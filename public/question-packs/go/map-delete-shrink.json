@@ -1,0 +1,274 @@
+{
+  "id": "go-map-delete-shrink",
+  "name": "Map delete 与内存回收",
+  "domain": "go",
+  "description": "delete 不缩容的原理、内存只增不减的根因与解决方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "go-map-delete-shrink",
+      "domain": "go",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": [
+        "delete",
+        "内存",
+        "缩容",
+        "GC"
+      ],
+      "title": "delete 不缩容：Map 的内存只增不减",
+      "content": "## 场景：缓存 map 定期清理，但内存就是不降\n\n你的团队在生产环境运行着一个 Go 编写的缓存服务。这个服务使用 `map[string]CacheEntry` 在内存中缓存热点数据，每条数据带有 TTL（过期时间），后台 goroutine 每分钟扫描一次 map，用 `delete(m, key)` 清理过期的 key。\n\n服务上线一周后，运维同事找到你：\"这个服务有内存泄漏。`top` 命令显示 RSS 从启动时的 200MB 涨到了 2GB，但 Prometheus 监控显示 map 中活跃的 key 数量一直在 50 万左右波动。每次 GC 后内存稍微下降，但整体趋势一直在涨。\"\n\n你确认了没有 goroutine 泄漏、没有全局变量持有引用，代码逻辑也没有 bug。到底是什么在吃掉内存？",
+      "answer": "## delete 只做标记，不释放 bucket 内存\n\n这个问题的根因藏在 Go runtime 的 map 实现细节中。当你调用 `delete(m, key)` 时，Go 做了什么？打开 runtime 源码（`runtime/map.go` 的 `mapdelete` 函数），你会发现它的操作非常「克制」：\n\n1. 通过哈希值定位到 key 所在的 bucket 和 slot。\n2. 将该 slot 的 `tophash` 标记为 `emptyOne`（值为 1），表示「这个位置曾经有数据，现在被删了」。\n3. 将 key 和 value 的内存清零（`memclrHasPointers` 或 `memclrNoHeapPointers`），让 GC 能回收 key 和 value 指向的对象。\n4. 如果相邻的后续 slot 也是空的，还会把 tophash 从 `emptyOne` 优化为 `emptyRest`（值为 0），表示从这个位置开始到 bucket 末尾都是空的——这是一个查找优化，让后续 probe 可以提前终止。\n5. `count` 递减。\n\n关键点在于：整个过程中，**bucket 本身的内存不会被释放，overflow bucket 也不会被回收**。delete 只是在 bucket 的 tophash 数组中做了一个标记，bucket 结构体（含 8 个 key slot + 8 个 value slot + overflow 指针）的内存块仍然完整地存在于堆上。\n\n## 为什么 map 永远不会自动缩容\n\nGo 的 map 有扩容机制（翻倍扩容和等量扩容），但没有对应的缩容机制。也就是说，map 一旦增长到某个 bucket 数量（2^B），即使你删除了 99% 的 key，B 值也不会减小，bucket 数组也不会缩小。\n\n这不是一个 bug，而是 Go 团队深思熟虑后的设计决策。社区多次提出过添加 shrink 功能的 proposal（如 GitHub issue #20135），Go 核心团队给出的理由包括：\n\n**复杂度高、收益有限**：缩容需要重新分配更小的 bucket 数组并迁移所有数据，和扩容一样代价不低。但与扩容不同，缩容的触发时机很难确定——你怎么知道用户不会马上又插入大量数据？如果缩容后立刻又扩容，反而浪费更多 CPU。\n\n**语义上的困难**：map 的内存布局直接影响所有正在迭代中的 `range` 循环。如果在 range 过程中触发缩容导致 bucket 数组改变，迭代器的正确性很难保证。Go 的 map iterator 已经足够复杂（需要处理扩容期间的迭代），再加上缩容会使实现变得更加脆弱。\n\n**指针安全性**：Go 的 GC 是精确 GC（precise GC），它需要知道每个指针的确切位置。bucket 数组的布局在编译期确定，如果运行时缩容导致布局变化，GC 的 bitmap 扫描逻辑需要额外处理，增加了 runtime 的复杂度。\n\n## 回到你的场景：内存为什么持续上涨\n\n现在可以解释缓存服务的内存问题了。服务的运行模式是：\n\n1. 新请求进来 → 缓存 miss → 从数据库加载 → `m[key] = value`（写入 map）\n2. 每分钟定时器 → 扫描 map → `delete(m, key)` 删除过期 key\n3. 新请求进来 → 缓存 miss（因为 key 被删了）→ 又写入 map\n\n看起来 key 的数量稳定在 50 万左右，但实际上 map 经历了数百万次的 insert/delete 循环。每一波新 key 的 hash 值分布可能和之前不同，导致 Go runtime 不断触发扩容（要么是负载因子超过 6.5，要么是 overflow bucket 碎片化触发等量扩容）。而扩容只增大 bucket 数组，从不缩小——所以 B 值只会单调递增，map 底层的 bucket 数组越来越大。\n\n即使 delete 后 key 和 value 的对象被 GC 回收了，bucket 数组本身（作为一块连续分配的大内存）始终被 map 引用着，GC 无法回收。这就是 RSS 持续上涨的根因——不是 key/value 泄漏，而是 bucket 数组膨胀。\n\n## 解决方案\n\n### 方案一：定期重建 map（最常用）\n\n最直接的方案是定期创建一个新 map，将有效数据拷贝过去，然后替换旧 map：\n\n```go\nfunc rebuildMap(old map[string]CacheEntry) map[string]CacheEntry {\n    newMap := make(map[string]CacheEntry, len(old))\n    for k, v := range old {\n        if !v.IsExpired() {\n            newMap[k] = v\n        }\n    }\n    return newMap\n}\n```\n\n新 map 的 bucket 数组大小由 `make` 的 hint 参数和实际拷贝进去的元素数量决定，不会继承旧 map 膨胀后的 bucket 数组。旧 map 失去引用后整体被 GC 回收。建议在 key 数量比峰值下降超过 50% 时触发重建，或者设定一个固定周期（如每小时重建一次）。需要注意的是，重建期间需要加锁保证并发安全，且拷贝大 map 有一定的 CPU 开销。\n\n### 方案二：直接置 nil 释放整个 map\n\n如果业务允许短暂的缓存失效（cold start），可以更暴力地清空：\n\n```go\nmu.Lock()\nm = make(map[string]CacheEntry, expectedSize)\nmu.Unlock()\n```\n\n或者 `m = nil` 后重新初始化。这适用于缓存数据可以被重新加载的场景（cache aside pattern）——短暂的缓存 miss 高峰后会自动恢复。\n\n### 方案三：使用带 TTL 管理的缓存库\n\n生产环境更推荐使用成熟的内存缓存库，它们内部已经处理了内存回收问题：\n\n- **go-cache**（`patrickmn/go-cache`）：基于 map + RWMutex，内置过期清理和统计。\n- **ristretto**（`dgraph-io/ristretto`）：基于 TinyLFU 淘汰策略的高性能缓存，支持 cost-based 淘汰，自动控制内存上限。\n- **bigcache**（`allegro/bigcache`）：将数据序列化为 `[]byte` 存储在预分配的字节数组中，完全绕开了 map 的 bucket 膨胀问题（因为主要数据不在 map 的 value 中），且对 GC 友好——百万级 key 的 GC pause 只有微秒级。\n- **freecache**（`coocood/freecache`）：类似 bigcache，零 GC 开销设计，使用 ringbuffer 存储数据。\n\n这些库的共同思路是：要么定期重建底层存储，要么根本不依赖 Go map 作为主要存储结构——从根源上避免了「delete 不缩容」的问题。\n\n## map 内存模型的本质\n\n最后总结一下技术本质：Go map 的 bucket 数组是作为一个连续的内存块分配的（`makeBucketArray` 函数中调用 `newarray`）。Go 的内存分配器（基于 TCMalloc 思想）和 GC 的基本单位是「对象」——它们只能整体分配或回收一个对象，不能释放对象内部的一部分。bucket 数组是一个对象，只要 hmap 还引用着它，GC 就不会回收，即使数组中 99% 的 slot 都是空的。\n\n这就是 Go map「内存只增不减」的根本物理原因：**连续分配的内存块无法被部分释放**。理解了这一点，你就知道为什么唯一有效的「缩容」方式是创建一个新 map——因为只有让旧的整块内存失去所有引用，GC 才能将其完整回收。",
+      "keyPoints": [
+        "delete 只将 tophash 标记为 emptyOne/emptyRest，不释放 bucket 内存",
+        "Go map 有扩容机制但没有缩容机制，B 值只增不减",
+        "bucket 数组是连续分配的内存块，只能整体回收，不能部分释放",
+        "解决方案：定期重建新 map 拷贝有效数据 / 使用 m = nil 整体释放",
+        "生产环境推荐使用 go-cache、ristretto、bigcache 等成熟缓存库",
+        "Go 团队多次讨论缩容方案但因复杂度/收益比不足而搁置"
+      ],
+      "quiz": [
+        {
+          "id": "go-map-delete-shrink-q1",
+          "question": "调用 delete(m, key) 后，Go runtime 对 bucket 做了什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "释放该 key 所在的 bucket 内存，归还给操作系统"
+            },
+            {
+              "id": "B",
+              "text": "将 bucket 中该 slot 的 tophash 标记为 emptyOne/emptyRest，清零 key 和 value，但不释放 bucket"
+            },
+            {
+              "id": "C",
+              "text": "将整个 bucket 移动到一个 free list 中以便复用"
+            },
+            {
+              "id": "D",
+              "text": "触发一次 GC 来回收该 bucket 的内存"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "delete 的操作非常轻量：标记 tophash 为 emptyOne（如果后续 slot 也空则优化为 emptyRest），memclr 清零 key 和 value 的内存（让 GC 能回收它们指向的对象），然后 count 减 1。bucket 结构体本身的内存完全不受影响。A 不可能——bucket 是数组的一部分，不能单独释放；C 中 Go map 没有 bucket free list 机制；D 中 delete 不会主动触发 GC。"
+        },
+        {
+          "id": "go-map-delete-shrink-q2",
+          "question": "为什么 Go 团队至今没有给 map 添加自动缩容功能？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "因为缩容功能的代码太少，不值得添加"
+            },
+            {
+              "id": "B",
+              "text": "因为 Go 不支持泛型，无法实现通用缩容"
+            },
+            {
+              "id": "C",
+              "text": "因为缩容的触发时机难以确定、会影响 range 迭代器正确性、且增加 runtime 复杂度"
+            },
+            {
+              "id": "D",
+              "text": "因为 Go 的 GC 已经自动处理了缩容"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Go 团队在 GitHub issue #20135 等多次讨论中阐述了理由：缩容后如果立刻又扩容会浪费 CPU（时机判断困难）；map 的 range 迭代器已经需要处理扩容期间的复杂性，缩容会进一步加剧；精确 GC 的 bitmap 扫描逻辑也需要额外适配。Go 1.18 引入泛型后 B 选项已不成立；D 不对——GC 只能回收无引用的对象，被 hmap 引用的 bucket 数组不会被回收。"
+        },
+        {
+          "id": "go-map-delete-shrink-q3",
+          "question": "一个 map 先插入 100 万 key 再 delete 掉 99 万，此时 map 的 bucket 数组大小会怎样？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "缩小到只能容纳 1 万 key 的大小"
+            },
+            {
+              "id": "B",
+              "text": "保持在能容纳 100 万 key 的大小，B 值不变"
+            },
+            {
+              "id": "C",
+              "text": "减小一半"
+            },
+            {
+              "id": "D",
+              "text": "完全释放，由 GC 回收后重新分配"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go map 没有缩容机制。在插入 100 万 key 的过程中经历了多次翻倍扩容，B 值增长到满足 loadFactor * 2^B >= 1000000。删除 99 万 key 后，count 变为 1 万，但 B 值不变，bucket 数组大小不变。那 99 万个位置只是被标记为 empty，bucket 内存仍然被 map 持有。只有将整个 map 丢弃（赋 nil 或重建新 map）才能释放这些内存。"
+        },
+        {
+          "id": "go-map-delete-shrink-q4",
+          "question": "以下哪种方式能有效释放 map 占用的多余 bucket 内存？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "调用 runtime.GC() 强制触发垃圾回收"
+            },
+            {
+              "id": "B",
+              "text": "使用 for range 遍历 map 并 delete 所有 key"
+            },
+            {
+              "id": "C",
+              "text": "创建一个新 map，拷贝有效数据到新 map，让旧 map 被 GC 回收"
+            },
+            {
+              "id": "D",
+              "text": "设置 GOGC=1 让 GC 更频繁地运行"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "唯一有效释放 bucket 内存的方式是让整个旧 map（包括其 bucket 数组）失去引用，被 GC 整体回收。创建新 map 并拷贝有效数据是标准做法。A 不行——runtime.GC() 只能回收无引用的对象，旧 map 仍被变量引用着；B 只是把所有 slot 标记为 empty，bucket 内存不变；D 中 GC 频率再高也无法回收被引用的对象。"
+        },
+        {
+          "id": "go-map-delete-shrink-q5",
+          "question": "在缓存服务中，哪个做法最能避免 map 的 bucket 内存持续膨胀？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "使用 sync.Map 替代普通 map"
+            },
+            {
+              "id": "B",
+              "text": "使用 bigcache 或 freecache 等基于字节数组存储的缓存库"
+            },
+            {
+              "id": "C",
+              "text": "增大 GOGC 值减少 GC 频率"
+            },
+            {
+              "id": "D",
+              "text": "使用 map[string]*CacheEntry（指针值）替代 map[string]CacheEntry"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "bigcache 和 freecache 将数据序列化为 []byte 存储在预分配的 ringbuffer/字节数组中，不依赖 Go map 的 bucket 机制作为主要存储。它们的内存使用量是预分配且可控的，不会出现「bucket 只增不减」的问题。A 中 sync.Map 同样有 bucket 不缩容的问题；C 中 GC 频率与 bucket 释放无关；D 中指针值只减小了 value 复制成本，bucket 膨胀问题依然存在。"
+        },
+        {
+          "id": "go-map-delete-shrink-q6",
+          "question": "delete(m, key) 后，key 和 value 指向的堆对象会怎样？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "立即被释放，内存归还操作系统"
+            },
+            {
+              "id": "B",
+              "text": "永远不会被回收，造成内存泄漏"
+            },
+            {
+              "id": "C",
+              "text": "key/value 的 slot 被 memclr 清零，它们指向的堆对象在下次 GC 时如果无其他引用则被回收"
+            },
+            {
+              "id": "D",
+              "text": "被移到一个 finalizer 队列中等待手动释放"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "delete 会对 key 和 value 的 slot 调用 memclr（memclrHasPointers 或 memclrNoHeapPointers），清除 bucket 中对这些对象的引用。如果没有其他变量持有这些对象的引用，下次 GC 扫描时它们就会被标记为不可达并回收。所以 delete 确实能释放 key/value 对象——释放不了的是 bucket 结构体本身的内存。A 错在「立即」，Go 使用 GC 而非手动释放；B 不对，key/value 是可以被回收的。"
+        },
+        {
+          "id": "go-map-delete-shrink-q7",
+          "question": "tophash 中 emptyOne 和 emptyRest 这两个状态有什么区别？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "emptyOne 表示该 slot 被删除，emptyRest 表示该 slot 及之后所有 slot 都是空的"
+            },
+            {
+              "id": "B",
+              "text": "emptyOne 用于普通 bucket，emptyRest 用于 overflow bucket"
+            },
+            {
+              "id": "C",
+              "text": "emptyOne 表示 key 被删但 value 还在，emptyRest 表示 key 和 value 都被删了"
+            },
+            {
+              "id": "D",
+              "text": "两者没有区别，只是不同版本的 Go 使用不同命名"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个查找优化。emptyOne（值为 1）表示「这个位置被删了，但后面可能还有数据，需要继续探查」。emptyRest（值为 0）表示「从这个位置到 bucket 末尾（包括 overflow）都是空的，不用继续了」。delete 时如果检测到后续连续 slot 都是空的，会将 tophash 从 emptyOne 升级为 emptyRest，让后续的 key lookup 可以提前终止探查，减少不必要的比较。"
+        },
+        {
+          "id": "go-map-delete-shrink-q8",
+          "question": "为什么 Go map 的 bucket 数组不能被部分释放？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Go 语言不支持内存操作"
+            },
+            {
+              "id": "B",
+              "text": "bucket 数组是一个连续分配的内存块，Go 的内存分配器和 GC 只能以对象为单位回收，无法释放对象内部的一部分"
+            },
+            {
+              "id": "C",
+              "text": "bucket 数组存储在栈上，不受 GC 管理"
+            },
+            {
+              "id": "D",
+              "text": "操作系统不允许释放已分配内存的一部分"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go 的内存分配器（基于 TCMalloc 思想）将 bucket 数组作为一个完整的对象分配在堆上。GC 的回收粒度也是对象级别——要么整体回收，要么不回收。你不能告诉 GC「请释放这个数组的后半部分」。这是所有使用 tracing GC 的语言的共同限制。C 不对，map 的 bucket 数组总是在堆上（太大了不会逃逸到栈）；D 不完全准确，madvise 等系统调用可以提示 OS 释放页面，但 Go runtime 不会对 bucket 数组这样做。"
+        },
+        {
+          "id": "go-map-delete-shrink-q9",
+          "question": "在重建 map 时，以下代码有什么问题？\n\n```go\nnewMap := make(map[string]CacheEntry)\nfor k, v := range oldMap {\n    newMap[k] = v\n}\noldMap = newMap\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "逻辑完全正确，没有任何问题"
+            },
+            {
+              "id": "B",
+              "text": "make 没有指定 hint 容量，可能导致重建过程中多次扩容；且并发场景下缺少锁保护"
+            },
+            {
+              "id": "C",
+              "text": "range 遍历 map 期间不能创建新 map"
+            },
+            {
+              "id": "D",
+              "text": "newMap 赋值给 oldMap 后，newMap 会被 GC 回收"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "两个问题：1) make(map[string]CacheEntry) 没有传入容量 hint，如果 oldMap 有 50 万 key，重建过程中 newMap 要从零开始经历多次翻倍扩容，浪费 CPU。应该用 make(map[string]CacheEntry, len(oldMap))。2) 在并发环境中，range oldMap 和 oldMap = newMap 操作需要加锁，否则其他 goroutine 可能在重建期间读写旧 map 导致 race condition。C 不对，Go 允许在 range 中操作其他 map；D 不对，赋值后 newMap 和 oldMap 指向同一个底层对象。"
+        },
+        {
+          "id": "go-map-delete-shrink-q10",
+          "question": "以下哪个 Go 缓存库采用了「数据存储在预分配字节数组中」的设计来规避 map bucket 膨胀问题？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "go-cache（patrickmn/go-cache）"
+            },
+            {
+              "id": "B",
+              "text": "bigcache（allegro/bigcache）"
+            },
+            {
+              "id": "C",
+              "text": "sync.Map"
+            },
+            {
+              "id": "D",
+              "text": "groupcache（golang/groupcache）"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "bigcache 的核心设计是将所有缓存数据序列化为 []byte，存储在预分配的环形字节数组（BytesQueue）中。map 只存储 key → offset 的映射（map[uint64]uint32），value 的实际数据不在 map 的 bucket 中。这种设计的好处：1) 字节数组大小可控，不会无限膨胀；2) map 的 value 只是一个 uint32 偏移量，非常紧凑。freecache 也采用了类似设计。go-cache 底层仍是普通 map，sync.Map 有同样的 bucket 问题，groupcache 关注的是分布式缓存协调而非底层存储。"
+        }
+      ]
+    }
+  ]
+}
