@@ -1,0 +1,154 @@
+{
+  "id": "go-http-server-production",
+  "name": "net/http 生产级 Server：超时、优雅退出与连接管理",
+  "domain": "go",
+  "description": "构建生产级 HTTP server 的关键配置：超时参数、优雅退出、连接池管理与常见陷阱",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "go-http-server-production",
+      "domain": "go",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": ["net/http", "server", "timeout", "graceful-shutdown", "生产环境"],
+      "title": "net/http 生产级 Server：超时、优雅退出与连接管理",
+      "content": "你新接手了一个 Go HTTP 服务，代码是这样写的：\n\n```go\nfunc main() {\n    http.HandleFunc(\"/api/users\", handleUsers)\n    log.Fatal(http.ListenAndServe(\":8080\", nil))\n}\n```\n\n上线后遇到了几个问题：\n1. 偶尔有客户端报 timeout，但服务端没有任何日志\n2. 部署新版本时 rolling update 导致正在处理的请求被中断，返回 502\n3. 监控显示 goroutine 数量缓慢增长，怀疑有 goroutine 泄漏\n\n请重写这个 server 启动代码，使其达到生产标准。解释每个超时参数的含义，以及如何实现优雅退出。",
+      "answer": "这三行代码能让 server 跑起来，但离生产标准差得远。让我逐个分析问题并给出完整的生产级方案。\n\n**问题 1：没有超时配置**。`http.ListenAndServe` 使用的是 `http.Server` 的零值——所有超时都是 0（即无超时）。一个慢客户端（slowloris）可以打开连接后不发送数据，server 端会一直等待。如果攻击者打开几千个这样的连接，你的 goroutine 数量会飙升，最终 OOM。\n\nnet/http 的 Server 有这些超时参数：\n\n```go\nsrv := &http.Server{\n    Addr:         \":8080\",\n    ReadTimeout:  5 * time.Second,    // 从接受连接到读完整个 request body\n    WriteTimeout: 10 * time.Second,   // 从读完 request 到写完 response\n    IdleTimeout:  120 * time.Second,  // keep-alive 连接的空闲超时\n    ReadHeaderTimeout: 2 * time.Second, // 读 request header 的超时（防 slowloris）\n    MaxHeaderBytes: 1 << 20,          // 1MB max header size\n}\n```\n\n这些超时的关系要搞清楚：\n\n```\n连接建立 ──→ ReadHeaderTimeout ──→ ReadTimeout ──→ Handler 执行 ──→ WriteTimeout\n                                                    │\n                                                    └── 这段时间不受 Server 超时控制\n                                                        需要用 context timeout\n```\n\n重点：`ReadTimeout` 和 `WriteTimeout` 是从连接建立开始计算的绝对时间，不是从 handler 开始。如果你的 handler 需要处理 5 秒，但 `WriteTimeout` 是 3 秒，handler 还没写完 response 连接就被关闭了。所以 `WriteTimeout` 应该大于你最慢的 handler 的预期处理时间。\n\n对于长时间的 handler，更好的方式是在 handler 内用 context timeout 控制：\n\n```go\nfunc handleUsers(w http.ResponseWriter, r *http.Request) {\n    ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)\n    defer cancel()\n    \n    users, err := s.repo.ListUsers(ctx) // 传递 context\n    // ...\n}\n```\n\n**问题 2：没有优雅退出**。`log.Fatal(http.ListenAndServe(...))` 在收到 SIGTERM 时直接退出——正在处理的请求被中断。在 K8s rolling update 时，Pod 收到 SIGTERM 后需要在 terminationGracePeriodSeconds（默认 30s）内完成清理。\n\n优雅退出的完整实现：\n\n```go\nfunc main() {\n    srv := &http.Server{\n        Addr:              \":8080\",\n        Handler:           setupRouter(),\n        ReadHeaderTimeout: 2 * time.Second,\n        ReadTimeout:       5 * time.Second,\n        WriteTimeout:      10 * time.Second,\n        IdleTimeout:       120 * time.Second,\n    }\n\n    // 启动 server（非阻塞）\n    go func() {\n        log.Printf(\"server starting on %s\", srv.Addr)\n        if err := srv.ListenAndServe(); err != http.ErrServerClosed {\n            log.Fatalf(\"server error: %v\", err)\n        }\n    }()\n\n    // 等待中断信号\n    quit := make(chan os.Signal, 1)\n    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)\n    sig := <-quit\n    log.Printf(\"received signal %v, shutting down...\", sig)\n\n    // 优雅关闭：停止接受新连接，等待已有请求完成\n    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)\n    defer cancel()\n    \n    if err := srv.Shutdown(ctx); err != nil {\n        log.Printf(\"graceful shutdown failed: %v\", err)\n        srv.Close() // 强制关闭\n    }\n    log.Println(\"server stopped\")\n}\n```\n\n`srv.Shutdown(ctx)` 做了什么：(1) 关闭所有 listener——不再接受新连接；(2) 关闭所有空闲连接；(3) 等待所有活跃连接的 handler 完成；(4) 如果 context 超时，返回 context.DeadlineExceeded（此时仍有请求未完成）。\n\n在 K8s 中，还需要配合 readiness probe 和 preStop hook：\n\n```yaml\nlifecycle:\n  preStop:\n    exec:\n      command: [\"sleep\", \"5\"]  # 给 endpoint controller 时间移除 pod\nterminationGracePeriodSeconds: 30\n```\n\npreStop sleep 的原因：K8s 发送 SIGTERM 和从 Service endpoints 中移除 Pod 是并行的。如果 server 收到 SIGTERM 立即停止接受新连接，但 kube-proxy 还没更新 iptables 规则，新请求仍然被路由到这个 Pod——返回 connection refused。sleep 5 秒让 endpoints 更新完成后再开始优雅关闭。\n\n**问题 3：goroutine 泄漏**。最常见的原因是 handler 中发起了 HTTP 请求但没有正确关闭 response body：\n\n```go\n// ❌ 泄漏：response body 没有被读完和关闭\nresp, err := http.Get(\"http://other-service/api\")\nif err != nil {\n    return err\n}\nresult := resp.StatusCode // 只用了 status code，没有读 body\n// 连接无法被复用，底层 goroutine 一直等待 body 被读完\n\n// ✅ 正确写法\nresp, err := http.Get(\"http://other-service/api\")\nif err != nil {\n    return err\n}\ndefer resp.Body.Close()\nio.Copy(io.Discard, resp.Body) // 必须读完 body 才能复用连接\n```\n\n另一个原因是使用了默认的 `http.DefaultClient`——它没有超时。如果下游服务挂了，请求会无限等待。\n\n```go\nvar httpClient = &http.Client{\n    Timeout: 10 * time.Second,\n    Transport: &http.Transport{\n        MaxIdleConns:        100,\n        MaxIdleConnsPerHost: 10,\n        IdleConnTimeout:     90 * time.Second,\n    },\n}\n```",
+      "keyPoints": [
+        "http.ListenAndServe 使用零值 Server——无超时、无优雅退出，不适合生产环境",
+        "ReadHeaderTimeout 防 slowloris 攻击，ReadTimeout 控制整个 request 读取，WriteTimeout 控制 response 写入",
+        "WriteTimeout 从连接建立开始计算，需要大于最慢 handler 的处理时间",
+        "srv.Shutdown 实现优雅退出：停止新连接 → 等待活跃请求完成 → 超时后强制关闭",
+        "K8s 中需要 preStop sleep 让 endpoints 更新完成后再优雅关闭，避免请求路由到已停止的 Pod",
+        "HTTP client 必须关闭并读完 response body（io.Copy(io.Discard, body)）否则连接泄漏",
+        "不要使用 http.DefaultClient——它没有超时，下游故障会导致 goroutine 泄漏"
+      ],
+      "quiz": [
+        {
+          "id": "go-http-server-q1",
+          "question": "使用 http.ListenAndServe(\":8080\", nil) 在生产环境的最大风险是什么？",
+          "choices": [
+            {"id": "A", "text": "没有超时配置——slowloris 攻击可以耗尽 goroutine，没有优雅退出——部署时中断请求"},
+            {"id": "B", "text": "端口 8080 不安全"},
+            {"id": "C", "text": "nil handler 会 panic"},
+            {"id": "D", "text": "性能比 nginx 差"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：零值 http.Server 所有超时都是 0（无限等待）。恶意客户端打开连接后不发送数据，每个连接消耗一个 goroutine。几千个这样的连接就能耗尽服务器资源。另外没有 Shutdown 实现，SIGTERM 时强制退出导致请求中断。nil handler 使用 DefaultServeMux 不会 panic。"
+        },
+        {
+          "id": "go-http-server-q2",
+          "question": "ReadTimeout 和 WriteTimeout 的计时起点是什么？",
+          "choices": [
+            {"id": "A", "text": "从接受 TCP 连接（accept）开始计时，不是从 handler 开始"},
+            {"id": "B", "text": "从 handler 函数被调用开始"},
+            {"id": "C", "text": "从 DNS 解析开始"},
+            {"id": "D", "text": "从客户端发出请求开始"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：这是 net/http Server 超时的一个重要细节。ReadTimeout 从 accept 到 request body 读完，WriteTimeout 从 request header 读完到 response 写完。如果网络延迟高，客户端传输请求体慢，ReadTimeout 可能在 handler 还没开始就超时。这就是为什么建议在 handler 内用 context.WithTimeout 控制业务超时。"
+        },
+        {
+          "id": "go-http-server-q3",
+          "question": "srv.Shutdown(ctx) 调用后会发生什么？",
+          "choices": [
+            {"id": "A", "text": "停止接受新连接 → 关闭空闲连接 → 等待活跃请求完成 → context 超时则返回错误"},
+            {"id": "B", "text": "立即关闭所有连接"},
+            {"id": "C", "text": "等待所有连接空闲后关闭"},
+            {"id": "D", "text": "发送 FIN 包给所有客户端"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：Shutdown 是渐进式的——先关闭 listener（不接受新连接），然后关闭空闲的 keep-alive 连接，最后等待所有正在处理请求的 handler return。如果在 context 超时前所有 handler 完成，Shutdown 返回 nil。如果超时，返回 context.DeadlineExceeded——此时你可以调用 srv.Close() 强制关闭。"
+        },
+        {
+          "id": "go-http-server-q4",
+          "question": "K8s 中为什么需要 preStop sleep 再优雅关闭？",
+          "choices": [
+            {"id": "A", "text": "SIGTERM 和从 Service endpoints 移除 Pod 是并行的，需要等 kube-proxy 更新 iptables 后再停止接受连接"},
+            {"id": "B", "text": "让 Pod 有时间保存日志"},
+            {"id": "C", "text": "K8s 要求至少 5 秒的 preStop"},
+            {"id": "D", "text": "防止 OOM"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：当 Pod 被终止时，kubelet 发送 SIGTERM 和 API server 从 Endpoints 移除 Pod 是两个独立的并行操作。kube-proxy 监听 Endpoints 变化来更新 iptables 规则有延迟（通常 1-5 秒）。如果 server 收到 SIGTERM 立即关闭 listener，但 iptables 还在把请求路由到这个 Pod——客户端收到 connection refused（502）。preStop sleep 给 iptables 更新时间。"
+        },
+        {
+          "id": "go-http-server-q5",
+          "question": "以下代码有什么问题？\n\n```go\nresp, _ := http.Get(url)\ndata, _ := io.ReadAll(resp.Body)\n```",
+          "choices": [
+            {"id": "A", "text": "没有 defer resp.Body.Close()——response body 不关闭会导致连接泄漏"},
+            {"id": "B", "text": "io.ReadAll 效率低"},
+            {"id": "C", "text": "http.Get 不能传 url"},
+            {"id": "D", "text": "应该用 json.Decoder"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：HTTP response body 是一个 io.ReadCloser，必须关闭。如果不关闭，底层的 TCP 连接无法被放回连接池复用，导致连接泄漏。另外忽略 error 也是问题——如果 http.Get 返回 error，resp 可能是 nil，访问 resp.Body 会 panic。正确做法：检查 err → defer resp.Body.Close() → 读取 body。"
+        },
+        {
+          "id": "go-http-server-q6",
+          "question": "为什么不应该使用 http.DefaultClient？",
+          "choices": [
+            {"id": "A", "text": "DefaultClient 没有超时设置——如果下游服务不响应，请求 goroutine 会永远阻塞"},
+            {"id": "B", "text": "DefaultClient 不支持 HTTPS"},
+            {"id": "C", "text": "DefaultClient 不支持 POST"},
+            {"id": "D", "text": "DefaultClient 每次都创建新连接"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：http.DefaultClient 的 Timeout 是 0（无超时）。如果下游服务宕机或响应极慢，你的 goroutine 会一直阻塞在 read 上。在高 QPS 服务中，这会导致 goroutine 数量暴增直到 OOM。应该创建自定义 Client，设置合理的 Timeout（如 10s），并配置 Transport 的连接池参数。"
+        },
+        {
+          "id": "go-http-server-q7",
+          "question": "ReadHeaderTimeout 专门防御什么攻击？",
+          "choices": [
+            {"id": "A", "text": "Slowloris 攻击——恶意客户端极慢地发送 HTTP header，消耗服务器连接资源"},
+            {"id": "B", "text": "SQL 注入"},
+            {"id": "C", "text": "XSS 攻击"},
+            {"id": "D", "text": "DDoS 流量攻击"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：Slowloris 是一种低带宽 DoS 攻击——攻击者打开大量连接，每隔几秒发送一个字节的 header 数据，保持连接不超时也不完成。没有 ReadHeaderTimeout 的 server 会为每个连接分配一个 goroutine 一直等待 header 完成，几千个这样的连接就能耗尽资源。ReadHeaderTimeout=2s 意味着 2 秒内必须读完所有 header，否则关闭连接。"
+        },
+        {
+          "id": "go-http-server-q8",
+          "question": "以下 http.Transport 配置中，MaxIdleConnsPerHost=10 是什么意思？",
+          "choices": [
+            {"id": "A", "text": "对每个目标主机最多保持 10 个空闲的 keep-alive 连接——超出的连接用完即关闭"},
+            {"id": "B", "text": "同时只能有 10 个请求"},
+            {"id": "C", "text": "DNS 缓存最多 10 条"},
+            {"id": "D", "text": "连接池总大小为 10"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：HTTP/1.1 keep-alive 连接在请求完成后不关闭，放入连接池等待复用。MaxIdleConnsPerHost 控制每个目标主机的空闲连接数上限。如果你的服务只调用一个下游，设 10 意味着最多保持 10 个空闲连接。当并发请求超过 10 时，额外的请求会创建新连接，但用完后因为空闲池已满而被关闭。合理设置可以平衡连接复用和资源占用。"
+        },
+        {
+          "id": "go-http-server-q9",
+          "question": "IdleTimeout 设置过短（如 5 秒）会有什么问题？",
+          "choices": [
+            {"id": "A", "text": "keep-alive 连接很快被关闭，大量请求需要重新建立 TCP 连接（三次握手 + TLS），增加延迟"},
+            {"id": "B", "text": "所有请求超时"},
+            {"id": "C", "text": "server 无法启动"},
+            {"id": "D", "text": "客户端无法连接"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：IdleTimeout 控制 keep-alive 连接的空闲超时。设太短意味着连接频繁被关闭重建——TCP 三次握手约 1 个 RTT（通常 1-10ms），如果是 HTTPS 还有 TLS 握手（额外 1-2 RTT）。高 QPS 服务中这个开销很显著。通常设 60-120 秒，让连接在请求间隙保持。设太长则空闲连接占用资源——需要根据流量模式权衡。"
+        },
+        {
+          "id": "go-http-server-q10",
+          "question": "handler 中如何正确设置请求级别的超时？",
+          "choices": [
+            {"id": "A", "text": "用 context.WithTimeout(r.Context(), timeout) 创建带超时的 context，传给下游调用"},
+            {"id": "B", "text": "设置更大的 WriteTimeout"},
+            {"id": "C", "text": "在 handler 中 time.Sleep"},
+            {"id": "D", "text": "用 sync.WaitGroup"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：Server 级别的 ReadTimeout/WriteTimeout 是粗粒度的，不适合控制单个 handler 的业务超时。正确做法是在 handler 内创建 context.WithTimeout，将 context 传递给所有下游调用（DB 查询、HTTP 请求、gRPC 调用）。当 context 超时时，下游调用自动取消。r.Context() 已经关联了连接生命周期——连接关闭时 context 自动 cancel。"
+        }
+      ],
+      "references": [
+        "https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/",
+        "https://pkg.go.dev/net/http#Server"
+      ]
+    }
+  ]
+}

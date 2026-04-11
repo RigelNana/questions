@@ -1,0 +1,141 @@
+{
+  "id": "go-conc-goroutine-leak",
+  "name": "Goroutine 泄漏：从发现到根治",
+  "domain": "go",
+  "description": "Goroutine 泄漏的常见原因、排查手段、pprof 诊断与修复策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "go-conc-goroutine-leak",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["goroutine", "泄漏", "pprof", "context", "channel"],
+      "question": "线上服务 goroutine 数量持续增长，如何定位和修复？",
+      "content": "你维护的一个 Go 微服务最近频繁触发内存告警。打开 Grafana 一看，`go_goroutines` 指标从服务启动时的几十个，在过去三天里缓慢爬升到了十几万。服务并没有明显的流量增长，重启之后指标归零但随后又开始攀升。\n\n你用 `pprof` 抓了一个 goroutine profile，发现绝大多数 goroutine 都阻塞在同一个位置——一个 channel 的接收操作上。代码大致长这样：\n\n```go\nfunc processOrder(ctx context.Context, orderID string) error {\n    resultCh := make(chan *Result)\n    go func() {\n        result, err := callPaymentService(orderID)\n        if err != nil {\n            return // 注意这里\n        }\n        resultCh <- result\n    }()\n    \n    select {\n    case result := <-resultCh:\n        return handleResult(result)\n    case <-ctx.Done():\n        return ctx.Err()\n    }\n}\n```\n\n每次请求都会启动一个 goroutine 去调用支付服务。当支付服务正常响应时一切正常，但当支付服务报错时，内层 goroutine 直接 return 了，没有往 channel 发送任何东西。此时外层的 select 如果因为 ctx 超时而退出，那个 resultCh 就再也没有人读了——但如果支付服务后来又成功了呢？内层 goroutine 会永远阻塞在 `resultCh <- result` 这一行，因为没有人接收。而如果支付服务报错，内层 goroutine 虽然 return 了，但外层还在等 resultCh，如果 ctx 没有超时，外层也会永远阻塞。\n\n这就是最经典的 goroutine 泄漏模式。让我们深入分析 goroutine 泄漏的各种成因和系统化的排查方法。",
+      "answer": "Goroutine 泄漏是 Go 服务在生产环境中最常见也最隐蔽的问题之一。和内存泄漏不同，goroutine 泄漏往往不会立刻导致 OOM，而是像慢性病一样逐渐消耗系统资源——每个阻塞的 goroutine 至少占用 2KB 的栈空间（Go 1.4+ 的初始栈大小），十万个就是 200MB，而且这些 goroutine 还持有引用的对象不会被 GC 回收，实际内存影响远超栈本身。\n\n上面代码的问题出在 channel 的生命周期管理上。unbuffered channel 的发送和接收必须配对，任何一方缺席都会导致另一方永久阻塞。修复方案有两个层次：最简单的是把 `make(chan *Result)` 改成 `make(chan *Result, 1)`——用 buffered channel。这样即使没有接收者，发送操作也能完成，goroutine 可以正常退出。但更根本的修复是在内层 goroutine 中也监听 ctx：\n\n```go\nfunc processOrder(ctx context.Context, orderID string) error {\n    resultCh := make(chan *Result, 1)\n    errCh := make(chan error, 1)\n    go func() {\n        result, err := callPaymentService(orderID)\n        if err != nil {\n            errCh <- err\n            return\n        }\n        resultCh <- result\n    }()\n    \n    select {\n    case result := <-resultCh:\n        return handleResult(result)\n    case err := <-errCh:\n        return fmt.Errorf(\"payment failed: %w\", err)\n    case <-ctx.Done():\n        return ctx.Err()\n    }\n}\n```\n\n这里有三个关键改动：resultCh 改为 buffer 1 的 channel，新增 errCh 来传递错误，两个 channel 都有 buffer 所以内层 goroutine 无论成功失败都能写入后退出。\n\n但 goroutine 泄漏远不止 channel 这一种模式。常见的泄漏场景至少有五大类：\n\n第一类是 channel 阻塞泄漏，就是上面的例子。变种包括：往一个没有消费者的 channel 发送、从一个没有生产者也没有关闭的 channel 接收、for-range 一个永远不会关闭的 channel。\n\n第二类是 context 未传播泄漏。当你启动一个 goroutine 执行后台任务但没有传入 context，或者传入了 context 但任务内部没有检查 ctx.Done()，那么即使调用方已经取消，后台 goroutine 仍然在执行。这在 HTTP handler 中尤其常见——客户端断开连接后，handler 的 context 会被取消，但如果你 `go func() { heavyComputation() }()` 没有传 ctx，这个计算会一直跑到完成才退出。\n\n第三类是锁竞争泄漏。当大量 goroutine 竞争同一把锁，而持有锁的 goroutine 因为某种原因（比如死锁、慢 I/O）迟迟不释放，等待锁的 goroutine 就会堆积。这种情况在 pprof 中表现为大量 goroutine 阻塞在 `sync.Mutex.Lock` 上。\n\n第四类是网络 I/O 泄漏。调用外部 HTTP 服务或数据库时没有设置超时，如果对端不响应，goroutine 会永远阻塞在网络读写上。这就是为什么 `http.Client` 一定要设置 `Timeout`，数据库连接一定要设置 `SetConnMaxLifetime`。\n\n第五类是 ticker/timer 泄漏。`time.NewTicker` 创建后如果不调用 `Stop()`，ticker 的内部 goroutine 会持续运行。虽然 Go 1.23 开始 ticker 和 timer 可以被 GC 回收了，但在早期版本中这是一个真实的泄漏源。\n\n排查 goroutine 泄漏的标准流程：第一步，在 Prometheus/Grafana 中监控 `go_goroutines` 和 `process_resident_memory_bytes` 指标，发现持续增长的趋势。第二步，通过 `net/http/pprof` 暴露 debug 端点，在浏览器中访问 `/debug/pprof/goroutine?debug=1` 可以看到所有 goroutine 的堆栈，按堆栈聚合后最多的那个就是泄漏源。第三步，用 `go tool pprof` 的 `top` 和 `tree` 命令定量分析，或者用 `goroutine?debug=2` 看每个 goroutine 的详细状态（包括阻塞时长）。第四步，在测试中使用 `go.uber.org/goleak` 包，它可以在每个 Test 函数结束时检查是否有 goroutine 泄漏，把泄漏消灭在开发阶段。\n\n预防 goroutine 泄漏的核心原则可以总结为一句话：启动 goroutine 时，你必须清楚地知道它将在什么条件下退出。如果你回答不了这个问题，那这个 goroutine 就有泄漏风险。具体到编码规范：所有启动 goroutine 的函数都应该接受 context.Context 参数；所有 channel 操作都应该有对应的超时或取消机制；所有外部 I/O 都应该设置超时；所有 ticker/timer 都应该在 defer 中 Stop。",
+      "quiz": [
+        {
+          "id": "go-conc-goroutine-leak-q1",
+          "question": "以下代码为什么会导致 goroutine 泄漏？\n```go\nch := make(chan int)\ngo func() { ch <- 42 }()\n// 没有接收 ch\n```",
+          "options": [
+            {"label": "A", "text": "unbuffered channel 发送会阻塞直到有接收者，而主 goroutine 没有接收，子 goroutine 永远阻塞"},
+            {"label": "B", "text": "channel 没有关闭导致内存泄漏"},
+            {"label": "C", "text": "goroutine 中不能操作外部变量"},
+            {"label": "D", "text": "make(chan int) 创建的 channel 不能发送数据"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：unbuffered channel 的发送操作必须有对应的接收者才能完成，否则发送方 goroutine 会永久阻塞，无法退出。B 错误：channel 不关闭不会导致内存泄漏，问题在于 goroutine 阻塞。C 错误：goroutine 闭包可以合法地捕获外部变量。D 错误：make(chan int) 创建的 channel 完全可以发送和接收数据。"
+        },
+        {
+          "id": "go-conc-goroutine-leak-q2",
+          "question": "把 `make(chan int)` 改成 `make(chan int, 1)` 为什么能防止上述泄漏？",
+          "options": [
+            {"label": "A", "text": "buffered channel 在缓冲区未满时发送不会阻塞，buffer 为 1 允许发送一次后 goroutine 正常退出"},
+            {"label": "B", "text": "buffered channel 会自动关闭"},
+            {"label": "C", "text": "buffered channel 的数据会自动被 GC 回收"},
+            {"label": "D", "text": "buffered channel 内部使用了 goroutine pool"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：buffer 为 1 的 channel 允许一次无阻塞的发送，即使没有接收者，发送方也能将数据放入缓冲区后正常退出。B 错误：buffered channel 不会自动关闭，关闭需要显式调用 close()。C 错误：channel 缓冲区中的数据不会被 GC 自动回收，但 goroutine 可以退出从而不再持有引用。D 错误：channel 内部不使用 goroutine pool，它是基于 runtime 调度的同步原语。"
+        },
+        {
+          "id": "go-conc-goroutine-leak-q3",
+          "question": "在生产环境中，哪个工具最适合快速定位 goroutine 泄漏的堆栈？",
+          "options": [
+            {"label": "A", "text": "net/http/pprof 的 /debug/pprof/goroutine?debug=1"},
+            {"label": "B", "text": "go vet"},
+            {"label": "C", "text": "go build -race"},
+            {"label": "D", "text": "go test -count=1"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：/debug/pprof/goroutine?debug=1 按堆栈聚合显示所有 goroutine 及其数量，能直接看到哪个位置堆积了最多的阻塞 goroutine。B 错误：go vet 是静态分析工具，检查代码中的常见错误但不能检测运行时的 goroutine 泄漏。C 错误：-race 是竞态检测器，用于发现数据竞争而非 goroutine 泄漏。D 错误：go test -count=1 只是运行测试，本身不具备泄漏检测能力。"
+        },
+        {
+          "id": "go-conc-goroutine-leak-q4",
+          "question": "Go 中每个 goroutine 的初始栈大小是多少？",
+          "options": [
+            {"label": "A", "text": "2 KB（Go 1.4+）"},
+            {"label": "B", "text": "8 KB"},
+            {"label": "C", "text": "64 KB"},
+            {"label": "D", "text": "1 MB"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：Go 1.4 开始将 goroutine 初始栈大小从 8KB 降到 2KB（连续栈实现），栈可以按需增长到 1GB。B 错误：8KB 是 Go 1.3 及之前的初始栈大小。C 错误：64KB 不是任何版本的 Go 的默认栈大小。D 错误：1MB 是操作系统线程的典型栈大小，不是 goroutine 的。"
+        },
+        {
+          "id": "go-conc-goroutine-leak-q5",
+          "question": "以下哪种场景不会导致 goroutine 泄漏？",
+          "options": [
+            {"label": "A", "text": "goroutine 内部执行完所有代码后正常 return"},
+            {"label": "B", "text": "从一个永远不会关闭且无数据的 channel 接收"},
+            {"label": "C", "text": "goroutine 内部调用外部 HTTP 服务但没有设置超时"},
+            {"label": "D", "text": "goroutine 竞争一把被死锁的 mutex"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：goroutine 正常执行完毕后 return，运行时会回收其栈空间和相关资源，不存在泄漏。B 错误：从一个永远不会关闭且没有数据的 channel 接收会导致 goroutine 永久阻塞。C 错误：没有超时的 HTTP 调用可能永远等待响应，导致 goroutine 阻塞。D 错误：等待一个被死锁的 mutex 会导致 goroutine 永久阻塞。"
+        },
+        {
+          "id": "go-conc-goroutine-leak-q6",
+          "question": "goleak 包（go.uber.org/goleak）的主要使用场景是什么？",
+          "options": [
+            {"label": "A", "text": "在单元测试中检测测试结束后是否有未退出的 goroutine"},
+            {"label": "B", "text": "在生产环境中自动杀死泄漏的 goroutine"},
+            {"label": "C", "text": "限制一个程序最多启动多少个 goroutine"},
+            {"label": "D", "text": "监控 goroutine 的 CPU 使用率"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：goleak 在测试函数结束时检查是否有超出预期的 goroutine 仍在运行，通过 defer goleak.VerifyNone(t) 使用，把泄漏问题在开发阶段就暴露出来。B 错误：Go 运行时不提供杀死单个 goroutine 的机制，goleak 只是检测工具。C 错误：goroutine 数量限制不是 goleak 的功能，那需要用 semaphore 模式实现。D 错误：CPU 使用率监控应该用 pprof CPU profile，不是 goleak。"
+        },
+        {
+          "id": "go-conc-goroutine-leak-q7",
+          "question": "for range 一个 channel 时，如果 channel 永远不被关闭，会发生什么？",
+          "options": [
+            {"label": "A", "text": "for range 会永远阻塞，goroutine 泄漏"},
+            {"label": "B", "text": "for range 在 channel 为空时自动退出"},
+            {"label": "C", "text": "编译错误，for range 不能用于 channel"},
+            {"label": "D", "text": "runtime panic: channel not closed"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：for range channel 会持续接收直到 channel 被关闭，如果 channel 永远不关闭，for range 所在的 goroutine 就会永远阻塞。B 错误：channel 为空（无数据）时 for range 会阻塞等待而非退出，只有 close(ch) 才能让 for range 结束。C 错误：for range 完全可以用于 channel，这是 Go 的标准语法。D 错误：不关闭 channel 不会导致 panic，只会导致接收方阻塞。"
+        },
+        {
+          "id": "go-conc-goroutine-leak-q8",
+          "question": "在 HTTP handler 中，哪种做法最能防止 goroutine 泄漏？",
+          "options": [
+            {"label": "A", "text": "将 request 的 context 传入所有启动的 goroutine，并在 goroutine 内监听 ctx.Done()"},
+            {"label": "B", "text": "使用 runtime.Goexit() 在 handler 返回时强制退出所有 goroutine"},
+            {"label": "C", "text": "设置 GOMAXPROCS 限制 goroutine 数量"},
+            {"label": "D", "text": "在 handler 中不使用 goroutine"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：HTTP request 的 context 会在客户端断开或超时时自动取消，将其传入子 goroutine 并监听 ctx.Done() 可以确保 goroutine 在请求结束后及时退出。B 错误：runtime.Goexit() 只退出当前 goroutine，不能退出其他 goroutine。C 错误：GOMAXPROCS 控制的是并行执行的 OS 线程数，不是 goroutine 数量。D 错误：完全不用 goroutine 虽然避免了泄漏，但也丧失了并发能力，不是合理的解决方案。"
+        },
+        {
+          "id": "go-conc-goroutine-leak-q9",
+          "question": "time.NewTicker 在 Go 1.22 及之前版本中为什么需要手动 Stop？",
+          "options": [
+            {"label": "A", "text": "不 Stop 的 ticker 内部 goroutine 会持续运行，无法被 GC 回收"},
+            {"label": "B", "text": "不 Stop 会导致 panic"},
+            {"label": "C", "text": "不 Stop 的 ticker 会占用 CPU 100%"},
+            {"label": "D", "text": "Stop 只是最佳实践，不 Stop 也没有任何副作用"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：在 Go 1.22 及之前，ticker 内部由 runtime timer 驱动，不调用 Stop() 就无法被 GC 回收，会持续消耗资源。Go 1.23 改进了 timer 的 GC 行为，但 Stop() 仍然是推荐的做法。B 错误：不 Stop ticker 不会 panic，只会导致资源泄漏。C 错误：ticker 不会占用 100% CPU，它的开销主要在于无法被 GC 回收的定时器资源。D 错误：在 Go 1.22 及之前确实有副作用，会导致资源泄漏。"
+        },
+        {
+          "id": "go-conc-goroutine-leak-q10",
+          "question": "以下防止 goroutine 泄漏的原则，哪个是最核心的？",
+          "options": [
+            {"label": "A", "text": "启动 goroutine 前，必须明确它在什么条件下退出"},
+            {"label": "B", "text": "尽量少用 goroutine"},
+            {"label": "C", "text": "所有 goroutine 必须在 1 秒内完成"},
+            {"label": "D", "text": "每个 goroutine 都必须使用 recover 捕获 panic"}
+          ],
+          "answer": "A",
+          "explanation": "A 正确：这是防止 goroutine 泄漏的核心原则。在启动每个 goroutine 时，你应该能够回答'它什么时候会退出'这个问题，通常通过 context 取消、channel 关闭或超时来实现。B 错误：少用 goroutine 只是降低了风险概率，不是根本解决方案。C 错误：goroutine 的执行时间取决于业务需求，限定 1 秒是不合理的。D 错误：recover 用于防止 panic 导致进程崩溃，与 goroutine 泄漏是不同的问题。"
+        }
+      ],
+      "domain": "go"
+    }
+  ]
+}
