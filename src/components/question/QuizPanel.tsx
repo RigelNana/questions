@@ -99,20 +99,20 @@ export function QuizPanel({
   const isCorrect = existingAttempt?.isCorrect ?? (showExplanation ? displayAnswer === currentQuiz.correctAnswer : undefined);
 
   return (
-    <div className="border border-[var(--color-notion-border)] rounded-lg overflow-hidden">
+    <div className="border border-[var(--color-notion-border)] rounded-xl overflow-hidden">
       {/* Header */}
       <div className="px-4 py-3 bg-[var(--color-notion-bg-secondary)] border-b border-[var(--color-notion-border)] flex items-center justify-between">
-        <span className="text-sm font-medium text-[var(--color-notion-text)]">
+        <span className="text-sm font-semibold text-[var(--color-notion-text)]">
           配套选择题
         </span>
         <div className="flex items-center gap-3 text-xs text-[var(--color-notion-text-secondary)]">
-          <span>进度 {Math.min(existingAttempts.length + (showExplanation ? 1 : 0), quizzes.length)}/{quizzes.length}</span>
-          <span>正确 {correctCount + (isCorrect === true && !existingAttempt ? 1 : 0)}</span>
+          <span>{Math.min(existingAttempts.length + (showExplanation ? 1 : 0), quizzes.length)}/{quizzes.length}</span>
+          <span className="text-[var(--color-notion-correct)]">✓ {correctCount + (isCorrect === true && !existingAttempt ? 1 : 0)}</span>
         </div>
       </div>
 
       {/* Dot navigation */}
-      <div className="px-4 py-2 bg-[var(--color-notion-bg-secondary)] border-b border-[var(--color-notion-border)] flex items-center gap-1.5 flex-wrap">
+      <div className="px-4 py-2.5 bg-[var(--color-notion-bg-secondary)] border-b border-[var(--color-notion-border)] flex items-center gap-1.5 flex-wrap">
         {quizzes.map((q, i) => {
           const attempt = existingAttempts.find((a) => a.quizId === q.id);
           const isCurrent = i === currentIndex;
@@ -128,8 +128,8 @@ export function QuizPanel({
             <button
               key={q.id}
               onClick={() => jumpTo(i)}
-              className={`w-2.5 h-2.5 rounded-full transition-all ${dotColor} ${
-                isCurrent ? 'scale-125 ring-2 ring-[var(--color-notion-accent)] ring-offset-1' : 'hover:scale-110'
+              className={`w-2.5 h-2.5 rounded-full transition-all duration-200 ${dotColor} ${
+                isCurrent ? 'scale-150 ring-2 ring-[var(--color-notion-accent)]/40 ring-offset-1' : 'hover:scale-125'
               }`}
               title={`Q${i + 1}`}
             />
@@ -138,9 +138,9 @@ export function QuizPanel({
       </div>
 
       {/* Question */}
-      <div className="p-3 sm:p-5">
-        <div className="text-xs text-[var(--color-notion-text-secondary)] mb-2">
-          Q{currentIndex + 1}.
+      <div className="p-4 sm:p-5">
+        <div className="text-xs text-[var(--color-notion-accent)] font-medium mb-2">
+          Q{currentIndex + 1}
         </div>
         <MarkdownRenderer content={currentQuiz.question} className="mb-4" />
 
@@ -150,15 +150,17 @@ export function QuizPanel({
             const isSelected = displayAnswer === choice.id;
             const isCorrectChoice = choice.id === currentQuiz.correctAnswer;
 
-            let choiceStyle = 'border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]';
+            let choiceStyle = 'border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/60 hover:bg-[var(--color-notion-bg-secondary)]';
             if (isAnswered) {
               if (isCorrectChoice) {
-                choiceStyle = 'border-[var(--color-notion-correct)] bg-[var(--color-notion-correct-light)]';
+                choiceStyle = 'border-[var(--color-notion-correct)]/60 bg-[var(--color-notion-correct-light)]';
               } else if (isSelected && !isCorrectChoice) {
-                choiceStyle = 'border-[var(--color-notion-error)] bg-[var(--color-notion-error-light)]';
+                choiceStyle = 'border-[var(--color-notion-error)]/60 bg-[var(--color-notion-error-light)]';
+              } else {
+                choiceStyle = 'border-[var(--color-notion-border)] opacity-60';
               }
             } else if (isSelected) {
-              choiceStyle = 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)]';
+              choiceStyle = 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)] shadow-sm shadow-[var(--color-notion-accent)]/10';
             }
 
             return (
@@ -166,16 +168,16 @@ export function QuizPanel({
                 key={choice.id}
                 onClick={() => !isAnswered && setSelectedAnswer(choice.id)}
                 disabled={isAnswered}
-                className={`w-full text-left px-3 sm:px-4 py-2.5 sm:py-3 rounded border transition-colors flex items-start gap-2 sm:gap-3 ${choiceStyle} ${
+                className={`w-full text-left px-3.5 sm:px-4 py-2.5 sm:py-3 rounded-lg border transition-all duration-200 flex items-start gap-2.5 sm:gap-3 ${choiceStyle} ${
                   isAnswered ? 'cursor-default' : 'cursor-pointer'
                 }`}
               >
-                <span className="text-sm font-medium text-[var(--color-notion-text-secondary)] flex-shrink-0 mt-0.5">
+                <span className={`text-sm font-medium flex-shrink-0 mt-0.5 ${isSelected && !isAnswered ? 'text-[var(--color-notion-accent)]' : 'text-[var(--color-notion-text-secondary)]'}`}>
                   {choice.id}.
                 </span>
                 <MarkdownRenderer content={choice.text} className="text-sm flex-1" />
                 {!isAnswered && (
-                  <kbd className="text-[10px] text-[var(--color-notion-text-secondary)] opacity-40 flex-shrink-0 mt-1 hidden sm:inline">
+                  <kbd className="text-[10px] text-[var(--color-notion-text-secondary)] opacity-30 flex-shrink-0 mt-1 hidden sm:inline font-mono">
                     {choiceIdx + 1}
                   </kbd>
                 )}
@@ -190,12 +192,12 @@ export function QuizPanel({
             <button
               onClick={handleSubmit}
               disabled={!selectedAnswer}
-              className="px-4 py-2 bg-[var(--color-notion-accent)] text-white rounded text-sm font-medium hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed transition-opacity"
+              className="px-5 py-2.5 bg-[var(--color-notion-accent)] text-white rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-200"
             >
               提交答案
             </button>
-            <span className="text-[10px] text-[var(--color-notion-text-secondary)] opacity-50 hidden sm:inline">
-              按 Enter 提交
+            <span className="text-[10px] text-[var(--color-notion-text-secondary)] opacity-40 hidden sm:inline">
+              Enter ↵
             </span>
           </div>
         )}
@@ -203,21 +205,21 @@ export function QuizPanel({
         {/* Explanation */}
         {isAnswered && (
           <div
-            className={`mt-4 p-3 sm:p-4 rounded border ${
+            className={`mt-4 p-3.5 sm:p-4 rounded-xl border animate-slide-up ${
               isCorrect
-                ? 'border-[var(--color-notion-correct)] bg-[var(--color-notion-correct-light)]'
-                : 'border-[var(--color-notion-error)] bg-[var(--color-notion-error-light)]'
+                ? 'border-[var(--color-notion-correct)]/40 bg-[var(--color-notion-correct-light)]'
+                : 'border-[var(--color-notion-error)]/40 bg-[var(--color-notion-error-light)]'
             }`}
           >
-            <div className="flex items-center gap-2 mb-2">
-              <span className={`text-sm font-medium flex items-center gap-1 ${isCorrect ? 'text-[var(--color-notion-correct)]' : 'text-[var(--color-notion-error)]'}`}>
-                {isCorrect ? <><CheckCircle className="w-4 h-4" /> 正确</> : <><XCircle className="w-4 h-4" /> 错误</>}
+            <div className="flex items-center gap-2 mb-2.5">
+              <span className={`text-sm font-semibold flex items-center gap-1.5 ${isCorrect ? 'text-[var(--color-notion-correct)]' : 'text-[var(--color-notion-error)]'}`}>
+                {isCorrect ? <><CheckCircle className="w-4 h-4" /> 回答正确</> : <><XCircle className="w-4 h-4" /> 回答错误</>}
               </span>
             </div>
             <MarkdownRenderer content={currentQuiz.explanation} className="text-sm" />
             {!isCorrect && (
-              <div className="mt-2 pt-2 border-t border-[var(--color-notion-border)] text-xs text-[var(--color-notion-text-secondary)]">
-                正确答案: <span className="font-medium text-[var(--color-notion-correct)]">{currentQuiz.correctAnswer}</span>
+              <div className="mt-2.5 pt-2 border-t border-[var(--color-notion-border)] text-xs text-[var(--color-notion-text-secondary)]">
+                正确答案: <span className="font-semibold text-[var(--color-notion-correct)]">{currentQuiz.correctAnswer}</span>
               </div>
             )}
           </div>
@@ -228,17 +230,17 @@ export function QuizPanel({
           <button
             onClick={handlePrev}
             disabled={currentIndex === 0}
-            className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)] disabled:opacity-30 transition-colors"
+            className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
           >
             <ChevronLeft className="w-4 h-4" /> 上一题
           </button>
-          <span className="text-xs text-[var(--color-notion-text-secondary)]">
+          <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono">
             {currentIndex + 1} / {quizzes.length}
           </span>
           <button
             onClick={handleNext}
             disabled={currentIndex === quizzes.length - 1}
-            className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)] disabled:opacity-30 transition-colors"
+            className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
           >
             下一题 <ChevronRight className="w-4 h-4" />
           </button>

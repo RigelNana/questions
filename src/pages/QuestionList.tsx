@@ -12,8 +12,10 @@ import {
   type QuestionType,
   type Difficulty,
 } from '../types';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 
 type StatusFilter = 'all' | 'completed' | 'incomplete' | 'bookmarked';
+const PAGE_SIZE = 15;
 
 export function QuestionList() {
   const { domain } = useParams<{ domain: string }>();
@@ -29,6 +31,7 @@ export function QuestionList() {
   const [difficultyFilter, setDifficultyFilter] = useState<Difficulty | 0>(0);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
 
   useEffect(() => {
     fetchRegistry();
@@ -39,6 +42,11 @@ export function QuestionList() {
       fetchPacksForDomain(domain as Domain);
     }
   }, [registry, domain, fetchPacksForDomain]);
+
+  // Reset page when filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [typeFilter, difficultyFilter, statusFilter, searchQuery, domain]);
 
   const allQuestions = getQuestionsForDomain(domain as Domain);
 
@@ -72,6 +80,12 @@ export function QuestionList() {
     return result;
   }, [allQuestions, typeFilter, difficultyFilter, statusFilter, searchQuery, progress, bookmarks]);
 
+  const totalPages = Math.max(1, Math.ceil(filteredQuestions.length / PAGE_SIZE));
+  const paginatedQuestions = filteredQuestions.slice(
+    (currentPage - 1) * PAGE_SIZE,
+    currentPage * PAGE_SIZE,
+  );
+
   if (!domain) return null;
   const domainKey = domain as Domain;
   const DomainIcon = DOMAIN_ICONS[domainKey];
@@ -87,41 +101,41 @@ export function QuestionList() {
   return (
     <div className="animate-fade-in">
       {/* Breadcrumb */}
-      <div className="text-sm text-[var(--color-notion-text-secondary)] mb-4 flex items-center">
-        <Link to="/" className="hover:text-[var(--color-notion-accent)] no-underline">
+      <div className="text-sm text-[var(--color-notion-text-secondary)] mb-5 flex items-center">
+        <Link to="/" className="hover:text-[var(--color-notion-accent)] no-underline transition-colors">
           首页
         </Link>
-        <span className="mx-2">/</span>
+        <span className="mx-2 opacity-40">/</span>
         <span className="text-[var(--color-notion-text)] inline-flex items-center gap-1.5">
           <DomainIcon className="w-4 h-4" /> {DOMAIN_LABELS[domainKey]}
         </span>
       </div>
 
-      <h1 className="text-xl font-bold text-[var(--color-notion-text)] mb-1 flex items-center gap-2">
-        <DomainIcon className="w-5 h-5" /> {DOMAIN_LABELS[domainKey]}
+      <h1 className="text-xl font-bold text-[var(--color-notion-text)] mb-1.5 flex items-center gap-2.5 tracking-tight">
+        <DomainIcon className="w-5 h-5 text-[var(--color-notion-accent)]" /> {DOMAIN_LABELS[domainKey]}
       </h1>
-      <p className="text-sm text-[var(--color-notion-text-secondary)] mb-6">
+      <p className="text-sm text-[var(--color-notion-text-secondary)] mb-7">
         共 {allQuestions.length} 题，已完成{' '}
         {allQuestions.filter((q) => progress[q.id]?.completedAt).length} 题
       </p>
 
       {/* Filters */}
-      <div className="flex flex-col sm:flex-row sm:flex-wrap gap-3 sm:gap-4 mb-6 p-3 sm:p-4 rounded-lg bg-[var(--color-notion-bg-secondary)] border border-[var(--color-notion-border)]">
+      <div className="flex flex-col sm:flex-row sm:flex-wrap gap-3 sm:gap-4 mb-7 p-4 rounded-xl bg-[var(--color-notion-bg-secondary)] border border-[var(--color-notion-border)]">
         {/* Search */}
         <input
           type="text"
           placeholder="搜索题目..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          className="w-full sm:flex-1 sm:min-w-[200px] px-3 py-2 text-sm rounded border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] focus:outline-none focus:border-[var(--color-notion-accent)]"
+          className="w-full sm:flex-1 sm:min-w-[200px] px-3.5 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] focus:outline-none focus:border-[var(--color-notion-accent)] focus:ring-2 focus:ring-[var(--color-notion-accent)]/10 transition-all"
         />
 
-        <div className="grid grid-cols-3 gap-2 sm:flex sm:gap-4">
+        <div className="grid grid-cols-3 gap-2 sm:flex sm:gap-3">
           {/* Type filter */}
           <select
             value={typeFilter}
             onChange={(e) => setTypeFilter(e.target.value as QuestionType | 'all')}
-            className="px-3 py-2 text-sm rounded border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] w-full sm:w-auto"
+            className="px-3 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] w-full sm:w-auto transition-colors hover:border-[var(--color-notion-accent)]"
           >
             <option value="all">全部类型</option>
             <optgroup label="八股题">
@@ -140,20 +154,20 @@ export function QuestionList() {
           <select
             value={difficultyFilter}
             onChange={(e) => setDifficultyFilter(Number(e.target.value) as Difficulty | 0)}
-            className="px-3 py-2 text-sm rounded border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] w-full sm:w-auto"
+            className="px-3 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] w-full sm:w-auto transition-colors hover:border-[var(--color-notion-accent)]"
           >
             <option value={0}>全部难度</option>
-            <option value={1}>* 基础</option>
-            <option value={2}>** 进阶</option>
-            <option value={3}>*** 高级</option>
-            <option value={4}>**** 专家</option>
+            <option value={1}>⭐ 基础</option>
+            <option value={2}>⭐⭐ 进阶</option>
+            <option value={3}>⭐⭐⭐ 高级</option>
+            <option value={4}>⭐⭐⭐⭐ 专家</option>
           </select>
 
           {/* Status filter */}
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
-            className="px-3 py-2 text-sm rounded border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] w-full sm:w-auto"
+            className="px-3 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] w-full sm:w-auto transition-colors hover:border-[var(--color-notion-accent)]"
           >
             <option value="all">全部状态</option>
             <option value="completed">已完成</option>
@@ -165,22 +179,72 @@ export function QuestionList() {
 
       {/* Question list */}
       {filteredQuestions.length === 0 ? (
-        <div className="py-12 text-center text-[var(--color-notion-text-secondary)]">
+        <div className="py-16 text-center text-[var(--color-notion-text-secondary)]">
           {allQuestions.length === 0
             ? '该域暂无题目，请添加题库 JSON 文件'
             : '没有匹配的题目'}
         </div>
       ) : (
-        <div className="border border-[var(--color-notion-border)] rounded-lg overflow-hidden animate-stagger">
-          {filteredQuestions.map((q) => (
-            <QuestionCard
-              key={q.id}
-              question={q}
-              isCompleted={!!progress[q.id]?.completedAt}
-              isBookmarked={bookmarks.includes(q.id)}
-            />
-          ))}
-        </div>
+        <>
+          <div className="border border-[var(--color-notion-border)] rounded-xl overflow-hidden animate-stagger">
+            {paginatedQuestions.map((q) => (
+              <QuestionCard
+                key={q.id}
+                question={q}
+                isCompleted={!!progress[q.id]?.completedAt}
+                isBookmarked={bookmarks.includes(q.id)}
+              />
+            ))}
+          </div>
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between mt-6 pt-4">
+              <span className="text-sm text-[var(--color-notion-text-secondary)]">
+                {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, filteredQuestions.length)} / {filteredQuestions.length}
+              </span>
+
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  disabled={currentPage === 1}
+                  className="p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] disabled:opacity-30 transition-all"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+
+                {Array.from({ length: totalPages }, (_, i) => i + 1)
+                  .filter((p) => p === 1 || p === totalPages || Math.abs(p - currentPage) <= 1)
+                  .map((page, i, arr) => {
+                    const showEllipsis = i > 0 && page - arr[i - 1] > 1;
+                    return (
+                      <span key={page} className="flex items-center">
+                        {showEllipsis && <span className="px-1 text-[var(--color-notion-text-secondary)]">…</span>}
+                        <button
+                          onClick={() => setCurrentPage(page)}
+                          className={`w-9 h-9 rounded-lg text-sm font-medium transition-all ${
+                            page === currentPage
+                              ? 'bg-[var(--color-notion-accent)] text-white'
+                              : 'hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)]'
+                          }`}
+                        >
+                          {page}
+                        </button>
+                      </span>
+                    );
+                  })}
+
+                <button
+                  onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={currentPage === totalPages}
+                  className="p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] disabled:opacity-30 transition-all"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

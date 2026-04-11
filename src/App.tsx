@@ -12,10 +12,13 @@ const Settings = lazy(() => import('./pages/Settings').then((m) => ({ default: m
 
 function PageLoader() {
   return (
-    <div className="flex items-center justify-center py-20">
-      <div className="flex items-center gap-3 text-[var(--color-notion-text-secondary)]">
-        <div className="w-4 h-4 border-2 border-[var(--color-notion-accent)] border-t-transparent rounded-full animate-spin" />
-        <span className="text-sm">加载中...</span>
+    <div className="animate-fade-in py-8 space-y-6">
+      <div className="skeleton h-7 w-48 rounded-lg" />
+      <div className="skeleton h-4 w-72 rounded-md" />
+      <div className="space-y-3 pt-2">
+        <div className="skeleton h-20 rounded-xl" />
+        <div className="skeleton h-20 rounded-xl" />
+        <div className="skeleton h-20 rounded-xl" />
       </div>
     </div>
   );

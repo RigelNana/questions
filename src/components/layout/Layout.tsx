@@ -43,7 +43,7 @@ export function Layout() {
   }, []);
 
   return (
-    <div className="flex h-screen overflow-hidden">
+    <div className="flex h-screen overflow-hidden bg-[var(--color-notion-bg)]">
       <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
       <div className="flex-1 flex flex-col overflow-hidden">
@@ -53,7 +53,7 @@ export function Layout() {
         />
 
         <main className="flex-1 overflow-y-auto">
-          <div className="max-w-6xl mx-auto px-4 py-5 sm:px-6 sm:py-8 pb-20 lg:pb-8 safe-bottom">
+          <div className="max-w-5xl mx-auto px-5 py-6 sm:px-8 sm:py-10 pb-24 lg:pb-10 safe-bottom">
             <Outlet />
           </div>
         </main>

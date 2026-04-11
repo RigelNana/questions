@@ -10,18 +10,18 @@ export function BottomNav() {
   ];
 
   return (
-    <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-[var(--color-notion-bg)] border-t border-[var(--color-notion-border)] safe-bottom">
-      <div className="flex items-center justify-around h-14">
+    <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-40 glass-surface border-t border-[var(--color-notion-border)] safe-bottom">
+      <div className="flex items-center justify-around h-16">
         {items.map(({ to, icon: Icon, label, end }) => (
           <NavLink
             key={to}
             to={to}
             end={end}
             className={({ isActive }) =>
-              `flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-lg no-underline transition-colors ${
+              `flex flex-col items-center gap-1 px-4 py-2 rounded-xl no-underline transition-all duration-200 ${
                 isActive
-                  ? 'text-[var(--color-notion-accent)]'
-                  : 'text-[var(--color-notion-text-secondary)]'
+                  ? 'text-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)]'
+                  : 'text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
               }`
             }
           >
