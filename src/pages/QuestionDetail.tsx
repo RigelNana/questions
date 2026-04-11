@@ -7,7 +7,9 @@ import { DifficultyBadge } from '../components/filter/DifficultyBadge';
 import { TypeBadge } from '../components/filter/TypeBadge';
 import { QuizPanel } from '../components/question/QuizPanel';
 import { DOMAIN_LABELS, DOMAIN_ICONS, type Domain, type QuizAttempt } from '../types';
-import { Lightbulb, Star, ChevronUp, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Lightbulb, Star, ChevronUp, ChevronLeft, ChevronRight, BookOpen, ClipboardCheck } from 'lucide-react';
+
+type DetailTab = 'content' | 'quiz';
 
 export function QuestionDetail() {
   const { domain, questionId } = useParams<{ domain: string; questionId: string }>();
@@ -29,6 +31,7 @@ export function QuestionDetail() {
   } = useProgressStore();
 
   const [showAnswer, setShowAnswer] = useState(false);
+  const [activeTab, setActiveTab] = useState<DetailTab>('content');
 
   useEffect(() => {
     fetchRegistry();
@@ -45,6 +48,12 @@ export function QuestionDetail() {
       setLastVisited(domain, questionId);
     }
   }, [domain, questionId, setLastVisited]);
+
+  // Reset tab on question change
+  useEffect(() => {
+    setActiveTab('content');
+    setShowAnswer(false);
+  }, [questionId]);
 
   const domainKey = domain as Domain;
   const question = questionId ? getQuestionById(questionId) : undefined;
@@ -70,7 +79,6 @@ export function QuestionDetail() {
     const newIndex = currentIndex + direction;
     if (newIndex >= 0 && newIndex < allQuestions.length) {
       navigate(`/domains/${domain}/${allQuestions[newIndex].id}`);
-      setShowAnswer(false);
     }
   };
 
@@ -111,6 +119,7 @@ export function QuestionDetail() {
   }
 
   const DomainIcon = DOMAIN_ICONS[domainKey];
+  const hasQuiz = question.quiz.length > 0;
 
   return (
     <div className="animate-fade-in">
@@ -144,10 +153,35 @@ export function QuestionDetail() {
         {question.title}
       </h1>
 
-      {/* Two-column layout: content left, quiz right on xl+ */}
-      <div className="flex flex-col xl:flex-row xl:gap-8">
-        {/* Left column: question content + answer */}
-        <div className="flex-1 min-w-0 xl:max-w-[58%]">
+      {/* Tab bar */}
+      {hasQuiz && (
+        <div className="flex items-center gap-1 mb-6 border-b border-[var(--color-notion-border)]">
+          <button
+            onClick={() => setActiveTab('content')}
+            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-all duration-200 -mb-px ${
+              activeTab === 'content'
+                ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
+                : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
+            }`}
+          >
+            <BookOpen className="w-4 h-4" /> 题目内容
+          </button>
+          <button
+            onClick={() => setActiveTab('quiz')}
+            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-all duration-200 -mb-px ${
+              activeTab === 'quiz'
+                ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
+                : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
+            }`}
+          >
+            <ClipboardCheck className="w-4 h-4" /> 选择题 ({question.quiz.length})
+          </button>
+        </div>
+      )}
+
+      {/* Tab: Content */}
+      {activeTab === 'content' && (
+        <div className="animate-fade-in">
           {/* Content */}
           <div className="p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] mb-5">
             <MarkdownRenderer content={question.content} />
@@ -172,6 +206,14 @@ export function QuestionDetail() {
               <Star className={`w-4 h-4 ${bookmarked ? 'fill-current' : ''}`} />
               {bookmarked ? '已收藏' : '收藏'}
             </button>
+            {hasQuiz && (
+              <button
+                onClick={() => setActiveTab('quiz')}
+                className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] transition-all duration-200 text-[var(--color-notion-text)]"
+              >
+                <ClipboardCheck className="w-4 h-4" /> 开始做题
+              </button>
+            )}
           </div>
 
           {/* Answer */}
@@ -211,23 +253,21 @@ export function QuestionDetail() {
             </div>
           )}
         </div>
+      )}
 
-        {/* Right column: Quiz panel (sticky on xl+) */}
-        {question.quiz.length > 0 && (
-          <div className="xl:w-[42%] xl:flex-shrink-0 mb-5">
-            <div className="xl:sticky xl:top-16">
-              <QuizPanel
-                quizzes={question.quiz}
-                existingAttempts={progress?.quizAttempts ?? []}
-                onAttempt={handleQuizAttempt}
-              />
-            </div>
-          </div>
-        )}
-      </div>
+      {/* Tab: Quiz */}
+      {activeTab === 'quiz' && hasQuiz && (
+        <div className="animate-fade-in">
+          <QuizPanel
+            quizzes={question.quiz}
+            existingAttempts={progress?.quizAttempts ?? []}
+            onAttempt={handleQuizAttempt}
+          />
+        </div>
+      )}
 
-      {/* Navigation */}
-      <div className="flex items-center justify-between pt-5 mt-2 border-t border-[var(--color-notion-border)]">
+      {/* Navigation — with generous bottom margin */}
+      <div className="flex items-center justify-between pt-5 mt-6 mb-8 border-t border-[var(--color-notion-border)]">
         <button
           onClick={() => handleNav(-1)}
           disabled={currentIndex <= 0}

@@ -199,7 +199,7 @@ export function QuestionList() {
 
           {/* Pagination */}
           {totalPages > 1 && (
-            <div className="flex items-center justify-between mt-6 pt-4">
+            <div className="flex items-center justify-between mt-6 pt-4 mb-8">
               <span className="text-sm text-[var(--color-notion-text-secondary)]">
                 {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, filteredQuestions.length)} / {filteredQuestions.length}
               </span>
