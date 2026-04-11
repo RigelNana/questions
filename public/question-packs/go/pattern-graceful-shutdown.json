@@ -1,0 +1,154 @@
+{
+  "id": "go-pattern-graceful-shutdown",
+  "name": "优雅退出模式：信号处理、资源清理与超时控制",
+  "domain": "go",
+  "description": "Go 服务优雅退出的完整模式：信号捕获、多组件协调关闭、超时兜底与 K8s 适配",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "go-pattern-graceful-shutdown",
+      "domain": "go",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": ["graceful-shutdown", "signal", "context", "生产环境", "K8s"],
+      "title": "优雅退出模式：信号处理、资源清理与超时控制",
+      "content": "你的 Go 服务有多个需要清理的组件：HTTP server、gRPC server、Kafka consumer、数据库连接池、Redis 连接池。部署在 K8s 上，terminationGracePeriodSeconds=30。\n\n当前的关闭代码：\n\n```go\nfunc main() {\n    // ... 初始化各组件 ...\n    \n    c := make(chan os.Signal, 1)\n    signal.Notify(c, os.Interrupt)\n    <-c\n    \n    httpSrv.Shutdown(context.Background()) // 没有超时\n    grpcSrv.GracefulStop()                  // 没有超时\n    kafkaConsumer.Close()                   // 阻塞直到完成\n    db.Close()\n    redis.Close()\n    log.Println(\"bye\")\n}\n```\n\n这段代码有什么问题？如何改写成生产级的优雅退出？要考虑：关闭顺序、超时控制、并行 vs 串行关闭、K8s SIGTERM 处理。",
+      "answer": "这段代码有好几个问题，在生产环境中随时可能导致部署失败或数据丢失。让我逐一分析。\n\n**问题 1：只监听了 os.Interrupt（Ctrl+C），没监听 SIGTERM**。K8s 发送的是 SIGTERM 不是 SIGINT。`os.Interrupt` 在 Unix 上是 SIGINT（Ctrl+C），在 K8s 滚动更新时 kubelet 发送 SIGTERM——你的代码完全收不到，30 秒后被 SIGKILL 强杀。\n\n**问题 2：没有超时控制**。`httpSrv.Shutdown(context.Background())` 传了一个永不超时的 context——如果有一个客户端建立了连接但一直不发送数据（或者 handler 有 bug 卡住），Shutdown 会永远等下去。K8s 只给 30 秒，超时后直接 SIGKILL。\n\n**问题 3：关闭顺序不对**。Kafka consumer 可能还在消费消息并调用 HTTP/gRPC 接口或写数据库。如果先关了 HTTP server 和数据库，Kafka consumer 的处理函数会报错——可能导致消息处理失败需要重试。正确的顺序是：先停止消息入口（Kafka consumer），再停止请求入口（HTTP/gRPC），最后关闭底层依赖（DB/Redis）。\n\n**问题 4：串行关闭太慢**。HTTP server shutdown 等 10 秒 + gRPC graceful stop 等 10 秒 + Kafka close 等 5 秒 = 25 秒。如果每个都用到了超时上限，总时间可能超过 K8s 的 30 秒。HTTP 和 gRPC 的关闭可以并行。\n\n**生产级优雅退出方案**：\n\n```go\nfunc main() {\n    // ... 初始化 ...\n    \n    // 用 signal.NotifyContext 更简洁（Go 1.16+）\n    ctx, stop := signal.NotifyContext(context.Background(), \n        syscall.SIGINT, syscall.SIGTERM)\n    defer stop()\n    \n    // 启动各 server（省略）\n    \n    // 阻塞等待信号\n    <-ctx.Done()\n    log.Println(\"shutdown signal received\")\n    \n    // 总超时（留 5 秒余量给 K8s）\n    shutdownCtx, cancel := context.WithTimeout(\n        context.Background(), 25*time.Second)\n    defer cancel()\n    \n    // 阶段 1：停止消息消费（先断入口）\n    log.Println(\"phase 1: stopping consumers\")\n    kafkaConsumer.Close() // 停止拉取新消息，等待当前消息处理完\n    \n    // 阶段 2：停止请求入口（并行关闭 HTTP 和 gRPC）\n    log.Println(\"phase 2: stopping servers\")\n    var wg sync.WaitGroup\n    \n    wg.Add(1)\n    go func() {\n        defer wg.Done()\n        if err := httpSrv.Shutdown(shutdownCtx); err != nil {\n            log.Printf(\"http shutdown: %v\", err)\n        }\n    }()\n    \n    wg.Add(1)\n    go func() {\n        defer wg.Done()\n        // GracefulStop 没有 context 参数，用 goroutine + timer 实现超时\n        done := make(chan struct{})\n        go func() {\n            grpcSrv.GracefulStop()\n            close(done)\n        }()\n        select {\n        case <-done:\n        case <-shutdownCtx.Done():\n            grpcSrv.Stop() // 超时强制关闭\n        }\n    }()\n    \n    wg.Wait()\n    \n    // 阶段 3：关闭底层依赖\n    log.Println(\"phase 3: closing dependencies\")\n    db.Close()\n    redis.Close()\n    \n    log.Println(\"shutdown complete\")\n}\n```\n\n**关闭顺序的原则**：自顶向下——先关闭流量入口（不再接受新请求/消息），再等待正在处理的请求完成，最后关闭底层资源。具体来说：\n\n```\n阶段 1: 消息消费者（Kafka/RabbitMQ）  → 停止拉取新消息，处理完当前消息\n阶段 2: 请求入口（HTTP/gRPC server）   → 停止接受新连接，等待活跃请求完成\n阶段 3: 底层依赖（DB/Redis/远程调用）  → 关闭连接池、刷新缓冲区\n```\n\n如果顺序反了——先关 DB 再关 HTTP server——正在处理的 HTTP 请求写数据库会报错，可能导致事务不一致。\n\n**signal.NotifyContext vs signal.Notify**。Go 1.16+ 的 `signal.NotifyContext` 返回一个在收到信号时自动 cancel 的 context，代码更简洁。它等价于 signal.Notify + channel + 手动 cancel。但注意不要直接用这个 ctx 作为 shutdown context——因为 Shutdown 需要一个有限超时的 context，而 signal context 在收到信号时立即 cancel 了。\n\n**K8s 的配合**。terminationGracePeriodSeconds=30 意味着 kubelet 发送 SIGTERM 后等 30 秒，如果 Pod 还没退出就发 SIGKILL。所以你的关闭逻辑必须在 30 秒内完成——包括 preStop hook 的时间。如果 preStop sleep 5 秒，你的代码只有 25 秒来关闭。上面的代码把总超时设为 25 秒就是这个原因。\n\n还有一个细节：健康检查。当开始关闭时，readiness probe 应该开始返回不健康，让 K8s 不再路由新流量到这个 Pod。你可以用一个 atomic 变量：\n\n```go\nvar isShuttingDown atomic.Bool\n\n// 收到信号后\nisShuttingDown.Store(true)\n\n// readiness handler\nfunc healthHandler(w http.ResponseWriter, r *http.Request) {\n    if isShuttingDown.Load() {\n        w.WriteHeader(http.StatusServiceUnavailable)\n        return\n    }\n    w.WriteHeader(http.StatusOK)\n}\n```",
+      "keyPoints": [
+        "K8s 发送 SIGTERM 不是 SIGINT——必须同时监听 syscall.SIGTERM",
+        "关闭顺序自顶向下：消息消费者 → HTTP/gRPC server → DB/Redis 等底层依赖",
+        "每个关闭操作都必须有超时控制，总超时要小于 K8s terminationGracePeriodSeconds",
+        "独立组件（HTTP/gRPC）可以并行关闭，用 sync.WaitGroup 等待全部完成",
+        "signal.NotifyContext（Go 1.16+）比 signal.Notify + channel 更简洁",
+        "gRPC GracefulStop 没有 context 参数，需要用 goroutine+select 手动实现超时兜底",
+        "配合 readiness probe 返回不健康，让 K8s 停止路由新流量到正在关闭的 Pod"
+      ],
+      "quiz": [
+        {
+          "id": "go-graceful-q1",
+          "question": "K8s 在滚动更新时向 Pod 发送什么信号？",
+          "choices": [
+            {"id": "A", "text": "SIGTERM"},
+            {"id": "B", "text": "SIGINT"},
+            {"id": "C", "text": "SIGKILL"},
+            {"id": "D", "text": "SIGHUP"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：K8s 的 Pod 终止流程是 SIGTERM → 等待 terminationGracePeriodSeconds（默认 30s）→ SIGKILL。SIGTERM 是可以被捕获和处理的——你的程序应该在收到 SIGTERM 后开始优雅关闭。SIGKILL 不可捕获——这是最后手段。很多 Go 程序只监听了 os.Interrupt（SIGINT），导致在 K8s 中收不到 SIGTERM，只能被 SIGKILL 强杀。"
+        },
+        {
+          "id": "go-graceful-q2",
+          "question": "以下哪个是正确的组件关闭顺序？",
+          "choices": [
+            {"id": "A", "text": "Kafka consumer → HTTP/gRPC server → 数据库连接池 → Redis"},
+            {"id": "B", "text": "数据库 → Redis → HTTP server → Kafka consumer"},
+            {"id": "C", "text": "所有组件同时并行关闭"},
+            {"id": "D", "text": "随机顺序关闭"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：自顶向下关闭——先断流量入口，再关底层依赖。先关 Kafka consumer 防止新消息进入，再关 HTTP/gRPC server 等待已有请求完成（这些请求可能需要访问 DB/Redis），最后关 DB/Redis。如果先关 DB，正在处理的请求写库会失败。C 部分可行但需要确保不存在依赖关系——实际上 server handler 依赖 DB 所以不能并行关。"
+        },
+        {
+          "id": "go-graceful-q3",
+          "question": "为什么优雅退出的总超时要小于 K8s terminationGracePeriodSeconds？",
+          "choices": [
+            {"id": "A", "text": "超过 terminationGracePeriodSeconds 后 K8s 发 SIGKILL 强杀 Pod，程序没有机会执行清理逻辑"},
+            {"id": "B", "text": "K8s 会回滚部署"},
+            {"id": "C", "text": "Pod 会被标记为 OOM"},
+            {"id": "D", "text": "没有必要，可以设无限超时"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：SIGKILL 不可捕获——进程被立即终止，defer 不执行、文件不 flush、连接不关闭。如果 terminationGracePeriodSeconds=30 而你的关闭代码需要 35 秒，最后 5 秒的清理逻辑不会执行。所以应该设总超时 = terminationGracePeriodSeconds - preStop时间 - 安全余量（通常 25 秒）。"
+        },
+        {
+          "id": "go-graceful-q4",
+          "question": "signal.NotifyContext 和 signal.Notify 有什么区别？",
+          "choices": [
+            {"id": "A", "text": "NotifyContext 返回一个收到信号时自动 cancel 的 context，不需要手动管理 channel"},
+            {"id": "B", "text": "NotifyContext 只能在 main 中使用"},
+            {"id": "C", "text": "NotifyContext 不支持 SIGTERM"},
+            {"id": "D", "text": "两者完全相同"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：signal.NotifyContext 是 Go 1.16 加入的便利函数。它内部创建 channel + 启动 goroutine 监听信号 + 收到信号时 cancel context。代码从 4 行变成 1 行。返回的 stop 函数用于清理——类似 signal.Stop，放在 defer 里确保资源释放。可以在任何地方使用，不限于 main。"
+        },
+        {
+          "id": "go-graceful-q5",
+          "question": "gRPC server 的 GracefulStop() 有什么特点需要注意？",
+          "choices": [
+            {"id": "A", "text": "没有 context/timeout 参数——如果有连接一直不关闭它会永远阻塞，需要手动实现超时兜底"},
+            {"id": "B", "text": "它立即断开所有连接"},
+            {"id": "C", "text": "它只停止 unary RPC，不停止 streaming"},
+            {"id": "D", "text": "它需要在另一个 goroutine 中调用"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：GracefulStop() 阻塞直到所有活跃 RPC 完成——没有超时机制。如果有客户端打开了 streaming RPC 一直不关闭，GracefulStop 永远不会返回。解决方案是在 goroutine 中调用 GracefulStop，同时用 select 监听超时 context，超时后调用 Stop()（强制关闭）。"
+        },
+        {
+          "id": "go-graceful-q6",
+          "question": "以下代码有什么问题？\n\n```go\nctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM)\ndefer stop()\n<-ctx.Done()\nhttpSrv.Shutdown(ctx) // 用同一个 ctx\n```",
+          "choices": [
+            {"id": "A", "text": "ctx 已经因为信号被 cancel 了，Shutdown 立即返回不会等待活跃请求完成"},
+            {"id": "B", "text": "stop() 不应该 defer"},
+            {"id": "C", "text": "SIGTERM 不会触发 ctx cancel"},
+            {"id": "D", "text": "代码完全正确"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：signal context 在收到 SIGTERM 时被 cancel——此时 ctx.Err() == context.Canceled。把这个已 cancel 的 ctx 传给 Shutdown，Shutdown 检查到 ctx.Done() 已关闭，立即返回 context.Canceled 而不等待活跃请求。正确做法是用 context.Background() 创建新的带超时 context 传给 Shutdown。"
+        },
+        {
+          "id": "go-graceful-q7",
+          "question": "收到关闭信号后，readiness probe 应该如何响应？",
+          "choices": [
+            {"id": "A", "text": "返回 503 Service Unavailable，让 K8s 停止路由新流量到这个 Pod"},
+            {"id": "B", "text": "继续返回 200 OK"},
+            {"id": "C", "text": "直接关闭 health check 端点"},
+            {"id": "D", "text": "返回 301 重定向到其他 Pod"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：readiness probe 返回不健康后，K8s 将 Pod 从 Service endpoints 中移除，kube-proxy 更新 iptables 停止路由新流量。这配合 preStop sleep 确保了流量平滑切换。C 虽然也能让 probe 失败，但不够优雅——返回明确的 503 更清晰。注意 liveness probe 不应该因为关闭中返回不健康——否则 K8s 会认为 Pod 挂了并重启它。"
+        },
+        {
+          "id": "go-graceful-q8",
+          "question": "make(chan os.Signal, 1) 中 buffer size 为什么设为 1？",
+          "choices": [
+            {"id": "A", "text": "signal.Notify 不会阻塞发送——如果 channel 满了信号会被丢弃，buffer=1 确保至少能接收一个信号"},
+            {"id": "B", "text": "只需要接收一个信号就够了"},
+            {"id": "C", "text": "无缓冲 channel 也可以"},
+            {"id": "D", "text": "随便设的，没有特殊原因"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：signal.Notify 文档明确说明：package signal will not block sending to c。如果 channel 没有 buffer 且没有 goroutine 在接收，信号会被丢弃。buffer=1 确保在你的代码 ready 之前到来的信号不会丢失。如果用无缓冲 channel，在 goroutine 还没执行到 <-c 时收到的信号就丢了。这是 Go 信号处理的标准实践。"
+        },
+        {
+          "id": "go-graceful-q9",
+          "question": "如果 Kafka consumer 的 Close() 方法卡住了怎么办？",
+          "choices": [
+            {"id": "A", "text": "用 goroutine + context 超时包装：在 goroutine 中调用 Close()，select 等待完成或超时"},
+            {"id": "B", "text": "直接 os.Exit(1)"},
+            {"id": "C", "text": "发送 SIGKILL 给自己"},
+            {"id": "D", "text": "忽略它，让 K8s SIGKILL"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：和 gRPC GracefulStop 一样，任何没有 timeout 参数的 Close 方法都应该用 goroutine + select 模式包装超时。如果超时了，记录日志并继续下一阶段的关闭——不要因为一个组件卡住就整体超时被 SIGKILL。B/C 太激进。D 虽然可行（最终 SIGKILL 会清理一切），但不优雅——DB 连接、Redis 连接可能没有正确归还。"
+        },
+        {
+          "id": "go-graceful-q10",
+          "question": "在 K8s 中，preStop hook 的 sleep 时间应该设为多少？",
+          "choices": [
+            {"id": "A", "text": "3-5 秒——足够 kube-proxy 更新 iptables 规则，同时不要浪费太多 grace period"},
+            {"id": "B", "text": "0 秒——不需要等待"},
+            {"id": "C", "text": "和 terminationGracePeriodSeconds 一样长"},
+            {"id": "D", "text": "60 秒"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：kube-proxy 监听 Endpoints 变化并更新 iptables 通常需要 1-5 秒（取决于集群规模和 kube-proxy 模式）。preStop sleep 3-5 秒足以覆盖大多数场景。B 错误：不 sleep 的话新请求可能路由到已开始关闭的 Pod。C 错误：sleep 整个 grace period 就没有时间做实际的关闭了。D 太长，如果 terminationGracePeriodSeconds=30 只剩下 -30 秒关闭。"
+        }
+      ],
+      "references": [
+        "https://pkg.go.dev/os/signal#NotifyContext",
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination"
+      ]
+    }
+  ]
+}
