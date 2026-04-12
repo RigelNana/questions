@@ -1,0 +1,155 @@
+{
+  "id": "go-slice-concurrent-access",
+  "name": "多 goroutine 并发读写 slice 的问题",
+  "domain": "go",
+  "description": "slice并发读写的data race问题、-race检测、mutex/channel保护方案、无锁分片方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "go-slice-concurrent-access",
+      "domain": "go",
+      "type": "modification",
+      "difficulty": 3,
+      "tags": ["slice", "并发", "data race", "mutex", "atomic"],
+      "title": "多个 goroutine 同时读写同一个 slice 会怎样",
+      "content": "## 场景\n\n你们团队正在开发一个日志采集服务，需要从多个数据源并发收集指标数据，最终汇总到一个 slice 中做批量写入。一位同事写了这样一段代码：\n\n```go\npackage main\n\nimport (\n    \"fmt\"\n    \"sync\"\n)\n\nfunc main() {\n    var data []int\n    var wg sync.WaitGroup\n\n    for i := 0; i < 1000; i++ {\n        wg.Add(1)\n        go func(n int) {\n            defer wg.Done()\n            data = append(data, n)\n        }(i)\n    }\n\n    wg.Wait()\n    fmt.Println(\"collected:\", len(data))\n}\n```\n\n他跑了几次，发现每次输出的 `len(data)` 结果都不一样——有时候 900 多，有时候 700 多，偶尔还 panic 了。他加上 `-race` 参数重新编译后，控制台瞬间刷出了一大片类似这样的警告：\n\n```\n==================\nWARNING: DATA RACE\nRead at 0x00c0000a4018 by goroutine 7:\n  main.main.func1()\n      /tmp/main.go:15 +0x7e\n\nPrevious write at 0x00c0000a4018 by goroutine 6:\n  main.main.func1()\n      /tmp/main.go:15 +0x96\n\nGoroutine 7 (running) created at:\n  main.main()\n      /tmp/main.go:13 +0x6e\n\nGoroutine 6 (running) created at:\n  main.main()\n      /tmp/main.go:13 +0x6e\n==================\nFound 58 data race(s)\n```\n\n他来找你，想知道这段代码到底出了什么问题，以及应该怎么修才能保证并发安全。\n\n### 问题\n\n请解释多个 goroutine 同时对同一个 slice 执行 append 操作时会发生什么。这里的 data race 具体指的是哪些内存操作在竞争？有哪些方案可以修复这个问题，它们在不同场景下各有什么优劣？",
+      "answer": "要理解这个问题的本质，我们得从 slice 在 runtime 层面的内存布局说起，然后再来分析并发 append 到底破坏了什么，最后系统地讨论几种修复方案和它们在工程中的取舍。\n\n## slice 的内部结构与 append 的非原子性\n\nGo 的 slice 在运行时对应一个叫做 SliceHeader 的三元组结构，包含三个字段：一个指向底层数组的指针（Data）、当前长度（Len）和容量（Cap）。当你写 `data = append(data, n)` 的时候，runtime 实际上做了好几件事情：首先读取 data 的 Len 和 Cap，判断容量是否足够；如果够，就把新元素写入底层数组的第 Len 个位置，然后把 Len 加一；如果不够，就分配一个更大的数组，把旧数据复制过去，再更新 Data 指针和 Cap 值。整个过程涉及多次内存读写操作，而这些操作之间没有任何原子性保证。\n\n这就是问题的核心所在。当两个 goroutine 同时执行 append 时，它们可能在同一个瞬间读到了相同的 Len 值——假设都读到了 42。于是它们都认为应该往索引 42 的位置写入数据，然后都把 Len 更新为 43。结果就是两个值被写到了同一个位置，其中一个被覆盖丢失了，而 Len 只增加了 1 而不是 2。这就解释了为什么最终 `len(data)` 总是比预期的 1000 少。\n\n但数据丢失只是最轻微的后果。更危险的情况发生在需要扩容的时刻。假设 goroutine A 读到了旧的 Data 指针和 Cap 值，判断需要扩容，于是分配了新数组并开始复制数据。与此同时 goroutine B 还拿着旧的 Data 指针往旧数组里写数据。当 A 完成扩容把 data 的 Data 指针更新为新数组地址后，B 写入旧数组的那些数据就彻底丢了——旧数组很快会被 GC 回收。更极端的情况下，如果两个 goroutine 同时触发扩容，它们会各自分配一个新数组，各自往自己的新数组里复制数据然后更新 Data 指针，最终只有最后一个写入的指针会留下来，另一个分配的数组连同它复制的数据全部作废。这就是程序偶尔 panic 的原因——在极端的竞态条件下，SliceHeader 的三个字段可能处于一种不一致的状态，比如 Data 已经指向了新数组但 Len 还是旧值，或者 Len 已经更新了但 Cap 还是旧值。runtime 在访问这种不一致的 SliceHeader 时就可能越界访问内存，触发 panic 甚至更隐蔽的内存损坏。\n\n值得特别强调的是，Go 语言内存模型明确规定：对同一变量的并发读写如果没有同步机制，就构成 data race，其结果是未定义行为（undefined behavior）。这不是“最多丢几条数据”这么简单的事情——编译器和 CPU 都有权在未定义行为的基础上做任何优化假设，理论上可能导致完全无法预料的结果。所以并发写 slice 不是一个“性能不好”的问题，而是一个正确性问题，必须修复。\n\n## 方案一：sync.Mutex 加锁保护\n\n最直接的修复方式是用互斥锁把 append 操作包起来：\n\n```go\nvar mu sync.Mutex\nvar data []int\n\nfor i := 0; i < 1000; i++ {\n    wg.Add(1)\n    go func(n int) {\n        defer wg.Done()\n        mu.Lock()\n        data = append(data, n)\n        mu.Unlock()\n    }(i)\n}\n```\n\n这个方案的语义非常清晰：同一时刻只有一个 goroutine 能执行 append，完全消除了竞态。对于大多数业务场景来说，mutex 方案已经足够好了。它的额外开销主要来自两部分——锁本身的 CAS 操作（在无竞争时大约几十纳秒）以及竞争时的 goroutine 调度开销。在你的场景中，如果每次 append 只是写入一个 int，锁的持有时间极短，实际上竞争并不会特别激烈。但如果你要在锁内做更重的操作，比如序列化一个大结构体然后 append，锁竞争就会成为瓶颈，goroutine 大量排队等待会拖慢整体吞吐。\n\n如果读操作远多于写操作的场景，还可以考虑 `sync.RWMutex`，它允许多个 goroutine 同时持有读锁，只在写操作时互斥。不过对于 append 这种纯写操作的场景，RWMutex 并没有优势。\n\n## 方案二：channel 收集模式\n\n另一种非常 Go 风格的做法是用 channel 来收集数据，让一个专门的 goroutine 负责汇总：\n\n```go\nch := make(chan int, 1000)\n\nfor i := 0; i < 1000; i++ {\n    wg.Add(1)\n    go func(n int) {\n        defer wg.Done()\n        ch <- n\n    }(i)\n}\n\ngo func() {\n    wg.Wait()\n    close(ch)\n}()\n\nvar data []int\nfor v := range ch {\n    data = append(data, v)\n}\n```\n\n这个方案的核心思路是“不要通过共享内存来通信，要通过通信来共享内存”——这正是 Go 并发哲学的精髓。所有写 slice 的操作都集中在了消费端的单个 goroutine 中，天然不存在竞态。channel 方案的好处在于它把数据流的方向和所有权表达得非常清晰：生产者只管往 channel 里发数据，消费者独占 slice 的写权限。在代码可读性和可维护性上，这种模式往往比 mutex 更胜一筹，尤其是在数据处理流水线（pipeline）的场景中。\n\n不过 channel 也不是没有代价。每次发送和接收都涉及 runtime 层面的锁操作和 goroutine 调度（是的，channel 内部也有锁），在极高吞吐量场景下，channel 的性能通常比 mutex 方案略差。此外，如果你选择无缓冲 channel，生产者和消费者必须严格同步，反而可能降低并发度；带缓冲 channel 则需要你合理估算缓冲区大小——设太小会导致生产者阻塞，设太大会浪费内存。\n\n## 方案三：预分片无锁方案\n\n如果你追求极致性能，可以考虑一种从根源上消除共享的方案——预先分配好 slice 的空间，让每个 goroutine 写入自己独占的索引位置：\n\n```go\ndata := make([]int, 1000)\n\nfor i := 0; i < 1000; i++ {\n    wg.Add(1)\n    go func(n int) {\n        defer wg.Done()\n        data[n] = n * n  // 每个 goroutine 写不同的索引\n    }(i)\n}\n```\n\n这段代码是完全合法且安全的。虽然多个 goroutine 在操作同一个 slice，但它们访问的是底层数组中不同的内存地址——这就和多个 goroutine 同时读写不同的变量一样安全。Go 的 race detector 也不会报警，因为不存在对同一内存位置的并发访问。这个方案的前提是你必须提前知道数据的数量，并且能为每个 goroutine 分配一个唯一的索引。在日志采集的场景中，如果数据源的数量是固定的，就可以用这个模式。它的优势是零锁开销，CPU 缓存友好（尤其当每个 goroutine 操作的内存区域在不同 cache line 上时）。\n\n预分片还有一种变体：为每个 goroutine 创建独立的局部 slice，最后在单线程中合并。这样每个 goroutine 内部对自己的 slice 做 append 是完全安全的，不需要任何同步机制。最后的合并操作虽然是单线程的，但通常很快——只是一次性的内存拷贝。这种方式特别适合 map-reduce 模式的数据处理。\n\n## 性能对比与工程选择\n\n在实际项目中该选哪个方案？这取决于你的具体场景。如果并发度不高（几十个 goroutine）且每次操作很轻量，mutex 是最简单直接的选择，写起来快，不容易出错，性能也完全够用。如果你的系统本身就是流式数据处理的架构，channel 方案和整体设计更契合，代码也更 Go 风格。如果你面对的是计算密集型的高并发场景，比如同时有上万个 goroutine 在产生数据，预分片方案的性能优势就很明显了。\n\n一个粗略的性能参考：在一台普通的 8 核服务器上用 benchmark 测试 10000 个 goroutine 各写入一个 int 的场景，mutex 方案大约需要 2-3 毫秒，channel 方案大约 3-5 毫秒，预分片方案不到 1 毫秒。当然，这些数字高度依赖硬件环境和具体负载模式，不能简单外推，但它们反映了三种方案的相对关系。\n\n最后回到日志采集服务的原始需求上来。一个工程上比较成熟的做法是结合 channel 和批量写入：用一个带缓冲的 channel 收集各数据源的指标，一个消费者 goroutine 从 channel 中批量读取数据（比如每次最多读 500 条或者每 100 毫秒读一次），攒成一批后再做批量写入。这样既保证了并发安全，又实现了批量操作的性能优化，是生产环境中最常见的模式。\n\n总结一下核心要点：slice 本身不是并发安全的，因为 SliceHeader 的三个字段和底层数组的读写在 append 过程中没有原子性保证。并发 append 不仅仅会丢数据，在扩容时可能导致内存损坏和 panic，属于未定义行为。修复方案从简单到高性能依次是 mutex 加锁、channel 收集和预分片写入，根据实际场景选择最合适的方案即可。",
+      "keyPoints": [
+        "slice 在 runtime 中是 SliceHeader 三元组（Data、Len、Cap），append 操作涉及多次非原子的内存读写",
+        "并发 append 的竞态不仅会导致数据丢失，扩容时可能引发内存损坏和 panic，属于未定义行为",
+        "go build -race 或 go run -race 可以在运行时检测 data race，但无法发现所有竞态——它只报告实际发生的并发访问",
+        "sync.Mutex 是最直接的方案，语义清晰、代码简洁，适合大多数业务场景",
+        "channel 收集模式体现了 Go 的并发哲学，将写操作集中到单个消费者 goroutine，天然消除竞态",
+        "预分配索引方案让每个 goroutine 写不同位置，零锁开销，但需要提前知道数据量",
+        "多个 goroutine 写同一 slice 的不同索引是安全的，因为访问的是不同内存地址，不构成 data race"
+      ],
+      "quiz": [
+        {
+          "id": "slice-concurrent-q1",
+          "question": "多个 goroutine 同时对同一个 slice 执行 append，最可能出现的现象是什么？",
+          "choices": [
+            {"id": "A", "text": "编译错误，Go 不允许在 goroutine 内使用 append"},
+            {"id": "B", "text": "程序正常运行，数据完整，只是顺序不确定"},
+            {"id": "C", "text": "数据丢失、长度不符预期，甚至可能 panic"},
+            {"id": "D", "text": "程序会自动加锁，性能降低但结果正确"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "slice 不是并发安全的数据结构。多个 goroutine 同时 append 会导致 SliceHeader 和底层数组的竞态读写，轻则数据被覆盖丢失、长度不正确，重则在扩容时出现内存不一致从而 panic。Go 不会自动为 slice 操作加锁。"
+        },
+        {
+          "id": "slice-concurrent-q2",
+          "question": "使用 `go run -race main.go` 启动程序时，race detector 的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "静态分析源码中所有可能的竞态，编译期就能发现全部问题"},
+            {"id": "B", "text": "在运行时监控内存访问，报告实际发生的并发读写冲突"},
+            {"id": "C", "text": "自动为所有共享变量加锁，消除 data race"},
+            {"id": "D", "text": "只检测 channel 的死锁问题，不涉及 slice 等普通变量"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go 的 race detector 基于 ThreadSanitizer 技术，在运行时对每次内存访问进行追踪和记录。它只能报告程序执行过程中实际发生的并发访问冲突，无法发现那些在本次运行中没有触发的潜在竞态。它不修改程序行为，也不自动加锁。"
+        },
+        {
+          "id": "slice-concurrent-q3",
+          "question": "slice 并发 append 的 data race 具体竞争的是哪些内存？",
+          "choices": [
+            {"id": "A", "text": "只有底层数组的元素内存存在竞争"},
+            {"id": "B", "text": "只有 SliceHeader 的 Len 字段存在竞争"},
+            {"id": "C", "text": "SliceHeader 的 Data、Len、Cap 三个字段以及底层数组都可能被并发读写"},
+            {"id": "D", "text": "只有发生扩容时才存在竞争，不扩容就安全"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "append 操作需要读取 Len 和 Cap 来判断容量，写入底层数组后更新 Len，扩容时还要修改 Data 和 Cap。因此 SliceHeader 的全部三个字段和底层数组都参与了读写，都可能产生竞态。即使不发生扩容，对 Len 和底层数组同一索引位置的并发读写同样构成 data race。"
+        },
+        {
+          "id": "slice-concurrent-q4",
+          "question": "以下哪段代码可以安全地在多个 goroutine 中并发写入 slice？",
+          "choices": [
+            {"id": "A", "text": "data := make([]int, 0); go func() { data = append(data, 1) }()"},
+            {"id": "B", "text": "data := make([]int, 100); go func() { data[i] = val }() // 每个 goroutine 写不同的 i"},
+            {"id": "C", "text": "var data []int; go func() { atomic.AddInt64(&data[0], 1) }()"},
+            {"id": "D", "text": "data := make([]int, 0); go func() { copy(data, src) }()"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 slice 长度已经预分配好，且每个 goroutine 写入不同的索引位置时，它们访问的是底层数组中不同的内存地址，不构成 data race，因此是安全的。选项 A 并发 append 有竞态，选项 C 对 nil slice 操作会 panic，选项 D 并发 copy 也可能竞态。"
+        },
+        {
+          "id": "slice-concurrent-q5",
+          "question": "用 sync.Mutex 保护并发 append 时，以下哪种写法是正确的？",
+          "choices": [
+            {"id": "A", "text": "mu.Lock(); go func() { data = append(data, n); mu.Unlock() }()"},
+            {"id": "B", "text": "go func() { mu.Lock(); data = append(data, n); mu.Unlock() }()"},
+            {"id": "C", "text": "go func() { data = append(data, n) }(); mu.Lock(); mu.Unlock()"},
+            {"id": "D", "text": "mu.Lock(); data = append(data, n) // 不需要 Unlock，Go 会自动释放"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Lock 和 Unlock 必须在同一个 goroutine 中配对调用。选项 A 在主 goroutine 加锁、子 goroutine 解锁，违反了 Mutex 的使用规范。选项 C 的加锁位置完全错误，不保护 append 操作。选项 D 不释放锁会导致后续所有尝试加锁的 goroutine 永久阻塞。"
+        },
+        {
+          "id": "slice-concurrent-q6",
+          "question": "channel 收集方案相比 mutex 方案的主要优势是什么？",
+          "choices": [
+            {"id": "A", "text": "channel 内部不需要锁，所以性能总是更好"},
+            {"id": "B", "text": "channel 使数据流方向和所有权更清晰，代码更易理解和维护"},
+            {"id": "C", "text": "channel 可以完全避免 goroutine 之间的同步开销"},
+            {"id": "D", "text": "channel 方案不需要 sync.WaitGroup 来等待 goroutine 结束"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "channel 内部实际上也有锁（runtime 层面的 mutex），所以它并不总是比 sync.Mutex 更快。channel 的真正优势在于它把并发通信的语义表达得更清楚——生产者和消费者的角色分明，数据流向一目了然。这符合 Go 的并发设计哲学，在复杂的数据处理流水线中尤其有价值。"
+        },
+        {
+          "id": "slice-concurrent-q7",
+          "question": "关于 Go 的 data race，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "data race 只会导致数据不准确，不会导致程序崩溃"},
+            {"id": "B", "text": "data race 在 Go 中属于未定义行为，可能导致任何不可预期的后果"},
+            {"id": "C", "text": "只有对指针类型的并发读写才算 data race，int 等基本类型不会"},
+            {"id": "D", "text": "只要不发生扩容，slice 的并发 append 就不算 data race"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go 语言内存模型明确定义：对同一变量的并发读写若没有同步机制即为 data race，其结果是未定义行为。这意味着程序可能数据错误、可能 panic、可能内存损坏，甚至可能在某些运行中看起来正常但在另一些运行中崩溃。任何类型的变量都可能产生 data race，不限于指针类型。"
+        },
+        {
+          "id": "slice-concurrent-q8",
+          "question": "在 channel 收集模式中，应该如何合理设置缓冲区大小？",
+          "choices": [
+            {"id": "A", "text": "总是使用无缓冲 channel，这样可以严格保证数据顺序"},
+            {"id": "B", "text": "缓冲区设为 1 即可，多了浪费内存"},
+            {"id": "C", "text": "根据生产者数量和消费速率估算，避免生产者频繁阻塞同时不过度浪费内存"},
+            {"id": "D", "text": "设为无限大，这样永远不会阻塞"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "缓冲区大小需要在吞吐量和内存消耗之间权衡。无缓冲 channel 会强制同步，降低并发度。缓冲太小会导致生产者频繁阻塞排队。Go 中不存在无限大缓冲的 channel，必须指定一个具体的数值。合理的做法是根据生产者数量和消费者处理速度来估算一个适当的缓冲值。"
+        },
+        {
+          "id": "slice-concurrent-q9",
+          "question": "以下哪种场景最适合使用预分片（pre-partition）方案而非 mutex？",
+          "choices": [
+            {"id": "A", "text": "事先不知道数据总量，数据源动态增减"},
+            {"id": "B", "text": "固定数量的 goroutine 各自处理独立的数据块，结果写入各自对应的位置"},
+            {"id": "C", "text": "多个 goroutine 需要读取彼此写入的数据进行聚合计算"},
+            {"id": "D", "text": "只有两个 goroutine，一个读一个写"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "预分片方案的核心前提是每个 goroutine 有确定的、互不重叠的写入位置。当 goroutine 数量固定、数据量已知时，可以预先分配好 slice 空间，让每个 goroutine 只操作自己负责的区段。这种方式完全没有锁开销，性能最优。但如果数据量动态变化或需要 goroutine 间交叉访问数据，就不适用了。"
+        },
+        {
+          "id": "slice-concurrent-q10",
+          "question": "在高并发日志采集系统中，工程上最常见的数据汇总模式是什么？",
+          "choices": [
+            {"id": "A", "text": "所有 goroutine 直接往全局 slice append，靠 mutex 保护"},
+            {"id": "B", "text": "每个 goroutine 一个独立的 slice，程序结束时一次性合并"},
+            {"id": "C", "text": "用带缓冲 channel 收集数据，消费者 goroutine 批量读取后做批量写入"},
+            {"id": "D", "text": "使用 sync.Map 代替 slice 来存储日志数据"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "生产环境中最常见的做法是结合 channel 收集和批量处理：生产者将数据发送到带缓冲的 channel，一个或少量消费者从 channel 中批量读取（比如攒够一批或到达超时时间），然后统一做批量写入。这种方式兼顾了并发安全、吞吐性能和批量操作的效率，是日志采集、指标上报等场景的标准模式。"
+        }
+      ],
+      "references": [
+        "https://go.dev/ref/mem",
+        "https://go.dev/doc/articles/race_detector",
+        "https://pkg.go.dev/sync"
+      ]
+    }
+  ]
+}

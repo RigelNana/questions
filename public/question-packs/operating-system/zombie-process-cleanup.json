@@ -1,0 +1,161 @@
+{
+  "id": "os-zombie-process-cleanup",
+  "name": "僵尸进程排查与清理",
+  "domain": "operating-system",
+  "description": "大量僵尸进程的排查思路和清理方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-zombie-process-cleanup-1",
+      "domain": "operating-system",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": [
+        "zombie",
+        "debugging",
+        "ps",
+        "waitpid",
+        "SIGCHLD",
+        "troubleshooting"
+      ],
+      "title": "系统中出现大量僵尸进程时应如何排查和清理",
+      "content": "## 故障场景\n\n凌晨两点，线上监控突然告警：一台跑着任务调度服务的 CentOS 7 服务器，进程数飙到了 31000+，距离默认的 PID 上限 32768 只剩不到两千个余量。新的进程已经开始创建失败，crontab 任务、SSH 连接全部报 `fork: Resource temporarily unavailable`，服务处于半瘫痪状态。\n\n你火速 SSH 登上去（还好之前有一个存活的会话），先 `ps aux` 看了一眼，满屏都是 `Z` 状态的进程：\n\n```bash\n$ ps aux | head -5\nUSER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot         1  0.0  0.1  19356  1544 ?        Ss   Jun10   0:03 /usr/lib/systemd/systemd\nroot      1024  0.2  1.2 458720 12800 ?        Sl   Jun10   5:17 /opt/scheduler/task-dispatcher\nroot      3021  0.0  0.0      0     0 ?        Z    02:13   0:00 [worker] <defunct>\nroot      3022  0.0  0.0      0     0 ?        Z    02:13   0:00 [worker] <defunct>\n\n$ ps aux | awk '$8~/^Z/' | wc -l\n8247\n```\n\n8247 个僵尸进程。VSZ 和 RSS 都是 0，说明它们并不占用实际内存，但每个僵尸都占用了一个 PID 号和一条内核进程表（task_struct）条目。继续翻 `ps` 输出，这些僵尸的 COMMAND 列全部显示为 `[worker] <defunct>`，看起来是同一个父进程 fork 出来的。\n\n现在的问题是：这些僵尸进程是怎么来的？谁是它们的父进程？为什么没有被回收？怎么在不重启服务的前提下快速清理，同时从根本上解决问题防止复发？",
+      "answer": "## 一、僵尸进程（Zombie Process）基础：先搞清楚它到底是什么\n\n要排查僵尸进程问题，首先必须理解 Unix/Linux 进程的完整生命周期。在 Linux 中，每个进程都有一个唯一的进程标识符 PID，内核为每个进程维护一个叫做 task_struct 的数据结构（在 Linux 5.x 内核源码中定义在 `include/linux/sched.h`，这个结构体大约有 600+ 个字段，大小在 x86_64 上约为 6KB）。task_struct 里保存了进程的所有元信息：PID、父进程 PPID、进程状态、调度信息、打开的文件描述符、信号掩码等等。\n\n一个进程从创建到消亡要经历这样几个状态：TASK_RUNNING（就绪/运行中）→ TASK_INTERRUPTIBLE 或 TASK_UNINTERRUPTIBLE（睡眠）→ EXIT_ZOMBIE（僵尸）→ 最终被彻底释放。关键的转折点在于：当一个子进程执行完毕调用 `_exit()` 系统调用后，内核并不会立刻回收它的 task_struct。内核会把这个进程的状态设为 EXIT_ZOMBIE，释放掉它占用的内存页、文件描述符、信号处理器等所有资源，但刻意保留 task_struct 本身和其中的退出状态码（exit code）。为什么？因为 Unix 的设计哲学是：父进程有权利也有义务知道子进程是怎么退出的——是正常返回了 0，还是被信号杀掉了，还是 core dump 了。父进程通过调用 `wait()`、`waitpid()` 或 `waitid()` 系统调用来读取子进程的退出状态，读取完成后内核才会真正释放那条 task_struct，这个过程叫做\"收尸\"（reap）。\n\n所以僵尸进程的本质就是：**子进程已经退出了，但父进程还没有调用 wait 系列函数来读取它的退出状态**。僵尸进程不消耗 CPU，不占用内存（所有用户态资源已经释放），但它占据一个 PID 号和大约 6KB 的内核空间。少量僵尸无伤大雅，但当数量达到数千上万时，PID 耗尽会导致整个系统无法 fork 新进程，这就是我们遇到的线上故障。\n\n你可以用一段简单的 C 代码来复现僵尸进程：\n\n```c\n#include <stdio.h>\n#include <unistd.h>\n#include <stdlib.h>\n\nint main() {\n    for (int i = 0; i < 5; i++) {\n        pid_t pid = fork();\n        if (pid == 0) {\n            // 子进程立刻退出\n            printf(\"child %d exiting\\n\", getpid());\n            _exit(0);\n        }\n    }\n    // 父进程不调用 wait，直接 sleep\n    printf(\"parent %d sleeping, check ps for zombies\\n\", getpid());\n    sleep(60);\n    return 0;\n}\n```\n\n编译运行后，`ps aux | grep Z` 就能看到 5 个僵尸进程。这就是最经典的僵尸制造场景：fork 了子进程但忘了 wait。\n\n## 二、深度排查：四步定位并清理\n\n回到线上故障现场。我们已经知道有 8247 个僵尸，接下来要按步骤排查。\n\n### 第一步：确认僵尸进程数量和趋势\n\n先用精确命令确认当前僵尸数量，并判断数量是否还在增长：\n\n```bash\n# 精确统计 Z 状态进程数量（STAT 列以 Z 开头）\n$ ps -eo stat | grep -c '^Z'\n8247\n\n# 也可以用 awk 过滤 ps aux 的第 8 列\n$ ps aux | awk '$8~/^Z/' | wc -l\n8247\n\n# 从 /proc 统计（效率更高，不依赖 ps 的输出格式）\n$ cat /proc/*/status 2>/dev/null | grep -c \"^State:.*zombie\"\n8247\n```\n\n接下来要判断僵尸是否还在持续产生。每隔 5 秒统计一次：\n\n```bash\n$ watch -n 5 'ps -eo stat | grep -c \"^Z\"'\n# 观察输出：\n# 8247 → 8289 → 8334 → 8371\n# 数字在持续增长，说明父进程还在不停 fork 但不 wait\n```\n\n在我们这个案例中，数字每隔几秒就增加几十个，说明问题还在持续发生。这意味着必须尽快找到并处理父进程。\n\n### 第二步：找到僵尸进程的父进程\n\n僵尸进程自身已经\"死了\"，你没法对它做任何事情——不能 kill 一个已经死掉的进程（这是很多新手会犯的错误，后面 quiz 会考到）。唯一的办法是找到它的父进程。用 `ps` 命令查看 PPID：\n\n```bash\n# 列出所有僵尸进程及其父进程 PID\n$ ps -eo pid,ppid,stat,comm | awk '$3~/^Z/' | head -5\n  PID  PPID STAT COMMAND\n 3021  1024 Z    worker <defunct>\n 3022  1024 Z    worker <defunct>\n 3023  1024 Z    worker <defunct>\n 3024  1024 Z    worker <defunct>\n 3025  1024 Z    worker <defunct>\n\n# 统计僵尸的 PPID 分布——看是不是都来自同一个父进程\n$ ps -eo ppid,stat | awk '$2~/^Z/{print $1}' | sort | uniq -c | sort -rn\n   8247 1024\n```\n\n结果非常清晰：所有 8247 个僵尸的 PPID 都是 1024。看看 PID 1024 是什么：\n\n```bash\n$ ps -p 1024 -o pid,ppid,stat,cmd\n  PID  PPID STAT CMD\n 1024     1 Sl   /opt/scheduler/task-dispatcher\n\n$ ls -la /proc/1024/exe\nlrwxrwxrwx 1 root root 0 Jun 10 02:00 /proc/1024/exe -> /opt/scheduler/task-dispatcher\n```\n\n找到了：罪魁祸首是 `/opt/scheduler/task-dispatcher`，一个任务调度进程，它 fork 出 worker 子进程来执行任务，但没有正确回收子进程的退出状态。\n\n### 第三步：分析父进程为什么没有回收\n\n父进程没有回收子进程，通常有以下几种原因，需要逐一排查。\n\n第一种可能：代码里压根没写 wait 逻辑。这是最常见的 bug，开发者 fork 了子进程后只管 fork 不管收尸。用 `strace` 跟踪父进程的系统调用，看看它有没有在调 wait：\n\n```bash\n$ strace -p 1024 -e trace=wait4,waitpid,waitid -f 2>&1 | head -20\nstrace: Process 1024 attached\n# 如果几十秒内没有看到任何 wait4/waitpid 调用，\n# 说明父进程确实没有在等待子进程退出\n```\n\n如果 strace 显示父进程完全没有调用 wait 系列函数，那就是代码 bug，需要通知开发修复。\n\n第二种可能：父进程注册了 SIGCHLD 信号处理器，但处理器有 bug。SIGCHLD 是子进程退出时内核发给父进程的信号（signal number 17）。正确的做法是在 SIGCHLD handler 里循环调用 `waitpid(-1, &status, WNOHANG)` 直到返回 0 或 -1，因为多个子进程可能几乎同时退出，但 Unix 信号不排队——如果在处理一个 SIGCHLD 时又来了两个 SIGCHLD，后面的会被合并成一个。如果 handler 里只调用了一次 waitpid，那每次信号只回收一个子进程，剩下的就变成僵尸了。用 strace 可以验证：\n\n```bash\n$ strace -p 1024 -e trace=signal,wait4 2>&1 | head -30\n--- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=9102, ...} ---\nrt_sigreturn({mask=[]})                 = -1 EINTR\nwait4(-1, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], WNOHANG, NULL) = 9102\nwait4(-1, 0x7ffd2a3b8a4c, WNOHANG, NULL) = 0\n# 看到了吗：收到一次 SIGCHLD，只调了两次 wait4\n# （第二次返回 0 表示没有更多已退出子进程）\n# 但如果在这期间有 3 个子进程退出，信号合并导致只触发 1 次，\n# 只回收了 1 个，另外 2 个就变成了僵尸\n```\n\n如果你看到 wait4 确实在被调用但僵尸还在增长，大概率就是这个\"信号合并\"的问题。\n\n第三种可能：父进程的主线程阻塞在某个长时间操作上，无暇处理 SIGCHLD。比如父进程在做一个巨大的数据库查询或网络请求，导致事件循环被卡住，信号一直 pending。用 `cat /proc/1024/status` 检查 pending 信号：\n\n```bash\n$ cat /proc/1024/status | grep -i sig\nSigQ:   8247/63281    # 当前排队信号数 / 上限\nSigPnd: 0000000000000000\nShdPnd: 0000000000020000  # 第 17 位（bit 16）置 1，即 SIGCHLD 在 pending\nSigBlk: 0000000000000000\nSigIgn: 0000000000000000\nSigCgt: 0000000000020002\n```\n\n`ShdPnd` 字段的 0x20000 = 1<<16，在信号编号从 1 开始的约定下对应 signal 17（SIGCHLD）。如果这个位置位了，说明有一个 SIGCHLD 正在 pending 等待被处理，父进程可能被阻塞了。\n\n### 第四步：清理方案——分短期止血和长期修复\n\n**短期止血方案一：给父进程发 SIGCHLD 信号。** 如果父进程有 SIGCHLD handler 但因为信号合并丢失了部分信号，手动发一个 SIGCHLD 可以触发它再去 wait：\n\n```bash\n$ kill -SIGCHLD 1024\n# 等几秒再看僵尸数量\n$ sleep 3 && ps -eo stat | grep -c '^Z'\n8240\n# 少了几个但远远没清完——因为 handler 里的 while 循环把当前能回收的都回收了，\n# 但新的僵尸还在产生\n# 可以写个循环持续发送\n$ for i in $(seq 1 100); do kill -SIGCHLD 1024; sleep 0.1; done\n$ ps -eo stat | grep -c '^Z'\n6012\n# 有效果但不够彻底，治标不治本\n```\n\n**短期止血方案二：kill 父进程，让 init/systemd 接管回收。** 如果方案一效果不理想，或者父进程本身就是 bug，最直接的办法是杀掉父进程。当父进程死亡后，所有子进程（包括僵尸）会被重新挂到 PID 1（init 或 systemd）下面。init/systemd 天生会定期调用 wait 来回收孤儿僵尸：\n\n```bash\n# 先确认 task-dispatcher 可以被重启（比如有 systemd service 管理）\n$ systemctl status task-dispatcher\n● task-dispatcher.service - Task Dispatcher Service\n   Active: active (running) since ...\n   Main PID: 1024\n\n# 杀掉父进程\n$ kill 1024\n# 如果 kill（SIGTERM）不管用，用 SIGKILL\n$ kill -9 1024\n\n# 等待几秒，僵尸应该全部消失\n$ sleep 5 && ps -eo stat | grep -c '^Z'\n0\n\n# systemd 的 Restart=always 会自动拉起新的 task-dispatcher\n$ systemctl status task-dispatcher\n● task-dispatcher.service - Task Dispatcher Service\n   Active: active (running) since ...\n   Main PID: 10245  # 新的 PID\n```\n\n僵尸全部清除，PID 空间恢复正常，服务恢复。但这只是止血，根因还需要修复代码。\n\n**长期修复方案：修正代码中的子进程回收逻辑。** 最常见的正确写法是在 SIGCHLD handler 中循环 waitpid：\n\n```c\n#include <signal.h>\n#include <sys/wait.h>\n#include <errno.h>\n\nvoid sigchld_handler(int sig) {\n    int saved_errno = errno;  // 保存 errno，因为 waitpid 会修改它\n    // 循环回收所有已退出的子进程，WNOHANG 确保不阻塞\n    while (waitpid(-1, NULL, WNOHANG) > 0)\n        ;  // 一直 wait 直到没有更多已退出的子进程\n    errno = saved_errno;\n}\n\nint main() {\n    struct sigaction sa;\n    sa.sa_handler = sigchld_handler;\n    sigemptyset(&sa.sa_mask);\n    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;\n    // SA_RESTART: 被信号中断的系统调用自动重启\n    // SA_NOCLDSTOP: 子进程停止（SIGSTOP）时不发 SIGCHLD，只在退出时发\n    sigaction(SIGCHLD, &sa, NULL);\n\n    // ... 正常的 fork 逻辑 ...\n}\n```\n\n这段代码解决了信号合并的问题：即使多个子进程同时退出只触发一次 SIGCHLD，handler 里的 while 循环也会把所有已退出的子进程全部回收干净。注意两个细节：一是保存和恢复 errno，因为 handler 是在主程序执行流中异步插入的，如果 handler 里的 waitpid 修改了 errno 而主程序正在检查 errno，就会出诡异的 bug；二是用 SA_RESTART 标志，避免主程序中的 read/write 等阻塞调用因为 SIGCHLD 被中断后报 EINTR 错误。\n\n## 三、预防与进阶：不要等到起火了才学怎么灭火\n\n### 方法一：SA_NOCLDWAIT 标志——让内核自动回收\n\n如果你根本不关心子进程的退出状态（很多场景确实不关心），可以在 sigaction 中设置 SA_NOCLDWAIT 标志，或者直接把 SIGCHLD 的处理方式设为 SIG_IGN：\n\n```c\n// 方法 A：SA_NOCLDWAIT\nstruct sigaction sa;\nsa.sa_handler = SIG_DFL;\nsa.sa_flags = SA_NOCLDWAIT;\nsigaction(SIGCHLD, &sa, NULL);\n\n// 方法 B：忽略 SIGCHLD（POSIX.1-2001 标准行为）\nsignal(SIGCHLD, SIG_IGN);\n```\n\n两种方式的效果一样：子进程退出后不会进入 EXIT_ZOMBIE 状态，内核直接回收 task_struct。代价是你无法通过 wait 获取子进程的退出状态码了。对于那些\"fire and forget\"式的 worker 子进程，这是最简洁的方案。\n\n### 方法二：double fork 技巧——经典的守护进程手法\n\ndouble fork 是 Unix 编程中一个经典技巧：父进程 fork 出子进程，子进程立刻再 fork 出孙进程，然后子进程退出。此时孙进程的父进程（子进程）已经死了，孙进程变成孤儿被 init 收养。init 会负责回收孙进程，而父进程只需要 wait 那个短命的子进程即可：\n\n```c\npid_t pid = fork();\nif (pid == 0) {\n    // 子进程：再 fork 一次\n    pid_t grandchild = fork();\n    if (grandchild == 0) {\n        // 孙进程：执行真正的任务，退出后由 init 回收\n        execvp(task_cmd, task_args);\n        _exit(127);\n    }\n    // 子进程立刻退出\n    _exit(0);\n}\n// 父进程等待子进程（子进程几乎立刻退出，不会阻塞）\nwaitpid(pid, NULL, 0);\n// 孙进程在后台跑，退出后由 init 自动回收，不会产生僵尸\n```\n\n这个技巧在需要后台执行任务但不想管理子进程生命周期时非常好用。很多守护进程（daemon）的启动过程都用到了 double fork。\n\n### 方法三：PID 上限调整\n\nLinux 默认的 PID 上限是 32768（`/proc/sys/kernel/pid_max`），在 64 位系统上可以调到最大 4194304（即 2^22）。如果你的业务本身就需要大量进程或线程，可以适当调高：\n\n```bash\n# 查看当前 PID 上限\n$ cat /proc/sys/kernel/pid_max\n32768\n\n# 临时调整（重启失效）\n$ echo 4194304 > /proc/sys/kernel/pid_max\n\n# 永久生效\n$ echo \"kernel.pid_max = 4194304\" >> /etc/sysctl.conf\n$ sysctl -p\n```\n\n但要注意：调高 PID 上限只是给你更多的缓冲时间，不能解决根因。如果代码持续泄漏僵尸，迟早还是会耗尽。这个调整更多是作为防御性措施，让你在出问题时有更多时间排查和止血。\n\n### 方法四：容器环境中的特殊考量\n\n在 Docker 和 Kubernetes 中，僵尸进程问题有一个特殊的坑：容器内的 PID 1 进程。在传统 Linux 系统中，PID 1 是 init 或 systemd，它们天生会 wait 所有孤儿进程。但在容器里，PID 1 通常是你的应用程序本身（比如一个 Python 脚本或 Go 二进制），它大概率没有实现 wait 孤儿的逻辑。\n\n如果容器内的某个进程 fork 出子进程后自己崩溃了，子进程变成孤儿挂到 PID 1 下面，但 PID 1（你的应用）不会 wait 它，于是孤儿变僵尸。解决方案是使用一个轻量级的 init 进程作为容器的 PID 1：\n\n```dockerfile\n# 方案一：使用 tini 作为 init（推荐）\nFROM ubuntu:22.04\nRUN apt-get update && apt-get install -y tini\nENTRYPOINT [\"tini\", \"--\"]\nCMD [\"/opt/scheduler/task-dispatcher\"]\n\n# 方案二：Docker 19.03+ 内置的 --init 选项\n# docker run --init my-image\n```\n\n`tini` 是一个极小的 init 进程（只有几十 KB），它做两件事：转发信号给子进程，以及 wait 所有孤儿。在 Kubernetes 中，你也可以通过 `shareProcessNamespace: true` 让 Pod 的 pause 容器充当 PID 1 的角色，但更推荐直接在镜像里加 tini，因为它不依赖集群配置。\n\n还有一个经常被忽视的点：如果你用的是 Go 语言写的服务，`os/exec.Cmd.Wait()` 内部会调用 waitpid 来回收子进程，但如果你用了 `cmd.Start()` 而没有调用 `cmd.Wait()`，同样会产生僵尸。Go 的 `exec.Command` 封装得很好，但也要确保每个 Start 都配对一个 Wait。\n\n### 排查流程总结\n\n把整个排查过程串起来：首先用 `ps -eo stat | grep -c '^Z'` 确认僵尸数量和增长趋势，然后用 `ps -eo pid,ppid,stat,comm | awk '$3~/^Z/{print $2}' | sort | uniq -c | sort -rn` 找到产生僵尸最多的父进程，再用 `strace -p <PPID> -e trace=wait4` 确认父进程是否在正常调用 wait，最后根据诊断结果选择止血方案（发 SIGCHLD 或杀父进程）和长期修复方案（修复代码中的 wait 逻辑、使用 SA_NOCLDWAIT、容器内加 tini）。这套流程适用于几乎所有僵尸进程故障的排查。",
+      "keyPoints": [
+        "僵尸进程的本质是子进程已退出但父进程未调用 wait/waitpid 读取其退出状态，内核保留 task_struct 以供父进程查询，每个僵尸占用一个 PID 和约 6KB 内核内存",
+        "Unix 信号不排队：多个子进程同时退出可能只触发一次 SIGCHLD，因此 SIGCHLD handler 中必须用 while(waitpid(-1, NULL, WNOHANG) > 0) 循环回收所有已退出的子进程",
+        "排查的核心路径是通过 ps -eo pid,ppid,stat 找到僵尸的 PPID，再用 strace -p PPID -e trace=wait4 确认父进程是否在正常调用 wait 系统调用",
+        "短期清理可以向父进程发 SIGCHLD 触发回收，若无效则 kill 父进程让 init/systemd 接管；长期修复需要在代码中正确处理 SIGCHLD 或使用 SA_NOCLDWAIT 标志让内核自动回收",
+        "容器环境中 PID 1 通常是应用本身而非 init，不会自动回收孤儿僵尸，需要使用 tini 或 docker --init 作为轻量级 init 进程来兜底处理"
+      ],
+      "quiz": [
+        {
+          "id": "os-zombie-process-cleanup-q1",
+          "question": "僵尸进程（Zombie Process）占用了哪些系统资源？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "占用 CPU 时间和内存页，因为进程还在运行"
+            },
+            {
+              "id": "B",
+              "text": "占用一个 PID 号和内核中的 task_struct 条目，不消耗 CPU 和用户态内存"
+            },
+            {
+              "id": "C",
+              "text": "占用文件描述符和网络端口，导致其他进程无法监听"
+            },
+            {
+              "id": "D",
+              "text": "不占用任何系统资源，只是 ps 输出中的一条显示记录"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "僵尸进程已经执行完毕，内核释放了它所有的用户态资源（内存页、文件描述符、信号处理器等），所以 A 和 C 都不对。但内核刻意保留了 task_struct 结构体（约 6KB）和 PID 号，等待父进程调用 wait 读取退出状态，所以 D 说不占用任何资源也是错的。大量僵尸的真正危害是耗尽 PID 空间，导致系统无法 fork 新进程。"
+        },
+        {
+          "id": "os-zombie-process-cleanup-q2",
+          "question": "以下哪个命令能准确统计系统中当前的僵尸进程数量？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "top -b -n 1 | grep zombie"
+            },
+            {
+              "id": "B",
+              "text": "ps -eo stat | grep -c \"^Z\""
+            },
+            {
+              "id": "C",
+              "text": "cat /proc/meminfo | grep Zombie"
+            },
+            {
+              "id": "D",
+              "text": "vmstat 1 1 | awk '{print $16}'"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 选项通过 ps 列出所有进程的状态列，用 grep -c 精确统计以 Z 开头的行数，是最准确直接的统计方式。A 选项中 top 的摘要行确实显示 zombie 数量（如 \"2 zombie\"），但需要额外的文本处理才能提取数字，且 top 的输出格式因版本不同而有差异，不如 B 稳定可靠。C 选项完全错误，/proc/meminfo 是内存信息，没有僵尸进程相关字段。D 选项也不对，vmstat 输出的是虚拟内存和 CPU 统计，不包含僵尸进程计数。"
+        },
+        {
+          "id": "os-zombie-process-cleanup-q3",
+          "question": "在 SIGCHLD 信号处理器中，为什么必须用 while 循环调用 waitpid 而不是只调用一次？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "因为 waitpid 第一次调用可能失败，需要重试"
+            },
+            {
+              "id": "B",
+              "text": "因为 Unix 标准信号不排队，多个子进程同时退出可能只触发一次 SIGCHLD，一次 waitpid 只能回收一个子进程"
+            },
+            {
+              "id": "C",
+              "text": "因为 while 循环可以让处理器持续运行，避免被内核抢占"
+            },
+            {
+              "id": "D",
+              "text": "因为 waitpid 需要遍历所有子进程的退出状态才能返回正确结果"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Unix 的标准信号（1-31 号）是不排队的，如果同一个信号在被处理期间又来了多次，只会记录一次 pending。所以当 3 个子进程几乎同时退出时，可能只触发 1 次 SIGCHLD。如果 handler 里只调用一次 waitpid，就只回收 1 个子进程，另外 2 个变成僵尸。while 循环配合 WNOHANG 标志可以一次把所有已退出的子进程全部回收。A 选项描述的重试机制和信号合并问题无关。C 选项关于内核抢占的说法毫无根据。D 选项对 waitpid 的工作方式理解有误，waitpid(-1, ...) 每次只回收一个子进程并返回其 PID。"
+        },
+        {
+          "id": "os-zombie-process-cleanup-q4",
+          "question": "线上发现大量僵尸进程后，执行 kill -9 <zombie_pid> 会有什么效果？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "僵尸进程会被强制终止并从进程表中移除"
+            },
+            {
+              "id": "B",
+              "text": "没有任何效果，因为僵尸进程已经死了，无法接收信号，只有让父进程 wait 或杀掉父进程才能清除"
+            },
+            {
+              "id": "C",
+              "text": "会导致内核崩溃，因为向已退出的进程发送 SIGKILL 是未定义行为"
+            },
+            {
+              "id": "D",
+              "text": "僵尸进程会被重新挂到 init 进程下面，由 init 自动回收"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个非常常见的误区。很多人遇到僵尸进程的第一反应是 kill -9，但僵尸进程已经退出了，它不再是一个活着的进程，内核不会把信号投递给它。kill 命令会返回成功（因为进程条目确实存在），但进程状态不会有任何变化。A 选项描述的是对活跃进程的行为，不适用于僵尸。C 选项夸大了后果，向僵尸发信号不会导致内核崩溃，只是没有效果。D 选项描述的是父进程死亡时的行为，不是向僵尸发信号的行为。正确的做法是杀掉僵尸的父进程（PPID），让僵尸成为孤儿后被 init 接管回收。"
+        },
+        {
+          "id": "os-zombie-process-cleanup-q5",
+          "question": "在 Docker 容器中，应用进程作为 PID 1 运行时，为什么更容易出现僵尸进程问题？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Docker 容器的内核版本较低，不支持自动回收僵尸进程"
+            },
+            {
+              "id": "B",
+              "text": "容器内的 PID 1 是应用进程而非 init/systemd，应用进程通常没有实现 wait 孤儿进程的逻辑，导致孤儿僵尸无法被回收"
+            },
+            {
+              "id": "C",
+              "text": "容器的 PID namespace 不支持僵尸进程的回收机制"
+            },
+            {
+              "id": "D",
+              "text": "容器的 cgroup 限制了 wait 系统调用的执行频率"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "在传统 Linux 系统中，PID 1（init 或 systemd）有一个特殊职责：回收所有变成孤儿的子进程。当一个进程的父进程死亡后，该进程会被重新挂到 PID 1 下面，init/systemd 会定期调用 wait 来回收它们。但在 Docker 容器里，PID 1 通常是你的应用程序（比如 python app.py），它没有实现这个\"收养并回收孤儿\"的逻辑。A 选项不对，容器和宿主机共享同一个内核。C 选项不对，PID namespace 完全支持僵尸回收机制。D 选项不对，cgroup 限制的是 CPU、内存等资源，不会限制系统调用。解决方案是使用 tini 或 docker run --init 作为容器的 PID 1。"
+        }
+      ],
+      "references": [
+        "https://man7.org/linux/man-pages/man2/waitpid.2.html",
+        "https://man7.org/linux/man-pages/man7/signal.7.html",
+        "https://github.com/krallin/tini",
+        "https://blog.phusion.nl/2015/01/20/docker-and-the-pid-1-zombie-reaping-problem/"
+      ]
+    }
+  ]
+}
