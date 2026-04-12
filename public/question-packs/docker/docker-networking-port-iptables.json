@@ -1,0 +1,136 @@
+﻿{
+  "id": "docker-networking-port-iptables",
+  "name": "端口映射与 iptables 原理",
+  "description": "深入分析 -p 端口映射背后的 DNAT/MASQUERADE iptables 规则及 docker-proxy 的角色",
+  "domain": "docker",
+  "questions": [
+    {
+      "id": "docker-networking-port-iptables-q1",
+      "type": "principle",
+      "difficulty": 3,
+      "content": "面试中经常遇到这样的追问：「你能解释一下 docker run -p 8080:80 这个端口映射到底做了什么吗？」很多人的第一反应是「把宿主机的 8080 端口转发到容器的 80 端口」，这没有错，但只停留在用户态的理解层面。面试官真正想听到的，是你对 Linux 内核网络栈中 Netfilter/iptables 规则链的掌握程度——具体来说，Docker daemon 在你按下回车的那一刻，究竟往 iptables 的哪些表、哪些链里插入了什么规则，数据包是怎样一跳一跳地从宿主机的 eth0 走到容器的 veth pair 对端的。\n\n这道题有几个常见的语法变体值得先梳理：\n\n- `-p 8080:80`：宿主机所有网卡的 8080 → 容器 80（默认 TCP）\n- `-p 127.0.0.1:8080:80`：仅绑定到 loopback，外部流量不可达\n- `-p 8080:80/udp`：显式指定 UDP 协议\n- `-P`（大写）：随机分配宿主机高端口，映射 Dockerfile 中 EXPOSE 声明的所有端口\n\n理解了这些语法之后，真正的问题来了：这些映射规则在内核层面是如何实现的？Docker daemon 是否只靠 iptables 就能完成全部工作？docker-proxy 这个经常被 `ps aux` 看到的进程又扮演什么角色？当容器自己通过宿主机 IP 访问自己的映射端口时会发生什么？这些问题串联起来，就构成了一道高质量的 Docker 网络原理面试题。",
+      "answer": "## 第一步：容器端口映射基础\n\n当 Docker daemon 处理 `-p hostPort:containerPort` 参数时，它在内核和用户态各做了一件事：在 iptables 的 nat 表中插入 DNAT 规则，同时启动一个 docker-proxy 用户态进程。我们先看直观的现象。执行 `docker run -d -p 8080:80 --name web nginx` 之后，用 `ps aux | grep docker-proxy` 可以看到这样一行：\n\n```\n/usr/bin/docker-proxy -proto tcp -host-ip 0.0.0.0 -host-port 8080 \\\n  -container-ip 172.17.0.2 -container-port 80\n```\n\n这个进程监听宿主机的 `0.0.0.0:8080`，把收到的 TCP 连接转发给 `172.17.0.2:80`。但这只是故事的一半——真正承担大部分流量转发工作的是内核态的 iptables 规则。\n\n## 第二步：iptables 原理详解\n\n执行 `iptables -t nat -L -n -v` 可以看到 Docker 自动维护的规则。最关键的是 DOCKER 链中的 DNAT 规则：\n\n```\nChain PREROUTING (policy ACCEPT)\ntarget   prot opt source      destination\nDOCKER   all  --  0.0.0.0/0   0.0.0.0/0   ADDRTYPE match dst-type LOCAL\n\nChain OUTPUT (policy ACCEPT)\ntarget   prot opt source      destination\nDOCKER   all  --  0.0.0.0/0  !127.0.0.0/8  ADDRTYPE match dst-type LOCAL\n\nChain DOCKER (2 references)\ntarget   prot opt source      destination\nDNAT     tcp  --  0.0.0.0/0   0.0.0.0/0   tcp dpt:8080 to:172.17.0.2:80\n```\n\n这段规则的工作流程是：任何目的端口为 8080 的 TCP 包在进入路由决策之前，先经过 PREROUTING 链跳转到 DOCKER 链，被 DNAT 规则将目标地址改写为 `172.17.0.2:80`。改写后的数据包进入 FORWARD 链，经由 `docker0` 网桥转发到容器的 veth 接口。\n\n在 filter 表中，Docker 还插入了配套的放行规则：\n\n```\nChain DOCKER (1 references)\ntarget   prot opt in        out\nACCEPT   tcp  --  !docker0  docker0   tcp dpt:80 ctstate DNAT\n```\n\n这条规则确保只有经过 DNAT 转换的流量才会被放行到容器——`!docker0` 表示入接口不能是 docker0 自身，防止桥内流量被错误匹配。\n\n**回包处理与 conntrack**\n\n容器回复数据包时，Linux 内核的 conntrack（连接跟踪）模块自动记住了入站时的 DNAT 映射关系。回包经过 docker0 网桥回到宿主机网络栈时，conntrack 自动将源地址从 `172.17.0.2:80` 改回宿主机端口 `<hostIP>:8080`，整个过程对外部客户端完全透明，不需要额外的规则。\n\n**MASQUERADE 与容器出站**\n\n对于容器主动访问外网的场景，Docker 在 POSTROUTING 链中添加了 MASQUERADE 规则：\n\n```\nChain POSTROUTING (policy ACCEPT)\ntarget       prot opt source         destination\nMASQUERADE   all  --  172.17.0.0/16  0.0.0.0/0\n```\n\n这条规则对所有从 `172.17.0.0/16` 子网出去的包做源地址伪装，替换为宿主机出口网卡的 IP。注意 MASQUERADE 与 SNAT 的区别：前者动态获取出口 IP，适合 DHCP 场景；后者需要硬编码地址。\n\n**docker-proxy 的补充角色**\n\n既然 iptables DNAT 已经能转发流量，为什么还需要 docker-proxy？答案在于 Linux 内核的一个历史限制。当宿主机上的「本地进程」（而非外部流量）访问 `127.0.0.1:8080` 时，数据包走的是 OUTPUT 链而非 PREROUTING 链。在早期内核版本中，OUTPUT 链的 DNAT 处理对回环地址存在兼容问题，docker-proxy 作为用户态后备方案来兜底。在现代内核（4.x+）中，配合 `net.ipv4.conf.all.route_localnet=1` 这个 sysctl 参数，iptables OUTPUT 链的 DNAT 已经能正确处理本地回环流量，docker-proxy 的必要性大幅降低。\n\n**Hairpin NAT（发夹 NAT）**\n\n当容器 A 通过宿主机 IP 的映射端口访问「自己」时，数据包从容器出发经 docker0 到达宿主机网络栈，被 DNAT 后又要转回同一个容器。这种 U 形回弹路径就是所谓的「发夹」。Docker 默认通过设置 bridge 的 hairpin mode（`brctl hairpin docker0 vethXXX on`）或 sysctl 参数 `net.bridge.bridge-nf-call-iptables=1` 来启用发夹转发。如果 hairpin 没有正确配置，容器通过宿主机 IP 访问自己的映射端口时会超时——这是排查网络问题时容易忽略的一个坑。\n\n## 第三步：扩展与安全\n\n**禁用 docker-proxy**\n\n在 `/etc/docker/daemon.json` 中设置 `{\"userland-proxy\": false}` 可以关闭 docker-proxy。好处是减少每个端口映射创建一个进程的开销——想象一下你有 200 个容器各映射 3 个端口的场景。坏处是完全依赖内核态 iptables 路径的正确性，在极老的内核上可能出现本地回环访问失败。生产环境中大量端口映射时建议禁用。\n\n**nftables 迁移**\n\n从 Debian 10、Ubuntu 20.04、CentOS 8 开始，系统默认防火墙后端切换为 nftables。Docker 当前仍然通过 `iptables-nft`（iptables 命令的 nftables 后端翻译层）与之兼容——你执行的 `iptables` 命令实际上被翻译成 nftables 规则写入内核。用 `nft list ruleset` 查看时会看到 Docker 创建的表和链，但格式与传统 `iptables -L` 输出不同。Docker 社区正在推进原生 nftables 支持，但截至目前仍依赖 iptables-nft 兼容层。\n\n**安全风险：-p 绕过 UFW/firewalld**\n\n这是一个极易踩坑的生产问题。Docker 直接操作 iptables 的 nat 和 filter 表，在 DOCKER 链中插入的规则优先级高于 UFW 和 firewalld 的用户规则。即使你用 `ufw deny 8080` 封掉了端口，`docker run -p 8080:80` 创建的 DOCKER 链 ACCEPT 规则仍然会放行流量，因为 FORWARD 链中 DOCKER 链的跳转在 ufw-user-forward 之前被匹配。解决方案有两种：一是在 `/etc/docker/daemon.json` 中设置 `{\"iptables\": false}` 完全禁止 Docker 修改 iptables（但你需要手动维护所有规则）；二是使用 Docker 17.06+ 提供的 `DOCKER-USER` 链——这是一个在 DOCKER 链之前被评估的 filter 链，你可以在其中插入自定义的 DROP/REJECT 规则来过滤入站流量，这是官方推荐的做法。\n\n**面试核心考点**\n\n面试官最看重的是你能否画出数据包从宿主机 eth0 进入、经 PREROUTING → DOCKER 链 DNAT → FORWARD → docker0 → veth pair → 容器 eth0 的完整路径，以及你对 docker-proxy 存在意义和 hairpin NAT 的理解深度。能顺带提到 `-p` 绕过主机防火墙的安全风险和 `DOCKER-USER` 链的对策，是一个明显的加分项。",
+      "keyPoints": [
+        "Docker 的 -p 端口映射本质上是在 iptables nat 表的 DOCKER 链中插入 DNAT 规则，将宿主机端口流量的目标地址改写为容器 IP:Port",
+        "PREROUTING 链负责外部入站流量的 DNAT 跳转，OUTPUT 链负责宿主机本地进程访问映射端口的场景",
+        "docker-proxy 是用户态代理进程，为每个 -p 映射创建独立进程，主要兜底处理本地回环流量在早期内核上的兼容问题",
+        "conntrack 连接跟踪模块自动维护 DNAT 映射的状态表，回包时自动执行反向地址转换，无需额外规则",
+        "MASQUERADE 规则对容器出站流量做源地址伪装，使容器能通过宿主机 IP 访问外部网络",
+        "Hairpin NAT 解决容器通过宿主机 IP 访问自身映射端口时的 U 形回环转发问题，依赖 bridge hairpin mode 设置",
+        "Docker 直接操作 iptables 的 nat/filter 表会导致 -p 映射绕过 UFW/firewalld，需通过 DOCKER-USER 链插入自定义规则来管控安全策略"
+      ],
+      "quiz": [
+        {
+          "id": "docker-networking-port-iptables-q1-quiz1",
+          "question": "执行 docker run -p 8080:80 nginx 后，iptables 中实现端口转发的核心规则类型是？",
+          "options": {
+            "A": "SNAT — 修改数据包的源 IP 地址",
+            "B": "REDIRECT — 将数据包重定向到本机其他端口",
+            "C": "DNAT — 修改数据包的目标地址为容器 IP:Port",
+            "D": "MASQUERADE — 动态伪装出站数据包的源地址"
+          },
+          "correctAnswer": "C"
+        },
+        {
+          "id": "docker-networking-port-iptables-q1-quiz2",
+          "question": "Docker 在 iptables nat 表中创建的、专门存放端口映射 DNAT 规则的自定义链名称是？",
+          "options": {
+            "A": "DOCKER",
+            "B": "DOCKER-USER",
+            "C": "DOCKER-ISOLATION-STAGE-1",
+            "D": "DOCKER-INGRESS"
+          },
+          "correctAnswer": "A"
+        },
+        {
+          "id": "docker-networking-port-iptables-q1-quiz3",
+          "question": "外部客户端访问宿主机的映射端口时，数据包进入 iptables 后最先经过哪个链？",
+          "options": {
+            "A": "INPUT",
+            "B": "FORWARD",
+            "C": "OUTPUT",
+            "D": "PREROUTING"
+          },
+          "correctAnswer": "D"
+        },
+        {
+          "id": "docker-networking-port-iptables-q1-quiz4",
+          "question": "关于 docker-proxy 用户态代理进程，以下哪项描述是正确的？",
+          "options": {
+            "A": "它在内核态运行，是 iptables DNAT 的高性能替代方案",
+            "B": "它为每个 -p 映射启动独立进程，主要兜底处理宿主机本地回环流量",
+            "C": "它负责所有外部入站流量的端口转发，iptables 规则仅作备份",
+            "D": "它只在使用 overlay 网络驱动时才会被启动"
+          },
+          "correctAnswer": "B"
+        },
+        {
+          "id": "docker-networking-port-iptables-q1-quiz5",
+          "question": "容器回包时源地址 172.17.0.2:80 是如何被还原为宿主机端口的？",
+          "options": {
+            "A": "docker-proxy 截获回包并手动修改源地址",
+            "B": "POSTROUTING 链中的 SNAT 规则负责回包地址还原",
+            "C": "内核 conntrack 模块根据连接跟踪表自动执行反向 NAT",
+            "D": "容器内部默认路由的 src 字段直接指定了宿主机 IP"
+          },
+          "correctAnswer": "C"
+        },
+        {
+          "id": "docker-networking-port-iptables-q1-quiz6",
+          "question": "在 /etc/docker/daemon.json 中禁用 docker-proxy 的正确配置项是？",
+          "options": {
+            "A": "{\"proxy-mode\": \"iptables-only\"}",
+            "B": "{\"userland-proxy\": false}",
+            "C": "{\"bridge-nf-call-iptables\": true}",
+            "D": "{\"docker-proxy\": \"disabled\"}"
+          },
+          "correctAnswer": "B"
+        },
+        {
+          "id": "docker-networking-port-iptables-q1-quiz7",
+          "question": "Hairpin NAT（发夹 NAT）机制解决的核心问题是？",
+          "options": {
+            "A": "容器通过宿主机 IP 的映射端口访问自身时的回环转发",
+            "B": "不同 Docker 网络中的容器互相访问对方的映射端口",
+            "C": "容器访问外部 DNS 服务器时的地址解析",
+            "D": "多个容器映射同一宿主机端口时的负载均衡"
+          },
+          "correctAnswer": "A"
+        },
+        {
+          "id": "docker-networking-port-iptables-q1-quiz8",
+          "question": "以下关于 Docker -p 端口映射与主机防火墙关系的描述，哪项是正确的？",
+          "options": {
+            "A": "UFW/firewalld 的规则优先级始终高于 Docker 的 iptables 规则",
+            "B": "Docker 17.06+ 之后的版本已自动与 UFW 规则保持同步",
+            "C": "只要启用了 firewalld，Docker 的端口映射就会被正确过滤",
+            "D": "Docker 直接操作 iptables 表，-p 映射的端口可能绕过 UFW/firewalld 的限制"
+          },
+          "correctAnswer": "D"
+        },
+        {
+          "id": "docker-networking-port-iptables-q1-quiz9",
+          "question": "以下哪条命令可以正确查看 Docker 创建的端口映射 NAT 规则？",
+          "options": {
+            "A": "iptables -L FORWARD -n -v",
+            "B": "iptables -t nat -L DOCKER -n -v",
+            "C": "iptables -t mangle -L PREROUTING -n",
+            "D": "nft list table ip filter"
+          },
+          "correctAnswer": "B"
+        },
+        {
+          "id": "docker-networking-port-iptables-q1-quiz10",
+          "question": "在 Debian 10+ 等默认使用 nftables 的系统上，Docker 如何处理端口映射规则？",
+          "options": {
+            "A": "通过 iptables-nft 兼容层将 iptables 命令翻译为 nftables 规则",
+            "B": "Docker 自动检测并使用原生 nft 命令直接创建规则",
+            "C": "Docker 完全绕过 nftables，直接调用 Netfilter 内核 API",
+            "D": "Docker 在 nftables 系统上不支持端口映射，需手动降级为 iptables-legacy"
+          },
+          "correctAnswer": "A"
+        }
+      ]
+    }
+  ]
+}
