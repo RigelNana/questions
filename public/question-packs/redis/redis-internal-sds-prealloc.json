@@ -1,0 +1,156 @@
+{
+  "id": "redis-internal-sds-prealloc",
+  "name": "SDS 空间预分配与惰性释放",
+  "domain": "redis",
+  "description": "深入解析 Redis SDS 的空间预分配策略（1MB 阈值）和惰性释放机制的实现原理与性能收益",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-internal-sds-prealloc-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["sds", "space-prealloc", "lazy-free", "sdsMakeRoomFor", "redis-internals", "memory-management", "amortized-analysis"],
+      "title": "SDS 的 free/alloc 字段如何实现空间预分配与惰性释放？",
+      "content": "如果你写过 C 语言，一定知道用 strcat 频繁拼接字符串有多痛苦——每次拼接都要手动 realloc 一次，先算新长度、分配新内存、复制旧数据、追加新数据、释放旧内存，五步缺一不可。一个循环里拼 1000 次字符串，就是 1000 次 realloc。realloc 不是什么轻量操作，它需要跟操作系统的内存分配器打交道，如果当前内存块后面没有连续的空闲空间，分配器甚至要在堆上找一块全新的、更大的区域，把全部内容 memcpy 过去再释放旧块。在 Redis 这种每秒处理数十万次命令的系统中，如果每次 APPEND 都触发一次 realloc，性能会被拖到不可接受的地步。\n\n实际上 Redis 早在 1.0 版本就面对了这个问题。antirez 设计 SDS（Simple Dynamic String）时，在 sdshdr 结构体中专门加入了额外的字段来追踪「已分配但尚未使用」的空间。在 Redis 3.2 之前的旧版 SDS 中，这个字段叫 free，表示 buf 数组末尾还有多少空闲字节可用；3.2 之后的重构版用 alloc 字段替代了 free，alloc 记录的是 buf 的总分配大小（不含 header 和末尾 '\\0'），空闲空间通过 alloc - len 计算得出。不管是 free 还是 alloc，它们背后驱动的是同一套机制：空间预分配（space pre-allocation）和惰性空间释放（lazy space freeing）。\n\n空间预分配的核心思路是：每次 SDS 需要扩容时，不是刚好分配到够用的大小，而是多分配一些「冗余空间」。这样下次再追加数据时，如果冗余空间够用，就不需要再 realloc 了。惰性释放则是反过来的策略：当 SDS 的内容缩短时（比如执行 SDSTRIM 去除两端字符），不立即把多出来的内存还给操作系统，而是留着以备后续增长使用。这两个策略配合起来，把频繁字符串修改场景下的 realloc 调用次数从 O(N) 降到了摊还 O(1)。\n\n但问题在于具体的预分配规则是什么？1MB 这个阈值从哪里来？惰性释放会不会导致内存浪费？sdsMakeRoomFor 的源码到底是怎么实现的？sdsclear 和 sdsfree 的行为有什么区别？这些才是面试官真正想追问的方向。",
+      "answer": "## 第一步：SDS 基础回顾——从 sdshdr 结构体说起\n\n### 什么是 SDS\n\nSDS 全称 Simple Dynamic String，是 Redis 内部使用的字符串实现。Redis 虽然用 C 语言编写，但几乎所有需要处理字符串的地方——键名、字符串值、AOF 缓冲区、客户端输入缓冲区——用的都不是 C 原生的 char*，而是 SDS。原因很简单：C 原生字符串以 '\\0' 结尾，获取长度需要 O(N) 遍历，不支持二进制安全，而且 strcat 等函数不检查缓冲区边界，极易溢出。SDS 在字节数组前面加了一个 header 结构体来记录长度和容量信息，从根本上解决了这些问题。\n\n### sdshdr 结构体与 len/alloc 字段\n\n在 Redis 7.x（以及 3.2 之后的所有版本）中，SDS 定义了五种 header 类型：sdshdr5、sdshdr8、sdshdr16、sdshdr32、sdshdr64。以最常用的 sdshdr8 为例，其定义在 src/sds.h 中：\n\n```c\nstruct __attribute__ ((__packed__)) sdshdr8 {\n    uint8_t len;        // 当前字符串的实际长度（已使用的字节数）\n    uint8_t alloc;      // buf 数组的总分配长度（不含 header 和末尾 '\\0'）\n    unsigned char flags; // 低 3 位标识 header 类型\n    char buf[];         // 柔性数组成员，存储实际字符串内容\n};\n```\n\n`__attribute__((__packed__))` 禁止编译器做字节对齐填充，确保 header 尽可能紧凑——sdshdr8 的 header 只有 3 个字节。这里最关键的是 len 和 alloc 两个字段的含义。len 是字符串的「逻辑长度」，也就是当前实际使用了多少字节；alloc 是 buf 数组的「物理容量」，也就是 malloc 实际分配了多少字节的空间。两者之差 alloc - len 就是当前可用的空闲空间，不需要 realloc 就能直接写入的字节数。\n\n在 Redis 3.2 之前的旧版 SDS 中，header 只有一种格式，包含的字段是 len 和 free（而非 alloc）。free 直接记录空闲字节数。3.2 的重构将 free 替换为 alloc 主要有两个原因：一是配合多种 header 类型的引入，用 alloc 表达总容量比用 free 表达剩余空间在语义上更清晰；二是 alloc 可以用来计算 SDS 实际占用的内存大小（用于 MEMORY USAGE 命令等场景），而 free 做不到这一点。\n\n### C 字符串 realloc 的性能问题\n\n理解了 SDS 的结构之后，再来看没有这些元数据时会发生什么。C 原生字符串的典型拼接代码：\n\n```c\nchar *s = malloc(6);\nstrcpy(s, \"hello\");\n// 每次追加都要 realloc\nfor (int i = 0; i < 1000; i++) {\n    size_t old_len = strlen(s);       // O(N) 遍历\n    size_t add_len = strlen(\" world\");\n    s = realloc(s, old_len + add_len + 1); // 系统调用级别的开销\n    strcat(s, \" world\");              // 又一次 O(N) 遍历找 '\\0'\n}\n```\n\n这段代码有三个性能灾难：strlen 每次 O(N) 遍历、realloc 每次都调用（共 1000 次）、strcat 又一次 O(N) 遍历。realloc 的开销尤其大——如果当前内存块后面没有足够的连续空闲空间（这在堆碎片化严重时非常常见），realloc 需要在堆上另找一块空间、将全部数据 memcpy 过去、释放旧块。对于一个逐渐增长到数十 KB 的字符串，这意味着每次 realloc 都要复制越来越多的数据，总的时间复杂度退化为 O(N²)。\n\nRedis 的 SDS 通过空间预分配和惰性释放两个策略彻底解决了这个问题。\n\n## 第二步：空间预分配与惰性释放的实现细节\n\n### 空间预分配：sdsMakeRoomFor 源码分析\n\n空间预分配的核心逻辑在 src/sds.c 的 sdsMakeRoomFor 函数中。当 SDS 需要追加数据但空闲空间不足时（比如调用 sdscat、sdscatlen），会先调用 sdsMakeRoomFor 来扩容。以下是 Redis 7.2 中该函数的关键源码（省略了错误处理和 header 类型切换的细节）：\n\n```c\n/* sds.c — sdsMakeRoomFor 核心逻辑 */\nsds sdsMakeRoomFor(sds s, size_t addlen) {\n    size_t avail = sdsavail(s);  // avail = alloc - len\n    size_t len = sdslen(s);\n    size_t newlen;\n\n    // 1. 如果空闲空间已经够用，直接返回，不做任何分配\n    if (avail >= addlen) return s;\n\n    // 2. 计算扩容后的最小所需长度\n    newlen = len + addlen;\n\n    // 3. 核心：预分配策略——根据 newlen 决定实际分配多大\n    if (newlen < SDS_MAX_PREALLOC)  // SDS_MAX_PREALLOC = 1024*1024 = 1MB\n        newlen *= 2;                // 小于 1MB：翻倍分配\n    else\n        newlen += SDS_MAX_PREALLOC; // 大于等于 1MB：多分配 1MB\n\n    // 4. 调用 s_realloc（封装了 realloc）执行实际的内存分配\n    //    如果需要切换 header 类型（比如从 sdshdr8 升级到 sdshdr16），\n    //    会用 s_malloc + memcpy + s_free 代替 realloc\n    ...\n    sdssetalloc(s, newlen);  // 更新 alloc 字段\n    return s;\n}\n```\n\n这个函数的预分配策略由常量 SDS_MAX_PREALLOC 控制，定义在 src/sds.h 中：`#define SDS_MAX_PREALLOC (1024*1024)`，即 1MB。策略分两种情况：\n\n**情况一：newlen < 1MB（翻倍策略）。** 假设当前 SDS 的 len 为 100 字节，需要追加 50 字节，那么 newlen = 150 字节。因为 150 < 1MB，所以实际分配 150 × 2 = 300 字节。此时 len=150，alloc=300，空闲空间 = 150 字节。下次追加只要不超过 150 字节就不需要再 realloc。\n\n**情况二：newlen ≥ 1MB（加法策略）。** 假设当前 SDS 的 len 为 2MB，需要追加 1 字节，那么 newlen = 2MB+1。因为 2MB+1 ≥ 1MB，所以实际分配 2MB+1+1MB = 3MB+1。此时空闲空间约 1MB。这个策略避免了大字符串翻倍导致的内存浪费——一个 10MB 的字符串如果翻倍就是 20MB，多出的 10MB 空闲空间在大部分场景下不会被用到。\n\n用一个内存布局变化图来展示连续三次 APPEND 操作的过程：\n\n```\n初始状态：SET key \"hi\"         len=2, alloc=2, avail=0\n+------+---+---+----+\n| hdr  | h | i | \\0 |\n+------+---+---+----+\n\n第一次 APPEND \"!!\"（需要 2 字节，avail=0 不够）\n  → newlen = 2+2 = 4, 4 < 1MB → alloc = 4*2 = 8\n+------+---+---+---+---+---+---+---+---+----+\n| hdr  | h | i | ! | ! | . | . | . | . | \\0 |\n+------+---+---+---+---+---+---+---+---+----+\n              len=4          alloc=8  avail=4\n              (.表示空闲空间)\n\n第二次 APPEND \"ab\"（需要 2 字节，avail=4 够用）\n  → 不触发 realloc，直接写入！\n+------+---+---+---+---+---+---+---+---+----+\n| hdr  | h | i | ! | ! | a | b | . | . | \\0 |\n+------+---+---+---+---+---+---+---+---+----+\n              len=6          alloc=8  avail=2\n\n第三次 APPEND \"cd\"（需要 2 字节，avail=2 刚好够用）\n  → 仍然不触发 realloc！\n+------+---+---+---+---+---+---+---+---+----+\n| hdr  | h | i | ! | ! | a | b | c | d | \\0 |\n+------+---+---+---+---+---+---+---+---+----+\n              len=8          alloc=8  avail=0\n```\n\n三次 APPEND 操作只触发了一次 realloc。如果用 C 原生字符串，同样的操作需要三次 realloc。\n\n### 惰性空间释放：缩短时不立即回收\n\n惰性释放是预分配的反面：当 SDS 的内容变短时，多余的空间不会立即释放，而是保留在 alloc 中等待后续复用。这个行为体现在多个 SDS 函数中：\n\n**sdstrim** 函数用于去除字符串两端包含在指定字符集中的字符（类似 Python 的 strip）。它的实现是移动 buf 中的有效数据到起始位置、更新 len 字段，但完全不修改 alloc——多出来的空间就留在那里。\n\n**sdsrange** 函数用于截取子串（类似 GETRANGE 命令的底层操作）。它用 memmove 把指定范围的字节移到 buf 起始位置、更新 len，同样不释放多余空间。\n\n**sdsclear** 函数最为极端——它把 len 设为 0，buf[0] 设为 '\\0'，但 alloc 完全不变。一个 10MB 的 SDS 调用 sdsclear 后，逻辑上变成了空字符串，但物理上仍然占用 10MB 的内存。这个函数在 Redis 内部被频繁使用，比如 AOF 缓冲区在每次刷盘后会调用 sdsclear 重置，下次写入时直接复用已分配的空间而不需要重新分配。\n\n```c\n/* sds.c — sdsclear 实现 */\nvoid sdsclear(sds s) {\n    sdssetlen(s, 0);  // len = 0\n    s[0] = '\\0';      // 保持 C 字符串兼容\n    // 注意：alloc 不变，内存不释放！\n}\n```\n\n如果确实需要释放多余空间，必须显式调用 **sdsRemoveFreeSpace** 函数，它会用 realloc 将内存收缩到恰好容纳 len + header + '\\0' 的大小。而 **sdsfree** 则是彻底释放整个 SDS 的函数，包括 header、buf 和所有空闲空间，对应的是 malloc 的完全逆操作。\n\n## 第三步：摊还分析、内存影响与面试扩展\n\n### 预分配的摊还复杂度分析\n\n空间预分配策略的数学本质是一个经典的「倍增摊还」（doubling amortized）问题。对于 newlen < 1MB 的翻倍策略，考虑从空字符串开始连续执行 N 次 APPEND、每次追加 1 字节的场景。第 1 次 APPEND 触发 realloc（alloc 从 0 变为 2），第 2 次不触发（alloc=2 够用），第 3 次触发（alloc 从 2 变为 6），第 4-6 次不触发，第 7 次触发……实际触发 realloc 的次数约为 log₂(N) 次。每次 realloc 的复制开销与当前 len 成正比，总的复制开销约为 1 + 2 + 4 + 8 + ... + N = 2N - 1 = O(N)。平摊到 N 次操作，每次 APPEND 的摊还复杂度为 O(1)。这与 C 原生字符串每次 realloc 的 O(N) 总复杂度 O(N²) 相比是质的飞跃。\n\n对于 newlen ≥ 1MB 的加法策略，虽然不再翻倍，但每次扩容多出 1MB 的空间意味着至少要再追加 1MB 数据才会再次触发 realloc。在大字符串场景下，这既避免了翻倍带来的巨大内存浪费，又保证了 realloc 的频率不会太高。\n\n### 内存碎片与生产影响\n\n预分配和惰性释放的代价是内存使用率不是 100%——SDS 总是会持有一些「用不到但也没释放」的空闲空间。在极端场景下，比如大量字符串先增长到很大再缩短到很小（APPEND 后再 SETRANGE 缩短），alloc 远大于 len，就会造成显著的内存浪费。Redis 的 INFO memory 输出中有一个 mem_fragmentation_ratio 指标，如果这个值远大于 1.0（比如 1.5 以上），可能就有 SDS 惰性释放积累的空间浪费在其中。\n\nRedis 4.0 引入了 activedefrag（主动碎片整理）功能，可以在后台扫描内存并重新分配碎片化严重的对象，包括 SDS。从 Redis 4.0 开始可以通过 `config set activedefrag yes` 开启这个功能，配合 active-defrag-threshold-lower（触发整理的碎片率下限，默认 10%）和 active-defrag-threshold-upper（全力整理的碎片率上限，默认 100%）来控制行为。在生产环境中，如果观察到 mem_fragmentation_ratio 持续偏高，开启 activedefrag 是比重启 Redis 更优雅的解决方案。\n\n### sdsclear 只重置 len 不释放的设计考量\n\nsdsclear 是一个容易被忽视但设计巧妙的函数。Redis 的 AOF 重写缓冲区（aof_rewrite_buf_blocks）、客户端输出缓冲区等场景都存在「写入→刷盘/发送→清空→再写入」的循环模式。如果每次清空都释放内存再重新分配，就回到了频繁 malloc/free 的老路。sdsclear 只重置 len 为 0 而保留 alloc，下次写入直接复用已分配的空间，完美适配这种「清空-复用」模式。理解这一点对排查 Redis 内存占用很重要：如果你看到一个 Redis 实例的 used_memory 在 AOF 重写期间突然增大然后不回落，很可能就是 AOF 缓冲区的 SDS 通过 sdsclear 保持了峰值时的 alloc。\n\n### 面试高频考点总结\n\n面试官问「SDS 的空间预分配」时，最常见的追问方向有三个。第一个是让你说出具体的预分配规则——必须答出 1MB 阈值、翻倍策略和加法策略，以及 SDS_MAX_PREALLOC 这个常量名。第二个是追问「惰性释放会不会导致内存泄漏」——答案是不会，因为 SDS 的空闲空间仍然由 Redis 进程持有，INFO memory 的 used_memory 能统计到这部分内存，而且可以通过 sdsRemoveFreeSpace 主动回收或由 activedefrag 自动整理。第三个方向是让你对比 SDS 的扩容策略与其他语言的动态数组策略——Go 的 slice 在容量小于 256 时翻倍、大于 256 时按约 1.25 倍增长（Go 1.18+），Java 的 ArrayList 按 1.5 倍增长，C++ 的 std::vector 在大部分实现中翻倍——SDS 的 1MB 阈值切换策略是一种针对 Redis 字符串使用模式的定制化设计，平衡了小字符串的快速增长需求和大字符串的内存节约需求。",
+      "keyPoints": [
+        "SDS 的 alloc 字段记录 buf 的总分配容量，alloc - len 即为当前空闲空间；Redis 3.2 之前用 free 字段直接记录空闲字节数，3.2 后改用 alloc 以支持多种 header 类型和 MEMORY USAGE 计算",
+        "空间预分配策略由 sdsMakeRoomFor 函数和 SDS_MAX_PREALLOC（1MB）常量控制：扩容后 newlen < 1MB 时分配 2 × newlen（翻倍），newlen ≥ 1MB 时分配 newlen + 1MB（加法），避免大字符串翻倍的巨大内存浪费",
+        "惰性空间释放意味着 sdstrim、sdsrange、sdsclear 等缩短操作只更新 len 字段而不调用 realloc 回收多余空间，保留的空闲空间可供后续增长操作直接使用",
+        "翻倍预分配策略将 N 次连续 APPEND 的 realloc 次数从 O(N) 降至 O(log N)，总复制开销从 O(N²) 降至 O(N)，摊还到每次操作为 O(1)",
+        "sdsclear 只将 len 设为 0 而保留全部已分配内存（alloc 不变），专门服务于 AOF 缓冲区等「清空-复用」循环模式，避免反复 malloc/free",
+        "需要主动回收空闲空间时可调用 sdsRemoveFreeSpace 收缩到精确大小；彻底销毁 SDS 则使用 sdsfree 释放全部内存（含 header、buf 和空闲空间）",
+        "惰性释放积累的空闲空间会体现在 INFO memory 的 mem_fragmentation_ratio 中，Redis 4.0+ 可通过 activedefrag 在后台自动整理内存碎片",
+        "SDS 的 1MB 阈值切换策略是针对 Redis 字符串使用模式的定制设计：小字符串频繁增长时翻倍保证快速收敛，大字符串场景下加法策略控制内存上界"
+      ],
+      "quiz": [
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz1",
+          "question": "SDS 中 alloc 字段的含义是什么？",
+          "choices": [
+            {"id": "A", "text": "buf 数组的总分配长度（不含 header 和末尾 '\\0'）"},
+            {"id": "B", "text": "字符串的实际使用长度（等同于 strlen 的结果）"},
+            {"id": "C", "text": "buf 数组中尚未使用的空闲字节数"},
+            {"id": "D", "text": "包含 header、buf 和 '\\0' 在内的整个 SDS 对象的总字节数"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "alloc 记录的是 buf 数组被 malloc/realloc 分配的总长度，不包含 header 大小和末尾的 '\\0' 字节。B 选项描述的是 len 字段的含义。C 选项描述的是旧版 SDS（Redis 3.2 之前）中 free 字段的含义——在新版中空闲空间通过 alloc - len 计算得出，而不是由一个独立字段存储。D 选项错误地把 header 和 '\\0' 也算了进去，实际上 alloc 只衡量 buf 的数据区容量。"
+        },
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz2",
+          "question": "当一个 len=200 字节的 SDS 需要追加 100 字节且空闲空间不足时，sdsMakeRoomFor 会将 alloc 扩容到多少？",
+          "choices": [
+            {"id": "A", "text": "300 字节，刚好满足 len + addlen 的需求"},
+            {"id": "B", "text": "400 字节，按照 1.5 倍增长策略分配"},
+            {"id": "C", "text": "1048876 字节（300 + 1MB），因为超过了 SDS_MAX_PREALLOC 阈值"},
+            {"id": "D", "text": "600 字节，因为 newlen=300 < 1MB，执行翻倍策略 300×2=600"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "sdsMakeRoomFor 的预分配规则是：先计算 newlen = len + addlen = 200 + 100 = 300。然后检查 newlen 是否小于 SDS_MAX_PREALLOC（1MB = 1048576 字节）。300 远小于 1MB，所以执行翻倍策略：alloc = 300 × 2 = 600 字节。A 选项是「刚好够用」的分配方式，SDS 不会这样做，因为那样下次追加又得 realloc。B 选项的 1.5 倍增长是 Java ArrayList 的策略，不是 SDS 的。C 选项错误地套用了大于 1MB 时的加法策略。"
+        },
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz3",
+          "question": "当一个 len=5MB 的 SDS 需要追加 1 字节时，sdsMakeRoomFor 的实际分配策略是什么？",
+          "choices": [
+            {"id": "A", "text": "alloc 翻倍到约 10MB，与小字符串使用相同的翻倍策略"},
+            {"id": "B", "text": "alloc 刚好设为 5MB+1 字节，大字符串不做任何预分配"},
+            {"id": "C", "text": "alloc 设为约 6MB+1（newlen + 1MB），使用加法策略避免翻倍带来的巨大内存浪费"},
+            {"id": "D", "text": "alloc 设为约 6.25MB（newlen × 1.25），采用渐进增长因子"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "当 newlen = 5MB+1 字节 ≥ SDS_MAX_PREALLOC（1MB）时，sdsMakeRoomFor 使用加法策略而非翻倍策略，实际分配 newlen + 1MB ≈ 6MB+1 字节。这是因为翻倍一个 5MB 的字符串意味着多分配 5MB 的空闲空间，而在大部分生产场景下这些空间不会被用到，属于严重浪费。加法策略固定多分配 1MB，在保留合理预留空间的同时控制了内存上界。A 选项翻倍到 10MB 会浪费近 5MB。B 选项不做预分配则下次追加又要 realloc。D 选项的 1.25 倍因子是 Go 1.18+ slice 的增长策略。"
+        },
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz4",
+          "question": "以下哪个函数在缩短 SDS 后会立即释放多余的内存空间？",
+          "choices": [
+            {"id": "A", "text": "sdstrim — 去除两端指定字符后立即 realloc 回收"},
+            {"id": "B", "text": "sdsclear — 清空内容的同时释放所有空闲空间"},
+            {"id": "C", "text": "sdsrange — 截取子串后自动收缩 alloc 到 len"},
+            {"id": "D", "text": "sdsRemoveFreeSpace — 显式调用 realloc 收缩到精确大小"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "sdstrim、sdsrange 和 sdsclear 都遵循惰性空间释放策略——它们只更新 len 字段，不调用 realloc 回收多余内存。sdstrim 移动有效数据后更新 len 但 alloc 不变；sdsrange 用 memmove 截取子串后同样保留原有 alloc；sdsclear 更极端，直接将 len 设为 0 但 alloc 完全不变。只有 sdsRemoveFreeSpace 会显式调用 realloc 将内存收缩到恰好容纳 len + header + '\\0' 的大小，是唯一的主动回收手段。"
+        },
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz5",
+          "question": "一个 SDS 经过 SET key \"hello world\"（11 字节）→ APPEND key \"!!!\"（3 字节）→ SETRANGE key 0 \"hi\"（覆盖前 2 字节）操作后，其 len、alloc 分别最可能是多少？",
+          "choices": [
+            {"id": "A", "text": "len=14, alloc=14 — 每次操作都精确分配"},
+            {"id": "B", "text": "len=14, alloc=28 — APPEND 时翻倍预分配，SETRANGE 不改变 alloc"},
+            {"id": "C", "text": "len=14, alloc=22 — APPEND 时按 1.5 倍预分配"},
+            {"id": "D", "text": "len=2, alloc=28 — SETRANGE 会截断字符串到覆盖范围"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "SET 创建时 len=11，alloc=11（初始创建通常精确分配）。APPEND 3 字节后 len 应为 14，因为原有空间不足需要扩容，newlen=14 < 1MB 所以翻倍：alloc=14×2=28。SETRANGE key 0 \"hi\" 只是在原地覆盖前 2 个字节（将 'he' 改为 'hi'），不改变字符串长度也不影响 alloc。所以最终 len=14, alloc=28。A 选项忽略了预分配策略。C 选项的 1.5 倍不是 SDS 的策略。D 选项对 SETRANGE 的理解完全错误——SETRANGE 是覆盖写入，不会截断字符串。"
+        },
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz6",
+          "question": "关于 sdsclear 和 sdsfree 的区别，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "sdsclear 释放 buf 中的数据但保留 header，sdsfree 连 header 一起释放"},
+            {"id": "B", "text": "两者效果相同，都会将 SDS 占用的内存归还给操作系统"},
+            {"id": "C", "text": "sdsclear 只将 len 设为 0 且 alloc 不变（内存完全保留），sdsfree 释放整个 SDS 的全部内存"},
+            {"id": "D", "text": "sdsclear 将 alloc 设为 0 并调用 realloc 收缩内存，sdsfree 则不释放只标记为可回收"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "sdsclear 的实现只做两件事：sdssetlen(s, 0) 将 len 置零，s[0]='\\0' 保持 C 字符串兼容。它不修改 alloc，不调用 realloc，内存完全保留——一个 10MB 的 SDS 调用 sdsclear 后逻辑上是空字符串，物理上仍占 10MB。这种设计服务于 AOF 缓冲区等「清空-复用」场景。sdsfree 则调用 s_free 彻底释放整个内存块（header + buf + 空闲空间），调用后指针失效。A 选项错误，sdsclear 不释放任何内存。B 和 D 选项对两个函数的行为都有根本性的误解。"
+        },
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz7",
+          "question": "对比 SDS 的翻倍预分配策略和 Go 1.18+ slice 的扩容策略，以下哪个描述最准确？",
+          "choices": [
+            {"id": "A", "text": "两者完全相同，都在小容量时翻倍、大容量时线性增长"},
+            {"id": "B", "text": "SDS 以 1MB 为阈值在翻倍和加法（+1MB）之间切换，Go slice 以 256 为阈值在翻倍和约 1.25 倍渐进增长之间切换"},
+            {"id": "C", "text": "SDS 始终翻倍不设上限，Go slice 始终按 1.25 倍增长"},
+            {"id": "D", "text": "SDS 按 1.5 倍增长，Go slice 按 2 倍增长，方向相反"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "SDS 和 Go slice 的扩容策略都采用了「小容量激进增长、大容量保守增长」的分段设计，但具体参数不同。SDS 的分界线是 SDS_MAX_PREALLOC = 1MB：小于 1MB 翻倍（×2），大于等于 1MB 固定加 1MB。Go 1.18+ 的 slice 分界线是 256 个元素：小于 256 翻倍（×2），大于等于 256 按 newcap + (newcap+3*256)/4 的公式渐进增长（约等于 ×1.25 + 192）。两者的设计思路相似但参数针对各自的使用场景做了定制。A 选项说完全相同不准确。C 和 D 选项的描述都是错误的。"
+        },
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz8",
+          "question": "生产环境中发现 Redis 实例的 mem_fragmentation_ratio 持续在 1.8 左右，可能与 SDS 相关的原因是什么？如何缓解？",
+          "choices": [
+            {"id": "A", "text": "SDS 的预分配策略与碎片率无关，1.8 的碎片率一定是操作系统内存分配器的问题"},
+            {"id": "B", "text": "大量字符串先 APPEND 增长再 DEL 删除，SDS 惰性释放导致碎片化；可通过 Redis 4.0+ 的 activedefrag 功能自动整理"},
+            {"id": "C", "text": "应该将 SDS_MAX_PREALLOC 从 1MB 调小到 64KB 来减少预分配浪费"},
+            {"id": "D", "text": "碎片率 1.8 是正常的健康状态，不需要任何处理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "mem_fragmentation_ratio = used_memory_rss / used_memory，1.8 意味着 RSS 比 Redis 认为自己使用的内存多了 80%，这是明显偏高的。SDS 惰性释放导致的「已分配但未使用」空间、频繁大小变化的字符串造成的 jemalloc 碎片都可能是原因。Redis 4.0 引入的 activedefrag 功能可以在后台扫描并重新分配碎片化的内存对象，通过 config set activedefrag yes 开启。A 选项过于绝对，SDS 的内存行为确实影响碎片率。C 选项错误，SDS_MAX_PREALLOC 是编译时常量，不能动态调整。D 选项错误，1.8 的碎片率意味着近一半的 RSS 是浪费，需要关注。"
+        },
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz9",
+          "question": "Redis 3.2 将 SDS 的 free 字段替换为 alloc 字段的核心原因是什么？",
+          "choices": [
+            {"id": "A", "text": "为了配合多种 header 类型（sdshdr5/8/16/32/64），alloc 表达总容量的语义更清晰，且能直接计算 SDS 实际占用的内存大小"},
+            {"id": "B", "text": "alloc 比 free 占用更少的存储空间，进一步压缩了 header 大小"},
+            {"id": "C", "text": "free 字段存在并发安全问题，alloc 字段通过原子操作解决了多线程竞争"},
+            {"id": "D", "text": "纯粹是代码风格重构，free 和 alloc 在功能上完全等价没有任何区别"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 3.2 的 SDS 重构引入了 sdshdr5/8/16/32/64 五种 header 类型以针对不同长度的字符串优化内存。在这种多 header 体系中，用 alloc 表示总容量比用 free 表示剩余空间在语义上更一致、更清晰。更重要的是，alloc 可以直接用来计算 SDS 对象的实际内存占用（header_size + alloc + 1），这对 MEMORY USAGE 命令和内存分析至关重要，而 free 做不到这一点（还需要额外知道 len 才能算出总大小）。B 选项错误，alloc 和 free 在同种 header 中占用的空间相同。C 选项错误，Redis 是单线程模型，不存在并发安全问题。D 选项忽视了语义和功能上的真实差异。"
+        },
+        {
+          "id": "redis-internal-sds-prealloc-q1-quiz10",
+          "question": "在连续 N 次 APPEND 操作（每次追加固定长度）的场景下，SDS 翻倍预分配策略将 realloc 的总次数控制在什么量级？",
+          "choices": [
+            {"id": "A", "text": "O(N) — 每次 APPEND 仍然需要一次 realloc"},
+            {"id": "B", "text": "O(N²) — realloc 次数随字符串增长而加速增加"},
+            {"id": "C", "text": "O(log N) — 翻倍策略使得 realloc 间隔指数增长，总次数呈对数级别"},
+            {"id": "D", "text": "O(1) — 预分配一次后永远不需要再 realloc"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "翻倍预分配的核心效果是每次 realloc 后空闲空间等于当前 len，下一次 realloc 至少需要再追加 len 字节的数据才会触发。这意味着两次 realloc 之间的 APPEND 次数随字符串增长呈指数增加（1, 2, 4, 8, ...），所以 N 次 APPEND 总共只触发约 log₂(N) 次 realloc。A 选项是不做预分配时的情况。B 选项的 O(N²) 是 C 原生字符串频繁 strcat 的总复制开销，不是 realloc 次数。D 选项不可能，任何有限的预分配空间最终都会被用完，只是触发频率大大降低了。"
+        }
+      ],
+      "references": [
+        "https://github.com/redis/redis/blob/7.2/src/sds.h",
+        "https://github.com/redis/redis/blob/7.2/src/sds.c",
+        "https://redis.io/docs/latest/develop/reference/internals/"
+      ]
+    }
+  ]
+}
