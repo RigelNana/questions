@@ -1,0 +1,156 @@
+{
+  "id": "docker-lifecycle-graceful-shutdown",
+  "name": "容器优雅停止实现",
+  "domain": "docker",
+  "description": "全面讲解容器优雅停止的信号传递链路、PID 1 问题及 tini/dumb-init 方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-lifecycle-graceful-shutdown-q1",
+      "domain": "docker",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["docker", "graceful-shutdown", "SIGTERM", "PID 1", "tini", "dumb-init", "exec-form", "STOPSIGNAL", "容器生命周期"],
+      "title": "如何实现容器的 Graceful Shutdown？从信号链路到生产落地",
+      "content": "你的团队最近做了一轮微服务容器化改造，所有服务都运行在 Docker 上，前面挂了一层 Nginx 反向代理。上线后第一次做滚动更新就踩了坑——每次 `docker stop` 旧容器、启动新容器的窗口期，监控上都会冒出一波 502 错误。奇怪的是，这波 502 的持续时间几乎精确等于 10 秒，也就是 `docker stop` 默认的超时等待时间。\n\n你在本地复现了这个问题：\n\n```bash\n$ time docker stop myapp\nmyapp\nreal    0m10.245s\nuser    0m0.012s\nsys     0m0.008s\n```\n\n看日志，没有任何 graceful shutdown 的痕迹——既没有「closing connections」也没有「flushing buffers」，容器就像被人直接拔了电源。你检查了 Dockerfile：\n\n```dockerfile\nFROM node:20-slim\nCOPY . /app\nWORKDIR /app\nCMD npm start\n```\n\n而应用代码里明明写好了 SIGTERM 处理逻辑：\n\n```javascript\nprocess.on('SIGTERM', () => {\n  console.log('Received SIGTERM, shutting down gracefully...');\n  server.close(() => {\n    console.log('All connections closed.');\n    process.exit(0);\n  });\n});\n```\n\n代码写了，但从来没触发过。问题出在哪？要彻底解决容器的优雅停止问题，需要从 Docker 的信号传递机制讲到生产环境的最佳实践——面试官想听的不只是找到这个 bug，而是你对整条信号传递链路的理解，以及在 Docker 和 Kubernetes 两种编排环境下分别怎么保证优雅停止。",
+      "answer": "## 容器优雅停止的核心概念\n\n容器化环境中，优雅停止（Graceful Shutdown）是一个看似简单却在生产环境中高频踩坑的问题。所谓优雅停止，是指容器在收到停止指令后，不是立即被杀掉，而是先完成三件关键的收尾工作。第一，把正在处理的 HTTP 请求或 RPC 调用处理完再关闭监听端口，这就是「连接排空」（connection draining）——如果这一步缺失，客户端会收到 `connection reset by peer` 或 502 错误。第二，把缓冲区里还没落盘的数据写入磁盘或远端存储，确保数据持久化不丢——想象一下 Redis 的 AOF 缓冲区在被 SIGKILL 时还有几百条写命令没 fsync。第三，向消息队列发送 ACK 确认或把未处理的消息 reject 回去，避免消息被静默吞掉——Kafka consumer 被强杀后，那条消息会卡在「已拉取未提交」状态，等待 session timeout 后才能被重新分配，白白浪费几十秒。\n\n`docker stop` 的设计就是为了给应用留出做这些收尾工作的时间。它的完整工作流程分两步：首先向容器的 PID 1 进程发送一个停止信号（默认是 SIGTERM，信号编号 15），然后等待一个宽限期（默认 10 秒，可以通过 `docker stop -t` 参数修改）。如果宽限期内 PID 1 正常退出了，容器停止完成，退出码是 143（128+15）；如果超时后 PID 1 还在跑，Docker 会补发 SIGKILL（信号编号 9）强制终止，退出码变成 137（128+9）。这两个退出码在排查问题时非常关键——看到 137 就知道容器是被强杀的，优雅停止没有生效。\n\n## 信号传递链路与 PID 1 问题\n\n回到 content 中的 bug。问题的根源在 Dockerfile 的 `CMD npm start` 这一行。这是 shell form 写法，Docker 引擎会将它展开为 `/bin/sh -c \"npm start\"`，容器内的进程树变成这样：\n\n```\nPID   USER   COMMAND\n1     root   /bin/sh -c npm start\n7     root   npm start\n12    root   node /app/server.js\n```\n\nPID 1 是 `/bin/sh`，npm 是 sh 的子进程，而你的 Node.js 应用 server.js 是 npm 的孙子进程。`docker stop` 发出的 SIGTERM 只会送达 PID 1——也就是 sh。而 `/bin/sh` 作为 PID 1 有一个致命特性：它没有注册 SIGTERM 的信号处理函数（signal handler）。根据 Linux 内核对 PID 1 的保护规则——如果 PID 1 没有为某个信号注册 handler，内核直接忽略该信号而不执行默认的终止动作——SIGTERM 被静默丢弃了。sh 不退出，它的子进程 npm 和孙子进程 node 自然也收不到任何停止通知，于是整个容器卡在那里，直到 10 秒后被 SIGKILL 强杀。你可以在容器内验证这一点：\n\n```bash\n$ docker exec myapp cat /proc/1/status | grep SigCgt\nSigCgt: 0000000000000000    # sh 没有注册任何信号处理函数\n```\n\n`SigCgt` 字段全为零，说明 PID 1（sh）没有 catch 任何信号，所有发给它的信号都会被内核的 PID 1 保护机制吞掉。\n\n## 三条解决路线\n\n### 路线一：exec form 让应用直接成为 PID 1\n\n把 Dockerfile 改成 exec form：\n\n```dockerfile\nCMD [\"node\", \"/app/server.js\"]\n```\n\n注意这里跳过了 npm，直接用 node 启动。因为 npm 本身也不会把信号转发给子进程——`npm start` 内部是用 `child_process.spawn` 启动 node 的，npm 收到 SIGTERM 后自己退出了但不会通知子进程。exec form 不经过 sh 解析，Docker 直接调用 `execve(\"node\", [\"node\", \"/app/server.js\"])`，node 进程成为 PID 1。Node.js 运行时默认注册了 SIGTERM handler，`docker stop` 发出的 SIGTERM 能正常递交给应用的 `process.on('SIGTERM')` 回调，触发连接排空后优雅退出。\n\n如果你确实需要 shell 变量展开（比如 `$PORT`），可以用 exec form 配合 `exec` 关键字：\n\n```dockerfile\nCMD [\"sh\", \"-c\", \"exec node /app/server.js --port=$PORT\"]\n```\n\n`exec` 会调用 `execve` 用 node 进程替换掉当前的 sh 进程，node 成为 PID 1，既能用 shell 变量展开又能正常接收信号。这是一个非常实用的技巧。\n\n### 路线二：tini / dumb-init 作为轻量级 init 进程\n\n如果你的应用进程树比较复杂——比如主进程会 fork 出 worker 子进程——单纯让主进程成为 PID 1 可能不够，因为普通应用进程没有回收僵尸进程的逻辑。这时候需要一个专门的 init 进程。tini 是 Docker 官方推荐的方案，编译后的二进制只有不到 30KB，它做两件事：注册所有信号的 handler 并通过 `kill(-child_pid, sig)` 转发给子进程组，以及持续调用 `waitpid(-1, ...)` 回收僵尸进程。\n\n最简单的方式是在运行时加 `--init` 参数：\n\n```bash\n$ docker run --init -d --name myapp node:20-slim node /app/server.js\n$ docker exec myapp ps aux\nPID   USER   COMMAND\n  1   root   /sbin/docker-init -- node /app/server.js\n  8   root   node /app/server.js\n```\n\n`/sbin/docker-init` 就是 Docker 内置的 tini 二进制（Docker 20.10+ 默认自带）。Docker Compose 中对应 `init: true`。如果要在镜像中内置 tini：\n\n```dockerfile\nFROM node:20-slim\nRUN apt-get update && apt-get install -y --no-install-recommends tini \\\n    && rm -rf /var/lib/apt/lists/*\nENTRYPOINT [\"tini\", \"--\"]\nCMD [\"node\", \"/app/server.js\"]\n```\n\ndumb-init 和 tini 核心功能一致，额外支持信号重写（signal rewriting）——比如你可以用 `dumb-init --rewrite 15:3` 把收到的 SIGTERM（15）映射成 SIGQUIT（3）再转发给子进程，这在 Nginx 这类用 SIGQUIT 触发优雅退出的应用中有实际价值。\n\n### 路线三：STOPSIGNAL 与 stop_grace_period 配置\n\n某些应用不用 SIGTERM 作为优雅退出信号——Nginx 官方推荐用 SIGQUIT，Apache httpd 用 SIGWINCH。Dockerfile 的 `STOPSIGNAL` 指令可以自定义停止信号：\n\n```dockerfile\nFROM nginx:1.25-alpine\nSTOPSIGNAL SIGQUIT\n```\n\n但要注意：STOPSIGNAL 只改变了发哪个信号，不解决 PID 1 保护问题。如果你同时用了 shell form，换什么信号都没用，照样被 sh 吞掉。\n\n宽限期通过 Docker Compose 的 `stop_grace_period` 配置（`docker stop` 用 `-t` 参数）：\n\n```yaml\nservices:\n  api:\n    image: myapp:latest\n    init: true\n    stop_grace_period: 30s\n```\n\n一般建议和应用的最长请求超时对齐。比如 API 最长超时 15 秒，stop_grace_period 设 20 秒留点余量就够了。设太长会拖慢滚动更新速度——每个容器多等 30 秒，10 个实例就多等 5 分钟。\n\n## 应用层信号处理与连接排空\n\n信号能送达只是第一步，应用自身也必须正确处理。以 Go 为例，标准的优雅停止模式用 `signal.NotifyContext`：\n\n```go\nfunc main() {\n    srv := &http.Server{Addr: \":8080\", Handler: mux}\n    go srv.ListenAndServe()\n\n    ctx, stop := signal.NotifyContext(context.Background(),\n        syscall.SIGTERM, syscall.SIGINT)\n    defer stop()\n    <-ctx.Done()\n\n    shutdownCtx, cancel := context.WithTimeout(\n        context.Background(), 15*time.Second)\n    defer cancel()\n    srv.Shutdown(shutdownCtx)\n}\n```\n\n`http.Server.Shutdown` 会先关闭监听端口（不再接受新连接），然后等待所有活跃连接的请求处理完毕。数据库连接池（`sql.DB`）需要在 shutdown 阶段调用 `db.Close()` 等待借出的连接归还后再关闭底层 TCP 连接。Redis 连接池、gRPC 客户端连接都遵循「停止借出 → 等待归还 → 关闭底层」的三步排空模式。\n\n## Kubernetes preStop hook 与面试扩展\n\n在 Kubernetes 环境中有一个关键区别：**Pod 从 Service Endpoints 摘除和容器收到 SIGTERM 是并行进行的**。kubelet 收到删除指令后，同时做两件事——通知 Endpoints controller 摘除 Pod IP，以及执行 preStop hook（如果配了）再发 SIGTERM。这带来一个竞态条件：SIGTERM 可能在 iptables/ipvs 规则更新之前就到达容器，应用开始关闭了但新请求还在被路由过来。\n\n解决方案是加一个 preStop hook：\n\n```yaml\nlifecycle:\n  preStop:\n    exec:\n      command: [\"sh\", \"-c\", \"sleep 5\"]\n```\n\n这 5 秒 sleep 给 Endpoints 摘除留出传播时间。注意 preStop 的执行时间算在 `terminationGracePeriodSeconds`（默认 30 秒）内，所以应用实际可用的 shutdown 时间是 30-5=25 秒。\n\n面试中这道题的高频追问方向包括：`docker stop` 两阶段流程、exec form vs shell form 的 PID 1 差异、tini/dumb-init 的原理、退出码 137 和 143 的含义、K8s preStop hook 解决 Endpoints 竞态的方案、以及「你们项目中是怎么做优雅停止的」这类落地经验题。能把这条链路从 Docker daemon 一直讲到应用层信号 handler 再延伸到 K8s，面试官通常就不会继续追问了。",
+      "keyPoints": [
+        "容器优雅停止的三个核心收尾工作是 HTTP 连接排空、缓冲区数据持久化和消息队列 ACK 确认，被 SIGKILL 强杀时这三者都无法完成，导致客户端收到 connection reset、缓冲数据丢失、消息被重复投递",
+        "docker stop 的两阶段流程：先向 PID 1 发送 SIGTERM（默认）等待 grace period（默认 10 秒），超时未退出则发 SIGKILL 强杀，退出码 143 表示 SIGTERM 正常退出、137 表示被 SIGKILL 强杀",
+        "shell form（CMD command arg）使 /bin/sh 成为 PID 1，sh 没有注册 SIGTERM handler 导致信号被内核的 PID 1 保护机制静默丢弃，应用作为子进程完全收不到停止信号",
+        "exec form（CMD [\"command\", \"arg\"]）通过 execve 让应用直接成为 PID 1 接收信号；需要 shell 变量展开时用 CMD [\"sh\", \"-c\", \"exec app $ARGS\"] 的 exec 替换模式兼顾两者",
+        "tini 和 dumb-init 是不到 30KB 的轻量 init 进程，作为 PID 1 转发信号给子进程组并回收僵尸进程，Docker --init 参数和 Compose init: true 可直接注入内置 tini 无需改 Dockerfile",
+        "STOPSIGNAL 指令可自定义停止信号（如 Nginx 用 SIGQUIT），但只改变信号类型不解决 PID 1 保护问题，必须配合 exec form 或 tini 使用才有效",
+        "Kubernetes 中 Pod 删除时 Endpoints 摘除和 SIGTERM 发送并行进行存在竞态，需要 preStop hook（如 sleep 5）给 Endpoints 传播留出时间窗口，preStop 时间算在 terminationGracePeriodSeconds 内"
+      ],
+      "quiz": [
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz1",
+          "question": "docker stop 默认向容器发送的第一个信号是什么？",
+          "choices": [
+            {"id": "A", "text": "SIGKILL（信号 9），直接强制终止容器进程"},
+            {"id": "B", "text": "SIGTERM（信号 15），通知进程优雅退出"},
+            {"id": "C", "text": "SIGINT（信号 2），模拟 Ctrl+C 中断"},
+            {"id": "D", "text": "SIGHUP（信号 1），通知进程终端挂断"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "docker stop 的工作流程是先发 SIGTERM（信号 15）给容器的 PID 1 进程，等待 grace period（默认 10 秒）后若进程未退出再发 SIGKILL 强杀。SIGTERM 是 Unix 系统中请求进程优雅退出的标准信号，进程可以捕获它并执行清理逻辑。A 选项的 SIGKILL 是第二阶段的兜底手段，不是第一个发送的信号。C 选项的 SIGINT 是终端中断信号（Ctrl+C），docker stop 不使用它。D 选项的 SIGHUP 是终端挂断信号，与容器停止无关。可以通过 STOPSIGNAL 指令或 docker stop --signal 自定义第一阶段的信号类型。"
+        },
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz2",
+          "question": "容器优雅停止最核心要解决的问题是什么？",
+          "choices": [
+            {"id": "A", "text": "减少容器的重启时间，加快滚动更新速度"},
+            {"id": "B", "text": "降低容器停止时的宿主机 CPU 和内存占用"},
+            {"id": "C", "text": "确保进行中的请求和事务完成后再退出，避免连接中断和数据丢失"},
+            {"id": "D", "text": "防止容器镜像文件系统层在停止时被损坏"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "优雅停止的核心目标是让应用在退出前完成三件收尾工作：HTTP/RPC 连接排空（把正在处理的请求处理完再关端口）、缓冲数据持久化（把内存中未落盘的数据 flush 到磁盘）、消息队列 ACK 确认（避免消息被静默吞掉）。如果被 SIGKILL 强杀，TCP 连接会被粗暴断开导致客户端收到 502/connection reset，缓冲区数据丢失，消息队列中的消息处于「已消费未确认」状态等待超时重投。A 选项说的是启动速度，和停止无关。B 选项混淆了资源管理和生命周期管理。D 选项中镜像层是只读的，不会因容器停止而损坏。"
+        },
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz3",
+          "question": "Dockerfile 中 CMD npm start（shell form）为什么会导致应用收不到 SIGTERM？",
+          "choices": [
+            {"id": "A", "text": "shell form 使 /bin/sh 成为 PID 1，sh 没有注册 SIGTERM handler 导致信号被内核的 PID 1 保护机制丢弃，应用作为 sh 的子进程收不到信号"},
+            {"id": "B", "text": "npm 进程本身会拦截所有信号并吞掉，不转发给 node 子进程"},
+            {"id": "C", "text": "Docker 引擎在检测到 shell form 时会自动跳过 SIGTERM 阶段直接发 SIGKILL"},
+            {"id": "D", "text": "Node.js 的 process.on('SIGTERM') 在容器内的 PID namespace 中不生效"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "shell form 写法会被 Docker 展开为 /bin/sh -c \"npm start\"，所以 PID 1 是 /bin/sh 而不是应用进程。Linux 内核对 PID 1 有特殊保护：如果 PID 1 没有为某个信号注册处理函数，内核直接忽略该信号而不是执行默认终止动作。/bin/sh 没有注册 SIGTERM handler，所以 SIGTERM 被内核静默丢弃。docker stop 只向 PID 1 发信号，sh 的子进程（npm 和 node）完全不知道有停止信号到来。B 选项虽然 npm 确实不转发信号，但核心原因是 sh 作为 PID 1 导致信号就没进来。C 和 D 选项都是编造的，Docker 不会因 form 类型改变行为，Node.js 信号机制在容器内正常工作。"
+        },
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz4",
+          "question": "Docker 的 --init 参数底层使用了什么机制来解决信号传递问题？",
+          "choices": [
+            {"id": "A", "text": "在容器中启动一个精简版 systemd 作为 PID 1 管理所有进程"},
+            {"id": "B", "text": "修改容器的 PID namespace 配置使内核取消对 PID 1 的信号保护"},
+            {"id": "C", "text": "将应用进程的 PID 强制改为 2 以绕过 PID 1 信号保护规则"},
+            {"id": "D", "text": "注入内置的 tini 二进制作为 PID 1，由 tini 注册信号 handler 转发给子进程组并回收僵尸进程"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "docker run --init 会自动在容器中注入 /sbin/docker-init（本质上就是 tini），让它作为 PID 1 运行。tini 是一个不到 30KB 的轻量级 init 进程，做两件事：注册所有信号的处理函数，收到信号后通过 kill(-child_pid, sig) 转发给子进程组；持续调用 waitpid(-1, ...) 回收孤儿和僵尸进程。Docker Compose 中对应 init: true 配置项。A 选项错误，不是 systemd 而是 tini，systemd 太重了不适合容器场景。B 选项错误，内核的 PID 1 保护机制无法通过用户态配置关闭。C 选项是编造的，PID 是内核分配的不能手动修改。"
+        },
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz5",
+          "question": "执行 docker inspect --format '{{.State.ExitCode}}' myapp 返回 137，这说明容器是怎么退出的？",
+          "choices": [
+            {"id": "A", "text": "容器正常退出，应用代码中调用了 process.exit(137)"},
+            {"id": "B", "text": "容器被 SIGKILL（信号 9）强制终止，退出码 128+9=137，通常意味着容器没有在 grace period 内响应 SIGTERM"},
+            {"id": "C", "text": "容器因 OOM（内存不足）被 Linux 内核的 OOM Killer 杀死"},
+            {"id": "D", "text": "容器因磁盘空间不足导致文件系统只读而退出"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Linux 中当进程被信号终止时，退出码的计算公式是 128 + 信号编号。SIGKILL 的编号是 9，所以退出码是 128+9=137。在 docker stop 的上下文中，137 意味着容器没有在 grace period（默认 10 秒）内响应 SIGTERM 正常退出，被 Docker 在超时后发送的 SIGKILL 强杀了。这是 PID 1 信号传递问题的典型特征。A 选项虽然理论上应用也能主动返回 137，但这不是惯例做法。C 选项中 OOM Kill 确实也会产生 137（因为 OOM Killer 也是发 SIGKILL），需要结合 docker inspect 的 OOMKilled 字段和 dmesg 日志来区分。D 选项中磁盘问题不会产生 137 退出码。"
+        },
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz6",
+          "question": "关于 Dockerfile 的 STOPSIGNAL 指令，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "STOPSIGNAL 只改变 docker stop 发送的信号类型，如果 PID 1 没有注册该信号的 handler，信号同样会被内核丢弃"},
+            {"id": "B", "text": "设置 STOPSIGNAL 后 Docker 会自动确保 PID 1 能够处理该信号"},
+            {"id": "C", "text": "STOPSIGNAL 只支持 SIGTERM 和 SIGKILL 两种信号"},
+            {"id": "D", "text": "STOPSIGNAL 会覆盖 docker stop --signal 参数指定的信号"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "STOPSIGNAL 指令告诉 Docker 在 docker stop 的第一阶段发送哪个信号来替代默认的 SIGTERM，比如 Nginx 镜像通常设置 STOPSIGNAL SIGQUIT。但它只改变信号的类型，不解决 PID 1 保护问题——如果你用了 shell form 导致 /bin/sh 是 PID 1，sh 同样没有注册 SIGQUIT 的 handler，信号照样被内核丢弃。所以 STOPSIGNAL 必须配合 exec form 或 tini 使用才有效。B 选项错误，Docker 不会自动做任何信号处理。C 选项错误，STOPSIGNAL 支持任何有效的 Linux 信号。D 选项因果颠倒，docker stop --signal 参数会覆盖 STOPSIGNAL 设置。"
+        },
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz7",
+          "question": "tini 和 dumb-init 这两个轻量级 init 进程的主要区别是什么？",
+          "choices": [
+            {"id": "A", "text": "tini 只支持 Linux，dumb-init 支持 Linux 和 macOS 跨平台"},
+            {"id": "B", "text": "tini 用 C 编写只有 30KB，dumb-init 用 Python 编写有 5MB"},
+            {"id": "C", "text": "核心功能相同（信号转发+僵尸回收），但 dumb-init 额外支持信号重写，可以将收到的信号映射为另一个信号再转发给子进程"},
+            {"id": "D", "text": "tini 是 Docker 官方从零开发的，dumb-init 是第三方社区项目，两者设计理念完全不同"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "tini 和 dumb-init 都是 Yelp 公司开源的轻量级容器 init 进程，核心功能完全一致：作为 PID 1 注册信号 handler 并转发给子进程组，同时回收僵尸进程。主要区别在于 dumb-init 支持信号重写（signal rewriting）——比如用 dumb-init --rewrite 15:3 可以把收到的 SIGTERM（15）映射成 SIGQUIT（3）再转发给子进程，这在 Nginx 等使用非标准信号触发优雅退出的应用中很有用。A 选项错误，两者都是 Linux 原生工具。B 选项错误，dumb-init 也是 C 编写的，体积同样很小。D 选项有误，tini 最初是 Yelp 开源的项目，后来被 Docker 集成。"
+        },
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz8",
+          "question": "在 Kubernetes 滚动更新中，Pod 被删除时从 Service Endpoints 摘除和发送 SIGTERM 的先后关系是怎样的？",
+          "choices": [
+            {"id": "A", "text": "先从 Endpoints 摘除，确认流量切走后再向容器发送 SIGTERM"},
+            {"id": "B", "text": "先发 SIGTERM 触发应用关闭，应用关闭监听端口后 Endpoints 自动感知并摘除"},
+            {"id": "C", "text": "先发 SIGKILL 强杀容器，然后从 Endpoints 中清理残留记录"},
+            {"id": "D", "text": "两者并行进行——kubelet 同时触发 Endpoints 摘除和执行 preStop hook/发送 SIGTERM，存在竞态条件"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Kubernetes 中 Pod 被删除时，kubelet 会同时做两件事：一是通知 Endpoints controller 把 Pod IP 从 Service 后端列表中摘除，二是执行 preStop hook（如果配置了）然后发送 SIGTERM。这两个操作是并行的，不保证先后顺序。这带来一个经典的竞态条件：SIGTERM 可能在 kube-proxy 的 iptables/ipvs 规则更新完成之前就到达容器，应用开始关闭了但新请求还在被路由过来。所以生产环境通常要加一个 preStop: sleep 5 给 Endpoints 摘除留出传播时间。A 选项描述的是理想状态但实际上 K8s 不是这样工作的。B 选项因果关系完全颠倒。C 选项错误，K8s 遵循 SIGTERM→grace period→SIGKILL 的标准流程。"
+        },
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz9",
+          "question": "容器应用在收到 SIGTERM 后执行清理逻辑超过了 stop_grace_period（或 docker stop -t 指定的超时时间），会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Docker 在超时后发送 SIGKILL 强制终止容器，清理逻辑被中断，可能导致数据不一致或连接泄漏"},
+            {"id": "B", "text": "Docker 会无限等待直到应用自行退出，不会发送 SIGKILL"},
+            {"id": "C", "text": "Docker 会再次发送 SIGTERM 信号催促应用加速退出"},
+            {"id": "D", "text": "容器状态被标记为 unhealthy 但进程继续运行直到自然结束"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "docker stop 的设计是严格的两阶段模型：SIGTERM + grace period + SIGKILL。如果应用在 grace period 内没有退出，Docker 不会继续等待，而是直接发送 SIGKILL 强制终止。SIGKILL 是不可捕获、不可阻塞、不可忽略的信号（即使是 PID 1 也不例外），进程会被立即杀死，所有进行中的清理逻辑被中断。这可能导致数据库事务未提交、文件写入不完整、TCP 连接未正常关闭等问题。所以 stop_grace_period 的设置要和应用最长清理时间匹配。B 选项错误，Docker 不会无限等待。C 选项是编造的，Docker 不会重发 SIGTERM。D 选项混淆了 healthcheck 和停止流程，两者无关。"
+        },
+        {
+          "id": "docker-lifecycle-graceful-shutdown-q1-quiz10",
+          "question": "容器 docker stop 退出码总是 137 且日志中没有优雅停止记录，排查的第一步应该是什么？",
+          "choices": [
+            {"id": "A", "text": "检查应用代码中是否正确注册了 SIGTERM 的信号处理函数"},
+            {"id": "B", "text": "增大 docker stop 的超时时间到 60 秒以上"},
+            {"id": "C", "text": "检查 Dockerfile 的 CMD/ENTRYPOINT 是 exec form 还是 shell form，用 docker exec ps aux 确认应用是否是 PID 1"},
+            {"id": "D", "text": "升级 Docker Engine 到最新版本并重启 dockerd 守护进程"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "退出码 137（128+9=SIGKILL）说明容器是被超时后的 SIGKILL 强杀的，SIGTERM 没有被处理。在排查信号传递问题时，第一步应该确认信号链路是否通畅——即检查 CMD/ENTRYPOINT 是 exec form 还是 shell form，用 docker exec <container> ps aux 看 PID 1 到底是 /bin/sh 还是应用进程本身。如果 PID 1 是 sh，问题就在这里，信号根本没有到达应用层。只有确认信号能送达后，才需要检查应用代码的 handler（A 选项）。B 选项只是延长等待时间，如果信号本身送不到应用，等多久都没用。D 选项是盲目操作，Docker 的信号行为在各版本中是一致的。"
+        }
+      ],
+      "references": [
+        "https://docs.docker.com/reference/cli/docker/container/stop/",
+        "https://docs.docker.com/reference/dockerfile/#cmd",
+        "https://github.com/krallin/tini",
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination"
+      ]
+    }
+  ]
+}
