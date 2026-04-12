@@ -1,0 +1,158 @@
+{
+  "id": "os-dynamic-thread-pool-design",
+  "name": "动态伸缩线程池设计",
+  "domain": "operating-system",
+  "description": "从线程池核心参数到监控驱动的动态伸缩策略，系统讲解如何设计一个生产级的弹性线程池方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-dynamic-thread-pool-design-1",
+      "domain": "operating-system",
+      "type": "open-ended",
+      "difficulty": 3,
+      "tags": ["thread-pool", "dynamic-scaling", "auto-tuning", "work-stealing", "monitoring"],
+      "title": "如何设计一个支持动态伸缩的线程池",
+      "content": "你所在的团队负责一个电商订单处理服务，技术栈是 Java 17 + Spring Boot 3.1，部署在 4 核 8GB 的 Kubernetes Pod 中。当前使用固定大小的线程池处理异步任务：\n\n```java\nThreadPoolExecutor executor = new ThreadPoolExecutor(\n    200,                          // corePoolSize\n    200,                          // maximumPoolSize\n    0L, TimeUnit.SECONDS,         // keepAliveTime\n    new LinkedBlockingQueue<>(50000)  // workQueue\n);\n```\n\n最近一次大促期间（峰值 QPS 约 8000），监控系统采集到以下数据：\n\n```\n[2024-11-11 00:03:22] pool-size=200, active-threads=200, queue-size=48762, completed=1203847\n[2024-11-11 00:03:32] pool-size=200, active-threads=200, queue-size=50000, rejected=347\n[2024-11-11 00:03:42] pool-size=200, active-threads=200, queue-size=50000, rejected=1893\n```\n\n队列在短短 10 秒内就被打满，随后开始大量拒绝任务，每一条被拒绝的任务背后都是一个下单失败的用户。而在日常低峰期（QPS 约 200），同样 200 个线程中有 170 个处于空闲状态，每个线程默认占用约 1MB 栈内存，白白浪费了 170MB。\n\n运维同事每次大促前手动调整线程池参数，改完之后重新发布、逐台滚动重启，整个流程耗时 30 分钟以上。如果大促流量比预估高 50%，也只能干瞪眼等着任务被拒绝。\n\n你的任务是：设计一个支持动态伸缩的线程池方案，让线程池能够根据运行时负载自动调整大小，同时支持运维通过配置中心实时调参而不需要重启服务。请说明你的核心设计思路、关键伸缩策略、监控指标选择，以及与现有方案（如 Java 21 虚拟线程、Kubernetes HPA）的对比取舍。",
+      "answer": "## 第一步：线程池与动态伸缩的核心概念\n\n线程池的本质是一种「池化复用」模式。操作系统创建一个线程的成本并不低——在 Linux 上，每个线程默认分配 8MB 的栈空间（可以通过 `ulimit -s` 查看），线程创建涉及内核态的 `clone` 系统调用、分配 `task_struct` 结构体、设置页表映射等一系列操作。根据实际测试，在 Linux 5.15 内核上创建一个 Java 平台线程大约需要 50-100 微秒，而从线程池复用一个已有线程只需要不到 1 微秒。在高并发场景下，如果每个请求都创建新线程，这个 100 倍的差距足以成为系统的瓶颈。线程池通过预先创建一组工作线程，让它们循环从任务队列中取任务执行，将线程的生命周期与任务的生命周期解耦，从而把「创建线程」的开销摊薄到了初始化阶段。\n\nJava 中最核心的线程池实现是 `java.util.concurrent.ThreadPoolExecutor`，理解它的四个关键参数是设计动态伸缩方案的前提。`corePoolSize` 是核心线程数，这些线程即使空闲也不会被回收（除非设置了 `allowCoreThreadTimeOut`）；`maximumPoolSize` 是最大线程数，超过核心数的线程在空闲超过 `keepAliveTime` 后会被回收；`workQueue` 是任务等待队列，当核心线程全部繁忙时，新任务在这里排队。当一个新任务提交时，ThreadPoolExecutor 按照这样的顺序处理：如果当前线程数小于 `corePoolSize`，直接创建新的核心线程来执行；如果已达到 `corePoolSize`，任务进入 `workQueue` 排队等待；如果队列也满了且线程数未达到 `maximumPoolSize`，才会创建非核心线程；如果线程数已经到达上限且队列也满了，执行拒绝策略（默认抛出 `RejectedExecutionException`）。\n\n这套机制看起来已经支持「动态」了——线程数确实可以在 `corePoolSize` 和 `maximumPoolSize` 之间浮动。但问题在于，这种伸缩是「被动的」且「迟钝的」。它要等到队列完全满了之后才会开始创建非核心线程，而此时任务延迟通常已经飙升到不可接受的程度。而且 `corePoolSize` 和 `maximumPoolSize` 这些参数是启动时写死的，运行时调整需要重启服务。题目中的场景就是这个问题的典型写照：固定 200 线程，低峰浪费内存，高峰队列爆满。\n\n所谓「动态伸缩线程池」，核心思想是在 ThreadPoolExecutor 之上增加一层「监控→决策→执行」的反馈控制回路（feedback control loop）。它通过实时采集线程池的运行指标，根据预设的伸缩策略自动调整线程池参数，同时支持通过配置中心进行人工干预——本质上就是把线程池从一个「静态资源」变成一个「自适应系统」。\n\n## 第二步：动态伸缩线程池的系统设计\n\n### 明确业务需求与约束\n\n在动手设计之前，先把约束条件钉死。根据题目中的场景：QPS 范围 200 到 8000（40 倍波动）；任务类型以 IO 密集型为主（订单处理涉及数据库写入和下游 RPC 调用，单个任务 IO 等待占比约 70%）；部署环境是 4 核 8GB 的容器；团队 5 人，标准 Spring Boot 技术栈；SLA 要求 P99 延迟 < 200ms；核心红线是不允许任务丢失——每一条被拒绝的任务都意味着一个失败的订单。\n\n### 核心架构：监控-决策-执行闭环\n\n推荐的方案是一个三层架构。最底层是增强版的 `ThreadPoolExecutor`，对外暴露动态调参的能力；中间层是监控采集与伸缩决策引擎，定时采集指标并根据策略计算目标线程数；最上层是配置中心集成与告警通知，支持运维实时干预。整体的控制回路如下：\n\n```java\npublic class DynamicThreadPoolExecutor extends ThreadPoolExecutor {\n    private final ScalingPolicy scalingPolicy;\n    private final MetricsCollector metrics;\n    // 独立的监控调度器——绝不能用业务线程池！\n    private final ScheduledExecutorService monitor =\n        Executors.newSingleThreadScheduledExecutor(\n            r -> new Thread(r, \"tp-monitor\"));\n\n    public void start() {\n        monitor.scheduleAtFixedRate(this::evaluateAndScale,\n            5, 5, TimeUnit.SECONDS);\n    }\n\n    private void evaluateAndScale() {\n        PoolSnapshot snap = metrics.collect(this);\n        ScalingDecision decision = scalingPolicy.evaluate(snap);\n        if (decision.action() == SCALE_UP) {\n            int target = Math.min(decision.targetSize(), getAbsoluteMax());\n            setMaximumPoolSize(target);  // 扩容：先 max 后 core\n            setCorePoolSize(target);\n        } else if (decision.action() == SCALE_DOWN) {\n            int target = Math.max(decision.targetSize(), getAbsoluteMin());\n            setCorePoolSize(target);     // 缩容：先 core 后 max\n            setMaximumPoolSize(target);\n        }\n    }\n}\n```\n\n这段代码中有一个极其容易踩的坑：`setCorePoolSize` 和 `setMaximumPoolSize` 的调用顺序。ThreadPoolExecutor 内部会校验 `corePoolSize <= maximumPoolSize`，扩容时如果先调 `setCorePoolSize(400)` 而当前 `maximumPoolSize` 还是 200，直接抛 `IllegalArgumentException`。所以扩容先设 max 再设 core，缩容反过来先设 core 再设 max。这个坑在 Hippo4j 和 DynamicTp 的源码中都有专门处理。\n\n### 监控指标选择\n\n伸缩决策需要三个核心指标配合使用。第一个是「队列深度」（queue depth），反映任务积压程度；第二个是「活跃线程比例」（active threads / pool size），反映线程利用率；第三个是「任务等待时间」（从入队到开始执行的时间差），直接关联用户感知延迟。单靠任何一个指标都容易误判——队列短不代表不忙，可能线程数刚好够用；活跃线程比例高也不一定需要扩容，可能只是一个 500ms 的毛刺马上就过去了。因此推荐使用滑动窗口（比如最近 30 秒）的加权均值作为决策输入，避免对瞬时波动过度反应。\n\n### 扩容策略\n\n当满足以下任一条件且持续 10 秒以上时触发扩容：队列深度超过容量的 70%，或者任务平均等待时间超过 SLA 的一半（本例中是 100ms），或者活跃线程比例超过 85%。扩容采用阶梯式增长，每次增加当前线程数的 25%，而不是一次性拉到最大值。原因很实际：在 4 核的容器上，线程不是越多越好。当线程数远超 CPU 核心数时，上下文切换（context switch）的开销开始吃掉并行带来的收益。对于 IO 密集型任务，业界经验公式是 `线程数 ≈ CPU 核数 × (1 + IO等待时间/CPU计算时间)`，在本例中大约是 `4 × (1 + 70/30) ≈ 13`，但由于每个任务的 IO 等待时间波动较大，实际线程数上限设在 CPU 核数 × 50 到 100 之间（即 200-400）比较安全。\n\n### 缩容策略\n\n缩容比扩容更需要谨慎。最重要的机制是「冷却期」（cooldown）：一次缩容完成后的 60 到 120 秒内不允许再次缩容。这是为了防止「震荡」——流量稍微下降就缩容，缩完流量回升又扩容，反复创建销毁线程的开销比维持几个空闲线程大得多。缩容的触发条件是活跃线程比例持续 60 秒低于 30%，每次缩减当前线程数的 20%。缩容时还有一个隐蔽的坑：被回收的线程如果持有 `ThreadLocal` 变量（比如 MDC 的日志追踪上下文、数据库连接缓存），这些对象不会自动释放，因为 `ThreadLocal` 的引用链是 `Thread → ThreadLocalMap → Entry → value`，线程对象本身被 GC 回收后 value 才能释放。如果线程池框架内部缓存了线程引用，就会造成内存泄漏。生产环境中建议在线程的 `afterExecute` 钩子里主动调用 `ThreadLocal.remove()`。\n\n### 配置中心集成\n\n将线程池的核心参数注册到 Nacos 或 Apollo 配置中心，监听配置变更事件实时更新本地参数。这样运维可以在大促前通过配置中心「预热」线程池（提前把 `minPoolSize` 调到预估峰值对应的线程数），也可以在出现异常时紧急手动调参，全程无需重启。一个典型的 Nacos 配置示例如下：\n\n```yaml\ndynamic-thread-pool:\n  order-executor:\n    min-pool-size: 50\n    max-pool-size: 400\n    queue-capacity: 10000\n    scale-up-threshold: 0.85    # 活跃线程比例扩容阈值\n    scale-down-threshold: 0.30  # 活跃线程比例缩容阈值\n    cooldown-seconds: 60        # 缩容冷却期\n```\n\n### 可选方案与取舍\n\n如果团队已升级到 Java 21，「虚拟线程」（Virtual Thread，JEP 444）是一个值得认真考虑的替代方案。虚拟线程由 JVM 调度而非操作系统调度，创建成本极低（初始内存约 200 字节 vs 平台线程的 1MB），理论上可以创建数百万个虚拟线程。对于 IO 密集型任务，直接使用 `Executors.newVirtualThreadPerTaskExecutor()` 替代传统线程池，几乎不需要做动态伸缩——因为虚拟线程的创建销毁成本可以忽略不计。但虚拟线程有两个限制：第一，对 CPU 密集型任务没有优势，因为虚拟线程最终仍需映射到平台线程（carrier thread）执行，受限于 CPU 核心数；第二，使用 `synchronized` 关键字会 pin 住 carrier thread（JDK 21 的已知限制），需要改用 `ReentrantLock`。\n\n另一个方案是在 Kubernetes 层面用 HPA（Horizontal Pod Autoscaler）做 Pod 级别的弹性扩缩。HPA 通过监控 CPU、内存或自定义 metrics 自动增减 Pod 副本数。但 HPA 的扩容速度通常在分钟级别（拉镜像 + 启动 JVM + Spring 上下文初始化 + 预热），无法应对秒级的流量突变。因此最佳实践是两者配合使用：线程池动态伸缩处理秒级的流量波动，HPA 处理分钟级的趋势性变化。两层弹性叠加，既能快速响应突发流量，又能应对持续性的负载增长。\n\n## 第三步：扩展知识\n\n### 开源实现参考\n\n在开源社区已经有成熟的动态线程池框架。「Hippo4j」（GitHub 5.7k stars）是一个基于 Spring Boot 的动态线程池框架，支持 Nacos、Apollo、Zookeeper 等多种配置中心，内置 Grafana 监控面板和企业微信/钉钉告警推送，接入只需引入一个 starter 依赖加几行 YAML 配置。「DynamicTp」是美团开源的方案，同样与 Spring Boot 深度集成，额外提供了任务包装（TaskWrapper）、多种通知渠道和线程池运行时诊断等功能。如果团队不想从零造轮子，直接接入这两个框架之一是最具性价比的选择——核心伸缩逻辑不到 500 行代码，但配套的监控、告警、配置管理才是真正耗费工程量的部分。\n\n在 Go 语言生态中，虽然 goroutine 的创建成本远低于线程（初始栈仅 2KB，可动态增长到 1GB），但在超高并发场景下仍然需要限制 goroutine 数量，避免内存被无数 goroutine 的栈撑爆。「ants」是 Go 社区最流行的 goroutine 池库（GitHub 13k+ stars），实现了动态伸缩、过期清理和预分配 worker 等功能，设计思路与 Java 动态线程池异曲同工。\n\n### 生产踩坑经验\n\n最后分享一个真实的生产事故：某团队将监控伸缩任务提交到了被监控的业务线程池中执行。日常没问题，但大促高峰时业务线程池被打满，监控任务在队列末尾排队，永远轮不到执行。扩容逻辑触发不了，线程数始终停在初始值，系统彻底卡死。这是一个经典的「谁来监控监控者」问题——监控线程必须运行在独立的 `ScheduledExecutorService` 上，与业务线程池完全隔离，而且这个监控调度器自身只需要 1 个线程就够了。",
+      "keyPoints": [
+        "动态线程池的核心是在 ThreadPoolExecutor 之上建立「监控→决策→执行」的闭环反馈控制系统，通过实时采集队列深度、活跃线程比例和任务等待时间三个核心指标来驱动伸缩决策",
+        "扩容策略采用阶梯式增长（每次增加当前线程数的 25%），IO 密集型任务线程数上限约为 CPU 核数 × 50-100，避免一次性创建大量线程导致上下文切换风暴",
+        "缩容必须设置 60-120 秒冷却期防止震荡，优先回收空闲时间最长的线程，同时在 afterExecute 钩子中主动清理 ThreadLocal 变量防止内存泄漏",
+        "调用 setCorePoolSize 和 setMaximumPoolSize 的顺序至关重要——扩容时先 max 后 core，缩容时先 core 后 max，否则触发 IllegalArgumentException",
+        "IO 密集型和 CPU 密集型任务必须使用独立线程池隔离，避免慢 IO 任务阻塞快 CPU 任务导致整体延迟上升",
+        "集成 Nacos 或 Apollo 配置中心实现运行时热更新，大促前可预热线程池、出问题时紧急调参，全程无需重启服务",
+        "Java 21 虚拟线程从根本上改变 IO 密集型场景的线程池设计思路，创建成本约 200 字节，但 synchronized 会 pin 住 carrier thread 需改用 ReentrantLock",
+        "监控调度线程必须独立于被监控的业务线程池运行，否则线程池满载时监控任务无法执行、扩容逻辑永远无法触发，形成死锁式恶性循环"
+      ],
+      "quiz": [
+        {
+          "id": "os-dynamic-thread-pool-design-1-q1",
+          "question": "动态伸缩线程池与传统固定大小线程池的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "动态线程池通过「监控→决策→执行」的反馈控制闭环自动调整线程数量，而固定线程池的参数在启动后不会变化"},
+            {"id": "B", "text": "动态线程池使用无界队列避免任务丢失，固定线程池使用有界队列"},
+            {"id": "C", "text": "动态线程池只适用于 IO 密集型任务，固定线程池只适用于 CPU 密集型任务"},
+            {"id": "D", "text": "动态线程池不需要设置 corePoolSize 和 maximumPoolSize 参数"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "动态伸缩线程池的本质是在传统 ThreadPoolExecutor 之上增加了一层反馈控制回路，通过实时监控线程利用率、队列深度和任务等待时间等指标，自动调整 corePoolSize 和 maximumPoolSize。B 选项错误，动态线程池同样使用有界队列来保护系统，无界队列会导致 OOM；C 选项错误，动态线程池对两种任务类型都适用，只是策略参数不同；D 选项错误，动态线程池仍然需要这两个参数，只是它们可以在运行时被动态修改。"
+        },
+        {
+          "id": "os-dynamic-thread-pool-design-1-q2",
+          "question": "Java ThreadPoolExecutor 提交新任务时的处理顺序是什么？",
+          "choices": [
+            {"id": "A", "text": "如果线程数 < corePoolSize 则创建核心线程 → 否则任务入队 → 队列满且线程数 < maximumPoolSize 则创建非核心线程 → 都满则执行拒绝策略"},
+            {"id": "B", "text": "先将任务放入队列 → 队列满则创建核心线程 → 核心线程满则创建非核心线程 → 都满则拒绝"},
+            {"id": "C", "text": "先根据 CPU 利用率判断 → 利用率低则创建线程 → 利用率高则放入队列 → 队列满则拒绝"},
+            {"id": "D", "text": "先创建非核心线程处理 → 非核心线程满则创建核心线程 → 核心线程满则入队 → 队列满则拒绝"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "ThreadPoolExecutor 的任务提交遵循「核心线程→队列→非核心线程→拒绝」这个严格顺序。这也是为什么固定线程池在高负载时反应迟钝的根本原因——它必须等到队列完全满了之后才会创建额外线程。B 选项颠倒了核心线程和队列的顺序，这是最常见的记错点；C 选项混淆了操作系统级调度和线程池级调度，ThreadPoolExecutor 不关心 CPU 利用率；D 选项完全颠倒了核心线程和非核心线程的优先级。理解这个顺序是设计动态伸缩策略的基础。"
+        },
+        {
+          "id": "os-dynamic-thread-pool-design-1-q3",
+          "question": "动态调整线程池大小时，为什么扩容必须先调用 setMaximumPoolSize 再调用 setCorePoolSize？",
+          "choices": [
+            {"id": "A", "text": "因为 ThreadPoolExecutor 内部校验 corePoolSize ≤ maximumPoolSize，先调 core 会因为 core > 当前 max 而抛出 IllegalArgumentException"},
+            {"id": "B", "text": "因为先调 setCorePoolSize 会立即创建新线程，导致瞬时线程数超过 maximumPoolSize 引发 OOM"},
+            {"id": "C", "text": "因为 JVM 规范要求 maximumPoolSize 必须在 corePoolSize 之前被修改，否则触发 JVM 安全检查"},
+            {"id": "D", "text": "因为先调 setCorePoolSize 会触发队列重新分配，可能丢失正在排队的任务"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个非常实际的生产踩坑点。ThreadPoolExecutor 的 setCorePoolSize 方法内部有 `if (corePoolSize > maximumPoolSize) throw new IllegalArgumentException()` 的校验。假设当前 core=200, max=200，你想扩到 400，如果先调 setCorePoolSize(400)，此时 400 > 200 直接报错。正确的扩容顺序是先 setMaximumPoolSize(400) 再 setCorePoolSize(400)；缩容时反过来。B 选项错误，setCorePoolSize 不会在设置瞬间就创建线程到新值；C 选项是编造的，JVM 没有这个规范要求；D 选项错误，调整线程数不影响队列中的任务。"
+        },
+        {
+          "id": "os-dynamic-thread-pool-design-1-q4",
+          "question": "Work-stealing 机制在多队列线程池中是如何提升整体吞吐量的？",
+          "choices": [
+            {"id": "A", "text": "空闲线程主动从其他繁忙线程的本地任务队列末尾（tail）窃取任务执行，减少线程间的负载不均衡"},
+            {"id": "B", "text": "繁忙线程将自己队列中多余的任务主动推送给空闲线程，由繁忙线程决定负载分配"},
+            {"id": "C", "text": "一个全局调度器定期将所有队列中的任务重新洗牌并随机分配给各线程"},
+            {"id": "D", "text": "每个线程维护一个按执行时间排序的优先级队列，始终优先执行耗时最短的任务"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Work-stealing（工作窃取）是 Java ForkJoinPool 的核心调度策略，也是动态线程池可以借鉴的机制。每个线程维护一个双端队列（deque），线程从自己队列的头部（head）取任务，而窃取者从其他线程队列的尾部（tail）取任务，这样可以最大程度减少锁竞争。B 选项描述的是「工作推送」而非「工作窃取」，推送模式需要繁忙线程额外承担分配开销；C 选项是中心化调度，扩展性差且有单点瓶颈；D 选项描述的是最短任务优先调度，与 work-stealing 的负载均衡目标不同。"
+        },
+        {
+          "id": "os-dynamic-thread-pool-design-1-q5",
+          "question": "线程池监控数据显示：pool-size=200, active-threads=195, queue-size=45000/50000, avg-wait-time=350ms。此时应该采取什么措施？",
+          "choices": [
+            {"id": "A", "text": "立即触发扩容，因为线程利用率 97.5%、队列深度 90%、任务等待时间远超 SLA，三个指标全部亮红灯"},
+            {"id": "B", "text": "不需要操作，队列还有 5000 的余量，等队列完全满了再考虑扩容"},
+            {"id": "C", "text": "立即缩容，200 个线程消耗太多内存资源，应该减少到 100 个"},
+            {"id": "D", "text": "只需要将队列容量从 50000 扩大到 200000，不需要增加线程数"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这组数据三个核心指标全面告急：活跃线程比例 195/200=97.5% 远超 85% 的扩容阈值；队列深度 45000/50000=90% 远超 70% 的扩容阈值；任务平均等待时间 350ms 远超 SLA 200ms 的一半即 100ms 的阈值。如果不立即扩容，几秒内队列就会打满并开始拒绝任务。B 选项犯了「等到火烧起来再灭」的错误，队列 90% 已经是危险水位；C 选项完全是反方向操作；D 选项只是延迟了问题爆发的时间——如果线程处理速度跟不上任务提交速度，队列再大也早晚会满，而且更大的队列意味着更长的等待时间。"
+        },
+        {
+          "id": "os-dynamic-thread-pool-design-1-q6",
+          "question": "动态线程池缩容时，如果不清理被回收线程的 ThreadLocal 变量，最可能导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "ThreadLocal 引用的对象无法被 GC 回收造成内存泄漏，尤其在使用 MDC 日志追踪的服务中容易积累大量孤立的上下文对象"},
+            {"id": "B", "text": "被回收线程的 ThreadLocal 值会自动传递给新创建的线程，导致不同请求的追踪 ID 串号"},
+            {"id": "C", "text": "JVM 会检测到 ThreadLocal 泄漏并抛出 ThreadLocalLeakException，导致服务崩溃"},
+            {"id": "D", "text": "ThreadLocal 变量会被序列化到磁盘 swap 分区，导致磁盘 IO 飙升影响整体性能"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "ThreadLocal 的内存泄漏是 Java 线程池中最隐蔽的坑之一。虽然 ThreadLocalMap 使用弱引用（WeakReference）指向 ThreadLocal 对象本身，但 value 是强引用。当线程被线程池复用而不是被 GC 回收时，Thread 对象持续存活，其 ThreadLocalMap 中的 entry 就不会被清理。在动态缩容场景下，虽然线程最终会被回收，但如果框架内部维护了线程引用的缓存，这些 value 就成了内存泄漏源。B 选项错误，ThreadLocal 不会自动传递值；C 选项编造了一个不存在的异常类；D 选项混淆了内存管理和磁盘 IO 的关系。"
+        },
+        {
+          "id": "os-dynamic-thread-pool-design-1-q7",
+          "question": "与动态伸缩线程池相比，Java 21 虚拟线程在以下哪种场景下不具备优势？",
+          "choices": [
+            {"id": "A", "text": "CPU 密集型计算任务，因为虚拟线程最终映射到平台线程执行，无法突破物理 CPU 核心数的并行上限"},
+            {"id": "B", "text": "高并发 IO 密集型任务，因为虚拟线程在 IO 阻塞时仍会占用操作系统线程"},
+            {"id": "C", "text": "短生命周期任务，因为虚拟线程的创建和销毁成本比平台线程更高"},
+            {"id": "D", "text": "超过 1000 并发的场景，因为虚拟线程调度器在高并发时存在严重的性能退化"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "虚拟线程的核心优势在于 IO 阻塞时自动 unmount 释放 carrier thread（平台线程），让有限的平台线程可以服务海量的虚拟线程。但对于 CPU 密集型任务，虚拟线程在执行计算时必须一直占用 carrier thread，此时百万个虚拟线程和 4 个平台线程的效果是一样的——真正并行执行的始终只有 CPU 核心数个任务。B 选项恰好说反了，虚拟线程在 IO 阻塞时会释放平台线程，这正是它的优势；C 选项也说反了，虚拟线程的创建成本约 200 字节，远低于平台线程的 1MB；D 选项没有事实依据，虚拟线程的调度器在高并发下表现良好。"
+        },
+        {
+          "id": "os-dynamic-thread-pool-design-1-q8",
+          "question": "电商大促前，运维通过配置中心对动态线程池进行「预热」的最佳操作是什么？",
+          "choices": [
+            {"id": "A", "text": "提前将 minPoolSize 调高到预估峰值负载对应的线程数，让线程池在流量到来前就预先创建好足够的核心线程"},
+            {"id": "B", "text": "将 maxPoolSize 设置为 Integer.MAX_VALUE（约 21 亿），让线程池在需要时可以无限扩容"},
+            {"id": "C", "text": "关闭动态伸缩功能并将线程数固定为最大值，以获得最稳定可预测的性能表现"},
+            {"id": "D", "text": "将任务队列容量设为 0，确保每个提交的任务都立即获得一个独立线程执行"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "预热的核心思想是「提前付出创建线程的开销，避免在流量洪峰到来时再临时扩容」。通过配置中心将 minPoolSize 调高，setCorePoolSize 内部会调用 `prestartAllCoreThreads()` 的等效逻辑，提前创建好核心线程，等大促流量到来时线程已经就绪，不需要走「队列积压→触发扩容→创建线程」的延迟路径。B 选项极其危险，21 亿线程会直接 OOM 或触发操作系统的 `max_threads` 限制；C 选项放弃了动态伸缩的优势，如果峰值比预估低很多就浪费了资源；D 选项会导致每个任务都创建新线程（类似 Executors.newCachedThreadPool 的行为），在高 QPS 下线程数会迅速失控。"
+        },
+        {
+          "id": "os-dynamic-thread-pool-design-1-q9",
+          "question": "如果将监控伸缩任务提交到被监控的业务线程池中运行，在线程池满载时会发生什么？",
+          "choices": [
+            {"id": "A", "text": "监控任务在队列中排队等待，扩容逻辑永远无法执行，线程池始终停在当前大小，形成死锁式的恶性循环"},
+            {"id": "B", "text": "ThreadPoolExecutor 内部对监控类型的任务有优先级调度机制，会优先执行监控任务"},
+            {"id": "C", "text": "监控任务会自动 fallback 到 JVM 内置的 ForkJoinPool.commonPool() 中执行，不受业务线程池影响"},
+            {"id": "D", "text": "JVM 的 Thread Starvation Detector 会检测到监控线程饥饿并自动增加线程池容量"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个真实的生产事故案例。当业务线程池的所有线程都在执行任务、队列也接近满载时，提交到同一个线程池的监控任务只能在队列末尾排队。由于监控任务无法执行，伸缩决策逻辑不会被触发，扩容永远不会发生，系统彻底卡死——这就是经典的「谁来监控监控者」（Who watches the watchmen）问题。B 选项错误，标准的 ThreadPoolExecutor 没有任务优先级机制（PriorityBlockingQueue 可以实现但默认不用）；C 选项错误，任务不会自动切换执行器；D 选项编造了一个不存在的 JVM 功能。解决方案很简单：监控调度器必须使用独立的 ScheduledExecutorService。"
+        },
+        {
+          "id": "os-dynamic-thread-pool-design-1-q10",
+          "question": "动态线程池运行一段时间后，监控发现线程数在 minPoolSize 和 maxPoolSize 之间每隔几秒就扩缩一次（频繁震荡），最可能的原因和解决方案是什么？",
+          "choices": [
+            {"id": "A", "text": "缩容冷却期设置过短或未设置，导致刚缩完流量回升就再次扩容，应将冷却期增大到 60-120 秒并使用滑动窗口平滑指标"},
+            {"id": "B", "text": "maxPoolSize 设置得太大，线程数波动范围过宽，应缩小 maxPoolSize 到接近 minPoolSize"},
+            {"id": "C", "text": "任务队列容量太小导致频繁触发拒绝策略，应将队列容量增大到 100 万"},
+            {"id": "D", "text": "JVM 的 GC 频繁 STW 导致线程利用率指标忽高忽低，应将 GC 从 G1 切换到 ZGC"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "震荡（oscillation）是所有自适应控制系统的经典问题，在动态线程池场景中尤其常见。当流量有周期性波动时（比如每隔几秒有一批定时任务），如果缩容太激进、冷却期太短，就会出现「扩→缩→扩→缩」的循环。每次扩缩都有线程创建销毁的开销，频繁震荡的性能甚至不如固定线程池。解决方案有两个：一是增加冷却期到 60-120 秒，缩容后的这段时间内即使指标低于阈值也不再缩容；二是使用滑动窗口（如最近 30 秒的加权均值）而非瞬时值来做伸缩决策，平滑掉短期的指标波动。B 选项是治标不治本；C 选项与震荡原因无关；D 选项虽然 GC STW 确实影响指标，但震荡的根因是控制策略而非 GC。"
+        }
+      ],
+      "references": [
+        "https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html",
+        "https://openjdk.org/jeps/444",
+        "https://github.com/opengoofy/hippo4j",
+        "https://github.com/dromara/dynamic-tp",
+        "https://github.com/panjf2000/ants"
+      ]
+    }
+  ]
+}

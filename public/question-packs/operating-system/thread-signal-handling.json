@@ -1,0 +1,285 @@
+{
+  "id": "os-thread-signal-handling",
+  "name": "多线程程序信号安全处理",
+  "domain": "operating-system",
+  "description": "深入剖析多线程环境下 POSIX 信号的递送规则、async-signal-safe 约束，以及 pthread_sigmask + sigwait 专用信号线程模式的原理与实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-thread-signal-handling-1",
+      "domain": "operating-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": [
+        "thread",
+        "signal",
+        "pthread_sigmask",
+        "sigwait",
+        "signal-safety",
+        "multi-threading"
+      ],
+      "title": "多线程程序中如何安全地处理信号",
+      "content": "## 场景\n\n你们团队维护了一个 C 语言编写的多线程日志采集服务，运行在 Linux 5.15（Ubuntu 22.04 LTS）上，使用 pthreads 创建了 8 个工作线程负责从不同数据源拉取日志并写入 Kafka。服务通过 systemd 管理，`systemctl stop` 发送 SIGTERM 触发优雅退出。\n\n最近运维同事反馈，执行 `systemctl stop log-collector` 时，服务大约每 20 次会有 1 次卡死不退出，必须等到 systemd 的 `TimeoutStopSec=90s` 超时后被 SIGKILL 强杀。journal 日志中没有任何退出相关的输出，服务就像突然失去了响应。\n\n你用 `strace -p <pid> -f` 附加到卡死的进程后，看到如下输出：\n\n```\n[pid 12345] futex(0x7f8a1c000910, FUTEX_WAIT_PRIVATE, 2, NULL) = ?\n[pid 12346] futex(0x7f8a1c000910, FUTEX_WAIT_PRIVATE, 2, NULL) = ?\n[pid 12347] --- SIGTERM {si_signo=SIGTERM, si_code=SI_USER, si_pid=1, si_uid=0} ---\n[pid 12347] futex(0x7f8a1c000910, FUTEX_WAIT_PRIVATE, 2, NULL\n```\n\n注意第三行：线程 12347 收到了 SIGTERM，随后也卡在了同一个 futex 地址上。进一步检查代码，发现信号处理函数是这样写的：\n\n```c\nvoid sigterm_handler(int sig) {\n    printf(\"Received signal %d, shutting down...\\n\", sig);\n    g_shutdown = 1;\n    pthread_cond_broadcast(&work_cond);\n}\n```\n\n而在主函数中，信号注册使用了传统的 `signal()` 调用：\n\n```c\nsignal(SIGTERM, sigterm_handler);\n```\n\n问题来了：为什么这段看起来「合理」的信号处理代码会导致服务在多线程环境下偶发死锁？如何正确地在多线程程序中处理信号？",
+      "answer": "## 核心主体概念基础详解\n\n要理解多线程程序中信号处理的复杂性，首先要搞清楚 Linux 信号机制的本质。信号（signal）是 Unix/Linux 系统中最古老的进程间通信机制之一，设计可以追溯到 1970 年代的 Unix V7。从本质上说，信号就是内核或另一个进程发给目标进程的一个异步通知，告诉它「发生了某件事，你需要处理一下」。\n\nLinux 系统定义了 64 个信号，编号 1 到 64。前 31 个是经典的 POSIX 标准信号（也叫非实时信号），包括常见的 SIGTERM（15，请求终止）、SIGKILL（9，强制终止）、SIGSEGV（11，段错误）、SIGINT（2，Ctrl+C）等。后 33 个（SIGRTMIN 到 SIGRTMAX）是实时信号，支持排队和携带附加数据。两者的一个关键区别是：非实时信号不排队——同一个信号在 pending 状态下被重复发送只会记录一次；而实时信号可以排队，多次发送不丢失。\n\n信号的处理方式有三种：使用默认处理（SIG_DFL，通常是终止进程或忽略），显式忽略（SIG_IGN），安装自定义处理函数。注册处理函数有两个 API——传统的 `signal()` 和 POSIX 标准的 `sigaction()`。生产代码中应始终使用 `sigaction()`，因为 `signal()` 的行为在不同系统上存在差异：在某些旧系统上 handler 被调用后会重置为 SIG_DFL，而且 `signal()` 无法精细控制信号掩码。一个标准的 `sigaction()` 注册方式如下：\n\n```c\nstruct sigaction sa;\nsa.sa_handler = my_handler;\nsigemptyset(&sa.sa_mask);\nsa.sa_flags = SA_RESTART;  // 被信号中断的系统调用自动重启\nsigaction(SIGTERM, &sa, NULL);\n```\n\n信号的生命周期经历三个阶段：生成（generation）、递送（delivery）和处理（handling）。内核或进程调用 `kill()` 时信号被生成；如果目标进程没有阻塞该信号，信号被递送；进程在从内核态返回用户态时检查 pending 信号并执行处理函数。如果信号被阻塞，它停留在 pending 状态直到解除阻塞。理解了这些基础之后，我们就可以切入真正的重点：当一个进程有多个线程时，信号的递送规则发生了根本性的变化。\n\n## 多线程信号处理的核心问题与解决方案\n\n### 为什么场景中的代码会死锁\n\n回到场景中的问题。那段信号处理函数调用了 `printf()` 和 `pthread_cond_broadcast()`，这两个函数都不是异步信号安全（async-signal-safe）的。POSIX 标准在 `man 7 signal-safety` 中明确列出了可以在信号处理函数中安全调用的函数清单，只有大约 150 个函数在列表中，而 `printf()`、`malloc()`、`free()`、`pthread_mutex_lock()` 等常用函数统统不在其中。\n\n为什么不安全？因为 `printf()` 内部会获取 stdout 的互斥锁来保证线程安全输出。假设线程 A 正在执行 `printf()` 并已持有 stdout 的锁，此时 SIGTERM 恰好被递送给线程 A，信号处理函数打断 `printf()` 的执行并再次调用 `printf()`——尝试对同一个非递归锁加锁两次，死锁就发生了。这正是 strace 输出中所有线程都卡在同一个 futex 地址的原因——那个 futex 就是 glibc 中 stdout 内部的互斥锁。`pthread_cond_broadcast()` 同理：它的内部实现涉及多个互斥操作，信号如果中断了 pthreads 自身的临界区并重入，后果是未定义行为。\n\n这个 bug 之所以「偶发」（大约 5% 的概率），是因为死锁只在一个非常窄的时间窗口内发生——信号恰好在 `printf()` 或 `pthread_cond_broadcast()` 持有内部锁的那几微秒内到达。窗口越窄，复现越难，这类 bug 在生产环境中极其棘手。\n\n### 多线程环境下信号递送的规则\n\nPOSIX 规定了两类信号递送目标。线程定向信号（thread-directed signal）只递送给指定线程，通过 `pthread_kill(thread, sig)` 或 `tgkill()` 系统调用发送，SIGSEGV、SIGFPE、SIGBUS 等硬件异常信号也属于此类——哪个线程触发了非法内存访问，信号就递送给哪个线程。进程定向信号（process-directed signal）递送给进程中「任意一个未阻塞该信号的线程」，通过 `kill(pid, sig)` 或外部命令发送。内核在所有未阻塞该信号的线程中选一个来递送，具体选哪个取决于实现——Linux 内核通常优先选主线程，但这不是保证，在高负载下信号可能被递送到任何工作线程。\n\n另一个关键点是：信号 disposition（处理方式，即 SIG_DFL / SIG_IGN / 自定义 handler）是进程级共享的——所有线程看到相同的 handler，但信号掩码（signal mask）是每个线程独立的。这意味着你可以让不同线程阻塞不同的信号集。\n\n### 正确方案：专用信号线程 + sigwait\n\n多线程信号处理的黄金法则是：**所有线程阻塞信号，由一个专用线程同步等待**。\n\n**第一步**，在 `main()` 中创建任何线程之前，用 `pthread_sigmask()` 阻塞所有需要处理的信号。子线程会继承创建者的信号掩码，所以主线程阻塞后，后续线程都自动阻塞：\n\n```c\nsigset_t set;\nsigemptyset(&set);\nsigaddset(&set, SIGTERM);\nsigaddset(&set, SIGINT);\nsigaddset(&set, SIGUSR1);\npthread_sigmask(SIG_BLOCK, &set, NULL);\n```\n\n注意用 `pthread_sigmask()` 而非 `sigprocmask()`——后者在多线程程序中行为未定义（POSIX 如此规定，虽然 Linux glibc 内部 `sigprocmask` 会调用 `pthread_sigmask`，但不应依赖此实现细节）。\n\n**第二步**，创建专用信号线程，用 `sigwait()` 同步等待信号：\n\n```c\nvoid *signal_thread(void *arg) {\n    sigset_t set;\n    sigemptyset(&set);\n    sigaddset(&set, SIGTERM);\n    sigaddset(&set, SIGINT);\n    sigaddset(&set, SIGUSR1);\n\n    int sig;\n    while (1) {\n        int ret = sigwait(&set, &sig);\n        if (ret != 0) continue;\n        switch (sig) {\n        case SIGTERM:\n        case SIGINT:\n            printf(\"Received signal %d, initiating shutdown\\n\", sig);\n            pthread_mutex_lock(&shutdown_mutex);\n            g_shutdown = 1;\n            pthread_cond_broadcast(&work_cond);\n            pthread_mutex_unlock(&shutdown_mutex);\n            return NULL;\n        case SIGUSR1:\n            reload_config();\n            break;\n        }\n    }\n    return NULL;\n}\n```\n\n`sigwait()` 的关键在于：它在普通线程上下文中返回，信号已经从 pending 集合中移除，线程可以安全调用任何函数——`printf`、`malloc`、`pthread_mutex_lock` 都没问题。这与信号处理函数在信号上下文中执行、受 async-signal-safety 限制形成了本质区别。\n\n**第三步**，启动顺序必须是：先阻塞信号 → 创建工作线程 → 创建信号线程 → join 所有线程。\n\n### Linux 特有方案：signalfd\n\nLinux 2.6.22（2007 年）引入了 `signalfd()` 系统调用，提供了另一种同步处理信号的方式——把信号变成文件描述符上的可读事件：\n\n```c\nsigset_t mask;\nsigemptyset(&mask);\nsigaddset(&mask, SIGTERM);\npthread_sigmask(SIG_BLOCK, &mask, NULL);\n\nint sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);\n// 现在可以把 sfd 加入 epoll 监听\nstruct signalfd_siginfo fdsi;\nssize_t s = read(sfd, &fdsi, sizeof(fdsi));\nif (s == sizeof(fdsi))\n    printf(\"Got signal %d\\n\", fdsi.ssi_signo);\n```\n\n`signalfd` 相比 `sigwait` 的核心优势在于它是一个文件描述符，可以和 `epoll` 一起使用，完美融入事件驱动架构。如果你的服务已经有了 epoll 事件循环（比如网络服务器），`signalfd` 可以把信号处理统一到同一个事件循环中。劣势是 `signalfd` 是 Linux 特有的，不具备 POSIX 可移植性。\n\n## 扩展延伸\n\n### async-signal-safe 函数的深层理解\n\nPOSIX.1-2017 列出的 async-signal-safe 函数有一个规律：几乎所有涉及堆分配（`malloc`/`free`）或 stdio 缓冲（`printf`/`fprintf`）的函数都不在列表中。这是因为这些函数内部使用了非递归锁保护全局状态。信号可能在锁被持有时到达，handler 中重入同一函数就会死锁。如果确实需要在 handler 中输出信息，应使用 `write(STDERR_FILENO, msg, len)`——`write()` 是 async-signal-safe 的。\n\n另一个容易忽略的点：`errno` 也可能被 handler 修改。async-signal-safe 的 handler 应在入口保存 `errno` 并在出口恢复：\n\n```c\nvoid handler(int sig) {\n    int saved_errno = errno;\n    write(STDERR_FILENO, \"signal\\n\", 7);\n    errno = saved_errno;\n}\n```\n\n### self-pipe trick\n\n在 `signalfd` 出现之前，业界广泛使用 self-pipe trick：创建一个管道，handler 中只往写端写一个字节（`write()` 是安全的），主循环用 `poll()` 监听读端。D.J. Bernstein 在 1990 年代推广了这个技巧，OpenSSH、Nginx 早期版本等项目都使用了这个模式。\n\n### fork 与多线程信号的交叉问题\n\n多线程程序中调用 `fork()` 是一个雷区。`fork()` 只复制调用它的那个线程到子进程——其他线程全部消失。如果其他线程在 `fork()` 时持有锁（比如 `malloc` 的内部锁），子进程会继承被锁住的状态但持有者已不存在，锁永远不会释放。POSIX 提供了 `pthread_atfork()` 来注册 fork 前后的回调，但最佳实践是：多线程程序 fork 后立即调用 `exec`，不要在子进程中做任何复杂操作。\n\n### 生产环境最佳实践\n\n在生产级多线程服务中，信号处理应遵循四条原则。第一，永远不在 handler 中做复杂操作——如果不得不用 handler，最多设置一个 `volatile sig_atomic_t` 标志。第二，优先使用 sigwait 或 signalfd 将信号处理同步化。第三，所有线程创建之前就设好信号掩码。第四，用 `sigaction()` 代替 `signal()` 并设 `SA_RESTART` 标志避免慢系统调用被 EINTR 中断。\n\nGo 语言的 runtime 是一个值得学习的工程范例。Go 1.21+ 的 runtime 用 `sigaction` 安装了自己的信号处理函数，内部使用 self-pipe trick——handler 只设标志并写一个字节到管道，真正的处理逻辑在普通 goroutine 上下文执行。用 Go 写需要处理信号的服务，推荐使用 `signal.Notify` 注册 channel 接收信号。\n\n调试技巧方面，GDB 中可以用 `handle SIGTERM nostop noprint pass` 避免调试器拦截信号，`strace -e trace=signal -f` 可以跟踪所有线程的信号收发。Thread Sanitizer（`-fsanitize=thread`）可以检测信号 handler 中的数据竞争。",
+      "keyPoints": [
+        "POSIX 规定进程定向信号（如 SIGTERM）会被递送给进程中任意一个未阻塞该信号的线程，无法精确控制哪个线程收到信号",
+        "信号处理函数在信号上下文中执行，只能调用 async-signal-safe 函数；printf、malloc、pthread_mutex_lock 等常用函数都不在安全列表中，在 handler 中调用会导致死锁或未定义行为",
+        "多线程信号处理的黄金法则：所有线程用 pthread_sigmask 阻塞信号，由专用线程通过 sigwait 同步等待并在普通线程上下文中安全处理",
+        "pthread_sigmask 必须在创建子线程之前调用，子线程继承父线程的信号掩码，确保所有工作线程都不会收到被阻塞的信号",
+        "sigwait 与 handler 的本质区别在于执行上下文：sigwait 在普通线程上下文返回，不受 async-signal-safety 约束，可以安全调用任何函数",
+        "Linux 特有的 signalfd 把信号转化为文件描述符事件，可以和 epoll 统一到同一个事件循环中，适合事件驱动架构",
+        "多线程程序中 fork 只复制调用线程，其他线程持有的锁在子进程中永远不会释放，fork 后应立即 exec",
+        "应始终使用 sigaction 代替 signal 注册处理函数，并设置 SA_RESTART 标志避免慢系统调用被 EINTR 中断"
+      ],
+      "quiz": [
+        {
+          "id": "os-thread-signal-handling-1-q1",
+          "question": "当外部进程通过 kill(pid, SIGTERM) 向一个多线程进程发送 SIGTERM 时，内核会将信号递送给哪个线程？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "始终递送给主线程（即调用 main 函数的线程）"
+            },
+            {
+              "id": "B",
+              "text": "递送给进程中任意一个未阻塞 SIGTERM 的线程"
+            },
+            {
+              "id": "C",
+              "text": "递送给所有线程，每个线程都会执行一次 handler"
+            },
+            {
+              "id": "D",
+              "text": "递送给最近一次调用 sigaction 注册 handler 的那个线程"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。POSIX 标准规定，进程定向信号（通过 kill() 发送）会被递送给进程中「任意一个未阻塞该信号的线程」，内核从所有符合条件的线程中选择一个。选项 A 是常见误解——虽然 Linux 内核实现中通常优先选主线程，但这是实现细节而非标准保证，在高负载下信号可能被递送到任何工作线程。选项 C 完全错误，信号只会被递送给一个线程，不会广播给所有线程。选项 D 也不正确，sigaction 设置的是进程级的信号处理方式，与信号递送目标无关。"
+        },
+        {
+          "id": "os-thread-signal-handling-1-q2",
+          "question": "在多线程进程中，以下哪项是每个线程独立的，而不是进程级共享的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "信号的 disposition（即 SIG_DFL / SIG_IGN / 自定义 handler）"
+            },
+            {
+              "id": "B",
+              "text": "信号掩码（signal mask，即哪些信号被阻塞）"
+            },
+            {
+              "id": "C",
+              "text": "通过 sigaction 注册的信号处理函数"
+            },
+            {
+              "id": "D",
+              "text": "SA_RESTART、SA_SIGINFO 等信号处理标志"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。POSIX 标准明确规定：信号掩码（signal mask）是每个线程独立维护的，通过 pthread_sigmask 设置；而信号的 disposition（处理方式）是进程级共享的——一个线程调用 sigaction 注册了 SIGTERM 的 handler，所有线程看到的都是这个 handler。选项 A、C、D 都描述的是进程级共享的属性。这个区分是理解多线程信号处理的基础：正是因为信号掩码是线程独立的，我们才能用 pthread_sigmask 让工作线程阻塞信号、让专用线程接收信号。"
+        },
+        {
+          "id": "os-thread-signal-handling-1-q3",
+          "question": "在多线程程序中，应该在什么时机调用 pthread_sigmask 阻塞信号？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "在每个工作线程的入口函数中分别调用"
+            },
+            {
+              "id": "B",
+              "text": "在 main 函数中、创建任何子线程之前调用"
+            },
+            {
+              "id": "C",
+              "text": "在信号处理线程创建之后、工作线程创建之前调用"
+            },
+            {
+              "id": "D",
+              "text": "在所有线程创建完成之后统一调用"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。子线程会继承创建者线程的信号掩码，所以在 main 函数中创建任何线程之前就阻塞信号是最简洁、最安全的做法——后续创建的所有线程（包括工作线程和信号线程）都会自动继承这个阻塞集。选项 A 虽然也能工作，但存在竞态窗口：线程刚创建但还没执行到 pthread_sigmask 调用时，信号可能被递送给它。选项 C 和 D 都不正确，因为在子线程已经创建之后才设置主线程的掩码，不会影响已有子线程的掩码。"
+        },
+        {
+          "id": "os-thread-signal-handling-1-q4",
+          "question": "关于 sigwait 和信号处理函数（signal handler）的区别，以下说法正确的是：",
+          "choices": [
+            {
+              "id": "A",
+              "text": "sigwait 和 handler 都在信号上下文中执行，都受 async-signal-safety 约束"
+            },
+            {
+              "id": "B",
+              "text": "sigwait 在普通线程上下文中返回，不受 async-signal-safety 约束，可安全调用任何函数"
+            },
+            {
+              "id": "C",
+              "text": "sigwait 性能更好但不能获取信号编号，handler 可以获取信号编号"
+            },
+            {
+              "id": "D",
+              "text": "sigwait 会自动解除信号阻塞，handler 不会改变信号掩码"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。这是 sigwait 模式的核心优势。sigwait 是一个普通的阻塞调用，当目标信号到达时，它把信号从 pending 集合中取出并在普通线程上下文中返回——此时线程可以安全调用 printf、malloc、pthread_mutex_lock 等任何函数。而信号处理函数是在信号上下文中异步执行的，可能打断当前线程正在执行的任何代码，因此只能调用 async-signal-safe 函数。选项 C 错误，sigwait 的第二个参数就是用来接收信号编号的。选项 D 也不准确，sigwait 不会解除阻塞，它是从已阻塞信号的 pending 集合中取信号。"
+        },
+        {
+          "id": "os-thread-signal-handling-1-q5",
+          "question": "以下 strace 输出表明了什么问题？\n\n```\n[pid 8801] write(1, \"Processing batch\"...) = ?\n[pid 8801] --- SIGTERM {si_signo=SIGTERM, si_code=SI_USER} ---\n[pid 8801] futex(0x7f2a8c0008d0, FUTEX_WAIT_PRIVATE, 2, NULL\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "线程 8801 在执行 write 系统调用时被 SIGTERM 中断，write 返回 EINTR"
+            },
+            {
+              "id": "B",
+              "text": "线程 8801 正在执行 stdio 输出（如 printf），收到 SIGTERM 后 handler 再次尝试获取 stdout 内部锁导致死锁"
+            },
+            {
+              "id": "C",
+              "text": "线程 8801 的 SIGTERM handler 正在等待另一个线程释放 futex，属于正常的线程同步"
+            },
+            {
+              "id": "D",
+              "text": "SIGTERM 信号被内核错误地递送给了正在执行 I/O 的线程，应该重新配置信号递送策略"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。strace 输出清晰地展示了一个经典的信号处理死锁场景。线程 8801 正在执行 write（这是 printf 内部的系统调用，说明 printf 已经持有了 stdout 的内部互斥锁），此时 SIGTERM 被递送并打断执行，handler 中再次调用 printf 试图获取同一个非递归锁，导致 futex 死等。选项 A 不正确——如果只是 EINTR，write 会返回错误而不是永久阻塞在 futex 上。选项 C 忽略了 futex 地址是 stdio 内部锁而非业务锁。选项 D 是对信号递送机制的误解，POSIX 不支持按线程状态配置递送策略。"
+        },
+        {
+          "id": "os-thread-signal-handling-1-q6",
+          "question": "以下哪个函数可以在信号处理函数中安全调用（属于 async-signal-safe 函数）？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "printf()"
+            },
+            {
+              "id": "B",
+              "text": "malloc()"
+            },
+            {
+              "id": "C",
+              "text": "write()"
+            },
+            {
+              "id": "D",
+              "text": "pthread_mutex_lock()"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "正确答案是 C。write() 是 POSIX 标准明确列出的 async-signal-safe 函数之一。它是一个直接的系统调用封装，内部不使用任何用户态锁或全局缓冲区，因此可以安全地在信号处理函数中调用。printf() 不安全是因为它使用 stdio 缓冲区和内部互斥锁；malloc() 不安全是因为堆管理器使用了内部锁保护堆元数据（glibc 的 ptmalloc2 有 arena 锁）；pthread_mutex_lock() 不在 async-signal-safe 列表中，在 handler 中调用可能导致自死锁。如果需要在 handler 中输出调试信息，应使用 write(STDERR_FILENO, msg, len)。"
+        },
+        {
+          "id": "os-thread-signal-handling-1-q7",
+          "question": "关于 Linux signalfd 和 POSIX sigwait 两种同步信号处理方式的对比，以下说法正确的是：",
+          "choices": [
+            {
+              "id": "A",
+              "text": "signalfd 是 POSIX 标准的一部分，跨平台兼容性优于 sigwait"
+            },
+            {
+              "id": "B",
+              "text": "signalfd 返回文件描述符可融入 epoll 事件循环，sigwait 只能阻塞等待无法与 I/O 多路复用集成"
+            },
+            {
+              "id": "C",
+              "text": "sigwait 性能远高于 signalfd，因为不涉及文件描述符开销"
+            },
+            {
+              "id": "D",
+              "text": "signalfd 和 sigwait 都不需要提前用 pthread_sigmask 阻塞信号"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。signalfd 最大的优势在于它返回一个文件描述符，可以和 epoll、poll、select 一起使用。对于已经使用 epoll 事件循环的网络服务来说，signalfd 可以把信号处理统一到同一个事件循环中，代码结构更干净。sigwait 是阻塞调用，需要一个专用线程来等待，无法直接嵌入 I/O 多路复用。选项 A 正好说反了——signalfd 是 Linux 特有 API（2.6.22+ 引入），sigwait 才是 POSIX 标准的。选项 C 无实质依据，两者在信号处理场景下性能差异可忽略。选项 D 错误，两者都要求提前阻塞信号，否则信号会被默认 handler 处理而不是进入 pending 队列。"
+        },
+        {
+          "id": "os-thread-signal-handling-1-q8",
+          "question": "一个通过 systemd 管理的多线程 C 服务需要支持 SIGTERM 优雅退出和 SIGUSR1 热重载配置，以下哪种实现方式最适合生产环境？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "用 signal() 分别注册 SIGTERM 和 SIGUSR1 的 handler，在 handler 中设置全局标志并调用 pthread_cond_broadcast 通知工作线程"
+            },
+            {
+              "id": "B",
+              "text": "在 main 中用 pthread_sigmask 阻塞 SIGTERM 和 SIGUSR1，创建专用信号线程用 sigwait 同步接收信号，在普通上下文中执行关闭或重载逻辑"
+            },
+            {
+              "id": "C",
+              "text": "不做信号处理，依赖 systemd 的 TimeoutStopSec 超时后 SIGKILL 强杀，通过 ExecStartPre 脚本做数据持久化"
+            },
+            {
+              "id": "D",
+              "text": "在每个工作线程中都调用 sigwait 等待 SIGTERM，哪个线程先收到就由哪个线程负责关闭"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。这是多线程信号处理的标准模式：先阻塞信号、再创建工作线程、最后用专用线程 sigwait 同步等待。在 sigwait 返回后，代码运行在普通线程上下文中，可以安全调用任何函数来执行关闭或重载操作。选项 A 使用了 signal()（行为不可移植）和在 handler 中调用非 async-signal-safe 函数（pthread_cond_broadcast），正是本题场景中导致死锁的做法。选项 C 完全放弃优雅退出，可能导致数据丢失或客户端连接异常断开。选项 D 让多个线程竞争 sigwait 会导致不确定的行为，而且关闭逻辑分散在各线程中难以协调。"
+        },
+        {
+          "id": "os-thread-signal-handling-1-q9",
+          "question": "在一个有 4 个线程的多线程程序中，其中一个线程调用了 fork()。关于子进程中的信号处理状态，以下说法正确的是：",
+          "choices": [
+            {
+              "id": "A",
+              "text": "子进程继承父进程的所有 4 个线程，信号掩码和 handler 保持不变"
+            },
+            {
+              "id": "B",
+              "text": "子进程只有调用 fork 的那个线程，继承该线程的信号掩码和进程级的信号 disposition"
+            },
+            {
+              "id": "C",
+              "text": "子进程只有调用 fork 的那个线程，但信号掩码和 handler 都被重置为默认值"
+            },
+            {
+              "id": "D",
+              "text": "子进程继承所有 4 个线程但信号掩码被重置，需要重新调用 pthread_sigmask"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。POSIX 规定 fork() 创建的子进程只包含调用 fork 的那个线程——其他 3 个线程在子进程中不存在。子进程继承两样东西：调用线程的信号掩码，以及父进程的信号 disposition（handler 注册信息）。选项 A 完全错误，fork 不会复制其他线程。选项 C 也不对，信号掩码和 disposition 都会被继承而非重置。这里有一个著名的陷阱：如果其他 3 个线程在 fork 时持有锁（比如 malloc 内部锁），子进程会继承这些锁的锁定状态，但持有者线程已不存在，锁永远无法释放。这就是为什么多线程程序 fork 后应立即 exec。"
+        },
+        {
+          "id": "os-thread-signal-handling-1-q10",
+          "question": "一个多线程服务在收到 SIGTERM 后偶发卡死（约 5% 概率），你已确认 handler 中调用了 printf 导致死锁。在不修改代码的前提下，以下哪个调试手段最能有效定位死锁的具体位置？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "用 gdb attach 后执行 thread apply all bt，查看所有线程的调用栈"
+            },
+            {
+              "id": "B",
+              "text": "用 strace -e trace=write -f 跟踪所有线程的 write 系统调用"
+            },
+            {
+              "id": "C",
+              "text": "用 valgrind --tool=helgrind 运行程序检测锁竞争"
+            },
+            {
+              "id": "D",
+              "text": "增大 systemd 的 TimeoutStopSec 到 300 秒，等待锁超时自动释放"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确答案是 A。当进程已经死锁时，用 gdb attach 上去后执行 thread apply all bt 可以看到每个线程的完整调用栈——你会看到某个线程的栈从 signal handler 进入 printf 再进入 __lll_lock_wait（futex 等待），同时另一个帧显示同一个线程之前正在 printf 中持有该锁。这是定位死锁最直接有效的手段。选项 B 只能看到系统调用层面的信息，无法显示用户态调用栈和锁状态。选项 C 适合事前检测而非事后诊断，且 valgrind 的性能开销可能改变时序使死锁不复现。选项 D 完全无效——pthread_mutex 没有超时机制，死锁不会自行解除。"
+        }
+      ],
+      "references": [
+        "https://man7.org/linux/man-pages/man7/signal-safety.7.html",
+        "https://man7.org/linux/man-pages/man3/pthread_sigmask.3.html",
+        "https://man7.org/linux/man-pages/man3/sigwait.3.html",
+        "https://man7.org/linux/man-pages/man2/signalfd.2.html",
+        "https://pubs.opengroup.org/onlinepubs/9699919799/functions/V2_chap02.html#tag_15_04"
+      ]
+    }
+  ]
+}

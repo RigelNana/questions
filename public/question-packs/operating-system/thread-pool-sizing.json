@@ -1,0 +1,155 @@
+{
+  "id": "os-thread-pool-sizing",
+  "name": "线程池核心参数设置",
+  "domain": "operating-system",
+  "description": "线程池核心参数（核心线程数、最大线程数、队列容量等）的设置策略与调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-thread-pool-sizing-1",
+      "domain": "operating-system",
+      "type": "tuning",
+      "difficulty": 2,
+      "tags": ["thread-pool", "sizing", "CPU-bound", "IO-bound", "concurrency", "throughput"],
+      "title": "线程池的核心参数应该如何设置",
+      "content": "## 场景\n\n你所在团队维护一个 Java 订单处理服务（Spring Boot 2.7 + JDK 17），部署在 4 核 8G 的 ECS 实例上。这个服务的核心逻辑是接收上游的订单消息，对每条订单做三件事：调用风控接口校验（平均耗时 80ms，纯网络 I/O 等待）、写入 MySQL 数据库（平均耗时 20ms）、发送通知到 Kafka（平均耗时 5ms）。也就是说处理一条订单的总耗时约 105ms，其中约 100ms 在等待 I/O，真正消耗 CPU 的计算时间不到 5ms。\n\n前任开发者用了 Java 的 `ThreadPoolExecutor` 来处理订单，配置如下：\n\n```java\nnew ThreadPoolExecutor(\n    4,                          // corePoolSize\n    4,                          // maximumPoolSize\n    60L, TimeUnit.SECONDS,      // keepAliveTime\n    new LinkedBlockingQueue<>() // 无界队列\n);\n```\n\n日常低峰期（每秒约 200 条订单）一切正常，但最近业务量增长到每秒 800 条，监控平台出现了不妙的信号：\n\n```\n# Prometheus 监控数据\norder_queue_size{instance=\"order-svc-01\"} 12847\norder_processing_latency_p99{instance=\"order-svc-01\"} 16.2s\norder_processing_latency_p50{instance=\"order-svc-01\"} 8.4s\norder_timeout_total{instance=\"order-svc-01\"} 1823\njvm_threads_live{instance=\"order-svc-01\"} 38\nsystem_cpu_usage{instance=\"order-svc-01\"} 0.12\n```\n\n队列堆积了 12847 条未处理的订单，P99 延迟飙到了 16 秒，超时失败了 1823 条。但最让人困惑的是：**CPU 使用率只有 12%**，4 个核心几乎全在空闲。机器资源明明很充裕，但服务就是处理不过来。\n\n你的 Tech Lead 看了一眼配置，说了句：「4 个核心线程处理 I/O 密集型任务，线程全卡在网络等待上，CPU 当然闲着。线程池参数得重新调。」\n\n### 思考\n\n线程池有哪些核心参数？每个参数控制的是线程池行为的哪个环节？对于这种 I/O 密集型任务，线程数应该设多少合适——有没有一个可以直接套用的公式？`corePoolSize` 和 `maximumPoolSize` 应该设成一样吗？无界队列在这里造成了什么隐患？如果任务类型从 I/O 密集变成 CPU 密集，参数设置的策略会有什么本质不同？",
+      "answer": "## 第一步：线程池的核心概念——为什么需要线程池以及它的参数体系\n\n线程池（Thread Pool）是一种基于「池化」思想的并发编程模式，核心理念是预先创建一组工作线程并让它们持续存活，当新任务到来时直接从池中取一个空闲线程来执行，任务执行完后线程不销毁而是回到池中等待下一个任务。这种复用机制避免了频繁创建和销毁线程带来的开销——在 Linux 上创建一个线程需要执行 `clone()` 系统调用、分配线程栈（默认 8MB 虚拟内存，由 `ulimit -s` 控制）、在内核中创建 `task_struct` 结构体，整个过程大约需要 20-50 微秒。单次看不算多，但如果每秒要处理上千个请求，每次都创建线程再销毁，光这一项开销就能吃掉可观的 CPU 时间。更严重的是，线程数不受控地增长会导致内存耗尽和上下文切换风暴——这恰恰是上一篇「什么是线程池」中那个 HTTP 网关服务崩溃的根因。\n\n线程池的参数体系决定了它在面对不同负载时的行为模式。以 Java 的 `ThreadPoolExecutor` 为例（其他语言的线程池实现如 Python 的 `concurrent.futures.ThreadPoolExecutor`、Go 的 worker pool 模式、C++ 的 `std::async` 策略，核心概念完全一致），它有七个构造参数，但真正影响性能调优的核心参数是五个：\n\n**corePoolSize（核心线程数）** 是线程池中长期存活的线程数量。即使这些线程处于空闲状态，默认情况下也不会被回收。当一个新任务提交到线程池时，如果当前活跃线程数还没达到 corePoolSize，线程池会直接创建一个新线程来执行这个任务——即使池中已有空闲线程。这个「优先创建」的行为在 `java.util.concurrent.ThreadPoolExecutor` 的 `execute()` 方法源码中看得很清楚（JDK 17 源码的第 1340 行左右）：先检查 `workerCountOf(c) < corePoolSize`，如果满足就直接 `addWorker(command, true)`。\n\n**maximumPoolSize（最大线程数）** 是线程池允许创建的线程数上限。当核心线程全忙、任务队列也满了的时候，线程池才会创建超出 corePoolSize 的临时线程来应急。这些临时线程在空闲超过 keepAliveTime 后会被回收。\n\n**workQueue（任务队列）** 是核心线程全忙时暂存新任务的缓冲区。Java 中常用的队列实现有三种：`LinkedBlockingQueue`（可选有界/无界，默认无界）、`ArrayBlockingQueue`（有界）、`SynchronousQueue`（容量为 0，提交任务时必须有线程立刻接手否则就触发创建新线程或拒绝）。队列的选择直接决定了线程池的扩展行为——这也是题目中那个配置最大的隐患所在。\n\n**keepAliveTime（空闲线程存活时间）** 控制超出 corePoolSize 的临时线程在空闲多久后被销毁。设置得太短，线程频繁创建销毁浪费资源；设置得太长，突发流量过后空闲线程占着内存不释放。\n\n**RejectedExecutionHandler（拒绝策略）** 是当线程数已达 maximumPoolSize 且队列已满时的最后防线。JDK 提供了四种内置策略：`AbortPolicy`（直接抛 `RejectedExecutionException`，这是默认策略）、`CallerRunsPolicy`（让提交任务的线程自己执行，起到反压效果）、`DiscardPolicy`（静默丢弃）、`DiscardOldestPolicy`（丢弃队列最老的任务再提交新任务）。生产环境中最常用的是 `CallerRunsPolicy`，因为它能自动产生背压，让上游感知到下游处理不过来从而减速。\n\n理解了这五个参数后，线程池处理任务的完整决策链就清晰了：新任务进来 → 当前线程数 < corePoolSize？创建新核心线程 → 否则放入 workQueue → 队列满了？当前线程数 < maximumPoolSize？创建临时线程 → 否则执行拒绝策略。这个决策链是面试中最高频的考点之一。\n\n## 第二步：从当前问题出发——诊断参数配置的问题并给出具体调优方案\n\n回到题目中的场景。订单处理服务的配置 `corePoolSize=4, maximumPoolSize=4, 无界 LinkedBlockingQueue` 在 I/O 密集型场景下犯了三个典型错误。\n\n**第一个错误：线程数严重偏低。** 处理一条订单耗时 105ms，其中 CPU 计算时间约 5ms，I/O 等待时间约 100ms。也就是说一个线程在处理任务的 105ms 中，有 95% 的时间在等 I/O，CPU 完全空闲。4 个线程同时工作时，每个线程每秒最多处理 `1000ms / 105ms ≈ 9.5` 条订单，4 个线程加起来最多处理约 38 条/秒——远低于 800 条/秒的需求。CPU 使用率只有 12% 的原因就在这里：4 个线程对 4 核 CPU 来说根本喂不饱。\n\n**第二个错误：使用无界队列。** `new LinkedBlockingQueue<>()` 不传参数时默认容量是 `Integer.MAX_VALUE`（约 21 亿）。在这种配置下，maximumPoolSize 这个参数实际上完全失效了——因为队列永远不会满，线程池永远不会创建超出 corePoolSize 的线程。更危险的是，当消费速度跟不上生产速度时，队列会无限膨胀，最终导致 OOM。题目中队列堆积到 12847 条，如果流量持续下去就会内存溢出。\n\n**第三个错误：corePoolSize 等于 maximumPoolSize。** 这意味着线程池没有弹性，无法在流量高峰时自动扩容。虽然对于某些场景（比如固定并发量的批处理）这样配置是合理的，但对于流量波动的在线服务来说，缺乏弹性会在低谷期浪费资源或在高峰期能力不足。\n\n### 线程数计算：经典公式与实践修正\n\n业界最广泛引用的线程数计算公式来自 Brian Goetz 的《Java Concurrency in Practice》（2006 年出版）：\n\n```\n最优线程数 = CPU 核心数 × (1 + W/C)\n```\n\n其中 W 是平均等待时间（Wait time），C 是平均计算时间（Compute time）。对于题目中的场景：W = 100ms，C = 5ms，CPU 核心数 = 4，代入公式得到 `4 × (1 + 100/5) = 4 × 21 = 84`。也就是说理论上配置 84 个线程才能把 4 核 CPU 充分利用。\n\n验证一下：84 个线程，每个线程每秒处理 9.5 条，总吞吐量 ≈ 798 条/秒，恰好接近 800 条/秒的需求。CPU 使用率预期会从 12% 提升到 `84 × 5ms / (4 × 1000ms) ≈ 10.5%` × 多线程调度因子——实际因为上下文切换和缓存失效等因素，CPU 使用率大约会在 40%-60% 的范围，这是一个健康的工作区间。\n\n对于 CPU 密集型任务（比如图片压缩、加密运算、科学计算），W 接近 0，公式退化为 `线程数 ≈ CPU 核心数`。在实践中通常设为 `CPU 核心数 + 1`，多出的那 1 个线程是为了在某个线程偶尔触发页面错误（page fault）或其他短暂阻塞时，确保 CPU 不会空闲。这个 +1 的建议同样来自 Goetz 的书。\n\n但是公式只是起点，不是终点。真实系统中有很多因素会让理论值偏离最优：I/O 延迟不是固定值而是有波动的（P50 80ms 但 P99 可能到 500ms）；服务器上不只跑你一个应用；线程之间可能存在锁竞争；GC 暂停会让所有线程短暂停顿。所以生产环境的正确做法是：**用公式算出一个基准值，然后通过压测逐步调整**。\n\n### 调优后的具体参数推荐\n\n针对题目场景，调优后的线程池配置如下：\n\n```java\nnew ThreadPoolExecutor(\n    50,                                     // corePoolSize: 常态保持 50 个线程\n    100,                                    // maximumPoolSize: 高峰可扩到 100\n    30L, TimeUnit.SECONDS,                  // 临时线程空闲 30s 后回收\n    new ArrayBlockingQueue<>(500),           // 有界队列，容量 500\n    new ThreadPoolExecutor.CallerRunsPolicy() // 队列满时让调用者线程自己执行\n);\n```\n\ncorePoolSize 设 50 而不是公式算出的 84，是因为 84 是把 CPU 跑满的理论值。生产环境不应该把 CPU 跑满——需要留出余量应对 GC 暂停、I/O 延迟波动和突发请求。maximumPoolSize 设 100 给了一个弹性空间，当风控接口偶尔慢到 200ms（P99 场景）时，更多线程可以维持吞吐量。队列从无界改为有界（500），防止堆积导致 OOM。拒绝策略用 `CallerRunsPolicy`，让提交线程自己执行任务，产生天然的背压效果。\n\n### 调优前后的对比数据\n\n经过压测验证（用 JMeter 以 800 TPS 持续发压 10 分钟），调优前后的关键指标对比如下：\n\n| 指标 | 调优前 (4 线程+无界队列) | 调优后 (50/100 线程+有界队列) |\n|------|------------------------|------------------------------|\n| 吞吐量 | ~38 TPS | ~780 TPS |\n| P50 延迟 | 8.4s | 120ms |\n| P99 延迟 | 16.2s | 350ms |\n| 队列堆积 | 12847 | < 50 |\n| CPU 使用率 | 12% | 45% |\n| 超时失败数 | 1823 | 0 |\n\n吞吐量提升了 20 倍，P99 延迟从 16 秒降到了 350 毫秒，超时归零。CPU 使用率从 12% 上升到 45%——这恰恰说明之前 CPU 在严重空转浪费。\n\n## 第三步：进阶知识——动态调参、不同语言的线程池实现与生产环境陷阱\n\n### 动态线程池：运行时调参的能力\n\n`ThreadPoolExecutor` 提供了 `setCorePoolSize()` 和 `setMaximumPoolSize()` 方法，支持运行时动态修改线程池大小。美团技术团队在 2020 年发表的技术文章中详细介绍了他们的动态线程池方案：将线程池参数存储在配置中心（如 Apollo 或 Nacos），监听配置变更并实时调整。关键代码只有几行：\n\n```java\nexecutor.setCorePoolSize(newCoreSize);\nexecutor.setMaximumPoolSize(newMaxSize);\n// 如果新 corePoolSize > 当前活跃线程数，会立刻创建新线程\n// 如果新 corePoolSize < 当前核心线程数，多余的线程在空闲后才会被回收\n```\n\n需要注意的是，修改队列容量不像修改线程数那么直接——`ArrayBlockingQueue` 的容量在创建时就固定了，不支持运行时修改。如果要支持动态队列容量，需要用可变容量的队列实现（如 `LinkedBlockingQueue` 配合反射修改 `capacity` 字段，或者使用 `ResizableCapacityLinkedBlockingQueue`）。\n\n### 不同语言的线程池参数对应\n\nGo 语言没有标准库级别的线程池，通常用 goroutine + buffered channel 实现 worker pool 模式。channel 的 buffer size 对应 workQueue 的容量，goroutine 数量对应 maximumPoolSize。由于 goroutine 的创建成本极低（约 2KB 初始栈，几百纳秒创建时间），Go 中的「线程池大小」更多是用来限制并发数而非节省创建开销。Python 的 `concurrent.futures.ThreadPoolExecutor` 只有一个 `max_workers` 参数，内部使用无界队列，因此需要在提交端自行控制任务量来避免内存溢出。\n\n### 生产环境常见陷阱\n\n**陷阱一：I/O 密集型任务用 CPU 核心数作线程数。** 这是最常见的错误配置，通常来源于网上那句被广泛误传的「线程数等于 CPU 核心数」。这个建议只适用于纯 CPU 密集型场景。对于 I/O 密集型任务，如果机器有 4 核就只开 4 个线程，那 CPU 大部分时间都在空闲等 I/O，吞吐量完全上不去——就像题目中的场景。\n\n**陷阱二：无脑用无界队列。** `Executors.newFixedThreadPool()` 和 `Executors.newSingleThreadExecutor()` 这两个工厂方法内部都使用了无界的 `LinkedBlockingQueue`。阿里巴巴 Java 开发手册明确禁止使用这两个工厂方法，原因就是无界队列在消费速度跟不上生产速度时会导致 OOM。正确做法是永远手动创建 `ThreadPoolExecutor` 并使用有界队列。\n\n**陷阱三：忽略线程池的监控。** 一个没有监控的线程池就是一颗定时炸弹。至少应该监控以下四个指标：活跃线程数（`getActiveCount()`）、队列大小（`getQueue().size()`）、已完成任务数（`getCompletedTaskCount()`）和拒绝次数（通过自定义 RejectedExecutionHandler 计数）。在 Spring Boot 中可以通过 Micrometer 将这些指标暴露给 Prometheus。\n\n**陷阱四：混合任务类型共用一个线程池。** 如果一个线程池同时处理 CPU 密集型任务和 I/O 密集型任务，参数无论怎么设都是错的——线程数设多了 CPU 任务打满核心导致延迟飙升，设少了 I/O 任务又把 CPU 闲置浪费。正确做法是按任务类型拆分不同的线程池，各自独立配置参数。\n\n### 面试高频追问与应答要点\n\n面试官问「线程池参数怎么设」的时候，最差的回答是直接甩一个公式。正确的回答框架是：先区分任务类型（CPU 密集还是 I/O 密集），再根据任务特征用公式算出基准值，然后强调必须通过压测验证和调整，最后提到动态调参和监控的必要性。如果能再提到 Little's Law（利特尔法则：`L = λ × W`，即系统中的平均请求数 = 到达速率 × 平均处理时间）来佐证线程数的推导逻辑，会给面试官留下非常深刻的印象。比如题目场景中，λ = 800 条/秒，W = 0.105 秒，所以系统中平均有 `800 × 0.105 = 84` 条订单正在处理中——这恰好与 Goetz 公式的结果吻合，说明两个公式从不同角度得出了一致的结论。",
+      "keyPoints": [
+        "线程池的五个核心参数是 corePoolSize（常驻线程数）、maximumPoolSize（线程数上限）、workQueue（任务缓冲队列）、keepAliveTime（临时线程空闲回收时间）和 RejectedExecutionHandler（拒绝策略），它们共同决定了任务提交后的完整决策链",
+        "I/O 密集型任务的最优线程数公式为 CPU 核心数 × (1 + W/C)，其中 W 是平均等待时间、C 是平均计算时间；CPU 密集型任务线程数通常设为 CPU 核心数 + 1",
+        "无界队列（如默认的 LinkedBlockingQueue）会导致 maximumPoolSize 参数完全失效，因为队列永远不会满，线程池永远不会扩容，最终还会因队列无限膨胀而 OOM",
+        "生产环境应使用有界队列（ArrayBlockingQueue）配合 CallerRunsPolicy 拒绝策略，在队列满时让调用者线程自己执行任务，自然形成背压保护系统",
+        "公式只是基准值起点，真实环境中 I/O 延迟波动、GC 暂停、锁竞争等因素都会影响最优值，必须通过压测逐步调整而非直接套用公式上线",
+        "Little's Law（L = λ × W）可以从排队论角度验证线程数推导：系统中平均并发请求数等于到达速率乘以平均处理时间，这个值就是需要的最少线程数",
+        "不同类型的任务应使用独立的线程池分别配置参数，混合 CPU 密集和 I/O 密集任务在同一个线程池中会导致参数无论怎么设都不合理",
+        "线程池必须配套监控（活跃线程数、队列大小、完成任务数、拒绝次数），并支持运行时动态调参以应对流量波动"
+      ],
+      "quiz": [
+        {
+          "id": "os-thread-pool-sizing-1-q1",
+          "question": "Java ThreadPoolExecutor 中，当一个新任务提交时，以下哪个描述最准确地反映了线程池的决策顺序？",
+          "choices": [
+            {"id": "A", "text": "先尝试放入队列，队列满了再创建线程，线程数达到 corePoolSize 后执行拒绝策略"},
+            {"id": "B", "text": "先检查当前线程数是否小于 corePoolSize，是则创建新线程；否则放入队列；队列满了且线程数小于 maximumPoolSize 则创建临时线程；否则执行拒绝策略"},
+            {"id": "C", "text": "先检查是否有空闲线程，有则复用；没有则创建新线程直到达到 maximumPoolSize；之后放入队列；队列满了执行拒绝策略"},
+            {"id": "D", "text": "先创建线程直到达到 maximumPoolSize，然后开始放入队列，队列满了执行拒绝策略"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ThreadPoolExecutor 的 execute() 方法有明确的三步决策链：第一步判断 workerCount < corePoolSize 就直接创建核心线程（即使有空闲线程也会创建新的，直到达到 corePoolSize）；第二步尝试将任务放入 workQueue；第三步当队列满了才检查是否能创建临时线程（workerCount < maximumPoolSize），不能就执行拒绝策略。A 选项的错误在于把队列判断放在了线程创建之前；C 选项的「先复用空闲线程」描述不准确，线程池在核心线程未满时是优先创建新线程而非复用空闲线程；D 选项的顺序完全颠倒，把 maximumPoolSize 的判断提前到了队列入队之前。"
+        },
+        {
+          "id": "os-thread-pool-sizing-1-q2",
+          "question": "根据 Brian Goetz 的线程数计算公式 N_threads = N_cpu × (1 + W/C)，一个 8 核服务器上运行的服务，每个请求平均 CPU 计算时间为 10ms、等待数据库 I/O 时间为 90ms，理论最优线程数是多少？",
+          "choices": [
+            {"id": "A", "text": "8 个，因为线程数不应超过 CPU 核心数"},
+            {"id": "B", "text": "16 个，因为 I/O 密集型任务通常设为 CPU 核心数的 2 倍"},
+            {"id": "C", "text": "80 个，代入公式 8 × (1 + 90/10) = 80"},
+            {"id": "D", "text": "800 个，因为等待时间越长线程数应该越多，需要 8 × 100 = 800"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "代入公式：N_cpu = 8，W（等待时间）= 90ms，C（计算时间）= 10ms，得到 8 × (1 + 90/10) = 8 × 10 = 80 个线程。A 选项的「线程数不超过 CPU 核心数」只适用于纯 CPU 密集型任务（W 接近 0 时公式退化为 N_cpu），对 I/O 密集型完全不适用。B 选项的「2 倍 CPU 核心数」是一个被广泛传播但不够精确的经验值，没有考虑实际的 W/C 比率。D 选项错误地把乘数理解为 W 本身而非 W/C 比率，公式中 W 和 C 的单位必须一致才能求比值。"
+        },
+        {
+          "id": "os-thread-pool-sizing-1-q3",
+          "question": "使用 Executors.newFixedThreadPool(10) 创建的线程池，其内部使用的任务队列是什么类型，这会带来什么问题？",
+          "choices": [
+            {"id": "A", "text": "ArrayBlockingQueue(1024)，当队列满时任务会被拒绝抛出异常"},
+            {"id": "B", "text": "SynchronousQueue，提交任务时必须有空闲线程立刻接手否则阻塞"},
+            {"id": "C", "text": "LinkedBlockingQueue（无界），当任务提交速度持续超过处理速度时队列无限增长最终导致 OOM"},
+            {"id": "D", "text": "PriorityBlockingQueue，任务按优先级排序执行，高优先级任务可能饿死低优先级任务"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "查看 JDK 源码中 Executors.newFixedThreadPool() 的实现：`return new ThreadPoolExecutor(nThreads, nThreads, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>())`。无参构造的 LinkedBlockingQueue 容量为 Integer.MAX_VALUE（约 21 亿），本质上就是无界队列。这意味着如果 10 个线程全忙，新任务会持续堆积在队列中不会触发拒绝策略，内存会持续增长直到 OOM。这正是阿里巴巴 Java 开发手册明确禁止使用 Executors 工厂方法创建线程池的原因。A 选项描述的是手动创建有界 ArrayBlockingQueue 的情况；B 选项描述的是 Executors.newCachedThreadPool() 的行为；D 选项的 PriorityBlockingQueue 不是标准线程池工厂使用的队列。"
+        },
+        {
+          "id": "os-thread-pool-sizing-1-q4",
+          "question": "一个纯 CPU 密集型任务（如图片压缩），在 4 核服务器上运行，线程池的 corePoolSize 设为 100 会导致什么结果？",
+          "choices": [
+            {"id": "A", "text": "吞吐量提升约 25 倍（100/4），因为更多线程可以处理更多任务"},
+            {"id": "B", "text": "吞吐量基本不变甚至下降，因为 CPU 密集型任务的线程数超过核心数后，线程间的上下文切换开销反而会降低有效 CPU 时间"},
+            {"id": "C", "text": "吞吐量不变，CPU 使用率不受线程数影响"},
+            {"id": "D", "text": "系统会自动限制实际运行的线程数为 4，多余的线程不会被调度"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CPU 密集型任务的特点是线程几乎不会阻塞等待 I/O，每个线程都在持续使用 CPU。4 核 CPU 意味着同一时刻最多只能有 4 个线程真正在执行指令。当你创建 100 个线程来做 CPU 密集计算时，操作系统调度器必须在这 100 个线程之间频繁切换，每次上下文切换（保存/恢复寄存器、刷新 TLB 缓存、切换内核栈）大约需要 1-5 微秒。更严重的是，线程切换会导致 CPU 缓存（L1/L2/L3 Cache）中的热点数据被新线程的数据覆盖（称为 cache thrashing），后续访问产生缓存未命中。因此 100 线程的吞吐量不仅不会提升，反而会因切换和缓存失效的开销而下降。A 错在假设线程数与吞吐量成线性关系；D 错在操作系统不会限制调度。"
+        },
+        {
+          "id": "os-thread-pool-sizing-1-q5",
+          "question": "某服务的线程池监控数据如下：pool_size=50, active_count=50, queue_size=500, completed_task=12000, rejected_count=347。以下哪个分析最准确？",
+          "choices": [
+            {"id": "A", "text": "线程池运行健康，50 个线程全部活跃说明 CPU 利用率高效"},
+            {"id": "B", "text": "线程池已满负荷运行且有 347 次任务被拒绝，说明 maximumPoolSize 或队列容量需要增大，或者需要排查任务处理是否异常变慢"},
+            {"id": "C", "text": "队列堆积 500 是正常现象，说明线程池的缓冲功能在正常发挥作用"},
+            {"id": "D", "text": "rejected_count=347 说明拒绝策略配置有误，应该换成 DiscardPolicy 来避免拒绝"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "pool_size=50 且 active_count=50 意味着所有线程都在忙碌，没有空闲线程。queue_size=500 如果等于队列容量上限，说明队列也满了。rejected_count=347 说明有 347 个任务触发了拒绝策略——这是一个明确的告警信号。正确的排查方向是：首先检查任务处理时间是否异常增长（比如下游服务变慢导致 I/O 等待时间增加），如果是临时性问题则等下游恢复；如果是长期性的流量增长则需要增大 maximumPoolSize 或扩容机器。A 错在忽视了拒绝信号；C 错在队列满并伴随拒绝不是正常现象；D 错在 DiscardPolicy 只是静默丢弃任务而不解决根因，还会导致数据丢失。"
+        },
+        {
+          "id": "os-thread-pool-sizing-1-q6",
+          "question": "以下哪个是使用无界队列（如默认 LinkedBlockingQueue）时最容易被忽视的陷阱？",
+          "choices": [
+            {"id": "A", "text": "无界队列会导致线程创建过多，因为队列无法缓冲任务所以线程池不断创建新线程"},
+            {"id": "B", "text": "无界队列会使 maximumPoolSize 参数完全失效，因为队列永远不会满，线程池永远不会创建超出 corePoolSize 的线程"},
+            {"id": "C", "text": "无界队列的 poll 和 offer 操作有很大的锁开销，在高并发下性能远差于有界队列"},
+            {"id": "D", "text": "无界队列不支持公平调度，会导致某些任务被长期饿死"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是线程池参数配置中最容易踩的坑。ThreadPoolExecutor 的决策链是：核心线程满 → 入队列 → 队列满 → 创建临时线程到 maximumPoolSize → 拒绝。当队列是无界的（容量为 Integer.MAX_VALUE），第三步「队列满」这个条件永远不会触发，所以线程池中的线程数永远不会超过 corePoolSize，maximumPoolSize 形同虚设。这就是为什么很多人配了 maximumPoolSize=200 却发现线程数从没超过 corePoolSize。A 选项说反了，无界队列的效果恰恰是抑制线程创建而非促进。C 选项不准确，LinkedBlockingQueue 使用分离的 putLock 和 takeLock 两把锁实现读写分离，并发性能并不差。D 选项是与队列有界无界无关的调度公平性问题。"
+        },
+        {
+          "id": "os-thread-pool-sizing-1-q7",
+          "question": "CallerRunsPolicy 和 AbortPolicy 作为线程池拒绝策略，在生产环境中各自的适用场景是什么？",
+          "choices": [
+            {"id": "A", "text": "CallerRunsPolicy 适用于需要背压保护的场景，让提交者线程自己执行任务从而自动降低提交速率；AbortPolicy 适用于任务不可丢失且调用方有异常处理机制的场景"},
+            {"id": "B", "text": "AbortPolicy 性能更好因为直接抛异常不需要执行任务，所以高吞吐场景都应该用 AbortPolicy"},
+            {"id": "C", "text": "CallerRunsPolicy 会阻塞调用者线程，导致上游超时，所以生产环境永远不应该使用"},
+            {"id": "D", "text": "两者没有本质区别，都会导致任务丢失，只是通知方式不同（一个抛异常一个不通知）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "CallerRunsPolicy 的精妙之处在于它天然产生背压（backpressure）。当线程池和队列都满时，它让提交任务的那个线程（通常是接收请求的 I/O 线程或消息消费线程）自己去执行任务。这意味着这个线程在执行任务期间无法继续提交新任务，客观上减慢了任务提交速率，让线程池有时间消化积压。这种自适应的减速机制非常适合上下游速率不匹配的场景。AbortPolicy 抛出 RejectedExecutionException，适用于调用方能捕获异常并做补偿处理（如重试、降级）的场景。B 错在高吞吐不等于可以丢任务；C 说法过于绝对，CallerRunsPolicy 的阻塞正是背压的目的；D 错在 CallerRunsPolicy 不会丢失任务。"
+        },
+        {
+          "id": "os-thread-pool-sizing-1-q8",
+          "question": "你的服务同时处理两类任务：快速的缓存查询（平均 2ms，CPU 密集型解析）和慢速的外部 API 调用（平均 500ms，I/O 密集型）。以下哪种线程池配置方案最合理？",
+          "choices": [
+            {"id": "A", "text": "使用一个线程池，线程数设为两种任务需求的平均值，统一管理更简单"},
+            {"id": "B", "text": "拆分为两个独立线程池：缓存查询池设为 CPU 核心数 +1（如 5 个线程），外部 API 调用池设为 CPU 核心数 × (1 + 500/2) 的合理上限（如 50-100 个线程）"},
+            {"id": "C", "text": "使用 Executors.newCachedThreadPool() 让系统自动管理，按需创建和回收线程"},
+            {"id": "D", "text": "使用一个线程池但设置 maximumPoolSize 为很大的值（如 1000），让线程池自动适应两种任务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "不同类型的任务混合在同一个线程池中是生产环境的经典反模式。如果线程数设多了（按 I/O 密集型任务需求），大量线程同时执行 CPU 密集型任务会导致上下文切换风暴和缓存失效；如果线程数设少了（按 CPU 密集型任务需求），I/O 密集型任务会把线程全部占住等 I/O，CPU 空转。正确做法是按任务类型拆分线程池，各自独立配置参数。A 的平均值方案对两种任务都不是最优的。C 的 CachedThreadPool 在慢速 I/O 任务下会创建大量线程（每个 500ms 的任务都会长期占用一个线程），高并发时可能创建成千上万个线程导致内存溢出。D 的超大 maximumPoolSize 同样面临线程数失控的风险。"
+        },
+        {
+          "id": "os-thread-pool-sizing-1-q9",
+          "question": "在使用 ThreadPoolExecutor.setCorePoolSize() 动态调整核心线程数时，如果将 corePoolSize 从 50 缩小到 20，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "线程池会立即终止 30 个正在执行任务的核心线程，中断它们的任务"},
+            {"id": "B", "text": "多余的 30 个核心线程不会被立即终止，而是在当前任务执行完毕且空闲超过 keepAliveTime 后才被逐步回收"},
+            {"id": "C", "text": "setCorePoolSize 只是修改了一个数值标记，不会对已有线程产生任何实际影响"},
+            {"id": "D", "text": "需要先调用 shutdown() 关闭线程池再重新创建才能真正改变核心线程数"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ThreadPoolExecutor 的 setCorePoolSize() 方法设计得比较优雅。当新的 corePoolSize 比旧值小时，它不会暴力中断正在工作的线程——这会导致任务丢失和状态不一致。实际行为是：方法内部会调用 interruptIdleWorkers() 尝试中断空闲线程，对于正在执行任务的线程则不会干预。这些「多余」的核心线程在完成当前任务后，如果发现 workerCount > corePoolSize，会像临时线程一样进入 keepAliveTime 倒计时，空闲超时后自行退出。A 错在线程池不会中断正在执行任务的线程；C 低估了 setCorePoolSize 的实际效果，它确实会触发空闲线程的回收；D 完全不需要 shutdown 再重建。"
+        },
+        {
+          "id": "os-thread-pool-sizing-1-q10",
+          "question": "你的 Java 服务使用了线程池处理请求，压测时发现吞吐量在线程数从 10 增加到 50 时持续上升，但从 50 增加到 200 时吞吐量反而下降了 15%，同时 CPU 使用率从 70% 上升到 85%。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "JVM 的线程数有硬编码上限（通常 128 个），超过后新线程实际上处于挂起状态"},
+            {"id": "B", "text": "线程数增加导致上下文切换和锁竞争加剧，切换和等锁本身消耗了大量 CPU 时间（表现为 CPU 更高但有效工作吞吐反而降低）"},
+            {"id": "C", "text": "200 个线程的栈内存总量超过了 JVM 堆大小限制，触发了频繁 Full GC"},
+            {"id": "D", "text": "操作系统调度器在线程数超过 100 时会切换到低效的调度算法"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个典型的线程数过拐点（inflection point）的表现。从 10 到 50 线程时，增加的线程填补了 I/O 等待期间的 CPU 空闲，吞吐量随线程数接近线性增长。但超过最优线程数后，继续增加线程带来的边际收益（填充 CPU 空闲时间）开始小于边际成本（上下文切换、锁竞争、CPU 缓存失效）。Linux 的 CFS 调度器每次上下文切换需要 1-5 微秒，200 个线程频繁切换会消耗可观的 CPU 时间。此外如果任务中有共享资源的锁，更多线程意味着更激烈的锁竞争——线程花在 BLOCKED 状态等锁的时间增加了。A 错在 JVM 没有 128 线程的硬上限；C 错在线程栈不占堆内存而是占原生内存；D 错在 Linux CFS 调度器不会因线程数量改变算法。"
+        }
+      ],
+      "references": [
+        "https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html",
+        "https://jcip.net/"
+      ]
+    }
+  ]
+}
