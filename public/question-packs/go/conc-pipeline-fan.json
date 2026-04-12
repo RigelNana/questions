@@ -1,0 +1,155 @@
+{
+  "id": "go-conc-pipeline-fan",
+  "name": "Pipeline 与 Fan-in/Fan-out 并发模式",
+  "domain": "go",
+  "description": "数据管道模式、扇入扇出、stage 设计、背压控制、pipeline 取消与错误传播",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "go-conc-pipeline-fan",
+      "domain": "go",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": ["pipeline", "fan-in", "fan-out", "并发模式", "channel"],
+      "title": "Pipeline 与 Fan-in/Fan-out 并发模式",
+      "content": "你在做一个日志分析服务：从 S3 读取日志文件 → 解压 → 按行解析 → 过滤敏感信息 → 写入 Elasticsearch。每天处理 200GB 数据——单 goroutine 串行处理需要 8 小时——需要并行化。\n\n你想用 Go 的 pipeline 模式：每个处理阶段是一个 stage——stage 之间用 channel 连接——某些 stage（如解压、解析）可以 fan-out 到多个 worker。\n\n```go\n// 你的初始设计\nfunc main() {\n    files := listFiles(\"s3://logs/2024-01-15/\")\n    \n    for _, f := range files {\n        data := download(f)    // 串行下载\n        lines := decompress(data) // 串行解压\n        for _, line := range lines {\n            parsed := parse(line)  // 串行解析\n            if !isSensitive(parsed) {\n                index(parsed)      // 串行写入\n            }\n        }\n    }\n}\n```\n\n如何将这个串行流程改造成 pipeline + fan-out 模式？每个 stage 的 channel 缓冲区大小怎么定？如果下游慢怎么办（背压）？如何优雅取消整个 pipeline？",
+      "answer": "Pipeline 是 Go 并发编程中最经典的模式之一——Rob Pike 在 2012 年的 Concurrency is not Parallelism 演讲中就展示了这种思路。它的核心思想很简单：**把数据处理拆成多个阶段——每个阶段是一个函数——接收一个输入 channel——返回一个输出 channel**。\n\n**基本 Pipeline 结构**\n\n```go\n// Stage: 接收 <-chan，返回 <-chan\nfunc generator(files []string) <-chan string {\n    out := make(chan string)\n    go func() {\n        defer close(out)\n        for _, f := range files {\n            out <- f\n        }\n    }()\n    return out\n}\n\nfunc download(ctx context.Context, in <-chan string) <-chan []byte {\n    out := make(chan []byte)\n    go func() {\n        defer close(out)\n        for f := range in {\n            select {\n            case <-ctx.Done():\n                return\n            default:\n                data, _ := fetchFromS3(f)\n                out <- data\n            }\n        }\n    }()\n    return out\n}\n```\n\n每个 stage 的签名是 `func(ctx, <-chan T) <-chan U`——输入 channel 关闭时 range 自动退出——关闭输出 channel 通知下游——整条 pipeline 像多米诺骨牌一样级联停止。\n\n**Fan-out：一个 stage 启动多个 worker**\n\n```go\nfunc decompressStage(ctx context.Context, in <-chan []byte, numWorkers int) <-chan string {\n    out := make(chan string, numWorkers*2) // 缓冲 = worker 数 * 2\n    \n    var wg sync.WaitGroup\n    for i := 0; i < numWorkers; i++ {\n        wg.Add(1)\n        go func() {\n            defer wg.Done()\n            for data := range in {\n                select {\n                case <-ctx.Done():\n                    return\n                default:\n                    lines := gzipDecompress(data)\n                    for _, line := range lines {\n                        out <- line\n                    }\n                }\n            }\n        }()\n    }\n    \n    // 所有 worker 完成后关闭输出 channel\n    go func() {\n        wg.Wait()\n        close(out)\n    }()\n    \n    return out\n}\n```\n\n关键点：**多个 worker 从同一个 input channel 读取——Go 的 channel 是 goroutine-safe 的——多个读者自动负载均衡**。output channel 只在所有 worker 都退出后才关闭——用 WaitGroup 协调。\n\n**Fan-in：多个 channel 合并成一个**\n\n```go\nfunc fanIn(ctx context.Context, channels ...<-chan string) <-chan string {\n    out := make(chan string)\n    var wg sync.WaitGroup\n    \n    for _, ch := range channels {\n        wg.Add(1)\n        go func(c <-chan string) {\n            defer wg.Done()\n            for v := range c {\n                select {\n                case <-ctx.Done():\n                    return\n                case out <- v:\n                }\n            }\n        }(ch)\n    }\n    \n    go func() {\n        wg.Wait()\n        close(out)\n    }()\n    \n    return out\n}\n```\n\n**背压（Backpressure）——下游慢怎么办？**\n\nPipeline 的天然优势就是背压——如果 Elasticsearch 写入慢（下游 channel 满了）——上游的 channel 发送也会阻塞——天然限制了上游的速度。不需要额外的限流机制。\n\n但有一个陷阱：如果某个 stage 是 fan-out 的——多个 worker 可能同时阻塞在向 output channel 发送——导致所有 worker 都被卡住。解决方案：\n\n```go\n// 1. 增大缓冲区——buffer 吸收短暂的速度差\nout := make(chan string, 1024)\n\n// 2. 设置超时——丢弃而非阻塞\nselect {\ncase out <- data:\ncase <-time.After(5 * time.Second):\n    log.Warn(\"pipeline stage blocked, dropping data\")\n    metrics.Inc(\"pipeline.drops\")\ncase <-ctx.Done():\n    return\n}\n```\n\n**Channel 缓冲区大小经验**\n\n- **0（无缓冲）**：严格同步——上下游速度一致时用——但吞吐量低\n- **worker 数量 × 2**：一般推荐——给每个 worker 预留 2 个位置\n- **1024+**：高吞吐场景——但要注意内存——如果元素是 []byte 切片会占很多内存\n\n**优雅取消整个 Pipeline**\n\n```go\nfunc runPipeline() error {\n    ctx, cancel := context.WithCancel(context.Background())\n    defer cancel()\n    \n    // 信号处理\n    sigCh := make(chan os.Signal, 1)\n    signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)\n    go func() {\n        <-sigCh\n        log.Info(\"received signal, canceling pipeline...\")\n        cancel()\n    }()\n    \n    // 构建 pipeline\n    files := generator(listFiles(\"s3://logs/\"))\n    downloaded := download(ctx, files)\n    decompressed := decompressStage(ctx, downloaded, runtime.NumCPU())\n    parsed := parseStage(ctx, decompressed, runtime.NumCPU()*2)\n    filtered := filterStage(ctx, parsed)\n    \n    // 最后一个 stage 消费——阻塞直到完成\n    return indexStage(ctx, filtered, 4)\n}\n```\n\n取消用 context——cancel() 调用后——每个 stage 的 select 中 `<-ctx.Done()` 分支触发——goroutine 退出——channel 关闭——级联退出。\n\n**错误传播——用 errgroup**\n\n```go\nfunc runPipeline() error {\n    ctx, cancel := context.WithCancel(context.Background())\n    defer cancel()\n    \n    g, ctx := errgroup.WithContext(ctx)\n    \n    fileCh := make(chan string, 100)\n    dataCh := make(chan []byte, 16)\n    lineCh := make(chan string, 1024)\n    \n    // Stage 1: 生成文件列表\n    g.Go(func() error {\n        defer close(fileCh)\n        for _, f := range listFiles() {\n            select {\n            case fileCh <- f:\n            case <-ctx.Done():\n                return ctx.Err()\n            }\n        }\n        return nil\n    })\n    \n    // Stage 2: 下载（fan-out 4 workers）\n    for i := 0; i < 4; i++ {\n        g.Go(func() error {\n            for f := range fileCh {\n                data, err := fetchFromS3(f)\n                if err != nil {\n                    return fmt.Errorf(\"download %s: %w\", f, err)\n                }\n                select {\n                case dataCh <- data:\n                case <-ctx.Done():\n                    return ctx.Err()\n                }\n            }\n            return nil\n        })\n    }\n    \n    return g.Wait()\n}\n```\n\nerrgroup 的 WithContext——任何一个 goroutine 返回 error——ctx 被 cancel——所有其他 goroutine 收到取消信号。这是生产环境中 pipeline 错误处理的标准做法。\n\n**实际性能数据**\n\n```\n200GB 日志处理性能：\n串行模式:        8 小时\nPipeline (1 worker/stage):  3 小时（I/O 和 CPU 交叠）\nPipeline + Fan-out (8 CPU): 45 分钟\nPipeline + Fan-out + 调优:  25 分钟\n\n瓶颈通常在 I/O——不是 CPU。\n用 pprof 的 goroutine profile 看哪个 stage 阻塞最多。\n```",
+      "keyPoints": [
+        "Pipeline 每个 stage 是 func(ctx, <-chan T) <-chan U——输入关闭自动级联停止",
+        "Fan-out 让多个 worker 从同一个 channel 读——天然负载均衡——用 WaitGroup 等所有 worker 完成再 close",
+        "背压通过 channel 阻塞天然实现——下游慢上游自动减速——不需要额外限流",
+        "channel 缓冲区大小经验：worker数×2 一般够用——高吞吐用 1024+",
+        "优雅取消用 context.WithCancel——cancel() 后 select 的 ctx.Done() 分支级联退出",
+        "错误传播用 errgroup.WithContext——一个 goroutine 出错自动取消其他所有",
+        "用 pprof goroutine profile 找 pipeline 瓶颈——看哪个 stage 阻塞时间最长"
+      ],
+      "quiz": [
+        {
+          "id": "go-pipeline-q1",
+          "question": "Go pipeline 模式中每个 stage 的标准函数签名是什么？",
+          "choices": [
+            {"id": "A", "text": "func(ctx context.Context, in <-chan T) <-chan U——接收只读 channel 返回只读 channel"},
+            {"id": "B", "text": "func(in []T) []U——接收 slice 返回 slice"},
+            {"id": "C", "text": "func(in T) U——普通函数"},
+            {"id": "D", "text": "func(in chan T, out chan U)——双向 channel 参数"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：pipeline stage 的核心设计是「接收只读 channel，返回只读 channel」——stage 内部创建 output channel 并启动 goroutine 处理。返回 <-chan（只读）而非 chan——防止调用者误操作（如关闭 channel）。加 context 参数支持取消。这种签名让 stage 可以任意组合：stage3(ctx, stage2(ctx, stage1(ctx, input)))。"
+        },
+        {
+          "id": "go-pipeline-q2",
+          "question": "Fan-out 模式中多个 worker 从同一个 channel 读取为什么可行？",
+          "choices": [
+            {"id": "A", "text": "Go 的 channel 是 goroutine-safe 的——多个接收者竞争接收——每条消息只被一个 worker 取走——天然负载均衡"},
+            {"id": "B", "text": "每个 worker 收到所有消息（广播）"},
+            {"id": "C", "text": "需要加锁"},
+            {"id": "D", "text": "只有第一个 worker 能读"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：channel 的 receive 操作是原子的——多个 goroutine 同时 <-ch——runtime 保证每条消息只被一个 goroutine 接收。慢的 worker 自然少接收——快的多接收——天然实现负载均衡。不需要任何锁或分发逻辑。如果需要广播（每个 worker 都收到），不能用 channel——需要自己实现 pub-sub。"
+        },
+        {
+          "id": "go-pipeline-q3",
+          "question": "Fan-out stage 的 output channel 应该在什么时候 close？",
+          "choices": [
+            {"id": "A", "text": "所有 worker goroutine 都退出后——用 WaitGroup 等待所有 worker 完成再 close"},
+            {"id": "B", "text": "第一个 worker 完成就 close"},
+            {"id": "C", "text": "不需要 close"},
+            {"id": "D", "text": "用 defer close 在每个 worker 里 close"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：如果在某个 worker 退出时就 close——其他 worker 还在往已关闭的 channel 发送——panic。正确做法：每个 worker wg.Add(1)/wg.Done()——另起一个 goroutine 执行 wg.Wait() 后 close(out)。close 的作用是通知下游「没有更多数据了」——必须等所有 producer 都完成。如果 D 选项 defer close 在每个 worker 里——第一个退出的 worker 就会 close。"
+        },
+        {
+          "id": "go-pipeline-q4",
+          "question": "Pipeline 中背压（backpressure）是如何天然实现的？",
+          "choices": [
+            {"id": "A", "text": "channel 满了发送阻塞——下游慢→output channel 满→上游阻塞→自动减速——无需额外机制"},
+            {"id": "B", "text": "需要手动实现限流"},
+            {"id": "C", "text": "用 rate limiter"},
+            {"id": "D", "text": "不支持背压"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：这是 channel-based pipeline 最优雅的特性。如果 ES 写入慢——indexStage 的 input channel 满了——filterStage 发送阻塞——它的 input channel 也满了——层层传导到最上游的 generator。整个 pipeline 自动调节到最慢 stage 的速度。有缓冲的 channel 吸收短暂的速度波动——但持续的速度差最终还是会阻塞。"
+        },
+        {
+          "id": "go-pipeline-q5",
+          "question": "以下 pipeline 取消代码有什么问题？\n\n```go\nfor data := range in {\n    result := process(data)\n    out <- result\n}\n```",
+          "choices": [
+            {"id": "A", "text": "没有 select ctx.Done()——context 取消后 goroutine 可能阻塞在 out <- result 或 process() 中无法退出"},
+            {"id": "B", "text": "没有问题"},
+            {"id": "C", "text": "缺少 defer close"},
+            {"id": "D", "text": "需要加锁"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：如果下游已经取消（不再读 output channel）——out <- result 永远阻塞——goroutine 泄漏。正确写法：select { case out <- result: case <-ctx.Done(): return }。同理 process() 如果是耗时操作也需要接受 context——否则即使 ctx 取消了——process 还在运行。每个可能阻塞的操作都必须有 ctx.Done() 作为退出路径。"
+        },
+        {
+          "id": "go-pipeline-q6",
+          "question": "errgroup.WithContext 在 pipeline 错误处理中的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "任何一个 goroutine 返回 error——自动 cancel context——其他 goroutine 通过 ctx.Done() 收到取消信号"},
+            {"id": "B", "text": "收集所有 goroutine 的错误"},
+            {"id": "C", "text": "自动重试失败的 goroutine"},
+            {"id": "D", "text": "只等待第一个完成的 goroutine"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：errgroup.WithContext 创建一个绑定了 cancel 的 context——当 g.Go() 中任何函数返回 non-nil error——内部调用 cancel()。其他 goroutine 的 select case <-ctx.Done() 触发——级联退出。g.Wait() 返回第一个 error。注意它只返回第一个 error——不是所有 error。如果需要收集所有错误——用 multierr 或自定义方案。"
+        },
+        {
+          "id": "go-pipeline-q7",
+          "question": "channel 缓冲区大小对 pipeline 性能有什么影响？",
+          "choices": [
+            {"id": "A", "text": "缓冲区吸收 stage 间的速度波动——太小导致频繁阻塞——太大浪费内存。一般用 workerCount×2"},
+            {"id": "B", "text": "缓冲区越大越好"},
+            {"id": "C", "text": "必须用无缓冲 channel"},
+            {"id": "D", "text": "没有影响"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：无缓冲 channel 每次发送必须等接收者就绪——stage 间严格同步——吞吐量低。缓冲 channel 让 producer 不必等 consumer——吸收短暂的速度差。但缓冲不是越大越好——如果元素是大对象（如 []byte）——1024 缓冲可能占几百 MB 内存。经验值：CPU 密集型用 worker×2——I/O 密集型用 worker×4-8——根据 benchmark 调整。"
+        },
+        {
+          "id": "go-pipeline-q8",
+          "question": "如何找到 pipeline 中的瓶颈 stage？",
+          "choices": [
+            {"id": "A", "text": "用 pprof 的 goroutine profile——阻塞时间最长的 stage 就是瓶颈——或在每个 stage 加 metrics 统计处理速率"},
+            {"id": "B", "text": "看 CPU 使用率"},
+            {"id": "C", "text": "看内存"},
+            {"id": "D", "text": "猜测"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：go tool pprof 的 goroutine profile 显示每个 goroutine 阻塞在哪里——如果大量 goroutine 阻塞在某个 stage 的 out <- 上——说明下游是瓶颈。更精确的方法：每个 stage 入口和出口加 Prometheus counter——Grafana 看每个 stage 的 throughput（items/sec）——throughput 最低的就是瓶颈。瓶颈 stage 增加 fan-out worker 数。"
+        },
+        {
+          "id": "go-pipeline-q9",
+          "question": "以下 fan-in 实现有什么问题？\n\n```go\nfunc fanIn(chs ...<-chan int) <-chan int {\n    out := make(chan int)\n    for _, ch := range chs {\n        go func() {\n            for v := range ch { out <- v }\n        }()\n    }\n    return out\n}\n```",
+          "choices": [
+            {"id": "A", "text": "闭包捕获了循环变量 ch——所有 goroutine 读同一个 channel；且没有 close(out)——下游会永远阻塞"},
+            {"id": "B", "text": "没有问题"},
+            {"id": "C", "text": "需要加锁"},
+            {"id": "D", "text": "channel 方向错误"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：Go 1.22 之前 for range 的循环变量是同一个地址——闭包捕获的 ch 全指向最后一个 channel。修复：go func(c <-chan int) {...}(ch)。第二个问题更严重：out 永远不会被 close——下游 for v := range out 永远阻塞。必须用 WaitGroup 等所有 goroutine 退出后 close(out)。Go 1.22+ 修复了循环变量问题——但 close 问题仍需手动处理。"
+        },
+        {
+          "id": "go-pipeline-q10",
+          "question": "pipeline 中某个 stage 需要做批量写入（如 ES bulk API），如何设计？",
+          "choices": [
+            {"id": "A", "text": "在 stage 内部做 batching——攒够 N 条或超时后批量发送——用 ticker + 缓冲实现"},
+            {"id": "B", "text": "一条一条发送"},
+            {"id": "C", "text": "在 channel 中传 slice"},
+            {"id": "D", "text": "用全局 slice 收集"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：批量写入 stage 的经典实现：内部维护 buffer——每次从 input channel 读一条追加到 buffer——buffer 满 N 条或 time.Ticker 触发——调用 bulk API 发送。select { case item := <-in: buffer = append(...) case <-ticker.C: flush(buffer) case <-ctx.Done(): flush(buffer); return }。N 和超时根据下游 API 特性调——ES bulk 一般 500-2000 条或 5MB 一批。C 不太好——因为上游不知道下游的 batch size。"
+        }
+      ],
+      "references": [
+        "https://go.dev/blog/pipelines",
+        "https://talks.golang.org/2012/concurrency.slide",
+        "https://pkg.go.dev/golang.org/x/sync/errgroup"
+      ]
+    }
+  ]
+}
