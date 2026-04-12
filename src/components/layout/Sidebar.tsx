@@ -1,12 +1,12 @@
-import { NavLink } from 'react-router-dom';
-import { ALL_DOMAINS, DOMAIN_LABELS, DOMAIN_ICONS } from '../../types';
+import { NavLink } from "react-router-dom";
+import { ALL_DOMAINS, DOMAIN_LABELS, DOMAIN_ICONS } from "../../types";
 import {
   Target,
   LayoutDashboard,
   XCircle,
   TrendingUp,
   Settings,
-} from 'lucide-react';
+} from "lucide-react";
 
 interface SidebarProps {
   isOpen: boolean;
@@ -30,17 +30,21 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
           border-r border-[var(--color-notion-border)] flex flex-col
           transition-transform duration-250 ease-out
           lg:translate-x-0 lg:static lg:z-auto
-          ${isOpen ? 'translate-x-0' : '-translate-x-full'}
+          ${isOpen ? "translate-x-0" : "-translate-x-full"}
         `}
       >
         {/* Logo */}
         <div className="px-5 py-5 border-b border-[var(--color-notion-border)]">
-          <NavLink to="/" className="flex items-center gap-2.5 no-underline" onClick={onClose}>
+          <NavLink
+            to="/"
+            className="flex items-center gap-2.5 no-underline"
+            onClick={onClose}
+          >
             <div className="w-7 h-7 rounded-lg bg-[var(--color-notion-accent)] flex items-center justify-center">
               <Target className="w-4 h-4 text-white" />
             </div>
             <span className="font-semibold text-[var(--color-notion-text)] text-[15px] tracking-tight">
-              SRE 刷题
+              刷题
             </span>
           </NavLink>
         </div>
@@ -55,8 +59,8 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
               className={({ isActive }) =>
                 `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                   isActive
-                    ? 'bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium'
-                    : 'text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]'
+                    ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
+                    : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
                 }`
               }
             >
@@ -82,8 +86,8 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
                     className={({ isActive }) =>
                       `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                         isActive
-                          ? 'bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium'
-                          : 'text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]'
+                          ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
+                          : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
                       }`
                     }
                   >
@@ -108,8 +112,8 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
               className={({ isActive }) =>
                 `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                   isActive
-                    ? 'bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium'
-                    : 'text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]'
+                    ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
+                    : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
                 }`
               }
             >
@@ -122,8 +126,8 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
               className={({ isActive }) =>
                 `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                   isActive
-                    ? 'bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium'
-                    : 'text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]'
+                    ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
+                    : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
                 }`
               }
             >
@@ -136,8 +140,8 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
               className={({ isActive }) =>
                 `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                   isActive
-                    ? 'bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium'
-                    : 'text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]'
+                    ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
+                    : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
                 }`
               }
             >
