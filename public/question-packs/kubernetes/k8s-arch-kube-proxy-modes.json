@@ -1,0 +1,155 @@
+{
+  "id": "k8s-arch-kube-proxy-modes",
+  "name": "kube-proxy 三种代理模式对比",
+  "domain": "kubernetes",
+  "description": "对比 kube-proxy 的 userspace、iptables、IPVS 三种代理模式的工作原理与性能差异",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-arch-kube-proxy-modes-q1",
+      "domain": "kubernetes",
+      "type": "comparison",
+      "difficulty": 3,
+      "tags": ["kube-proxy", "iptables", "ipvs", "service", "k8s-arch"],
+      "title": "kube-proxy 的三种代理模式（userspace / iptables / IPVS）有什么区别？",
+      "content": "## 场景\n\n你所在的团队维护着一个 Kubernetes 1.28 集群，节点数量从最初的 20 台逐步扩展到了 300 台，Service 数量也从几十个增长到了 1500 多个。最近运维同事反馈了一个现象：每次有 Deployment 滚动更新时，部分节点上的网络会出现几秒钟的抖动，kubectl exec 进 Pod 用 curl 请求 ClusterIP 偶尔会超时。你登上一台节点，执行了以下命令：\n\n```bash\n$ kubectl get pods -n kube-system | grep kube-proxy\nkube-proxy-7x9qf   1/1   Running   0   42d\n\n$ kubectl logs kube-proxy-7x9qf -n kube-system | tail -5\nI0315 03:22:18.419827       1 proxier.go:1089] \"Syncing iptables rules\"\nI0315 03:22:18.891204       1 proxier.go:1243] \"SyncProxyRules complete\" elapsed=\"471.342ms\"\nI0315 03:22:19.420109       1 proxier.go:1089] \"Syncing iptables rules\"\nI0315 03:22:19.903887       1 proxier.go:1243] \"SyncProxyRules complete\" elapsed=\"483.721ms\"\nI0315 03:22:20.420031       1 proxier.go:1089] \"Syncing iptables rules\"\n```\n\n每次 iptables 规则同步耗时接近 500ms，你又看了一下当前 iptables 规则的数量：\n\n```bash\n$ iptables-save | wc -l\n47832\n```\n\n接近 5 万条 iptables 规则。你的 leader 让你调研一下是否应该把 kube-proxy 从默认的 iptables 模式切换到 IPVS 模式。在做调研之前，你需要先搞清楚一个基础问题：kube-proxy 到底支持哪几种代理模式，它们各自是怎么工作的，性能差异来自哪里？\n\n### 问题\n\n请详细对比 kube-proxy 的三种代理模式（userspace、iptables、IPVS）的工作原理、性能特征和适用场景。在什么情况下应该选择 IPVS 模式？切换时有哪些注意事项？",
+      "answer": "要回答这个问题，不能直接跳到三种模式的对比。先搞清楚 kube-proxy 本身是什么、做了什么事，才能真正理解三种模式为什么会存在，以及它们各自解决了什么痛点。\n\n## kube-proxy 是什么\n\nkube-proxy 是 Kubernetes 中运行在每个节点上的网络代理组件，它的核心职责只有一个：实现 Service 的虚拟 IP 到后端 Pod 的流量转发。当你创建一个 ClusterIP 类型的 Service 时，Kubernetes 会分配一个虚拟 IP（比如 10.96.0.100），但这个 IP 不属于任何网卡、不绑定在任何节点上，它只是一个「规则」。kube-proxy 的工作就是在每个节点的网络栈中植入转发规则，让发往这个虚拟 IP 的流量能正确地被路由到后端某个 Pod 的真实 IP 上。除了 ClusterIP，NodePort 和 LoadBalancer 类型的 Service 同样依赖 kube-proxy 来完成端口监听和流量转发。\n\nkube-proxy 以 DaemonSet 的形式运行在每个节点上，你可以用 `kubectl get pods -n kube-system | grep kube-proxy` 看到它。它的核心运行逻辑很直接：通过 Watch 机制监听 API Server 上 Service 和 EndpointSlice（Kubernetes 1.21+ 默认使用 EndpointSlice 替代 Endpoints）资源的变化，一旦检测到变化就更新本节点的转发规则。至于「转发规则」具体长什么样、在哪里执行、由谁执行——这正是三种代理模式的核心区别。\n\n## userspace 模式：最早的实现，所有流量都要绕一圈用户空间\n\nuserspace 模式是 Kubernetes 最早期（v1.0 时代）的实现方式。它的工作原理非常直白：kube-proxy 进程自己在用户空间打开一个监听端口作为代理，然后通过 iptables 规则把发往 Service ClusterIP 的流量重定向到这个代理端口上。流量的完整路径是这样的：客户端 Pod 发出请求 → 内核网络栈匹配 iptables DNAT 规则 → 流量被重定向到 kube-proxy 进程监听的端口 → kube-proxy 在用户空间接收数据包，根据轮询（Round Robin）算法选择一个后端 Pod → 再由 kube-proxy 把请求转发到选中的 Pod。\n\n这个流程的问题一眼就能看出来：每一个数据包都要从内核空间拷贝到用户空间，经过 kube-proxy 进程处理后再拷贝回内核空间转发出去。这两次内核态与用户态之间的上下文切换和数据拷贝是致命的性能瓶颈。在 Linux 网络编程中，内核态到用户态的一次数据拷贝大约引入 2-5 微秒的延迟，而这个路径每个包要走两次。更严重的是，kube-proxy 进程本身成了所有 Service 流量的单点瓶颈——所有经过 Service 的连接都要经过这一个进程，CPU 和文件描述符很快就会耗尽。在实际生产环境中，userspace 模式在几十个 Service 的规模下就会出现明显的性能瓶颈。\n\n正因为这些问题，userspace 模式从 Kubernetes 1.2 开始就不再是默认模式了，现在基本只存在于面试题和历史文档中。\n\n## iptables 模式：内核空间直接转发，但规则膨胀是硬伤\n\niptables 模式从 Kubernetes 1.2 开始成为默认模式，一直到今天（Kubernetes 1.30）仍然是默认值。它的核心改进在于：去掉了 kube-proxy 作为流量代理的角色，转而让 kube-proxy 只负责维护 iptables 规则，流量转发完全在内核空间的 netfilter 框架中完成。\n\n当你创建一个 Service（比如 my-svc，ClusterIP 为 10.96.0.100，端口 80）并且后端有 3 个 Pod 时，kube-proxy 会在 iptables 的 nat 表中写入大致如下的规则链：\n\n```bash\n# 入口链：匹配发往 Service ClusterIP 的流量\n-A KUBE-SERVICES -d 10.96.0.100/32 -p tcp --dport 80 -j KUBE-SVC-XXXX\n\n# Service 链：通过概率实现负载均衡\n-A KUBE-SVC-XXXX -m statistic --mode random --probability 0.33333 -j KUBE-SEP-AAAA\n-A KUBE-SVC-XXXX -m statistic --mode random --probability 0.50000 -j KUBE-SEP-BBBB\n-A KUBE-SVC-XXXX -j KUBE-SEP-CCCC\n\n# Endpoint 链：DNAT 到具体的 Pod IP\n-A KUBE-SEP-AAAA -p tcp -j DNAT --to-destination 10.244.1.5:8080\n-A KUBE-SEP-BBBB -p tcp -j DNAT --to-destination 10.244.2.8:8080\n-A KUBE-SEP-CCCC -p tcp -j DNAT --to-destination 10.244.3.12:8080\n```\n\n这里有一个精妙的细节：三个 Pod 的负载均衡是通过 iptables 的 `statistic` 模块的概率匹配实现的。第一条规则的概率是 1/3，如果没命中就到第二条，此时剩余概率空间只有 2/3，所以第二条的概率设为 1/2（即 2/3 × 1/2 = 1/3），第三条是兜底规则直接跳转。这样每个 Pod 被选中的概率都是 1/3，实现了随机轮询。\n\n流量路径变成了：客户端 Pod 发出请求 → 内核 netfilter 匹配 iptables 规则 → 直接在内核空间完成 DNAT（目标地址改写）→ 数据包被转发到目标 Pod。整个过程不经过任何用户空间进程，延迟极低。你可以通过 `iptables -t nat -L KUBE-SERVICES -n` 查看当前节点上的 Service 转发规则。\n\n那 iptables 模式的问题在哪？问题就出在你场景中看到的那 47832 条规则上。iptables 的规则匹配是线性遍历的——内核会从链的第一条规则开始逐条匹配，直到找到匹配的规则或者遍历完整条链。每个 Service 大约需要 5-10 条 iptables 规则（包括 KUBE-SERVICES 入口、KUBE-SVC 分发、每个 Pod 的 KUBE-SEP 规则），1500 个 Service 加上后端 Pod 的规则就膨胀到了几万条。更关键的是，iptables 规则的更新不是增量的：每次有 Service 或 Endpoint 变化时，kube-proxy 需要通过 `iptables-restore` 命令全量刷新整个 nat 表的规则。在你的场景中，这个全量刷新操作就是日志里看到的 SyncProxyRules，耗时 500ms。在规则更新的那一瞬间，部分连接可能会受到影响，这就是你观察到的网络抖动的根源。\n\n## IPVS 模式：内核级负载均衡器，为大规模集群而生\n\nIPVS（IP Virtual Server）模式从 Kubernetes 1.11 开始进入 GA 状态。IPVS 本身是 Linux 内核中 LVS（Linux Virtual Server）项目的核心组件，它是一个工作在内核空间的四层负载均衡器，专门为高性能流量转发而设计。\n\n在 IPVS 模式下，kube-proxy 不再通过 iptables 规则做流量转发，而是调用 netlink 接口直接在内核中创建 IPVS virtual server。每个 Service 的 ClusterIP 会被绑定到节点的一个 dummy 网卡（通常叫 `kube-ipvs0`）上，然后为这个 virtual server 配置后端 real server（即 Pod IP）。你可以通过 `ipvsadm -Ln` 查看：\n\n```bash\n$ ipvsadm -Ln\nIP Virtual Server version 1.2.1 (size=4096)\nProt LocalAddress:Port Scheduler Flags\n  -> RemoteAddress:Port           Forward Weight ActiveConn InActConn\nTCP  10.96.0.100:80 rr\n  -> 10.244.1.5:8080              Masq    1      3          12\n  -> 10.244.2.8:8080              Masq    1      5          8\n  -> 10.244.3.12:8080             Masq    1      2          15\nTCP  10.96.0.1:443 rr\n  -> 192.168.1.10:6443            Masq    1      28         142\n```\n\nIPVS 相比 iptables 的核心优势在于数据结构。iptables 的规则是链表，查找复杂度是 O(n)；而 IPVS 使用哈希表来索引 virtual server，查找复杂度是 O(1)。不管你有 100 个 Service 还是 10000 个 Service，IPVS 的转发性能几乎不变。在规则更新方面，IPVS 支持增量更新——新增一个 Pod 只需要调用一次 netlink 接口添加一个 real server，不需要像 iptables 那样全量刷新。\n\n另一个重要优势是负载均衡算法。iptables 模式只支持随机轮询（通过概率匹配模拟），而 IPVS 原生支持多种算法：`rr`（轮询）、`wrr`（加权轮询）、`lc`（最少连接）、`wlc`（加权最少连接）、`sh`（源地址哈希）等。你可以在 kube-proxy 的启动参数中通过 `--ipvs-scheduler` 指定，比如对于长连接服务用 `lc` 可以让连接分布更均匀。\n\n不过需要注意，IPVS 模式并没有完全抛弃 iptables。IPVS 本身只处理 DNAT（负载均衡转发），而 SNAT（源地址伪装，让 Pod 回包时能正确返回）、NodePort 的端口映射、以及 Service 的 externalTrafficPolicy 等功能仍然依赖少量 iptables 规则或 ipset 来实现。所以 IPVS 模式更准确的描述是「IPVS 做主力转发 + iptables/ipset 做辅助」。\n\n## 多维度对比\n\n从性能角度看，假设集群中有 5000 个 Service，每个 Service 有 3 个后端 Pod。iptables 模式下大约需要 5000 × (1 + 3 × 2) ≈ 35000 条规则，新建连接的首包需要线性遍历这些规则。根据社区的 benchmark 数据，在 5000 Service 规模下，iptables 模式的新建连接延迟大约在 5-8ms，而 IPVS 模式稳定在 1ms 以下。规则更新方面，iptables 全量刷新 35000 条规则大约需要 1-2 秒，而 IPVS 增量更新一个 Endpoint 只需要毫秒级。\n\n从负载均衡算法看，iptables 只有随机概率分发一种方式，无法感知后端 Pod 的实际负载。IPVS 的 `lc`（最少连接）算法会把新连接分配给当前活跃连接数最少的 Pod，对于处理时间不均匀的服务（比如有些请求要查数据库、有些直接返回缓存）来说效果明显更好。\n\n## 如何切换到 IPVS 模式\n\n切换之前，首先要确保节点上加载了必要的内核模块。IPVS 依赖 `ip_vs`、`ip_vs_rr`、`ip_vs_wrr`、`ip_vs_sh`、`nf_conntrack` 这几个模块，可以通过以下命令检查和加载：\n\n```bash\n$ lsmod | grep ip_vs\n$ modprobe -- ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh nf_conntrack\n```\n\n如果你的集群使用 kubeadm 部署，可以通过修改 kube-proxy 的 ConfigMap 来切换模式：\n\n```bash\n$ kubectl edit configmap kube-proxy -n kube-system\n```\n\n找到 `mode` 字段，改为 `\"ipvs\"`：\n\n```yaml\napiVersion: kubeproxy.config.k8s.io/v1alpha1\nkind: KubeProxyConfiguration\nmode: \"ipvs\"\nipvs:\n  scheduler: \"rr\"            # 负载均衡算法\n  strictARP: true             # 配合 MetalLB 等需要开启\n```\n\n然后滚动重启 kube-proxy DaemonSet：\n\n```bash\n$ kubectl rollout restart daemonset kube-proxy -n kube-system\n```\n\n这里有一个经典的坑：如果节点上没有预先加载 `ip_vs` 内核模块，kube-proxy 启动时会静默回退到 iptables 模式，不会报错退出。你以为切成了 IPVS，实际上还在跑 iptables。验证方式是查看 kube-proxy 日志中的 `Using ipvs Proxier` 字样，或者直接执行 `ipvsadm -Ln` 看是否有 virtual server 记录。另一个常见问题是切换到 IPVS 模式后，旧的 iptables 规则不会被自动清理。如果你发现 IPVS 模式下网络行为异常，可以手动清理残留规则：`iptables -t nat -F KUBE-SERVICES`。\n\n## 面试中的考察要点\n\n面试官问这道题时，最基本的期望是你能说清楚三种模式的核心区别：userspace 模式流量经过用户空间进程，性能最差；iptables 模式全部在内核空间转发，是当前默认值但有规则膨胀问题；IPVS 模式用哈希表替代链表实现 O(1) 查找，支持多种负载均衡算法，适合大规模集群。如果你还能说出 iptables 的概率分发原理、IPVS 的增量更新优势、以及切换模式时内核模块回退的坑，这道题就基本拿满分了。更进阶的讨论方向包括 Kubernetes 1.29 引入的 nftables 后端（作为 iptables 的替代）、以及 Cilium 等 eBPF 方案完全绕过 kube-proxy 的思路。",
+      "keyPoints": [
+        "kube-proxy 以 DaemonSet 运行在每个节点上，通过 Watch Service/EndpointSlice 变化来维护本节点的转发规则，是 Service 虚拟 IP 到 Pod 真实 IP 的核心桥梁",
+        "userspace 模式下每个数据包都要经历内核态→用户态→内核态两次拷贝和上下文切换，kube-proxy 进程本身成为流量单点瓶颈，从 Kubernetes 1.2 起不再是默认模式",
+        "iptables 模式通过 netfilter 在内核空间直接完成 DNAT 转发，利用 statistic 模块的概率匹配实现随机轮询负载均衡，是当前默认模式（截至 Kubernetes 1.30）",
+        "iptables 规则是线性链表遍历 O(n)，且每次更新需要 iptables-restore 全量刷新，在千级 Service 规模下规则数膨胀至数万条，同步耗时数百毫秒甚至秒级",
+        "IPVS 使用内核哈希表索引 virtual server 实现 O(1) 查找，支持增量更新和多种负载均衡算法（rr/wrr/lc/wlc/sh），5000 Service 规模下新建连接延迟仍可控制在 1ms 以内",
+        "切换 IPVS 模式必须预先加载 ip_vs 等内核模块，否则 kube-proxy 会静默回退到 iptables 模式而不报错，需要通过日志或 ipvsadm -Ln 验证",
+        "IPVS 模式并未完全脱离 iptables，SNAT、NodePort 端口映射等功能仍依赖少量 iptables/ipset 规则配合工作"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz1",
+          "question": "kube-proxy 监听 API Server 上哪些资源的变化来维护转发规则？",
+          "choices": [
+            {"id": "A", "text": "Pod 和 Node"},
+            {"id": "B", "text": "Service 和 EndpointSlice（或 Endpoints）"},
+            {"id": "C", "text": "Deployment 和 ReplicaSet"},
+            {"id": "D", "text": "Ingress 和 NetworkPolicy"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "kube-proxy 的核心工作是实现 Service 到后端 Pod 的流量转发，因此它 Watch 的是 Service 和 EndpointSlice（Kubernetes 1.21+ 默认使用 EndpointSlice 替代 Endpoints）这两类资源。当 Service 的定义发生变化或者后端 Pod 的就绪状态发生变化导致 EndpointSlice 更新时，kube-proxy 就会重新同步本节点的转发规则。Pod 和 Node 的变化不是 kube-proxy 直接关注的对象，Ingress 由 Ingress Controller 处理，NetworkPolicy 由 CNI 插件处理。"
+        },
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz2",
+          "question": "userspace 模式下，流量经过 kube-proxy 时的性能瓶颈主要来自什么？",
+          "choices": [
+            {"id": "A", "text": "每个数据包都需要在内核态和用户态之间两次拷贝和上下文切换"},
+            {"id": "B", "text": "iptables 规则数量过多导致匹配缓慢"},
+            {"id": "C", "text": "IPVS 哈希表冲突导致查找退化"},
+            {"id": "D", "text": "kube-proxy 需要频繁调用 API Server 查询后端 Pod 列表"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "userspace 模式的核心问题在于 kube-proxy 进程本身作为流量代理，每个数据包必须从内核空间拷贝到用户空间由 kube-proxy 处理，选择后端 Pod 后再拷贝回内核空间发出去。这两次内核态到用户态的上下文切换和数据拷贝是主要的性能瓶颈，每次大约引入 2-5 微秒延迟。B 描述的是 iptables 模式的问题，C 描述的跟 IPVS 相关但 IPVS 的哈希表性能非常好不会成为瓶颈，D 是错误的因为 kube-proxy 通过 Watch 机制获取信息而非逐包查询。"
+        },
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz3",
+          "question": "在 iptables 模式下，kube-proxy 如何为一个有 3 个后端 Pod 的 Service 实现负载均衡？",
+          "choices": [
+            {"id": "A", "text": "使用 iptables 的 round-robin 内置模块依次轮询三个 Pod"},
+            {"id": "B", "text": "通过 statistic 模块的 random 模式设置递进概率（1/3, 1/2, 1）实现随机分发"},
+            {"id": "C", "text": "为每个 Pod 创建独立的 iptables 链，按连接的源 IP 哈希选择"},
+            {"id": "D", "text": "在用户空间维护一个 Pod 列表，由 kube-proxy 进程轮询分配"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "iptables 模式利用 netfilter 的 statistic 模块实现负载均衡。对于 3 个 Pod，第一条规则的概率设为 0.33333（1/3），如果未命中则进入第二条规则，此时剩余概率空间为 2/3，第二条概率设为 0.5（实际被选中概率为 2/3 × 1/2 = 1/3），第三条作为兜底规则直接跳转（概率为 2/3 × 1/2 = 1/3）。这样每个 Pod 被选中的概率均等。A 选项错误因为 iptables 没有原生的 round-robin 模块。C 描述的更像是 IPVS 的 sh 调度算法。D 描述的是 userspace 模式的做法。"
+        },
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz4",
+          "question": "IPVS 模式相比 iptables 模式在规则查找上的核心数据结构优势是什么？",
+          "choices": [
+            {"id": "A", "text": "IPVS 使用 B+ 树索引 virtual server，查找复杂度为 O(log n)"},
+            {"id": "B", "text": "IPVS 将所有规则编译为 eBPF 字节码在内核中执行，避免了规则遍历"},
+            {"id": "C", "text": "IPVS 使用跳表（skiplist）数据结构，平均查找复杂度为 O(log n)"},
+            {"id": "D", "text": "IPVS 使用哈希表索引 virtual server，查找复杂度为 O(1)，而 iptables 是链表线性遍历 O(n)"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "这是 IPVS 和 iptables 在性能上的根本差异。iptables 的规则存储在链表中，每个数据包到达时需要从链头开始逐条匹配规则，规则数量越多匹配越慢，复杂度为 O(n)。IPVS 使用哈希表来索引 virtual server（Service），根据目标 IP 和端口直接哈希定位，查找复杂度为 O(1)，不受 Service 数量影响。A 和 C 的数据结构描述都是错误的。B 描述的是 Cilium 等 eBPF 方案的做法，不是 IPVS 的实现方式。"
+        },
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz5",
+          "question": "执行 ipvsadm -Ln 看到某个 virtual server 的 Scheduler 字段为 lc，这意味着什么？",
+          "choices": [
+            {"id": "A", "text": "流量按源 IP 地址哈希分配到固定的后端 Pod（会话保持）"},
+            {"id": "B", "text": "流量按后端 Pod 的权重进行加权轮询分配"},
+            {"id": "C", "text": "新连接会被分配到当前活跃连接数最少的后端 Pod"},
+            {"id": "D", "text": "流量按照后端 Pod 注册顺序依次轮询分配"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "IPVS 的 lc 是 least connection（最少连接）算法的缩写，它会把新建连接分配给当前活跃连接数最少的后端 real server。这对于处理时间不均匀的服务非常有用——如果某个 Pod 上的请求处理较慢导致连接堆积，lc 算法会自动将新连接导向负载更轻的 Pod。A 描述的是 sh（source hashing）算法的行为。B 描述的是 wrr（weighted round robin）算法。D 描述的是 rr（round robin）算法。IPVS 原生支持这些多种算法正是它相比 iptables 模式的重要优势之一。"
+        },
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz6",
+          "question": "将 kube-proxy 模式切换为 IPVS 后，执行 ipvsadm -Ln 发现没有任何 virtual server 记录，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "集群中没有创建任何 Service"},
+            {"id": "B", "text": "节点上没有加载 ip_vs 内核模块，kube-proxy 静默回退到了 iptables 模式"},
+            {"id": "C", "text": "kube-proxy 进程没有获得足够的 RBAC 权限"},
+            {"id": "D", "text": "需要重启 kubelet 才能使 IPVS 模式生效"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是切换 IPVS 模式时最经典的坑。kube-proxy 在启动时会检测 ip_vs、ip_vs_rr、ip_vs_wrr、ip_vs_sh、nf_conntrack 等内核模块是否可用。如果这些模块没有加载，kube-proxy 不会报错退出，而是静默回退到 iptables 模式继续运行。很多人在 ConfigMap 里改了 mode 为 ipvs 后以为切换成功了，实际上节点还在用 iptables。正确的做法是先执行 modprobe 加载所需模块，然后通过 kube-proxy 日志中的 Using ipvs Proxier 字样或 ipvsadm -Ln 的输出来验证。"
+        },
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz7",
+          "question": "关于 IPVS 模式和 iptables 的关系，以下哪种描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "IPVS 模式下流量转发由 IPVS 完成，但 SNAT、NodePort 端口映射等功能仍依赖少量 iptables/ipset 规则"},
+            {"id": "B", "text": "IPVS 模式完全不使用 iptables，所有功能都由 IPVS 和 ipset 实现"},
+            {"id": "C", "text": "IPVS 模式下 iptables 规则与 IPVS 规则完全独立，分别处理不同的 Service 类型"},
+            {"id": "D", "text": "IPVS 模式只在 ClusterIP 类型 Service 上生效，NodePort 和 LoadBalancer 仍然使用 iptables 模式"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "IPVS 本身只负责 DNAT（将目标地址从 Service ClusterIP 改写为 Pod IP）的负载均衡转发。但 Kubernetes Service 的完整实现还需要 SNAT（源地址伪装，确保 Pod 回包能正确返回）、NodePort 端口映射、externalTrafficPolicy 等功能，这些仍然依赖少量 iptables 或 ipset 规则来实现。所以 IPVS 模式更准确的描述是「IPVS 做主力转发 + iptables/ipset 做辅助」。B 的「完全不使用」说法是错误的。C 和 D 对 IPVS 和 iptables 的分工描述都不准确。"
+        },
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz8",
+          "question": "你的集群有 2000 个 Service，每次 Deployment 滚动更新时网络出现秒级抖动。kube-proxy 日志显示 SyncProxyRules 耗时 1.2 秒。最合理的优化方案是什么？",
+          "choices": [
+            {"id": "A", "text": "增加 kube-proxy 的 CPU 资源限制，让 iptables 规则同步更快"},
+            {"id": "B", "text": "减少 Service 数量，将多个 Service 合并为一个以减少 iptables 规则数"},
+            {"id": "C", "text": "将 kube-proxy 模式从 iptables 切换到 IPVS，利用增量更新和哈希表查找消除全量刷新瓶颈"},
+            {"id": "D", "text": "将 kube-proxy 的同步间隔从默认的 30 秒调大到 5 分钟以减少刷新频率"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这个场景是 iptables 模式在大规模集群下的经典痛点。2000 个 Service 可能产生 2-3 万条 iptables 规则，每次 Endpoint 变化时 kube-proxy 需要通过 iptables-restore 全量刷新这些规则，耗时超过 1 秒。切换到 IPVS 模式后，规则查找变为 O(1) 的哈希表查找，更新变为增量操作（只修改变化的 real server），同步耗时可以从秒级降到毫秒级。A 方案解决不了根本问题因为瓶颈在 iptables-restore 的全量刷新机制而非 CPU。B 会破坏服务抽象。D 会让规则更新更加滞后，加剧问题。"
+        },
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz9",
+          "question": "在 IPVS 模式下，Service 的 ClusterIP 被绑定到节点的哪个网络接口上？",
+          "choices": [
+            {"id": "A", "text": "节点的 eth0 主网卡"},
+            {"id": "B", "text": "cni0 或 flannel.1 等 CNI 创建的网桥接口"},
+            {"id": "C", "text": "kube-proxy 创建的 kube-ipvs0 dummy 网卡"},
+            {"id": "D", "text": "不绑定到任何网卡，直接由 IPVS 内核模块在 netfilter 层拦截"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "在 IPVS 模式下，kube-proxy 会创建一个名为 kube-ipvs0 的 dummy 网卡（虚拟网络接口），然后把所有 Service 的 ClusterIP 作为这个接口的地址绑定上去。这是因为 IPVS 的 virtual server 需要一个本地地址来接收流量——内核只有在目标 IP 是本机地址时才会将数据包交给 IPVS 处理。你可以通过 ip addr show kube-ipvs0 看到这个接口上绑定了所有 Service 的 ClusterIP。A 和 B 描述的是节点自身和 CNI 的网络接口，不会用来绑定 Service IP。D 的描述在 iptables 模式下更接近事实（iptables 通过 DNAT 拦截），但 IPVS 确实需要 dummy 网卡。"
+        },
+        {
+          "id": "k8s-arch-kube-proxy-modes-q1-quiz10",
+          "question": "Kubernetes 1.29 引入了一种新的 kube-proxy 后端作为 iptables 的替代方案，它是基于什么技术？",
+          "choices": [
+            {"id": "A", "text": "eBPF，完全在内核中运行小程序实现转发"},
+            {"id": "B", "text": "XDP（eXpress Data Path），在网卡驱动层直接处理数据包"},
+            {"id": "C", "text": "Open vSwitch（OVS），通过虚拟交换机实现流量转发"},
+            {"id": "D", "text": "nftables，作为 iptables 的下一代替代框架，支持增量更新和更高效的规则匹配"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Kubernetes 1.29 引入了 nftables 作为 kube-proxy 的新后端（Alpha 状态），它是 iptables 的下一代替代框架。nftables 相比 iptables 的主要优势包括：支持增量规则更新（不需要全量 restore）、更高效的规则匹配引擎、以及更清晰的规则组织方式。这解决了 iptables 模式在大规模集群下全量刷新的性能瓶颈，同时不需要像 IPVS 那样依赖额外的内核模块。A 描述的 eBPF 方案是 Cilium 等第三方 CNI 的做法，不是 kube-proxy 官方引入的。B 和 C 目前都不是 kube-proxy 的后端选项。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/services-networking/service/#virtual-ips-and-service-proxies",
+        "https://kubernetes.io/docs/reference/networking/virtual-ips/",
+        "https://github.com/kubernetes/kubernetes/blob/master/pkg/proxy/ipvs/README.md"
+      ]
+    }
+  ]
+}
