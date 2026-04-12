@@ -1,0 +1,155 @@
+{
+  "id": "docker-registry-gc",
+  "name": "Registry Garbage Collection",
+  "domain": "docker",
+  "description": "深入讲解 Docker Registry GC 的 mark-sweep 机制、无引用 blob 清理及在线 GC 风险",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-registry-gc-q1",
+      "domain": "docker",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["docker", "registry", "garbage-collection", "mark-sweep", "blob", "content-addressable-storage", "harbor"],
+      "title": "Docker Registry 的 Garbage Collection 机制是怎么工作的",
+      "content": "面试官问「Docker Registry 的 Garbage Collection 是怎么回事」，很多人脑子里第一反应是「GC 不就是清理没用的东西吗」，然后答不出任何细节。这道题实际考察的是你对 Registry 底层存储模型的理解——manifest 怎么引用 blob、删除 tag 后磁盘空间为什么没释放、GC 的 mark-sweep 机制怎么运作、以及在生产环境跑 GC 有哪些风险。\n\nDocker Registry（Distribution）采用 content-addressable storage（内容寻址存储）作为底层存储模型。每一层镜像数据（layer）、镜像配置（config）和镜像清单（manifest）都以其内容的 SHA256 哈希值作为唯一标识存储在 `blobs/` 目录下。tag 只是一个指向 manifest 摘要的软链接，存储在 `repositories/<name>/_manifests/tags/` 路径中。当你执行 `docker push myapp:v1` 时，Registry 做了三件事：把所有 layer blob 写入存储、把 config blob 写入存储、把 manifest blob 写入存储并在 tag 目录下创建指向 manifest digest 的引用。\n\n关键问题来了：当你通过 Registry HTTP API 执行 `DELETE /v2/<name>/manifests/<digest>` 删除一个 manifest 时，Registry 只是移除了引用记录——把 tag 到 manifest 的指针断开，把 manifest 从 revision 列表中剔除。但那些 manifest 引用的 layer blob 和 config blob 依然完好无损地躺在 `blobs/` 目录里。如果这些 blob 没有被其他 manifest 引用，它们就成了「孤儿 blob」，持续占用磁盘空间。\n\n我们在生产环境做过实测：一个跑了半年的 Registry 实例，存储了约 2000 个镜像 tag，期间频繁推送和删除了大量 CI 构建产物。`du -sh` 显示存储占用 89GB，但通过 API 列出所有现存 manifest 计算实际有效数据只有 31GB——也就是说将近 58GB 都是删除 tag 后残留的无引用 blob。这种「只增不减」的存储膨胀在高频 CI/CD 场景下非常普遍，不跑 GC 磁盘迟早会被撑爆。\n\nRegistry 的 `garbage-collect` 子命令就是专门解决这个问题的。但它不是简单的「扫一遍删掉没用的文件」，而是采用经典的 mark-sweep（标记—清除）两阶段算法，整个过程有严格的约束条件。你需要搞清楚 mark 阶段怎么遍历引用图、sweep 阶段怎么判断可删除对象、为什么必须在只读模式下运行 GC、以及 `--dry-run` 预览和实际执行的区别。",
+      "answer": "## 第一步：基础概念详解——Registry 存储结构与 blob 残留原理\n\nDocker Registry（正式名称 Distribution）是 Docker 官方开源的镜像存储和分发服务，遵循 OCI Distribution Specification。它的核心职责是接收 `docker push` 上传的镜像数据、响应 `docker pull` 的下载请求，以及提供 HTTP API 供管理工具操作镜像元数据。要理解 GC，先要把 Registry 的存储模型拆清楚。\n\nRegistry 使用 content-addressable storage（CAS，内容寻址存储）来组织所有数据。CAS 的原理是每个数据对象以其内容的加密哈希（SHA256）作为存储地址——相同内容必然产生相同地址，不同内容必然产生不同地址。这意味着两个镜像如果共享同一个 base layer（比如都基于 `ubuntu:22.04`），这个 layer 在 Registry 存储中只有一份物理副本，天然实现了去重。Registry 的文件系统布局大致如下：\n\n```\n/var/lib/registry/docker/registry/v2/\n├── blobs/\n│   └── sha256/\n│       ├── 2a/2a5e3...    # layer blob (压缩的文件系统层)\n│       ├── 7c/7c8d1...    # config blob (镜像配置 JSON)\n│       └── a3/a3f0b...    # manifest blob (镜像清单)\n└── repositories/\n    └── myapp/\n        ├── _manifests/\n        │   ├── revisions/\n        │   │   └── sha256/a3f0b.../link\n        │   └── tags/\n        │       └── v1/\n        │           └── current/link  → sha256:a3f0b...\n        └── _layers/\n            └── sha256/\n                ├── 2a5e3.../link\n                └── 7c8d1.../link\n```\n\n`blobs/` 目录按 SHA256 前两位字符分桶，存储所有实际数据文件。`repositories/` 目录维护镜像名到 manifest 的引用关系——`tags/v1/current/link` 文件内容就是一行 manifest 摘要值 `sha256:a3f0b...`，起到「tag → manifest」的指针作用。`_layers/` 下的 link 文件记录该仓库引用了哪些 blob。一个 manifest 的 JSON 结构大致如下：\n\n```json\n{\n  \"schemaVersion\": 2,\n  \"mediaType\": \"application/vnd.oci.image.manifest.v1+json\",\n  \"config\": {\n    \"mediaType\": \"application/vnd.oci.image.config.v1+json\",\n    \"digest\": \"sha256:7c8d1...\",\n    \"size\": 7023\n  },\n  \"layers\": [\n    {\"mediaType\": \"application/vnd.oci.image.layer.v1.tar+gzip\", \"digest\": \"sha256:2a5e3...\", \"size\": 32654947},\n    {\"mediaType\": \"application/vnd.oci.image.layer.v1.tar+gzip\", \"digest\": \"sha256:9f3e2...\", \"size\": 1672256}\n  ]\n}\n```\n\nmanifest 引用一个 config blob 和多个 layer blob，形成一棵简单的引用树。tag 指向 manifest，manifest 指向 config 和 layers——这就是 Registry 的完整引用图。当你通过 API 删除一个 manifest 时，Registry 只移除 `_manifests/revisions/` 和 `tags/` 下的引用记录，`blobs/` 目录中的 config blob 和 layer blob 原封不动。这是 CAS 的标准做法：删除引用而非删除数据，因为同一个 blob 可能被多个 manifest 引用，直接删数据可能破坏其他镜像。副作用就是：不再被任何 manifest 引用的 blob 会成为「孤儿」，无法通过正常 API 访问却持续占用磁盘。\n\n## 第二步：核心问题深度解答——GC 的 mark-sweep 机制与操作约束\n\nRegistry 内置的 `garbage-collect` 子命令采用经典的 mark-sweep 算法清理孤儿 blob，分为两个严格顺序执行的阶段。\n\n**Mark 阶段**负责构建「活跃引用集合」。GC 遍历 `repositories/` 下所有仓库的所有 manifest revision，对每个仍然存在的 manifest 解析其 JSON 内容，提取 config digest 和所有 layer digest，将这些 digest 标记为「被引用」。manifest 自身的 blob 同样被标记。Mark 结束后，GC 持有一份完整的活跃 blob 集合——所有仍被至少一个 manifest 引用的 blob digest。\n\n**Sweep 阶段**执行实际清理。GC 遍历 `blobs/` 目录下的所有 blob 文件，逐一检查其 digest 是否存在于活跃集合中。如果不存在，说明没有任何 manifest 引用它，GC 将其从存储中物理删除释放磁盘空间。\n\n执行 GC 的命令非常直接。先用 `--dry-run` 参数做预览，确认清理范围：\n\n```bash\n$ registry garbage-collect --dry-run /etc/docker/registry/config.yml\n\nmyapp\nmyapp: marking manifest sha256:a3f0b4c8e2...\nmyapp: marking blob sha256:7c8d1a9f03...\nmyapp: marking blob sha256:2a5e3b7d12...\nmyapp: marking blob sha256:9f3e2c4a81...\n\n4 blobs marked, 5 blobs and 0 manifests eligible for deletion\n```\n\n确认预览结果无误后，去掉 `--dry-run` 执行实际清理：\n\n```bash\n$ registry garbage-collect /etc/docker/registry/config.yml\n\nmyapp\nmyapp: marking manifest sha256:a3f0b4c8e2...\nmyapp: marking blob sha256:7c8d1a9f03...\nmyapp: marking blob sha256:2a5e3b7d12...\nmyapp: marking blob sha256:9f3e2c4a81...\n\n5 blobs eligible for deletion\nblob eligible for deletion: sha256:e4c58d3f91...\nblob eligible for deletion: sha256:b7d29a0c44...\nblob eligible for deletion: sha256:1f6a0e7b52...\nblob eligible for deletion: sha256:d92cb8f103...\nblob eligible for deletion: sha256:88f21c6d7e...\nINFO[0000] Deleting blob: /docker/registry/v2/blobs/sha256/e4/e4c58d3f91...\nINFO[0000] Deleting blob: /docker/registry/v2/blobs/sha256/b7/b7d29a0c44...\nINFO[0001] Deleting blob: /docker/registry/v2/blobs/sha256/1f/1f6a0e7b52...\nINFO[0001] Deleting blob: /docker/registry/v2/blobs/sha256/d9/d92cb8f103...\nINFO[0001] Deleting blob: /docker/registry/v2/blobs/sha256/88/88f21c6d7e...\n```\n\n这里有一个至关重要的操作约束：**GC 期间必须停止 Registry 的写入操作，或将 Registry 切换为只读模式**。原因在于 mark-sweep 不是原子操作——mark 和 sweep 之间存在时间窗口。设想 mark 阶段刚结束，sweep 还没开始，这时候一个新的 `docker push` 上传了一个 layer blob 并创建了新 manifest。如果这个 layer blob 的 digest 在 mark 阶段没有被标记（因为 mark 时这个 blob 还不被任何 manifest 引用），sweep 阶段就会错误地将它删除。结果是新推送的镜像引用了一个已被物理删除的 blob——后续 `docker pull` 必然失败，返回 `unknown blob` 错误。这就是 GC 的竞态条件。\n\n在 Registry 配置文件中开启只读模式和删除功能：\n\n```yaml\n# /etc/docker/registry/config.yml\nstorage:\n  delete:\n    enabled: true    # 必须开启，否则 API 拒绝 DELETE 请求\n  maintenance:\n    readonly:\n      enabled: true  # GC 前开启，完成后改回 false\n```\n\n还有一个容易被忽略的前置条件：Registry 默认不允许通过 API 删除 manifest（`DELETE` 请求返回 405 Method Not Allowed）。必须在配置中显式设置 `storage.delete.enabled: true` 才能执行 soft delete。soft delete 是 GC 的前提——如果你「删了 tag」但没开启 delete，实际上连引用记录都没断开，GC 跑完自然发现所有 blob 都还被引用，什么都不会清理。\n\n总结完整操作链路：开启 `storage.delete.enabled` → 通过 API 执行 manifest soft delete（断开引用） → 将 Registry 切为只读 → 执行 `registry garbage-collect` 进行 hard delete（物理删除 blob） → 恢复读写。soft delete 断开引用关系，hard delete 释放磁盘空间，两步缺一不可。\n\n## 第三步：体系化扩展延伸——Harbor GC、在线 GC 与磁盘监控\n\n### Harbor 的 GC 调度方案\n\n原生 Registry GC 的最大痛点是需要手动操作且期间必须停写。Harbor 做了显著改进：管理员在 Portal 的「系统管理 → 垃圾回收」页面配置定时 GC 计划（支持 cron 表达式），Harbor 在指定时间自动将底层 Registry 切为只读、执行 mark-sweep、完成后恢复读写，全程无需人工干预。GC 日志和释放空间统计在 Portal 中可实时查看。典型配置是每天凌晨 2 点执行，搭配 tag 保留策略（如「每仓库只保留最近 20 个 tag」或「只保留 30 天内推送的 tag」）自动淘汰旧镜像，形成完整的镜像生命周期管理闭环。\n\n### 在线 GC 的现状与探索\n\n社区一直有「不停写也能安全回收」的在线 GC 诉求。Distribution 项目在 3.0 规划中讨论过基于引用计数的方案，但引用计数在 S3 等对象存储后端上难以保证原子性。另一个方向是类似编程语言 GC 的「三色标记 + 写屏障」思路，在 mark 期间用写屏障记录新增引用关系，避免误删新 blob——但实现复杂度极高且社区进展缓慢。目前生产中较现实的折中方案是「短暂只读窗口 + 增量清理」：先用 `--dry-run` 预估可回收空间，将大量 soft delete 分批在低峰期执行，每次 GC 的只读窗口控制在分钟级。\n\n### 磁盘空间监控实践\n\nGC 不是万能药，Registry 运维中需要建立持续的磁盘监控体系。用 Prometheus 的 `node_filesystem_avail_bytes` 指标监控存储后端可用空间，设置 80% 使用率告警；定期执行 `--dry-run` 评估可回收空间占比；对接 Grafana 面板展示 blob 总量、manifest 总量和可回收比例的变化趋势。如果使用 S3 后端，还需注意 S3 的最终一致性可能导致 GC 删除后短时间内 blob 仍然可读——极端情况下 pull 请求可能在 GC 删除后的几秒内仍成功拉取到已删数据。\n\n### 面试高频追问方向\n\nRegistry GC 通常作为「私有 Registry 运维」话题链中的追问出现。经典路径是：「为什么删了 tag 磁盘没释放？」→ 考察 CAS 模型和 soft/hard delete 的区别；「GC 能不能在线跑？」→ 考察 mark-sweep 竞态条件的具体场景；「Harbor 的 GC 怎么配？」→ 考察生产实践。把 mark-sweep 两阶段的数据流画清楚，把竞态条件的时序举出来，就能展示对这个问题的真正理解。",
+      "keyPoints": [
+        "Registry 采用 content-addressable storage（CAS），所有 blob 以 SHA256 哈希作为存储地址，删除 tag 或 manifest 只移除引用记录，不物理删除底层 blob 文件",
+        "GC 采用 mark-sweep 两阶段算法：mark 阶段遍历所有仓库的 manifest revision 标记被引用的 blob digest，sweep 阶段物理删除未出现在活跃集合中的孤儿 blob",
+        "GC 期间必须将 Registry 切为只读模式，否则 mark 和 sweep 之间的时间窗口内新推送的 blob 可能被 sweep 误删，导致镜像引用损坏",
+        "执行 GC 前必须在配置中设置 storage.delete.enabled: true 并先通过 API 对目标 manifest 执行 soft delete 断开引用关系",
+        "--dry-run 参数可预览 GC 将清理的 blob 列表和数量而不执行实际删除，生产环境应先预览确认再正式执行",
+        "Harbor 在原生 Registry GC 基础上提供了 cron 定时调度、自动切换只读、执行日志可视化等改进，配合 tag 保留策略实现镜像生命周期自动管理",
+        "在线 GC 目前没有成熟的生产方案，社区讨论的引用计数和三色标记方案均存在实现难点，生产中常用「短暂只读窗口 + 低峰期分批清理」的折中策略"
+      ],
+      "quiz": [
+        {
+          "id": "docker-registry-gc-q1-quiz1",
+          "question": "Registry 的 content-addressable storage 模型中，blob 的存储路径由什么决定？",
+          "choices": [
+            {"id": "A", "text": "blob 内容的 SHA256 哈希值，相同内容的 blob 在物理存储中只有一份副本"},
+            {"id": "B", "text": "blob 上传的时间戳加服务端生成的随机 UUID"},
+            {"id": "C", "text": "镜像名称和 tag 的拼接字符串"},
+            {"id": "D", "text": "Registry 数据库中自增的 blob 序列号"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "content-addressable storage 的核心原理是以内容的加密哈希作为存储地址。Registry 将每个 blob 存储在 blobs/sha256/<前两位>/<完整哈希> 路径下，相同内容必然产生相同哈希，因此多个镜像共享的 base layer 在物理存储中只有一份副本，天然实现去重。选项 B 的时间戳加 UUID 是普通文件存储的命名方式，无法实现内容去重；选项 C 的镜像名和 tag 存储在 repositories/ 目录中，是引用关系而非 blob 的物理地址；选项 D 的自增序列号是关系型数据库的主键策略，Registry 不使用数据库管理 blob。"
+        },
+        {
+          "id": "docker-registry-gc-q1-quiz2",
+          "question": "通过 Registry HTTP API 删除一个镜像的 manifest 后，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "tag 指向的所有 layer blob 和 config blob 被立即从磁盘物理删除"},
+            {"id": "B", "text": "tag 和 manifest 的引用记录保留不变，但底层 blob 文件被标记为待删除状态"},
+            {"id": "C", "text": "仅 tag 到 manifest 的引用记录和 manifest revision 被移除，底层 blob 文件保持不变"},
+            {"id": "D", "text": "Registry 自动触发后台 GC 任务清理该 manifest 关联的所有无引用 blob"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Registry 的 DELETE API 执行的是 soft delete——只移除 _manifests/tags/ 和 _manifests/revisions/ 下的引用记录（link 文件），不触碰 blobs/ 目录中的任何物理文件。这是 CAS 存储的标准做法，因为同一个 blob 可能被多个 manifest 引用，直接删除物理文件可能破坏其他镜像。选项 A 描述的是 hard delete 行为，但 API 不会执行这一步；选项 B 错在 Registry 没有「待删除标记」机制；选项 D 错在 Registry 不会自动触发 GC，GC 必须由管理员手动执行或通过 Harbor 等上层工具调度。"
+        },
+        {
+          "id": "docker-registry-gc-q1-quiz3",
+          "question": "GC 的 mark 阶段具体执行了什么操作？",
+          "choices": [
+            {"id": "A", "text": "遍历 blobs/ 目录下所有文件，记录每个 blob 的最后访问时间和文件大小"},
+            {"id": "B", "text": "遍历所有仓库的 manifest revision，解析 manifest JSON 提取并标记所有被引用的 blob digest"},
+            {"id": "C", "text": "扫描 repositories/ 目录，直接删除所有没有 tag 指向的 manifest revision"},
+            {"id": "D", "text": "计算每个 blob 的引用计数，将引用计数归零的 blob 加入待删除队列"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "mark 阶段的目的是构建「活跃 blob 集合」。GC 从 repositories/ 出发，遍历每个仓库的 _manifests/revisions/ 目录中所有仍然存在的 manifest，解析每个 manifest 的 JSON 内容，提取 config 和 layers 字段中的 digest，将它们以及 manifest 自身的 digest 标记为「被引用」。选项 A 的文件访问时间不是 GC 的判断依据——CAS 基于引用关系而非时间；选项 C 的直接删除 manifest 属于 sweep 行为而非 mark；选项 D 描述的是引用计数算法，而 Registry GC 使用的是 mark-sweep，两者是不同的垃圾回收策略。"
+        },
+        {
+          "id": "docker-registry-gc-q1-quiz4",
+          "question": "GC 的 sweep 阶段如何判断一个 blob 是否应该被物理删除？",
+          "choices": [
+            {"id": "A", "text": "检查 blob 文件的创建时间，超过配置的保留天数则自动删除"},
+            {"id": "B", "text": "检查 blob 是否在 repositories/_layers/ 目录中有对应的 link 文件"},
+            {"id": "C", "text": "向集群中所有 Registry 节点广播查询，确认该 blob 在任何节点上都未被使用"},
+            {"id": "D", "text": "检查 blob 的 digest 是否存在于 mark 阶段构建的活跃 blob 集合中，不存在则删除"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "sweep 阶段遍历 blobs/ 目录下的所有物理文件，逐一检查每个 blob 的 digest 是否出现在 mark 阶段构建的活跃集合中。如果不在集合中，说明没有任何现存 manifest 引用这个 blob，它就是孤儿 blob，GC 将其从存储中物理删除。选项 A 的基于时间判断是 TTL 策略而非 mark-sweep；选项 B 的 _layers/link 文件只记录仓库级别的引用关系，soft delete 后这些 link 文件可能已被移除但 blob 仍然被其他仓库的 manifest 引用；选项 C 描述的分布式查询机制在原生 Registry 中不存在，GC 是单节点操作。"
+        },
+        {
+          "id": "docker-registry-gc-q1-quiz5",
+          "question": "执行 registry garbage-collect --dry-run 后输出「5 blobs eligible for deletion」，此时磁盘空间实际发生了什么变化？",
+          "choices": [
+            {"id": "A", "text": "5 个 blob 已被删除，磁盘空间立即释放"},
+            {"id": "B", "text": "没有任何 blob 被删除，--dry-run 仅执行 mark 阶段并报告可清理的 blob 数量"},
+            {"id": "C", "text": "5 个 blob 被移动到 Registry 的回收站目录，等待确认后才永久删除"},
+            {"id": "D", "text": "5 个 blob 被标记为软删除状态，需要再次运行 GC 才物理删除"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "--dry-run 是 GC 的预览模式，完整执行 mark 阶段并扫描 blobs/ 目录识别孤儿 blob，但不执行任何物理删除操作。它的作用是让管理员在正式清理之前确认清理范围和数量，避免误操作。输出中的「eligible for deletion」明确表示「符合删除条件」而非「已删除」。选项 A 误以为 --dry-run 会实际执行删除；选项 C 描述的回收站机制在 Registry 中不存在；选项 D 的「软删除状态」与 --dry-run 无关——--dry-run 不会修改任何存储状态。"
+        },
+        {
+          "id": "docker-registry-gc-q1-quiz6",
+          "question": "如果在 GC 的 mark-sweep 执行期间没有将 Registry 切为只读模式，最可能导致什么后果？",
+          "choices": [
+            {"id": "A", "text": "新推送的镜像引用的 blob 可能在 sweep 阶段被误删，导致后续 pull 返回 unknown blob 错误"},
+            {"id": "B", "text": "GC 进程会检测到写入冲突并自动中止，回滚所有已删除的 blob"},
+            {"id": "C", "text": "只有 mark 阶段之前已存在的镜像会受影响，之后推送的镜像完全安全"},
+            {"id": "D", "text": "Registry 内部有锁机制保护，GC 期间写入会自动排队等待 GC 完成"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 mark-sweep 的经典竞态条件。mark 阶段完成后、sweep 开始前的时间窗口内，如果有新的 docker push 上传了 blob 并创建了 manifest，而这些新 blob 在 mark 阶段没有被标记为活跃（因为 mark 时它们还不存在或不被引用），sweep 阶段就会将它们判定为孤儿并物理删除。结果是新推送的 manifest 引用了已被删除的 blob，后续 pull 返回 unknown blob 错误。选项 B 错在 Registry GC 没有冲突检测和回滚机制；选项 C 因果关系完全反了，恰恰是 mark 之后推送的镜像有风险；选项 D 错在原生 Registry 不提供 GC 级别的写入锁。"
+        },
+        {
+          "id": "docker-registry-gc-q1-quiz7",
+          "question": "在 Registry GC 的语境中，soft delete 和 hard delete 分别指什么？",
+          "choices": [
+            {"id": "A", "text": "soft delete 是删除 blob 文件但保留元数据记录，hard delete 是连元数据一起删除"},
+            {"id": "B", "text": "soft delete 是给 blob 设置过期时间，hard delete 是过期后系统自动清理"},
+            {"id": "C", "text": "soft delete 是通过 API 删除 manifest 引用记录，hard delete 是 GC sweep 阶段物理删除无引用的 blob 文件"},
+            {"id": "D", "text": "soft delete 是删除单个 tag 的指针，hard delete 是删除整个仓库及其所有数据"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "在 Registry 的 GC 流程中，这两个术语有明确定义。soft delete 指通过 HTTP API 的 DELETE 端点移除 manifest 的引用记录（tags/ 和 revisions/ 下的 link 文件），此时 blob 物理文件完好无损，只是不再被该 manifest 引用。hard delete 指 GC 的 sweep 阶段在确认某个 blob 不被任何 manifest 引用后，将其从存储后端物理删除释放空间。两步构成完整的清理链路：soft delete 断开引用 → hard delete 回收空间。选项 A 的方向搞反了；选项 B 描述的 TTL 机制 Registry 原生不支持；选项 D 将 soft delete 和 hard delete 的粒度错误地对应到了 tag 和仓库级别。"
+        },
+        {
+          "id": "docker-registry-gc-q1-quiz8",
+          "question": "相比原生 Registry 的 GC 操作，Harbor 在 GC 管理上提供了哪项核心改进？",
+          "choices": [
+            {"id": "A", "text": "Harbor 使用引用计数替代 mark-sweep，将 GC 耗时从分钟级降到毫秒级"},
+            {"id": "B", "text": "Harbor 实现了完全在线的 GC，无需任何只读窗口即可安全清理"},
+            {"id": "C", "text": "Harbor 将 GC 计算下推到客户端执行，服务端只负责确认删除结果"},
+            {"id": "D", "text": "Harbor 支持通过管理界面配置 cron 定时 GC，自动切换只读并在完成后恢复，无需人工干预"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Harbor 对 GC 的核心改进是自动化和可视化：管理员在 Portal 中配置 cron 表达式（如每天凌晨 2 点），Harbor 在触发时自动将底层 Registry 切为只读、执行 mark-sweep、完成后恢复读写，并在 Portal 展示 GC 日志和释放空间统计。选项 A 错在 Harbor 底层仍然使用 mark-sweep 算法，没有替换为引用计数；选项 B 错在 Harbor 的 GC 同样需要只读窗口，只是自动化了切换过程；选项 C 描述的客户端下推架构不存在，GC 始终在服务端 Registry 进程内执行。"
+        },
+        {
+          "id": "docker-registry-gc-q1-quiz9",
+          "question": "管理员发现 Registry 存储持续增长，直接运行 registry garbage-collect 命令但几乎没有 blob 被删除。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "没有先通过 API 对旧 manifest 执行 soft delete，所有 blob 仍然被现存 manifest 引用，GC 标记为全部活跃"},
+            {"id": "B", "text": "Registry 使用的是 S3 对象存储后端，GC 命令不支持远程存储清理"},
+            {"id": "C", "text": "GC 进程的操作系统用户没有 blobs/ 目录的写权限，无法执行物理删除"},
+            {"id": "D", "text": "Registry 版本太低，garbage-collect 子命令在 v2.5 之前不可用"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是生产中最常见的 GC「无效」场景。GC 的 mark 阶段遍历所有现存 manifest 并标记其引用的 blob，如果管理员没有先通过 DELETE API 删除旧 manifest（前提是配置中 storage.delete.enabled: true），那么所有 manifest 引用关系完好，所有 blob 都会被标记为活跃，sweep 阶段自然找不到任何孤儿 blob 可删除。选项 B 错在 GC 完全支持 S3、GCS、Azure Blob 等远程存储后端；选项 C 的权限问题会导致删除操作报错而非「没有 blob 被删除」；选项 D 错在 garbage-collect 子命令在 Registry v2 早期版本就已经存在。"
+        },
+        {
+          "id": "docker-registry-gc-q1-quiz10",
+          "question": "团队在执行 GC 后发现部分镜像 docker pull 失败，报错 unknown blob。以下哪个操作最可能导致了这个问题？",
+          "choices": [
+            {"id": "A", "text": "GC 执行前使用了 --dry-run 参数但忘记再次执行实际清理"},
+            {"id": "B", "text": "GC 执行期间 Registry 未切为只读模式，有新镜像在 mark 完成后被推送"},
+            {"id": "C", "text": "GC 配置文件路径指向了错误的 config.yml，清理了另一个 Registry 实例的数据"},
+            {"id": "D", "text": "Registry 存储后端使用 NFS 挂载，GC 不兼容网络文件系统"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "unknown blob 错误表明 manifest 引用了一个物理上不存在的 blob——这是 GC 竞态条件的典型症状。当 GC 执行期间 Registry 未切为只读模式，mark 阶段完成后的时间窗口内新的 docker push 上传了 blob 并创建了 manifest，但这些新 blob 未在 mark 阶段被标记为活跃，sweep 阶段将其误判为孤儿并物理删除。结果是新 manifest 引用了已不存在的 blob。选项 A 的 --dry-run 不执行任何删除，不可能导致 unknown blob；选项 C 的路径错误会让 GC 操作另一个实例的存储，当前实例的 blob 不受影响；选项 D 错在 GC 完全兼容 NFS 等网络文件系统后端。"
+        }
+      ],
+      "references": [
+        "https://distribution.github.io/distribution/about/garbage-collection/",
+        "https://docs.docker.com/registry/garbage-collection/",
+        "https://goharbor.io/docs/latest/administration/garbage-collection/"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,158 @@
+{
+  "id": "docker-debug-strace-seccomp",
+  "name": "strace 与 seccomp 限制",
+  "domain": "docker",
+  "description": "讲解在容器中使用 strace 需要 SYS_PTRACE capability 及 seccomp 对 ptrace 的限制与配置",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-debug-strace-seccomp-q1",
+      "domain": "docker",
+      "type": "debugging",
+      "difficulty": 4,
+      "tags": ["docker", "strace", "seccomp", "ptrace", "SYS_PTRACE", "capability", "容器调试", "系统调用", "安全策略", "nsenter"],
+      "title": "在容器中使用 strace 为什么报 Operation not permitted，怎么解决",
+      "content": "你们团队有一个跑在 Docker 容器里的 Go 微服务，上线两周后偶发请求超时，P99 延迟从正常的 15ms 飙到 800ms 以上。通过 Prometheus 监控确认超时集中在凌晨 2:00-2:30 这个窗口，怀疑是某个系统调用卡在了 I/O 上。你的第一反应是用 strace 跟踪一下到底慢在哪个 syscall，于是 exec 进容器开始操作：\n\n```bash\n$ docker exec -it order-service sh\n/ # strace -p 1 -e trace=read,write,futex -T\nstrace: attach: ptrace(PTRACE_SEIZE, 1): Operation not permitted\n```\n\n直接被打脸了。你又试了一下 strace 跟踪新进程：\n\n```bash\n/ # strace ls\nstrace: ptrace(PTRACE_TRACEME, ...): Operation not permitted\nstrace: PTRACE_SEIZE: Operation not permitted\n```\n\n还是不行。你确认过自己是 root 用户（uid=0），容器里也确实装了 strace，但就是报权限错误。同事说「加个 --privileged 重新跑容器就好了」，但这是生产环境，你不可能随便加 privileged。\n\n这个问题背后牵涉到两层安全机制的共同作用：Linux capabilities 和 seccomp。面试官问这道题的时候，不仅想知道你会不会「加个参数解决」，更想看你能不能说清楚：strace 为什么需要 ptrace 系统调用、Docker 默认为什么要禁止 ptrace、capabilities 和 seccomp 分别在哪一层拦截了它、生产环境下有哪些安全的替代方案。能把这几层讲透，就是高级 SRE 和初级运维的分水岭。",
+      "answer": "## 第一步：strace 工具基础与 ptrace 系统调用\n\nstrace 是 Linux 下最经典的系统调用跟踪工具，全称「system call trace」。它的核心能力是拦截并记录一个进程执行的所有系统调用（syscall）及其参数、返回值和耗时。在排查文件打开失败、网络连接超时、锁竞争、信号处理等问题时，strace 几乎是第一个被想到的工具——因为用户态代码再怎么复杂，最终都要通过系统调用跟内核交互，而 strace 能让你看到这条「用户态与内核态之间的边界」上到底发生了什么。\n\nstrace 最基础的两种用法：一种是跟踪已存在的进程 `strace -p <PID>`，另一种是启动一个新进程并跟踪 `strace <command>`。常用参数包括 `-e trace=<类别>` 过滤特定类别的系统调用（比如 network、file、memory），`-T` 显示每个 syscall 的耗时，`-c` 统计汇总模式，`-f` 跟踪 fork 出的子进程。一个典型的排查超时问题的用法：\n\n```bash\n$ strace -p 12345 -e trace=read,write,futex,epoll_wait -T -tt\n15:03:22.441892 futex(0xc000048148, FUTEX_WAIT_PRIVATE, 0, NULL) = 0 <0.000023>\n15:03:22.442018 read(7, \"GET /api/orders HTTP/1.1\\r\\n...\", 4096) = 342 <0.000011>\n15:03:22.442195 write(8, \"SELECT * FROM orders WHERE...\", 89) = 89 <0.000015>\n15:03:22.442380 read(8, 0xc000210000, 4096) = -1 EAGAIN <0.000008>\n15:03:22.442450 epoll_wait(3, [{EPOLLIN, {u32=8}}], 128, -1) = 1 <0.327156>\n15:03:22.769682 read(8, \"{\\\"rows\\\":...}\", 4096) = 2847 <0.000012>\n```\n\n从这段输出你能直接看到 epoll_wait 等了 327ms 才收到数据库响应——延迟的根因在数据库查询上，而不是应用代码。这就是 strace 的威力：把「应用慢了」这种模糊的现象精确到「某个具体系统调用卡了多久」。\n\nstrace 底层完全依赖 Linux 的 ptrace 系统调用来工作。ptrace（process trace）是内核提供的进程跟踪接口，最初为调试器（如 GDB）设计。当 strace 要附着（attach）到一个目标进程时，它调用 `ptrace(PTRACE_SEIZE, target_pid, ...)`；当 strace 启动一个新进程并跟踪时，子进程在 exec 之前调用 `ptrace(PTRACE_TRACEME, ...)`。两种模式都离不开 ptrace。GDB 的断点、单步执行、内存读写等功能也全部基于 ptrace——这意味着如果 ptrace 被禁止，不只是 strace 不能用，GDB 调试也一并失效。\n\n## 第二步：容器中 ptrace 被禁止的两层机制\n\n理解了 strace 依赖 ptrace 之后，问题就变成了：容器里的 ptrace 为什么会被拦截？答案是 Docker 同时启用了两层独立的安全机制来阻止 ptrace，你必须同时解除这两层限制才能让 strace 正常工作。\n\n**第一层：Linux capabilities 中缺少 SYS_PTRACE。** 传统的 Unix 权限模型只有两种状态——root（uid=0）拥有一切权限，普通用户几乎没有特殊权限。Linux capabilities 把 root 的「上帝权限」拆分成了大约 40 个细粒度的能力单元（截至 Linux 5.15 共有 41 个），每个 capability 控制一类特权操作。比如 CAP_NET_BIND_SERVICE 允许绑定 1024 以下端口，CAP_SYS_TIME 允许修改系统时钟，而 CAP_SYS_PTRACE 则控制是否允许使用 ptrace 系统调用以及跨越 namespace 边界检查进程。\n\nDocker 默认只给容器分配 14 个 capability，其中不包括 CAP_SYS_PTRACE。你可以用 `docker inspect` 确认这一点：\n\n```bash\n$ docker inspect --format '{{.HostConfig.CapAdd}}' order-service\n[]\n$ docker inspect --format '{{.HostConfig.CapDrop}}' order-service\n[]\n```\n\n空的 CapAdd 意味着使用默认集合。默认集合包含 CHOWN、DAC_OVERRIDE、FOWNER、FSETID、KILL、SETGID、SETUID、SETPCAP、NET_BIND_SERVICE、NET_RAW、SYS_CHROOT、MKNOD、AUDIT_WRITE、SETFCAP 这 14 个，注意没有 SYS_PTRACE。所以即使你在容器里是 root，内核检查到你的进程不具备 CAP_SYS_PTRACE 这个 capability，ptrace 调用就直接返回 EPERM（Operation not permitted）。\n\n要解除这一层限制，启动容器时加上 `--cap-add=SYS_PTRACE`：\n\n```bash\n$ docker run --cap-add=SYS_PTRACE -d --name order-service order-service:latest\n```\n\n**第二层：seccomp profile 默认拦截 ptrace。** 即使你加了 SYS_PTRACE capability，在某些场景下 strace 仍然可能被拦截——这是因为 Docker 还有第二道防线：seccomp（Secure Computing Mode）。seccomp 是 Linux 内核的系统调用过滤机制，工作在比 capabilities 更底层的位置。它通过 BPF（Berkeley Packet Filter）规则直接在内核中拦截系统调用——进程发起 syscall 时，内核先过 seccomp 的 BPF 过滤器，如果规则说「不允许」，这个 syscall 甚至不会进入正常的权限检查流程就被拒绝了。\n\nDocker 从 1.10 版本开始内置了一个默认的 seccomp profile，这个 profile 以白名单方式运作：只有列表中明确允许的系统调用才能执行。Docker 的默认 profile 大约允许了 300 多个常用 syscall，但 ptrace 默认不在白名单中（或者只在进程具备 CAP_SYS_PTRACE 时才有条件放行，具体行为取决于 Docker 版本）。在 Docker 20.10+ 的默认 seccomp profile 中，ptrace 这条规则写的是：\n\n```json\n{\n  \"names\": [\"ptrace\"],\n  \"action\": \"SCMP_ACT_ALLOW\",\n  \"includes\": {\n    \"caps\": [\"CAP_SYS_PTRACE\"]\n  }\n}\n```\n\n这段配置的含义是：ptrace 系统调用只有在容器拥有 CAP_SYS_PTRACE capability 时才放行。也就是说，在较新版本的 Docker 中，只要你加了 `--cap-add=SYS_PTRACE`，seccomp 这一层也会自动放行 ptrace。但在一些旧版本的 Docker 或自定义 seccomp profile 的环境中，ptrace 可能被无条件拦截，这时即使加了 capability 也没用。\n\n遇到加了 SYS_PTRACE 仍然不行的情况，可以临时禁用 seccomp 来确认是不是 seccomp 层的问题：\n\n```bash\n$ docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \\\n    -d --name order-service-debug order-service:latest\n```\n\n`seccomp=unconfined` 完全关闭 seccomp 过滤，容器可以调用任何系统调用。这在调试时有效，但在生产环境中相当于拆掉了一整道安全墙，风险很大。正确的做法是编写一个自定义 seccomp profile，在默认 profile 基础上只额外放行 ptrace：\n\n```json\n{\n  \"defaultAction\": \"SCMP_ACT_ERRNO\",\n  \"syscalls\": [\n    {\n      \"names\": [\"ptrace\"],\n      \"action\": \"SCMP_ACT_ALLOW\"\n    }\n  ]\n}\n```\n\n实际操作中，建议从 Docker 的默认 profile（位于 Moby 项目仓库 `profiles/seccomp/default.json`，约 350 行）复制一份，然后在 syscalls 数组中找到 ptrace 那条规则，把 `includes` 中的 `caps` 条件去掉或直接改成无条件 ALLOW。然后用 `--security-opt seccomp=./my-profile.json` 加载：\n\n```bash\n$ docker run --cap-add=SYS_PTRACE \\\n    --security-opt seccomp=./allow-ptrace-profile.json \\\n    -d --name order-service-debug order-service:latest\n```\n\n**不重启容器的替代方案。** 生产环境中你往往无法重启出问题的容器。这时最实用的方案是从宿主机直接 strace 容器进程：\n\n```bash\n# 拿到容器主进程在宿主机上的 PID\n$ PID=$(docker inspect --format '{{.State.Pid}}' order-service)\n$ echo $PID\n34521\n\n# 在宿主机上直接 strace，不受容器的 capability/seccomp 限制\n$ strace -p 34521 -e trace=read,write,futex,epoll_wait -T -tt\n03:15:44.221 epoll_wait(3, [{EPOLLIN, {u32=7}}], 128, -1) = 1 <0.412893>\n03:15:44.634 read(7, \"HTTP/1.1 200 OK\\r\\n...\", 4096) = 1523 <0.000009>\n```\n\n宿主机上的 root 进程拥有完整的 capabilities 且不受容器 seccomp profile 的限制，所以 strace 可以直接 attach 到容器进程。还可以配合 nsenter 先进入容器的 PID namespace 再 strace，这样看到的 PID 编号跟容器内一致：\n\n```bash\n$ nsenter -t $PID -p -- strace -p 1 -e trace=network -T\n```\n\n## 第三步：自定义 seccomp profile 与替代方案\n\n生产环境中如果频繁需要在容器内做 syscall 级别的调试，与其每次临时加参数，不如在 CI/CD 流程中维护两套 seccomp profile——一套用于正式部署（默认 profile，ptrace 禁止），另一套用于调试部署（在默认基础上放行 ptrace）。通过 Kubernetes 的 seccompProfile 字段或 Docker Compose 的 security_opt 字段来切换：\n\n```yaml\n# docker-compose.debug.yml\nservices:\n  order-service:\n    cap_add:\n      - SYS_PTRACE\n    security_opt:\n      - seccomp:./profiles/debug-seccomp.json\n```\n\n在 Kubernetes 1.19+ 中，seccomp profile 可以通过 Pod 的 securityContext 直接指定：\n\n```yaml\nspec:\n  securityContext:\n    seccompProfile:\n      type: Localhost\n      localhostProfile: profiles/allow-ptrace.json\n  containers:\n    - name: order-service\n      securityContext:\n        capabilities:\n          add: [\"SYS_PTRACE\"]\n```\n\n**更现代的替代方案。** strace 基于 ptrace 机制，每个被跟踪的 syscall 都会导致两次上下文切换（进入 tracer 和返回），对目标进程的性能影响通常在 20%-50% 左右，高负载服务可能更高。生产环境中越来越多团队转向基于 eBPF 的工具来做 syscall 级别的观测，因为 eBPF 程序直接运行在内核中，不需要 ptrace 也不会频繁切换上下文：\n\nbpftrace 可以做跟 strace 几乎相同的事情，但性能开销小得多。比如跟踪某个容器进程的所有 read 系统调用耗时：\n\n```bash\n$ bpftrace -e 'tracepoint:syscalls:sys_exit_read /pid == 34521/ {\n    @us = hist(args->ret >= 0 ? nsecs - @start[tid] : 0);\n}'\n```\n\nperf 工具也能跟踪系统调用，并且可以生成火焰图做全局分析：\n\n```bash\n$ perf trace -p 34521 --duration 100 -e 'read,write,futex'\n34521 read(7, 0x7f3a..., 4096) = 1523 (102.341 ms)\n```\n\n不过 bpftrace 和 perf 需要宿主机内核支持 eBPF（Linux 4.15+），并且需要 CAP_BPF 或 CAP_SYS_ADMIN capability，在容器内使用同样有权限限制。最实用的方式还是在宿主机层面部署这些工具，通过 PID 直接观测容器进程。\n\n**面试考点梳理。** 这道题在面试中的考察逻辑非常清晰：第一层看你能不能说出「ptrace 被禁了，加 SYS_PTRACE」这个直接答案；第二层看你知不知道 capabilities 和 seccomp 是两道独立的安全机制，以及它们的拦截顺序（先 seccomp BPF 过滤，再 capability 检查）；第三层看你在生产环境中的实际经验——知道从宿主机 strace、知道 nsenter、知道自定义 seccomp profile、知道 eBPF 替代方案。面试官最喜欢的追问是「你说加 --privileged 也能解决，但 privileged 到底做了什么」——答案是 privileged 模式关闭 seccomp、授予全部 capabilities、允许访问所有设备、禁用 AppArmor/SELinux，相当于容器跟宿主机只隔了一层 namespace 的薄墙，安全风险极高。能在回答中主动提到这个对比，说明你对容器安全模型有体系化的理解。",
+      "keyPoints": [
+        "strace 底层完全依赖 ptrace 系统调用工作，ptrace(PTRACE_SEIZE) 用于附着已有进程，ptrace(PTRACE_TRACEME) 用于跟踪新启动的进程，GDB 等调试器同样依赖 ptrace",
+        "Docker 默认只给容器分配 14 个 capability，不包含 CAP_SYS_PTRACE，即使容器内是 root 用户也无法执行 ptrace，需要启动时通过 --cap-add=SYS_PTRACE 显式添加",
+        "seccomp 是第二层独立防线，通过 BPF 规则在内核层面过滤系统调用，Docker 默认 seccomp profile 中 ptrace 仅在容器拥有 CAP_SYS_PTRACE 时才条件放行",
+        "capabilities 和 seccomp 是两道独立的安全机制，拦截顺序是先过 seccomp BPF 过滤器再做 capability 检查，两层都必须放行 ptrace 才能生效",
+        "生产环境最安全的替代方案是从宿主机直接 strace -p <容器进程PID>，宿主机 root 不受容器的 capability 和 seccomp 限制",
+        "--privileged 模式关闭 seccomp、授予全部 capabilities、允许访问所有设备、禁用 AppArmor/SELinux，安全风险极高，生产环境绝不应使用",
+        "基于 eBPF 的 bpftrace 和 perf 是 strace 的现代替代方案，无需 ptrace 且性能开销远低于 strace 的 20%-50% 开销",
+        "自定义 seccomp profile 应从 Docker 默认 profile 复制修改，仅对 ptrace 规则做定向放行，而非使用 seccomp=unconfined 关闭整个过滤机制"
+      ],
+      "quiz": [
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz1",
+          "question": "strace 工具底层依赖哪个 Linux 系统调用来实现进程跟踪？",
+          "choices": [
+            {"id": "A", "text": "ptrace，这是 Linux 内核提供的进程跟踪接口，strace 和 GDB 等调试器都依赖它"},
+            {"id": "B", "text": "strace 自身就是一个系统调用，直接由内核原生支持"},
+            {"id": "C", "text": "seccomp，strace 通过 seccomp BPF 规则拦截目标进程的系统调用"},
+            {"id": "D", "text": "perf_event_open，strace 通过内核的 perf 子系统采集系统调用数据"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "strace 完全依赖 ptrace 系统调用来工作。ptrace 是 Linux 内核为调试器设计的进程跟踪接口，strace 用 PTRACE_SEIZE 附着到目标进程、用 PTRACE_TRACEME 跟踪新进程。B 选项错误，strace 是用户态工具而非系统调用。C 选项混淆了概念，seccomp 是系统调用过滤机制，反而是用来限制 strace 的；strace 不使用 seccomp 来跟踪进程。D 选项的 perf_event_open 是 perf 工具和 eBPF 使用的接口，strace 不走这条路径。"
+        },
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz2",
+          "question": "Docker 默认给容器分配的 capabilities 集合中，以下哪个 capability 是包含在默认集合中的？",
+          "choices": [
+            {"id": "A", "text": "CAP_SYS_PTRACE，允许使用 ptrace 跟踪进程"},
+            {"id": "B", "text": "CAP_SYS_ADMIN，允许执行各种系统管理操作"},
+            {"id": "C", "text": "CAP_NET_BIND_SERVICE，允许绑定 1024 以下的特权端口"},
+            {"id": "D", "text": "CAP_SYS_MODULE，允许加载和卸载内核模块"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Docker 默认给容器分配 14 个 capability，CAP_NET_BIND_SERVICE 是其中之一，允许容器内的进程绑定 80、443 等特权端口。A 选项的 CAP_SYS_PTRACE 不在默认集合中，这正是容器内 strace 报 Operation not permitted 的原因之一。B 选项的 CAP_SYS_ADMIN 权限范围极广（几乎等于半个 root），Docker 出于安全考虑不会默认授予。D 选项的 CAP_SYS_MODULE 允许加载内核模块，如果容器能随意加载内核模块就可以直接逃逸，所以也不在默认集合中。"
+        },
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz3",
+          "question": "Docker 的 seccomp 默认 profile 对 ptrace 系统调用采取的策略是什么？",
+          "choices": [
+            {"id": "A", "text": "无条件禁止，即使添加了 CAP_SYS_PTRACE 也无法使用 ptrace"},
+            {"id": "B", "text": "无条件允许，seccomp 默认 profile 不过滤 ptrace"},
+            {"id": "C", "text": "返回 SCMP_ACT_LOG，允许 ptrace 执行但记录一条审计日志"},
+            {"id": "D", "text": "条件允许，只有当容器拥有 CAP_SYS_PTRACE capability 时才放行 ptrace"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Docker 20.10+ 的默认 seccomp profile 中，ptrace 规则设置了 includes.caps 条件：只有当容器拥有 CAP_SYS_PTRACE 时才执行 SCMP_ACT_ALLOW 放行。这意味着在较新版本的 Docker 中，只要通过 --cap-add=SYS_PTRACE 添加了这个 capability，seccomp 层也会自动放行。A 选项描述的是旧版本 Docker 的行为，在一些早期版本中 ptrace 确实是无条件禁止的。B 选项错误，ptrace 不在默认无条件白名单中。C 选项的 SCMP_ACT_LOG 是另一种策略，默认 profile 中 ptrace 没有使用它。"
+        },
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz4",
+          "question": "当容器内执行 strace 报 Operation not permitted 时，capabilities 和 seccomp 的拦截顺序是怎样的？",
+          "choices": [
+            {"id": "A", "text": "先由 capabilities 检查，再由 seccomp BPF 过滤"},
+            {"id": "B", "text": "两者并行检查，任一失败即拒绝"},
+            {"id": "C", "text": "只有 capabilities 一层检查，seccomp 不参与 ptrace 的权限控制"},
+            {"id": "D", "text": "先由 seccomp BPF 过滤器拦截，再做 capabilities 权限检查"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Linux 内核处理系统调用时的安全检查顺序是：seccomp BPF 过滤器先执行，如果 seccomp 拒绝了，syscall 直接返回 EPERM 或被 kill，根本不会走到后续的 capability 检查。只有 seccomp 放行后，内核才会继续做 LSM（Linux Security Module）检查和 capability 检查。所以 A 选项的顺序反了。B 选项的「并行检查」不对，内核的安全检查是有明确先后顺序的。C 选项忽略了 seccomp 的存在，实际上 seccomp 是比 capabilities 更底层的拦截机制。理解这个顺序在排查问题时很重要：如果加了 SYS_PTRACE 仍然失败，大概率是 seccomp 层的问题。"
+        },
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz5",
+          "question": "在容器内执行 strace ls 时看到以下输出，这说明什么问题？\n\nstrace: ptrace(PTRACE_TRACEME, ...): Operation not permitted\nstrace: PTRACE_SEIZE: Operation not permitted",
+          "choices": [
+            {"id": "A", "text": "strace 二进制文件损坏，需要重新安装 strace 包"},
+            {"id": "B", "text": "ptrace 系统调用被拦截，先尝试了 PTRACE_TRACEME 模式再尝试了 PTRACE_SEIZE 模式，两种都被内核拒绝"},
+            {"id": "C", "text": "ls 命令不存在于容器中，strace 无法找到要跟踪的目标程序"},
+            {"id": "D", "text": "容器的 PID namespace 隔离导致 strace 无法看到 ls 进程的 PID"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这段输出是 strace 启动新进程跟踪时的典型报错。strace 先让子进程调用 ptrace(PTRACE_TRACEME) 请求被父进程跟踪，失败后又尝试用 ptrace(PTRACE_SEIZE) 从外部附着，两种方式都返回了 EPERM。这明确说明是 ptrace 系统调用本身被拦截了，原因是容器缺少 CAP_SYS_PTRACE 或被 seccomp 过滤。A 选项不对，如果 strace 损坏会报其他错误而不是 ptrace EPERM。C 选项不对，如果 ls 不存在报错信息会是「No such file or directory」而不是 ptrace 权限错误。D 选项把 PID namespace 和 ptrace 权限搞混了，namespace 隔离不会导致 ptrace 返回 EPERM。"
+        },
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz6",
+          "question": "同事建议用 --privileged 模式运行容器来解决 strace 权限问题。以下关于 --privileged 的说法，哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "--privileged 关闭 seccomp 过滤、授予全部 capabilities、允许访问所有设备、禁用 AppArmor/SELinux，安全风险极高"},
+            {"id": "B", "text": "--privileged 只是添加了 CAP_SYS_PTRACE 这一个 capability，影响范围有限"},
+            {"id": "C", "text": "--privileged 只关闭了 seccomp 过滤，capabilities 保持默认不变"},
+            {"id": "D", "text": "--privileged 等价于 --cap-add=SYS_PTRACE --security-opt seccomp=unconfined 的组合"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "--privileged 是 Docker 中权限最宽松的模式，它做的事情远不止解决 ptrace 问题：授予容器全部约 41 个 capabilities、完全关闭 seccomp 系统调用过滤、禁用 AppArmor 和 SELinux 等 LSM 安全模块、允许容器访问宿主机的所有设备（/dev 下的设备文件全部可见）。B 选项严重低估了 privileged 的影响范围。C 选项只提到了 seccomp 一个方面。D 选项看起来接近但遗漏了设备访问和 LSM 禁用这两个重要维度，privileged 的影响范围比这个组合大得多。生产环境用 privileged 相当于容器跟宿主机之间只隔了 namespace 一层薄墙。"
+        },
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz7",
+          "question": "对比 strace（基于 ptrace）和 bpftrace（基于 eBPF）做系统调用跟踪，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "bpftrace 不需要任何特殊权限，在普通容器内可以直接使用"},
+            {"id": "B", "text": "strace 的性能开销更低，因为 ptrace 是内核原生接口不涉及额外的字节码编译"},
+            {"id": "C", "text": "strace 基于 ptrace 每个 syscall 导致两次上下文切换，开销约 20%-50%；bpftrace 的 eBPF 程序在内核态执行，性能开销远低于 strace"},
+            {"id": "D", "text": "两者性能开销相同，区别只在于输出格式不同"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "strace 基于 ptrace 机制，目标进程每执行一个被跟踪的系统调用，内核都要暂停目标进程、通知 strace 进程、等 strace 处理完再恢复目标进程，涉及两次用户态-内核态上下文切换，性能开销通常在 20%-50%。而 bpftrace 基于 eBPF，探测程序直接运行在内核态的沙箱中，不需要暂停目标进程，性能开销通常在个位数百分比。A 选项错误，bpftrace 需要 CAP_BPF 或 CAP_SYS_ADMIN 权限，在容器内同样受限。B 选项把性能对比搞反了，ptrace 的两次上下文切换恰恰是它性能差的原因。D 选项忽略了两者在实现机制上的根本差异。"
+        },
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz8",
+          "question": "生产环境中容器出现超时问题需要做 syscall 级别排查，但不能重启容器也不能修改其安全配置，最合适的做法是什么？",
+          "choices": [
+            {"id": "A", "text": "用 docker exec 进入容器后安装 strace 并执行跟踪"},
+            {"id": "B", "text": "从宿主机获取容器主进程 PID，直接在宿主机上用 strace -p <PID> 跟踪"},
+            {"id": "C", "text": "修改正在运行的容器的 seccomp profile 并动态添加 SYS_PTRACE capability"},
+            {"id": "D", "text": "用 docker update --cap-add=SYS_PTRACE 动态给运行中的容器添加 capability"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "从宿主机直接 strace 容器进程是生产环境中最实用的方案。先用 docker inspect --format '{{.State.Pid}}' 拿到容器主进程在宿主机上的 PID，然后在宿主机上以 root 执行 strace -p <PID>。宿主机的 root 拥有完整 capabilities 且不受容器 seccomp profile 限制。A 选项在容器内执行 strace 会遇到本题讨论的权限问题。C 选项不可行，capabilities 和 seccomp profile 都是容器创建时确定的，不能动态修改。D 选项编造了一个不存在的功能，docker update 只能修改 CPU/内存等资源限制，无法修改 capabilities。"
+        },
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz9",
+          "question": "关于 seccomp 的 BPF 过滤器工作机制，以下哪个描述是准确的？",
+          "choices": [
+            {"id": "A", "text": "seccomp BPF 过滤器运行在用户态，通过拦截 libc 的系统调用封装函数来实现过滤"},
+            {"id": "B", "text": "seccomp BPF 过滤器只能做黑名单过滤（拒绝指定的系统调用），不支持白名单模式"},
+            {"id": "C", "text": "seccomp BPF 过滤器是 Docker 独有的安全机制，只能在容器环境中使用"},
+            {"id": "D", "text": "seccomp BPF 过滤器在进程进入内核态执行系统调用之前，由内核的 BPF 虚拟机执行过滤规则，被拒绝的调用不会进入正常的权限检查流程"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "seccomp BPF 是 Linux 内核原生的系统调用过滤机制。当进程发起系统调用时，在真正执行 syscall 处理函数之前，内核先运行 seccomp 附加的 BPF 程序来决定是否放行。如果 BPF 规则返回 SCMP_ACT_ERRNO 或 SCMP_ACT_KILL，syscall 直接被拒绝，不会进入后续的 capability 检查和 LSM 检查。A 选项错误，seccomp 工作在内核态而非用户态，不依赖 libc。B 选项错误，Docker 的默认 seccomp profile 正是以白名单模式工作（defaultAction 设为 ERRNO，然后 syscalls 数组列出允许的调用）。C 选项错误，seccomp 是通用的 Linux 内核功能，任何进程都可以通过 prctl(PR_SET_SECCOMP) 或 seccomp() 系统调用为自己安装 BPF 过滤器。"
+        },
+        {
+          "id": "docker-debug-strace-seccomp-q1-quiz10",
+          "question": "以下哪种方式是在 Kubernetes 集群中为 Pod 配置自定义 seccomp profile 的正确做法（Kubernetes 1.19+ GA）？",
+          "choices": [
+            {"id": "A", "text": "在 Pod 的 securityContext 中设置 seccompProfile.type 为 Localhost 并指定 localhostProfile 路径"},
+            {"id": "B", "text": "在 Pod 的 annotations 中添加 seccomp.security.alpha.kubernetes.io/pod 注解"},
+            {"id": "C", "text": "通过 kubectl apply -f seccomp-profile.yaml 直接创建一个 SeccompProfile 的自定义资源"},
+            {"id": "D", "text": "在容器启动命令中添加 --security-opt seccomp=./profile.json 参数"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kubernetes 1.19 将 seccomp 支持升级为 GA（正式发布），使用 Pod 或容器级别的 securityContext.seccompProfile 字段来配置。type 可以是 RuntimeDefault（使用容器运行时的默认 profile）、Localhost（使用节点上的自定义 profile 文件）或 Unconfined（不施加 seccomp 限制）。当 type 为 Localhost 时，需要通过 localhostProfile 指定 profile 文件相对于 kubelet 的 seccomp profile 根目录的路径。B 选项是 Kubernetes 1.19 之前的 alpha 阶段做法，使用注解方式，现在已被 securityContext 字段取代。C 选项编造了不存在的 CRD 资源类型。D 选项是 Docker CLI 的参数格式，不适用于 Kubernetes 的 Pod 规范。"
+        }
+      ],
+      "references": [
+        "https://docs.docker.com/engine/security/seccomp/",
+        "https://man7.org/linux/man-pages/man2/ptrace.2.html",
+        "https://man7.org/linux/man-pages/man1/strace.1.html",
+        "https://github.com/moby/moby/blob/master/profiles/seccomp/default.json",
+        "https://kubernetes.io/docs/tutorials/security/seccomp/"
+      ]
+    }
+  ]
+}

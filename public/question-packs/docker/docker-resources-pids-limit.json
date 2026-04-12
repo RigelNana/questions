@@ -1,0 +1,156 @@
+{
+  "id": "docker-resources-pids-limit",
+  "name": "--pids-limit 进程数限制",
+  "domain": "docker",
+  "description": "讲解 --pids-limit 防止容器内 fork 炸弹耗尽宿主机 PID 资源的安全作用与配置",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-resources-pids-limit-q1",
+      "domain": "docker",
+      "type": "purpose",
+      "difficulty": 3,
+      "tags": ["pids-limit", "cgroup", "fork-bomb", "container-security", "resource-limit"],
+      "title": "docker run 的 --pids-limit 参数有什么安全作用？",
+      "content": "在容器安全加固的面试中，资源限制是一个绕不开的话题。大部分人熟悉 `-m` 限制内存、`--cpus` 限制 CPU，但聊到 PID 资源限制时，很多候选人就卡住了。\n\n考虑这样一个场景：你的团队在一台 8 核 32GB 的宿主机上跑了 20 个业务容器。某天凌晨三点，监控突然全面报警——所有容器的健康检查集体失败，SSH 也连不上宿主机，运维只能通过 IPMI 硬重启。事后排查发现，是其中一个容器内的应用因为 bug 触发了类似 fork 炸弹的行为，在极短时间内创建了数万个进程，耗尽了宿主机的 PID 资源。\n\nLinux 内核对整个系统能分配的 PID 总数是有上限的，这个值记录在 `/proc/sys/kernel/pid_max` 中，64 位系统上默认为 `32768`，较新内核可调至 `4194304`。当全局 PID 被耗尽时，任何进程的 `fork()` 调用都会失败，包括宿主机上的 sshd、dockerd、kubelet 等关键守护进程。更可怕的是，已有进程由于无法 fork 出子进程来处理请求，也会陷入不可用状态。一台原本健康的机器，就因为一个容器里的进程失控，整个瘫痪了。\n\n经典的 fork 炸弹长这样：\n\n```bash\n:(){ :|:& };:\n```\n\n这行代码定义了一个叫 `:` 的函数，函数体是调用自身并将输出管道给自身的另一个副本，两者都在后台执行。执行一次之后，进程数以指数级增长——1 变 2，2 变 4，4 变 8……不到几秒钟就能产生数万个进程。在没有任何 PID 限制的容器中执行这段代码，效果等同于直接在宿主机上执行——因为 Docker 默认不对容器的进程数做任何限制。\n\n现在问题来了：`docker run` 的 `--pids-limit` 参数具体起什么作用？它是通过什么内核机制实现的？默认值是多少？当容器内进程数达到上限时应用层面会看到什么错误？如何在 dockerd 级别为所有容器设置默认的 PID 限制？它和 `ulimit -u`（nproc）有什么本质区别？\n\n请系统性地讲解 `--pids-limit` 的安全作用、底层实现及生产配置方案。",
+      "answer": "## 一、PID 资源基础与 fork 炸弹威胁\n\n要理解 `--pids-limit` 的安全意义，先要搞清楚 PID 在 Linux 系统中的定位。PID（Process IDentifier）是内核为每个进程分配的唯一数字标识，内核内部通过一个位图结构来管理可分配的 PID 范围。这个范围的上限由 `/proc/sys/kernel/pid_max` 控制——可以把它理解成一个全局号码池，所有进程都要从这个池子里取号。\n\n查看和修改 `pid_max` 的方法：\n\n```bash\n# 查看当前 pid_max\ncat /proc/sys/kernel/pid_max\n32768\n\n# 临时调大（需要 root）\necho 65536 > /proc/sys/kernel/pid_max\n\n# 持久化配置\necho 'kernel.pid_max = 65536' >> /etc/sysctl.conf\nsysctl -p\n```\n\n关键点在于：PID 是全局共享资源。无论宿主机上跑了多少个容器，所有容器的进程加上宿主机自身的进程共用同一个 PID 空间。虽然 Docker 默认为每个容器创建了独立的 PID namespace（容器内看到的 PID 从 1 开始），但这只是「视觉隔离」——容器内的进程在宿主机上仍然各自占用一个真实的全局 PID 槽位。一个容器疯狂创建进程，抢占的是整台机器的 PID 额度。\n\n来详细拆解那段 fork 炸弹 `:(){ :|:& };:`：\n\n```bash\n:()        # 定义一个名为 \":\" 的函数（\":\" 在 bash 中是合法的函数名）\n{\n  : | : &  # 函数体：调用自身两次，通过管道连接，整体后台执行\n}\n;          # 函数定义结束\n:          # 立即调用这个函数，引爆连锁反应\n```\n\n第一次调用产生 2 个子进程，每个子进程又各产生 2 个，指数级增长。在一台 `pid_max=32768` 的机器上，理论上 15 轮递归（2^15 = 32768）就填满所有 PID。实际上由于管道、后台执行以及进程调度的开销，通常 3-5 秒内宿主机就会完全失去响应。\n\nPID 耗尽时的直接后果：系统中任何 `fork()` 和 `clone()` 系统调用都返回 `EAGAIN`（errno 11），对应的错误信息是 `Resource temporarily unavailable`。这不仅意味着新进程无法创建，连在 bash 里敲一条 `ps aux` 都执行不了——因为 bash 需要 fork 一个子进程来运行外部命令。宿主机在交互层面完全瘫痪，通常只能硬重启。\n\n## 二、--pids-limit 的安全作用与底层实现\n\nDocker 从 1.11 版本开始支持 `--pids-limit` 参数，底层依赖的是 Linux cgroup 的 pids 子系统（也叫 pids controller），这个子系统在 Linux 4.3 内核中引入。它的核心控制文件是 `pids.max`，用来设置一个 cgroup 内允许存在的最大进程（含线程）数量。\n\n当你执行下面这条命令：\n\n```bash\ndocker run -d --pids-limit=100 --name webapp nginx:1.25\n```\n\nDocker daemon 会在容器对应的 cgroup 路径下将 `pids.max` 写入 `100`。可以直接验证：\n\n```bash\n# cgroup v1 路径\ncat /sys/fs/cgroup/pids/docker/<container-id>/pids.max\n100\n\n# 查看当前容器内的进程+线程数\ncat /sys/fs/cgroup/pids/docker/<container-id>/pids.current\n3\n\n# 如果是 cgroup v2（较新发行版默认）\ncat /sys/fs/cgroup/system.slice/docker-<container-id>.scope/pids.max\n100\ncat /sys/fs/cgroup/system.slice/docker-<container-id>.scope/pids.current\n3\n```\n\n当 `pids.current` 达到 `pids.max` 时，该 cgroup 内所有新的 `fork()` 或 `clone()` 调用都会返回 `-EAGAIN`，但 cgroup 之外的进程完全不受影响。这就是 `--pids-limit` 的核心安全价值——将 fork 炸弹的爆炸半径严格限制在单个容器内部，宿主机和其他容器照常运行。\n\n一个极其重要但经常被忽视的事实：Docker 默认不设置 `--pids-limit`，此时 `pids.max` 的值是 `max`（即无限制）。换句话说，在默认配置下，任何一个容器都有能力通过不受控的进程创建耗尽宿主机的全部 PID 资源。这是 Docker 默认配置中一个实实在在的安全漏洞。\n\n### 触发限制后的应用层表现\n\n容器内进程数触达 `pids.max` 上限后，不同语言和框架报出的错误各不相同，但根因都是 `EAGAIN`：\n\n```\n# Shell\nsh: can't fork: Resource temporarily unavailable\n\n# Go\nfork/exec /bin/sh: resource temporarily unavailable\n\n# Java\njava.io.IOException: error=11, Resource temporarily unavailable\n\n# Python\nBlockingIOError: [Errno 11] Resource temporarily unavailable\n```\n\n需要强调的是，触发限制后容器内已有的进程不会被杀死，它们可以继续正常运行，只是无法再 fork 出新的子进程。这一点与内存 OOM 不同——OOM Killer 会直接杀进程，而 PID 限制只是拒绝新进程的创建请求。\n\n### dockerd 全局默认配置\n\n逐个容器手动设置 `--pids-limit` 在管理几十上百个容器时不现实。Docker daemon 支持通过 `/etc/docker/daemon.json` 设置全局默认值：\n\n```json\n{\n  \"default-pids-limit\": 200\n}\n```\n\n修改后执行 `systemctl restart docker`，之后启动的所有容器都会默认带上 `--pids-limit=200`。单个容器仍然可以在 `docker run` 时用 `--pids-limit` 覆盖这个默认值。\n\n生产环境中的合理取值需要根据业务类型来定。普通的 Web 服务（Nginx、Node.js、Go HTTP server）通常 100-200 就足够了。需要 fork 大量子进程的应用比如 Jenkins agent、PHP-FPM 可能需要 500-1000。可以先在测试环境用 `docker stats` 和 `pids.current` 观察业务正常运行时的峰值进程数，再在此基础上预留 50%-100% 的余量作为上限。\n\n### 实际演示对比\n\n没有 PID 限制时运行 fork 炸弹（千万不要在生产机器上试）：\n\n```bash\ndocker run --rm -it alpine sh -c ':(){ :|:& };:'\n# 几秒内宿主机可能完全失去响应，需要硬重启\n```\n\n设置 PID 限制后：\n\n```bash\ndocker run --rm -it --pids-limit=50 alpine sh -c ':(){ :|:& };:'\n# 容器内迅速刷屏 \"sh: can't fork\" 错误\n# 但宿主机完全正常，其他容器不受任何影响\n# Ctrl+C 或 docker stop 即可回收这个容器\n```\n\n## 三、扩展：ulimit nproc 的区别与 K8s PID Limiting\n\n面试中经常有人把 `--pids-limit` 和 `ulimit -u`（即 `nproc`）搞混，但两者的隔离层级完全不同。`ulimit -u` 是 per-UID 的限制，控制的是某个用户（按 UID 识别）在整个系统上能创建的进程总数。如果容器 A 和容器 B 都以 UID 0（root）运行，`ulimit -u 100` 意味着两个容器加起来最多 100 个进程。而 `--pids-limit` 是 per-cgroup 的限制，精确绑定在容器层面，每个容器独立拥有自己的配额，互不干扰。\n\n还有一个关键差异：`ulimit -u` 只统计进程数，不统计线程数。但 `pids.max` 统计的是进程加线程的总数——因为 Linux 内核中线程本质上是通过 `clone()` 系统调用创建的轻量级进程（LWP），在 PID 分配层面与普通进程没有区别。一个 Java 应用起 200 个线程，在 `pids.current` 中会被计为 200 多（主进程 + 线程数）。\n\n在 Kubernetes 环境中，PID 限制通过 kubelet 的 `podPidsLimit`（命令行参数 `--pod-max-pids`）来实现，从 Kubernetes 1.20 开始这个特性正式 GA：\n\n```yaml\napiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\npodPidsLimit: 200\n```\n\n这个配置为节点上每个 Pod 设置 PID 上限，底层同样是写入 cgroup 的 `pids.max`。注意 `podPidsLimit` 是 Pod 级别的限制——Pod 内如果有多个容器，它们共享这个配额。此外，kubelet 还支持通过 `--system-reserved` 中的 `pid=1000` 来为系统守护进程预留 PID 资源，防止用户 Pod 抢占完所有 PID 后影响 kubelet 自身的正常运行。\n\n面试中关于 `--pids-limit` 的高频考察角度集中在五个方面：底层机制是 cgroup pids 子系统而非 ulimit；默认值是无限制这本身就是安全风险；限制的是进程加线程总数不仅仅是进程；触发限制后 `fork()` 返回 `EAGAIN` 但已有进程不受影响；K8s 中对应的配置是 kubelet 的 `podPidsLimit`。把这些要点串联起来，配合 fork 炸弹的实际演示和 cgroup 文件的验证方法，能让面试官清楚地感受到你对容器资源隔离有真正的实战理解，而不只是背了一堆参数。",
+      "keyPoints": [
+        "`--pids-limit` 底层依赖 cgroup pids 子系统的 `pids.max` 文件，Linux 4.3 内核引入，Docker 1.11 开始支持",
+        "Docker 默认不设置 PID 限制（pids.max 为 max），任何容器都可能通过 fork 炸弹耗尽宿主机全部 PID 资源",
+        "fork 炸弹 `:(){ :|:& };:` 以指数级增长创建进程，在 pid_max=32768 的系统上 3-5 秒内可耗尽所有 PID",
+        "容器内进程数达到 pids.max 上限后，新的 fork()/clone() 返回 EAGAIN，已有进程不受影响、不会被杀死",
+        "pids.max 限制的是进程加线程总数，因为 Linux 线程本质是通过 clone() 创建的轻量级进程",
+        "dockerd 的 `default-pids-limit` 配置项可为所有新启动的容器设置全局默认 PID 上限，无需逐个指定",
+        "`--pids-limit` 是 per-cgroup（容器级）限制，而 ulimit -u（nproc）是 per-UID 限制，隔离粒度完全不同",
+        "Kubernetes 通过 kubelet 的 podPidsLimit 参数实现 Pod 级 PID 限制，1.20 版本正式 GA"
+      ],
+      "quiz": [
+        {
+          "id": "docker-resources-pids-limit-q1-quiz1",
+          "question": "`--pids-limit` 参数底层依赖的 Linux 内核机制是什么？",
+          "choices": [
+            {"id": "A", "text": "通过 ulimit 的 nproc 配置限制用户可创建的进程数"},
+            {"id": "B", "text": "通过 cgroup pids 子系统的 pids.max 文件限制 cgroup 内的进程和线程总数"},
+            {"id": "C", "text": "通过 PID namespace 隔离限制容器可见的 PID 数量范围"},
+            {"id": "D", "text": "通过修改 /proc/sys/kernel/pid_max 缩小容器可用的 PID 范围"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`--pids-limit` 的底层实现是 cgroup 的 pids 子系统（Linux 4.3 引入），Docker 将限制值写入容器对应 cgroup 路径下的 `pids.max` 文件。选项 A 的 ulimit nproc 是 per-UID 的限制，与 cgroup 层级无关；选项 C 的 PID namespace 只负责 PID 编号的隔离（容器内 PID 从 1 开始），不控制进程数量上限；选项 D 的 pid_max 是全局的 PID 号码池大小，不是针对单个容器的限制手段。cgroup pids 子系统才是真正实现 per-container 进程数量控制的内核机制。"
+        },
+        {
+          "id": "docker-resources-pids-limit-q1-quiz2",
+          "question": "Docker 默认情况下（不指定 `--pids-limit`），容器的 PID 限制是多少？",
+          "choices": [
+            {"id": "A", "text": "默认限制为 1024 个进程"},
+            {"id": "B", "text": "默认限制等于宿主机 pid_max 的一半"},
+            {"id": "C", "text": "默认无限制，pids.max 值为 max"},
+            {"id": "D", "text": "默认限制为 4096 个进程"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Docker 在默认配置下完全不设置 PID 限制，容器对应的 cgroup `pids.max` 值为「max」，意味着容器可以创建的进程数量仅受宿主机全局 `pid_max` 约束。选项 A 的 1024 和选项 D 的 4096 都是常见的误记，可能与其他资源限制的默认值混淆。选项 B 的「pid_max 的一半」也没有根据。这个默认不限制的行为是一个真实的安全隐患，因为任何一个容器内的 fork 炸弹都可能耗尽宿主机的全部 PID 资源，导致所有容器和宿主机服务瘫痪。"
+        },
+        {
+          "id": "docker-resources-pids-limit-q1-quiz3",
+          "question": "在设置了 `--pids-limit=100` 的容器中，当进程数达到上限后会发生什么？",
+          "choices": [
+            {"id": "A", "text": "新的 fork()/clone() 调用返回 EAGAIN 错误，已有进程继续正常运行"},
+            {"id": "B", "text": "内核的 OOM Killer 会杀死容器内占用资源最多的进程"},
+            {"id": "C", "text": "Docker daemon 会自动重启该容器"},
+            {"id": "D", "text": "容器被强制停止并进入 Exited 状态"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "当容器内的 `pids.current` 达到 `pids.max` 限制时，该 cgroup 内所有新的 `fork()` 和 `clone()` 系统调用会返回 `-EAGAIN`（errno 11），应用层面看到「Resource temporarily unavailable」错误。但已有的进程和线程不会被杀死，它们可以继续正常运行。选项 B 混淆了 PID 限制和内存 OOM 的行为——OOM Killer 是内存耗尽时的机制，与 PID 无关。选项 C 和 D 描述的自动重启或强制停止都不会发生，Docker 不会因为 PID 达到上限而干预容器的运行状态。"
+        },
+        {
+          "id": "docker-resources-pids-limit-q1-quiz4",
+          "question": "fork 炸弹 `:(){ :|:& };:` 在 pid_max=32768 的系统上大约多久能耗尽 PID？",
+          "choices": [
+            {"id": "A", "text": "大约 30 秒到 1 分钟"},
+            {"id": "B", "text": "大约 10-15 秒"},
+            {"id": "C", "text": "取决于 CPU 核数，通常需要几分钟"},
+            {"id": "D", "text": "大约 3-5 秒，因为进程以指数级增长"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "fork 炸弹的核心威力在于指数增长：每个进程调用自身两次并后台执行，进程数按 2 的幂次膨胀。理论上只需 15 轮递归（2^15 = 32768）就能填满所有 PID 槽位。考虑到管道创建、后台调度等系统开销，实际上大约 3-5 秒就能让 pid_max=32768 的系统完全无法 fork 新进程。选项 A 和 B 严重低估了指数增长的速度。选项 C 提到「取决于 CPU 核数」有一定道理，但 fork 本身开销极小，多核系统上增长反而更快，不会需要几分钟。"
+        },
+        {
+          "id": "docker-resources-pids-limit-q1-quiz5",
+          "question": "如何查看一个运行中容器当前的实际进程和线程总数？",
+          "choices": [
+            {"id": "A", "text": "读取容器对应 cgroup 的 pids.current 文件"},
+            {"id": "B", "text": "在容器内执行 ps aux | wc -l"},
+            {"id": "C", "text": "使用 docker inspect 查看 State.Pid 字段"},
+            {"id": "D", "text": "使用 docker top 命令统计输出行数"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "最准确的方法是读取容器对应 cgroup 路径下的 `pids.current` 文件，例如 `cat /sys/fs/cgroup/pids/docker/<id>/pids.current`。这个值由内核实时维护，包含了进程和线程的准确总数。选项 B 的 `ps aux` 只显示进程不显示线程，且 `wc -l` 还会多算一行表头，结果不准确。选项 C 的 `docker inspect State.Pid` 只返回容器主进程在宿主机上的 PID，是一个单独的数字而非进程总数。选项 D 的 `docker top` 同样只列出进程不列出线程，无法反映真实的 pids.current 值。"
+        },
+        {
+          "id": "docker-resources-pids-limit-q1-quiz6",
+          "question": "关于 `pids.max` 限制的范围，以下哪项描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "只限制通过 fork() 创建的子进程，不限制线程"},
+            {"id": "B", "text": "只限制容器内的用户态进程，不限制内核线程"},
+            {"id": "C", "text": "同时限制进程和线程，因为 Linux 线程也是通过 clone() 创建的"},
+            {"id": "D", "text": "只限制容器的主进程直接 fork 出的子进程，不限制孙进程"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "cgroup pids 子系统的 `pids.max` 限制的是该 cgroup 内所有通过 `fork()` 和 `clone()` 创建的任务（task）总数，包括进程和线程。在 Linux 内核中，线程本质上是通过 `clone()` 系统调用创建的轻量级进程（LWP），每个线程同样需要分配一个 PID（或 TID），因此会被 `pids.current` 计入。选项 A 认为不限制线程是常见误解——一个 Java 应用启动 200 个线程，pids.current 就会是 200 多。选项 B 的「不限制内核线程」不适用因为容器内通常没有内核线程。选项 D 关于「不限制孙进程」完全错误，cgroup 限制的是整个层级内的所有后代任务。"
+        },
+        {
+          "id": "docker-resources-pids-limit-q1-quiz7",
+          "question": "`--pids-limit` 和 `ulimit -u`（nproc）的本质区别是什么？",
+          "choices": [
+            {"id": "A", "text": "两者功能相同，只是配置方式不同"},
+            {"id": "B", "text": "--pids-limit 是 per-cgroup 限制绑定容器，ulimit -u 是 per-UID 限制跨容器累加"},
+            {"id": "C", "text": "--pids-limit 限制线程数，ulimit -u 限制进程数"},
+            {"id": "D", "text": "ulimit -u 是硬限制不可超越，--pids-limit 是软限制可以超出"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是面试中的经典对比考点。`--pids-limit` 基于 cgroup pids 子系统，是 per-cgroup 的限制，精确绑定到单个容器层面，每个容器有独立配额。而 `ulimit -u`（nproc）是 per-UID 的限制，按用户 ID 统计。如果容器 A 和容器 B 都以 root（UID 0）运行，nproc 限制下两个容器的进程数会合并计算，总和不能超过 nproc 值。选项 A 忽略了隔离粒度的根本差异。选项 C 把关系搞反了——实际上 pids.max 统计进程加线程，而 nproc 只统计进程不统计线程。选项 D 的「软限制」描述也不正确，pids.max 是硬限制。"
+        },
+        {
+          "id": "docker-resources-pids-limit-q1-quiz8",
+          "question": "在生产环境中，如何为 Docker daemon 启动的所有容器设置默认 PID 限制？",
+          "choices": [
+            {"id": "A", "text": "修改 /etc/security/limits.conf 中的 nproc 值"},
+            {"id": "B", "text": "设置环境变量 DOCKER_PIDS_LIMIT=200"},
+            {"id": "C", "text": "修改 /proc/sys/kernel/pid_max 缩小全局 PID 范围"},
+            {"id": "D", "text": "在 /etc/docker/daemon.json 中配置 default-pids-limit 字段"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Docker daemon 支持在 `/etc/docker/daemon.json` 配置文件中设置 `\"default-pids-limit\": 200`，修改后重启 dockerd 即可生效。之后启动的所有容器会默认带上这个 PID 限制，单个容器仍可通过 `--pids-limit` 参数覆盖。选项 A 的 `limits.conf` 配置的是 PAM 层面的 ulimit，与 cgroup 无关，且跨容器按 UID 累加。选项 B 的环境变量 `DOCKER_PIDS_LIMIT` 并不存在，Docker 没有这个环境变量。选项 C 修改 `pid_max` 是调整全局 PID 号码池大小，不是针对容器的限制手段，缩小它会影响宿主机上的所有进程。"
+        },
+        {
+          "id": "docker-resources-pids-limit-q1-quiz9",
+          "question": "在 Kubernetes 中，如何实现类似 `--pids-limit` 的 Pod 级 PID 限制？",
+          "choices": [
+            {"id": "A", "text": "在 Pod spec 的 resources.limits 中设置 pids 字段"},
+            {"id": "B", "text": "通过 LimitRange 对象设置命名空间级别的 PID 限制"},
+            {"id": "C", "text": "通过 kubelet 的 podPidsLimit 配置参数设置节点级默认值"},
+            {"id": "D", "text": "在容器的 securityContext 中配置 pidsLimit 字段"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Kubernetes 的 PID 限制通过 kubelet 配置实现，具体参数是 `podPidsLimit`（命令行形式为 `--pod-max-pids`），从 Kubernetes 1.20 开始正式 GA。这是一个节点级别的配置，为该节点上所有 Pod 设置统一的 PID 上限。选项 A 描述的 `resources.limits` 目前只支持 cpu、memory 和 hugepages，不支持 pids 字段。选项 B 的 LimitRange 同样只能限制 cpu 和 memory 等标准计算资源。选项 D 的 securityContext 负责安全相关配置如 runAsUser、capabilities 等，没有 pidsLimit 字段。PID 限制在 K8s 中是 kubelet 级别的配置，不支持在 Pod spec 中逐个指定。"
+        },
+        {
+          "id": "docker-resources-pids-limit-q1-quiz10",
+          "question": "以下哪种场景最需要将 `--pids-limit` 设置为较高的值（如 1000 以上）？",
+          "choices": [
+            {"id": "A", "text": "运行 Jenkins agent 容器，需要 fork 大量子进程执行构建任务"},
+            {"id": "B", "text": "运行 Redis 单实例缓存服务"},
+            {"id": "C", "text": "运行静态文件 Nginx 服务器"},
+            {"id": "D", "text": "运行单进程的 Go HTTP 微服务"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Jenkins agent 在执行构建任务时需要频繁 fork 子进程来运行 shell 命令、编译代码、执行测试脚本等，同时可能并行处理多个构建任务，峰值进程数很容易超过几百甚至上千。选项 B 的 Redis 是典型的单进程架构（可能有少量后台线程用于持久化），通常 50 以内就足够。选项 C 的 Nginx 静态文件服务器，进程数等于 worker 数加上 master，一般不超过 CPU 核数的两倍。选项 D 的 Go HTTP 服务虽然会创建大量 goroutine，但 goroutine 不是系统级线程，不计入 pids.current——Go runtime 通常只使用少量 OS 线程（默认等于 GOMAXPROCS）。"
+        }
+      ],
+      "references": [
+        "https://docs.docker.com/engine/containers/resource_constraints/",
+        "https://man7.org/linux/man-pages/man7/cgroups.7.html",
+        "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#pid"
+      ]
+    }
+  ]
+}

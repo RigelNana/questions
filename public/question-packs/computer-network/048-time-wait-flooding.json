@@ -1,0 +1,156 @@
+{
+  "id": "computer-network-048",
+  "name": "TIME_WAIT 堆积排查",
+  "domain": "computer-network",
+  "description": "大量 TIME_WAIT 连接的成因、排查思路与解决方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "computer-network-048-q1",
+      "domain": "computer-network",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["TCP", "TIME_WAIT", "端口耗尽", "高并发"],
+      "title": "大量 TIME_WAIT 连接的原因与解决方案",
+      "content": "你所在团队维护一套微服务架构的电商后端，核心服务用 Go 编写，部署在 4 台 8C16G 的 Linux 机器上。大促前一天的压测中，QPS 从日常的 3000 推到 12000 后，服务开始大量报错，日志里刷满了这样的信息：\n\n```\n2024-06-17 14:23:05 ERROR dial tcp 10.0.3.12:3306: connect: cannot assign requested address\n2024-06-17 14:23:05 ERROR dial tcp 10.0.3.15:6379: connect: cannot assign requested address\n2024-06-17 14:23:06 ERROR Post \"http://10.0.3.20:8080/api/inventory\": dial tcp: cannot assign requested address\n```\n\n运维同事登录其中一台机器，执行 `ss -s` 查看连接统计：\n\n```\nTotal: 68542\nTCP:   67816 (estab 1205, closed 2, orphaned 12, timewait 63012)\nTransport    Total     IP        IPv6\nRAW          0         0         0\nUDP          6         4         2\nTCP          4206      4206      0\nINET         4212      4210      2\nFRAG         0         0         0\n```\n\n63012 个 TIME_WAIT 连接！再看 `dmesg` 输出：\n\n```\n[482916.234] TCP: request_sock_TCP: Possible SYN flooding on port 8080. Sending cookies.\n[482918.891] net_ratelimit: 127 callbacks suppressed\n[482918.891] TCP: out of memory -- consider tuning tcp_mem\n```\n\n你执行 `sysctl net.ipv4.ip_local_port_range` 查看端口范围：\n\n```\nnet.ipv4.ip_local_port_range = 32768    60999\n```\n\n也就是说临时端口只有 60999 - 32768 = 28231 个，但 TIME_WAIT 已经占了 63012 个（同一个目标 IP:port 组合的连接共享端口池，多个目标累计超出）。端口池被耗尽，新连接根本分配不到临时端口，所有出站请求全部失败。\n\n这个问题的根因是什么？从应用层、内核层、架构层分别有哪些解决方案？在调整内核参数时有哪些容易踩的坑？",
+      "answer": "## 第一步：TCP TIME_WAIT 状态基础详解\n\n### TCP 连接的四次挥手与 TIME_WAIT 的来历\n\n要理解这个问题，先得弄清楚 TIME_WAIT 到底是什么。TCP 是面向连接的传输协议，建立连接靠三次握手，断开连接靠四次挥手（Four-Way Handshake）。四次挥手的流程是这样的：主动关闭方（假设是客户端）先发 FIN 报文告诉对方「我这边数据发完了」，服务端收到后回 ACK 表示「我知道了」，然后服务端把自己没发完的数据发完，再发一个 FIN 告诉客户端「我这边也发完了」，客户端收到后回最后一个 ACK。这个最后的 ACK 发出去之后，客户端并不会立刻释放连接，而是进入一个叫做 TIME_WAIT 的状态，默认等待 2 倍的 MSL（Maximum Segment Lifetime，报文最大生存时间）。在 Linux 内核中，MSL 被硬编码为 60 秒（定义在 `include/net/tcp.h` 中的 `TCP_TIMEWAIT_LEN` 宏，值为 60 * HZ），所以 TIME_WAIT 的持续时间固定为 60 秒。\n\n这里有个关键点：**TIME_WAIT 只出现在主动关闭连接的那一方**。如果你的服务主动调用 `close()` 断开连接，那 TIME_WAIT 就在你这边；如果是对端先关闭，TIME_WAIT 在对端。\n\n### TIME_WAIT 为什么必须存在\n\nTIME_WAIT 不是 bug，它有两个严肃的工程目的。第一，确保最后一个 ACK 能到达对端。如果客户端发完最后的 ACK 后立刻销毁连接，万一这个 ACK 在网络中丢了，服务端收不到 ACK 会重传 FIN，但客户端已经没有这个连接的状态了，只能回 RST，导致服务端异常关闭。等 2MSL 就是给这个重传留出时间窗口。第二，防止「迷途报文」（Wandering Duplicate）污染新连接。TCP 连接由四元组（源 IP、源端口、目标 IP、目标端口）唯一标识。如果旧连接关闭后立即用相同的四元组建新连接，而旧连接中某个延迟到达的数据包恰好序列号合法，就会被新连接错误接收。2MSL 的等待确保旧连接的所有报文在网络中彻底消亡。\n\n### 为什么高并发短连接场景容易堆积\n\n理解了以上机制，问题就很清楚了。每个被主动关闭的 TCP 连接都要在 TIME_WAIT 状态停留 60 秒。如果你的服务每秒创建 1000 个短连接（Short-Lived Connection），每个连接只用来发一个请求然后关闭，那 60 秒内就会积累 60000 个 TIME_WAIT 连接。这就是题目中看到的现象——QPS 推到 12000 后，服务到 MySQL、Redis、下游 HTTP 服务的连接全部是短连接，每个请求完成后立刻关闭，于是 TIME_WAIT 疯狂堆积，直到把 28231 个临时端口全部占满。\n\n## 第二步：核心问题深度解答——原因分析与解决方案\n\n### 根因拆解：短连接 + 高 QPS + 主动关闭 = TIME_WAIT 爆炸\n\n题目中的服务之所以出问题，是三个因素叠加的结果。第一，服务到 MySQL、Redis、下游服务全部使用短连接——每次请求新建 TCP 连接，用完就关。第二，QPS 从 3000 推到 12000，连接创建速率翻了 4 倍。第三，Go 的 `net/http` 客户端默认行为是在请求完成后主动关闭连接（如果没有正确配置连接复用），TIME_WAIT 落在客户端这边。三者叠加的结果就是每秒产生上万个 TIME_WAIT，60 秒后端口池被吃光。\n\n用数学估算：假设服务到 MySQL 每秒 4000 个短连接，到 Redis 每秒 5000 个，到下游 HTTP 每秒 3000 个，总计每秒 12000 个短连接。60 秒积累 720000 个 TIME_WAIT——虽然实际中同一四元组的连接可以复用 TIME_WAIT 的端口（取决于内核版本和配置），但 28231 个端口面对这个量级完全不够用。\n\n### 应用层解决方案——治本之策\n\n**最根本的解决方案是消除短连接**。在应用层做到连接复用，TIME_WAIT 的产生速率会断崖式下降。\n\n对于数据库连接，必须使用连接池（Connection Pool）。Go 的 `database/sql` 包本身就内置了连接池，但需要正确配置：\n\n```go\ndb, _ := sql.Open(\"mysql\", dsn)\ndb.SetMaxOpenConns(100)        // 最大打开连接数\ndb.SetMaxIdleConns(20)         // 最大空闲连接数\ndb.SetConnMaxLifetime(5 * time.Minute) // 连接最大存活时间\ndb.SetConnMaxIdleTime(3 * time.Minute) // 空闲连接最大存活时间\n```\n\n很多人踩的坑是 `MaxIdleConns` 设得太小甚至为 0。如果空闲连接数为 0，每次请求完连接就被关闭，等于退化成了短连接模式。生产环境中 `MaxIdleConns` 建议设为 `MaxOpenConns` 的 20%-50%。\n\n对于 Redis 连接，Go 常用的 `go-redis` 库默认就有连接池，但同样需要关注配置：\n\n```go\nrdb := redis.NewClient(&redis.Options{\n    PoolSize:     100,   // 连接池大小\n    MinIdleConns: 10,    // 最小空闲连接\n    PoolTimeout:  30 * time.Second,\n})\n```\n\n对于下游 HTTP 服务的调用，Go 的 `net/http` 默认是支持 Keep-Alive 连接复用的，但有两个常见的陷阱会导致连接无法复用。第一个是 Response Body 没有读完就关闭——HTTP/1.1 的 Keep-Alive 要求客户端必须把 Response Body 完整读完，否则连接无法回到连接池：\n\n```go\n// 错误写法：没有读完 body\nresp, _ := http.Get(url)\ndefer resp.Body.Close()\nif resp.StatusCode != 200 {\n    return // body 没读完，连接不会被复用\n}\n\n// 正确写法：确保 body 被完整读取\nresp, _ := http.Get(url)\ndefer resp.Body.Close()\nio.Copy(io.Discard, resp.Body) // 丢弃但读完 body\n```\n\n第二个陷阱是每次请求都创建新的 `http.Client`。`http.Client` 底层的 `http.Transport` 维护着连接池，如果每次请求 new 一个 Client，等于每次都用新的连接池，旧 Client 的连接得不到复用最终被关闭，产生 TIME_WAIT。正确做法是全局复用同一个 `http.Client`。\n\n### 内核层解决方案——应急手段\n\n应用层改造需要时间，大促在即时来不及改代码的情况下，可以通过内核参数临时缓解。\n\n**第一个参数：`net.ipv4.tcp_tw_reuse`**。设为 1 后，内核允许在建立新的出站连接时复用处于 TIME_WAIT 状态的端口，前提是新连接的时间戳严格大于旧连接的最后时间戳（依赖 TCP Timestamps 扩展）。这个参数只影响出站连接（connect 调用），不影响入站连接（accept 调用），风险相对可控：\n\n```bash\nsysctl -w net.ipv4.tcp_tw_reuse=1\n# Linux 4.6+ 还可以设为 2，表示对 loopback 和非 loopback 都生效\nsysctl -w net.ipv4.tcp_tw_reuse=2\n```\n\n**第二个参数：`net.ipv4.ip_local_port_range`**。默认的 32768-60999 只有约 28000 个端口，可以扩大到 1024-65535，理论上有 64511 个端口可用：\n\n```bash\nsysctl -w net.ipv4.ip_local_port_range=\"1024 65535\"\n```\n\n需要注意的是，扩大端口范围要避开应用程序显式绑定的端口。如果你的服务监听 8080，MySQL 监听 3306，Redis 监听 6379，这些端口会被自动排除不会被分配为临时端口，但如果有些中间件监听的端口在 1024-32767 范围内，就要小心冲突。\n\n**第三个参数：`net.ipv4.tcp_max_tw_buckets`**。这个参数限制系统中 TIME_WAIT 连接的最大数量，超过后内核会直接销毁多余的 TIME_WAIT 连接并打印警告日志。默认值在大多数发行版上是 262144，可以根据实际情况调整。但这是一个粗暴的手段——被强制销毁的 TIME_WAIT 无法保证 2MSL 的安全等待，理论上有迷途报文风险：\n\n```bash\n# 查看当前值\nsysctl net.ipv4.tcp_max_tw_buckets\n# 如果想限制在 20000 以内\nsysctl -w net.ipv4.tcp_max_tw_buckets=20000\n```\n\n### 架构层解决方案——长治久安\n\n如果服务架构中有反向代理层（比如 Nginx），可以在 Nginx 到后端之间开启 upstream keepalive，让 Nginx 和后端之间维持长连接池，避免每个请求都新建连接：\n\n```nginx\nupstream backend {\n    server 10.0.3.20:8080;\n    keepalive 64;           # 保持 64 个空闲长连接\n    keepalive_timeout 60s;  # 空闲连接超时时间\n    keepalive_requests 1000; # 单个连接最大请求数\n}\n\nserver {\n    location /api/ {\n        proxy_pass http://backend;\n        proxy_http_version 1.1;          # 必须用 HTTP/1.1\n        proxy_set_header Connection \"\"; # 清除 Connection: close\n    }\n}\n```\n\n这里有个关键细节：`proxy_http_version 1.1` 和 `proxy_set_header Connection \"\"` 缺一不可。HTTP/1.0 默认不支持 Keep-Alive，而 Nginx 到 upstream 默认用 HTTP/1.0，不加这两行配置 keepalive 形同虚设。\n\n另一个架构层方案是引入服务网格（Service Mesh）如 Istio 的 Envoy sidecar。Envoy 代理会自动维护到上游服务的连接池，应用代码完全不用关心连接管理。\n\n## 第三步：体系化扩展延伸\n\n### tcp_tw_recycle 的陷阱——为什么 Linux 4.12 彻底移除了它\n\n你可能在老文章里看到过 `net.ipv4.tcp_tw_recycle` 这个参数，它能把 TIME_WAIT 的回收时间从 60 秒缩短到一个 RTO（Retransmission Timeout，通常几百毫秒）。听起来很美好，但这个参数在 NAT 环境下有致命缺陷。tcp_tw_recycle 依赖 TCP Timestamps 来判断连接的新旧，但在 NAT 网关后面，多个客户端共享同一个出口 IP，它们的时间戳可能不同步。如果 Client A 时间戳是 1000、Client B 时间戳是 800，服务端在收到 Client A 的连接后记录了时间戳 1000，然后 Client B 的 SYN（时间戳 800）到达时会被内核判定为「过期报文」直接丢弃，导致 Client B 连接失败。这个问题在公有云和移动网络环境下非常普遍，因此 Linux 内核在 4.12 版本（2017 年 7 月发布）通过 commit `95a22ca` 彻底移除了 tcp_tw_recycle 参数。如果你在面试中提到这个参数，一定要同时说明它已经被移除以及被移除的原因，否则面试官会认为你的知识停留在老版本。\n\n### SO_LINGER 强制 RST 的风险\n\n有些开发者为了「快速释放连接」，会设置 socket 选项 `SO_LINGER` 的 `l_onoff=1, l_linger=0`，这会让 `close()` 调用直接发送 RST 而不是正常的 FIN，从而跳过 TIME_WAIT。这确实能解决 TIME_WAIT 堆积，但代价是对端会收到连接重置错误（Connection Reset），如果对端还有数据没读完就会丢数据。更严重的是，RST 报文不走正常的四次挥手流程，如果对端正在发送数据，这些数据会被静默丢弃。在金融、支付等对数据完整性要求高的场景下，这种做法是不可接受的。生产环境中只有在确认不需要可靠关闭（比如健康检查探测连接）时才可以考虑。\n\n### 监控 TIME_WAIT 的 Prometheus 指标\n\n线上服务应该对 TIME_WAIT 数量做持续监控。最常用的方式是通过 node_exporter 暴露的 `node_sockstat_TCP_tw` 指标，它直接读取 `/proc/net/sockstat` 中的 TIME_WAIT 计数。在 Prometheus 中配置告警规则：\n\n```yaml\ngroups:\n  - name: tcp_alerts\n    rules:\n      - alert: HighTimeWaitConnections\n        expr: node_sockstat_TCP_tw > 20000\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"TIME_WAIT 连接数超过 20000\"\n          description: \"实例 {{ $labels.instance }} 的 TIME_WAIT 连接数为 {{ $value }}，持续 5 分钟以上，请排查是否存在短连接泄漏。\"\n```\n\n除了绝对值告警，还应该关注增长速率。`rate(node_sockstat_TCP_tw[5m])` 如果持续为正且斜率陡峭，说明有新的短连接源在不断产生 TIME_WAIT。配合 `ss -tnp state time-wait | awk '{print $4}' | sort | uniq -c | sort -rn | head` 可以快速定位是哪个目标 IP:port 贡献了最多的 TIME_WAIT 连接，从而反推出是哪个服务的连接池没有配置好。\n\n### 面试考点总结\n\n关于 TIME_WAIT 的面试题通常从三个层次考察。第一层是基础认知：能说出 TIME_WAIT 出现在主动关闭方、持续 2MSL（Linux 下 60 秒）、以及它存在的两个目的（保证最后 ACK 到达和防止迷途报文）。第二层是实战排查：能说出 `ss -s` 查看总量、`ss -tnp state time-wait` 按目标分组统计、以及 `ip_local_port_range` 与 TIME_WAIT 数量的关系。第三层是解决方案的层次感：面试官最希望听到的回答是先说应用层（连接池、Keep-Alive），再说内核层（tcp_tw_reuse、扩大端口范围），最后说架构层（Nginx upstream keepalive、服务网格），并且能指出 tcp_tw_recycle 已被移除和 SO_LINGER 的风险。如果你能自然地从现象描述过渡到根因分析，再到分层次的解决方案，面试官基本会认为你有扎实的网络排障经验。",
+      "keyPoints": [
+        "TIME_WAIT 只出现在主动关闭连接的一方，持续时间为 2MSL，Linux 内核硬编码为 60 秒（TCP_TIMEWAIT_LEN = 60*HZ），不可通过用户态参数修改",
+        "TIME_WAIT 存在的两个目的：确保四次挥手最后一个 ACK 能到达对端（丢失后对端会重传 FIN），以及防止旧连接的迷途报文被同四元组的新连接错误接收",
+        "高并发短连接场景下 TIME_WAIT 堆积的根因公式：每秒短连接数 × 60 秒 = 稳态 TIME_WAIT 总量，当总量超过 ip_local_port_range 定义的端口数就会报 cannot assign requested address",
+        "应用层解决方案是治本之策：数据库使用连接池并合理配置 MaxIdleConns，HTTP 客户端全局复用 http.Client 并确保 Response Body 读完，Redis 使用带连接池的客户端库",
+        "net.ipv4.tcp_tw_reuse=1 允许出站连接复用 TIME_WAIT 端口（依赖 TCP Timestamps），是内核层最安全的应急参数；ip_local_port_range 可扩大到 1024-65535 增加可用端口",
+        "tcp_tw_recycle 在 NAT 环境下会导致时间戳不同步的客户端连接被静默丢弃，Linux 4.12 已彻底移除该参数",
+        "Nginx upstream keepalive 配置必须同时设置 proxy_http_version 1.1 和 proxy_set_header Connection \"\"，否则 Nginx 默认以 HTTP/1.0 连接后端，keepalive 不生效",
+        "通过 node_exporter 的 node_sockstat_TCP_tw 指标监控 TIME_WAIT 数量，配合 ss -tnp state time-wait 按目标 IP:port 分组统计可快速定位短连接泄漏源"
+      ],
+      "quiz": [
+        {
+          "id": "computer-network-048-q1-quiz1",
+          "question": "在 TCP 四次挥手过程中，TIME_WAIT 状态出现在哪一方？",
+          "choices": [
+            { "id": "A", "text": "主动关闭连接的一方，即先发送 FIN 报文的那一端" },
+            { "id": "B", "text": "被动关闭连接的一方，即后发送 FIN 报文的那一端" },
+            { "id": "C", "text": "通信双方都会同时进入 TIME_WAIT 状态" },
+            { "id": "D", "text": "取决于哪一方先完成数据发送，与 FIN 发送顺序无关" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "TIME_WAIT 严格出现在主动关闭连接的那一方。在四次挥手中，主动关闭方先发 FIN，收到对端的 FIN 和 ACK 后进入 TIME_WAIT，等待 2MSL 后才真正释放连接。B 选项描述的被动关闭方在发完 FIN 后进入的是 LAST_ACK 状态，收到 ACK 后直接进入 CLOSED。C 选项只有在双方同时发 FIN（simultaneous close）这种极少见的情况下才成立，正常情况不会双方都进入。D 选项混淆了数据发送完成和连接关闭的概念，TIME_WAIT 取决于谁先调用 close() 发起关闭。"
+        },
+        {
+          "id": "computer-network-048-q1-quiz2",
+          "question": "Linux 系统中 TIME_WAIT 状态的持续时间是多少？这个值由什么决定？",
+          "choices": [
+            { "id": "A", "text": "固定 60 秒，由内核源码中的 TCP_TIMEWAIT_LEN 宏硬编码，用户态无法通过 sysctl 修改" },
+            { "id": "B", "text": "默认 120 秒（2 × MSL，MSL=60 秒），可通过 sysctl net.ipv4.tcp_fin_timeout 调整" },
+            { "id": "C", "text": "默认 30 秒，可通过 sysctl net.ipv4.tcp_tw_timeout 参数调整" },
+            { "id": "D", "text": "动态计算，取决于当前网络的 RTT 值，网络越好 TIME_WAIT 越短" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Linux 内核将 TIME_WAIT 时长硬编码为 60 秒（TCP_TIMEWAIT_LEN = 60 * HZ，定义在 include/net/tcp.h 中），这个值无法通过任何 sysctl 参数修改。B 选项的错误非常经典——tcp_fin_timeout 控制的是 FIN_WAIT_2 状态的超时时间，不是 TIME_WAIT 的时间，很多人把这两者搞混。C 选项的 tcp_tw_timeout 参数根本不存在，是杜撰的。D 选项的说法对于 RTO（重传超时）成立，但 TIME_WAIT 是固定值不随 RTT 变化。"
+        },
+        {
+          "id": "computer-network-048-q1-quiz3",
+          "question": "TIME_WAIT 状态存在的核心目的是什么？",
+          "choices": [
+            { "id": "A", "text": "让操作系统有时间回收 socket 占用的内核内存和文件描述符" },
+            { "id": "B", "text": "确保最后一个 ACK 能到达对端（防止对端 FIN 重传无人应答），以及防止旧连接的迷途报文污染同四元组的新连接" },
+            { "id": "C", "text": "等待对端确认所有数据已经被应用层成功处理，类似于应用层的 ACK" },
+            { "id": "D", "text": "为 TCP 拥塞控制算法提供冷却窗口，防止关闭后立即建新连接导致网络拥塞" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "TIME_WAIT 有两个明确的协议级目的。第一，如果主动关闭方发出的最后一个 ACK 在网络中丢失，被动关闭方会重传 FIN。如果主动方此时已经销毁连接状态，就只能回 RST，导致对端异常。TIME_WAIT 期间主动方可以重新回复 ACK。第二，2MSL 的等待确保旧连接的所有残留报文在网络中彻底消亡，避免被同四元组的新连接误收。A 选项错误，TIME_WAIT 状态的 socket 内存开销极小（约 168 字节），不是为了回收资源。C 选项混淆了传输层和应用层的职责。D 选项纯属杜撰，TCP 拥塞控制与连接关闭无关。"
+        },
+        {
+          "id": "computer-network-048-q1-quiz4",
+          "question": "内核参数 net.ipv4.tcp_tw_reuse 设为 1 后的行为是什么？",
+          "choices": [
+            { "id": "A", "text": "允许处于 TIME_WAIT 的端口被入站和出站连接同时复用" },
+            { "id": "B", "text": "将 TIME_WAIT 的持续时间从 60 秒缩短到 1 秒以快速回收端口" },
+            { "id": "C", "text": "允许出站连接（connect 调用）复用 TIME_WAIT 端口，前提是新连接的 TCP 时间戳大于旧连接的最后时间戳" },
+            { "id": "D", "text": "直接跳过 TIME_WAIT 状态，close 后立即进入 CLOSED" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "tcp_tw_reuse=1 仅对出站连接生效，即客户端调用 connect() 建立新连接时，内核允许复用处于 TIME_WAIT 的本地端口，条件是新连接的 TCP Timestamps 严格大于旧连接的最后时间戳——这保证了不会出现迷途报文被误收的情况。A 选项错误，tcp_tw_reuse 不影响入站连接（accept 调用），服务端的 TIME_WAIT 端口不会被 reuse。B 选项混淆了端口复用和缩短等待时间的概念，TIME_WAIT 的 60 秒计时器仍然在走，只是端口可以被新连接借用。D 选项描述的是 SO_LINGER 设置 linger=0 的行为，会发 RST 跳过正常挥手，与 tcp_tw_reuse 完全不同。"
+        },
+        {
+          "id": "computer-network-048-q1-quiz5",
+          "question": "在一台 Linux 服务器上执行 ss -s，输出中显示 timewait 45000。同时 sysctl 查到 ip_local_port_range = 32768 60999。以下判断哪个正确？",
+          "choices": [
+            { "id": "A", "text": "临时端口池有 28231 个端口，TIME_WAIT 45000 已超过端口总数，所有出站连接一定失败" },
+            { "id": "B", "text": "45000 个 TIME_WAIT 分布在多个目标 IP:port 组合上，每个组合有独立的端口空间，不一定会耗尽" },
+            { "id": "C", "text": "TIME_WAIT 不占用临时端口，45000 个连接不会影响新连接建立" },
+            { "id": "D", "text": "需要立即将 tcp_max_tw_buckets 设为 0 来清除所有 TIME_WAIT" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "TCP 连接由四元组（源 IP、源端口、目标 IP、目标端口）唯一标识。内核分配临时端口时，是在特定的（源 IP、目标 IP、目标端口）组合下选择未被占用的源端口。如果这 45000 个 TIME_WAIT 连接分布在 3 个不同的目标（MySQL、Redis、HTTP 服务），每个目标各占约 15000 个端口，每个组合都没超过 28231，那就不会耗尽。A 选项的逻辑过于简化，没有考虑多目标分散的情况。C 选项完全错误，TIME_WAIT 确实占用四元组中的临时端口。D 选项极端危险，tcp_max_tw_buckets=0 会让内核立即销毁所有 TIME_WAIT，破坏 TCP 的可靠关闭机制。"
+        },
+        {
+          "id": "computer-network-048-q1-quiz6",
+          "question": "以下关于 tcp_tw_recycle 参数的说法，哪个是正确的？",
+          "choices": [
+            { "id": "A", "text": "这是目前解决 TIME_WAIT 堆积最推荐的内核参数，设为 1 即可安全使用" },
+            { "id": "B", "text": "该参数已在 Linux 4.12 内核中被彻底移除，因为在 NAT 环境下会导致来自同一出口 IP 但时间戳较小的客户端连接被静默丢弃" },
+            { "id": "C", "text": "该参数只影响 IPv6 连接，对 IPv4 连接无效" },
+            { "id": "D", "text": "该参数功能与 tcp_tw_reuse 完全相同，只是命名不同" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "tcp_tw_recycle 在 Linux 4.12（2017 年 7 月，commit 95a22ca）中被彻底移除。它的问题出在 NAT 场景下：tcp_tw_recycle 开启后，内核会记录每个 IP 最后一次连接的 TCP 时间戳。在 NAT 网关后面，多个客户端共享同一个出口 IP 但时间戳不同步，时间戳较小的客户端发来的 SYN 会被内核判定为过期报文而静默丢弃，导致连接超时。A 选项完全错误，这个参数早已不可用。C 选项无中生有，该参数在移除前对 IPv4 生效。D 选项混淆了两个不同的机制——tw_reuse 是允许新连接复用旧端口，tw_recycle 是加速回收 TIME_WAIT 缩短等待时间。"
+        },
+        {
+          "id": "computer-network-048-q1-quiz7",
+          "question": "使用 SO_LINGER 选项设置 l_onoff=1, l_linger=0 来关闭连接，与正常的四次挥手关闭相比，最关键的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "两者行为完全相同，SO_LINGER 只是提供了超时控制" },
+            { "id": "B", "text": "close() 会直接发送 RST 而非 FIN，跳过四次挥手和 TIME_WAIT，但对端会收到连接重置错误且未读数据丢失" },
+            { "id": "C", "text": "close() 会阻塞等待对端确认所有数据接收完毕后再关闭" },
+            { "id": "D", "text": "连接进入 TIME_WAIT 但持续时间缩短为 l_linger 指定的秒数" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 SO_LINGER 设置 l_onoff=1 且 l_linger=0 时，调用 close() 不会走正常的 FIN → ACK → FIN → ACK 四次挥手流程，而是直接发送 RST 报文强制重置连接。这意味着：第一，不会产生 TIME_WAIT 状态（RST 不需要等待）；第二，对端会收到 ECONNRESET 错误；第三，对端发送缓冲区中尚未读取的数据会被丢弃。A 选项错误，行为有本质区别。C 选项描述的是 l_onoff=1 且 l_linger>0 时 close() 的行为（阻塞等待数据发完或超时）。D 选项混淆了 linger 超时和 TIME_WAIT 时长的概念。"
+        },
+        {
+          "id": "computer-network-048-q1-quiz8",
+          "question": "团队的 Go 服务使用 net/http 调用下游 API，发现即使设置了 Transport.MaxIdleConnsPerHost，TIME_WAIT 仍然大量产生。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Go 的 net/http 不支持 HTTP Keep-Alive，每次请求必定新建连接" },
+            { "id": "B", "text": "Response Body 没有被完整读取就关闭了，导致连接无法回到空闲连接池被迫关闭" },
+            { "id": "C", "text": "MaxIdleConnsPerHost 的值设置得太大，超出了操作系统的限制" },
+            { "id": "D", "text": "下游服务使用了 HTTP/2 协议，与 Keep-Alive 不兼容" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Go HTTP 客户端最常见的连接泄漏陷阱。HTTP/1.1 的 Keep-Alive 复用机制要求客户端必须把 Response Body 完整读取到 EOF，底层的 TCP 连接才能被标记为「空闲」并回到连接池。如果代码在判断 StatusCode 不符合预期后直接 return，没有读完 body（即使 body 内容不需要），连接就无法复用，客户端会关闭它从而产生 TIME_WAIT。正确做法是在 defer resp.Body.Close() 之后加一行 io.Copy(io.Discard, resp.Body) 确保 body 被排空。A 选项错误，Go net/http 默认支持 Keep-Alive。C 选项因果倒置。D 选项无中生有，HTTP/2 的多路复用比 Keep-Alive 更高效。"
+        },
+        {
+          "id": "computer-network-048-q1-quiz9",
+          "question": "在 Nginx 反向代理配置中，添加了 upstream keepalive 64 但 TIME_WAIT 没有减少。以下哪个配置遗漏最可能导致 keepalive 不生效？",
+          "choices": [
+            { "id": "A", "text": "缺少 proxy_http_version 1.1 和 proxy_set_header Connection \"\" 配置" },
+            { "id": "B", "text": "没有在 upstream 块中配置 least_conn 负载均衡策略" },
+            { "id": "C", "text": "Nginx worker_connections 设置得太小" },
+            { "id": "D", "text": "没有启用 Nginx 的 TCP fastopen 功能" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Nginx 到 upstream 后端默认使用 HTTP/1.0 协议，而 HTTP/1.0 默认不支持持久连接。即使配置了 keepalive 64，如果不加 proxy_http_version 1.1 将协议版本升级到 1.1，每个请求完成后连接仍会被关闭。同时还需要 proxy_set_header Connection \"\" 来清除客户端可能传递的 Connection: close 头——如果这个头被透传到后端，后端也会在回复后关闭连接。这两个配置缺一不可，是 Nginx keepalive 不生效的最常见原因。B 选项的负载均衡策略与 keepalive 是否生效无关。C 选项影响的是总并发连接数。D 选项的 TCP Fast Open 是建连优化，与连接复用无关。"
+        },
+        {
+          "id": "computer-network-048-q1-quiz10",
+          "question": "线上服务需要监控 TIME_WAIT 连接数并设置告警。以下哪种方式能最准确地获取当前 TIME_WAIT 数量？",
+          "choices": [
+            { "id": "A", "text": "使用 netstat -an | grep TIME_WAIT | wc -l 逐行计数" },
+            { "id": "B", "text": "读取 /proc/net/sockstat 中的 tw 字段或使用 ss -s 查看 timewait 统计值" },
+            { "id": "C", "text": "通过 /proc/net/tcp 文件逐行遍历所有 TCP 连接并过滤状态码" },
+            { "id": "D", "text": "使用 lsof -i -sTCP:TIME_WAIT 查看所有处于 TIME_WAIT 的 socket" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "读取 /proc/net/sockstat 或使用 ss -s 是获取 TIME_WAIT 数量最高效也最准确的方式。/proc/net/sockstat 中有一行 TCP: inuse X orphan Y tw Z alloc W mem M，其中 tw 字段直接由内核维护，O(1) 读取，零遍历开销。node_exporter 的 node_sockstat_TCP_tw 指标就是读的这个文件。A 选项的 netstat 需要遍历所有连接做文本匹配，在连接数多时非常慢，而且 netstat 属于已废弃的 net-tools 套件。C 选项读 /proc/net/tcp 能获得数据但效率极低，因为 TIME_WAIT 的 socket 是独立管理的（在 tw_hash 表中），不一定全部出现在 /proc/net/tcp 中。D 选项的 lsof 开销巨大且不适合监控场景。"
+        }
+      ],
+      "references": [
+        "https://vincent.bernat.ch/en/blog/2014-tcp-time-wait-state-linux",
+        "https://man7.org/linux/man-pages/man7/tcp.7.html",
+        "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=95a22caee396cef0bb2ca8fafdd2b73bbb43b2"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,155 @@
+{
+  "id": "docker-internals-net-ns",
+  "name": "Network Namespace 网络隔离",
+  "domain": "docker",
+  "description": "深入讲解 Network Namespace 隔离完整网络栈及 veth pair 连接容器与宿主机的机制",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-internals-net-ns-q1",
+      "domain": "docker",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["docker", "network namespace", "namespace", "veth pair", "网络隔离", "CLONE_NEWNET", "docker0", "iptables", "CNI"],
+      "title": "Network Namespace 是怎么实现网络栈完全隔离的？",
+      "content": "面试官问「Network Namespace 是怎么实现网络栈完全隔离的」，大部分候选人会说「每个容器有自己的 IP 和端口」。方向对了，但停在这个层面远远不够——面试官紧接着会追问：Network Namespace 到底隔离了哪些东西？容器内的路由表和宿主机的路由表是同一份吗？两个容器都监听 80 端口为什么不冲突？创建一个新的 Network Namespace 后里面是什么状态？容器的 eth0 是怎么跟宿主机连起来的？\n\nNetwork Namespace 是 Linux 内核提供的六种 Namespace 隔离机制之一（另外五种是 PID、Mount、UTS、IPC、User），也是 Docker 容器网络的基石。理解它不只是理解一个 Linux 特性，而是理解整个容器网络模型的底层支撑。先看一台宿主机上运行两个容器时的实际网络状态：\n\n```bash\n# 查看两个容器进程的 net namespace inode\n$ readlink /proc/$(docker inspect -f '{{.State.Pid}}' nginx1)/ns/net\nnet:[4026532465]\n\n$ readlink /proc/$(docker inspect -f '{{.State.Pid}}' nginx2)/ns/net\nnet:[4026532537]\n\n# 两个容器的 inode 号完全不同——它们处于不同的网络命名空间\n# 再看宿主机自身的\n$ readlink /proc/1/ns/net\nnet:[4026531992]\n```\n\n三个 inode 号全部不同（4026531992、4026532465、4026532537），意味着宿主机和两个容器各自拥有完全独立的网络栈。那么「完全独立的网络栈」到底包含什么？新创建的 Network Namespace 里面是什么样子的？隔离的网络环境之间又是怎么通过 veth pair 建立连接的？搞清楚这些问题，才算真正理解 Docker 容器网络的底层实现。",
+      "answer": "## 第一步：Network Namespace 基础概念详解\n\n### Linux Namespace 隔离体系中的定位\n\nLinux Namespace 是内核提供的一组资源隔离机制，让不同进程组看到不同的系统资源视图。从 Linux 2.6.24 开始，内核陆续实现了六种 Namespace（后来扩展到八种，增加了 Cgroup Namespace 和 Time Namespace）：PID Namespace 隔离进程号、Mount Namespace 隔离文件系统挂载点、UTS Namespace 隔离主机名、IPC Namespace 隔离进程间通信资源、User Namespace 隔离用户和组 ID、Network Namespace 隔离网络栈。Docker 创建容器时通过 `clone()` 系统调用配合不同的 `CLONE_NEW*` 标志位，一次性创建多种 Namespace，把容器进程「关」进一套完全隔离的资源视图中。\n\nNetwork Namespace 在这套体系中负责的是网络层面的完整隔离。所谓「完整」不只是隔离 IP 地址这么简单——它隔离的是整个网络栈（network stack），包括：网络设备列表（网卡）、IPv4/IPv6 协议栈及地址、路由表、iptables/nftables 防火墙规则、socket 列表、端口空间、ARP 缓存表、`/proc/net` 和 `/sys/class/net` 下的所有网络相关伪文件。每个 Network Namespace 就是一套完整的、独立的网络世界。\n\n### 为什么容器需要网络隔离\n\n没有 Network Namespace 的话，所有容器共享宿主机的网络栈。这意味着两个容器不能同时监听 80 端口（端口冲突），一个容器修改 iptables 规则会影响其他容器的网络行为，一个容器甚至可以抓到其他容器的网络流量（安全隐患）。Network Namespace 让每个容器拥有独立的端口空间——容器 A 和容器 B 都可以绑定 `0.0.0.0:80` 而互不干扰，因为它们的 socket 列表、端口空间完全独立。\n\n最直观的验证方式就是手动创建一个 Network Namespace 并观察它的初始状态：\n\n```bash\n# 创建一个名为 test-ns 的 Network Namespace\n$ sudo ip netns add test-ns\n\n# 查看新 NS 内的网络设备——只有 lo 且默认是 DOWN 状态\n$ sudo ip netns exec test-ns ip link show\n1: lo: <LOOPBACK> mtu 65536 qdisc noop state DOWN mode DEFAULT group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\n# 路由表完全为空\n$ sudo ip netns exec test-ns ip route show\n(无输出)\n\n# iptables 规则全是默认 ACCEPT 的空链\n$ sudo ip netns exec test-ns iptables -L -n\nChain INPUT (policy ACCEPT)\ntarget     prot opt source               destination\n\nChain FORWARD (policy ACCEPT)\ntarget     prot opt source               destination\n\nChain OUTPUT (policy ACCEPT)\ntarget     prot opt source               destination\n```\n\n一个刚创建的 Network Namespace 内部只有一个处于 DOWN 状态的 lo 回环设备，没有任何 IP 地址、没有路由、没有防火墙规则——这是一个完全干净的网络世界，跟宿主机的网络栈没有任何共享。\n\n## 第二步：Network Namespace 实现网络栈隔离的核心机制\n\n### clone(CLONE_NEWNET)：内核创建独立网络栈的入口\n\nLinux 内核通过 `clone()` 系统调用的 `CLONE_NEWNET` 标志位创建新的 Network Namespace。Docker 的底层运行时 runc 在创建容器进程时会调用 `clone(CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS | ...)`，一次性创建多种隔离命名空间。当 `CLONE_NEWNET` 被设置后，内核在 `copy_net_ns()` 函数（源码路径 `net/core/net_namespace.c`）中执行以下操作：分配一个新的 `struct net` 结构体（这是内核中 Network Namespace 的核心数据结构），初始化独立的网络设备列表、路由表（FIB，Forwarding Information Base）、Netfilter 规则集、socket 哈希表和端口分配位图，然后在新命名空间中自动创建一个 lo 回环设备（但不自动启用，状态为 DOWN）。\n\n除了 `clone()` 之外，已经存在的进程还可以通过 `unshare(CLONE_NEWNET)` 系统调用把自己移入一个新的 Network Namespace，或者通过 `setns()` 系统调用加入一个已存在的 Network Namespace。Docker 的 `docker exec` 命令底层就是通过 `setns()` 让新进程加入目标容器的各种 Namespace。\n\n### 隔离了什么：六大网络资源的完全独立\n\nNetwork Namespace 隔离的不是某几个参数，而是整个网络栈的每一个组成部分。用一个实际对比最直观：\n\n```bash\n# 宿主机的网络设备\n$ ip link show\n1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN\n2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP\n3: docker0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP\n5: veth8f3a1d@if4: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master docker0\n\n# 容器内的网络设备——完全不同的设备列表\n$ docker exec nginx1 ip link show\n1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN\n4: eth0@if5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP\n```\n\n宿主机看到 lo、eth0、docker0、veth 四个设备，容器只看到 lo 和 eth0 两个设备。这不是权限控制（不是「不让你看」），而是内核数据结构级别的隔离——容器进程调用 `getifaddrs()` 等系统调用时，内核查询的是该进程所属 Network Namespace 中的 `struct net` 里的设备链表，压根看不到其他 Namespace 的设备。同理，容器执行 `ss -tlnp` 看到的 socket 列表只是自己 Namespace 内的 socket，别的容器监听的端口完全不可见也不冲突。路由表、iptables 规则、ARP 缓存也都是 per-namespace 的独立副本。\n\n### veth pair：打通隔离边界的核心机制\n\nNetwork Namespace 提供了完美的隔离，但隔离太彻底会导致容器完全无法通信——一个只有 DOWN 状态 lo 的网络世界没有任何实际用途。这就需要一种机制在不同的 Namespace 之间建立数据通道——veth pair 承担了这个角色。veth pair（虚拟以太网设备对）是 Linux 内核提供的虚拟网络设备，总是成对创建，一端发送的以太网帧会立即出现在另一端，而且可以跨 Namespace 工作。\n\nDocker 创建容器时通过 runc 的 netlink 调用完成以下操作：先用 `ip link add` 创建一对 veth 设备，然后用 `ip link set vethXXX netns [容器PID]` 把其中一端移入容器的 Network Namespace 并命名为 eth0（这就是容器内看到的网卡），另一端留在宿主机命名空间并 attach 到 docker0 网桥。手动模拟这个过程可以更清楚地看到完整链路：\n\n```bash\n# 创建 Network Namespace\n$ sudo ip netns add container-ns\n\n# 创建 veth pair\n$ sudo ip link add veth-host type veth peer name veth-container\n\n# 把一端移入容器的 NS\n$ sudo ip link set veth-container netns container-ns\n\n# 宿主机侧：启用并挂到 docker0 网桥\n$ sudo ip link set veth-host up\n$ sudo brctl addif docker0 veth-host\n\n# 容器侧：重命名、配 IP、启用、加默认路由\n$ sudo ip netns exec container-ns ip link set veth-container name eth0\n$ sudo ip netns exec container-ns ip addr add 172.17.0.99/16 dev eth0\n$ sudo ip netns exec container-ns ip link set eth0 up\n$ sudo ip netns exec container-ns ip link set lo up\n$ sudo ip netns exec container-ns ip route add default via 172.17.0.1\n\n# 验证：从容器 NS 内 ping 宿主机网关\n$ sudo ip netns exec container-ns ping -c1 172.17.0.1\nPING 172.17.0.1 (172.17.0.1) 56(84) bytes of data.\n64 bytes from 172.17.0.1: icmp_seq=1 ttl=64 time=0.038 ms\n```\n\n这就是 Docker 每次 `docker run` 背后做的事情——只不过 runc 通过 netlink 系统调用完成，速度更快且全部在内核态内存中完成。\n\n### 容器间通信与端口映射\n\n同一 docker0 网桥上的容器通信走纯二层转发：容器 A 发 ARP 请求获取容器 B 的 MAC 地址，ARP 广播帧通过 veth pair 到达 docker0 网桥，网桥将其泛洪（flood）到所有端口，容器 B 收到后回复 ARP 响应。后续数据帧由 docker0 在 FDB（Forwarding Database，转发数据库）中查找目标 MAC 对应的 veth 端口直接转发——整个过程不经过三层路由也不经过 NAT，延迟通常在 50-100μs 级别。如果两个容器在不同的 bridge 网络上，则需要宿主机路由表参与三层转发，或者使用 `docker network connect` 将容器同时接入多个网络。\n\n端口映射（`-p 8080:80`）的实现也依赖 Network Namespace 的隔离性。Docker 通过 iptables 的 DNAT（Destination NAT，目标地址转换）规则将发往宿主机 8080 端口的流量重写目标地址为容器 IP:80：\n\n```bash\n$ sudo iptables -t nat -L DOCKER -n -v\nChain DOCKER (2 references)\n pkts bytes target     prot opt in     out     source         destination\n   23  1380 DNAT       tcp  --  !docker0 *  0.0.0.0/0      0.0.0.0/0    tcp dpt:8080 to:172.17.0.2:80\n```\n\n规则中的 `!docker0` 确保只有从非 docker0 接口进入的流量才做 DNAT，避免容器间直接通信被错误地重写目标地址。因为容器的 80 端口是在独立的 Network Namespace 内监听的，宿主机上的其他进程绑定 80 端口完全不冲突——这正是 Network Namespace 端口空间隔离的直接体现。\n\n## 第三步：体系化扩展与面试考点\n\n### ip netns 与 nsenter 实操技巧\n\n`ip netns` 是操作 Network Namespace 的标准工具，但有个重要细节：Docker 创建的 Network Namespace 不会自动注册到 `/var/run/netns/` 目录（`ip netns add` 创建的才会注册），所以 `ip netns list` 看不到容器的 NS。要用 `ip netns` 操作容器的网络命名空间，需要手动创建符号链接：\n\n```bash\n$ PID=$(docker inspect -f '{{.State.Pid}}' nginx1)\n$ sudo mkdir -p /var/run/netns\n$ sudo ln -sf /proc/$PID/ns/net /var/run/netns/nginx1\n\n# 现在可以用 ip netns exec 进入容器的网络命名空间\n$ sudo ip netns exec nginx1 ss -tlnp\nState    Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process\nLISTEN   0       511     0.0.0.0:80          0.0.0.0:*          users:((\"nginx\",pid=1,fd=6))\n```\n\n另一个更常用的工具是 `nsenter --target $PID --net`，它不需要符号链接就能直接进入指定进程的 Network Namespace，在排查容器网络问题时更方便：直接 `nsenter` 进去用 `ip`、`ss`、`tcpdump` 等命令诊断，不需要容器内安装这些工具。\n\n### CNI 插件与 Network Namespace 的自动化管理\n\n在 Kubernetes 环境中，容器的 Network Namespace 管理交给 CNI（Container Network Interface）插件完成。CNI 规范定义了 `ADD`、`DEL`、`CHECK` 三个标准操作，插件（如 Calico、Flannel、Cilium）负责在容器的 Network Namespace 内创建网络设备、分配 IP、配置路由。比如 Calico 使用纯三层路由方案，在每个 Network Namespace 内配置到对端 Pod 的 /32 路由；Cilium 基于 eBPF 在内核数据路径上直接编程，绕过传统 iptables 规则链，转发性能更高。无论哪种 CNI 插件，底层都依赖 Network Namespace 提供的隔离能力——CNI 只是自动化了 veth 创建、IP 分配、路由写入这些本来需要手动做的事。\n\n### Kubernetes Pod 的 Network Namespace 共享\n\n一个值得单独拿出来讲的场景是 Kubernetes Pod。Pod 内的多个容器共享同一个 Network Namespace，这就是为什么 Pod 内的容器可以通过 `localhost` 互相访问。实现方式是：kubelet 先创建一个 pause 容器（也叫 infra 容器），这个容器的唯一职责就是持有 Network Namespace（以及其他共享的 Namespace），然后 Pod 内的业务容器通过 `--network container:pause` 的方式加入 pause 容器的 Network Namespace。pause 容器本身几乎不消耗资源（它的主进程就是一个无限 `pause()` 的 C 程序），但它保证了即使业务容器重启，Pod 的 IP 和网络配置也不会丢失。\n\n### 面试回答层次建议\n\n回答这道题建议分三层递进。第一层讲清楚 Network Namespace 隔离的完整范围：不只是 IP 地址，而是网卡设备、路由表、iptables 规则、socket 列表、端口空间全部独立，每个 Namespace 对应内核中一个独立的 `struct net` 结构体。第二层解释实现机制：`clone(CLONE_NEWNET)` 触发内核创建独立的网络栈，新 Namespace 初始只有 DOWN 状态的 lo 设备，通过 veth pair 跨 Namespace 传递数据包，一端在容器内命名为 eth0，另一端在宿主机连接 docker0 网桥。第三层展开生产相关知识：端口映射通过 iptables DNAT 实现且不与宿主机端口冲突，K8s Pod 通过 pause 容器共享 Network Namespace 实现 localhost 互通，CNI 插件自动化管理 Network Namespace 内的网络配置。能从「内核隔离数据结构」讲到「Docker/K8s 的落地应用」，这道题基本拿满分。",
+      "keyPoints": [
+        "Network Namespace 隔离的是完整网络栈而非单一资源，包括网络设备列表、IP 地址、路由表、iptables/nftables 规则、socket 列表、端口空间、ARP 缓存全部独立，每个 NS 对应内核中一个 struct net 结构体",
+        "通过 clone() 系统调用的 CLONE_NEWNET 标志位创建新 Network Namespace，内核在 copy_net_ns() 中分配独立的 struct net 并初始化空白的 FIB、Netfilter 规则集、socket 哈希表和端口位图",
+        "新创建的 Network Namespace 只有一个处于 DOWN 状态的 lo 回环设备，没有 IP 地址、路由和防火墙规则，需要通过 veth pair 等机制手动建立与外部的网络连接",
+        "veth pair 是跨 Network Namespace 传递数据包的核心机制——Docker 将一端移入容器 NS 命名为 eth0，另一端留在宿主机挂载到 docker0 网桥，充当两个隔离网络栈之间的虚拟网线",
+        "端口映射通过 iptables DNAT 规则将宿主机端口流量重写目标地址转发到容器 NS 内的端口，因为端口空间完全隔离所以容器和宿主机绑定相同端口不冲突",
+        "Docker 创建的 Network Namespace 不注册到 /var/run/netns/ 目录，需要手动创建符号链接后才能用 ip netns exec 操作，更便捷的替代方案是 nsenter --target PID --net",
+        "Kubernetes Pod 通过 pause 容器持有 Network Namespace，业务容器以共享模式加入同一 NS，实现 Pod 内 localhost 互通且 IP 在容器重启后保持不变"
+      ],
+      "quiz": [
+        {
+          "id": "docker-internals-net-ns-q1-quiz1",
+          "question": "Network Namespace 隔离的网络资源范围包括以下哪项？",
+          "choices": [
+            {"id": "A", "text": "网卡设备列表、IP 地址、路由表、iptables 规则、socket 列表和端口空间全部独立，每个 NS 是一套完整的网络栈"},
+            {"id": "B", "text": "仅隔离 IP 地址和端口空间，路由表和 iptables 规则仍然与宿主机共享以保证网络连通性"},
+            {"id": "C", "text": "仅隔离网卡设备和 IP 地址，端口空间与宿主机共享所以同一端口不能被多个容器同时监听"},
+            {"id": "D", "text": "隔离所有网络资源但共享 ARP 缓存表，因为 ARP 是链路层协议无法被 Namespace 机制隔离"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Network Namespace 隔离的是完整的网络栈，不是其中的某几个组件。内核为每个 Network Namespace 分配独立的 struct net 结构体，其中包含网络设备链表、FIB 路由表、Netfilter 规则集（iptables/nftables）、socket 哈希表、端口分配位图和 ARP 邻居表。B 选项错误，路由表是 per-namespace 的独立副本，不与宿主机共享。C 选项错误，端口空间完全隔离，所以多个容器可以同时监听 80 端口而不冲突。D 选项错误，ARP 缓存（neighbour table）同样是 per-namespace 的，每个 NS 维护自己的 ARP 表。"
+        },
+        {
+          "id": "docker-internals-net-ns-q1-quiz2",
+          "question": "创建新的 Network Namespace 的底层系统调用和标志位是什么？",
+          "choices": [
+            {"id": "A", "text": "fork() 配合 FORK_NEWNET 标志位，在子进程中创建新的网络命名空间"},
+            {"id": "B", "text": "clone() 配合 CLONE_NEWNET 标志位，内核在 copy_net_ns() 中分配独立的 struct net 结构体"},
+            {"id": "C", "text": "exec() 配合 EXEC_NS_NET 环境变量，在执行新程序时自动创建网络命名空间"},
+            {"id": "D", "text": "sethostname() 配合 NET_NS_CREATE 参数，通过设置新主机名间接触发内核创建网络命名空间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Linux 内核通过 clone() 系统调用的 CLONE_NEWNET 标志位创建新的 Network Namespace。runc 在启动容器进程时调用 clone() 并组合多个 CLONE_NEW* 标志（CLONE_NEWPID、CLONE_NEWNET、CLONE_NEWNS 等）一次性创建所有隔离命名空间。内核在 copy_net_ns() 函数中分配 struct net 结构体并初始化独立的网络资源。A 选项错误，fork() 不支持 Namespace 相关标志位，且 FORK_NEWNET 不存在。C 选项错误，exec() 用于替换当前进程映像，与 Namespace 创建无关。D 选项纯属虚构，sethostname() 只修改 UTS Namespace 中的主机名。此外 unshare(CLONE_NEWNET) 也能创建新的 Network Namespace，但用于已存在的进程将自己移入新 NS。"
+        },
+        {
+          "id": "docker-internals-net-ns-q1-quiz3",
+          "question": "一个刚通过 ip netns add 创建的 Network Namespace 内部的初始网络状态是什么？",
+          "choices": [
+            {"id": "A", "text": "包含一个已启用（UP）的 lo 回环设备和一条指向宿主机网关的默认路由"},
+            {"id": "B", "text": "完全为空，没有任何网络设备，连 lo 回环设备都需要手动创建"},
+            {"id": "C", "text": "只有一个处于 DOWN 状态的 lo 回环设备，没有 IP 地址、没有路由、iptables 规则全是默认空链"},
+            {"id": "D", "text": "继承宿主机全部网络设备和路由表的只读快照，但不能修改任何配置"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "新创建的 Network Namespace 内部只有一个 lo 回环设备，而且它默认处于 DOWN 状态（state DOWN），没有分配 IP 地址，路由表完全为空，iptables 只有默认的 ACCEPT 策略空链。这意味着新 NS 是一个完全干净的网络环境，与宿主机零共享。A 选项错误，lo 默认是 DOWN 状态而非 UP，也没有默认路由——需要手动 ip link set lo up 和 ip route add。B 选项错误，内核会自动创建 lo 设备，不需要手动创建。D 选项错误，新 NS 不会继承宿主机的任何网络配置，它是从零开始的空白状态。这也是为什么 Docker 需要通过 veth pair 手动为容器建立网络连接。"
+        },
+        {
+          "id": "docker-internals-net-ns-q1-quiz4",
+          "question": "Docker 使用 veth pair 连接容器和宿主机的具体方式是？",
+          "choices": [
+            {"id": "A", "text": "创建 veth pair 后两端都留在宿主机命名空间，通过 iptables 规则将流量注入容器的 lo 回环接口"},
+            {"id": "B", "text": "创建 veth pair 后一端放入容器 NS 命名为 docker0，另一端留在宿主机命名为 eth0"},
+            {"id": "C", "text": "创建 veth pair 后两端都放入容器 NS，一端连接容器进程另一端作为与宿主机通信的隧道出口"},
+            {"id": "D", "text": "创建 veth pair 后一端移入容器 NS 命名为 eth0，另一端留在宿主机命名空间并挂载到 docker0 网桥"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "veth pair 的核心特性是总是成对创建且跨 Namespace 工作。Docker 的操作流程是：创建一对 veth 设备，用 ip link set 将其中一端移入容器的 Network Namespace 并命名为 eth0（这是容器内看到的「网卡」），另一端留在宿主机的默认命名空间中命名为 vethXXXXXX 并 attach 到 docker0 网桥。A 选项错误，veth pair 的两端必须在不同的命名空间才能实现跨 NS 通信。B 选项搞反了设备命名——容器内的是 eth0 而非 docker0，docker0 是宿主机上的网桥设备。C 选项错误，如果两端都在容器 NS 内就无法与宿主机通信，失去了 veth pair 的意义。"
+        },
+        {
+          "id": "docker-internals-net-ns-q1-quiz5",
+          "question": "两个 Docker 容器都绑定 0.0.0.0:80 端口为什么不会发生冲突？",
+          "choices": [
+            {"id": "A", "text": "因为每个容器处于独立的 Network Namespace，端口空间和 socket 列表完全隔离，各自绑定的是自己 NS 内的 80 端口"},
+            {"id": "B", "text": "因为 Docker 自动为第二个容器开启了 SO_REUSEPORT 选项让多个进程可以绑定同一端口"},
+            {"id": "C", "text": "因为两个容器的 IP 地址不同，虽然端口相同但五元组不同所以内核允许绑定"},
+            {"id": "D", "text": "因为 Docker 实际上只让第一个容器真正绑定了 80 端口，第二个容器通过 iptables 转发实现假绑定"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Network Namespace 端口空间隔离的直接体现。每个 Network Namespace 拥有独立的 socket 哈希表和端口分配位图，容器 A 绑定的 80 端口和容器 B 绑定的 80 端口分别记录在两个不同的内核数据结构中，彼此完全不可见。B 选项错误，SO_REUSEPORT 是同一 Namespace 内允许多进程绑定同一端口的机制，跟 Namespace 隔离无关。C 选项的思路有部分道理但本质原因不对——即使两个容器配置了相同的 IP 地址也不会冲突，因为它们在不同的 NS 中。D 选项纯属虚构，Docker 不需要做任何特殊处理，Namespace 隔离天然解决了端口冲突问题。"
+        },
+        {
+          "id": "docker-internals-net-ns-q1-quiz6",
+          "question": "为什么执行 ip netns list 看不到 Docker 创建的网络命名空间？",
+          "choices": [
+            {"id": "A", "text": "因为 Docker 创建的命名空间在内核中使用了不同的底层数据结构，ip netns 工具无法识别"},
+            {"id": "B", "text": "因为 Docker 创建的 Network Namespace 没有在 /var/run/netns/ 目录下注册文件，而 ip netns list 只扫描该目录"},
+            {"id": "C", "text": "因为 Docker 容器运行在 User Namespace 内部的嵌套网络命名空间中，需要 root 权限才能列出"},
+            {"id": "D", "text": "因为 Docker 使用 cgroup 而非 namespace 实现网络隔离，所以 ip netns 无法感知"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ip netns list 命令的工作原理很简单：它遍历 /var/run/netns/ 目录下的文件列表，每个文件对应一个已命名的 Network Namespace。ip netns add 创建 NS 时会自动在该目录下创建绑定挂载（bind mount），但 Docker/runc 通过 clone(CLONE_NEWNET) 创建的 NS 不会在这个目录注册。解决办法是手动创建符号链接：ln -sf /proc/$PID/ns/net /var/run/netns/容器名。A 选项错误，Docker 创建的 NS 和 ip netns add 创建的在内核中是完全相同的 struct net 结构体，没有区别。C 选项错误，Docker 默认不启用 User Namespace。D 选项混淆了概念，cgroup 管的是资源限制，网络隔离靠的就是 Network Namespace。"
+        },
+        {
+          "id": "docker-internals-net-ns-q1-quiz7",
+          "question": "同一 docker0 网桥上两个容器之间的数据包传输路径是？",
+          "choices": [
+            {"id": "A", "text": "容器 A eth0 → veth → 宿主机路由表三层转发 → iptables MASQUERADE → veth → 容器 B eth0"},
+            {"id": "B", "text": "容器 A eth0 → veth → iptables DNAT 重写目标地址 → docker0 → veth → 容器 B eth0"},
+            {"id": "C", "text": "容器 A eth0 → veth → docker0 网桥根据目标 MAC 在 FDB 中查找端口 → veth → 容器 B eth0，纯二层转发不经过 NAT"},
+            {"id": "D", "text": "容器 A eth0 → 宿主机物理网卡 → 外部交换机回环转发 → 宿主机物理网卡 → veth → 容器 B eth0"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "同一 bridge 上的容器通信走纯二层（L2）转发路径。容器 A 先发 ARP 请求获取容器 B 的 MAC 地址，docker0 网桥泛洪 ARP 到所有端口，容器 B 回复后，后续数据帧直接由 docker0 在 FDB（转发数据库）中根据目标 MAC 找到对应的 veth 端口转发。整个过程不经过三层路由也不经过 NAT，延迟在 50-100μs 级别。A 选项错误，同网桥容器间通信不需要三层路由和 MASQUERADE。B 选项错误，DNAT 用于端口映射场景，同网桥容器互通不涉及 DNAT。D 选项错误，数据包不会离开宿主机内核，更不会经过物理交换机。"
+        },
+        {
+          "id": "docker-internals-net-ns-q1-quiz8",
+          "question": "docker run -p 8080:80 的端口映射在内核层面是通过什么机制实现的？",
+          "choices": [
+            {"id": "A", "text": "通过 Linux 内核的 SO_BINDTODEVICE 选项将宿主机 8080 端口的 socket 直接绑定到容器的 veth 设备"},
+            {"id": "B", "text": "通过修改容器 Network Namespace 内的路由表，将宿主机 8080 端口的流量路由到容器进程"},
+            {"id": "C", "text": "纯粹通过 docker-proxy 用户态进程在宿主机监听 8080 端口并 TCP 代理转发到容器，没有内核态参与"},
+            {"id": "D", "text": "通过 iptables 的 DNAT 规则将目标端口 8080 的流量重写目标地址为容器 IP:80，转发到容器的 Network Namespace"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Docker 端口映射的主要机制是 iptables DNAT 规则。Docker daemon 在 nat 表的 DOCKER 链中插入规则，将发往宿主机 8080 端口的 TCP 流量的目标地址重写为容器的 IP:80（如 172.17.0.2:80），然后内核根据路由表将包转发到 docker0 网桥再到容器的 veth pair。A 选项错误，SO_BINDTODEVICE 只是将 socket 绑定到特定网卡，不能实现跨 Namespace 的端口映射。B 选项错误，路由表不能修改端口号，端口重写是 Netfilter DNAT 的能力。C 选项部分正确——docker-proxy 确实存在且作为备用的用户态转发机制（处理 localhost 和 hairpin 场景），但主要流量走的是 iptables DNAT 内核态路径，性能远高于用户态代理。"
+        },
+        {
+          "id": "docker-internals-net-ns-q1-quiz9",
+          "question": "关于 /proc/[pid]/ns/net 文件，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "该文件包含容器 Network Namespace 内的完整网络配置（IP、路由等），可以直接 cat 读取"},
+            {"id": "B", "text": "该文件是一个符号链接指向 NS 的 inode，两个进程的该文件指向相同 inode 说明它们共享网络栈"},
+            {"id": "C", "text": "该文件只在容器首次启动时生成，容器重启后 inode 号保持不变"},
+            {"id": "D", "text": "该文件存储的是 Network Namespace 的创建时间戳，不能用于判断进程间的 NS 关系"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "/proc/[pid]/ns/net 是一个特殊的符号链接，指向该进程所属 Network Namespace 的 inode（格式为 net:[inode号]）。通过 readlink 读取两个进程的该文件，如果 inode 号相同则说明它们处于同一个 Network Namespace，共享网络栈。Docker 的 --network container:xxx 模式和 Kubernetes Pod 中的容器就是这样共享 NS 的。A 选项错误，该文件不是普通文本文件，不包含网络配置信息，它只是一个指向内核 Namespace 对象的引用。C 选项错误，容器重启后 runc 会创建新的 Network Namespace，inode 号会改变。D 选项错误，该文件不存储时间戳，它的核心用途就是标识和引用 Namespace 对象，nsenter 和 setns() 都通过打开这个文件来加入指定的 NS。"
+        },
+        {
+          "id": "docker-internals-net-ns-q1-quiz10",
+          "question": "Kubernetes Pod 中多个容器能够通过 localhost 互相访问的底层实现原理是什么？",
+          "choices": [
+            {"id": "A", "text": "K8s 为 Pod 内每个容器创建独立的 Network Namespace，然后用 veth pair 两两互连并配置路由"},
+            {"id": "B", "text": "K8s 在 Pod 级别使用 overlay 网络搭建内部隧道，不同容器的 lo 流量通过 VXLAN 封装后互通"},
+            {"id": "C", "text": "pause 容器先创建并持有 Network Namespace，业务容器通过共享该 NS 加入同一网络栈，天然实现 localhost 互通"},
+            {"id": "D", "text": "K8s 将 Pod 内所有容器放入同一个 PID Namespace，共享 PID 后自动共享网络栈和端口空间"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Kubernetes Pod 的网络模型核心是 Network Namespace 共享。kubelet 启动 Pod 时先创建一个 pause 容器（也叫 infra 容器），它的唯一职责是通过 clone(CLONE_NEWNET) 创建并持有 Network Namespace。随后 Pod 内的业务容器以 --network container:pause 的方式加入 pause 容器的 NS，所有容器看到的是同一套网卡、IP、路由和端口空间，所以能通过 localhost 互访。pause 容器保证了即使业务容器重启，Pod 的 IP 和网络配置也不会丢失。A 选项错误，Pod 内的容器不是各自独立的 NS，而是共享同一个。B 选项错误，Pod 内部通信不需要 overlay 网络，共享 NS 后就是本地通信。D 选项混淆了概念，PID Namespace 和 Network Namespace 是独立的隔离维度，共享 PID 不会自动共享网络。"
+        }
+      ],
+      "references": [
+        "https://man7.org/linux/man-pages/man7/network_namespaces.7.html",
+        "https://docs.docker.com/engine/network/",
+        "https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md"
+      ]
+    }
+  ]
+}

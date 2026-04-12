@@ -1,0 +1,155 @@
+{
+  "id": "computer-network-049",
+  "name": "CLOSE_WAIT 堆积排查",
+  "domain": "computer-network",
+  "description": "大量 CLOSE_WAIT 连接的成因、排查方法与代码层面的防范",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "computer-network-049-q1",
+      "domain": "computer-network",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["TCP", "CLOSE_WAIT", "连接泄露", "排查"],
+      "title": "大量 CLOSE_WAIT 连接的原因与排查方法",
+      "content": "## 故障现场\n\n周五下午 4 点，你负责的一个 Java 订单服务开始报警——Prometheus 上 `process_open_fds` 指标从正常的 300 持续攀升，1 小时内飙到了 8000 多。紧接着 Grafana 上的 JVM heap 使用率也开始不正常地增长，Old Gen 从 40% 一路涨到 92%。运维同事跑到机器上一看，服务进程已经在疯狂 Full GC，接口响应时间从 50ms 飙到了 8 秒。又过了 20 分钟，服务直接 OOM crash 了，Kubernetes 自动重启后过不了多久又 crash，陷入了 CrashLoopBackOff。\n\n你 SSH 上节点，用 `ss` 命令查看 TCP 连接状态，输出让你倒吸一口凉气：\n\n```bash\n$ ss -tnp | head -5\nState      Recv-Q Send-Q  Local Address:Port   Peer Address:Port  Process\nCLOSE-WAIT 32     0       10.244.1.15:38792    10.96.0.100:3306   users:(\"java\",pid=1,fd=847)\nCLOSE-WAIT 32     0       10.244.1.15:38814    10.96.0.100:3306   users:(\"java\",pid=1,fd=851)\nCLOSE-WAIT 32     0       10.244.1.15:39002    10.96.0.100:3306   users:(\"java\",pid=1,fd=863)\nCLOSE-WAIT 1      0       10.244.1.15:52110    10.96.0.55:6379    users:(\"java\",pid=1,fd=912)\n\n$ ss -tnp state close-wait | wc -l\n6847\n```\n\n6847 个 CLOSE_WAIT 连接！其中大部分连向 MySQL（`10.96.0.100:3306`），少部分连向 Redis（`10.96.0.55:6379`）。更反常的是，这些 CLOSE_WAIT 连接的 `Recv-Q` 都有数据——说明对端已经发了 FIN 过来，但本地进程还没有读完接收缓冲区的数据，更没有调用 `close()` 关闭连接。\n\n你的同事说「是不是 MySQL 那边主动断开了连接？」——没错，MySQL 的 `wait_timeout` 默认 8 小时，连接空闲超过这个时间 MySQL 会主动关闭，发 FIN 给客户端。但问题是：为什么客户端收到 FIN 后没有正常关闭连接？为什么这些 CLOSE_WAIT 会一直堆积不释放？\n\n### 问题\n\n请从 TCP 状态机的角度解释 CLOSE_WAIT 的本质含义，分析大量 CLOSE_WAIT 堆积的根本原因，并给出从发现到定位到修复的完整排查方法。如果你能把底层原理、排查命令和代码层面的防范结合起来讲清楚，说明你对 TCP 连接管理有真正的生产经验。",
+      "answer": "## 第一步：TCP 连接关闭与 CLOSE_WAIT 基础\n\n### TCP 四次挥手回顾\n\n要理解 CLOSE_WAIT，必须先搞清楚 TCP 连接是怎么关闭的。TCP 是全双工协议——数据可以同时双向流动，所以关闭连接时需要两个方向分别关闭，这就是经典的「四次挥手」。假设客户端 A 想关闭连接，流程如下：第一步，A 发送 FIN 报文给 B，表示「我这边没有数据要发了」，A 进入 `FIN_WAIT_1` 状态。第二步，B 收到 FIN 后回复 ACK，表示「我知道了」，B 进入 `CLOSE_WAIT` 状态，同时 A 收到 ACK 后进入 `FIN_WAIT_2` 状态。第三步，B 处理完自己剩余的数据后也发送 FIN 给 A，表示「我这边也关了」，B 进入 `LAST_ACK` 状态。第四步，A 收到 B 的 FIN 后回复 ACK，进入 `TIME_WAIT` 状态（等待 2MSL 后彻底关闭），B 收到 ACK 后直接关闭。\n\n整个过程中有两个角色：「主动关闭方」（先发 FIN 的一端）和「被动关闭方」（后收到 FIN 的一端）。CLOSE_WAIT 是被动关闭方独有的状态——它出现在第二步和第三步之间，也就是 B 已经收到了 A 的 FIN 并回了 ACK，但 B 自己还没有发 FIN 的这段时间。在这段时间里，B 的应用层代码应该把剩余数据处理完，然后调用 `close()` 系统调用关闭 socket，内核才会发出 B 端的 FIN，连接才能走到 `LAST_ACK` 状态最终关闭。\n\n### CLOSE_WAIT 与 TIME_WAIT 的本质区别\n\n很多人在面试中把 CLOSE_WAIT 和 TIME_WAIT 搞混，这两个状态虽然都出现在连接关闭阶段，但本质完全不同。TIME_WAIT 出现在主动关闭方——你主动发了 FIN，对端也回了 FIN，你发完最后一个 ACK 后进入 TIME_WAIT，等 2MSL（通常 60 秒）后内核自动释放连接。TIME_WAIT 是内核层面的定时器，到时间了自动消失，应用层代码管不了也不需要管。大量 TIME_WAIT 说明你的服务在大量主动关闭连接，通常是正常行为（比如短连接 HTTP 服务），最多通过 `net.ipv4.tcp_tw_reuse` 做优化。\n\nCLOSE_WAIT 则完全不同。它出现在被动关闭方，而且内核不会自动帮你清理它——CLOSE_WAIT 状态没有超时机制。内核在收到对端 FIN 后把 socket 状态标记为 CLOSE_WAIT，然后就等着你的应用程序来调用 `close()`。如果应用程序不调用 `close()`，这个 socket 就会永远停在 CLOSE_WAIT 状态，直到进程退出才由内核回收。这意味着每一个 CLOSE_WAIT 连接都在消耗一个文件描述符和对应的内核内存，堆积到一定数量就会触发 `Too many open files` 错误或者内存耗尽。\n\n用一句话总结区别：TIME_WAIT 是操作系统在等，到时间自己会清理；CLOSE_WAIT 是操作系统在等你的代码执行 `close()`，你不调用它就永远不清理。\n\n### ss 命令：TCP 连接诊断的核心工具\n\n`ss`（Socket Statistics）是 Linux 下查看网络连接的标准工具，取代了老旧的 `netstat`。它直接读取内核的 socket 信息（通过 netlink 机制），速度比 `netstat` 快一个数量级，在连接数达到上万时差距尤其明显。排查 CLOSE_WAIT 问题最常用的几个命令如下：\n\n```bash\n# 查看所有 CLOSE_WAIT 连接及其归属进程\nss -tnp state close-wait\n\n# 按对端 IP 统计 CLOSE_WAIT 数量，快速锁定是哪个后端服务出了问题\nss -tn state close-wait | awk '{print $4}' | sort | uniq -c | sort -rn\n\n# 查看特定进程的所有连接状态分布\nss -tnp | grep 'pid=12345' | awk '{print $1}' | sort | uniq -c\n```\n\n`-t` 表示只看 TCP 连接，`-n` 表示不做 DNS 反解（加速输出），`-p` 表示显示进程信息。`state close-wait` 是 `ss` 特有的过滤语法，直接在内核层面过滤状态，比 `grep CLOSE-WAIT` 效率高得多。输出中的 `Recv-Q` 字段特别关键——在 CLOSE_WAIT 状态下，`Recv-Q` 如果大于 0，说明对端发来的 FIN 之前还有数据没被应用层 `read()`，应用程序可能卡在了某个地方没有消费数据。\n\n## 第二步：CLOSE_WAIT 堆积的根因与排查\n\n### 根本原因：应用没调 close()\n\n99% 的 CLOSE_WAIT 堆积都指向同一个根因——你的代码有 bug，没有正确关闭连接。对端发了 FIN 过来（可能是对端服务主动断开、超时断开、crash 断开），你的内核协议栈已经回了 ACK 并把 socket 标记为 CLOSE_WAIT，但你的应用层代码没有对这个 socket 调用 `close()`，导致内核无法发送 FIN 完成四次挥手。连接就永远卡在 CLOSE_WAIT 状态，文件描述符也不会释放。\n\n这里有个微妙的地方：不是说你的代码里完全没有 `close()`，而是在某些异常路径下 `close()` 没有被执行到。最经典的三个场景：\n\n**场景一：HTTP 客户端没关闭响应体。** 这是 Go 和 Java 项目中最常见的 CLOSE_WAIT 泄漏原因。以 Go 的 `net/http` 为例，`http.Get()` 返回的 `resp.Body` 是一个 `io.ReadCloser`——如果你只读了数据但忘了调用 `resp.Body.Close()`，底层的 TCP 连接不会被归还到连接池，也不会被关闭。当对端服务器发送完响应后关闭连接（发 FIN），你这边就会堆积 CLOSE_WAIT。正确的写法是：\n\n```go\nresp, err := http.Get(\"https://api.example.com/data\")\nif err != nil {\n    return err\n}\ndefer resp.Body.Close()  // 必须关闭，即使你不需要读 body\n// 即使你不关心 body 内容，也要 drain 掉，否则连接无法复用\nio.Copy(io.Discard, resp.Body)\n```\n\n在 Java 中同样的问题出现在 Apache HttpClient 上：如果你用了 `CloseableHttpResponse` 但忘了在 `finally` 块里调用 `response.close()`，或者用了 `HttpURLConnection` 但没有调用 `disconnect()`，都会导致 CLOSE_WAIT。\n\n**场景二：数据库连接泄漏。** 这正是我们开头故障案例的原因。代码里手动从连接池获取了 `Connection`，在正常路径上会 `close()` 归还连接池，但在异常路径（比如中间抛了异常）上跳过了 `close()`。连接池的连接对象虽然还在，但底层 socket 已经被 MySQL 服务端超时关闭了，连接池不知道这些连接已经失效，也不会去清理它们。典型的有问题代码：\n\n```java\n// 错误写法：异常路径上 conn 不会被关闭\nConnection conn = dataSource.getConnection();\ntry {\n    PreparedStatement ps = conn.prepareStatement(sql);\n    ResultSet rs = ps.executeQuery();\n    // 如果这里抛异常...\n    processResult(rs);\n    conn.close();  // 这行永远执行不到\n} catch (Exception e) {\n    log.error(\"query failed\", e);\n    // conn 没有被关闭！\n}\n```\n\n**场景三：忘记关闭 Socket 或流。** 在直接操作 `Socket` 或 `InputStream` / `OutputStream` 的场景下（比如自己实现的 RPC 框架、TCP 长连接服务），如果读线程检测到对端关闭了连接（`read()` 返回 -1 或 0），但代码没有在这个分支里调用 `socket.close()`，CLOSE_WAIT 就会堆积。\n\n### 完整排查流程\n\n实际排查一个 CLOSE_WAIT 堆积问题，我通常分三步走：\n\n**第一步：ss 确认规模和目标。** 先用 `ss -tn state close-wait | wc -l` 看堆积了多少，再用 `ss -tnp state close-wait | awk '{print $4}' | sort | uniq -c | sort -rn` 按对端地址统计，快速锁定是哪个后端服务的连接在泄漏。在我们的案例中，99% 的 CLOSE_WAIT 连向 `10.96.0.100:3306`——MySQL。\n\n**第二步：lsof 锁定进程和文件描述符。** 用 `lsof -i -nP | grep CLOSE_WAIT | grep java` 可以看到具体是哪个进程、哪些文件描述符处于 CLOSE_WAIT。`lsof -p <pid> | wc -l` 查看进程总共打开了多少文件描述符，对比 `ulimit -n` 看是不是快到上限了。如果已经逼近上限，新的连接会报 `java.net.SocketException: Too many open files`。\n\n```bash\n$ lsof -p 1 -nP | grep 'CLOSE_WAIT' | head -3\njava 1 app 847u IPv4 1234567 0t0 TCP 10.244.1.15:38792->10.96.0.100:3306 (CLOSE_WAIT)\njava 1 app 851u IPv4 1234568 0t0 TCP 10.244.1.15:38814->10.96.0.100:3306 (CLOSE_WAIT)\njava 1 app 863u IPv4 1234569 0t0 TCP 10.244.1.15:39002->10.96.0.100:3306 (CLOSE_WAIT)\n\n$ lsof -p 1 | wc -l\n9312\n\n$ ulimit -n\n10240\n```\n\n**第三步：jstack / goroutine dump 查代码。** 这是最关键的一步——找到代码里哪个地方持有连接没释放。对 Java 服务用 `jstack <pid>` 抓线程 dump，搜索包含数据库连接或 HTTP 连接相关类名的栈帧，看看有没有线程阻塞在获取连接上（说明连接池已耗尽），或者有没有线程持有连接但卡在了某个耗时操作上。\n\n```bash\n$ jstack 1 | grep -A 20 'BLOCKED\\|WAITING' | grep -i 'pool\\|connection\\|socket'\n  at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:186)\n  - waiting on <0x00000006c7a8b0c0> (a java.util.concurrent.Semaphore)\n  at com.example.order.dao.OrderDao.queryOrder(OrderDao.java:47)\n```\n\n如果发现大量线程阻塞在 `getConnection()` 上，说明连接池已经被耗尽——池子里的连接都泄漏了没还回来。这时候去看 `OrderDao.java:47` 附近的代码，大概率就是那个没在 `finally` 里 `close()` 的地方。\n\n对 Go 服务，用 `kill -SIGUSR1 <pid>` 或者访问 `pprof` 的 goroutine dump（`/debug/pprof/goroutine?debug=2`），搜索涉及 `net.(*conn)` 或 `database/sql` 的 goroutine，看哪些 goroutine 持有连接但卡在了某个地方。\n\n如果应用层 dump 看不出问题，还可以用 `strace` 从系统调用层面跟踪：\n\n```bash\n# 跟踪进程的 close() 和 shutdown() 系统调用\nstrace -p <pid> -e trace=close,shutdown -f 2>&1 | head -50\n```\n\n如果一段时间内完全没有 `close()` 相关的系统调用，而 `ss` 显示 CLOSE_WAIT 还在增长，基本可以确认是应用层代码的连接泄漏。\n\n## 第三步：防范与工程实践\n\n### 不同语言的连接泄漏防范\n\n**Java：try-with-resources 是标配。** Java 7 引入的 try-with-resources 语法就是为了解决资源泄漏而生的。任何实现了 `AutoCloseable` 接口的资源（`Connection`、`InputStream`、`HttpResponse`）都应该用这种方式管理：\n\n```java\n// 正确写法：无论是否抛异常，conn 都会被关闭\ntry (Connection conn = dataSource.getConnection();\n     PreparedStatement ps = conn.prepareStatement(sql);\n     ResultSet rs = ps.executeQuery()) {\n    processResult(rs);\n}  // 编译器自动生成 finally { rs.close(); ps.close(); conn.close(); }\n```\n\n**Go：defer 是生命线。** Go 没有 try-with-resources，但 `defer` 提供了同等能力。关键原则是：获取资源后立刻 `defer` 释放，不要把 `close` 放到函数末尾去手动调用。\n\n```go\nresp, err := http.Get(url)\nif err != nil {\n    return err\n}\ndefer resp.Body.Close()\n```\n\n**Python：with 语句 + 上下文管理器。** Python 的 `with` 语句等价于 Java 的 try-with-resources：\n\n```python\n# 正确写法：with 保证 response 在退出时被关闭\nwith requests.get('https://api.example.com/data', stream=True) as response:\n    process(response.json())\n```\n\n### 连接池的健康检查\n\n在故障案例中，连接池本身也有责任——HikariCP 默认的 `maxLifetime` 是 30 分钟，但 MySQL 的 `wait_timeout` 是 8 小时。如果连接池中的空闲连接在 MySQL 端被超时断开了（MySQL 发了 FIN），但 HikariCP 不知道，下次分配这个连接给应用时，应用在一个已经 CLOSE_WAIT 的连接上执行 SQL 就会失败。正确的配置是让连接池的 `maxLifetime` 短于数据库的 `wait_timeout`，并开启连接有效性检查：\n\n```yaml\n# HikariCP 配置\nspring:\n  datasource:\n    hikari:\n      max-lifetime: 1800000          # 30 分钟，必须短于 MySQL wait_timeout\n      connection-test-query: SELECT 1 # 分配连接前验证有效性\n      validation-timeout: 3000        # 验证超时 3 秒\n      idle-timeout: 600000            # 空闲连接 10 分钟后回收\n      leak-detection-threshold: 30000 # 连接持有超过 30 秒报警\n```\n\n`leak-detection-threshold` 这个参数特别有用——HikariCP 会记录每个连接被借出的时间，如果超过阈值还没归还，就在日志中打印获取连接时的堆栈，直接告诉你哪行代码借了连接没还。\n\n### 系统层面的监控与兜底\n\n生产环境中应该把 CLOSE_WAIT 数量作为常规监控指标。用 Prometheus 的 node_exporter 或自定义 script 采集 `ss -tn state close-wait | wc -l`，设置告警阈值（比如单个 Pod 超过 100 个 CLOSE_WAIT 就报警）。虽然内核层面没法设置 CLOSE_WAIT 的超时（这是 TCP 协议规定的），但可以通过 `tcp_keepalive_time`、`tcp_keepalive_intvl`、`tcp_keepalive_probes` 三个参数让内核主动探测连接是否存活，如果对端已经消失（比如 crash 了没发 FIN），keepalive 探测失败后内核会自动关闭连接。不过要注意，keepalive 只能检测对端「消失」的情况，不能解决对端「正常发了 FIN 但你没 close」的 CLOSE_WAIT 问题。\n\n### 面试高频考点\n\n面试中 CLOSE_WAIT 相关的考察通常有四个层次。第一层：能说出 CLOSE_WAIT 出现在被动关闭方、收到 FIN 并回了 ACK 之后，需要应用调用 `close()` 才能进入 `LAST_ACK` 状态。第二层：能分析根因是代码没关闭连接，能举出 HTTP 响应体未关闭、数据库连接泄漏等具体场景。第三层：能给出完整的排查命令链——`ss -tnp state close-wait` → `lsof -p <pid>` → `jstack` / goroutine dump → `strace`，每一步看什么、判断什么。第四层：能从工程角度讲防范——try-with-resources / defer / with 语句、连接池健康检查配置、`leak-detection-threshold` 告警、CLOSE_WAIT 数量监控。如果你还能讲清楚 CLOSE_WAIT 和 TIME_WAIT 的本质区别（一个等应用 close，一个等内核定时器），以及为什么 CLOSE_WAIT 没有超时机制（因为 TCP 协议不知道你的应用什么时候处理完剩余数据），面试官会认为你有真正的排障经验。",
+      "keyPoints": [
+        "CLOSE_WAIT 是被动关闭方独有的状态，出现在收到对端 FIN 并回复 ACK 之后、本端应用调用 close() 之前，内核不会自动清理 CLOSE_WAIT，必须由应用层代码显式调用 close() 才能推进到 LAST_ACK",
+        "TIME_WAIT 出现在主动关闭方且有 2MSL 超时自动回收，CLOSE_WAIT 出现在被动关闭方且没有超时机制——前者是内核在等，后者是内核在等你的代码",
+        "99% 的 CLOSE_WAIT 堆积根因是应用代码 bug：某些异常路径上没有执行到 close()，常见于 HTTP 响应体未关闭、数据库连接在异常分支未归还连接池、Socket read 返回 -1 后未调用 close()",
+        "排查链路为 ss -tnp state close-wait 确认规模和对端地址 → lsof -p <pid> 查看文件描述符消耗 → jstack / goroutine dump 定位持有连接的代码路径 → strace 跟踪 close() 系统调用是否被执行",
+        "Java 的 try-with-resources、Go 的 defer、Python 的 with 语句是防止连接泄漏的语言级保障，获取资源后应立即注册释放，不要将 close() 放在函数末尾手动调用",
+        "连接池配置的 maxLifetime 必须短于数据库的 wait_timeout，并开启连接有效性检查（connection-test-query）和泄漏检测（leak-detection-threshold），从框架层面兜底代码 bug",
+        "CLOSE_WAIT 堆积会持续消耗文件描述符和内核内存，最终导致 Too many open files 或 OOM，生产环境应将 CLOSE_WAIT 数量纳入 Prometheus 监控并设置告警阈值"
+      ],
+      "quiz": [
+        {
+          "id": "computer-network-049-q1-quiz1",
+          "question": "TCP 四次挥手中，CLOSE_WAIT 状态出现在哪一方？",
+          "choices": [
+            {"id": "A", "text": "主动关闭连接的一方，在发送 FIN 之后进入"},
+            {"id": "B", "text": "被动关闭的一方，收到对端 FIN 并回复 ACK 之后进入"},
+            {"id": "C", "text": "双方同时进入，因为 TCP 是全双工协议需要同步状态"},
+            {"id": "D", "text": "主动关闭的一方，在收到对端 FIN 并发送最后一个 ACK 之后进入"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CLOSE_WAIT 是被动关闭方的专属状态。当对端发来 FIN 表示要关闭连接时，本端内核自动回复 ACK，然后 socket 进入 CLOSE_WAIT 状态，等待应用层调用 close() 发出本端的 FIN。A 选项描述的是主动关闭方的 FIN_WAIT_1 状态；C 选项描述的情况叫同时关闭（Simultaneous Close），双方会进入 CLOSING 状态而非 CLOSE_WAIT；D 选项描述的其实是 TIME_WAIT 状态——主动关闭方收到对端 FIN 并发送最后 ACK 后进入 TIME_WAIT。"
+        },
+        {
+          "id": "computer-network-049-q1-quiz2",
+          "question": "CLOSE_WAIT 和 TIME_WAIT 最核心的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "CLOSE_WAIT 没有超时机制，必须等应用层调用 close() 才能推进；TIME_WAIT 有 2MSL 超时，到时间内核自动回收"},
+            {"id": "B", "text": "CLOSE_WAIT 的超时时间是 60 秒，TIME_WAIT 的超时时间是 120 秒"},
+            {"id": "C", "text": "CLOSE_WAIT 消耗的内存比 TIME_WAIT 多十倍以上，所以更危险"},
+            {"id": "D", "text": "CLOSE_WAIT 只出现在 UDP 协议中，TIME_WAIT 只出现在 TCP 协议中"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 CLOSE_WAIT 和 TIME_WAIT 最本质的区别。TIME_WAIT 有明确的 2MSL（Maximum Segment Lifetime，通常 60 秒）超时，时间到了内核自动释放，应用层不需要干预。而 CLOSE_WAIT 完全没有超时机制——TCP 协议规定被动关闭方需要等应用处理完剩余数据再关闭，内核不知道应用什么时候处理完，所以只能一直等 close() 调用。B 选项给 CLOSE_WAIT 加了一个不存在的超时时间；C 选项虽然有一定道理（CLOSE_WAIT 的 socket 确实比 TIME_WAIT 占更多资源），但这不是核心区别；D 选项完全错误，两者都是 TCP 状态。"
+        },
+        {
+          "id": "computer-network-049-q1-quiz3",
+          "question": "大量 CLOSE_WAIT 堆积的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "对端服务器发送了过多的 FIN 报文导致本端处理不过来"},
+            {"id": "B", "text": "网络中间设备（如防火墙）拦截了本端发出的 FIN 报文"},
+            {"id": "C", "text": "应用代码在某些路径上没有调用 close() 关闭 socket，导致内核无法发出 FIN 完成挥手"},
+            {"id": "D", "text": "操作系统内核的 TCP 协议栈存在 bug，未能正确处理 FIN 报文的状态转换"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "CLOSE_WAIT 堆积几乎 100% 是应用层的问题，不是网络问题也不是内核问题。内核在收到 FIN 后已经自动回了 ACK 并标记 socket 为 CLOSE_WAIT，剩下的事就是等应用程序调用 close()。如果应用在异常路径上跳过了 close()——比如 Java 代码没用 try-with-resources、Go 代码没 defer 关闭响应体、Socket read 返回 -1 后没处理——连接就永远卡在 CLOSE_WAIT。A 选项的逻辑不对，FIN 的处理是内核自动完成的，不存在「处理不过来」；B 选项虽然理论上可能，但极其罕见，且现象是连接卡在 FIN_WAIT_1 而非 CLOSE_WAIT；D 选项在现代 Linux 内核中几乎不可能发生。"
+        },
+        {
+          "id": "computer-network-049-q1-quiz4",
+          "question": "以下哪种场景最容易导致 CLOSE_WAIT 连接泄漏？",
+          "choices": [
+            {"id": "A", "text": "使用 HTTP/2 长连接复用时，连接池中的空闲连接超过了服务端的超时时间"},
+            {"id": "B", "text": "Go 代码中调用 http.Get() 后只检查了 err，没有 defer resp.Body.Close()"},
+            {"id": "C", "text": "服务端配置了 TCP keepalive 探测间隔为 60 秒"},
+            {"id": "D", "text": "客户端使用了 SO_LINGER 选项设置了 0 秒的 linger 时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go 的 http.Get() 返回的 resp.Body 是一个 io.ReadCloser，底层关联着一个 TCP 连接。如果不调用 resp.Body.Close()，这个连接既不会归还连接池也不会被关闭。当服务端发送完响应后关闭连接（发 FIN），客户端就会堆积 CLOSE_WAIT。A 选项描述的情况确实可能导致连接失效，但连接池框架通常有健康检查来处理；C 选项的 keepalive 探测只能检测对端消失的情况，跟 CLOSE_WAIT 无关；D 选项设置 SO_LINGER 为 0 会导致连接被 RST 粗暴关闭，反而不会产生 CLOSE_WAIT。"
+        },
+        {
+          "id": "computer-network-049-q1-quiz5",
+          "question": "以下 ss 命令输出中，哪个字段能帮你判断 CLOSE_WAIT 连接上是否还有未读数据？",
+          "choices": [
+            {"id": "A", "text": "Send-Q：发送队列中未确认的字节数"},
+            {"id": "B", "text": "Recv-Q：接收缓冲区中应用层尚未 read() 的字节数"},
+            {"id": "C", "text": "Process：连接所属的进程 PID 和进程名"},
+            {"id": "D", "text": "Peer Address：对端的 IP 地址和端口号"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 CLOSE_WAIT 状态下，Recv-Q 表示接收缓冲区中应用层还没有通过 read() 系统调用取走的字节数。如果 Recv-Q 大于 0，说明对端在发 FIN 之前还发了数据过来，但你的应用没有读取就「卡住」了——可能是阻塞在了其他操作上，也可能是代码逻辑直接跳过了 read。这个信息有助于判断泄漏是「读都没读」还是「读了但没关」。A 选项的 Send-Q 在 CLOSE_WAIT 状态下通常为 0（本端没有数据要发）；C 和 D 提供的是连接归属和对端信息，有用但不能判断数据是否被消费。"
+        },
+        {
+          "id": "computer-network-049-q1-quiz6",
+          "question": "以下 Java 代码哪个写法能正确避免数据库连接泄漏？",
+          "choices": [
+            {"id": "A", "text": "在 try 块最后一行调用 conn.close()，catch 块中不关闭"},
+            {"id": "B", "text": "使用 try-with-resources：try (Connection conn = dataSource.getConnection()) { ... }"},
+            {"id": "C", "text": "依赖 JVM 的 finalize() 方法在 GC 时自动关闭连接"},
+            {"id": "D", "text": "设置连接池 maxLifetime 为 0 让连接永不过期"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "try-with-resources 是 Java 7 引入的资源管理语法，编译器会自动在 try 块结束时（无论正常退出还是异常退出）调用 close()。这从语法层面保证了资源不会泄漏。A 选项是最常见的错误写法——如果 try 块中间抛了异常，最后一行的 conn.close() 不会执行到，而 catch 块又没有关闭逻辑，连接就泄漏了。C 选项依赖 finalize() 是极不靠谱的做法，finalize() 的执行时机不可预测，在 Java 9 后已经被标记为 deprecated。D 选项设置 maxLifetime 为 0 不仅不能防泄漏，还会让连接池中的连接永远不被回收，如果数据库端超时关闭了连接反而更容易产生 CLOSE_WAIT。"
+        },
+        {
+          "id": "computer-network-049-q1-quiz7",
+          "question": "排查 CLOSE_WAIT 问题时，以下哪个工具组合顺序最合理？",
+          "choices": [
+            {"id": "A", "text": "strace 跟踪系统调用 → ss 查看连接状态 → jstack 看线程栈"},
+            {"id": "B", "text": "ss -tnp state close-wait 确认规模和对端 → lsof -p 查看文件描述符 → jstack / goroutine dump 定位代码"},
+            {"id": "C", "text": "tcpdump 抓包分析 → 重启服务恢复 → 修改内核参数降低超时"},
+            {"id": "D", "text": "直接修改 net.ipv4.tcp_fin_timeout 参数缩短 CLOSE_WAIT 超时"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确的排查思路是从宏观到微观：先用 ss 确认有多少 CLOSE_WAIT、连向哪些后端服务（定性定量），再用 lsof 看进程的文件描述符消耗情况（评估影响），最后用 jstack 或 goroutine dump 在代码层面定位哪个调用栈持有连接没释放（找根因）。A 选项把 strace 放第一步太低效了，strace 会产生大量输出且对服务性能有影响，应该在前面的步骤缩小范围后再用。C 选项的 tcpdump 抓包对 CLOSE_WAIT 问题帮助不大（问题在应用层不在网络层），重启只是临时止血，修改内核参数更是牛头不对马嘴。D 选项是一个经典误区——tcp_fin_timeout 控制的是 FIN_WAIT_2 的超时，不是 CLOSE_WAIT，CLOSE_WAIT 根本没有内核超时参数。"
+        },
+        {
+          "id": "computer-network-049-q1-quiz8",
+          "question": "HikariCP 连接池的哪个配置参数能帮助提前发现连接泄漏？",
+          "choices": [
+            {"id": "A", "text": "maximumPoolSize：设置更大的连接池上限来容忍泄漏"},
+            {"id": "B", "text": "leak-detection-threshold：连接借出超过指定时间未归还则打印获取时的堆栈告警"},
+            {"id": "C", "text": "connectionTimeout：缩短获取连接的超时时间让泄漏更快暴露"},
+            {"id": "D", "text": "minimumIdle：减少空闲连接数来限制泄漏的上限"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "leak-detection-threshold 是 HikariCP 专门为检测连接泄漏设计的参数。设置后，HikariCP 会记录每个连接被借出的时刻和获取连接时的堆栈信息，如果连接持有时间超过阈值（比如 30 秒）还没归还，就在日志中打印完整的堆栈——直接告诉你哪行代码拿了连接没还。A 选项是「掩耳盗铃」，增大连接池只是延迟了问题爆发，不解决根因。C 选项缩短 connectionTimeout 只会让借不到连接的线程更快超时报错，但不能定位泄漏源。D 选项减少 minimumIdle 影响的是空闲连接的回收策略，跟泄漏检测无关。"
+        },
+        {
+          "id": "computer-network-049-q1-quiz9",
+          "question": "以下关于 tcp_fin_timeout 内核参数的说法哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "tcp_fin_timeout 控制 CLOSE_WAIT 状态的超时时间，调小可以加速 CLOSE_WAIT 回收"},
+            {"id": "B", "text": "tcp_fin_timeout 控制 FIN_WAIT_2 状态的超时时间，跟 CLOSE_WAIT 没有任何关系"},
+            {"id": "C", "text": "tcp_fin_timeout 同时控制 CLOSE_WAIT 和 TIME_WAIT 的超时时间"},
+            {"id": "D", "text": "tcp_fin_timeout 控制 TIME_WAIT 状态的超时时间，调小可以加速端口回收"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个非常经典的混淆点。tcp_fin_timeout 的名字容易让人误以为它跟「FIN 相关的所有状态」都有关，但它实际上只控制 FIN_WAIT_2 状态的超时——也就是主动关闭方发了 FIN 并收到了 ACK、但还没收到对端 FIN 时的等待时间，默认 60 秒。CLOSE_WAIT 在 Linux 内核中没有超时参数，因为 TCP 协议要求被动关闭方由应用层决定何时关闭。A 选项是最常见的误解，网上大量「调 tcp_fin_timeout 解决 CLOSE_WAIT」的文章都是错的。C 选项把三个不同状态混为一谈。D 选项把 tcp_fin_timeout 和 TIME_WAIT 关联也是错的，TIME_WAIT 的时长是 2MSL，在大多数 Linux 内核中硬编码为 60 秒，不受 tcp_fin_timeout 影响。"
+        },
+        {
+          "id": "computer-network-049-q1-quiz10",
+          "question": "某 Go 服务出现大量连向 Redis 的 CLOSE_WAIT，以下哪种排查和修复思路最可能有效？",
+          "choices": [
+            {"id": "A", "text": "修改 Redis 的 timeout 配置，让 Redis 不要主动断开空闲连接"},
+            {"id": "B", "text": "检查代码中使用 redis.Client 后是否忘记 defer conn.Close()，以及连接池的 IdleTimeout 是否短于 Redis 的 timeout"},
+            {"id": "C", "text": "在 Linux 内核中开启 tcp_tw_recycle 参数加速连接回收"},
+            {"id": "D", "text": "将 Redis 客户端从 TCP 模式改为 Unix Socket 模式避免 TCP 状态问题"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CLOSE_WAIT 连向 Redis 说明 Redis 服务端主动断开了连接（发了 FIN），但 Go 客户端没有关闭对应的 socket。排查方向有两个：一是代码层面——是否从连接池取出连接后在异常路径上没有归还（忘记 defer conn.Close()）；二是连接池配置——客户端连接池的 IdleTimeout 应该短于 Redis 的 timeout 配置，这样连接池会在 Redis 超时断开之前主动回收空闲连接。A 选项只是推迟问题发生的时间，不解决根因；C 选项的 tcp_tw_recycle 控制的是 TIME_WAIT 回收而非 CLOSE_WAIT，而且这个参数在 Linux 4.12 后已经被移除；D 选项即使改为 Unix Socket 模式，如果代码不关闭连接同样会泄漏文件描述符。"
+        }
+      ],
+      "references": [
+        "https://blog.cloudflare.com/this-is-strictly-a-tcp-connection-teardown-story/",
+        "https://man7.org/linux/man-pages/man8/ss.8.html",
+        "https://github.com/brettwooldridge/HikariCP#gear-configuration-knobs-baby"
+      ]
+    }
+  ]
+}

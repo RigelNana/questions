@@ -1,0 +1,158 @@
+{
+  "id": "docker-production-resource-request-limit",
+  "name": "容器资源 Request/Limit 策略",
+  "domain": "docker",
+  "description": "生产环境容器资源 Request/Limit 设定策略与调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-production-resource-request-limit-q1",
+      "domain": "docker",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["docker", "资源管理", "Request", "Limit", "调优"],
+      "title": "生产环境容器资源 Request/Limit 的设定策略",
+      "content": "你所在团队半年前把核心业务迁移到了 Kubernetes 集群（v1.28，80 个节点，混跑在线服务和离线任务）。最近一次季度成本复盘中，FinOps 团队抛出了一组尴尬的数据：整个集群的 CPU 实际利用率只有 18%，内存利用率 35%，但调度器却频繁报出 `0/80 nodes are available: 80 Insufficient cpu` 导致新 Pod 无法调度。换句话说，节点看起来已经「满」了，但物理资源大量闲置。\n\n你打开 Grafana，拉出几个核心服务的监控面板，发现了问题的根源。以订单服务为例，`kubectl top pods` 的输出如下：\n\n```\nNAME                        CPU(cores)   MEMORY(bytes)\norder-svc-6f8b9d4c7-2xk9n   120m         256Mi\norder-svc-6f8b9d4c7-7tmvd   135m         248Mi\norder-svc-6f8b9d4c7-h3p8r   118m         261Mi\n```\n\n但这个服务的 Deployment 资源配置却是：\n\n```yaml\nresources:\n  requests:\n    cpu: \"1000m\"\n    memory: \"1Gi\"\n  limits:\n    cpu: \"2000m\"\n    memory: \"2Gi\"\n```\n\n也就是说，CPU request 设了 1 核但实际只用了 120m 左右（12% 利用率），每个 Pod 白白「预定」了 880m 的 CPU 额度。三副本加起来就是 2.64 核的 CPU 资源被锁死在调度账本上却从未使用。Grafana 上 CPU 用量曲线长期稳定在 request 线的 10-15% 处，只有日终跑批时会短暂冲到 400m——离 2000m 的 limit 线还差得远。\n\n与此同时，另一个推荐服务的情况完全相反：它的 CPU request 只设了 100m，但高峰期实际用量经常飙到 800m。结果就是这些 Pod 频繁遭遇 CPU Throttling，`container_cpu_cfs_throttled_periods_total` 指标显示节流比例高达 45%，P99 延迟从正常的 50ms 飙到 300ms。运维还发现推荐服务的某些 Pod 内存用量缓慢爬升后被 OOM Kill，原因是 memory request 只设了 256Mi 而 limit 设了 2Gi，QoS 等级为 Burstable，在节点内存压力大时首当其冲被驱逐。\n\n面对这种「一半浪费、一半饥饿」的局面，请系统性地回答：Kubernetes 的 Request 和 Limit 在调度和运行时分别扮演什么角色？如何基于监控数据科学地设定这两个值？不同类型的应用（在线服务、离线任务、Java 应用）应该采用什么差异化策略？在集群层面如何通过 LimitRange 和 ResourceQuota 做好兜底管控？",
+      "answer": "要把 Request/Limit 策略讲透，得先理解这两个值在 Kubernetes 的调度和运行时阶段分别做了什么，然后才能讨论生产环境里怎么科学地定值。\n\n## 第一步：Request 和 Limit 的基础概念与底层映射\n\nKubernetes 的资源模型围绕两个核心参数展开：`requests` 是 Pod 向调度器声明的「最低保障」，调度器（kube-scheduler）只看 requests 来决定 Pod 能不能放到某个节点上——节点的 Allocatable 减去所有已调度 Pod 的 requests 总和就是「剩余可分配量」，如果一个新 Pod 的 requests 超过了这个剩余量，调度就会失败。`limits` 则是运行时的「硬天花板」，由 kubelet 通过 cgroup 在节点上强制执行——容器实际使用量超过 limit 就会被内核介入。\n\n理解这两个值，必须搞清楚它们在 Docker/containerd 层面对应的底层机制。CPU request 被映射为 cgroup 的 `cpu.shares`（cgroup v1）或 `cpu.weight`（cgroup v2），这是一个相对权重而非硬限制——当节点 CPU 空闲时，任何容器都可以用超出 request 的 CPU；只有当多个容器竞争同一颗核心时，shares 值才决定每个容器能分到多少时间片。CPU limit 则被映射为 CFS bandwidth control 的 `cpu.cfs_quota_us` 和 `cpu.cfs_period_us`——比如设 limit 为 2000m，就意味着每 100ms 的调度周期内，该容器最多使用 200ms 的 CPU 时间，超过就会被 throttle（节流），表现为进程被暂停等待下一个周期。\n\n内存的映射更直接也更凶残。Memory limit 被写入 cgroup 的 `memory.limit_in_bytes`（v1）或 `memory.max`（v2），容器的物理内存使用一旦触及这个值，内核的 OOM Killer 直接以 SIGKILL 终止进程——连优雅退出的机会都没有。Memory request 则不对应任何 cgroup 参数，它纯粹是调度器的记账工具，运行时不做任何强制。\n\n这里引出一个面试经典考点——QoS Class（服务质量等级）。Kubernetes 根据 requests 和 limits 的设定方式将 Pod 分为三个等级：`Guaranteed` 是所有容器的 requests 都等于 limits，这类 Pod 享有最高优先级，节点资源压力大时最后才被驱逐；`Burstable` 是至少有一个容器设了 requests 但 requests 不等于 limits，在节点压力下优先于 Guaranteed 被驱逐；`BestEffort` 是完全没设 requests 和 limits，最先被驱逐。一个真实的 YAML 配置示例：\n\n```yaml\n# Guaranteed QoS — request == limit\nresources:\n  requests:\n    cpu: \"500m\"\n    memory: \"512Mi\"\n  limits:\n    cpu: \"500m\"\n    memory: \"512Mi\"\n\n# Burstable QoS — request < limit\nresources:\n  requests:\n    cpu: \"200m\"\n    memory: \"256Mi\"\n  limits:\n    cpu: \"1000m\"\n    memory: \"1Gi\"\n```\n\n## 第二步：基于监控数据的科学设定策略\n\n理解了底层机制之后，核心问题就变成了：request 和 limit 到底该设多少？拍脑袋设值是生产环境里最常见的错误，正确做法是「用数据说话」——通过至少 7 天的监控数据覆盖完整的业务周期（包含工作日高峰、周末低谷、月初月末等）来确定基线。\n\n**CPU request 的设定原则是取 P50（中位数）到 P70 之间的用量。** 为什么不是平均值？因为 CPU 用量的分布通常是偏态的——大部分时间用量很低，但周期性地出现尖峰。如果你用平均值设 request，那么 50% 以上的时间实际用量都低于 request，造成资源浪费。Prometheus 的查询示例：\n\n```promql\n# P50 CPU 用量（过去 7 天）\nquantile_over_time(0.5, \n  rate(container_cpu_usage_seconds_total{pod=~\"order-svc.*\"}[5m])[7d:1m]\n)\n\n# P95 CPU 用量（用于设定 limit 参考）\nquantile_over_time(0.95, \n  rate(container_cpu_usage_seconds_total{pod=~\"order-svc.*\"}[5m])[7d:1m]\n)\n```\n\n回到题目中的订单服务，7 天监控数据显示 CPU P50 = 125m，P95 = 380m，P99 = 520m。那么合理的设定是 `request: 200m`（P50 基础上留 50% 余量），`limit: 800m`（P99 基础上留 50% 余量应对极端情况）。相比原来的 request 1000m，直接省了 80% 的调度预算。\n\n**CPU limit 的设定是一个有争议的话题。** Google 的 SRE 团队在公开分享中建议「大多数在线服务不设 CPU limit」，理由是 CFS throttling 会引入不可预测的延迟毛刺——即使节点整体 CPU 空闲率 60%，容器到达 quota 上限仍会被 throttle。Tim Hockin（Kubernetes 联合创始人）也曾在 GitHub issue 中表达过类似观点。但不设 CPU limit 的前提是你对集群的 CPU overcommit 有把控能力。一个折中方案是设一个宽松的 limit（比如 P99 的 2-3 倍），防止单个容器因 bug 吃光整个节点的 CPU，同时在正常运行时不会触发 throttle。\n\n**Memory request 和 limit 应该设为接近甚至相等的值。** 这是和 CPU 策略最大的不同点，原因在于内存超限的惩罚方式完全不同——CPU 超限只是被 throttle（慢一点但还活着），而内存超限直接被 OOM Kill（进程被杀）。如果 memory request 设 256Mi 但 limit 设 2Gi，Pod 的 QoS 变成 Burstable，在节点内存压力大时会被优先驱逐。更危险的是，程序可能在 request 和 limit 之间的灰色地带运行一段时间后突然被 OOM Kill，导致故障排查非常困难。推荐做法是 `memory request ≈ memory limit`，基于 P99 内存用量加 20% 余量来设值。回到订单服务，如果 7 天 P99 内存是 280Mi，那么合理配置是 `request: 350Mi, limit: 384Mi`。\n\n**VPA（Vertical Pod Autoscaler）和 Goldilocks 是自动化推荐工具。** VPA 通过分析历史资源用量自动推荐 request 值，它有三种模式：`Off` 只推荐不执行，`Initial` 只在 Pod 创建时应用推荐值，`Auto` 会直接驱逐 Pod 重建以应用新值。生产环境建议先用 Off 模式跑两周，看看推荐值是否合理：\n\n```yaml\napiVersion: autoscaling.k8s.io/v1\nkind: VerticalPodAutoscaler\nmetadata:\n  name: order-svc-vpa\nspec:\n  targetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: order-svc\n  updatePolicy:\n    updateMode: \"Off\"\n  resourcePolicy:\n    containerPolicies:\n    - containerName: \"*\"\n      minAllowed:\n        cpu: 50m\n        memory: 128Mi\n      maxAllowed:\n        cpu: 2000m\n        memory: 4Gi\n```\n\nFairwinds 公司开源的 Goldilocks 则在 VPA 之上提供了一个可视化 Dashboard，为每个 Deployment 展示「建议 request」和「建议 limit」，并用红黄绿三色标注当前设定与建议值的偏差程度。\n\n**超卖比（Overcommit Ratio）** 是集群层面的全局调控杠杆。超卖比定义为所有 Pod 的 requests 总和与节点实际物理资源的比值。CPU 超卖比 2:1 到 4:1 在在线业务集群中是常见的，意味着你可以在一个 8 核节点上调度 requests 总和为 16-32 核的 Pod——只要这些 Pod 不同时打满。内存超卖比则应控制在 1.2:1 到 1.5:1，因为内存超限是致命的。可以通过 Prometheus 指标监控实际超卖比：\n\n```promql\n# 节点级 CPU 超卖比\nsum(kube_pod_container_resource_requests{resource=\"cpu\"}) by (node)\n/\nkube_node_status_allocatable{resource=\"cpu\"}\n```\n\n## 第三步：体系化扩展——不同应用类型的差异化策略与集群管控\n\n不同类型的应用在资源行为上差异巨大，不能一套策略打天下。\n\n**在线服务（API Gateway、Web 后端）** 对延迟敏感，CPU throttle 直接影响 P99。推荐策略：CPU request 基于 P50-P70 用量，CPU limit 设为宽松值（P99 × 2）或不设，memory request ≈ limit 基于 P99 用量 + 20% buffer，QoS 目标是 Guaranteed 或接近 Guaranteed 的 Burstable。\n\n**离线任务（Spark Job、数据 ETL、定时批处理）** 对延迟不敏感但追求吞吐量。推荐策略：CPU request 设低（给在线服务让路），CPU limit 设较高允许空闲时刻占满节点，memory limit 基于历史峰值设定。配合 PriorityClass 设为低优先级，节点资源紧张时优先抢占离线任务：\n\n```yaml\napiVersion: scheduling.k8s.io/v1\nkind: PriorityClass\nmetadata:\n  name: batch-low\nvalue: 100\nglobalDefault: false\ndescription: \"低优先级离线任务，资源紧张时可被抢占\"\n```\n\n**Java 应用** 是资源设定的重灾区。JVM 的堆（Heap）只是内存占用的一部分，还有 Metaspace、线程栈（每线程默认 1MB）、CodeCache、DirectByteBuffer、GC 本身的数据结构。经验公式是 `memory limit = MaxHeapSize / 0.6 到 0.7`。比如堆设 512MB，memory limit 至少要设 750Mi-850Mi。同时 JVM 需要配置容器感知参数（JDK 8u191+）：\n\n```bash\njava -XX:MaxRAMPercentage=65.0 \\\n     -XX:InitialRAMPercentage=50.0 \\\n     -XX:+UseContainerSupport \\\n     -jar app.jar\n```\n\n**LimitRange** 和 **ResourceQuota** 是集群管理员在 namespace 层面做兜底管控的两道防线。LimitRange 为单个 Pod/Container 设定默认值和上下限，防止开发者提交一个没写 resources 的 Deployment 导致 BestEffort Pod 泛滥：\n\n```yaml\napiVersion: v1\nkind: LimitRange\nmetadata:\n  name: default-limits\n  namespace: production\nspec:\n  limits:\n  - type: Container\n    default:          # 不写 resources 时自动注入\n      cpu: \"500m\"\n      memory: \"512Mi\"\n    defaultRequest:\n      cpu: \"100m\"\n      memory: \"128Mi\"\n    max:              # 单个容器不能超过\n      cpu: \"4000m\"\n      memory: \"8Gi\"\n    min:\n      cpu: \"50m\"\n      memory: \"64Mi\"\n```\n\nResourceQuota 则限制整个 namespace 的资源总量，防止单个团队过度消耗集群资源：\n\n```yaml\napiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: team-order\n  namespace: order-team\nspec:\n  hard:\n    requests.cpu: \"40\"\n    requests.memory: \"80Gi\"\n    limits.cpu: \"80\"\n    limits.memory: \"160Gi\"\n    pods: \"200\"\n```\n\n成本优化的核心思路可以总结为「四步走」：第一，用 VPA Off 模式或 Goldilocks 跑两周采集推荐值；第二，按 P50-P70 设 request、P99×1.5 设 limit 的策略批量调整；第三，通过 LimitRange 防止新 Deployment「裸奔」；第四，持续监控实际超卖比和节点利用率，用 `kube_pod_container_resource_requests` vs `container_cpu_usage_seconds_total` 的比值作为 Dashboard 核心指标。某电商团队用这套方法论把 CPU 利用率从 18% 提升到了 55%，在不增加节点的情况下多承载了 40% 的服务。\n\n面试中关于 Request/Limit 的高频追问包括：CPU throttle 和 OOM Kill 的区别（一个是限速一个是杀进程）、QoS 三个等级的驱逐顺序、为什么内存 request 要约等于 limit 而 CPU 不用、VPA 和 HPA 能否同时使用（可以，但不能都管 CPU——VPA 管 request 值，HPA 管副本数，通常让 VPA 管内存、HPA 管 CPU）、以及超卖比设多少合适这种开放题。能够从底层 cgroup 映射讲到监控数据驱动的设值方法论，再到集群级管控和不同应用的差异化策略，就足以展现出你对 Kubernetes 资源管理的体系化理解。",
+      "keyPoints": [
+        "CPU request 映射为 cgroup cpu.shares（相对权重），CPU limit 映射为 CFS quota（绝对上限），超过 quota 的容器会被 throttle 而不是被杀",
+        "Memory limit 映射为 cgroup memory.max，超限直接触发 OOM Kill，因此 memory request 应尽量等于 limit 以获得 Guaranteed QoS 保护",
+        "QoS 三个等级（Guaranteed > Burstable > BestEffort）决定了节点资源压力下的驱逐顺序，Guaranteed 要求所有容器的 request 等于 limit",
+        "CPU request 应基于 P50-P70 历史用量设定而非拍脑袋，避免调度预算浪费；CPU limit 可设宽松值或对延迟敏感服务不设",
+        "VPA Off 模式可安全地收集推荐值而不修改 Pod，Goldilocks 在 VPA 之上提供可视化对比 Dashboard",
+        "CPU 超卖比 2:1 到 4:1 在在线业务中可接受，内存超卖比应控制在 1.2:1 到 1.5:1 以避免连锁 OOM",
+        "Java 应用的 memory limit 必须覆盖堆内存 + Metaspace + 线程栈 + DirectBuffer，经验公式为 MaxHeap / 0.65",
+        "LimitRange 为 namespace 内容器注入默认 resources 防止 BestEffort Pod 泛滥，ResourceQuota 限制 namespace 总资源用量"
+      ],
+      "quiz": [
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz1",
+          "question": "Kubernetes 中，kube-scheduler 在决定 Pod 调度到哪个节点时，参考的是哪个资源参数？",
+          "choices": [
+            {"id": "A", "text": "containers[].resources.requests，调度器根据节点剩余 Allocatable 减去所有已调度 Pod 的 requests 总和来判断"},
+            {"id": "B", "text": "containers[].resources.limits，调度器必须保证节点能满足所有 Pod 的最大资源需求"},
+            {"id": "C", "text": "requests 和 limits 的平均值，调度器取两者均值作为评估基准"},
+            {"id": "D", "text": "Pod 运行时的实际用量，调度器通过 metrics-server 获取实时数据来决策"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "kube-scheduler 在调度时只看 requests，不看 limits 也不看实际用量。节点的「可分配量」= Allocatable - 已调度 Pod 的 requests 总和。如果剩余量不够容纳新 Pod 的 requests，调度失败并报 Insufficient cpu/memory。这就是为什么题目中 CPU 实际利用率只有 18% 却出现调度失败——因为 requests 设得过高把调度账本占满了，但实际物理资源大量闲置。选项 B 的错误在于 limits 只在运行时由 kubelet 通过 cgroup 强制执行，与调度无关。选项 D 的错误在于调度器是静态决策，不依赖运行时指标。"
+        },
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz2",
+          "question": "CPU limit 在 cgroup v1 中被映射为什么底层机制？",
+          "choices": [
+            {"id": "A", "text": "cpu.shares，设置 CPU 时间片的相对权重"},
+            {"id": "B", "text": "cpuset.cpus，将容器绑定到特定的 CPU 核心"},
+            {"id": "C", "text": "cpu.cfs_quota_us 和 cpu.cfs_period_us，实现 CFS Bandwidth Control 硬限制"},
+            {"id": "D", "text": "cpu.stat 文件中的 throttled_time 参数"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "CPU limit 通过 CFS Bandwidth Control 实现，对应 cgroup 的 cpu.cfs_quota_us（配额）和 cpu.cfs_period_us（周期，默认 100ms）。例如 limit 为 2000m 意味着 quota = 200000us / period = 100000us，即每 100ms 最多用 200ms CPU 时间（相当于 2 个核心）。超过配额容器会被 throttle——进程暂停等待下一周期。选项 A 是 CPU request 的映射，shares 是相对权重而非硬限制。选项 B 是 cpuset 调度策略而非 CFS 带宽控制。选项 D 是 throttle 的统计指标而非控制参数。"
+        },
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz3",
+          "question": "以下哪个 Pod 的资源配置会获得 Guaranteed QoS 等级？",
+          "choices": [
+            {"id": "A", "text": "只设了 requests 没设 limits"},
+            {"id": "B", "text": "limits 大于 requests，两者都设了但不相等"},
+            {"id": "C", "text": "既没设 requests 也没设 limits"},
+            {"id": "D", "text": "所有容器的 requests 和 limits 完全相等（cpu 和 memory 都设且值相同）"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Guaranteed QoS 的条件是 Pod 内所有容器的 cpu 和 memory 都设了 requests 和 limits，且每个容器的 request == limit。这类 Pod 享有最高优先级，节点内存压力大时最后才被 kubelet 驱逐。选项 A 只设 requests 不设 limits 属于 Burstable。选项 B 是典型的 Burstable（request < limit）。选项 C 完全不设资源声明属于 BestEffort，节点资源紧张时第一个被驱逐。面试中常追问：为什么内存密集型服务推荐 Guaranteed？因为 Burstable Pod 在节点内存压力下会被优先驱逐或 OOM Kill。"
+        },
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz4",
+          "question": "生产环境中，为什么推荐 memory request 和 memory limit 设为接近甚至相等的值？",
+          "choices": [
+            {"id": "A", "text": "因为内存不像 CPU 可以被 throttle，内存超过 limit 直接触发 OOM Kill 终止进程，且 request ≈ limit 可获得 Guaranteed QoS 减少被驱逐风险"},
+            {"id": "B", "text": "因为 Linux 内核不支持内存的弹性分配，必须在启动时固定"},
+            {"id": "C", "text": "因为 Kubernetes 不支持内存 limit 大于 request 的配置，YAML 校验会报错"},
+            {"id": "D", "text": "因为内存价格比 CPU 贵很多，需要精确控制避免浪费"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "CPU 超限的惩罚是 throttle（限速，进程慢但不死），内存超限的惩罚是 OOM Kill（进程直接被 SIGKILL）。如果 memory request 远小于 limit，Pod 的 QoS 会是 Burstable，在节点内存压力大时优先被驱逐。程序可能在 request 和 limit 之间的灰色地带运行一段时间后突然被 Kill，导致排查困难。设 request ≈ limit 既能获得 Guaranteed QoS 保护，又能避免程序在「看起来正常实际随时可能被杀」的状态下运行。选项 B 错误，Linux 完全支持动态内存分配。选项 C 错误，K8s 允许 limit > request。"
+        },
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz5",
+          "question": "通过 Prometheus 查询某服务 7 天的 CPU P95 用量为 380m，P50 为 125m，以下哪个 CPU request/limit 设定最合理？",
+          "choices": [
+            {"id": "A", "text": "request: 1000m, limit: 2000m（大幅超过实际用量，确保安全）"},
+            {"id": "B", "text": "request: 200m, limit: 800m（request 基于 P50 加余量，limit 基于 P95 加余量应对极端峰值）"},
+            {"id": "C", "text": "request: 380m, limit: 380m（直接用 P95 作为固定值）"},
+            {"id": "D", "text": "request: 50m, limit: 不设（最大化节点利用率）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CPU request 基于 P50-P70 加适当余量（这里 125m 的 P50 加 60% 余量取 200m），既不浪费调度预算，又保证日常运行的基本保障。CPU limit 基于 P95-P99 加余量（380m 的 P95 加倍取 800m），覆盖绝大多数峰值场景同时防止异常情况吃光节点。选项 A 是题目中原始配置的翻版——request 1000m 但实际只用 120m，造成 80% 的调度浪费。选项 C 用 P95 做 request 会导致 95% 的时间都在浪费。选项 D request 过低，竞争时分不到足够 CPU。"
+        },
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz6",
+          "question": "以下关于 CPU Throttling 的说法，哪个是错误的？",
+          "choices": [
+            {"id": "A", "text": "CPU Throttling 只在节点所有 CPU 都被占满时才会发生"},
+            {"id": "B", "text": "即使节点整体 CPU 空闲率很高，设了 CPU limit 的容器仍可能被 throttle"},
+            {"id": "C", "text": "可以通过 container_cpu_cfs_throttled_periods_total 指标监控 throttle 的发生频率"},
+            {"id": "D", "text": "被 throttle 的容器不会被杀死，只是暂停等待下一个 CFS 周期"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个非常常见的误解。CPU throttling 由 CFS Bandwidth Control 的 quota 硬限制触发，与节点整体 CPU 利用率无关。只要容器在当前 100ms 周期内用完了自己的 quota，就会被 throttle——即使此时节点上其他核心完全空闲。这也是为什么 Google SRE 团队建议在线服务不设 CPU limit 或设宽松值，因为 throttle 引入的延迟毛刺对 P99 伤害极大。选项 B 正确描述了这个反直觉行为。选项 C 正确，该指标是诊断 throttle 的核心指标。选项 D 正确，throttle 只是暂停不是终止。"
+        },
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz7",
+          "question": "VPA（Vertical Pod Autoscaler）的 updateMode 设为 \"Off\" 时，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "VPA 完全不工作，不采集数据也不推荐"},
+            {"id": "B", "text": "VPA 持续采集历史用量并生成推荐值，但不自动修改 Pod 的 resources 配置"},
+            {"id": "C", "text": "VPA 只在 Pod 首次创建时注入推荐值，之后不再更新"},
+            {"id": "D", "text": "VPA 直接驱逐并重建 Pod 以应用新的推荐值"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "VPA 的 Off 模式是生产环境的安全入口——它持续运行 Recommender 组件分析历史资源用量并计算推荐值，但不会触发任何实际变更。运维团队可以通过 `kubectl describe vpa <name>` 查看推荐的 request 值，人工评估合理性后再手动调整 Deployment。选项 C 描述的是 Initial 模式，只在 Pod 创建时注入推荐值。选项 D 描述的是 Auto 模式，会驱逐 Pod 并以新推荐值重建。生产环境建议先用 Off 模式跑 1-2 周验证推荐值，再逐步升级到 Initial 或 Auto。"
+        },
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz8",
+          "question": "某 Java 服务的 JVM 堆设为 512MB，容器 memory limit 设为 600Mi，频繁被 OOM Kill。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "JVM 的实际内存占用远超堆大小，Metaspace、线程栈、CodeCache、DirectBuffer 等堆外内存导致总 RSS 超过 600Mi"},
+            {"id": "B", "text": "cgroup 的 memory.limit_in_bytes 只限制堆内存，不限制堆外内存"},
+            {"id": "C", "text": "JDK 不支持在容器内运行，必须使用 GraalVM Native Image"},
+            {"id": "D", "text": "600Mi 的 limit 会被 Kubernetes 自动向下取整为 512Mi"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "JVM 的实际物理内存（RSS）= Heap + Metaspace + ThreadStack × 线程数 + CodeCache + DirectByteBuffer + GC 数据结构 + JNI 原生分配。假设 512MB 堆 + 128MB Metaspace + 200 线程 × 1MB 栈 = 200MB + 64MB CodeCache，总计约 904MB，远超 600Mi 的 limit。经验公式是 memory limit ≈ MaxHeapSize / 0.6-0.7，即 512 / 0.65 ≈ 787Mi，至少设 800Mi 才安全。选项 B 错误，cgroup 限制的是进程整体的物理内存，不区分堆内堆外。选项 D 错误，K8s 不会修改用户设定的 limit 值。"
+        },
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz9",
+          "question": "以下关于 LimitRange 和 ResourceQuota 的描述，哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "LimitRange 作用于整个集群，ResourceQuota 作用于单个 namespace"},
+            {"id": "B", "text": "两者功能完全相同，只是语法不同"},
+            {"id": "C", "text": "LimitRange 为单个容器/Pod 设定默认值和上下限，ResourceQuota 限制 namespace 内资源总量"},
+            {"id": "D", "text": "ResourceQuota 可以自动调整 Pod 的 resources 值，类似 VPA 的功能"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "LimitRange 和 ResourceQuota 是两道不同粒度的防线。LimitRange 针对单个容器或 Pod，可以设定 default（默认 limit）、defaultRequest（默认 request）、max（上限）和 min（下限），最重要的功能是自动为没写 resources 的容器注入默认值，防止 BestEffort Pod 泛滥。ResourceQuota 针对整个 namespace，限制该 namespace 内所有 Pod 的 requests/limits 总和、Pod 数量上限等，防止单个团队过度消耗集群资源。选项 A 错误，LimitRange 也是 namespace 级别的，不是集群级。选项 D 错误，ResourceQuota 只做准入控制不会修改值。"
+        },
+        {
+          "id": "docker-production-resource-request-limit-q1-quiz10",
+          "question": "在一个混跑在线服务和离线任务的 K8s 集群中，以下哪种策略最合理？",
+          "choices": [
+            {"id": "A", "text": "所有工作负载统一使用相同的 request/limit 比例"},
+            {"id": "B", "text": "在线服务设高 request 低 limit，离线任务设低 request 高 limit"},
+            {"id": "C", "text": "在线服务用较高 request + 接近的 limit（趋向 Guaranteed），离线任务用低 request + 高 limit + 低 PriorityClass，资源紧张时抢占离线任务"},
+            {"id": "D", "text": "不设任何 request/limit，完全靠操作系统的 OOM Killer 自然淘汰"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "混合集群的核心策略是「在线优先，离线让路」。在线服务对延迟敏感，需要较高 request 保证 CPU 竞争时的优先级，memory request ≈ limit 获得 Guaranteed QoS 防止被驱逐。离线任务对延迟不敏感但追求吞吐，低 request 意味着容易调度上去，高 limit 允许空闲时刻占满节点。配合 PriorityClass 设低优先级，当在线服务需要扩容时，调度器会抢占低优先级的离线 Pod。选项 B 「在线服务低 limit」会导致 throttle 增加 P99 延迟，方向错误。选项 D 在生产环境完全不可接受。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/manage-resources/",
+        "https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler",
+        "https://github.com/FairwindsOps/goldilocks",
+        "https://home.robusta.dev/blog/stop-using-cpu-limits"
+      ]
+    }
+  ]
+}

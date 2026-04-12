@@ -1,0 +1,156 @@
+{
+  "id": "docker-cgroup-isolation-tradeoffs",
+  "name": "容器资源隔离设计权衡",
+  "domain": "docker",
+  "description": "探讨多租户容器平台中资源隔离与公平调度的设计权衡",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-cgroup-isolation-tradeoffs-q1",
+      "domain": "docker",
+      "type": "open-ended",
+      "difficulty": 3,
+      "tags": ["docker", "资源隔离", "多租户", "调度", "设计", "cgroup", "noisy-neighbor", "混部"],
+      "title": "容器资源隔离与公平调度的设计权衡",
+      "content": "你负责一个多租户容器平台，规模是 200 台物理机、日均运行约 6000 个容器，租户分为「在线服务」和「离线计算」两大类。平台当前的资源管理策略比较粗放——只对 CPU 和内存设了硬上限（`--cpus` 和 `--memory`），磁盘 IO 和网络带宽没有做任何隔离。\n\n某天凌晨 2 点，A 租户的核心在线交易服务告警：P99 延迟从平时的 15ms 飙到了 800ms，QPS 从 12000 下降到 3000。你登上宿主机排查，用 `iostat -x 1` 看到磁盘使用率已经 100%：\n\n```\nDevice   r/s    w/s   rkB/s    wkB/s  await  svctm  %util\nsda     12.00 4850.00  48.00 620800.00 185.60   0.21 100.00\n```\n\n写入 IOPS 达到 4850、吞吐 620MB/s，`await`（平均 IO 等待时间）飙到 185ms。你用 `iotop -oP` 定位到罪魁祸首——B 租户的一个 Spark 离线任务在疯狂写中间结果到本地磁盘，单进程写入速率超过 600MB/s。A 租户的在线服务需要做少量的日志写入和偶尔的磁盘读取，但因为磁盘 IO 队列被 B 租户占满，每次 IO 请求的 `await` 从正常的 0.5ms 涨到了 185ms，直接拖垮了响应延迟。\n\n进一步排查发现，这台宿主机上 CPU 平均利用率只有 35%、内存使用率 60%，从 CPU 和内存维度看资源还很充裕，但磁盘 IO 这个维度已经被严重挤压。更麻烦的是，你检查了其他几台混部机器，发现类似的 Noisy Neighbor（嘈杂邻居）问题在不同维度反复出现——有的是网络带宽被大数据导出任务占满，有的是某个容器的 CPU throttle 严重但 shares 配比不合理。\n\n现在要求你设计一个完整的资源隔离方案。目标是：在线服务的延迟 SLA 必须得到保障（P99 < 50ms），同时离线任务能最大化利用闲时资源，整体集群利用率不能低于 55%。你会怎么设计？需要考虑 CPU、内存、磁盘 IO、网络带宽四个维度的隔离策略，以及优先级、超卖、Noisy Neighbor 检测等问题。",
+      "answer": "## 第一步：容器资源隔离基础概念详解\n\n要设计多租户资源隔离方案，首先得搞清楚容器资源隔离的本质是什么。容器不是虚拟机，它和宿主机共享同一个 Linux 内核，所有容器的进程本质上都是宿主机上的普通进程。资源隔离靠的是 Linux 内核的 cgroup（Control Groups）机制——把一组进程放进一个「控制组」，然后通过往 `/sys/fs/cgroup/` 下的控制文件写入参数来限制这组进程能使用多少 CPU、内存、磁盘 IO 等资源。Docker 的 `--cpus`、`--memory`、`--device-read-bps` 这些参数，底层全部是在操作 cgroup 的控制文件。\n\n为什么需要隔离？因为所有容器共享宿主机的物理资源池，如果不加限制，任何一个容器都可以把整台机器的某种资源吃光，导致同机器上其他容器「饿死」。这就是经典的 Noisy Neighbor（嘈杂邻居）问题——你的邻居太吵了，把你的资源都抢走了。题目中 B 租户 Spark 任务吃光磁盘 IO 导致 A 租户延迟飙升，就是典型案例。\n\n资源隔离的维度不只是 CPU 和内存。一个完整的隔离方案至少要覆盖四个维度：CPU 时间片（通过 cgroup 的 cpu 子系统）、内存容量（memory 子系统）、磁盘 IO 带宽和 IOPS（blkio / io 子系统）、网络带宽（内核 tc 流量控制）。现实中大部分团队只做了前两个维度就觉得「够了」，结果线上一出 IO 或网络维度的 Noisy Neighbor 问题就手忙脚乱——正如题目描述的场景。\n\n## 第二步：多维度资源隔离的设计权衡\n\n### CPU 隔离：shares + quota 的组合策略\n\nCPU 隔离有两个核心机制：`cpu.shares`（软限制 / 权重）和 `cpu.cfs_quota_us` + `cpu.cfs_period_us`（硬限制 / 配额）。设计的关键权衡是：只用硬限制（quota）会浪费资源，只用软限制（shares）无法保障 SLA。\n\n硬限制的含义是「无论 CPU 多空闲，你最多只能用这么多」。比如 `--cpus=2` 意味着每 100ms 调度周期内，这个容器最多消耗 200ms 的 CPU 时间。好处是确定性强，坏处是如果整台机器只有这一个容器在跑，剩下的 CPU 也不让它用，白白浪费。软限制 `cpu.shares` 是比例权重，只在 CPU 发生竞争时才起作用——如果机器空闲，shares 值低的容器照样可以用满所有 CPU 核心。\n\n对于多租户平台，推荐的组合策略是：在线服务设置 quota 作为上限防止单个服务占满整机，同时设置较高的 shares（比如 4096）保证竞争时优先获得 CPU；离线任务不设 quota（或设很大的值），设置较低的 shares（比如 256），让它们在 CPU 空闲时充分利用资源，一旦在线服务需要 CPU 就立刻让出来。\n\n```bash\n# 在线服务容器：保障型配置\ndocker run --cpus=4 --cpu-shares=4096 online-service\n# cgroup 效果：quota=400000/period=100000, shares=4096\n\n# 离线任务容器：弹性配置\ndocker run --cpu-shares=256 offline-job\n# cgroup 效果：quota=-1(无上限), shares=256\n```\n\n这里有个常见的坑：很多人以为 `cpu.shares` 是绝对值，实际上它是相对比例。如果一台机器上只有一个 shares=256 的离线容器，它照样能用满所有 CPU。只有当多个容器同时竞争 CPU 时，shares 的比例才会生效。这正是我们想要的效果——闲时离线任务全力跑，忙时在线服务优先。\n\n另一个值得注意的点是 CPU throttling。当容器的 CPU 使用量在一个 period（默认 100ms）内达到 quota 上限时，内核会暂停该容器的所有线程直到下一个 period 开始。这就是 `cpu.stat` 文件中 `nr_throttled` 和 `throttled_time` 的含义。你可以通过 `cat /sys/fs/cgroup/cpu/docker/<id>/cpu.stat` 查看容器被 throttle 了多少次。如果在线服务频繁被 throttle，说明 quota 设得太紧，需要适当放宽。\n\n### 内存隔离：硬限制 + 软限制的配合\n\n内存隔离相比 CPU 要更「刚性」，因为内存不像 CPU 时间片那样可以「分时共享」——一块内存被进程 A 占了，进程 B 就用不了。cgroup 提供两个关键参数：`memory.limit_in_bytes`（硬上限，cgroup v2 中是 `memory.max`）触达后触发 OOM Kill，`memory.soft_limit_in_bytes`（软上限，v2 中是 `memory.high`）触达后内核会积极回收该 cgroup 的页面缓存但不杀进程。\n\n推荐策略是：在线服务的 `memory.limit` 设为实际峰值的 1.2-1.5 倍，`memory.soft_limit` 设为日常稳态值，这样既能防止 OOM 又能在内存紧张时优先回收在线服务不太需要的缓存页。离线任务的 `memory.limit` 设为严格值，超了就 OOM Kill 并自动重试，因为离线任务通常具备幂等性。\n\n### IO 隔离：blkio 权重 + 带宽限制\n\n这是题目中 Noisy Neighbor 的直接成因，也是大部分容器平台做得最差的一个维度。cgroup 的 blkio 子系统（v2 中是 io 控制器）提供两种限制方式：基于权重的比例分配（`blkio.weight`，类似 CPU 的 shares）和基于绝对值的带宽/IOPS 限速（`blkio.throttle.read_bps_device` / `blkio.throttle.write_bps_device`）。\n\n针对题目场景，推荐的方案是：给在线服务设置较高的 blkio 权重（比如 500，默认值是 100-1000 范围内），给离线任务设置较低的权重（比如 100）；同时给离线任务加上绝对带宽上限，防止极端情况。\n\n```bash\n# 离线任务：IO 权重低 + 写入带宽硬上限 100MB/s\ndocker run --blkio-weight=100 \\\n  --device-write-bps /dev/sda:100mb \\\n  --device-write-iops /dev/sda:1000 \\\n  offline-spark-job\n\n# 在线服务：IO 权重高，不设绝对上限\ndocker run --blkio-weight=500 online-service\n```\n\n但 blkio 有一个大坑需要注意：在 cgroup v1 中，blkio throttle 只对 Direct IO 生效，对经过 Page Cache 的 Buffered IO 几乎无效。也就是说，如果 Spark 任务用的是 Buffered Write（大部分应用默认如此），`blkio.throttle.write_bps_device` 限制的只是实际落盘的速率，应用层的写入速度可能远超这个限制——数据先写入 Page Cache，然后由内核的 writeback 线程异步刷盘。真正在 Buffered IO 场景下也能生效的 IO 限制，需要 cgroup v2 的 io 控制器（它在 writeback 路径上做了标记，能正确追踪每个 cgroup 产生的脏页），或者强制应用使用 Direct IO（`O_DIRECT` 标志）。这就是为什么很多团队配了 blkio 限制却觉得「没效果」——不是配错了，是 v1 的先天缺陷。\n\n### 网络带宽隔离：tc 流量控制\n\n网络带宽隔离不在 cgroup 的能力范围内（cgroup v1 的 net_cls 子系统只做分类标记，不做限速），需要借助 Linux 内核的 Traffic Control（tc）子系统。tc 工作在网络设备的 qdisc（排队规则）层，可以对出站流量做精确的带宽限制和优先级调度。\n\n一个典型的做法是用 HTB（Hierarchical Token Bucket）qdisc 为不同优先级的容器分配带宽：\n\n```bash\n# 在宿主机的 eth0 上创建 HTB 根 qdisc\ntc qdisc add dev eth0 root handle 1: htb default 30\n\n# 总带宽 10Gbps，在线服务保证 8Gbps\ntc class add dev eth0 parent 1: classid 1:10 htb \\\n  rate 8gbit ceil 10gbit prio 1\n\n# 离线任务保证 1Gbps，最多突发到 5Gbps\ntc class add dev eth0 parent 1: classid 1:20 htb \\\n  rate 1gbit ceil 5gbit prio 2\n\n# 用 cgroup net_cls 或 iptables mark 将容器流量分到对应 class\n```\n\n这个配置的核心设计是：在线服务有 8Gbps 的保底带宽（`rate`），网络空闲时可以用满 10Gbps（`ceil`），优先级为 1（最高）。离线任务保底 1Gbps，空闲时可突发到 5Gbps，优先级为 2。当网络拥塞时，HTB 会优先保证高优先级 class 的 `rate`，低优先级 class 只能分到剩余带宽。\n\n### Noisy Neighbor 的检测与处理\n\n光有隔离配置还不够，你还需要一套检测机制来发现「隔离策略被突破」或「配置不当」的情况。推荐的检测指标包括：CPU 维度监控 `cpu.stat` 中的 `nr_throttled`（被节流次数）和 `throttled_time`（被节流总时长）；内存维度监控 `memory.usage_in_bytes` 与 `memory.limit_in_bytes` 的比值；IO 维度监控 `iostat` 的 `await`（IO 等待时间）和 `%util`（磁盘利用率）；网络维度监控 `tc -s class show dev eth0` 的丢包和延迟。\n\n检测到 Noisy Neighbor 后的处理策略有三级：第一级「动态降权」——通过 cgroup 控制文件热调低嘈杂容器的 shares/weight/bandwidth，这是无损的，秒级生效；第二级「迁移驱逐」——将嘈杂容器迁移到专用的离线计算节点池，从根源上消除干扰；第三级「Kill 重调度」——对于严重影响在线 SLA 的离线任务直接杀掉并在其他节点重新调度。\n\n## 第三步：体系化扩展延伸\n\n**超卖策略（Overcommit）与资源回收。** 要让集群利用率超过 55%，必须做超卖——允许所有容器的资源请求总和超过物理资源总量。关键在于「卖给谁」。在线服务的资源必须是「实打实」的（request=limit，对应 Kubernetes 的 Guaranteed QoS），调度器保证物理机上一定有足够资源。超卖的空间来自离线任务——它们只设 request 不设 limit（对应 Burstable QoS），request 值设得很低用于调度占位，实际运行时可以使用节点上所有闲置资源。当在线服务需要资源时，离线任务通过低 shares/weight 自动让出。这就是业界所说的「在离线混部」策略，字节跳动、阿里巴巴的大规模集群都采用了这种模式，能把整体利用率从 30% 拉到 60% 以上。\n\n**Kubernetes QoS Class 的落地。** 在 K8s 体系中，上述策略映射为三种 QoS 等级：Guaranteed（requests=limits，oom_score_adj=-997，最后被杀）适用于在线核心服务；Burstable（requests<limits）适用于在线非核心服务；BestEffort（不设 requests/limits，oom_score_adj=1000，最先被杀）适用于离线批处理。节点资源紧张时 kubelet 的 eviction manager 按 BestEffort → Burstable → Guaranteed 的顺序驱逐 Pod。AWS ECS 则通过 Task Placement Strategies（binpack / spread）和 Capacity Providers 来实现类似的效果。\n\n**面试回答策略。** 回答这类开放设计题时，建议按三层递进：第一层讲隔离维度——CPU（shares+quota）、Memory（hard+soft limit）、IO（blkio weight+throttle）、Network（tc HTB），让面试官知道你了解全貌而不只是 CPU/Memory；第二层讲设计权衡——硬限制 vs 软限制的取舍、超卖策略、在离线混部的优先级设计，展示你有系统性思维；第三层讲检测与自愈——Noisy Neighbor 指标监控、动态降权、迁移驱逐，证明你考虑了运维可行性。如果能提到 cgroup v1 blkio 对 Buffered IO 无效这个坑点，基本就超越 95% 的候选人了。",
+      "keyPoints": [
+        "CPU 隔离推荐 shares + quota 组合策略：在线服务设 quota 防过载且 shares 设高（如 4096）保证竞争优先，离线任务不设 quota 但 shares 设低（如 256），实现闲时充分利用、忙时自动让出",
+        "cgroup v1 的 blkio throttle 只对 Direct IO 生效，对经过 Page Cache 的 Buffered IO 几乎无效——这是大部分团队配了 IO 限制却觉得没效果的根本原因，需要升级到 cgroup v2 的 io 控制器才能正确追踪 Buffered IO 的脏页归属",
+        "网络带宽隔离不属于 cgroup 能力范围，需要借助 Linux tc（Traffic Control）子系统的 HTB qdisc，通过 rate 保底带宽、ceil 突发上限、prio 优先级三个参数为不同类型容器分配网络资源",
+        "内存隔离推荐 hard limit + soft limit 配合：在线服务的 memory.limit 设为峰值的 1.2-1.5 倍防 OOM，memory.soft_limit 设为稳态值触发优先回收缓存页；离线任务设严格 limit，超限直接 OOM Kill 并重试",
+        "Noisy Neighbor 检测需覆盖四个维度的核心指标：CPU 看 nr_throttled 和 throttled_time、内存看 usage/limit 比值、IO 看 iostat 的 await 和 %util、网络看 tc class 统计的丢包和延迟",
+        "在离线混部的超卖策略：在线服务 request=limit（Guaranteed QoS）确保资源实打实，离线任务低 request 高弹性利用闲置资源，通过低 shares/weight 在资源竞争时自动让出，整体利用率可从 30% 提升到 60%+",
+        "处理 Noisy Neighbor 的三级响应：动态降权（秒级无损）→ 迁移驱逐（分钟级根治）→ Kill 重调度（紧急兜底），需要监控系统与调度系统联动实现自动化闭环"
+      ],
+      "quiz": [
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz1",
+          "question": "在多租户容器平台中，为什么 CPU 隔离通常需要 cpu.shares 和 cpu.cfs_quota_us 配合使用，而不是只用其中一种？",
+          "choices": [
+            {"id": "A", "text": "shares 提供竞争时的优先级比例分配，quota 提供绝对上限防止单容器占满整机，两者配合既保证公平性又防止资源浪费"},
+            {"id": "B", "text": "shares 和 quota 功能完全相同，只是 API 不同，配合使用是为了向后兼容 cgroup v1 和 v2"},
+            {"id": "C", "text": "shares 控制内存分配比例，quota 控制 CPU 时间片，两者分别管不同资源所以必须都配置"},
+            {"id": "D", "text": "只用 quota 就足够了，shares 是过时的参数，现代 Docker 版本已经不再使用 shares 机制"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "cpu.shares 是软限制，只在多个容器竞争 CPU 时按比例分配，CPU 空闲时低 shares 容器照样可以用满所有核心，这避免了资源浪费。cpu.cfs_quota_us 是硬限制，无论 CPU 多空闲都不让容器超过上限，防止单个容器的 bug 或流量突增吃光整机 CPU。只用 shares 无法保障延迟敏感服务的确定性 SLA；只用 quota 会在 CPU 空闲时白白浪费算力。B 选项错误，两者功能完全不同；C 选项将 shares 的功能搞错了，shares 也是管 CPU 的；D 选项不对，shares 在 Kubernetes 的 CPU request 映射中仍然是核心机制。"
+        },
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz2",
+          "question": "当 cgroup 的 cpu.cfs_quota_us=200000、cpu.cfs_period_us=100000 时，这个容器的 CPU 限制等价于什么？",
+          "choices": [
+            {"id": "A", "text": "等价于 --cpus=2，即每 100ms 调度周期内最多使用 200ms 的 CPU 时间，相当于 2 个核心的算力"},
+            {"id": "B", "text": "等价于 --cpus=0.5，即只能使用半个核心的 CPU 时间"},
+            {"id": "C", "text": "等价于 --cpus=200，即可以使用 200 个核心"},
+            {"id": "D", "text": "这个配置无效，quota 不能超过 period 的值"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "CFS（Completely Fair Scheduler）Bandwidth Control 的计算公式是：可用 CPU 核心数 = quota / period。200000 / 100000 = 2，意味着这个 cgroup 在每个 100ms 的调度周期内最多消耗 200ms 的 CPU 时间，等价于 2 个完整核心的算力。quota 完全可以超过 period——quota=200000 表示 200ms，period=100000 表示 100ms，比值就是 2 核。B 选项算反了（0.5 核应该是 quota=50000）。C 选项理解错了单位（微秒不是核心数）。D 选项是常见误解，quota 大于 period 是完全合法的配置，这正是表达多核限制的方式。"
+        },
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz3",
+          "question": "关于 cgroup v1 的 blkio throttle 对 Buffered IO 的限制效果，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "blkio throttle 对 Buffered IO 和 Direct IO 的限制效果完全一致，都能精确控制到设定的带宽值"},
+            {"id": "B", "text": "cgroup v1 的 blkio throttle 只对 Direct IO 生效，对经过 Page Cache 的 Buffered IO 几乎无效，需要 cgroup v2 的 io 控制器才能正确限制"},
+            {"id": "C", "text": "blkio throttle 对 Buffered IO 限制更严格，因为 Page Cache 会放大写入量"},
+            {"id": "D", "text": "blkio throttle 不区分 IO 类型，但只在磁盘 %util 达到 100% 时才开始限制"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 cgroup v1 blkio 子系统最大的坑。当应用使用 Buffered IO（大部分应用的默认行为）时，写入先进入 Page Cache（内核的页面缓存），然后由内核的 writeback 线程异步刷盘。在 cgroup v1 中，writeback 线程是内核线程而非容器进程，blkio 无法将其产生的 IO 归属到正确的 cgroup，导致 throttle 规则对 Buffered Write 几乎不起作用。cgroup v2 重新设计了 IO 控制器，在 writeback 路径上标记了 cgroup 归属信息（memcg-aware writeback），才真正解决了这个问题。A 选项是最常见的错误认知，C 和 D 选项都不符合实际行为。"
+        },
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz4",
+          "question": "使用 Linux tc（Traffic Control）的 HTB qdisc 做容器网络带宽隔离时，rate 和 ceil 两个参数的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "rate 是保证带宽（guaranteed bandwidth），即使网络拥塞也能获得的最低带宽；ceil 是突发上限（burst ceiling），网络空闲时可以使用的最大带宽"},
+            {"id": "B", "text": "rate 是最大带宽限制，ceil 是最小保证带宽，两者含义与字面意思相反"},
+            {"id": "C", "text": "rate 和 ceil 含义相同，只是分别用于入站和出站流量的配置"},
+            {"id": "D", "text": "rate 控制 TCP 流量的速率，ceil 控制 UDP 流量的速率，两者按协议区分"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "HTB（Hierarchical Token Bucket）是 Linux tc 中最常用的分层令牌桶 qdisc。rate 参数定义了该 class 的保证带宽——即使其他 class 也在竞争网络资源，这个 class 至少能获得 rate 指定的带宽。ceil 参数定义了突发上限——当父 class 有空闲带宽时，该 class 最多可以借用到 ceil 值。例如 rate=1gbit ceil=5gbit 表示保底 1Gbps、最大突发到 5Gbps。B 选项搞反了含义，C 选项错误地将两者按流量方向区分（tc 默认只控制出站，入站需要用 IFB 设备），D 选项按协议区分完全不对。"
+        },
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz5",
+          "question": "你在一台宿主机上执行 cat /sys/fs/cgroup/cpu/docker/<容器ID>/cpu.stat 看到如下输出：\nnr_periods 50000\nnr_throttled 32000\nthrottled_time 48000000000\n这说明什么问题？",
+          "choices": [
+            {"id": "A", "text": "容器在 50000 个调度周期中有 32000 次被 CPU 节流（throttle 率 64%），累计被暂停了 48 秒，说明 CPU quota 设置过于紧张需要放宽"},
+            {"id": "B", "text": "容器总共运行了 50000 秒，其中 32000 秒处于空闲状态，CPU 利用率只有 36%"},
+            {"id": "C", "text": "容器创建了 50000 个线程，其中 32000 个被内核拒绝，说明 pids 限制太低"},
+            {"id": "D", "text": "这些数值在正常范围内，throttled 次数低于 periods 说明容器运行正常"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "cpu.stat 文件记录了 CFS Bandwidth Control 的统计数据。nr_periods 是总的调度周期数，nr_throttled 是发生 throttle（节流）的周期数，throttled_time 是累计被暂停的时间（单位纳秒）。32000/50000=64% 的 throttle 率意味着这个容器在 64% 的调度周期中都因为用完了 quota 被内核暂停。48000000000 纳秒 = 48 秒的累计暂停时间。这是一个严重的问题——容器的业务线程被频繁暂停会直接导致请求延迟飙升。解决方案是增大 cpu.cfs_quota_us 或评估应用是否确实需要更多 CPU 资源。B 选项完全误读了指标含义，C 选项将 CPU 统计混淆成了 pids 子系统，D 选项对 64% throttle 率的严重性判断错误。"
+        },
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz6",
+          "question": "以下关于 cpu.shares 的理解中，哪个是常见的错误认知？",
+          "choices": [
+            {"id": "A", "text": "cpu.shares 是相对权重，只有在多个容器同时竞争 CPU 时才生效"},
+            {"id": "B", "text": "如果一台机器上只有一个 shares=256 的容器在运行，它最多只能使用 25% 的 CPU 资源"},
+            {"id": "C", "text": "两个容器 shares 分别为 1024 和 512，在 CPU 竞争时前者获得约 2/3 的 CPU 时间"},
+            {"id": "D", "text": "Kubernetes 中 Pod 的 CPU request 值会被转换为 cpu.shares 写入 cgroup"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是关于 cpu.shares 最常见的误解。shares 不是绝对限制，而是相对权重——它只在 CPU 资源发生竞争时才起作用。如果一台 8 核机器上只有一个 shares=256 的容器在运行，没有任何其他容器跟它竞争，它可以使用全部 8 核的 CPU。shares=256 只意味着「当其他容器也需要 CPU 时，按 256 的比例分配」。如果有另一个 shares=768 的容器加入竞争，那么 256 和 768 按 1:3 比例分，前者获得 25% 后者 75%。A 选项准确描述了 shares 的机制，C 选项的 2/3 比例计算正确（1024/(1024+512)），D 选项也是正确的——Kubernetes 将 CPU request 按 1 核 = 1024 shares 转换。"
+        },
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz7",
+          "question": "在「在离线混部」场景中，在线服务和离线任务的资源配置策略有什么核心区别？",
+          "choices": [
+            {"id": "A", "text": "在线服务 request=limit（Guaranteed QoS）确保资源预留，离线任务低 request 高弹性，通过低 shares/weight 在资源竞争时自动让出"},
+            {"id": "B", "text": "在线服务不设任何限制以获得最好性能，离线任务设严格的 quota 和 memory limit 防止资源抢占"},
+            {"id": "C", "text": "两者配置完全相同，依靠调度器的时间片轮转机制自动公平分配"},
+            {"id": "D", "text": "在线服务只在白天运行，离线任务只在夜间运行，通过时间分片完全隔离不需要 cgroup 配置"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在离线混部的核心思路是「确定性保障 + 弹性利用」。在线服务需要确定性的资源保障——request=limit（对应 Kubernetes Guaranteed QoS）意味着调度器在放置 Pod 时确保节点有足够物理资源，且 cgroup 设置了硬上限防止邻居干扰。离线任务则设较低的 request 用于调度占位，不设 limit 或设较大的 limit，运行时通过低 shares/weight 实现「有资源就用、有竞争就让」。B 选项的做法极其危险——不设限的在线服务可能因为 bug 吃光整机资源。C 选项忽略了不同业务类型的 SLA 差异。D 选项的时间分片方案虽然存在但利用率极低，不是混部的主流做法。"
+        },
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz8",
+          "question": "你的多租户容器平台上，某台宿主机的 iostat 显示 %util=100% 且 await=185ms，但 CPU 利用率只有 35%。以下哪个处理方案最合理？",
+          "choices": [
+            {"id": "A", "text": "增加更多 CPU 核心，因为 CPU 是瓶颈导致 IO 处理不过来"},
+            {"id": "B", "text": "用 iotop 定位高 IO 容器，对其施加 blkio 限制或迁移到专用离线节点，同时升级到 cgroup v2 确保 Buffered IO 也能被有效限制"},
+            {"id": "C", "text": "重启宿主机清除 IO 队列积压，这是临时性问题重启后会恢复正常"},
+            {"id": "D", "text": "将所有容器的内存限制调低，减少 Page Cache 占用从而降低 IO 压力"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "题目场景是典型的 IO 维度 Noisy Neighbor 问题——CPU 和内存都还有余量，但磁盘 IO 已经被某个容器（很可能是离线任务）占满。正确的处理思路是：第一步用 iotop -oP 定位是哪个容器/进程在产生大量 IO；第二步短期内对该容器施加 blkio 带宽限制或 IO 权重降权；第三步考虑将高 IO 离线任务迁移到配备 NVMe SSD 的专用离线节点池。同时建议升级到 cgroup v2，因为 v1 的 blkio throttle 对 Buffered IO 无效。A 选项误判了瓶颈（是 IO 不是 CPU）。C 选项是典型的治标不治本。D 选项的逻辑不成立——降低内存不能直接解决 IO 抢占问题。"
+        },
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz9",
+          "question": "在 cgroup v2 中，memory.high 和 memory.max 的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "memory.high 是软上限，触达后内核积极回收该 cgroup 的页面缓存但不杀进程；memory.max 是硬上限，触达后触发 OOM Kill"},
+            {"id": "B", "text": "memory.high 是物理内存限制，memory.max 是虚拟内存限制，两者管理不同类型的内存"},
+            {"id": "C", "text": "memory.high 和 memory.max 功能完全相同，只是命名风格从 v1 到 v2 的变化"},
+            {"id": "D", "text": "memory.high 是 cgroup 中进程数的上限，memory.max 是单个进程的内存上限"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "cgroup v2 中 memory.high 对应 v1 的 memory.soft_limit_in_bytes，memory.max 对应 v1 的 memory.limit_in_bytes。两者的机制有本质区别：当 cgroup 的内存使用量触达 memory.high 时，内核会加大对该 cgroup 的内存回收压力（reclaim），积极回收页面缓存、匿名页等，但不会杀进程——这是一种「软着陆」机制。当内存使用量触达 memory.max 且回收也无法释放足够内存时，内核触发 OOM Killer 杀掉 cgroup 内占用最多内存的进程。在多租户场景下推荐两者配合使用：memory.high 设为日常稳态值触发提前回收，memory.max 设为绝对上限作为最后防线。B 选项混淆了物理/虚拟内存概念，C 选项忽略了两者功能的本质差异，D 选项完全误解了参数含义。"
+        },
+        {
+          "id": "docker-cgroup-isolation-tradeoffs-q1-quiz10",
+          "question": "当你发现多租户平台上某台宿主机频繁出现 Noisy Neighbor 问题时，以下哪种检测和响应策略最完善？",
+          "choices": [
+            {"id": "A", "text": "只监控 CPU 利用率，超过 80% 时告警并手动处理"},
+            {"id": "B", "text": "监控 CPU throttle 次数、内存 usage/limit 比值、IO await 和 %util、网络丢包率，自动触发三级响应：动态降权 → 迁移驱逐 → Kill 重调度"},
+            {"id": "C", "text": "不做任何检测，依靠 cgroup 限制自动隔离所有资源争抢"},
+            {"id": "D", "text": "每天固定时间重启所有离线任务容器，通过定时清理避免 Noisy Neighbor 问题"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "完善的 Noisy Neighbor 检测与响应需要覆盖所有资源维度并实现自动化闭环。单纯依靠 CPU 利用率（A 选项）会遗漏 IO、网络、内存等维度的问题——正如题目中 CPU 只有 35% 但 IO 已经 100%。完全依赖 cgroup（C 选项）也不够，因为 cgroup v1 的 blkio 对 Buffered IO 无效、tc 需要额外配置、配置值本身可能不合理。定时重启（D 选项）是最粗暴且无效的方案，既无法保障 SLA 也浪费算力。B 选项的策略是：多维度监控指标（CPU nr_throttled、memory 使用率、IO await、网络丢包）发现问题，三级响应机制（秒级动态降权 → 分钟级迁移 → 紧急 Kill）自动处理，同时将每次事件反馈到调度策略中持续优化。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/tasks/configure-pod-container/quality-service-pod/",
+        "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html",
+        "https://man7.org/linux/man-pages/man8/tc.8.html",
+        "https://docs.docker.com/engine/containers/resource_constraints/"
+      ]
+    }
+  ]
+}

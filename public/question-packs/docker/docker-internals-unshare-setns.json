@@ -1,0 +1,157 @@
+{
+  "id": "docker-internals-unshare-setns",
+  "name": "unshare 与 setns 系统调用",
+  "domain": "docker",
+  "description": "深入讲解 clone/unshare/setns 三个 namespace 相关系统调用在容器创建和进入中的使用",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-internals-unshare-setns-q1",
+      "domain": "docker",
+      "type": "trivia",
+      "difficulty": 4,
+      "tags": ["docker", "namespace", "unshare", "setns", "clone", "系统调用", "runc", "容器原理", "rootless", "nsenter"],
+      "title": "unshare 与 setns 系统调用在容器中的使用",
+      "content": "Linux 容器的本质就是一组受 namespace 隔离、被 cgroup 限制的普通进程。而操纵 namespace 的手段，归结为内核提供的三个系统调用：「clone()」「unshare()」和「setns()」。\n\n当你执行 `docker run` 启动一个新容器时，底层的 runc 会调用 clone() 并传入 CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS 等标志位组合，为新创建的子进程分配一整套独立的 namespace。从子进程的视角看，它是 PID 1，拥有独立的网络栈和挂载点——与宿主机完全隔离。而当你执行 `docker exec` 进入一个已经在运行的容器时，用的是截然不同的路径：setns() 系统调用通过打开 `/proc/<pid>/ns/` 下的文件描述符，将新进程塞进目标容器已有的各个 namespace 中。\n\n第三个系统调用 unshare() 介于两者之间。它不创建新进程，而是让「当前进程」直接脱离某些 namespace 并创建新的。在命令行中你可以直接体验：\n\n```bash\n# 创建新的 PID namespace 并在其中启动 bash\nsudo unshare --pid --fork --mount-proc bash\necho $$   # 输出 1，当前 bash 就是新 namespace 的 init\nps aux    # 只能看到 bash 和 ps 自身\n```\n\n这条命令背后，unshare(1) 工具调用了 unshare(CLONE_NEWPID) 系统调用创建新的 PID namespace，再 fork 出子进程（因为 PID namespace 只对新进程生效），最后 exec bash。`--mount-proc` 则在新 Mount namespace 中重新挂载 /proc，让 ps 读到正确的进程列表。\n\n这三个系统调用各有分工：clone() 负责容器的「诞生」，setns() 负责容器的「进入」，unshare() 则在 rootless 容器、namespace 工具和测试场景中广泛使用。理解它们的差异和配合方式，是容器底层原理面试的高频考点。面试官常见的追问包括：runc 创建容器的调用链是怎样的？docker exec 底层发生了什么？为什么 runc 的 nsenter 模块要用 C 写而不是 Go？\n\n本题从内核 namespace API 的角度出发，系统梳理三个系统调用在容器生命周期中各自扮演的角色，并深入到 runc 源码层面分析它们的实际使用方式。",
+      "answer": "## 第一步：Namespace 操作的三个系统调用基础\n\nLinux namespace 是内核提供的资源隔离机制。从 Linux 2.4.19 引入 Mount namespace 开始，到 Linux 5.6 加入 Time namespace，内核已经支持 8 种 namespace 类型：\n\n| 类型 | 隔离内容 | clone 标志 |\n|------|---------|----------|\n| Mount | 挂载点和文件系统视图 | CLONE_NEWNS |\n| UTS | 主机名和域名 | CLONE_NEWUTS |\n| IPC | System V IPC 和 POSIX 消息队列 | CLONE_NEWIPC |\n| PID | 进程 ID 编号空间 | CLONE_NEWPID |\n| Network | 网络设备、协议栈、端口 | CLONE_NEWNET |\n| User | 用户和组 ID 映射 | CLONE_NEWUSER |\n| Cgroup | cgroup 根目录视图 | CLONE_NEWCGROUP |\n| Time | CLOCK_MONOTONIC 和 CLOCK_BOOTTIME | CLONE_NEWTIME |\n\n内核通过 `/proc/<pid>/ns/` 目录暴露每个进程的 namespace 归属信息。目录下每个文件是一个符号链接，指向对应 namespace 的匿名 inode：\n\n```bash\n$ ls -la /proc/1/ns/\nlrwxrwxrwx 1 root root 0 ... mnt -> 'mnt:[4026531840]'\nlrwxrwxrwx 1 root root 0 ... net -> 'net:[4026531992]'\nlrwxrwxrwx 1 root root 0 ... pid -> 'pid:[4026531836]'\nlrwxrwxrwx 1 root root 0 ... uts -> 'uts:[4026531838]'\n```\n\n方括号中的数字是 inode 号。两个进程的某个 ns 文件指向相同 inode，就说明它们共享同一个 namespace 实例。这套文件系统接口不仅用于观察，更是 setns() 系统调用的操作入口——setns() 正是通过打开这些文件获得文件描述符来完成 namespace 切换。\n\n围绕 namespace 的操作，内核一共提供了三个系统调用：clone() 在创建进程时同时创建 namespace，unshare() 让当前进程脱离并创建新 namespace，setns() 让当前进程加入已存在的 namespace。三者构成了 namespace 操作的完整 API。\n\n## 第二步：三个系统调用详解\n\n**一、clone()：创建新进程同时创建新 namespace**\n\nclone() 是 fork() 的增强版本，通过 flags 参数精确控制父子进程间共享哪些资源。容器场景下的典型用法：\n\n```c\n#define _GNU_SOURCE\n#include <sched.h>\n#include <signal.h>\n\nint flags = CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS |\n            CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER;\n\npid_t child = clone(child_func, stack + STACK_SIZE,\n                    flags | SIGCHLD, arg);\n```\n\n这段代码创建的子进程同时拥有 6 种全新的 namespace，在 PID namespace 中它就是 PID 1。runc 在 `libcontainer/nsenter/nsexec.c` 中正是这样做的——当 `runc create` 执行时，它通过 clone() 加上精心选择的 flag 组合，创建出一个 parent → child → grandchild 的三级进程链。parent 处理 User namespace 映射（写 uid_map/gid_map），child 负责 clone(CLONE_NEWPID) 创建 PID namespace，grandchild 成为容器的真正 init 进程，最后 exec 用户指定的 entrypoint。三级结构的设计是为了正确处理 User namespace 和 PID namespace 之间的依赖关系：uid_map 必须由外部进程写入，而 PID namespace 的 init 进程必须是 clone 出来的新进程。\n\n**二、unshare()：当前进程脱离现有 namespace**\n\nunshare() 的特点是不创建新进程，直接改变调用者自身的 namespace 归属：\n\n```c\n#include <sched.h>\n\n// 当前进程创建并进入新的 Mount namespace\nif (unshare(CLONE_NEWNS) == -1) {\n    perror(\"unshare\");\n    exit(1);\n}\n// 此后的 mount/umount 不影响原 namespace 中的其他进程\n```\n\n命令行工具 unshare(1) 就是对这个系统调用的用户态封装。回顾前面的示例：\n\n```bash\nsudo unshare --pid --fork --mount-proc bash\n```\n\n这条命令的执行流程是：unshare(CLONE_NEWPID) 创建新 PID namespace → fork() 产生子进程（子进程在新 PID namespace 中成为 PID 1）→ unshare(CLONE_NEWNS) 创建新 Mount namespace → mount(\"proc\", \"/proc\", \"proc\", ...) 重挂载 /proc → execvp(\"bash\", ...)。之所以需要 `--fork`，是因为 PID namespace 有一个关键特性：unshare(CLONE_NEWPID) 只影响「后续创建的子进程」，调用者本身仍然在旧的 PID namespace 中。\n\nunshare() 在 rootless 容器中发挥着核心作用。非 root 用户可以调用 unshare(CLONE_NEWUSER) 创建新的 User namespace，在其中获得「虚拟的」root 权限（uid 0 映射到宿主机上的普通 uid），然后在这个 User namespace 中进一步创建 PID、Network、Mount 等其他 namespace。Podman 的 rootless 模式底层就依赖这个机制——它让普通用户无需真正的 root 权限就能运行容器。\n\n**三、setns()：加入已存在的 namespace**\n\nsetns() 让调用进程「移入」一个已经存在的 namespace：\n\n```c\n#include <fcntl.h>\n#include <sched.h>\n\n// 获取目标容器网络 namespace 的文件描述符\nint fd = open(\"/proc/25891/ns/net\", O_RDONLY);\nif (fd == -1) {\n    perror(\"open\");\n    exit(1);\n}\n\n// 加入该网络 namespace\nif (setns(fd, CLONE_NEWNET) == -1) {\n    perror(\"setns\");\n    exit(1);\n}\nclose(fd);\n// 此后当前进程共享 PID 25891 的网络栈\n```\n\n这正是 `docker exec` 的底层原理。Docker daemon 收到 exec 请求后，经过 containerd → containerd-shim → runc 的调用链，runc 进程找到目标容器 init 进程的 PID，逐一打开 /proc/<pid>/ns/ 下的各个 namespace 文件并调用 setns()，然后 exec 用户指定的命令。nsenter(1) 命令提供了同样的能力：\n\n```bash\n# 进入 PID 25891 的全部常用 namespace\nnsenter -t 25891 -m -u -i -n -p -- /bin/bash\n```\n\n其中 `-t` 指定目标 PID，`-m/-u/-i/-n/-p` 分别对应 Mount、UTS、IPC、Network、PID namespace。\n\n**四、三者配合：容器生命周期的完整图景**\n\n一条典型的容器操作链：runc 通过 clone(CLONE_NEW*) 创建容器 init 进程——这是容器的诞生；用户通过 docker exec 触发 setns() 让新进程加入已有 namespace——这是容器的进入；Podman rootless 模式用 unshare(CLONE_NEWUSER) 在无特权环境下启动容器——这是 namespace 操作的另一种组合。三个系统调用的分工可以简记为：clone 用于「创建」，setns 用于「加入」，unshare 用于「脱离并新建」。\n\n## 第三步：体系化扩展延伸\n\n**Go runtime 与 namespace 的交互：runc nsenter 的精巧设计**\n\nrunc 用 Go 编写，但 namespace 切换操作却必须用 C 完成，这背后有一个工程上的硬性约束。Go runtime 在进入 main() 函数之前，就已经通过 pthread_create 启动了多个线程（用于 GC、goroutine 调度、netpoller 等）。而 setns() 和 unshare() 只影响「调用线程」——如果在 Go 代码中调用 setns()，只有当前 goroutine 恰好所在的那个 OS 线程会进入新 namespace，其他线程仍然停留在旧 namespace 中。这种不一致会导致难以排查的故障。\n\nrunc 的解决方案是 `libcontainer/nsenter` 包中的 C 代码。它利用 GCC 的 `__attribute__((constructor))` 机制注册了一个构造函数 nsexec()，该函数在 Go runtime 初始化之前就被 dynamic linker 执行：\n\n```c\nvoid __attribute__((constructor)) nsexec(void) {\n    // 从环境变量和管道读取 namespace 配置信息\n    // 在 Go runtime 启动前完成所有 clone/unshare/setns 操作\n    // 此时进程还是单线程状态，namespace 切换安全且一致\n}\n```\n\n这是 runc 源码中最精巧的设计之一。面试中如果能讲到这一层，说明你不仅理解 namespace API，还对 Go runtime 的线程模型和 CGo 的边界有深入认识。\n\n**面试考点总结**\n\n围绕 unshare/setns 这一主题，面试官通常从以下维度展开考察：能否准确区分 clone/unshare/setns 三者的适用场景；能否描述 docker exec 从 daemon 到 setns() 的完整调用链路；是否知道 /proc/<pid>/ns/ 目录的作用和查看方式；能否解释 runc 为什么在 Go 项目中嵌入 C 代码做 namespace 切换；对 rootless 容器中 User namespace 的作用是否有实际理解。把这些点串联起来讲清楚，这道题基本不会被难住。",
+      "keyPoints": [
+        "clone() 通过 CLONE_NEW* 标志在创建子进程的同时创建新 namespace，是容器启动（runc create）的核心系统调用",
+        "unshare() 让当前进程脱离现有 namespace 并创建新的，不产生新进程，是 unshare 命令和 rootless 容器的底层机制",
+        "setns() 通过打开 /proc/<pid>/ns/ 下的文件描述符将进程加入已存在的 namespace，是 docker exec 和 nsenter 的底层实现",
+        "/proc/<pid>/ns/ 目录暴露进程的 namespace 归属，inode 号相同表示共享同一 namespace 实例",
+        "runc 使用 parent→child→grandchild 三级进程结构配合 clone() 处理 User namespace 和 PID namespace 的创建依赖",
+        "Go runtime 在 main() 前已启动多线程，setns() 只影响调用线程，因此 runc 用 C constructor 在 runtime 初始化前完成 namespace 切换",
+        "三个系统调用分工明确：clone 创建容器、setns 进入容器、unshare 实现 rootless 容器和 namespace 实验"
+      ],
+      "quiz": [
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz1",
+          "question": "Linux 内核提供了几个操作 namespace 的核心系统调用？",
+          "choices": [
+            {"id": "A", "text": "两个：fork() 和 setns()，前者创建隔离进程，后者切换 namespace"},
+            {"id": "B", "text": "三个：clone()、unshare() 和 setns()，分别用于创建时隔离、运行时脱离和加入已有 namespace"},
+            {"id": "C", "text": "四个：clone()、fork()、unshare() 和 setns()，fork() 也支持 namespace 标志"},
+            {"id": "D", "text": "一个：clone()，unshare 和 setns 只是它的用户态封装"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "内核围绕 namespace 操作一共提供了三个系统调用：clone() 在创建新进程时通过 CLONE_NEW* 标志同时创建新 namespace，unshare() 让当前进程脱离现有 namespace 并创建新的，setns() 让当前进程加入一个已经存在的 namespace。fork() 虽然也能创建进程，但它不接受 CLONE_NEW* 标志，无法在创建时指定 namespace——fork() 本质上是 clone() 的简化版本。unshare 和 setns 是独立的系统调用而非 clone 的封装，三者各有独立的内核实现路径。"
+        },
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz2",
+          "question": "clone() 系统调用在容器创建中的核心作用是什么？",
+          "choices": [
+            {"id": "A", "text": "创建新进程的同时通过 CLONE_NEW* 标志为其分配全新的 namespace 集合"},
+            {"id": "B", "text": "将已有进程移入另一个进程的 namespace"},
+            {"id": "C", "text": "仅创建 namespace 对象而不创建新进程"},
+            {"id": "D", "text": "复制目标容器的 namespace 配置到当前进程"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "clone() 是 fork() 的增强版本，通过 flags 参数控制父子进程间资源共享关系。在容器场景下，runc 调用 clone() 并传入 CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS 等标志组合，子进程从出生那一刻就拥有一整套独立的 namespace。B 描述的是 setns() 的功能。C 不符合 clone() 的行为——clone() 必然创建新进程。D 描述的操作不存在于任何 namespace 相关系统调用中。"
+        },
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz3",
+          "question": "unshare() 系统调用与 clone() 最核心的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "unshare() 只能创建 User namespace，clone() 可以创建所有类型"},
+            {"id": "B", "text": "unshare() 需要 root 权限，clone() 不需要"},
+            {"id": "C", "text": "unshare() 不创建新进程，直接修改当前进程的 namespace 归属"},
+            {"id": "D", "text": "unshare() 只影响子进程的 namespace，对当前进程无效"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是两者最根本的区别。clone() 创建一个新的子进程，子进程在新 namespace 中运行；unshare() 则直接修改调用者自身的 namespace 归属，不产生新进程。A 错误——unshare() 支持所有类型的 CLONE_NEW* 标志。B 不准确——两者在权限要求上的差异取决于 namespace 类型而非系统调用本身，非 root 用户都可以通过 CLONE_NEWUSER 操作 User namespace。D 对 unshare() 的理解恰好相反——unshare() 改变的是当前进程自身，不过 CLONE_NEWPID 比较特殊，它只对后续 fork 出的子进程生效。"
+        },
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz4",
+          "question": "docker exec 进入已运行容器时，底层核心依赖的系统调用是哪个？",
+          "choices": [
+            {"id": "A", "text": "clone(CLONE_NEWPID)，为 exec 进程创建新的 PID namespace"},
+            {"id": "B", "text": "fork() + execve()，标准的进程创建流程"},
+            {"id": "C", "text": "unshare(CLONE_NEWNS)，将进程从宿主机 namespace 中分离"},
+            {"id": "D", "text": "setns()，通过 /proc/<pid>/ns/ 下的文件描述符将新进程加入容器已有的 namespace"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "docker exec 的底层实现链路是 Docker daemon → containerd → containerd-shim → runc，runc 找到目标容器 init 进程的 PID 后，逐一打开 /proc/<pid>/ns/ 下的各个 namespace 文件，对每个文件调用 setns(fd, nstype) 将自身加入容器的 namespace，最后 exec 用户指定的命令。A 使用 clone 创建新 namespace 是「启动新容器」的操作，不是进入已有容器。B 的 fork+exec 只是普通的进程创建，不涉及 namespace 切换。C 的 unshare 是脱离并创建新 namespace，与「加入已有 namespace」方向相反。"
+        },
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz5",
+          "question": "setns() 系统调用的 fd 参数应该从哪里获取？",
+          "choices": [
+            {"id": "A", "text": "通过 open() 打开 /proc/<pid>/ns/<type> 文件获得对应 namespace 的文件描述符"},
+            {"id": "B", "text": "通过 socket() 创建 namespace 专用套接字获得"},
+            {"id": "C", "text": "由 clone() 系统调用的返回值直接提供"},
+            {"id": "D", "text": "通过 ioctl() 从 /dev/namespace 设备文件获得"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "setns() 的原型是 int setns(int fd, int nstype)，fd 参数必须是指向目标 namespace 的文件描述符。获取方式是用 open() 打开 /proc/<pid>/ns/ 目录下对应类型的文件，例如 open(\"/proc/25891/ns/net\", O_RDONLY) 获取 PID 25891 所属网络 namespace 的 fd。B 所说的 namespace 专用套接字不存在。C 的 clone() 返回值是子进程的 PID 而非文件描述符。D 所说的 /dev/namespace 设备文件同样不存在于 Linux 中。"
+        },
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz6",
+          "question": "执行 sudo unshare --pid --fork --mount-proc bash 时，为什么必须加 --fork 参数？",
+          "choices": [
+            {"id": "A", "text": "bash 进程不支持在 unshare 进程内部直接运行，必须通过 fork 解耦"},
+            {"id": "B", "text": "--fork 用于创建守护进程，防止退出 bash 后 namespace 被内核回收"},
+            {"id": "C", "text": "unshare 命令自身不支持 exec，必须先 fork 再在子进程中 exec"},
+            {"id": "D", "text": "PID namespace 的 unshare 只对后续创建的子进程生效，调用者本身仍在旧 PID namespace 中"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "这是 PID namespace 的一个关键特性。调用 unshare(CLONE_NEWPID) 后，调用者进程本身的 PID 不变、仍然属于旧的 PID namespace；只有之后 fork() 出来的子进程才会成为新 PID namespace 中的成员（且第一个子进程成为 PID 1）。如果不加 --fork，bash 会在旧 PID namespace 中运行，/proc 显示的仍是宿主机的进程列表，达不到隔离效果。A 和 C 的说法不符合 unshare 和 bash 的实际行为。B 混淆了守护进程和 namespace 生命周期的概念。"
+        },
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz7",
+          "question": "runc 的 nsenter 模块为什么必须用 C 语言实现而非纯 Go？",
+          "choices": [
+            {"id": "A", "text": "Go 语言标准库没有封装 setns() 和 unshare() 系统调用的接口"},
+            {"id": "B", "text": "Go runtime 在 main() 前已通过 pthread_create 启动多线程，setns() 只影响调用线程，必须在 runtime 初始化前通过 C constructor 完成切换"},
+            {"id": "C", "text": "Linux 内核对 namespace 系统调用有二进制格式校验，只允许 C 编译产物直接调用"},
+            {"id": "D", "text": "C 语言的系统调用比 Go 通过 CGo 发起的调用快两个数量级，性能是主要考量"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个工程层面的硬性约束。Go runtime 在进入用户的 main() 函数之前就已经创建了多个 OS 线程（GC 线程、sysmon 线程、netpoller 线程等）。setns() 和 unshare() 都只影响调用它们的那个线程，不会自动传播到进程中的其他线程。如果在 Go 代码中调用 setns()，只有当前 goroutine 所在线程会切换 namespace，其余线程仍留在旧 namespace 中——这种不一致会引发各种诡异故障。runc 利用 GCC 的 __attribute__((constructor)) 在 Go runtime 初始化之前执行 C 函数完成所有 namespace 操作，此时进程仍是单线程状态。A 不正确——Go 可以通过 syscall 包直接调用系统调用。C 和 D 的说法都没有技术依据。"
+        },
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz8",
+          "question": "Podman rootless 模式让普通用户无需 root 权限就能运行容器，其关键机制是什么？",
+          "choices": [
+            {"id": "A", "text": "使用具有 SUID 位的辅助程序临时将 euid 提升为 root"},
+            {"id": "B", "text": "通过 Linux capabilities 机制给 Podman 二进制授予 CAP_SYS_ADMIN 权限"},
+            {"id": "C", "text": "调用 unshare(CLONE_NEWUSER) 创建 User namespace，在其中获得虚拟的 uid 0 映射，再创建其他 namespace"},
+            {"id": "D", "text": "利用 eBPF 钩子绕过内核对 namespace 创建的权限检查"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Linux 内核允许非特权用户创建 User namespace（这是唯一不需要 CAP_SYS_ADMIN 的 namespace 类型）。在新的 User namespace 中，创建者被映射为 uid 0（root），拥有该 namespace 内的全部 capabilities。凭借这个虚拟的 root 身份，用户可以进一步在 User namespace 内部创建 PID、Network、Mount 等其他类型的 namespace，从而实现完整的容器隔离。Podman rootless 和 rootless BuildKit 都是基于这个机制。A 所述的 SUID 方式确实存在于某些辅助工具中（如 newuidmap/newgidmap），但核心隔离机制仍是 User namespace。B 中给二进制添加 capabilities 的方式不属于 rootless。D 所述的 eBPF 绕过机制不存在。"
+        },
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz9",
+          "question": "runc 创建容器时使用 parent → child → grandchild 三级进程结构，主要原因是什么？",
+          "choices": [
+            {"id": "A", "text": "处理 User namespace 映射与 PID namespace 创建的依赖——uid_map 须由 namespace 外部进程写入，PID 1 须是 clone 出的新进程"},
+            {"id": "B", "text": "实现容器进程的优雅退出信号转发链，每一级负责转发一种信号"},
+            {"id": "C", "text": "提高容器启动速度——三级进程可以并行初始化不同类型的 namespace"},
+            {"id": "D", "text": "Linux 内核限制单次 clone() 最多传入 3 个 CLONE_NEW* 标志，需分三次创建"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "三级进程结构的核心原因是 User namespace 和 PID namespace 之间存在操作上的依赖。创建 User namespace 后，uid_map 和 gid_map 必须由 namespace「外部」的进程来写入（内核的安全约束）；而 PID namespace 要求 init 进程（PID 1）必须是通过 clone(CLONE_NEWPID) 新创建的子进程。parent 进程留在原 namespace 负责写 uid_map/gid_map，child 进程执行 clone(CLONE_NEWPID)，grandchild 进入新 PID namespace 成为 PID 1 并最终 exec 容器 entrypoint。B 混淆了信号处理与 namespace 创建的职责。C 不正确——namespace 创建是串行依赖的而非并行的。D 没有这样的内核限制，单次 clone() 可以同时传入所有 CLONE_NEW* 标志。"
+        },
+        {
+          "id": "docker-internals-unshare-setns-q1-quiz10",
+          "question": "以下关于 /proc/<pid>/ns/ 目录的说法，哪项是正确的？",
+          "choices": [
+            {"id": "A", "text": "该目录只在容器进程上存在，宿主机上的普通进程没有这个目录"},
+            {"id": "B", "text": "目录下的符号链接指向 namespace 的匿名 inode，两个进程的同类型 ns 文件 inode 号相同表示共享同一 namespace"},
+            {"id": "C", "text": "可以通过直接修改这些符号链接的指向来切换进程所属的 namespace"},
+            {"id": "D", "text": "该目录只有 root 用户才有权限读取，普通用户完全无法访问"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "/proc/<pid>/ns/ 是内核暴露 namespace 信息的标准接口。每个文件是一个符号链接，目标格式为 type:[inode]，例如 net:[4026531992]。当两个进程的某类 ns 文件指向相同的 inode 号时，说明它们共享同一个 namespace 实例——同一个 Kubernetes Pod 中的容器通常共享 Network namespace，可以通过对比 net ns 的 inode 来验证。A 不正确——所有进程都有 /proc/<pid>/ns/ 目录，包括宿主机上的普通进程（如 systemd、sshd）。C 错误——这些文件是内核虚拟的，不能通过 ln 或重定向修改，namespace 切换只能通过系统调用完成。D 也不准确——普通用户可以读取自己进程的 ns 目录，只是访问其他用户进程的 ns 需要适当权限。"
+        }
+      ],
+      "references": [
+        "https://man7.org/linux/man-pages/man2/clone.2.html",
+        "https://man7.org/linux/man-pages/man2/unshare.2.html",
+        "https://man7.org/linux/man-pages/man2/setns.2.html",
+        "https://man7.org/linux/man-pages/man7/namespaces.7.html",
+        "https://github.com/opencontainers/runc/blob/main/libcontainer/nsenter/nsexec.c"
+      ]
+    }
+  ]
+}
