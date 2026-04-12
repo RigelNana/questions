@@ -1,0 +1,155 @@
+{
+  "id": "context-switch",
+  "name": "上下文切换：那些隐藏的性能杀手",
+  "domain": "operating-system",
+  "description": "上下文切换代价分析、自愿与非自愿切换、TLB 刷新、cache 污染、Go 协程切换对比",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-context-switch-cost",
+      "domain": "operating-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["上下文切换", "cache miss", "TLB", "perf", "vmstat"],
+      "title": "上下文切换的真实代价与排查方法",
+      "content": "# 上下文切换：为什么你的服务延迟突然抖动了\n\n周五下午 4 点，你收到告警：核心交易服务的 P99 延迟从 8ms 跳到 50ms。CPU 使用率只有 40%，内存充足，磁盘 I/O 正常。你掏出工具箱，`vmstat 1` 跑了几轮：\n\n```bash\n$ vmstat 1 5\nprocs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----\n r  b   swpd   free   buff  cache   si   so    bi    bo   in     cs  us sy id wa st\n 8  0      0 2048576 231284 4893712   0    0     4    12 8234  45230  28 12 58  1  1\n 9  0      0 2047832 231284 4893720   0    0     0    16 8456  47891  30 14 54  1  1\n11  0      0 2047120 231288 4893724   0    0     0     8 8102  51204  27 15 56  1  1\n 7  0      0 2048064 231288 4893728   0    0     0    20 7998  43567  29 11 58  1  1\n10  0      0 2047544 231288 4893732   0    0     0    12 8321  49876  28 13 57  1  1\n```\n\n你注意到 `cs` 列（上下文切换次数）每秒高达 4-5 万，`r` 列（可运行进程数）持续在 7-11，而这台机器只有 8 个 CPU 核心。与此同时，`sy`（系统态 CPU）占比 11-15%，明显偏高。\n\n请分析：上下文切换到底做了什么？为什么每秒 4-5 万次切换会导致延迟飙升？如何用工具定位到是哪些进程在频繁切换？",
+      "answer": "# 上下文切换：远不止\"保存和恢复寄存器\"那么简单\n\n## 上下文切换到底做了什么\n\n很多人把上下文切换理解为\"保存旧进程的寄存器、恢复新进程的寄存器\"，这只说对了冰山一角。一次完整的进程上下文切换，内核需要做这些事情：\n\n**1. 保存当前进程的 CPU 上下文**\n\n包括通用寄存器（rax, rbx, rcx...）、栈指针（rsp）、指令指针（rip）、段寄存器、浮点/SIMD 寄存器（xmm0-xmm15，如果用了 AVX 还有 ymm/zmm）。在 x86-64 上，光 FPU/SSE/AVX 状态就可能需要保存 512-2048 字节。内核用 `xsave`/`xrstor` 指令来做这件事，这本身就需要几百个 CPU cycle。\n\n**2. 切换内核栈**\n\n每个进程有自己的内核栈（Linux 上默认 16KB，`THREAD_SIZE`）。内核需要把 `current` 指针切换到新进程的 `task_struct`，并切换 RSP 到新进程的内核栈顶。\n\n**3. 切换页表（如果是不同进程）**\n\n这是最昂贵的部分。如果前后两个进程属于不同的地址空间（不同进程，而非同进程的线程），内核需要加载新进程的页表基地址到 CR3 寄存器。**切换 CR3 会导致 TLB（Translation Lookaside Buffer）被刷新**。\n\nTLB 是 CPU 中缓存虚拟地址→物理地址映射的硬件缓存，容量很小（L1 dTLB 通常 64 条目，L2 sTLB 通常 1536 条目），但命中时地址翻译只需 1 个 cycle，不命中则需要走 4 级页表，花费 20-100+ cycle。一次 TLB flush 后，所有翻译都要重来，接下来大量内存访问都会触发 TLB miss。\n\n现代 CPU 有 PCID（Process-Context IDentifier）优化——给每个进程的 TLB 条目打标签，切换 CR3 时不全部刷新，只是切换标签过滤。Linux 从 4.14 开始默认启用 PCID，大幅降低了 TLB 刷新的代价。但 PCID 只有 12 位（最多 4096 个 ID），进程多了还是要回收。\n\n```bash\n# 检查你的 CPU 是否支持 PCID\n$ grep pcid /proc/cpuinfo | head -1\nflags : ... pcid ...\n\n# 检查 TLB miss 率\n$ perf stat -e dTLB-load-misses,dTLB-loads -p $(pgrep go-service) -- sleep 5\n  Performance counter stats for process id '12847':\n         2,847,231   dTLB-load-misses   # 3.21% of all dTLB loads\n        88,716,402   dTLB-loads\n```\n\n**4. CPU Cache 污染**\n\n上下文切换后，L1/L2/L3 cache 中缓存的是旧进程的数据和指令。新进程开始执行时，几乎每次内存访问都是 cache miss。L1 cache miss 代价约 4ns，L2 约 10ns，L3 约 40ns，如果要访问主存则需要 100ns+。这就是为什么上下文切换的\"真实代价\"远大于寄存器保存/恢复本身——后者可能只要 1-2μs，但 cache 预热（warm up）可能导致接下来几毫秒的代码执行都变慢。\n\n## 自愿切换 vs 非自愿切换\n\n`/proc/<pid>/status` 中有两个关键字段：\n\n```bash\n$ grep ctxt /proc/12847/status\nvoluntary_ctxt_switches:    1847293\nnonvoluntary_ctxt_switches:  328471\n```\n\n- **自愿切换（voluntary）**：进程主动让出 CPU，通常因为等待 I/O、锁、sleep、channel 操作。这在 I/O 密集型服务中是正常的。\n- **非自愿切换（nonvoluntary）**：进程没有主动让出，但时间片用完被调度器强制切走。这在 CPU 竞争激烈时出现。\n\n你题目中的场景，`r` 列 7-11（可运行进程数超过 CPU 核心数 8），说明有 CPU 争用。大量非自愿切换会导致 cache 频繁污染，这就是延迟毛刺的来源。\n\n## 用 perf 和 pidstat 精确定位\n\n**步骤一：确认哪些进程切换频繁**\n\n```bash\n$ pidstat -w 1 5\nAverage:      UID       PID   cswch/s nvcswch/s  Command\nAverage:     1000     12847   2341.20   892.40   go-service\nAverage:     1000     12848   2218.60   847.20   go-service\nAverage:     1001     13200    234.80    12.40   java\nAverage:     1001     13201    198.40     8.60   java\n```\n\n看 `nvcswch/s`（非自愿切换/秒），Go 服务每秒 800+ 次非自愿切换，远高于 Java 进程。原因：Go 服务使用了大量 goroutine，runtime 把它们映射到 GOMAXPROCS 个系统线程上，这些线程在 CFS 调度器看来就是普通进程，和 Spark 的 Java 线程争抢 CPU。\n\n**步骤二：用 perf 看 cache miss 的影响**\n\n```bash\n$ perf stat -e context-switches,cache-misses,cache-references,instructions \\\n    -p $(pgrep -f go-service | head -1) -- sleep 10\n\n  Performance counter stats for process id '12847':\n         31,204   context-switches\n     48,729,341   cache-misses       # 12.7% of all cache refs\n    383,218,742   cache-references\n  8,127,394,521   instructions\n```\n\n12.7% 的 cache miss 率偏高（正常应在 5% 以下），直接印证了上下文切换导致的 cache 污染。\n\n## 解决方案\n\n1. **减少 CPU 争用**：用 cgroup 限制 Spark 任务的 CPU 配额，或将 Go 服务和 Spark 调度到不同机器/不同 cpuset。\n\n2. **调 GOMAXPROCS**：在容器中，Go 默认读的是宿主机核心数。如果容器限制了 4 核 CPU，但 GOMAXPROCS=8，就会创建 8 个 OS 线程争抢 4 核——内部就在频繁切换。使用 `uber-go/automaxprocs` 库自动设置。\n\n3. **CPU 绑核**：对延迟敏感的服务，用 `taskset` 或 K8s 的 `cpuManagerPolicy: static` + Guaranteed QoS 实现 CPU 独占，彻底消除非自愿切换。\n\n4. **调整调度参数**：增大 `sched_min_granularity_ns`（从 0.75ms 到 3ms）减少切换频率，但会牺牲交互性——只在批处理场景适用。\n\n## Goroutine 切换 vs 线程切换\n\n值得一提的是，Go 的 goroutine 切换和 OS 线程切换完全不是一个量级：\n\n| 指标 | OS 线程切换 | Goroutine 切换 |\n|------|-----------|---------------|\n| 切换主体 | 内核 | Go runtime（用户态） |\n| 保存内容 | 全部寄存器 + FPU + TLB | 仅 PC、SP 和少量寄存器 |\n| 耗时 | 1-5μs（不含 cache miss） | ~200ns |\n| TLB 影响 | 跨进程需刷新 | 无影响（同一进程内） |\n| Cache 影响 | 严重污染 | 几乎无影响 |\n\nGo 的 M:N 调度模型正是为了减少 OS 层面的上下文切换：成千上万个 goroutine 复用少量 OS 线程，goroutine 之间的切换完全在用户态完成，不触发内核、不刷新 TLB、不污染 cache。但前提是 GOMAXPROCS 设置正确——如果 OS 线程数超过了可用核心数，OS 层面的切换照样避不掉。",
+      "keyPoints": [
+        "上下文切换的真实代价不在寄存器保存（~1μs），而在 TLB 刷新和 cache 污染导致的后续 cache miss（可能影响数毫秒）",
+        "切换 CR3 寄存器会刷新 TLB；Linux 4.14+ 利用 PCID 优化避免全量 TLB flush",
+        "自愿切换（voluntary）因 I/O 等待产生，是正常的；非自愿切换（nonvoluntary）因 CPU 争用产生，是性能问题信号",
+        "vmstat 的 cs 列看总切换次数，pidstat -w 看每个进程的自愿/非自愿切换，perf stat 看 cache miss 率",
+        "Go 的 goroutine 切换在用户态完成约 200ns，不涉及内核、TLB、cache 污染，比 OS 线程切换快一个数量级",
+        "容器中 GOMAXPROCS 应匹配 CPU limit 而非宿主机核心数，uber-go/automaxprocs 可自动处理",
+        "CPU 绑核（cpuset）是消除非自愿切换的终极方案，K8s 中通过 cpuManagerPolicy: static + Guaranteed QoS 实现"
+      ],
+      "quiz": [
+        {
+          "id": "os-ctx-switch-q1",
+          "question": "进程上下文切换中，哪个操作的性能影响通常最大？",
+          "choices": [
+            {"id": "A", "text": "保存和恢复通用寄存器"},
+            {"id": "B", "text": "切换 CR3 导致的 TLB 刷新及后续 cache 污染"},
+            {"id": "C", "text": "切换内核栈指针"},
+            {"id": "D", "text": "更新 task_struct 中的调度信息"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "寄存器保存/恢复（A）、栈切换（C）、task_struct 更新（D）都是 O(1) 的内存操作，总共耗时约 1-2μs。但切换 CR3 导致的 TLB 全量刷新会使后续大量内存访问触发 TLB miss（每次 20-100+ cycle），加上 L1/L2 cache 中旧进程数据被新进程访问逐步替换（cache cold start），这些间接代价可持续数毫秒。现代 CPU 的 PCID 特性可以缓解 TLB 刷新，但 cache 污染仍然是不可避免的。"
+        },
+        {
+          "id": "os-ctx-switch-q2",
+          "question": "以下哪种场景会产生自愿上下文切换（voluntary context switch）？",
+          "choices": [
+            {"id": "A", "text": "进程时间片用完被调度器抢占"},
+            {"id": "B", "text": "更高优先级的进程被唤醒"},
+            {"id": "C", "text": "进程调用 read() 等待磁盘数据返回"},
+            {"id": "D", "text": "进程占用 CPU 超过 sched_latency_ns"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "自愿切换是进程主动让出 CPU——通常因为等待 I/O（read/write）、等待锁（mutex_lock）、sleep、等待信号量等。进程从 TASK_RUNNING 变为 TASK_INTERRUPTIBLE/TASK_UNINTERRUPTIBLE，自愿放弃 CPU。A、B、D 都是进程没有主动让出但被调度器强制切走的情况，属于非自愿切换（nonvoluntary/involuntary）。区分两者对性能分析很重要：自愿切换高说明 I/O 多（正常），非自愿切换高说明 CPU 争抢激烈（需要干预）。"
+        },
+        {
+          "id": "os-ctx-switch-q3",
+          "question": "Linux 4.14+ 引入的 PCID 优化解决了什么问题？",
+          "choices": [
+            {"id": "A", "text": "减少了 CPU cache 的容量需求"},
+            {"id": "B", "text": "在 CR3 切换时避免全量 TLB 刷新，通过标签区分不同进程的 TLB 条目"},
+            {"id": "C", "text": "让不同进程共享相同的页表，减少内存占用"},
+            {"id": "D", "text": "消除了 Spectre/Meltdown 漏洞的性能影响"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PCID（Process-Context Identifier）是 x86 CPU 的特性，为每个 TLB 条目附加一个 12-bit 标签（最多 4096 个 ID）。切换 CR3 时 CPU 不再刷新整个 TLB，而是根据 PCID 标签过滤——旧进程的 TLB 条目仍然保留，如果切回来就能直接命中。这大幅降低了进程间上下文切换的 TLB miss 代价。PCID 不影响 cache 容量（A），不涉及页表共享（C），Spectre/Meltdown 的缓解是 KPTI（D），实际上 KPTI 引入的开销正需要 PCID 来补偿。"
+        },
+        {
+          "id": "os-ctx-switch-q4",
+          "question": "vmstat 输出中 `cs` 列显示每秒 50000 次上下文切换，`r` 列持续为 12（8 核机器）。以下分析哪个正确？",
+          "choices": [
+            {"id": "A", "text": "系统完全正常，50000 cs/s 对现代 CPU 来说很低"},
+            {"id": "B", "text": "I/O 瓶颈导致大量进程阻塞"},
+            {"id": "C", "text": "可运行进程数超过核心数，存在 CPU 争用，大量非自愿切换"},
+            {"id": "D", "text": "内存不足导致频繁换页"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "`r` 列是可运行（TASK_RUNNING）进程数，12 个可运行进程争抢 8 核 CPU，说明持续有 4 个进程在等待 CPU。这会导致大量非自愿切换（进程时间片到了被迫让出）。50000 cs/s 本身不算极端（有些系统正常可达十几万），但结合 r>核心数，高切换意味着 cache 频繁污染，引发延迟抖动。如果是 I/O 瓶颈（B），应看 `b` 列（阻塞进程数）和 `wa`（I/O 等待 CPU 百分比）。内存不足（D）看 `si/so`（swap in/out）。A 忽略了 r 列的含义。"
+        },
+        {
+          "id": "os-ctx-switch-q5",
+          "question": "以下 perf stat 输出说明了什么？\n\n```\n  31,204   context-switches\n  48,729,341   cache-misses    # 12.7% of all cache refs\n  383,218,742   cache-references\n```",
+          "choices": [
+            {"id": "A", "text": "正常数据，12.7% cache miss 率是 CPU 密集型应用的典型值"},
+            {"id": "B", "text": "cache miss 率偏高，可能与频繁上下文切换导致的 cache 污染有关"},
+            {"id": "C", "text": "说明应用的数据结构太大，无法放入 cache"},
+            {"id": "D", "text": "说明 CPU cache 硬件故障"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正常应用的 cache miss 率通常在 2-5% 范围。12.7% 明显偏高。结合 31204 次上下文切换（10 秒内，即 ~3120 次/秒），高 miss 率很可能是上下文切换导致的 cache 污染——每次切换后新进程的工作集不在 cache 中，需要重新从内存加载。当然 C 也是可能的原因（工作集超过 cache），但题目上下文给出了高频切换数据，cache 污染的关联性更强。确定根因需要同时看 `perf stat -e LLC-load-misses`（L3 miss）和减少切换后 miss 率是否下降。A 的判断标准不正确，D 极罕见且不会表现为稳定的 12.7%。"
+        },
+        {
+          "id": "os-ctx-switch-q6",
+          "question": "同一进程内两个线程之间的上下文切换，和两个不同进程之间的切换，关键区别是什么？",
+          "choices": [
+            {"id": "A", "text": "线程切换不需要保存任何寄存器"},
+            {"id": "B", "text": "线程切换不需要切换页表（CR3），因此不会刷新 TLB"},
+            {"id": "C", "text": "线程切换完全在用户态完成，不需要进入内核"},
+            {"id": "D", "text": "线程切换不涉及调度器，由线程库直接完成"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "同一进程的线程共享相同的地址空间（相同的页表），切换时不需要修改 CR3，因此 TLB 不会被刷新——这是线程切换比进程切换快的核心原因。但线程切换仍然需要保存/恢复寄存器（A 错），仍然需要通过内核调度器（C、D 错，除非是用户态线程/协程如 goroutine）。内核线程（pthread）的切换和进程切换走的是同一个 __schedule() → context_switch() 路径，只是跳过了 switch_mm()（切换内存描述符/页表）这一步。"
+        },
+        {
+          "id": "os-ctx-switch-q7",
+          "question": "Go 的 goroutine 切换和 OS 线程切换相比，以下哪个描述不正确？",
+          "choices": [
+            {"id": "A", "text": "goroutine 切换在用户态完成，不需要系统调用"},
+            {"id": "B", "text": "goroutine 切换只需要保存 PC、SP 和少量寄存器，耗时约 200ns"},
+            {"id": "C", "text": "goroutine 切换不会导致 TLB 刷新和 cache 污染"},
+            {"id": "D", "text": "goroutine 切换完全不涉及操作系统内核，因此不会产生任何 OS 线程切换"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "A、B、C 都是正确的——goroutine 切换发生在用户态的 Go runtime 中，只保存少量上下文，不触发 TLB 刷新。但 D 是错误的：当 goroutine 执行系统调用（如文件 I/O）时，承载它的 M（OS 线程）会被阻塞，Go runtime 会把 P 与该 M 解绑、绑定到另一个 M（或创建新 M），这个过程涉及 OS 线程的创建或唤醒。此外，当 GOMAXPROCS 大于可用核心数时，M 之间仍然会产生 OS 级别的上下文切换。goroutine 减少了切换但不能完全消除 OS 线程切换。"
+        },
+        {
+          "id": "os-ctx-switch-q8",
+          "question": "一个容器设置了 4 核 CPU limit，但 Go 服务启动时 GOMAXPROCS 被自动设为 64（宿主机核心数）。这会导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "Go 服务能使用 64 核 CPU，绕过容器限制"},
+            {"id": "B", "text": "创建 64 个 OS 线程争抢 4 核 CPU 配额，产生大量非自愿上下文切换和 CPU throttling"},
+            {"id": "C", "text": "Go runtime panic，因为核心数不匹配"},
+            {"id": "D", "text": "没有问题，Go runtime 会自动检测容器 CPU limit"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go 默认读 /proc/cpuinfo 获取核心数设置 GOMAXPROCS，在容器中这通常是宿主机核心数。GOMAXPROCS=64 意味着 Go runtime 创建 64 个 M（OS 线程），但 cgroup 只分配了 4 核配额。64 个线程竞争 4 核：1) CFS 调度器频繁进行非自愿上下文切换；2) 64 个线程在每个 100ms period 内快速消耗完 4 核 quota，触发 CPU throttling。解决方案是使用 uber-go/automaxprocs（读 cgroup cpu.cfs_quota_us 自动设置），或手动设 GOMAXPROCS=4。Go 不会 panic（C），也不会自动检测（D，至少到 Go 1.23 仍然不会）。"
+        },
+        {
+          "id": "os-ctx-switch-q9",
+          "question": "在 NUMA 架构下，进程被调度到不同 NUMA 节点的 CPU 上运行时，除了常规上下文切换代价外，还会额外带来什么问题？",
+          "choices": [
+            {"id": "A", "text": "进程需要重新编译才能在不同 NUMA 节点上运行"},
+            {"id": "B", "text": "跨 NUMA 节点访问内存延迟显著增加（remote memory access），性能可能下降 30-50%"},
+            {"id": "C", "text": "NUMA 节点之间无法共享文件描述符"},
+            {"id": "D", "text": "进程的 PID 会发生变化"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "NUMA（Non-Uniform Memory Access）架构中，每个 CPU socket 有自己的本地内存。进程在 NUMA node 0 的 CPU 上分配了内存，如果被调度到 node 1 的 CPU 上运行，所有内存访问都要通过 QPI/UPI 总线跨节点读取，延迟从本地的 ~80ns 增加到远程的 ~130ns（具体取决于硬件），带宽也显著下降。这就是为什么 NUMA-aware 调度很重要——使用 numactl --cpunodebind=0 --membind=0 可以把进程绑定到特定 NUMA 节点。K8s 的 TopologyManager 也是为此设计的。A、C、D 都是完全错误的描述。"
+        },
+        {
+          "id": "os-ctx-switch-q10",
+          "question": "你想用 `pidstat -w` 监控发现某个进程的非自愿切换率（nvcswch/s）突然从 50 飙升到 2000，但 CPU 使用率没变。最可能的原因是？",
+          "choices": [
+            {"id": "A", "text": "该进程内存泄漏导致 OOM"},
+            {"id": "B", "text": "同机有新的 CPU 密集型进程启动，抢占了 CPU 时间"},
+            {"id": "C", "text": "该进程的磁盘 I/O 增加"},
+            {"id": "D", "text": "网络带宽打满导致 TCP 重传"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "非自愿切换（nonvoluntary）意味着进程想继续运行但被调度器强制切走——原因是有其他进程在竞争 CPU。突然飙升说明有新的 CPU 密集型负载加入。该进程自身 CPU 使用率没变（它想用的 CPU 时间没变），但因为竞争加剧，频繁被抢占。内存泄漏（A）不直接导致 CPU 切换增加（除非触发大量 swap I/O）。磁盘 I/O（C）增加会导致自愿切换增加（等待 I/O），不是非自愿。网络重传（D）同理，进程在等待数据时是自愿让出 CPU。排查方向：用 `top` 或 `pidstat -u` 检查同机是否有新的高 CPU 使用率进程。"
+        }
+      ],
+      "references": [
+        "https://docs.kernel.org/scheduler/sched-design-CFS.html",
+        "https://perf.wiki.kernel.org/index.php/Main_Page",
+        "https://www.brendangregg.com/perf.html"
+      ]
+    }
+  ]
+}
