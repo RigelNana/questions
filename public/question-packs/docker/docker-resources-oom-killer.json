@@ -1,0 +1,136 @@
+{
+  "id": "docker-resources-oom-killer",
+  "name": "容器 OOM Killer 排查",
+  "description": "详解容器内存超限触发 OOM Killer 的行为、退出码 137 排查及 cgroup 内存事件分析",
+  "type": "debugging",
+  "difficulty": 3,
+  "domain": "docker",
+  "questions": [
+    {
+      "id": "docker-resources-oom-killer-q1",
+      "content": "生产环境中，一个运行了三天的 Java 微服务容器突然从 `docker ps` 的输出中消失了。运维同事通过 `docker ps -a` 发现该容器的退出码是 137，紧接着在宿主机上执行 `dmesg` 看到了这样一行日志：\n\n```\n[683279.012345] memory cgroup out of memory: Killed process 21389 (java), UID 1000, total-vm:2756924kB, anon-rss:1048612kB, file-rss:12288kB, shmem-rss:0kB\n```\n\n这是容器化部署中最常见也最令人头疼的故障之一——容器内存使用触及 cgroup 上限，Linux 内核的 OOM Killer 直接将进程以 SIGKILL 终结，进程连写一行日志的机会都没有就被「就地正法」了。\n\n请从以下三个层次展开分析：\n\n第一，Linux OOM Killer 的基础机制。内核在什么条件下启动 OOM Killer？它如何通过 `oom_score` 选择要终止的进程？管理员怎样通过 `oom_score_adj` 保护关键进程？\n\n第二，容器环境下的 OOM 行为。cgroup 级别的 OOM 与宿主机系统级 OOM 有什么本质区别？退出码 137 是怎么算出来的？如何通过 `docker inspect`、`dmesg`、cgroup 文件系统构成一条完整的排查链路？\n\n第三，应用层的容器内存感知。早期 JVM 为什么在容器里频繁 OOM？Java 的 `-XX:MaxRAMPercentage` 和 Go 的 `GOMEMLIMIT` 分别解决了什么问题？面试中关于 OOM 排查的高频考点有哪些？",
+      "answer": "要把容器 OOM Killer 讲清楚，得从 Linux 内核的内存分配哲学说起，然后层层推进到容器场景和应用层适配。\n\n**Linux OOM Killer 基础机制**\n\nLinux 内核默认采用「乐观内存分配」策略，即 overcommit。当进程通过 `malloc()` 或 `mmap()` 请求内存时，内核并不立刻分配物理页帧，而是先记一笔「欠条」——只有进程真正往这块虚拟地址写入数据时，才通过缺页异常（page fault）触发物理内存的分配。这种策略在绝大多数场景下表现良好，因为很多进程申请了大块内存却只使用其中一小部分。\n\n然而当所有进程的实际内存需求超出了物理内存加交换空间的总和，内核就面临一个无法回避的困境：内存真的不够用了。此时内核会启动 OOM Killer，从当前所有可见进程中挑选一个「牺牲品」强制终止，以回收内存保证系统不至于完全卡死。\n\n选择牺牲品的依据是每个进程的 `oom_score`，它的计算核心是进程实际消耗的物理内存占系统总内存的比例——占用越多，分值越高，越容易被选中。管理员可以通过 `/proc/<pid>/oom_score_adj` 微调这个分值，取值范围从 -1000 到 1000。设为 -1000 的进程永远不会被 OOM Kill（内核级豁免），设为 1000 则会被优先终止。你可以通过以下命令直观地查看：\n\n```bash\n# 查看 PID 1 的 OOM 分值和调整因子\ncat /proc/1/oom_score\ncat /proc/1/oom_score_adj\n```\n\n需要注意的是，`/proc/sys/vm/overcommit_memory` 控制内核的 overcommit 策略：值为 0 是默认的启发式模式（允许适度 overcommit），值为 1 表示永远允许 overcommit（激进模式），值为 2 表示严格禁止 overcommit（保守模式，commit 总量不超过 swap + 物理内存 × overcommit_ratio）。在容器场景下，宿主机通常保持默认值 0。\n\n**容器环境下的 OOM 行为**\n\n理解了 Linux 原生 OOM Killer 后，我们来看容器场景中关键的分野——cgroup 级别 OOM 和系统级 OOM 是两件截然不同的事。\n\n当你执行 `docker run -m 512m myapp` 时，Docker daemon 会将 512MB 写入该容器对应 cgroup 的 `memory.limit_in_bytes`（cgroup v1）或 `memory.max`（cgroup v2）。容器内所有进程的物理内存使用总和一旦触及这个阈值，触发的就是「cgroup 级别的 OOM」。它和系统级 OOM 最本质的区别在于杀伤范围：cgroup OOM 只在该 cgroup 内挑选牺牲品，绝不会殃及宿主机上的其他容器或系统进程；而系统级 OOM 则在整个系统范围内选择 `oom_score` 最高的进程终止，甚至可能杀掉 `sshd` 或 `dockerd`。\n\n被 OOM Kill 的容器，退出码固定为 137。这个数字并非 Docker 自定义的魔法值，而是 Shell 的通用约定：当进程被信号终止时，退出码等于 128 加上信号编号。SIGKILL 的信号编号为 9，因此 128 + 9 = 137。同理，如果你看到退出码 143，那代表进程收到了 SIGTERM（128 + 15 = 143）。\n\n排查 OOM Kill 有一条清晰的工具链，面试中能把这三步讲完整会非常加分：\n\n第一步，用 `docker inspect` 确认 OOM 标志：\n\n```bash\n$ docker inspect <container_id> --format='{{json .State}}'\n{\n  \"Status\": \"exited\",\n  \"ExitCode\": 137,\n  \"OOMKilled\": true,\n  \"Pid\": 0,\n  \"StartedAt\": \"2024-01-15T08:30:00Z\",\n  \"FinishedAt\": \"2024-01-18T14:22:37Z\"\n}\n```\n\n`OOMKilled: true` 是最直接的铁证。Docker daemon 在检测到 cgroup 的 OOM 事件后会设置这个字段。\n\n第二步，查看宿主机的内核日志获取详细信息：\n\n```bash\n$ dmesg | grep -i 'oom\\|killed process'\n[683279.012345] memory cgroup out of memory: Killed process 21389 (java), UID 1000, total-vm:2756924kB, anon-rss:1048612kB, file-rss:12288kB, shmem-rss:0kB\n[683279.012456] oom_reaper: reaped process 21389 (java), now anon-rss:0kB, file-rss:0kB, shmem-rss:0kB\n```\n\n这段日志的关键字段包括：`total-vm` 是进程的虚拟内存总量，`anon-rss` 是匿名页的实际物理内存占用（通常是堆和栈），`file-rss` 是文件映射页的占用。`anon-rss` 的值就约等于容器的内存限制（1048612kB ≈ 1024MB），这说明进程确实把内存吃满了。注意日志开头是「memory cgroup out of memory」而不是「Out of memory」，前者明确标识这是 cgroup 级别的 OOM。\n\n第三步，通过 cgroup 文件系统获取精确数据。在 cgroup v1 下：\n\n```bash\n# 当前内存使用量\ncat /sys/fs/cgroup/memory/docker/<container_id>/memory.usage_in_bytes\n# 内存硬限制\ncat /sys/fs/cgroup/memory/docker/<container_id>/memory.limit_in_bytes\n# OOM 控制信息（oom_kill_disable 和 under_oom 状态）\ncat /sys/fs/cgroup/memory/docker/<container_id>/memory.oom_control\n```\n\n在 cgroup v2 下，OOM 事件的统计更加集中。`memory.events` 文件包含多个计数器，其中 `oom` 记录触发 OOM 的总次数，`oom_kill` 记录实际杀死进程的次数（两者可能不相等，因为进程可能在 OOM 触发后自行退出）：\n\n```bash\ncat /sys/fs/cgroup/docker/<container_id>/memory.events\n# 输出示例：\n# low 0\n# high 0\n# max 3\n# oom 2\n# oom_kill 2\n```\n\n**应用层容器内存感知与面试考点**\n\nOOM 问题往往不只是基础设施层面的事，应用运行时也需要「知道」自己跑在容器里。最经典的反面教材来自早期 JVM。\n\nJDK 8u131 之前的 JVM 完全不感知 cgroup 内存限制。当容器通过 `-m 512m` 限制了内存，JVM 读取的却是宿主机的总内存（比如 64GB），然后按默认的 1/4 规则计算出最大堆为 16GB。结果不言而喻——JVM 启动后不久就因为堆分配超限被 OOM Kill。JDK 8u191 正式引入了 `-XX:+UseContainerSupport`（默认开启），使 JVM 能正确读取 cgroup 限制。配合 `-XX:MaxRAMPercentage=75.0` 可以将最大堆设为容器内存的 75%，留出余量给堆外内存（Direct ByteBuffer、Metaspace）、线程栈和 JNI 原生分配：\n\n```bash\ndocker run --memory=512m my-java-app \\\n  java -XX:MaxRAMPercentage=75.0 -jar app.jar\n```\n\n这里设 75% 而非 90% 或 100% 是有讲究的：JVM 的实际内存占用远不止堆大小，Metaspace、线程栈（每线程默认 1MB）、CodeCache、GC 自身的数据结构都占物理内存，如果堆占比太高，这些堆外组件的内存需求就会把总使用量推过 cgroup 限制。\n\nGo 语言在 1.19 版本引入了 `GOMEMLIMIT` 环境变量。它为垃圾回收器设置了一个「软内存上限」——当 Go 运行时的堆内存接近这个阈值时，GC 会更积极地回收，尽量将内存使用维持在阈值以下。但这不是硬限制：如果程序确实需要更多内存（比如突发的大请求），Go 仍然会分配，只是 GC 会持续施加更大的回收压力。典型的配置方式是设为容器内存限制的 80% 左右：\n\n```bash\ndocker run --memory=256m -e GOMEMLIMIT=200MiB my-go-app\n```\n\n面试中关于容器 OOM 的高频考点，按出现频率排列大致是：退出码 137 的含义和 128 + 信号编号的计算规则、`docker inspect` 中 `OOMKilled` 字段的检查方法、cgroup v1 与 v2 内存控制文件的差异（`memory.limit_in_bytes` vs `memory.max`）、`dmesg` 日志中区分 cgroup OOM 和系统 OOM 的关键词、JVM 容器感知参数的版本要求（JDK 8u191+），以及 Go `GOMEMLIMIT` 的软限制语义。能把从内核机制到应用适配这一整条链路讲清楚，就足以展现出对容器运行时扎实的理解深度。",
+      "keyPoints": [
+        "Linux OOM Killer 在物理内存和交换空间耗尽时触发，通过 oom_score 选择牺牲进程，oom_score_adj 可调节优先级（-1000 到 1000）",
+        "cgroup 级别 OOM 只杀死该 cgroup 内的进程，不影响宿主机和其他容器；系统级 OOM 在全局范围选择牺牲品",
+        "退出码 137 = 128 + 9（SIGKILL），这是 Shell 通用约定而非 Docker 特有",
+        "docker inspect 的 State.OOMKilled 字段和 dmesg 内核日志是排查容器 OOM 的两个核心证据来源",
+        "cgroup v1 通过 memory.limit_in_bytes 和 memory.oom_control 管理内存限制，v2 使用 memory.max 和 memory.events",
+        "Java 8u191+ 的 -XX:MaxRAMPercentage 让 JVM 感知容器内存限制，通常设为 75% 以留出堆外内存空间",
+        "Go 1.19 的 GOMEMLIMIT 是 GC 的软内存上限，会增加 GC 回收压力但不阻止实际分配超限"
+      ],
+      "quiz": [
+        {
+          "id": "docker-resources-oom-killer-q1-quiz1",
+          "question": "Linux OOM Killer 在什么条件下被内核触发？",
+          "options": {
+            "A": "进程 CPU 使用率持续超过 90%",
+            "B": "系统物理内存和交换空间均已耗尽，无法满足新的分配请求",
+            "C": "磁盘 I/O 队列深度超过阈值",
+            "D": "进程打开的文件描述符数量超过 ulimit 限制"
+          },
+          "correctAnswer": "B"
+        },
+        {
+          "id": "docker-resources-oom-killer-q1-quiz2",
+          "question": "容器退出码 137 是如何计算得出的？",
+          "options": {
+            "A": "128 + SIGKILL 信号编号 9 = 137，这是 Shell 的通用约定",
+            "B": "Linux 内核为 OOM 事件专门定义的固定错误码",
+            "C": "Docker 引擎自定义的容器异常退出标识",
+            "D": "137 是容器内 PID 1 进程的 main 函数返回值"
+          },
+          "correctAnswer": "A"
+        },
+        {
+          "id": "docker-resources-oom-killer-q1-quiz3",
+          "question": "以下哪种方式可以最直接地确认容器是否因 OOM 被终止？",
+          "options": {
+            "A": "查看 `docker logs` 中的应用日志",
+            "B": "使用 `docker stats` 监控实时内存使用",
+            "C": "通过 `docker inspect` 检查 `State.OOMKilled` 字段是否为 true",
+            "D": "进入容器查看 `/var/log/syslog`"
+          },
+          "correctAnswer": "C"
+        },
+        {
+          "id": "docker-resources-oom-killer-q1-quiz4",
+          "question": "cgroup 级别 OOM 与系统级 OOM 最核心的区别是什么？",
+          "options": {
+            "A": "cgroup OOM 发送 SIGTERM 而非 SIGKILL",
+            "B": "系统级 OOM 只终止内核线程不影响用户进程",
+            "C": "两者的退出码不同，分别是 137 和 139",
+            "D": "cgroup OOM 的杀伤范围限定在该 cgroup 内，系统级 OOM 可波及任意进程"
+          },
+          "correctAnswer": "D"
+        },
+        {
+          "id": "docker-resources-oom-killer-q1-quiz5",
+          "question": "在 cgroup v1 中，`docker run -m 512m` 的内存限制值被写入哪个文件？",
+          "options": {
+            "A": "memory.limit_in_bytes",
+            "B": "memory.soft_limit_in_bytes",
+            "C": "memory.max_usage_in_bytes",
+            "D": "memory.usage_in_bytes"
+          },
+          "correctAnswer": "A"
+        },
+        {
+          "id": "docker-resources-oom-killer-q1-quiz6",
+          "question": "通过 `dmesg` 查看 OOM Kill 日志时，以下哪项是日志中包含的关键排查信息？",
+          "options": {
+            "A": "容器的镜像名称和 tag",
+            "B": "被杀进程的 PID、进程名及 anon-rss 等内存占用数据",
+            "C": "容器的网络命名空间 ID",
+            "D": "Docker 引擎的版本号和 API 版本"
+          },
+          "correctAnswer": "B"
+        },
+        {
+          "id": "docker-resources-oom-killer-q1-quiz7",
+          "question": "JDK 8u191+ 推荐使用哪个 JVM 参数让堆大小自动适配容器内存限制？",
+          "options": {
+            "A": "用 `-Xmx` 硬编码一个固定值",
+            "B": "`-XX:MaxHeapSize` 配合手动计算",
+            "C": "`-XX:MaxRAMPercentage` 设置为容器内存的百分比",
+            "D": "`-XX:MinRAMPercentage` 设置一个下限即可"
+          },
+          "correctAnswer": "C"
+        },
+        {
+          "id": "docker-resources-oom-killer-q1-quiz8",
+          "question": "Go 1.19 引入的 `GOMEMLIMIT` 环境变量具有什么行为特点？",
+          "options": {
+            "A": "超过限制时运行时立刻触发 panic 终止进程",
+            "B": "直接限制 Go 进程的 RSS，超限则被操作系统 OOM Kill",
+            "C": "限制 goroutine 最大数量以间接控制内存",
+            "D": "为 GC 设置软上限，GC 会更积极回收但不阻止实际分配超限"
+          },
+          "correctAnswer": "D"
+        },
+        {
+          "id": "docker-resources-oom-killer-q1-quiz9",
+          "question": "以下哪个 `docker run` 参数直接设置容器的物理内存硬上限？",
+          "options": {
+            "A": "`--memory`",
+            "B": "`--memory-reservation`",
+            "C": "`--memory-swap`",
+            "D": "`--oom-kill-disable`"
+          },
+          "correctAnswer": "A"
+        },
+        {
+          "id": "docker-resources-oom-killer-q1-quiz10",
+          "question": "在 cgroup v2 中，查看容器触发 OOM 事件的累计次数应该读取哪个文件？",
+          "options": {
+            "A": "memory.oom_control",
+            "B": "memory.events",
+            "C": "memory.stat",
+            "D": "memory.pressure"
+          },
+          "correctAnswer": "B"
+        }
+      ]
+    }
+  ]
+}

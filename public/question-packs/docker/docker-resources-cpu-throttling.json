@@ -1,0 +1,157 @@
+{
+  "id": "docker-resources-cpu-throttling",
+  "name": "CPU Throttling 诊断",
+  "domain": "docker",
+  "description": "讲解 CFS 带宽控制导致的 CPU Throttling 现象、观测指标及 nr_throttled 排查方法",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-resources-cpu-throttling-q1",
+      "domain": "docker",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["cpu-throttling", "cfs", "cgroup", "nr_throttled", "cpu.stat", "性能诊断", "bandwidth-control"],
+      "title": "CPU Throttling 是什么？如何观测和诊断",
+      "content": "你的团队在生产环境跑了一组 Go 微服务，部署在 Docker 上，每个容器通过 `--cpus=2` 限制了 CPU 资源。监控面板上 CPU 使用率一直在 120%-150% 之间徘徊，远没有触达 200% 的上限，看起来还有不少余量。但诡异的事情出现了——每隔几秒钟，服务的 P99 延迟会突然从 15ms 飙到 200ms 甚至更高，形成非常明显的「毛刺」模式。\n\n你的同事用 `docker stats` 看了一眼：\n\n```\nCONTAINER ID   NAME        CPU %     MEM USAGE / LIMIT\na3f8e2c91d47   order-svc   142.36%   386MiB / 1GiB\nb7d1f4a08e62   pay-svc     138.71%   412MiB / 1GiB\n```\n\n「CPU 才用到 140%，限制是 200%，根本没到上限啊，为什么会卡？」他一脸困惑。\n\n另一个同事提出可能是 GC 导致的，但你用 pprof 看了 Go runtime 的 GC pause，STW 时间稳定在 200μs 以内，根本不可能造成 200ms 量级的毛刺。网络层面也排查过了，内网 ping 延迟稳定在 0.2ms，TCP retransmit 率接近零。上游依赖的 Redis 和 MySQL 响应时间也一切正常。\n\n这时候组里有经验的 SRE 说了一句：「去看看 cpu.stat 里的 nr_throttled。」\n\n你进到宿主机上找到容器的 cgroup 目录，看到这样的输出：\n\n```bash\ncat /sys/fs/cgroup/cpu/docker/a3f8e2c91d47.../cpu.stat\nnr_periods 348520\nnr_throttled 87130\nthrottled_time 162844392716\n```\n\nnr_throttled 高达 87130，换算一下就是在过去的运行周期中，有 25% 的 CFS period 发生了 CPU 节流。throttled_time 累计达到了 162.8 秒。\n\n问题来了：CPU 使用率明明没到 limit，为什么还会被 throttle？CFS 的带宽控制到底是怎么工作的？`nr_throttled` 和 `throttled_time` 这两个指标分别代表什么？你在生产环境中会怎么系统性地观测和诊断 CPU Throttling？",
+      "answer": "## Step 1：CFS 调度器与 CPU 带宽控制基础\n\n要搞清楚 CPU Throttling，得先理解 Linux 内核的 CFS 是怎么回事。CFS 全称 Completely Fair Scheduler（完全公平调度器），从 Linux 2.6.23 内核开始取代了老的 O(1) 调度器，成为默认的进程调度算法。CFS 的核心理念非常直白——所有可运行的进程按权重公平分配 CPU 时间。它在内部维护一棵红黑树，按每个进程已消耗的「虚拟运行时间」（vruntime）排序，vruntime 最小的进程优先获得 CPU。如果你只有一个容器独占整台机器，CFS 会让它自由使用所有 CPU 核心，没有任何节流。\n\n但容器场景需要资源隔离，光靠「公平」不够，还得有「上限」。Docker 的 `--cpus=2` 和 Kubernetes 的 `resources.limits.cpu: \"2\"` 底层都依赖同一个内核机制：CFS Bandwidth Control（CFS 带宽控制），这个特性在 Linux 3.2 内核引入。它通过两个 cgroup 参数来控制 CPU 配额：\n\n第一个是 `cfs_period_us`，调度周期，默认值 100000 微秒也就是 100ms。第二个是 `cfs_quota_us`，在一个 period 内允许使用的 CPU 时间总量。当你设置 `--cpus=2` 时，Docker 会把 quota 设为 200000μs，period 保持 100ms 不变。这意味着：每 100ms 内，这个 cgroup 下所有线程加起来最多能消耗 200ms 的 CPU 时间——等价于跑满两个核心。\n\n你可以在宿主机上直接验证这两个值：\n\n```bash\nCONTAINER_ID=$(docker inspect --format='{{.Id}}' order-svc)\ncat /sys/fs/cgroup/cpu/docker/${CONTAINER_ID}/cpu.cfs_quota_us\n# 200000\ncat /sys/fs/cgroup/cpu/docker/${CONTAINER_ID}/cpu.cfs_period_us\n# 100000\n```\n\n理解了 quota 和 period 的关系，Throttling 的本质就呼之欲出了。\n\n## Step 2：Throttling 详解——为什么 CPU 没到 limit 也会被节流\n\nCFS 带宽控制的运作方式是这样的：每个 period 开始时，内核给 cgroup 重新充满 quota。cgroup 下所有线程共享这份 quota——每个线程每执行一段时间就从 quota 中扣除对应的微秒数。一旦 quota 在当前 period 内被耗尽，这个 cgroup 下的所有线程立刻被挂起，不管它们在做什么，即使正在处理一个关键请求也毫不留情。被挂起的线程必须等到下一个 period 开始、quota 重新充值后才能继续运行。这段被强制等待的时间就是 throttled time。\n\n这就是「CPU 使用率没到 limit 但还是被 throttle」的根源。关键在于：`docker stats` 和 Prometheus 里的 CPU 使用率是一段时间窗口的平均值（通常是几秒到几十秒的粒度），而 throttling 发生在单个 period（100ms）的微观层面。\n\n来看一个具体例子。假设容器限制 `--cpus=2`（quota=200ms/period），容器内跑着一个 Go 服务，GOMAXPROCS=8，同时有 8 个 goroutine 在处理请求。在某个 100ms 的 period 里，前 25ms 内这 8 个线程恰好同时进入计算密集的逻辑（比如 JSON 序列化、加密运算或 GC 的标记阶段），每个线程消耗 25ms CPU 时间，总计 8 × 25ms = 200ms。Quota 在仅仅 25ms 内就被花光了。接下来 75ms 里，所有 8 个线程全部被挂起——这意味着在这 75ms 内，任何新进来的请求都无法被处理，正在处理中的请求也被冻结。如果一个请求恰好在 quota 耗尽的瞬间到达，它最多要等待 75ms 才能开始被处理。但如果你从 1 秒的窗口来计算平均 CPU 使用率，200ms / 1000ms = 20%，远低于 200% 的 limit。\n\n这就是为什么延迟毛刺和平均 CPU 使用率之间看起来「对不上号」。P50 延迟正常是因为大多数请求在 quota 充足时被处理了，P99 飙高是因为少部分请求撞上了 quota 耗尽的窗口。\n\n现在来解读 `cpu.stat` 中的三个指标。在 cgroup v1 中：\n\n```\nnr_periods 348520           # CFS 总共经过的 period 数\nnr_throttled 87130           # 其中发生了 throttling 的 period 数\nthrottled_time 162844392716  # 被 throttle 的累计时间（单位：纳秒）\n```\n\n`nr_throttled / nr_periods` 就是 throttle 率。本例中 87130 / 348520 ≈ 25%，意味着每 4 个 100ms 的调度周期里就有 1 个出现了节流。`throttled_time` 换算为秒：162844392716 / 1e9 ≈ 162.8 秒。这个数字告诉你容器累计有多少时间「本来想用 CPU 但被强制等待」。两个指标要结合看——nr_throttled 告诉你节流有多频繁，throttled_time 告诉你每次节流等了多久。\n\n在生产环境中，手动 cat 文件显然不够。Prometheus + cAdvisor 是标准方案。cAdvisor 暴露了 `container_cpu_cfs_throttled_periods_total` 和 `container_cpu_cfs_periods_total` 指标，用 PromQL 计算实时 throttle 率：\n\n```promql\nrate(container_cpu_cfs_throttled_periods_total{container=\"order-svc\"}[5m])\n/\nrate(container_cpu_cfs_periods_total{container=\"order-svc\"}[5m])\n```\n\n根据实战经验，throttle 率的告警阈值可以这样设：低于 5% 一般可以接受（偶发突发），5%-20% 是黄色预警（应该关注），超过 20% 是红色告警（延迟一定已经受到显著影响）。本例中 25% 的 throttle 率，对于一个支付服务来说已经是必须立刻处理的级别了。\n\n解决方案分几个层次。最直接的是调高 CPU limits——把 `--cpus=2` 改成 `--cpus=4`，给突发负载留出空间。但这是治标不治本，而且可能浪费资源。更精细的做法是调整 GOMAXPROCS 或线程数，减少并发线程数量使得 quota 消耗更均匀。比如把 GOMAXPROCS 从 8 降到 2（与 CPU limit 匹配），虽然单核利用率上去了，但 quota 不会在短时间内被突然吃光。\n\n## Step 3：扩展——K8s limits 争议、Burstable 方案与 cgroup v2\n\n**Kubernetes 中 CPU limits 要不要设？**\n\nCPU Throttling 问题在 Kubernetes 社区引发了旷日持久的争论。Google 的 Tim Hockin 在 2022 年明确建议「除非你有明确的理由，否则不要设置 CPU limits」。他的逻辑是：CPU 是可压缩资源（compressible resource），不像内存那样不释放就 OOM Kill——CPU 竞争最坏的结果只是变慢，而 CFS throttling 带来的阶梯式延迟毛刺反而比自然的 CPU 争用更恶劣。Zalando、Datadog、Buffer 等公司公开分享过他们的实践：只设 CPU requests（保证调度时的资源预留），不设 limits（运行时允许 burst 使用节点上的空闲 CPU）。\n\n但不设 limits 也有风险：一个失控的 Pod（死循环、错误的并发配置）可能吃光节点所有空闲 CPU，导致同节点的其他 Pod 饥饿。所以工程判断是：延迟敏感型服务（API 网关、支付、搜索）通常不设 CPU limits 以规避 throttling；批处理任务、离线计算、CI/CD Job 则应该设 limits 防止挤占在线服务资源。\n\n**CFS burst 特性**\n\nLinux 5.14 内核引入了 CFS burst（`cpu.cfs_burst_us`），这是针对 throttling 问题的内核级解决方案。它允许 cgroup 在 CPU 使用较低的 period 里「存钱」——把没用完的 quota 积攒起来，在后续高峰 period 里额外支出。比如 quota=200ms/period，前三个 period 每个只用了 150ms，积攒了 3 × 50ms = 150ms 的余额。在第四个 period 突发高峰时，可用 quota 变成 200ms + 150ms = 350ms，大幅减少被 throttle 的概率。\n\n```bash\n# 设置 burst 额度（cgroup v1）\necho 100000 > /sys/fs/cgroup/cpu/docker/${CONTAINER_ID}/cpu.cfs_burst_us\n```\n\n**cgroup v2 下的 cpu.max**\n\n在 cgroup v2（Ubuntu 22.04+、Kubernetes 1.25+ 默认启用）中，CPU 带宽控制的接口做了简化。`cpu.cfs_quota_us` 和 `cpu.cfs_period_us` 两个文件合并为一个 `cpu.max`：\n\n```bash\ncat /sys/fs/cgroup/docker/${CONTAINER_ID}/cpu.max\n# 200000 100000\n# 格式：quota period（微秒）\n# \"max 100000\" 表示不限制\n```\n\nthrottling 统计同样在 `cpu.stat` 中，但时间单位从 v1 的纳秒（throttled_time）变成了微秒（throttled_usec），迁移到 v2 后别把单位搞混了：\n\n```bash\ncat /sys/fs/cgroup/docker/${CONTAINER_ID}/cpu.stat\n# usage_usec 284729153\n# user_usec 251038274\n# system_usec 33690879\n# nr_periods 348520\n# nr_throttled 87130\n# throttled_usec 162844392\n```\n\n**面试中怎么答这道题**\n\n面试官考 CPU Throttling 通常有三个层次。第一层考原理认知：CFS bandwidth control 的 quota/period 机制是什么，throttling 在什么条件下发生。第二层考排查能力：给你一个 P99 毛刺的场景，看你能不能第一时间想到去查 `cpu.stat`，能不能正确解读 nr_throttled 和 throttled_time 的含义。第三层考工程判断力：Kubernetes 里要不要设 CPU limits？答得好的人不会给出非黑即白的结论，而是区分在线服务和离线任务、说清楚 throttling 的代价和不限制的风险、提到 CFS burst 等缓解方案。能把这三层都讲清楚，这道题就拿满分了。",
+      "keyPoints": [
+        "CFS 带宽控制通过 cfs_quota_us 和 cfs_period_us 两个参数限制 CPU 使用，Docker --cpus=2 等价于 quota=200000μs、period=100000μs，即每 100ms 内所有线程最多共享 200ms CPU 时间",
+        "CPU Throttling 发生在单个 period（100ms）粒度上——当多线程并发导致 quota 在 period 内提前耗尽时，即使平均 CPU 使用率远低于 limit 也会被节流，这是「CPU 没到上限却被 throttle」的核心原因",
+        "cpu.stat 中 nr_throttled 记录发生节流的 period 数量，throttled_time（v1 纳秒）/ throttled_usec（v2 微秒）记录累计被节流时间，nr_throttled/nr_periods 比值是衡量 throttling 严重程度的核心指标",
+        "CPU Throttling 在应用层的典型表现是 P99 延迟出现规律性毛刺而 P50 稳定，因为只有部分请求碰巧在 quota 耗尽的窗口被处理，最大额外延迟可达一个完整 period（100ms）",
+        "Prometheus + cAdvisor 通过 container_cpu_cfs_throttled_periods_total 和 container_cpu_cfs_periods_total 指标计算实时 throttle 率，5% 以下可接受、5%-20% 需关注、超过 20% 需立即处理",
+        "Linux 5.14 引入 CFS burst 特性（cpu.cfs_burst_us），允许在 CPU 空闲 period 积攒未使用的 quota，在突发高峰时额外消耗，有效缓解突发性 throttling",
+        "Kubernetes 社区对 CPU limits 存在争议——延迟敏感型服务通常只设 requests 不设 limits 以避免 throttling 毛刺，批处理任务则应设 limits 防止挤占在线服务的 CPU",
+        "cgroup v2 将 quota/period 合并为单个 cpu.max 文件（格式「quota period」），throttling 统计时间单位从 v1 的纳秒变为微秒，迁移时需注意单位差异"
+      ],
+      "quiz": [
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz1",
+          "question": "Docker 中设置 --cpus=2 时，CFS 带宽控制的 quota 和 period 分别被设为多少？",
+          "choices": [
+            {"id": "A", "text": "quota=200000μs，period=100000μs，表示每 100ms 内最多使用 200ms CPU 时间"},
+            {"id": "B", "text": "quota=200%，period=1s，表示每秒钟最多使用 200% 的 CPU"},
+            {"id": "C", "text": "quota=2000ms，period=1000ms，表示每秒内最多使用 2000ms CPU 时间"},
+            {"id": "D", "text": "quota=200000μs，period=200000μs，表示每 200ms 内最多使用 200ms CPU 时间"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "CFS 带宽控制用两个参数限制 CPU：cfs_period_us 默认是 100000μs（即 100ms），cfs_quota_us 等于 period × CPU 核数。--cpus=2 就是 100000 × 2 = 200000μs 的 quota。B 选项把 quota 理解成了百分比而非时间量，CFS 控制的本质是时间片分配而非比例。C 选项虽然等比放大了数字，但 Docker 实际使用的 period 默认是 100ms 而非 1s。D 选项把 period 也设成了 200000μs，这样 quota/period=1，等价于只用 1 个 CPU 核心。"
+        },
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz2",
+          "question": "一个容器设置了 --cpus=2，内部有 8 个工作线程同时满负载运行了 25ms，接下来会发生什么？",
+          "choices": [
+            {"id": "A", "text": "8 个线程各自消耗 25ms，总 CPU 时间为 200ms 但不会被 throttle，因为平均使用率才 20%"},
+            {"id": "B", "text": "只有超过 2 个线程会被调度执行，其余线程排队等待，不会出现 throttle"},
+            {"id": "C", "text": "8 个线程在 25ms 内耗尽了 200ms 的 quota，在当前 period 剩余的 75ms 内所有线程被挂起"},
+            {"id": "D", "text": "内核会自动将 quota 临时扩展到 800ms 以适应 8 线程并发，不发生 throttle"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这道题揭示了 CPU Throttling 最反直觉的地方。quota=200ms 是 cgroup 下所有线程在一个 period 内共享的总额度。8 个线程同时跑 25ms，总消耗 8 × 25ms = 200ms，恰好把 quota 花光——但此时 period（100ms）才过了 25ms。接下来的 75ms 里所有线程被强制挂起。A 选项的错误在于混淆了「瞬时消耗」和「平均使用率」——throttle 看的是单个 period 内的 quota 消耗，不是时间窗口平均值。B 选项误以为 CFS 限制的是并发线程数，实际上它限制的是 CPU 时间总量。D 选项中的自动扩展机制并不存在。"
+        },
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz3",
+          "question": "在 cgroup v1 的 cpu.stat 文件中看到 throttled_time 162844392716，这个值的含义和单位是什么？",
+          "choices": [
+            {"id": "A", "text": "被节流的 period 总数，无单位"},
+            {"id": "B", "text": "被节流的累计时间，单位为纳秒，约等于 162.8 秒"},
+            {"id": "C", "text": "被节流的累计时间，单位为微秒，约等于 162844 秒"},
+            {"id": "D", "text": "CPU 总使用时间中被节流占据的比例，单位为万分之一"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 cgroup v1 中，cpu.stat 的 throttled_time 字段记录的是被节流的累计时间，单位是纳秒。162844392716 纳秒 ÷ 1e9 = 162.8 秒。A 选项描述的其实是 nr_throttled 字段的含义，不是 throttled_time。C 选项把单位搞成了微秒，如果是微秒那换算后约 45 小时，明显不合理。需要特别注意的是 cgroup v2 中同类字段叫 throttled_usec，单位改成了微秒——这是 v1 和 v2 之间一个容易踩坑的差异。D 选项纯属编造，cpu.stat 中没有比例类型的字段。"
+        },
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz4",
+          "question": "容器的 cpu.stat 显示 nr_periods=100000、nr_throttled=15000，以下哪个判断最准确？",
+          "choices": [
+            {"id": "A", "text": "throttle 率 15%，属于正常水平，不需要关注"},
+            {"id": "B", "text": "throttle 率 15%，说明容器平均 CPU 使用率已经达到了 85%"},
+            {"id": "C", "text": "throttle 率 15%，说明容器的 CPU limit 设得太高，应该调低"},
+            {"id": "D", "text": "throttle 率 15%，P99 延迟很可能已经受到影响，应该排查并调整 CPU 配置"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "15000 / 100000 = 15% 的 throttle 率意味着每 100 个调度周期有 15 个发生了节流。根据生产经验，throttle 率超过 5% 就应该引起关注，超过 20% 需要紧急处理。15% 已经处于黄色到红色告警的边界，P99 延迟毛刺大概率已经很明显了。A 选项错在把 15% 当作正常水平，实际上这已经是中高程度的节流。B 选项混淆了 throttle 率和 CPU 利用率——它们是两个完全不同的维度，throttle 率高并不意味着平均 CPU 利用率高。C 选项因果倒置，throttle 率高说明 limit 太低或突发太多，应该调高而非调低。"
+        },
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz5",
+          "question": "CPU Throttling 在应用层面最典型的表现特征是什么？",
+          "choices": [
+            {"id": "A", "text": "平均吞吐量大幅下降，所有请求都变慢，P50 和 P99 同步升高"},
+            {"id": "B", "text": "应用直接报错或返回 HTTP 503，因为 CPU 资源被完全耗尽"},
+            {"id": "C", "text": "服务出现 OOM Kill，因为 CPU 节流导致内存无法及时释放"},
+            {"id": "D", "text": "P99 延迟出现规律性毛刺而 P50 基本稳定，因为只有部分请求碰巧在 quota 耗尽窗口被处理"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "CPU Throttling 的特征性表现是 P99 出现离散的延迟尖峰（毛刺），而 P50 保持正常。原因是在大多数 period 里 quota 充足，请求正常处理（P50 不受影响），但在 quota 耗尽的 period 里，恰好到达的请求必须等到下一个 period 才能被处理，最多额外增加一个 period（默认 100ms）的延迟。A 选项描述的是 CPU 全面不足的场景（比如机器满载），不是 throttle 的特征。B 选项误解了 throttle 的后果——被 throttle 的线程只是暂停，不会触发错误。C 选项把 CPU 节流和 OOM 混为一谈，两者是完全独立的资源限制机制。"
+        },
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz6",
+          "question": "用 Prometheus + cAdvisor 监控 CPU Throttling，以下哪个 PromQL 能正确计算 throttle 率？",
+          "choices": [
+            {"id": "A", "text": "container_cpu_cfs_throttled_periods_total / container_cpu_cfs_periods_total（直接除）"},
+            {"id": "B", "text": "rate(container_cpu_cfs_throttled_periods_total[5m]) / rate(container_cpu_cfs_periods_total[5m])"},
+            {"id": "C", "text": "rate(container_cpu_usage_seconds_total[5m]) / container_spec_cpu_quota"},
+            {"id": "D", "text": "sum(container_cpu_cfs_throttled_seconds_total) by (container)"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确的做法是对两个 counter 类型指标分别取 rate 再相除。cAdvisor 暴露的 container_cpu_cfs_throttled_periods_total 和 container_cpu_cfs_periods_total 都是单调递增的 counter，直接用原始值相除（A 选项）得到的是容器启动以来的全局 throttle 率，无法反映近期变化趋势。对两个 counter 分别取 rate 后相除，得到的是 5 分钟窗口内的瞬时 throttle 率。C 选项计算的是 CPU 利用率而非 throttle 率，而且 container_spec_cpu_quota 不是时间速率，维度不匹配。D 选项引用了一个不存在的指标名（cAdvisor 暴露的是 periods 而非 seconds）。"
+        },
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz7",
+          "question": "关于 Kubernetes 中是否应该设置 CPU limits，以下哪个说法最符合业界实践？",
+          "choices": [
+            {"id": "A", "text": "所有 Pod 都必须设置 CPU limits，否则集群资源无法管理"},
+            {"id": "B", "text": "所有 Pod 都不应该设 CPU limits，因为 CPU 是可压缩资源，throttle 比自然竞争更有害"},
+            {"id": "C", "text": "统一设 CPU limits 为 requests 的 2 倍，既限制又留余量"},
+            {"id": "D", "text": "延迟敏感型服务通常只设 requests 不设 limits 以避免 throttling，批处理任务设 limits 防止挤占在线资源"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "这是一个需要展现工程判断力的问题。Google 的 Tim Hockin 和多家头部公司（Zalando、Datadog）都分享过只设 requests 不设 limits 的实践，但这个建议主要针对延迟敏感的在线服务。对于批处理任务、离线计算、CI/CD Job，不设 limits 可能导致它们吃光节点空闲 CPU，影响同节点的在线服务。A 选项过于绝对——CPU limits 不是必须的，requests 才是调度的基础。B 选项走了另一个极端，完全不设 limits 对批处理任务来说有资源挤占风险。C 选项的「2 倍」没有依据，不同业务的突发特征差异很大，不存在通用倍数。"
+        },
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz8",
+          "question": "Linux 5.14 引入的 CFS burst 特性（cpu.cfs_burst_us）的工作原理是什么？",
+          "choices": [
+            {"id": "A", "text": "允许 cgroup 在 CPU 空闲的 period 积攒未使用的 quota，在突发高峰时额外消耗"},
+            {"id": "B", "text": "在 throttle 发生时临时借用下一个 period 的 quota，提前透支"},
+            {"id": "C", "text": "在 throttle 发生时自动将 period 缩短一半，减小单次 throttle 的延迟"},
+            {"id": "D", "text": "自动检测突发负载并临时解除 CFS 带宽控制限制直到负载恢复平稳"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "CFS burst 的设计思路是「存钱取钱」。当 cgroup 在某些 period 内没有用完 quota（比如 quota=200ms 但只用了 150ms），多出来的 50ms 可以被积攒到 burst 池中（上限为 cpu.cfs_burst_us 的设定值）。下一个高峰 period 到来时，可用 quota 等于正常 quota 加上积攒的余额，从而吸收突发峰值而不触发 throttle。B 选项的「借用下一个 period」概念不存在——burst 只能花之前攒的，不能透支。C 选项描述的是调整 period 长度的策略，与 burst 机制无关。D 选项中的「自动解除限制」也不是 burst 的行为，burst 只是增大了缓冲池，不会完全取消限制。"
+        },
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz9",
+          "question": "在 cgroup v2 环境下查看容器的 CPU quota 和 period，应该读取哪个文件？",
+          "choices": [
+            {"id": "A", "text": "cpu.max，内容格式为「quota period」两个数字，如 200000 100000"},
+            {"id": "B", "text": "cpu.cfs_quota_us 和 cpu.cfs_period_us 两个独立文件，与 v1 相同"},
+            {"id": "C", "text": "cpu.stat 中的 quota_usec 和 period_usec 字段"},
+            {"id": "D", "text": "cpu.weight，格式为 1-10000 的权重值"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "cgroup v2 对 CPU 带宽控制的接口做了整合，把 v1 中分散的 cpu.cfs_quota_us 和 cpu.cfs_period_us 合并为单个 cpu.max 文件，内容格式是「quota period」两个空格分隔的数字，单位都是微秒。如果没有设置限制，内容是「max 100000」。B 选项是 cgroup v1 的接口，在 v2 中这两个文件不存在。C 选项不对——cpu.stat 记录的是使用统计（usage、throttle 等），不包含配置参数。D 选项中的 cpu.weight 确实是 v2 的文件，但它控制的是 CPU 份额（类似 v1 的 cpu.shares），用于公平调度的权重分配，跟带宽限制（hard limit）是两个不同的维度。"
+        },
+        {
+          "id": "docker-resources-cpu-throttling-q1-quiz10",
+          "question": "一个 Go 服务设置了 --cpus=4，GOMAXPROCS=8，频繁出现 CPU Throttling。以下哪个调整最可能有效缓解 throttling？",
+          "choices": [
+            {"id": "A", "text": "将 GOMAXPROCS 增大到 16，提高并发处理能力"},
+            {"id": "B", "text": "将容器的 --memory 限制翻倍，避免内存不足导致 CPU 等待"},
+            {"id": "C", "text": "将 GOMAXPROCS 设为 4 与 CPU limit 匹配，减少线程同时竞争 quota 的程度"},
+            {"id": "D", "text": "在 Dockerfile 中添加 nice -n -20 降低进程优先级"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "GOMAXPROCS=8 意味着 Go runtime 最多用 8 个 OS 线程执行 goroutine，但 CPU limit 只有 4 核。8 个线程同时满载时，仅需 200000/(8×100000)=25ms 就能耗尽一个 period 的 quota（假设全部跑满），剩余 75ms 被 throttle。将 GOMAXPROCS 降到 4 与 limit 匹配后，4 个线程跑满一个 period 恰好用完 quota（4×100ms=400ms quota=400000μs——等等，--cpus=4 的 quota 是 400000μs，4 线程跑满 100ms 恰好用完 400ms，不会被 throttle），quota 消耗更平滑。A 选项适得其反，更多线程只会更快地耗尽 quota。B 选项与 CPU throttling 无关。D 选项搞反了 nice 值的方向，而且 nice 值影响的是 CFS 份额权重而非带宽限制。"
+        }
+      ],
+      "references": [
+        "https://docs.kernel.org/scheduler/sched-bwc.html",
+        "https://engineering.indeedblog.com/blog/2019/12/cpu-throttling-regression-fix/",
+        "https://github.com/kubernetes/kubernetes/issues/67577",
+        "https://medium.com/omio-engineering/cpu-limits-and-aggressive-throttling-in-kubernetes-c5b20bd8a718"
+      ]
+    }
+  ]
+}
