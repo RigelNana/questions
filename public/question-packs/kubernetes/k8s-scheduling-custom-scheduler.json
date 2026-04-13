@@ -1,0 +1,158 @@
+{
+  "id": "k8s-scheduling-custom-scheduler",
+  "name": "自定义调度器实现思路",
+  "domain": "kubernetes",
+  "description": "掌握 Kubernetes 自定义调度器的三种实现方式、Scheduling Framework 插件开发流程与生产级批调度方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-scheduling-custom-scheduler-q1",
+      "domain": "kubernetes",
+      "type": "project",
+      "difficulty": 4,
+      "tags": ["自定义调度器", "Scheduling Framework", "多调度器", "schedulerName", "项目实践"],
+      "title": "实现一个自定义调度器（custom scheduler）的思路是什么？",
+      "content": "## 场景\n\n你所在的公司有一个 AI 训练平台，集群规模约 200 个节点，其中 40 个节点配备了 NVIDIA A100 GPU。团队遇到了一个默认调度器无法解决的问题：一个分布式训练任务需要同时启动 8 个 Worker Pod，每个 Worker 需要 4 张 GPU。默认调度器按 Pod 逐个调度，结果经常出现前 6 个 Worker 被调度成功，但剩余 GPU 不够分配给最后 2 个 Worker 的情况。已经调度的 6 个 Worker 一直在等待未启动的同伴，白白占着 24 张 GPU 什么也不做。更糟糕的是，另一个训练任务的 Pod 也被部分调度了，两个任务互相占用对方需要的 GPU，形成死锁。\n\n运维团队尝试用 Pod Priority 和 PodTopologySpread 来缓解这个问题，但效果有限——Priority 可以让重要任务抢占低优先级 Pod，但无法保证一组 Pod「要么全部调度、要么一个都不调度」的语义。现在团队决定实现一个自定义调度器来支持批调度（gang scheduling / coscheduling），确保一个训练任务的所有 Pod 作为一个整体被调度。\n\n面试官在听完你的项目描述后追问：「实现一个自定义调度器有哪些方案？你选了哪个？具体怎么实现的？为什么不用默认调度器？」\n\n以下是当前集群中一个典型的训练任务定义：\n\n```yaml\napiVersion: batch/v1\nkind: Job\nmetadata:\n  name: llm-finetune-job\n  labels:\n    pod-group.scheduling.sigs.k8s.io/name: llm-finetune-group\n    pod-group.scheduling.sigs.k8s.io/min-member: \"8\"\nspec:\n  parallelism: 8\n  completions: 8\n  template:\n    metadata:\n      labels:\n        pod-group.scheduling.sigs.k8s.io/name: llm-finetune-group\n        pod-group.scheduling.sigs.k8s.io/min-member: \"8\"\n    spec:\n      schedulerName: my-custom-scheduler\n      containers:\n      - name: trainer\n        image: training-framework:v3.2.0\n        resources:\n          requests:\n            cpu: \"8\"\n            memory: 64Gi\n            nvidia.com/gpu: \"4\"\n          limits:\n            nvidia.com/gpu: \"4\"\n      restartPolicy: Never\n```\n\n请从方案选型、核心实现、部署上线三个维度完整阐述你实现这个自定义调度器的思路。",
+      "answer": "## Kubernetes 自定义调度器：从核心概念到生产实践\n\n### 一、kube-scheduler 基础与自定义调度的动机\n\nkube-scheduler 是 Kubernetes 控制平面中负责 Pod 调度决策的核心组件。它的工作模式是：通过 Informer 机制持续 Watch API Server，一旦发现 `spec.nodeName` 为空的 Pod，就将其放入内部的调度队列（SchedulingQueue），然后循环地从队列中取出 Pod，依次执行过滤（Filter）和打分（Score）两个阶段，从集群的所有节点中选出一个最优节点，最终通过 Binding API 将 Pod 绑定到这个节点上。\n\n默认调度器的设计目标是通用性：它能处理绝大部分工作负载的调度需求，包括基于资源 requests 的过滤、节点亲和性、Pod 拓扑分布约束等。但它有一个根本性的架构限制——调度决策是以单个 Pod 为粒度做出的。调度器每次从队列中取出一个 Pod，为它选一个节点，然后再取下一个 Pod。这种逐 Pod 调度的模式在微服务场景下完全够用，但在以下几类场景中会遇到瓶颈。\n\n第一类是 GPU 拓扑感知调度。NVIDIA A100 GPU 之间通过 NVLink 和 NVSwitch 互联，同一个 NVLink 域内的 GPU 之间通信带宽可以达到 600GB/s，而跨 PCIe 桥接的 GPU 之间只有约 32GB/s。分布式训练任务的性能对 GPU 拓扑极度敏感——如果 4 张 GPU 分配在同一个 NVLink 域内，All-Reduce 通信效率会比随机分配高出 3-5 倍。默认调度器对 GPU 的理解仅限于「这个节点有多少张可用 GPU」，它不了解 GPU 之间的拓扑关系。\n\n第二类就是题目中描述的批调度（gang scheduling）。一个分布式训练任务通常由多个 Worker Pod 组成，这些 Worker 之间通过 NCCL 或 MPI 进行集合通信，必须全部就绪后才能开始训练。如果只调度了部分 Worker，已调度的 Worker 会空等未就绪的同伴，白白浪费 GPU 资源。更严重的是，当多个训练任务同时提交时，可能出现资源死锁：任务 A 拿到了 6 个 Worker 的 GPU，任务 B 也拿到了 6 个 Worker 的 GPU，但两个任务都需要 8 个 Worker 才能启动，集群只剩 4 张空闲 GPU，谁也凑不齐，形成「资源碎片化死锁」。\n\n第三类是数据亲和调度。在大数据处理场景中，你希望计算 Pod 尽量调度到数据所在的节点上，减少跨节点的数据传输。默认调度器没有「知道数据在哪里」的能力，这需要自定义的调度逻辑。\n\n理解了这些背景，我们来看实现自定义调度器的三种主流方案。\n\n### 二、三种实现方案的选型与对比\n\n#### 方案一：Scheduling Framework 插件（最推荐）\n\nScheduling Framework 是 Kubernetes 从 v1.19 开始正式 GA 的调度器扩展架构。它将 kube-scheduler 的内部流程拆分为十余个扩展点（extension points），每个扩展点可以注册自定义插件。这种方式的核心思想是「在默认调度器内部注入你的逻辑」，而不是从头实现一个调度器。\n\n完整的扩展点链路为：`QueueSort` → `PreFilter` → `Filter` → `PostFilter` → `PreScore` → `Score` → `NormalizeScore` → `Reserve` → `Permit` → `PreBind` → `Bind` → `PostBind`。对于批调度场景，最关键的是 `Permit` 扩展点。`Permit` 插件可以在调度器为 Pod 选好节点之后、执行 Bind 之前拦截决策，返回三种结果：`Success`（允许绑定）、`Deny`（拒绝，Pod 回到队列）、`Wait`（挂起，等待信号）。利用 `Wait` 机制，你可以让同一个 PodGroup 中的 Pod 在 Permit 阶段排队等待，直到凑齐了 min-member 数量的 Pod 后一起放行。这就是 Coscheduling 的核心原理。\n\n这种方案的优势非常明显：你复用了默认调度器的全部能力（资源过滤、亲和性、拓扑分布），只需要在特定扩展点加入你的自定义逻辑。代码量小，通常一个 Filter + Score + Permit 三件套就够了。升级 Kubernetes 版本时，你的插件跟随 scheduler 代码一起编译，兼容性有保障。\n\n#### 方案二：独立调度器（Standalone Scheduler）\n\n第二种方案是完全独立地实现一个调度器进程，它与 kube-scheduler 并行运行。独立调度器的核心逻辑是一个 Watch-Decide-Bind 循环：Watch API Server 获取未调度的 Pod（`spec.nodeName` 为空且 `spec.schedulerName` 匹配自己的名字），执行你的自定义调度算法选择节点，然后调用 Binding API 将 Pod 绑定到选中的节点上。\n\n一个最简化的独立调度器用 Go 和 client-go 库实现大约需要 200-300 行代码。核心流程是这样的：\n\n```go\npackage main\n\nimport (\n    \"context\"\n    \"fmt\"\n    \"math/rand\"\n\n    v1 \"k8s.io/api/core/v1\"\n    metav1 \"k8s.io/apimachinery/pkg/apis/meta/v1\"\n    \"k8s.io/apimachinery/pkg/labels\"\n    \"k8s.io/client-go/informers\"\n    \"k8s.io/client-go/kubernetes\"\n    \"k8s.io/client-go/tools/clientcmd\"\n)\n\nconst schedulerName = \"my-custom-scheduler\"\n\nfunc main() {\n    config, _ := clientcmd.BuildConfigFromFlags(\"\", clientcmd.RecommendedHomeFile)\n    clientset, _ := kubernetes.NewForConfig(config)\n\n    factory := informers.NewSharedInformerFactory(clientset, 0)\n    podInformer := factory.Core().V1().Pods()\n    nodeInformer := factory.Core().V1().Nodes()\n\n    ctx := context.Background()\n    factory.Start(ctx.Done())\n    factory.WaitForCacheSync(ctx.Done())\n\n    // 主调度循环：Watch 未调度的 Pod\n    pods, _ := podInformer.Lister().List(labels.Everything())\n    for _, pod := range pods {\n        if pod.Spec.SchedulerName == schedulerName && pod.Spec.NodeName == \"\" {\n            node := selectNode(nodeInformer, pod)\n            if node != \"\" {\n                bind(clientset, pod, node)\n            }\n        }\n    }\n}\n\n// selectNode 实现你的自定义调度逻辑\nfunc selectNode(nodeInformer interface{}, pod *v1.Pod) string {\n    // 这里实现 GPU 拓扑感知、批调度等逻辑\n    // 示例：随机选择（生产中替换为真实算法）\n    return fmt.Sprintf(\"gpu-node-%d\", rand.Intn(40))\n}\n\n// bind 调用 Binding API 完成绑定\nfunc bind(clientset kubernetes.Interface, pod *v1.Pod, nodeName string) {\n    binding := &v1.Binding{\n        ObjectMeta: metav1.ObjectMeta{\n            Name:      pod.Name,\n            Namespace: pod.Namespace,\n        },\n        Target: v1.ObjectReference{\n            Kind: \"Node\",\n            Name: nodeName,\n        },\n    }\n    clientset.CoreV1().Pods(pod.Namespace).Bind(context.TODO(), binding, metav1.CreateOptions{})\n}\n```\n\n这种方案的好处是灵活性极高，你可以完全控制调度算法，不受 Scheduling Framework 的扩展点约束。但缺点同样明显：你需要自己实现资源过滤、亲和性检查、抢占逻辑等默认调度器已经做好的事情，工作量大且容易出错。你还需要处理并发安全、缓存同步、调度队列管理等基础设施问题。在生产环境中，维护一个独立调度器的成本远高于维护一个 Framework 插件。\n\n#### 方案三：Webhook Extender（旧方案，不推荐）\n\n在 Scheduling Framework 出现之前，Kubernetes 提供了 Extender 机制——调度器在 Filter 和 Score 阶段向外部 HTTP 服务发送 Webhook 请求，外部服务返回过滤结果或打分。这种方式在 Kubernetes 1.15 之前是唯一的调度扩展手段。\n\n但 Extender 有严重的性能问题：每个 Pod 调度都会触发一次甚至多次 HTTP 调用，在大规模集群中延迟不可接受。而且 Extender 只能参与 Filter 和 Score 两个阶段，无法介入 Permit、Reserve 等扩展点，实现批调度这类需求会非常别扭。从 Kubernetes 1.19 开始，社区明确推荐使用 Scheduling Framework 替代 Extender，新项目不应该再使用这种方案。\n\n### 三、Scheduling Framework 插件开发：以批调度为例\n\n确定了方案一之后，来看具体的开发步骤。以实现一个简化的批调度（Coscheduling）插件为例，核心思路是：在 Permit 阶段，检查当前 Pod 所属的 PodGroup 是否已经凑齐了 min-member 个 Pod，如果没凑齐就让 Pod 等待，凑齐了就全部放行。\n\n#### 步骤一：实现 Plugin 接口\n\n每个 Scheduling Framework 插件都需要实现 `framework.Plugin` 基础接口以及你关心的扩展点接口。对于批调度，我们需要实现 `FilterPlugin`（检查当前集群资源是否可能满足整个 PodGroup）、`ScorePlugin`（优先选择能同时容纳更多同组 Pod 的节点）和 `PermitPlugin`（等待凑齐后放行）。下面是一个自定义 Score 插件的核心代码，它根据节点上已有同组 Pod 的数量进行加分，鼓励同组 Pod 调度到相邻节点：\n\n```go\npackage coscheduling\n\nimport (\n    \"context\"\n    \"fmt\"\n\n    v1 \"k8s.io/api/core/v1\"\n    \"k8s.io/apimachinery/pkg/runtime\"\n    \"k8s.io/kubernetes/pkg/scheduler/framework\"\n)\n\nconst Name = \"CoschedulingScore\"\n\n// CoschedulingScore 插件：为同一 PodGroup 中的 Pod\n// 倾向于调度到已有同组 Pod 的节点上，减少跨节点通信开销\ntype CoschedulingScore struct {\n    handle framework.Handle\n}\n\nfunc (cs *CoschedulingScore) Name() string {\n    return Name\n}\n\n// Score 对每个候选节点打分：该节点上同组 Pod 越多，分数越高\nfunc (cs *CoschedulingScore) Score(\n    ctx context.Context,\n    state *framework.CycleState,\n    pod *v1.Pod,\n    nodeName string,\n) (int64, *framework.Status) {\n    groupName := pod.Labels[\"pod-group.scheduling.sigs.k8s.io/name\"]\n    if groupName == \"\" {\n        return 0, framework.NewStatus(framework.Success)\n    }\n\n    nodeInfo, err := cs.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)\n    if err != nil {\n        return 0, framework.NewStatus(framework.Error,\n            fmt.Sprintf(\"获取节点 %s 信息失败: %v\", nodeName, err))\n    }\n\n    // 统计该节点上已经运行的同组 Pod 数量\n    var count int64\n    for _, pi := range nodeInfo.Pods {\n        if pi.Pod.Labels[\"pod-group.scheduling.sigs.k8s.io/name\"] == groupName {\n            count++\n        }\n    }\n\n    return count * 10, framework.NewStatus(framework.Success)\n}\n\n// ScoreExtensions 返回 NormalizeScore 实现，将分数归一化到 0-100\nfunc (cs *CoschedulingScore) ScoreExtensions() framework.ScoreExtensions {\n    return cs\n}\n\nfunc (cs *CoschedulingScore) NormalizeScore(\n    ctx context.Context,\n    state *framework.CycleState,\n    pod *v1.Pod,\n    scores framework.NodeScoreList,\n) *framework.Status {\n    var maxScore int64\n    for _, s := range scores {\n        if s.Score > maxScore {\n            maxScore = s.Score\n        }\n    }\n    if maxScore == 0 {\n        return framework.NewStatus(framework.Success)\n    }\n    for i := range scores {\n        scores[i].Score = scores[i].Score * framework.MaxNodeScore / maxScore\n    }\n    return framework.NewStatus(framework.Success)\n}\n\n// New 是插件的工厂函数，Scheduling Framework 通过它实例化插件\nfunc New(obj runtime.Object, handle framework.Handle) (framework.Plugin, error) {\n    return &CoschedulingScore{handle: handle}, nil\n}\n```\n\n#### 步骤二：注册插件并编译自定义调度器\n\n写好插件代码后，需要在调度器的 main 函数中注册它。Kubernetes 提供了 `app.NewSchedulerCommand` 工具函数，你只需要传入自定义插件的注册函数即可：\n\n```go\npackage main\n\nimport (\n    \"os\"\n\n    \"k8s.io/component-base/cli\"\n    \"k8s.io/kubernetes/cmd/kube-scheduler/app\"\n\n    \"your-repo/pkg/coscheduling\"\n)\n\nfunc main() {\n    command := app.NewSchedulerCommand(\n        app.WithPlugin(coscheduling.Name, coscheduling.New),\n        // 可以注册多个插件\n        // app.WithPlugin(gpuTopology.Name, gpuTopology.New),\n    )\n    code := cli.Run(command)\n    os.Exit(code)\n}\n```\n\n编译这段代码会生成一个自定义的 kube-scheduler 二进制文件。它本质上就是标准的 kube-scheduler 加上你注册的额外插件——所有默认的调度插件（NodeResourcesFit、TaintToleration、PodTopologySpread 等）仍然可用。\n\n#### 步骤三：配置 KubeSchedulerConfiguration 启用插件\n\n编译完成后，通过 `KubeSchedulerConfiguration` 配置文件告诉调度器启用你的插件：\n\n```yaml\napiVersion: kubescheduler.config.k8s.io/v1\nkind: KubeSchedulerConfiguration\nleaderElection:\n  leaderElect: true\n  resourceNamespace: kube-system\n  resourceName: my-custom-scheduler\nprofiles:\n- schedulerName: my-custom-scheduler\n  plugins:\n    score:\n      enabled:\n      - name: CoschedulingScore\n        weight: 5\n      - name: NodeResourcesFit\n        weight: 1\n    permit:\n      enabled:\n      - name: CoschedulingPermit\n  pluginConfig:\n  - name: CoschedulingPermit\n    args:\n      # PodGroup 凑齐等待超时时间\n      permitWaitingTimeSeconds: 120\n```\n\n这段配置做了几件关键的事：`schedulerName` 设为 `my-custom-scheduler`，这样只有 Pod spec 中 `schedulerName: my-custom-scheduler` 的 Pod 才会被这个调度器处理；Score 阶段启用了 `CoschedulingScore` 插件并设置权重为 5（远高于 NodeResourcesFit 的 1），让同组 Pod 的紧凑性在打分中占更大权重；Permit 阶段启用了 `CoschedulingPermit` 插件来实现批调度的等待-放行逻辑。\n\n#### 步骤四：部署为 Deployment\n\n自定义调度器以 Deployment 形式部署到集群中，建议部署在 `kube-system` 命名空间。需要注意的是，调度器需要较高的 RBAC 权限——读取所有 Pod、Node、PersistentVolume 等资源，以及创建 Binding 和 Event 对象的权限：\n\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-custom-scheduler\n  namespace: kube-system\nspec:\n  replicas: 2\n  selector:\n    matchLabels:\n      component: my-custom-scheduler\n  template:\n    spec:\n      serviceAccountName: my-custom-scheduler\n      priorityClassName: system-cluster-critical\n      containers:\n      - name: scheduler\n        image: your-registry/custom-scheduler:v1.29.0\n        command:\n        - /usr/local/bin/kube-scheduler\n        - --config=/etc/kubernetes/scheduler-config.yaml\n        - --v=3\n        resources:\n          requests:\n            cpu: 500m\n            memory: 256Mi\n        livenessProbe:\n          httpGet:\n            path: /healthz\n            port: 10259\n            scheme: HTTPS\n```\n\n部署两个副本是为了高可用——调度器内置了 Leader Election 机制，同一时刻只有一个副本真正做调度决策，另一个作为热备。`priorityClassName: system-cluster-critical` 确保调度器 Pod 本身不会被抢占。\n\n### 四、Pod 如何使用自定义调度器\n\nPod 通过 `spec.schedulerName` 字段指定使用哪个调度器。如果不设置这个字段，默认值是 `default-scheduler`，由内置的 kube-scheduler 处理。设置为 `my-custom-scheduler` 后，默认调度器会忽略这个 Pod，只有我们自定义的调度器实例会拾取并调度它：\n\n```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: trainer-worker-0\n  labels:\n    pod-group.scheduling.sigs.k8s.io/name: llm-finetune-group\n    pod-group.scheduling.sigs.k8s.io/min-member: \"8\"\nspec:\n  schedulerName: my-custom-scheduler\n  containers:\n  - name: trainer\n    image: training-framework:v3.2.0\n    resources:\n      requests:\n        nvidia.com/gpu: \"4\"\n```\n\n这种设计允许集群中同时运行多个调度器。普通的微服务 Pod 继续由默认调度器处理，训练任务的 Pod 由自定义调度器处理，两者互不干扰。你甚至可以在同一个调度器进程中配置多个 Profile（每个 Profile 有不同的 `schedulerName` 和插件配置），这样一个二进制就能服务多种调度策略。\n\n### 五、体系化扩展：生产级批调度框架与进阶考点\n\n#### Volcano：CNCF 孵化级批调度框架\n\n在生产环境中，从零实现一个批调度插件的工作量不小——你需要处理 PodGroup 的生命周期管理、超时回收、优先级队列、资源配额等一系列问题。Volcano（https://volcano.sh）是 CNCF 孵化级项目，由华为云主导开发，它提供了一个完整的批调度解决方案。Volcano 以独立调度器的方式运行，内置了 Gang Scheduling、Fair-share Scheduling、Binpack、Task-topology 等插件，并引入了 `VolcanoJob` 和 `Queue` 两个核心 CRD。`VolcanoJob` 定义了一个批任务及其所有 Task 的 spec，`Queue` 实现了多租户的资源配额和公平共享。截至 v1.9 版本，Volcano 在阿里云、华为云的 AI 训练平台上有大规模生产部署，管理数万张 GPU 的调度。\n\n#### Apache YuniKorn：大数据与 AI 通用调度器\n\nYuniKorn 是 Apache 顶级项目，它的定位是「面向大数据和 AI 的通用资源调度器」。与 Volcano 不同，YuniKorn 的设计更偏向 YARN 的调度模型，提供了层级队列（hierarchical queues）、应用感知调度（application-aware scheduling）和自动队列管理。它既能以独立调度器模式运行，也能作为 Scheduling Framework 插件嵌入 kube-scheduler。YuniKorn 特别适合同时运行 Spark、Flink、TensorFlow 等多种框架的混合集群。\n\n#### Kueue：Kubernetes 原生任务队列\n\nKueue 是 Kubernetes SIG-Scheduling 官方维护的项目（v0.7+），它不是一个调度器，而是一个「调度前的准入控制层」。Kueue 通过 `ClusterQueue`、`LocalQueue` 和 `Workload` 三个 CRD 实现了资源配额管理和任务排队。它的工作模式是：任务提交后先在 Kueue 的队列中等待，Kueue 判断资源配额是否充足后才放行任务创建 Pod，Pod 随后由默认调度器或自定义调度器进行正常调度。这种「两级调度」的架构将资源配额管理和 Pod 调度解耦，降低了系统复杂度。在 Kubernetes 1.29+ 的生态中，Kueue + Scheduling Framework 插件的组合正在成为 AI 训练平台的主流方案。\n\n#### 常见坑点与避坑经验\n\n第一个坑是调度器版本与集群版本不匹配。自定义调度器的二进制必须与集群的 Kubernetes 版本保持一致（至少大版本一致），否则可能因 API 不兼容导致调度失败甚至 panic。每次集群升级时，自定义调度器的代码需要同步更新依赖并重新编译。\n\n第二个坑是多调度器的资源竞争。当默认调度器和自定义调度器同时运行时，两者对集群资源的视图是独立缓存的。如果默认调度器把一个节点的 GPU 分配给了一个普通 Pod，自定义调度器可能还没感知到这个变化，也尝试把训练 Pod 调度到同一个节点上。这会导致绑定冲突（Bind 失败），Pod 需要重新调度。解决方案是尽量让 GPU 节点只由自定义调度器管理（通过 taint + toleration 隔离），或者使用单调度器多 Profile 的架构避免资源视图不一致。\n\n第三个坑是 Permit 阶段的超时处理。批调度中如果一个 PodGroup 长时间凑不齐 min-member（比如集群资源不足），等待中的 Pod 会一直占用 Permit 阶段的等待槽位，可能影响其他 Pod 的调度。必须设置合理的超时时间（通常 60-300 秒），超时后释放已经 Permit 的 Pod 回到队列。\n\n#### 面试追问高频考点\n\n面试官在你回答完自定义调度器后，最常见的追问方向包括：「Scheduling Framework 的 Permit 和 Reserve 扩展点有什么区别」——Reserve 是在打分完成后预留资源（乐观锁定），Permit 是在 Reserve 之后决定是否放行绑定，批调度的等待逻辑放在 Permit 而不是 Reserve，因为 Reserve 阶段不支持异步等待；「自定义调度器和默认调度器同时运行时怎么避免冲突」——答前面提到的 taint 隔离或单进程多 Profile 方案；「如果不想编译自定义二进制，有没有更轻量的方式」——从 Kubernetes 1.27 开始社区在探讨 Scheduling Gateway（类似 Gateway API 的声明式扩展），但目前还不成熟，生产中仍推荐 Framework 插件方式。",
+      "keyPoints": [
+        "默认调度器以单 Pod 为粒度逐个调度，无法满足批调度（gang scheduling）「要么全部调度、要么一个都不调度」的语义，也不感知 GPU 拓扑关系",
+        "实现自定义调度器有三种方案：Scheduling Framework 插件（最推荐，在默认调度器中注册扩展插件）、独立调度器（完全自主实现 Watch → Decide → Bind 循环）、Webhook Extender（旧方案，HTTP 调用性能差且扩展点有限）",
+        "Scheduling Framework 将调度流程拆分为 QueueSort → PreFilter → Filter → PostFilter → PreScore → Score → NormalizeScore → Reserve → Permit → PreBind → Bind → PostBind 等扩展点，批调度核心依赖 Permit 扩展点的 Wait 机制",
+        "Pod 通过 spec.schedulerName 字段指定使用哪个调度器，默认值为 default-scheduler，自定义调度器只处理 schedulerName 与自己匹配的 Pod",
+        "Framework 插件开发四步流程：实现 FilterPlugin/ScorePlugin/PermitPlugin 接口 → 在 main 函数中注册插件 → 编译自定义调度器二进制 → 以 Deployment 形式部署到集群",
+        "多调度器并行运行时存在资源视图不一致的风险，建议通过 taint + toleration 隔离节点或使用单进程多 Profile 架构",
+        "生产级批调度方案推荐 Volcano（CNCF 孵化级，完整的 Gang Scheduling + Queue 管理）或 Kueue + Framework 插件的两级调度架构",
+        "自定义调度器二进制必须与集群 Kubernetes 版本保持大版本一致，每次集群升级需同步更新依赖并重新编译"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz1",
+          "question": "默认的 kube-scheduler 无法直接支持批调度（gang scheduling）的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "默认调度器以单个 Pod 为调度粒度，无法保证一组 Pod 要么全部调度、要么全部不调度"},
+            {"id": "B", "text": "默认调度器不支持 GPU 资源类型的调度"},
+            {"id": "C", "text": "默认调度器没有调度队列，无法处理并发的调度请求"},
+            {"id": "D", "text": "默认调度器只能在单个命名空间内调度 Pod"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "kube-scheduler 的核心架构是逐 Pod 调度——每次从队列中取出一个 Pod，为它选择一个节点并绑定，然后再处理下一个。这种模式无法实现「一组 Pod 作为整体要么全部被调度、要么一个都不调度」的 All-or-Nothing 语义。B 选项不对，默认调度器可以通过 Device Plugin 机制感知 GPU 数量，只是不了解 GPU 拓扑。C 选项完全错误，调度器有 SchedulingQueue 来管理待调度的 Pod。D 选项也是错的，调度器是集群级别的，不受命名空间限制。"
+        },
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz2",
+          "question": "Scheduling Framework 中哪个扩展点最适合实现批调度的「等待凑齐后一起绑定」逻辑？",
+          "choices": [
+            {"id": "A", "text": "Filter 扩展点"},
+            {"id": "B", "text": "Score 扩展点"},
+            {"id": "C", "text": "Permit 扩展点"},
+            {"id": "D", "text": "PostBind 扩展点"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Permit 扩展点位于 Score 之后、Bind 之前，它可以返回三种结果：Success（放行绑定）、Deny（拒绝）和 Wait（挂起等待信号）。利用 Wait 机制，批调度插件可以让同一个 PodGroup 中的 Pod 在 Permit 阶段排队等待，直到凑齐了 min-member 个 Pod 后一起放行执行绑定。A 的 Filter 扩展点只能做「通过/不通过」的布尔判断，无法实现等待逻辑。B 的 Score 只负责打分排名。D 的 PostBind 在绑定完成后才执行，此时已经无法控制绑定决策。"
+        },
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz3",
+          "question": "开发一个 Scheduling Framework 的 Score 插件，插件的 Score 方法返回值应该是什么？",
+          "choices": [
+            {"id": "A", "text": "返回一个布尔值表示节点是否可用"},
+            {"id": "B", "text": "返回一个 0-100 的整数分数和一个 Status 对象"},
+            {"id": "C", "text": "返回目标节点的名称字符串"},
+            {"id": "D", "text": "返回一个 Binding 对象"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Scheduling Framework 的 Score 接口定义要求每个 Score 插件对每个候选节点返回一个 int64 类型的分数和一个 *framework.Status 对象。原始分数在 NormalizeScore 阶段会被归一化到 0 到 framework.MaxNodeScore（100）的范围内，然后按权重加总选出得分最高的节点。A 选项描述的是 Filter 插件的行为（通过/不通过），不是 Score 插件。C 选项是最终调度结果，不是单个插件的输出。D 选项是 Bind 阶段的产物，与 Score 无关。"
+        },
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz4",
+          "question": "以下关于独立调度器（Standalone Scheduler）的描述，哪一项是正确的？",
+          "choices": [
+            {"id": "A", "text": "独立调度器需要替换集群中的 kube-scheduler，两者不能同时运行"},
+            {"id": "B", "text": "独立调度器通过 Watch 未调度的 Pod、执行调度算法、调用 Binding API 完成调度，可与 kube-scheduler 并行运行"},
+            {"id": "C", "text": "独立调度器不需要任何 RBAC 权限即可调度 Pod"},
+            {"id": "D", "text": "独立调度器只能用 Go 语言实现，因为必须依赖 client-go 库"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "独立调度器是一个完全独立的进程，它的核心逻辑是 Watch-Decide-Bind 循环：Watch API Server 发现 spec.nodeName 为空且 spec.schedulerName 匹配自己名字的 Pod，执行自定义调度算法选择节点，然后调用 Binding API 绑定。它与 kube-scheduler 通过 schedulerName 字段隔离，互不干扰。A 选项说不能同时运行是错的，Kubernetes 明确支持多调度器并行。C 选项错误，调度器需要读取 Pod、Node 等资源并创建 Binding 的权限。D 选项也不对，虽然 Go + client-go 是主流选择，但任何能调用 Kubernetes API 的语言都可以实现（Python 用 kubernetes-client，Java 用 fabric8 等）。"
+        },
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz5",
+          "question": "一个 Pod 的 YAML 中设置了 schedulerName: my-scheduler，但集群中没有名为 my-scheduler 的调度器在运行，这个 Pod 会处于什么状态？",
+          "choices": [
+            {"id": "A", "text": "Pod 会被默认调度器调度到一个节点上正常运行"},
+            {"id": "B", "text": "Pod 创建时会被 API Server 拒绝，因为调度器不存在"},
+            {"id": "C", "text": "Pod 会一直处于 Pending 状态，因为没有调度器认领它"},
+            {"id": "D", "text": "Pod 会自动回退到 default-scheduler 进行调度"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Kubernetes 中 schedulerName 只是一个字符串标识，API Server 不会校验指定的调度器是否存在。默认调度器在处理调度队列时会跳过 schedulerName 与自己不匹配的 Pod。如果指定的自定义调度器没有在集群中运行，就没有任何调度器会拾取这个 Pod，它会一直停留在 Pending 状态，kubectl describe pod 会看到没有任何调度相关的 Event。这是一个生产中很容易踩的坑——部署自定义调度器之前就创建了使用它的 Pod，或者调度器意外宕机。A 和 D 选项描述的自动回退行为不存在，B 选项的创建时校验也不存在。"
+        },
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz6",
+          "question": "在多调度器并行运行的场景下，以下哪种做法最容易导致资源调度冲突？",
+          "choices": [
+            {"id": "A", "text": "让两个调度器管理完全不同的节点池（通过 taint 隔离）"},
+            {"id": "B", "text": "让两个调度器都可以调度到同一批 GPU 节点上，不做任何隔离"},
+            {"id": "C", "text": "使用单个调度器进程配置多个 Profile，通过 schedulerName 区分"},
+            {"id": "D", "text": "让自定义调度器只处理特定命名空间中的 Pod"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当两个调度器同时运行且可以调度到相同的节点时，它们各自维护独立的资源缓存。调度器 A 在缓存中看到节点 X 还有 2 张 GPU，调度器 B 也看到节点 X 还有 2 张 GPU，两者可能同时决定把 Pod 调度到节点 X 上。先执行 Bind 的成功，后执行的会因为资源不足而 Bind 失败，Pod 需要重新调度。A 选项通过 taint 隔离节点池，每个调度器管理不同的节点，完全避免了冲突。C 选项是单进程多 Profile，共享同一份资源缓存，不存在视图不一致的问题，这是社区推荐的最佳实践。D 选项只是命名空间级别的隔离，如果两个调度器仍然面向同一批节点，冲突依然存在。"
+        },
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz7",
+          "question": "以下关于 Webhook Extender 和 Scheduling Framework 插件的对比，哪项描述是准确的？",
+          "choices": [
+            {"id": "A", "text": "Extender 通过进程内函数调用扩展调度逻辑，Framework 插件通过 HTTP Webhook 扩展"},
+            {"id": "B", "text": "Extender 通过 HTTP Webhook 扩展，只能参与 Filter 和 Score 阶段；Framework 插件编译进调度器进程，可参与所有扩展点"},
+            {"id": "C", "text": "两者功能完全相同，只是实现语言不同"},
+            {"id": "D", "text": "Extender 性能更好因为它是独立进程不影响调度器主线程"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Webhook Extender 是 Scheduling Framework 出现之前的旧方案，调度器在 Filter 和 Score 阶段通过 HTTP 请求调用外部服务来获取扩展的过滤和打分结果。它的局限性很明显：只能参与 Filter 和 Score 两个阶段，无法介入 Permit、Reserve、Bind 等扩展点；每次 HTTP 调用带来额外的网络延迟，在大规模集群中性能不可接受。Scheduling Framework 插件编译进调度器二进制，进程内函数调用零网络开销，且可以参与全部十余个扩展点。A 选项把两者搞反了。D 选项的「独立进程性能更好」恰恰相反，网络调用是 Extender 最大的性能瓶颈。"
+        },
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz8",
+          "question": "你的自定义调度器部署后，训练任务的 PodGroup 有 8 个 Pod，但 Permit 阶段只凑齐了 6 个就超时了。以下哪种处理方式最合理？",
+          "choices": [
+            {"id": "A", "text": "让已经通过 Permit 的 6 个 Pod 继续绑定节点开始运行"},
+            {"id": "B", "text": "超时后释放所有已 Permit 的 Pod 回到调度队列，避免资源被长期占用"},
+            {"id": "C", "text": "永久阻塞等待直到第 7 和第 8 个 Pod 可以被调度"},
+            {"id": "D", "text": "直接删除整个 PodGroup 的所有 Pod"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "批调度的核心语义是 All-or-Nothing，如果无法凑齐 min-member 个 Pod，已经调度的 Pod 应该被释放回队列。A 选项让 6 个 Pod 先跑起来违反了批调度语义——这 6 个 Worker 启动后会一直等待缺席的 2 个同伴，白白占用 GPU 资源，这正是我们要通过自定义调度器解决的问题。C 选项永久阻塞是灾难性的，它会导致 Permit 阶段的等待槽位被耗尽，阻塞其他 Pod 的调度。D 选项过于激进，删除 Pod 后用户需要重新提交任务。正确做法是超时后释放回队列，等集群资源充裕后再次尝试凑齐。生产中超时时间通常设为 60-300 秒。"
+        },
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz9",
+          "question": "Scheduling Framework 中 Reserve 和 Permit 扩展点的执行顺序和职责有什么区别？",
+          "choices": [
+            {"id": "A", "text": "Reserve 先于 Permit 执行，Reserve 在内存中预留资源，Permit 决定是否最终放行绑定"},
+            {"id": "B", "text": "Permit 先于 Reserve 执行，Permit 决定是否放行，Reserve 执行绑定操作"},
+            {"id": "C", "text": "两者同时执行，Reserve 处理 CPU 资源，Permit 处理 GPU 资源"},
+            {"id": "D", "text": "Reserve 和 Permit 功能完全相同，只是命名不同"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在 Scheduling Framework 的调度周期中，执行顺序是 Score → NormalizeScore → Reserve → Permit → PreBind → Bind。Reserve 扩展点在打分完成后、最终绑定前执行，它的职责是在调度器内部的缓存中乐观地预留资源（比如标记某个节点的 GPU 已被占用），这样后续调度其他 Pod 时不会重复分配同一份资源。Permit 紧随 Reserve 之后，决定是否最终允许绑定——它支持异步的 Wait 机制，可以让 Pod 挂起等待（批调度就利用了这个能力）。如果 Permit 最终拒绝，Reserve 阶段的预留会通过 Unreserve 回调释放。B 选项把顺序搞反了。C 和 D 选项完全不符合 Framework 的设计。"
+        },
+        {
+          "id": "k8s-scheduling-custom-scheduler-q1-quiz10",
+          "question": "以下哪个组件不是独立的调度器实现，而是调度前的准入控制层？",
+          "choices": [
+            {"id": "A", "text": "Volcano"},
+            {"id": "B", "text": "Apache YuniKorn"},
+            {"id": "C", "text": "Kueue"},
+            {"id": "D", "text": "kube-scheduler 的 Scheduling Framework"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Kueue 是 Kubernetes SIG-Scheduling 维护的官方项目，它的定位不是调度器，而是「调度前的任务排队和资源配额管理层」。工作模式是：任务提交后先在 Kueue 的队列（ClusterQueue / LocalQueue）中排队等待，Kueue 判断配额是否充足后才允许任务创建 Pod，然后由 kube-scheduler 或自定义调度器完成真正的 Pod 到节点的调度。Volcano 和 YuniKorn 都是完整的调度器实现，它们直接处理 Pod 到节点的绑定决策。D 选项 Scheduling Framework 是 kube-scheduler 内部的可插拔架构，本身就是调度器的一部分。Kueue + 调度器的「两级调度」模式在 AI 训练平台中正在成为主流。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/",
+        "https://kubernetes.io/docs/tasks/extend-kubernetes/configure-multiple-schedulers/",
+        "https://github.com/kubernetes-sigs/scheduler-plugins",
+        "https://volcano.sh/en/docs/",
+        "https://kueue.sigs.k8s.io/docs/overview/"
+      ]
+    }
+  ]
+}
