@@ -1,0 +1,157 @@
+{
+  "id": "k8s-eviction-order",
+  "name": "节点资源不足时 Pod 驱逐顺序",
+  "domain": "kubernetes",
+  "description": "深入解析 kubelet 节点压力驱逐机制：QoS 等级排序、同 QoS 内超额比例排序、驱逐信号阈值配置、软硬驱逐策略与 PDB 保护的交互",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-eviction-order-q1",
+      "domain": "kubernetes",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["kubelet", "Eviction", "QoS", "节点压力", "资源管理", "驱逐顺序"],
+      "title": "当节点资源不足时，Kubernetes 按什么顺序驱逐 Pod？",
+      "content": "面试官问你「节点资源不足时 Pod 是按什么顺序被驱逐的」，他考察的不只是你能不能答出「BestEffort 先被驱逐」这一句话。他真正想知道的是三件事：第一，你是否理解 kubelet 的节点压力驱逐（Node-pressure Eviction）机制——它跟调度器的 Preemption 有什么本质区别；第二，驱逐顺序的完整排序规则是什么——QoS 等级只是第一把排序键，同 QoS 内的排序逻辑才是真正的深水区；第三，你在生产环境中是否配置过驱逐阈值，是否理解软驱逐和硬驱逐的差异。\n\n来看一个真实场景。你运维着一个 20 节点的 Kubernetes 集群（v1.30），某天凌晨 2 点告警系统突然炸了：worker-08 节点上 6 个 Pod 在 3 分钟内接连被终止，其中包括一个核心的订单处理服务。你登上节点一看：\n\n```\n$ kubectl describe node worker-08\nConditions:\n  Type                 Status  LastHeartbeatTime                 Reason\n  ----                 ------  -----------------                 ------\n  MemoryPressure       True    Mon, 15 Jul 2024 02:03:17 +0800   KubeletHasInsufficientMemory\n  DiskPressure         False   Mon, 15 Jul 2024 02:03:17 +0800   KubeletHasNoDiskPressure\n  PIDPressure          False   Mon, 15 Jul 2024 02:03:17 +0800   KubeletHasSufficientPID\n  Ready                True    Mon, 15 Jul 2024 02:03:17 +0800   KubeletReady\n\n$ kubectl get events --field-selector reason=Evicted -n production --sort-by='.lastTimestamp'\nLAST SEEN   TYPE      REASON    OBJECT                        MESSAGE\n2m          Warning   Evicted   pod/log-collector-x7k9p       The node was low on resource: memory.\n2m          Warning   Evicted   pod/batch-report-gen-4f2d     The node was low on resource: memory.\n90s         Warning   Evicted   pod/data-sync-worker-8mn2     The node was low on resource: memory.\n90s         Warning   Evicted   pod/cache-warmer-p3q1         The node was low on resource: memory.\n60s         Warning   Evicted   pod/order-processor-a9b3      The node was low on resource: memory.\n60s         Warning   Evicted   pod/monitoring-agent-d5e1     The node was low on resource: memory.\n```\n\n6 个 Pod 被依次驱逐，但驱逐的顺序看起来不是随机的——没有设置 requests 的 log-collector 和 batch-report-gen 最先被干掉，内存使用远超 requests 的 data-sync-worker 和 cache-warmer 紧随其后，最后才轮到配置了合理 requests/limits 的 order-processor。为什么是这个顺序？kubelet 内部到底是按什么规则决定「先杀谁」的？\n\n要真正答好这道题，你需要先理解 kubelet 驱逐机制的整体设计——它是什么、为什么需要它、它的基本工作流程是怎样的。然后深入剖析驱逐排序的三层规则：QoS 等级排序 → 同 QoS 内超额比例排序 → 驱逐信号类型对排序的影响。最后讲清楚驱逐阈值配置、软硬驱逐的区别，以及 PDB 在驱逐场景下到底能不能保护你的服务。",
+      "answer": "## kubelet 节点压力驱逐机制基础详解\n\n在 Kubernetes 的资源管理体系中，有两种完全不同的「驱逐」机制，很多人会混为一谈，但它们的触发者、触发条件和驱逐逻辑完全不同。第一种是**调度器抢占（Scheduler Preemption）**，由 kube-scheduler 在调度高优先级 Pod 时主动发起，驱逐的是低优先级的 Pod，目的是为高优先级 Pod 腾出调度空间。第二种是**节点压力驱逐（Node-pressure Eviction）**，由每个节点上的 kubelet 进程在检测到节点资源（内存、磁盘、PID）不足时自动触发，目的是保护节点本身不被资源耗尽而崩溃。这道题考的是第二种——kubelet 驱逐。\n\nkubelet 驱逐的核心设计思想很简单：与其让整个节点因为内存耗尽触发 Linux OOM Killer 随机杀进程（OOM Killer 的选择逻辑对 Kubernetes 来说几乎是不可控的），不如让 kubelet 自己监控资源使用情况，在资源即将耗尽之前主动按优先级驱逐 Pod，确保关键服务尽可能存活、节点保持稳定。这就是为什么即使 Linux 内核有 OOM Killer，Kubernetes 仍然需要自己实现一套驱逐机制。\n\nkubelet 的驱逐工作流程可以概括为三步：监控 → 判定 → 执行。kubelet 内部运行着一个 eviction manager，默认每 10 秒（由 `--housekeeping-interval` 控制）通过 cAdvisor 采集一次节点的资源使用数据，包括可用内存（memory.available）、节点文件系统可用空间（nodefs.available）、镜像文件系统可用空间（imagefs.available）和可用 PID 数（pid.available）。采集到数据后，kubelet 将当前值与预设的驱逐阈值进行比较。如果某个资源的可用量低于阈值，kubelet 就认为节点处于「压力状态」，开始执行驱逐流程。\n\n你可以通过 `kubectl describe node` 查看节点是否处于压力状态。当 kubelet 检测到内存不足时，节点的 `MemoryPressure` Condition 会变为 True；磁盘不足时 `DiskPressure` 变为 True；PID 不足时 `PIDPressure` 变为 True。一旦某个 Condition 变为 True，kube-scheduler 就不会再往这个节点上调度新的 Pod（对应的 taint 是 `node.kubernetes.io/memory-pressure:NoSchedule` 等），直到压力解除。\n\n理解了 kubelet 驱逐的整体框架后，我们来深入剖析最核心的部分：驱逐排序规则。\n\n## 驱逐顺序的三层排序规则\n\n### 第一层：QoS 等级——最粗粒度的排序键\n\nkubelet 驱逐 Pod 的第一把排序键是 Pod 的 QoS（Quality of Service）等级。Kubernetes 为每个 Pod 自动计算一个 QoS 等级，这个等级不需要手动指定，完全由 Pod 中所有容器的 resources.requests 和 resources.limits 配置决定。三个等级从低到高分别是：\n\n**BestEffort** 是最低等级，当 Pod 中所有容器都没有设置任何 CPU 或内存的 requests 和 limits 时，这个 Pod 就是 BestEffort。它的含义很直白：「我不需要任何资源保障，有多少用多少，资源不够了先牺牲我」。典型的 BestEffort Pod 长这样：\n\n```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: log-collector\nspec:\n  containers:\n  - name: collector\n    image: fluent/fluent-bit:3.0\n    # 没有设置任何 resources —— QoS 为 BestEffort\n```\n\n**Burstable** 是中间等级，当 Pod 中至少有一个容器设置了 requests 或 limits，但不满足 Guaranteed 的条件时（即 requests ≠ limits，或者只设置了部分资源的 requests/limits），Pod 的 QoS 就是 Burstable。大部分生产环境中的 Pod 都落在这个等级——设了 requests 但没设 limits，或者 limits 大于 requests：\n\n```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: order-processor\nspec:\n  containers:\n  - name: processor\n    image: myapp/order-processor:v2.1\n    resources:\n      requests:\n        cpu: \"500m\"\n        memory: \"512Mi\"\n      limits:\n        cpu: \"2\"\n        memory: \"2Gi\"   # limits > requests → Burstable\n```\n\n**Guaranteed** 是最高等级，要求 Pod 中每一个容器都必须同时设置 CPU 和内存的 requests 与 limits，并且每个资源的 requests 必须等于 limits。这是最严格的配置——你明确告诉 Kubernetes「我只需要这么多资源，不多不少」：\n\n```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: payment-service\nspec:\n  containers:\n  - name: payment\n    image: myapp/payment:v3.0\n    resources:\n      requests:\n        cpu: \"1\"\n        memory: \"1Gi\"\n      limits:\n        cpu: \"1\"        # requests == limits\n        memory: \"1Gi\"   # requests == limits → Guaranteed\n```\n\n驱逐顺序的第一条规则就是：**BestEffort Pod 最先被驱逐，Burstable 其次，Guaranteed 最后被驱逐。** 这个规则的逻辑非常自然——你连 requests 都不愿意声明，说明这个 Pod 对资源需求没有任何承诺，kubelet 当然优先清理它来释放资源；而 Guaranteed Pod 的资源使用量是有严格上限的（limits == requests，不可能超额），理论上它不会是导致节点资源耗尽的「元凶」，所以最后才轮到它。\n\n你可以通过以下命令检查一个 Pod 的 QoS 等级：\n\n```bash\n$ kubectl get pod order-processor -o jsonpath='{.status.qosClass}'\nBurstable\n\n$ kubectl get pods -o custom-columns='NAME:.metadata.name,QOS:.status.qosClass,MEM_REQ:.spec.containers[0].resources.requests.memory,MEM_LIM:.spec.containers[0].resources.limits.memory'\nNAME                QOS           MEM_REQ   MEM_LIM\nlog-collector       BestEffort    <none>    <none>\norder-processor     Burstable     512Mi     2Gi\npayment-service     Guaranteed    1Gi       1Gi\n```\n\n### 第二层：同 QoS 内按超出 requests 的比例排序\n\nQoS 等级只是第一把排序键，但同一个 QoS 等级内可能有几十个 Pod，kubelet 怎么决定先驱逐哪个？这就涉及第二层排序规则，也是面试中真正的深水区。\n\n对于 **BestEffort** Pod，因为它们都没有设置 requests，kubelet 按照**实际资源使用量的绝对值**从高到低排序——谁用的内存最多，谁最先被驱逐。逻辑很简单：BestEffort Pod 没有任何资源承诺，那就按「谁占的资源多就先清理谁」来处理，这样能用最少的驱逐次数释放最多的资源。\n\n对于 **Burstable** Pod，排序逻辑复杂得多。kubelet 计算的是每个 Pod 的**实际使用量超出 requests 的比例**，而不是绝对使用量。具体公式是：\n\n```\n超额比例 = (实际使用量 - requests) / requests\n```\n\n超额比例越高，越先被驱逐。为什么要用比例而不是绝对差值？考虑两个 Burstable Pod：Pod A 的 requests 是 256Mi，实际用了 1Gi（超额比例 ≈ 300%）；Pod B 的 requests 是 4Gi，实际用了 5Gi（超额比例 = 25%）。虽然 Pod B 的绝对超额量（1Gi）大于 Pod A（768Mi），但 Pod A 的超额行为明显更「过分」——它用的资源是它承诺量的 4 倍。所以 kubelet 认为 Pod A 应该先被驱逐。这个设计背后的哲学是：requests 是 Pod 对集群做出的资源承诺，超出承诺越多的 Pod 越应该为资源紧张负责。\n\n这里有一个非常重要的边界条件：如果一个 Burstable Pod 的实际使用量**低于**它的 requests，那它在同 QoS 内的驱逐优先级会非常低。即使节点内存告急，kubelet 也会优先驱逐那些超额使用的 Pod，而不是那些规规矩矩在 requests 范围内使用资源的 Pod。这就是为什么生产环境中正确设置 requests 至关重要——它不仅影响调度，还直接决定了你的 Pod 在驱逐风暴中的存活概率。\n\n对于 **Guaranteed** Pod，因为 requests == limits，理论上容器的资源使用不会超过 requests（如果是内存，超过 limits 会被 cgroup 直接 OOM Kill；如果是 CPU，超过 limits 会被 throttle）。所以在正常情况下 Guaranteed Pod 不应该出现「超额」。kubelet 对 Guaranteed Pod 的驱逐优先级最低，只有在驱逐完所有 BestEffort 和 Burstable Pod 之后仍然无法缓解资源压力时，才会开始驱逐 Guaranteed Pod。在 Guaranteed 等级内部，kubelet 按实际使用量排序。\n\n把三层规则整合起来，完整的驱逐排序逻辑是：\n\n```\n第一优先级：BestEffort Pod（按实际资源使用量从高到低）\n     ↓ 驱逐完 BestEffort 仍不够\n第二优先级：Burstable Pod（按超出 requests 的比例从高到低）\n     ↓ 驱逐完超额 Burstable 仍不够\n第三优先级：Burstable Pod 中未超额的（按实际使用量从高到低）\n     ↓ 驱逐完所有 Burstable 仍不够\n第四优先级：Guaranteed Pod（按实际使用量从高到低）\n```\n\n### 第三层：驱逐信号类型的影响\n\nkubelet 支持多种驱逐信号，不同信号触发的驱逐在排序细节上有微妙差异。主要的驱逐信号包括：\n\n`memory.available` 是最常见的驱逐信号，表示节点的可用内存。计算方式是 `memory.available = node.status.capacity[memory] - node.stats.memory.workingSet`，其中 workingSet 是活跃内存（不包括可以被回收的 page cache）。当 memory.available 低于阈值时触发内存压力驱逐，排序完全按照上面描述的 QoS + 超额比例规则。\n\n`nodefs.available` 表示 kubelet 使用的文件系统（通常是根分区 `/`）的可用空间，包括 Pod 的本地临时存储（emptyDir、日志文件、容器可写层）。当磁盘驱逐触发时，kubelet 会额外考虑每个 Pod 的**本地磁盘使用量**——如果一个 Pod 的 emptyDir 或容器日志占用了大量磁盘空间，它会被优先驱逐。kubelet 在 v1.25+ 还会检查每个 Pod 的 `ephemeral-storage` requests/limits，磁盘使用超过 limits 的 Pod 会被立即驱逐（不需要等到节点级别的阈值触发）。\n\n`imagefs.available` 表示容器镜像存储所在文件系统的可用空间（如果 imagefs 和 nodefs 是同一个分区则两个信号等价）。当镜像文件系统空间不足时，kubelet 会先尝试删除未使用的容器镜像来释放空间，只有清理镜像后仍然不够才会驱逐 Pod。\n\n`pid.available` 表示节点可用的进程 ID 数量。PID 压力驱逐的排序规则与内存类似，但在实践中 PID 耗尽通常是某个 Pod 有 fork bomb 或者大量线程泄漏，kubelet 会优先驱逐 PID 使用量最高的 Pod。\n\n## 驱逐阈值配置：软驱逐与硬驱逐\n\nkubelet 的驱逐阈值分为两种：**硬驱逐阈值（Hard Eviction Threshold）** 和**软驱逐阈值（Soft Eviction Threshold）**，它们的行为差异很大。\n\n硬驱逐阈值是「红线」，一旦资源可用量低于硬驱逐阈值，kubelet 立即开始驱逐 Pod，没有任何宽限期。kubelet 的默认硬驱逐阈值配置如下：\n\n```\n--eviction-hard=memory.available<100Mi,nodefs.available<10%,imagefs.available<15%,pid.available<100\n```\n\n这意味着：节点可用内存低于 100Mi、根分区可用空间低于 10%、镜像分区可用空间低于 15%、可用 PID 低于 100 时，kubelet 立即执行驱逐。硬驱逐不给被驱逐的 Pod 任何优雅退出时间——kubelet 直接将 Pod 标记为 Failed（reason 为 Evicted），容器被立即终止（等效于 SIGKILL），Pod 不会走 preStop hook 也不会等待 terminationGracePeriodSeconds。这是一种「紧急刹车」机制，设计目的是在节点即将崩溃的临界点快速释放资源。\n\n软驱逐阈值则温和得多。它配合一个**观察期（eviction-soft-grace-period）** 使用：资源可用量必须持续低于软阈值超过观察期时长，kubelet 才会开始驱逐。并且软驱逐触发的驱逐会给 Pod 一段优雅退出时间（由 `eviction-max-pod-grace-period` 控制，与 Pod 自身的 terminationGracePeriodSeconds 取较小值）。典型的软驱逐配置：\n\n```\n--eviction-soft=memory.available<300Mi,nodefs.available<15%\n--eviction-soft-grace-period=memory.available=1m30s,nodefs.available=1m30s\n--eviction-max-pod-grace-period=30\n```\n\n这段配置的含义是：当节点可用内存持续低于 300Mi 超过 1 分 30 秒时，开始软驱逐，被驱逐的 Pod 最多有 30 秒的优雅退出时间。软驱逐的设计理念是「给节点一个自愈的机会」——内存暂时下降可能只是一个突发峰值，等 1 分半钟看看会不会自己恢复，避免不必要的 Pod 中断。\n\n在实际生产环境中，推荐的做法是**同时配置软驱逐和硬驱逐**，让两者形成双层防线：\n\n```yaml\n# kubelet 配置文件 /var/lib/kubelet/config.yaml\napiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\nevictionHard:\n  memory.available: \"100Mi\"\n  nodefs.available: \"10%\"\n  imagefs.available: \"15%\"\n  pid.available: \"100\"\nevictionSoft:\n  memory.available: \"500Mi\"\n  nodefs.available: \"15%\"\nevictionSoftGracePeriod:\n  memory.available: \"1m30s\"\n  nodefs.available: \"2m\"\nevictionMaxPodGracePeriod: 60\nevictionPressureTransitionPeriod: \"5m0s\"\n```\n\n这里的 `evictionPressureTransitionPeriod` 也值得注意：它控制 kubelet 在节点资源恢复正常后，要等多长时间才把节点的压力 Condition（如 MemoryPressure）从 True 改回 False。默认 5 分钟。这是为了防止节点在阈值边缘来回振荡（oscillation）——刚驱逐了 Pod 内存恢复了，解除压力后新 Pod 又被调度上来，内存又不够了，又开始驱逐——这种「驱逐风暴」在没有 transitionPeriod 保护的情况下真的会发生。\n\n你可以通过 kubelet 日志观察完整的驱逐决策过程：\n\n```bash\n$ journalctl -u kubelet --since \"2024-07-15 02:00:00\" | grep -i evict\nJul 15 02:01:47 worker-08 kubelet[1842]: I0715 02:01:47.234 eviction_manager.go:338] \"Eviction manager: attempting to reclaim\" resourceName=\"memory\"\nJul 15 02:01:47 worker-08 kubelet[1842]: I0715 02:01:47.235 eviction_manager.go:352] \"Eviction manager: must evict pod(s) to reclaim\" resourceName=\"memory\" available=\"87Mi\" threshold=\"100Mi\"\nJul 15 02:01:47 worker-08 kubelet[1842]: I0715 02:01:47.240 eviction_manager.go:368] \"Eviction manager: pods ranked for eviction\" pods=[\"log-collector-x7k9p\",\"batch-report-gen-4f2d\",\"data-sync-worker-8mn2\",\"cache-warmer-p3q1\",\"order-processor-a9b3\"]\nJul 15 02:01:47 worker-08 kubelet[1842]: I0715 02:01:47.245 eviction_manager.go:394] \"Eviction manager: evicting pod\" pod=\"default/log-collector-x7k9p\" reason=\"The node was low on resource: memory.\"\n```\n\n从日志中可以清楚看到：kubelet 先检测到 available（87Mi）低于 threshold（100Mi），然后对 Pod 进行排序（ranked for eviction），最后按排序结果依次驱逐，直到资源可用量恢复到阈值以上。\n\n## PDB 与节点压力驱逐的关系\n\n这是一个非常容易踩的坑：**PodDisruptionBudget（PDB）对 kubelet 的节点压力驱逐不起作用。**\n\n这一点和调度器抢占不同。调度器在执行 Preemption 时会检查 PDB，尽量不违反可用性约束。但 kubelet 的节点压力驱逐是一种「紧急保护」行为——节点自身正在崩溃的边缘，此时保护节点稳定性的优先级高于任何 Pod 的可用性保障。kubelet 在驱逐时完全不检查 PDB。如果你的 Deployment 配了 `minAvailable: 80%`，但所有副本都调度在同一个节点上，当这个节点触发内存驱逐时，kubelet 可以一口气把所有副本全部驱逐，PDB 挡不住。\n\n这意味着什么？意味着防止你的服务在驱逐风暴中全军覆没的正确方式不是加 PDB，而是：第一，确保副本分散在不同节点上（用 `topologySpreadConstraints` 或 Pod Anti-Affinity）；第二，正确设置 resources.requests 让 Pod 的 QoS 至少是 Burstable 且不超额；第三，如果是核心服务，设置 requests == limits 让 QoS 为 Guaranteed；第四，配置合理的驱逐阈值留出足够的缓冲区。\n\n## 体系化扩展\n\n### 与 Linux OOM Killer 的关系\n\nkubelet 驱逐是 Kubernetes 层面的保护机制，但如果驱逐速度不够快，或者某个容器突然在极短时间内吃掉大量内存（比如几秒内从 1Gi 飙到 8Gi），kubelet 的 10 秒采集间隔可能来不及反应。这时 Linux 内核的 OOM Killer 就会介入。OOM Killer 选择进程的算法和 kubelet 不同——它主要看 `oom_score_adj` 值。kubelet 会根据 Pod 的 QoS 等级设置容器进程的 oom_score_adj：BestEffort 容器的值为 1000（最高，最先被 OOM Kill），Burstable 容器的值根据 requests 占节点总量的比例在 2-999 之间计算，Guaranteed 容器的值为 -997（几乎不会被 OOM Kill）。所以即使绕过了 kubelet 驱逐直接触发 OOM Killer，杀进程的优先级仍然与 QoS 等级大致一致。\n\n你可以在节点上用以下命令查看容器的 oom_score_adj：\n\n```bash\n# 找到容器进程的 PID\n$ crictl inspect <container-id> | jq '.info.pid'\n28451\n\n# 查看 oom_score_adj\n$ cat /proc/28451/oom_score_adj\n999   # Burstable 容器，值越高越容易被 OOM Kill\n```\n\n### 驱逐后 Pod 的去向\n\n被 kubelet 驱逐的 Pod 不会自动在原节点上重启。Pod 会被标记为 Failed 状态，reason 为 `Evicted`。对于由 Deployment、StatefulSet 等控制器管理的 Pod，控制器会检测到副本数不足，创建新的 Pod 副本，新副本由调度器重新调度到有足够资源的节点上。对于裸 Pod（没有控制器管理的），驱逐后就彻底消失了，不会有任何组件重建它——这也是为什么生产环境强烈不建议使用裸 Pod。\n\n被驱逐的 Pod 对象不会立即从 etcd 中删除，而是以 Failed 状态保留。时间久了集群里会积累大量状态为 Evicted 的 Pod 对象。你可以定期清理：\n\n```bash\n$ kubectl get pods --all-namespaces --field-selector status.phase=Failed | grep Evicted | wc -l\n247\n\n$ kubectl get pods --all-namespaces --field-selector status.phase=Failed -o json | \\\n  jq -r '.items[] | select(.status.reason==\"Evicted\") | .metadata.namespace + \"/\" + .metadata.name' | \\\n  xargs -I {} kubectl delete pod {} --force\n```\n\n### 面试高频追问点\n\n面试官常见的追问方向包括：「如果我的 Pod 设置了 PriorityClass，kubelet 驱逐时会考虑 Priority 吗？」——从 Kubernetes v1.28 开始，kubelet 在驱逐排序中确实会考虑 Pod 的 priority 值。在同一 QoS 等级内，低优先级的 Pod 会先被驱逐。但 QoS 等级仍然是第一排序键——一个 priority 为 1000000 的 BestEffort Pod 仍然比 priority 为 0 的 Guaranteed Pod 先被驱逐。\n\n另一个追问是「怎么防止某个 Pod 被驱逐？」——严格来说你无法完全阻止 kubelet 驱逐任何 Pod（这是节点的自保机制）。但你可以通过以下方式让 Pod 尽可能排在驱逐列表的最后：设置 QoS 为 Guaranteed（requests == limits），使用较高的 PriorityClass，确保 Pod 的实际资源使用量不超过 requests。系统关键 Pod（如 kube-proxy、CNI 插件）使用 `system-node-critical` PriorityClass，kubelet 对这些 Pod 有特殊保护——即使触发了驱逐阈值，也会尽量避免驱逐标记为 critical 的 Pod。\n\n还有一个实战问题：「驱逐阈值设太高或太低会怎样？」——阈值设太高（比如 memory.available < 2Gi），节点还剩 2Gi 内存就开始驱逐，Pod 会频繁被中断，集群可用容量浪费严重。阈值设太低（比如 memory.available < 10Mi），kubelet 反应太慢，很可能在驱逐还没开始时 OOM Killer 就先动手了，导致不可控的进程终止。生产中推荐的做法是把硬驱逐阈值设为节点内存的 1-2%（最低不低于 100Mi），软驱逐阈值设为 3-5%，给 kubelet 足够的反应时间。",
+      "keyPoints": [
+        "kubelet 节点压力驱逐（Node-pressure Eviction）与调度器抢占（Scheduler Preemption）是两种完全不同的机制：前者由 kubelet 在节点资源不足时自动触发保护节点稳定性，后者由 kube-scheduler 为高优先级 Pod 腾出调度空间",
+        "驱逐排序的第一把键是 QoS 等级：BestEffort（无 requests/limits）最先被驱逐 → Burstable（requests ≠ limits 或部分设置）其次 → Guaranteed（所有容器的 requests == limits）最后被驱逐",
+        "同 QoS 内的排序规则：BestEffort 按实际使用量绝对值从高到低排序，Burstable 按超出 requests 的比例（(实际-requests)/requests）从高到低排序，未超额的 Burstable Pod 优先级低于超额的",
+        "kubelet 监控四种驱逐信号：memory.available（可用内存）、nodefs.available（根分区磁盘）、imagefs.available（镜像分区磁盘）、pid.available（可用 PID），任一信号低于阈值即触发驱逐",
+        "硬驱逐（eviction-hard）触发后立即终止 Pod 无宽限期，软驱逐（eviction-soft）需要资源持续低于阈值超过 grace-period 后才执行，且允许 Pod 优雅退出，生产中应同时配置两者形成双层防线",
+        "PDB 对 kubelet 的节点压力驱逐完全无效——kubelet 在驱逐时不检查 PDB，防止服务在驱逐风暴中全军覆没应依赖副本跨节点分散、正确的 requests 设置和 Guaranteed QoS",
+        "kubelet 根据 QoS 等级设置容器的 oom_score_adj：BestEffort 为 1000、Burstable 为 2-999、Guaranteed 为 -997，即使绕过 kubelet 触发 Linux OOM Killer，杀进程优先级仍与 QoS 一致",
+        "从 v1.28 起 kubelet 驱逐排序会考虑 Pod 的 priority 值，但 QoS 等级仍是第一排序键——高 priority 的 BestEffort Pod 仍比低 priority 的 Guaranteed Pod 先被驱逐"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-eviction-order-q1-quiz1",
+          "question": "Kubernetes 中 Pod 的 QoS 等级是由什么决定的？",
+          "choices": [
+            {"id": "A", "text": "由 Pod 中所有容器的 resources.requests 和 resources.limits 配置自动计算，无需手动指定"},
+            {"id": "B", "text": "由 Pod 的 spec.qosClass 字段手动指定，支持 BestEffort、Burstable、Guaranteed 三个值"},
+            {"id": "C", "text": "由 Pod 的 PriorityClass 的 value 值决定，priority 越高 QoS 等级越高"},
+            {"id": "D", "text": "由 Pod 所在 namespace 的 ResourceQuota 配置决定"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "QoS 等级是 Kubernetes 根据 Pod 中所有容器的 resources.requests 和 resources.limits 配置自动计算的，结果写入 Pod 的 status.qosClass 字段（注意是 status 不是 spec，不可手动设置）。所有容器都没有任何 requests/limits 则为 BestEffort；所有容器的每种资源 requests 都等于 limits 则为 Guaranteed；其余情况为 Burstable。B 选项错在 qosClass 不是 spec 字段不能手动指定；C 选项混淆了 PriorityClass 和 QoS，两者是完全独立的维度；D 选项中 ResourceQuota 控制的是 namespace 级别的资源配额，不影响单个 Pod 的 QoS 等级。"
+        },
+        {
+          "id": "k8s-eviction-order-q1-quiz2",
+          "question": "kubelet 节点压力驱逐与 kube-scheduler 抢占（Preemption）的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "两者完全相同，只是名称不同，都由 kube-scheduler 执行"},
+            {"id": "B", "text": "节点压力驱逐由 kubelet 在节点资源不足时触发保护节点，抢占由调度器为高优先级 Pod 腾出调度空间"},
+            {"id": "C", "text": "节点压力驱逐只处理内存问题，抢占只处理 CPU 问题"},
+            {"id": "D", "text": "节点压力驱逐只在夜间维护窗口执行，抢占可以随时发生"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是两个完全独立的机制。节点压力驱逐由每个节点上的 kubelet 进程执行，触发条件是节点的内存、磁盘或 PID 等资源可用量低于配置的阈值，目的是保护节点不被资源耗尽而崩溃，排序规则主要基于 QoS 等级和资源超额比例。调度器抢占由 kube-scheduler 执行，触发条件是高优先级 Pod 无法调度到任何节点上，目的是为高优先级 Pod 腾出资源，排序基于 PriorityClass 的 value 值。A 选项混淆了两者的执行组件；C 选项错误，节点压力驱逐覆盖内存、磁盘、PID 多种资源；D 选项没有任何依据。"
+        },
+        {
+          "id": "k8s-eviction-order-q1-quiz3",
+          "question": "当节点内存不足触发驱逐时，同为 Burstable 的两个 Pod：Pod A（requests 256Mi，实际使用 1Gi）和 Pod B（requests 4Gi，实际使用 5Gi），哪个先被驱逐？",
+          "choices": [
+            {"id": "A", "text": "Pod B 先被驱逐，因为它的绝对内存使用量（5Gi）更大"},
+            {"id": "B", "text": "Pod B 先被驱逐，因为它的绝对超额量（1Gi）大于 Pod A（768Mi）"},
+            {"id": "C", "text": "Pod A 先被驱逐，因为它的超额比例（≈300%）远高于 Pod B（25%）"},
+            {"id": "D", "text": "两者被驱逐的概率相同，kubelet 随机选择"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "kubelet 对 Burstable Pod 的驱逐排序使用的是超出 requests 的比例，而非绝对使用量或绝对超额量。Pod A 的超额比例是 (1024Mi - 256Mi) / 256Mi ≈ 300%，Pod B 的超额比例是 (5120Mi - 4096Mi) / 4096Mi = 25%。Pod A 的资源使用量是其承诺量（requests）的 4 倍，「违约行为」远比 Pod B 严重，所以 kubelet 认为 Pod A 应该先被驱逐。这个设计的哲学是 requests 代表 Pod 对集群做出的资源承诺，超出承诺比例越高的 Pod 越应该为资源紧张负责。A 和 B 选项都错误地使用了绝对值来判断；D 选项不存在随机驱逐机制。"
+        },
+        {
+          "id": "k8s-eviction-order-q1-quiz4",
+          "question": "kubelet 默认的硬驱逐阈值（eviction-hard）中，memory.available 的默认值是多少？",
+          "choices": [
+            {"id": "A", "text": "100Mi，即节点可用内存低于 100Mi 时立即开始硬驱逐"},
+            {"id": "B", "text": "500Mi，给 kubelet 留出足够的反应时间"},
+            {"id": "C", "text": "节点总内存的 10%，按比例动态计算"},
+            {"id": "D", "text": "0Mi，默认不启用内存硬驱逐，需手动配置"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "kubelet 的默认硬驱逐阈值为 memory.available < 100Mi、nodefs.available < 10%、imagefs.available < 15%、pid.available < 100。当节点可用内存低于 100Mi 时，kubelet 立即执行硬驱逐——不给被驱逐的 Pod 任何优雅退出时间，直接将 Pod 标记为 Failed 并终止容器。这个 100Mi 的默认值在大内存节点上可能显得偏低（64Gi 节点只留 100Mi 缓冲），生产中建议根据节点规格调整。B 选项的 500Mi 是一个合理的生产推荐值但不是默认值；C 选项的按比例计算不是默认行为（不过你可以手动配置百分比）；D 选项错误，内存硬驱逐默认是启用的。"
+        },
+        {
+          "id": "k8s-eviction-order-q1-quiz5",
+          "question": "以下 kubectl describe node 输出表明节点当前处于什么状态？\n\n```\nConditions:\n  Type                 Status\n  ----                 ------\n  MemoryPressure       True\n  DiskPressure         False\n  PIDPressure          False\n  Ready                True\n```",
+          "choices": [
+            {"id": "A", "text": "节点可用内存低于驱逐阈值，kubelet 正在或即将驱逐 Pod，且调度器不会向该节点调度新 Pod"},
+            {"id": "B", "text": "节点内存完全耗尽已经宕机，Ready 状态为 True 是残留数据"},
+            {"id": "C", "text": "节点内存使用率超过 50% 的预警状态，暂不触发驱逐"},
+            {"id": "D", "text": "节点上有 Pod 的内存 requests 超过了 limits，但节点本身资源充足"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "MemoryPressure 为 True 表示 kubelet 检测到节点的 memory.available 低于配置的驱逐阈值（默认 100Mi 硬阈值或自定义的软阈值），kubelet 已经开始或即将开始按 QoS 和超额比例排序驱逐 Pod。同时 kubelet 会给节点打上 node.kubernetes.io/memory-pressure:NoSchedule taint，阻止调度器向该节点调度新 Pod。Ready 为 True 说明节点本身还在正常运行（kubelet 还在上报心跳），只是内存资源紧张。B 选项过于极端，Ready 为 True 说明节点还活着；C 选项编造了一个不存在的 50% 预警机制；D 选项混淆了 Pod 级别的资源配置和节点级别的资源压力。"
+        },
+        {
+          "id": "k8s-eviction-order-q1-quiz6",
+          "question": "一个常见的误解是：给 Pod 配置 PodDisruptionBudget（PDB）可以防止它被 kubelet 节点压力驱逐。这个说法正确吗？",
+          "choices": [
+            {"id": "A", "text": "正确，PDB 是 Pod 的终极保护伞，任何驱逐行为都必须遵守 PDB"},
+            {"id": "B", "text": "不正确，kubelet 的节点压力驱逐完全不检查 PDB，PDB 只对 kubectl drain 和调度器抢占有约束"},
+            {"id": "C", "text": "部分正确，PDB 对软驱逐有效但对硬驱逐无效"},
+            {"id": "D", "text": "部分正确，PDB 对 Guaranteed Pod 的驱逐有效但对 BestEffort 无效"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PDB 对 kubelet 的节点压力驱逐完全无效。kubelet 的驱逐是节点的「自保」行为——当节点自身即将因资源耗尽而崩溃时，保护节点稳定性的优先级高于任何 Pod 的可用性保障。kubelet 在执行驱逐时不检查 PDB，如果你的 Deployment 所有副本碰巧都在同一个节点上，kubelet 可以一次性全部驱逐。PDB 真正有效的场景是主动运维操作（kubectl drain、节点升级）和调度器的 Preemption（调度器会尽量不违反 PDB，但不是绝对保证）。防止服务在驱逐风暴中全灭的正确做法是用 topologySpreadConstraints 分散副本到多个节点，并设置 Guaranteed QoS。C 和 D 选项编造了不存在的部分有效场景。"
+        },
+        {
+          "id": "k8s-eviction-order-q1-quiz7",
+          "question": "软驱逐（Soft Eviction）和硬驱逐（Hard Eviction）的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "软驱逐需要资源持续低于阈值超过观察期才执行且允许 Pod 优雅退出，硬驱逐触发后立即终止 Pod 无宽限期"},
+            {"id": "B", "text": "软驱逐只驱逐 BestEffort Pod，硬驱逐可以驱逐所有 QoS 等级的 Pod"},
+            {"id": "C", "text": "软驱逐由调度器执行，硬驱逐由 kubelet 执行"},
+            {"id": "D", "text": "软驱逐是发送 SIGTERM 信号，硬驱逐是发送 SIGKILL 信号，两者触发条件相同"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "软驱逐和硬驱逐的区别体现在两个维度。触发条件上：硬驱逐一旦资源低于阈值立即执行，软驱逐需要资源持续低于阈值超过 eviction-soft-grace-period 配置的观察期（比如 1m30s）才会触发，给节点一个自愈的机会。执行方式上：硬驱逐直接将 Pod 标记为 Failed 并立即终止容器（等效 SIGKILL），不走 preStop hook 和 terminationGracePeriodSeconds；软驱逐允许 Pod 在 eviction-max-pod-grace-period 限定的时间内优雅退出。两者都由 kubelet 执行，都可以驱逐任何 QoS 等级的 Pod。B 选项错误，两种驱逐都不限 QoS；C 选项错误，都是 kubelet 执行；D 选项只说对了一半（信号区别），触发条件完全不同。"
+        },
+        {
+          "id": "k8s-eviction-order-q1-quiz8",
+          "question": "生产环境中，一个核心服务的所有副本都部署在同一个节点上，该节点触发了内存驱逐。以下哪种方案最能有效防止该服务全部中断？",
+          "choices": [
+            {"id": "A", "text": "配置 PDB minAvailable: 80%，确保驱逐时至少保留 80% 的副本"},
+            {"id": "B", "text": "使用 topologySpreadConstraints 将副本分散到不同节点，并设置 requests == limits 使 QoS 为 Guaranteed"},
+            {"id": "C", "text": "将硬驱逐阈值 memory.available 设为 0Mi，禁用 kubelet 驱逐"},
+            {"id": "D", "text": "在 Pod 的 annotation 中添加 eviction.kubernetes.io/protect: true 标记驱逐豁免"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确的做法是双管齐下：用 topologySpreadConstraints（或 Pod Anti-Affinity）确保副本分散在多个节点上，这样即使一个节点触发驱逐也不会影响其他节点上的副本；同时设置 requests == limits 让 QoS 为 Guaranteed，使 Pod 排在驱逐列表的最后。A 选项无效，因为 PDB 对 kubelet 的节点压力驱逐不起作用。C 选项非常危险——禁用驱逐会导致节点内存完全耗尽，触发 Linux OOM Killer 随机杀进程，后果更不可控。D 选项不存在，Kubernetes 没有 eviction.kubernetes.io/protect 这个 annotation，没有任何机制可以让 Pod 完全豁免节点压力驱逐。"
+        },
+        {
+          "id": "k8s-eviction-order-q1-quiz9",
+          "question": "一个 priority 值为 1000000 的 BestEffort Pod 和一个 priority 值为 0 的 Guaranteed Pod 同时存在于一个内存不足的节点上，哪个先被 kubelet 驱逐？",
+          "choices": [
+            {"id": "A", "text": "Guaranteed Pod 先被驱逐，因为它的 priority 值（0）远低于 BestEffort Pod（1000000）"},
+            {"id": "B", "text": "BestEffort Pod 先被驱逐，因为 QoS 等级是第一排序键，BestEffort 永远先于 Guaranteed 被驱逐"},
+            {"id": "C", "text": "两者同时被驱逐，kubelet 不区分驱逐顺序"},
+            {"id": "D", "text": "取决于哪个 Pod 的实际内存使用量更大，与 QoS 和 priority 都无关"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 kubelet 的驱逐排序中，QoS 等级始终是第一排序键。即使一个 BestEffort Pod 拥有非常高的 PriorityClass value（比如 1000000），它仍然比任何 Guaranteed Pod 先被驱逐。从 Kubernetes v1.28 起，kubelet 确实在驱逐排序中引入了 priority 值作为参考，但它是在同一 QoS 等级内部的次级排序键——比如两个都是 Burstable 的 Pod，低 priority 的先被驱逐。但跨 QoS 等级时，QoS 永远优先于 priority。这与调度器抢占不同，抢占完全按 priority 值排序而不考虑 QoS。A 选项错误地让 priority 覆盖了 QoS；C 和 D 选项都忽略了排序规则。"
+        },
+        {
+          "id": "k8s-eviction-order-q1-quiz10",
+          "question": "集群中某个节点的 MemoryPressure Condition 在驱逐完 Pod 后内存恢复正常，但该 Condition 并没有立即变回 False，而是保持了 5 分钟才恢复。这是什么机制导致的？",
+          "choices": [
+            {"id": "A", "text": "kubelet 的 evictionPressureTransitionPeriod 机制，防止节点在阈值边缘来回振荡导致驱逐风暴"},
+            {"id": "B", "text": "kubelet 的 bug，Condition 更新有延迟需要等待下一个心跳周期"},
+            {"id": "C", "text": "kube-scheduler 故意延迟清除 taint，等待 kubelet 确认资源彻底恢复"},
+            {"id": "D", "text": "API Server 的 etcd 写入延迟，节点状态更新需要排队等待"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 kubelet 的 evictionPressureTransitionPeriod 机制（默认 5 分钟）。当节点从压力状态恢复正常后，kubelet 不会立即把 MemoryPressure 等 Condition 从 True 改回 False，而是等待 evictionPressureTransitionPeriod 这么长时间，确认资源稳定在阈值以上才解除压力状态。这个设计是为了防止振荡（oscillation）：如果没有过渡期，驱逐 Pod 后内存恢复 → 解除压力 → 调度器立刻往该节点调度新 Pod → 内存又不够 → 再次驱逐 → 再恢复 → 再调度，陷入无限循环。5 分钟的冷却期让节点有充足的缓冲时间。B 选项错误，这不是 bug 而是设计；C 选项错误，taint 由 kubelet 管理不是调度器；D 选项不存在，etcd 写入延迟是毫秒级不是分钟级。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/out-of-resource/",
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/",
+        "https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/"
+      ]
+    }
+  ]
+}
