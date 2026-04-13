@@ -1,0 +1,157 @@
+{
+  "id": "computer-network-139",
+  "name": "负载均衡健康检查机制",
+  "domain": "computer-network",
+  "description": "详解负载均衡器健康检查的实现方式、检测策略与生产最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "computer-network-139-q1",
+      "domain": "computer-network",
+      "type": "requirement",
+      "difficulty": 2,
+      "tags": ["健康检查", "负载均衡", "Nginx", "HAProxy", "探活"],
+      "title": "如何实现负载均衡的健康检查？",
+      "content": "你所在团队运维着一套电商订单服务，4 台 Go 后端实例通过 Nginx 反向代理对外提供 API。某天凌晨 2 点，监控告警显示订单创建接口的错误率突然飙升到 25% 左右，Grafana 面板上能看到 4 台实例中有 1 台的 HTTP 5xx 比例接近 100%。\n\n排查后发现这台实例的 MySQL 连接池耗尽了，所有数据库查询都超时返回 500。但诡异的是，Nginx 仍然把流量均匀地分发给这台「半死不活」的实例——因为它的端口确实还在监听，TCP 层面完全可达，Nginx 默认的轮询策略对此毫无感知。你手动把这台实例从 upstream 中摘除后错误率立即归零，但这引出了一个更深层的问题：**生产环境中不可能每次都靠人工摘除故障节点**。\n\n负载均衡器需要一套自动化的健康检查机制来解决以下问题：如何在后端实例出现故障时自动将其从流量池中剔除？被动检查和主动检查分别是怎么工作的？TCP 层面的端口探测与 HTTP 层面的状态码检查有什么本质区别？在 Kubernetes 环境下 livenessProbe、readinessProbe、startupProbe 三种探针各自解决什么问题？如何设计一个真正有效的 `/health` 端点，而不是那种永远返回 200 的「假健康检查」？",
+      "answer": "## 一、负载均衡与健康检查的基础概念\n\n负载均衡（Load Balancing）是分布式系统中最基础的流量分发机制。它的核心任务是将客户端请求按照某种策略（轮询、加权、最少连接、IP 哈希等）分配到多台后端实例上，从而实现水平扩展和高可用。常见的负载均衡器包括 Nginx、HAProxy、Envoy 以及各云厂商的 ALB/NLB。在最简单的配置下，Nginx 的 upstream 块就能实现基本的轮询负载均衡：\n\n```nginx\n# 最基础的 Nginx 负载均衡配置\nupstream order_api {\n    server 10.0.1.10:8080;  # 后端实例 1\n    server 10.0.1.11:8080;  # 后端实例 2\n    server 10.0.1.12:8080;  # 后端实例 3\n    server 10.0.1.13:8080;  # 后端实例 4\n}\n\nserver {\n    listen 80;\n    location /api/ {\n        proxy_pass http://order_api;\n    }\n}\n```\n\n但光有流量分发是不够的。后端实例随时可能出现各种故障：进程崩溃、内存溢出、数据库连接耗尽、磁盘写满、依赖的下游服务不可用。如果负载均衡器对此毫无感知，继续把流量分发给故障实例，用户就会收到错误响应。健康检查（Health Check）正是解决这个问题的核心机制——它让负载均衡器能够持续监测每台后端的运行状态，自动将故障实例从流量池中摘除，并在实例恢复后自动恢复流量。\n\n从实现范式上看，健康检查分为两大类：被动检查（Passive Check）和主动检查（Active Check）。被动检查的思路是「出了事再反应」——负载均衡器在转发正常业务流量的过程中，统计每台后端返回错误的次数，当错误累积到一定阈值时将该实例标记为不可用。主动检查的思路则是「定时巡逻」——负载均衡器按固定间隔向每台后端发送专门的探测请求，根据探测结果判断实例是否健康。两者各有利弊，成熟的生产方案通常是两者结合使用。\n\n## 二、被动健康检查：Nginx 的 max_fails 与 fail_timeout\n\nNginx 开源版内置的被动健康检查通过 `max_fails` 和 `fail_timeout` 两个参数控制，这也是大多数团队最先接触的健康检查方式：\n\n```nginx\nupstream order_api {\n    server 10.0.1.10:8080 max_fails=3 fail_timeout=30s;\n    server 10.0.1.11:8080 max_fails=3 fail_timeout=30s;\n    server 10.0.1.12:8080 max_fails=3 fail_timeout=30s;\n    server 10.0.1.13:8080 max_fails=3 fail_timeout=30s;\n}\n\nlocation /api/ {\n    proxy_pass http://order_api;\n    proxy_next_upstream error timeout http_502 http_503 http_504;\n    proxy_next_upstream_tries 2;\n    proxy_next_upstream_timeout 5s;\n    proxy_connect_timeout 3s;\n    proxy_read_timeout 10s;\n}\n```\n\n这两个参数的交互逻辑经常被误解。`fail_timeout` 实际上承担了双重角色：它既是「统计错误的时间窗口」，也是「实例被标记为不可用后的冷却时间」。具体来说，在任意 `fail_timeout`（30 秒）的滑动窗口内，如果某台后端的失败次数达到 `max_fails`（3 次），Nginx 将其标记为不可用；在接下来的 `fail_timeout`（30 秒）内，Nginx 不再向该实例转发流量；冷却期结束后，Nginx 会尝试向该实例发送一个真实请求进行「试探」，如果成功则恢复该实例的流量，如果失败则继续标记为不可用并重新计时。\n\n什么算「失败」呢？默认情况下，Nginx 认为 TCP 连接超时、连接被拒绝（connection refused）属于失败。但注意，HTTP 层面的 5xx 错误默认**不算**失败——这是很多人踩的坑。你需要通过 `proxy_next_upstream` 指令显式声明哪些 HTTP 状态码也算失败，上面配置中的 `error timeout http_502 http_503 http_504` 就是告诉 Nginx 把 502、503、504 也纳入失败计数。`proxy_next_upstream_tries 2` 表示最多重试 2 次，避免在所有后端都不健康时无限重试。\n\n被动检查的核心局限在于滞后性：它依赖真实业务流量来探测故障。在 `max_fails=3` 的配置下，至少有 3 个真实用户请求会收到错误响应后才能触发摘除。在低流量时段（如凌晨），故障发现时间更长，因为需要更久才能累积到阈值。这就是为什么仅靠被动检查在生产环境中是不够的。\n\n## 三、主动健康检查：HAProxy httpchk 与 OpenResty\n\n主动检查不依赖业务流量，而是由负载均衡器定时向每台后端发送探测请求。HAProxy 是主动健康检查做得最成熟的开源负载均衡器之一，它的配置直观且功能强大：\n\n```haproxy\nfrontend http_front\n    bind *:80\n    default_backend order_api\n\nbackend order_api\n    balance roundrobin\n    option httpchk GET /health/ready HTTP/1.1\\r\\nHost:\\ order-api.internal\n    http-check expect status 200\n\n    server s1 10.0.1.10:8080 check inter 5s fall 3 rise 2\n    server s2 10.0.1.11:8080 check inter 5s fall 3 rise 2\n    server s3 10.0.1.12:8080 check inter 5s fall 3 rise 2\n    server s4 10.0.1.13:8080 check inter 5s fall 3 rise 2\n\n    timeout server 30s\n    timeout connect 5s\n```\n\n`check` 关键字启用主动健康检查，`inter 5s` 表示每 5 秒发送一次探测请求，`fall 3` 表示连续 3 次探测失败则标记为 DOWN，`rise 2` 表示连续 2 次探测成功才恢复为 UP。`option httpchk` 指定了 HTTP 级别的探测方式——向 `/health/ready` 路径发送 GET 请求，`http-check expect status 200` 声明期望收到 200 状态码。这意味着即使没有任何用户流量，HAProxy 也会每 5 秒钟主动去「敲门」，一旦某台后端连续 3 次没有正确应答就自动将其踢出。\n\nNginx 开源版并不支持主动健康检查，这是 Nginx Plus 的商业功能。但在 OpenResty 生态中，可以通过 `lua-resty-upstream-healthcheck` 模块实现同等功能：\n\n```nginx\nlua_shared_dict healthcheck 1m;\n\ninit_worker_by_lua_block {\n    local hc = require \"resty.upstream.healthcheck\"\n    local ok, err = hc.spawn_checker{\n        shm = \"healthcheck\",\n        upstream = \"order_api\",\n        type = \"http\",\n        http_req = \"GET /health/ready HTTP/1.0\\r\\nHost: order-api\\r\\n\\r\\n\",\n        interval = 3000,      -- 每 3 秒探测一次\n        timeout = 2000,       -- 单次探测超时 2 秒\n        fall = 3,             -- 连续 3 次失败标记为 DOWN\n        rise = 2,             -- 连续 2 次成功恢复为 UP\n        valid_statuses = {200, 302},\n        concurrency = 1,\n    }\n    if not ok then\n        ngx.log(ngx.ERR, \"healthcheck spawner error: \", err)\n    end\n}\n```\n\n这段配置利用 OpenResty 的 `init_worker_by_lua_block` 在每个 worker 进程启动时创建一个后台定时器，定期向 upstream 中的每台后端发送 HTTP 探测请求。探测结果存储在 `lua_shared_dict` 共享内存中，所有 worker 进程共享同一份健康状态，避免重复探测。\n\n## 四、检查粒度：L4 端口探测 vs L7 HTTP 检查 vs 深度业务检查\n\n健康检查的粒度直接决定了它能发现什么级别的故障，这是面试中经常被追问的点。\n\n**L4 TCP 端口探测**是最粗粒度的检查，它只验证目标端口是否在监听、TCP 握手能否完成。如果后端进程还活着但内部已经出了严重问题（数据库连接耗尽、线程池满、GC 风暴），TCP 端口探测完全无法发现——这正是开头那个故障场景的根因。L4 检查适合作为最底层的兜底，但绝不应该是唯一的检查手段。\n\n**L7 HTTP 状态码检查**进了一步，它发送一个真正的 HTTP 请求并检查响应状态码。但如果你的 `/health` 端点只是 `return 200`，它同样无法反映后端的真实状态——我把这种叫做「假健康检查」，它在关键时刻形同虚设。\n\n真正有价值的是**深度业务健康检查**。一个设计良好的 `/health/ready` 端点应该检测后端所有关键依赖的可用性：\n\n```go\npackage main\n\nimport (\n\t\"context\"\n\t\"database/sql\"\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"sync/atomic\"\n\t\"time\"\n\n\t\"github.com/redis/go-redis/v9\"\n)\n\ntype HealthResponse struct {\n\tStatus  string            `json:\"status\"`\n\tChecks  map[string]string `json:\"checks\"`\n\tVersion string            `json:\"version\"`\n}\n\nfunc readinessHandler(db *sql.DB, rdb *redis.Client) http.HandlerFunc {\n\treturn func(w http.ResponseWriter, r *http.Request) {\n\t\tctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)\n\t\tdefer cancel()\n\n\t\tresp := HealthResponse{\n\t\t\tStatus:  \"ok\",\n\t\t\tChecks:  make(map[string]string),\n\t\t\tVersion: \"v1.4.2\",\n\t\t}\n\t\thttpCode := http.StatusOK\n\n\t\t// 检查 MySQL 连接池\n\t\tif err := db.PingContext(ctx); err != nil {\n\t\t\tresp.Checks[\"mysql\"] = \"fail: \" + err.Error()\n\t\t\tresp.Status = \"degraded\"\n\t\t\thttpCode = http.StatusServiceUnavailable\n\t\t} else {\n\t\t\tresp.Checks[\"mysql\"] = \"ok\"\n\t\t}\n\n\t\t// 检查 Redis 连接\n\t\tif err := rdb.Ping(ctx).Err(); err != nil {\n\t\t\tresp.Checks[\"redis\"] = \"fail: \" + err.Error()\n\t\t\tresp.Status = \"degraded\"\n\t\t\thttpCode = http.StatusServiceUnavailable\n\t\t} else {\n\t\t\tresp.Checks[\"redis\"] = \"ok\"\n\t\t}\n\n\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n\t\tw.WriteHeader(httpCode)\n\t\tjson.NewEncoder(w).Encode(resp)\n\t}\n}\n```\n\n这里有一个关键的设计决策：当某个依赖不可用时应该返回 503 而不是 200。很多团队犯的错误是把健康检查做成了「进程存活检查」——只要进程在跑就返回 200——这样的端点在关键时刻没有任何作用。但也要警惕过度检查的陷阱：如果你的 `/health/ready` 检查了所有依赖（MySQL、Redis、Kafka、Elasticsearch），任何一个依赖的短暂抖动都会导致实例被摘流。因此生产环境中通常区分两个端点：`/health/live` 只检查进程本身是否存活，用于 K8s livenessProbe；`/health/ready` 检查所有关键依赖，用于负载均衡器的流量分发决策和 K8s readinessProbe。\n\n## 五、Kubernetes 三种探针：liveness、readiness 与 startup\n\n在 Kubernetes 环境下，健康检查通过三种探针（Probe）实现，每种解决不同层次的问题：\n\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: order-api\nspec:\n  replicas: 4\n  selector:\n    matchLabels:\n      app: order-api\n  template:\n    metadata:\n      labels:\n        app: order-api\n    spec:\n      containers:\n        - name: order-api\n          image: order-api:v1.4.2\n          ports:\n            - containerPort: 8080\n          startupProbe:\n            httpGet:\n              path: /health/live\n              port: 8080\n            initialDelaySeconds: 5\n            periodSeconds: 3\n            failureThreshold: 10   # 最多等 5 + 3×10 = 35 秒启动\n          livenessProbe:\n            httpGet:\n              path: /health/live\n              port: 8080\n            periodSeconds: 10\n            failureThreshold: 3    # 连续 3 次失败则重启容器\n            timeoutSeconds: 3\n          readinessProbe:\n            httpGet:\n              path: /health/ready\n              port: 8080\n            periodSeconds: 5\n            failureThreshold: 2    # 连续 2 次失败则从 Service 摘除\n            successThreshold: 1\n            timeoutSeconds: 3\n```\n\n`livenessProbe` 回答的问题是「这个容器是不是已经死了需要重启」。它应该只检查进程本身是否还能正常工作——比如是否陷入了死锁、是否还能响应基本请求。如果 liveness 探测连续失败达到 `failureThreshold`，kubelet 会杀掉容器并重新创建。这里有一个非常重要的原则：**liveness 探针绝对不应该检查外部依赖**。如果 MySQL 短暂不可用就导致 liveness 失败，所有 Pod 会被同时重启，形成雪崩效应——MySQL 恢复后又被重启 Pod 的连接风暴压垮，陷入恶性循环。\n\n`readinessProbe` 回答的问题是「这个容器现在能不能接收流量」。当 readiness 探测失败时，Pod 不会被重启，只是从 Service 的 Endpoints 列表中移除，kube-proxy 不再将新流量路由到该 Pod。这正是负载均衡健康检查在 K8s 中的对应物。readinessProbe 应该检查所有关键依赖是否就绪，因为它的后果只是「暂时不接收流量」而不是「重启容器」。\n\n`startupProbe` 解决的是慢启动问题。Java 应用或需要预热缓存的服务可能需要几十秒甚至几分钟才能完成初始化。如果没有 startupProbe，livenessProbe 可能在应用还在启动时就判定它「死了」并触发重启，导致容器陷入无限重启循环。startupProbe 在容器启动阶段替代 livenessProbe 工作，只有当 startupProbe 首次成功后，livenessProbe 和 readinessProbe 才正式开始生效。\n\n## 六、优雅下线与抖动防护\n\n健康检查不仅仅是「发现故障」，还要配合优雅下线（Graceful Shutdown）实现平滑的流量迁移。当一个实例需要下线时（部署更新、缩容），正确的流程是：先让健康检查端点返回 503，等待负载均衡器感知并摘除流量，处理完存量请求，最后关闭进程：\n\n```go\nfunc main() {\n\tvar healthy int32 = 1\n\n\thttp.HandleFunc(\"/health/ready\", func(w http.ResponseWriter, r *http.Request) {\n\t\tif atomic.LoadInt32(&healthy) == 1 {\n\t\t\tw.WriteHeader(http.StatusOK)\n\t\t\tw.Write([]byte(`{\"status\":\"ok\"}`))\n\t\t} else {\n\t\t\tw.WriteHeader(http.StatusServiceUnavailable)\n\t\t\tw.Write([]byte(`{\"status\":\"draining\"}`))\n\t\t}\n\t})\n\n\tsrv := &http.Server{Addr: \":8080\"}\n\tgo srv.ListenAndServe()\n\n\tquit := make(chan os.Signal, 1)\n\tsignal.Notify(quit, syscall.SIGTERM)\n\t<-quit\n\n\t// 1. 标记为不健康，LB 下次探测时将摘除流量\n\tatomic.StoreInt32(&healthy, 0)\n\t// 2. 等待 LB 感知（至少一个探测周期 + 网络延迟）\n\ttime.Sleep(10 * time.Second)\n\t// 3. 优雅关闭：等待存量请求处理完毕\n\tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)\n\tdefer cancel()\n\tsrv.Shutdown(ctx)\n}\n```\n\n在 K8s 中，Pod 收到 SIGTERM 后有一个 `terminationGracePeriodSeconds`（默认 30 秒）的宽限期。配合 `preStop` 钩子可以实现更精细的控制——先 sleep 几秒等待 Endpoints 更新传播到所有节点的 kube-proxy，再开始优雅关闭。\n\n抖动防护同样至关重要。生产环境中网络偶尔会出现毫秒级抖动，如果健康检查过于敏感（1 次失败就摘除），就会导致实例在健康和不健康之间频繁切换，这种现象叫做 flapping。`fall` 参数（连续失败 N 次才标记为不健康）和 `rise` 参数（连续成功 N 次才恢复）就是用来对抗抖动的。通常建议 `fall=3`、`rise=2`，探测间隔 5-10 秒。如果探测间隔太短（比如 1 秒），探测本身的流量也会成为后端的负担。\n\n面试中常见的追问还包括：「如果所有后端同时不健康怎么办？」HAProxy 可以配置 `option allbackups` 启用备份服务器，Nginx 在所有 upstream 都标记为 down 后会重新将它们全部标记为 up 并重试——这是一个「宁可有错也不能全挂」的兜底策略。另一个追问是「健康检查本身是否会成为性能瓶颈」——答案是通常不会，因为探测间隔以秒计而非毫秒计，但如果你的 `/health/ready` 端点每次都要查数据库，在后端实例数很多时确实需要考虑缓存探测结果（比如每 3 秒真正检查一次依赖，其余探测直接返回缓存结果）。",
+      "keyPoints": [
+        "被动检查通过统计真实请求失败次数来发现故障，零额外开销但存在滞后性——至少有 max_fails 个用户请求会失败后才能触发摘除",
+        "Nginx 的 fail_timeout 承担双重角色：既是统计失败的时间窗口，也是实例被标记为不可用后的冷却恢复时间；HTTP 5xx 默认不计入失败次数，需通过 proxy_next_upstream 显式声明",
+        "主动检查由负载均衡器定时发送探测请求，HAProxy 通过 option httpchk 配合 fall/rise 参数实现，不依赖业务流量即可在用户感知前发现故障",
+        "L4 端口探测只能发现进程崩溃，L7 HTTP 探测能发现应用层错误，深度 /health/ready 端点检查所有关键依赖才能发现隐性故障如数据库连接池耗尽",
+        "K8s livenessProbe 绝不应检查外部依赖，否则依赖短暂不可用会导致所有 Pod 同时重启形成雪崩；readinessProbe 应检查所有依赖以决定是否接收流量",
+        "startupProbe 在容器启动阶段替代 livenessProbe 工作，防止慢启动应用（如 Java 服务、需要预热缓存的服务）被误判为死亡而陷入无限重启循环",
+        "优雅下线的正确流程是先让健康检查返回 503、等待至少一个探测周期让 LB 摘除流量、处理完存量请求后再关闭进程",
+        "fall/rise 参数通过要求连续多次失败或成功才改变状态来实现抖动防护，避免网络偶发抖动导致实例在健康与不健康之间频繁切换（flapping）"
+      ],
+      "quiz": [
+        {
+          "id": "q1",
+          "question": "被动健康检查与主动健康检查的核心区别是什么？",
+          "choices": [
+            { "id": "A", "text": "被动检查通过统计真实业务请求的失败次数来发现故障，主动检查由负载均衡器定时发送独立的探测请求" },
+            { "id": "B", "text": "被动检查只能检测 TCP 层故障，主动检查只能检测 HTTP 层故障" },
+            { "id": "C", "text": "被动检查在后端实例上运行 agent 进程上报状态，主动检查在负载均衡器上运行检测程序" },
+            { "id": "D", "text": "被动检查每秒执行一次，主动检查每分钟执行一次，两者只是频率不同" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "被动检查的核心特征是「搭便车」——它不产生额外的探测流量，而是在转发正常业务请求的过程中观察后端返回的错误。当错误累积到阈值（如 Nginx 的 max_fails）时将实例标记为不可用。主动检查则完全独立于业务流量，负载均衡器按固定间隔（如 HAProxy 的 inter 5s）主动向后端发送专用探测请求（如 GET /health）。B 选项错误，两种方式都可以工作在 L4 或 L7 层面。C 选项描述的是 agent-based 监控而非健康检查。D 选项错误，频率只是配置参数，不是两者的本质区别。"
+        },
+        {
+          "id": "q2",
+          "question": "为什么一个只返回硬编码 200 的 /health 端点在生产环境中是不够的？",
+          "choices": [
+            { "id": "A", "text": "因为负载均衡器不支持检查 HTTP 200 状态码" },
+            { "id": "B", "text": "因为硬编码 200 无法反映后端的真实状态，当数据库连接池耗尽等内部故障发生时 /health 依然返回 200，负载均衡器无法感知故障" },
+            { "id": "C", "text": "因为 HTTP 200 响应的体积太大，会占用大量带宽" },
+            { "id": "D", "text": "因为 HTTPS 环境下硬编码的响应会被 TLS 加密，负载均衡器无法解析" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "健康检查端点的价值在于如实反映后端实例「能否正常处理业务请求」。如果 /health 只是无条件返回 200，那么即使 MySQL 连接池耗尽、Redis 不可达、磁盘写满，负载均衡器仍然认为该实例是健康的并继续转发流量。一个有效的 /health/ready 端点应该实际检测所有关键依赖的可用性（数据库 Ping、Redis Ping 等），在依赖不可用时返回 503，这样负载均衡器才能及时将故障实例从流量池中摘除。A 选项错误，所有主流 LB 都支持 HTTP 状态码检查。C 和 D 选项完全偏离了问题本质。"
+        },
+        {
+          "id": "q3",
+          "question": "在 Nginx 中配置 max_fails=3 fail_timeout=30s 后，当某台后端在 30 秒内累积了 3 次失败，接下来会发生什么？",
+          "choices": [
+            { "id": "A", "text": "Nginx 立即将该实例从 upstream 中永久移除，需要手动 reload 才能恢复" },
+            { "id": "B", "text": "Nginx 将该实例标记为不可用，30 秒内不转发流量给它，30 秒后用一个真实请求试探，成功则恢复" },
+            { "id": "C", "text": "Nginx 将该实例的权重降低为原来的一半，逐渐减少分配给它的流量" },
+            { "id": "D", "text": "Nginx 向该实例发送一个 RST 包强制断开所有连接，然后开始主动健康检查" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Nginx 被动健康检查的完整流程是：在 fail_timeout（30 秒）时间窗口内，当某台后端的失败次数达到 max_fails（3 次），Nginx 将其标记为不可用（unavailable）。在接下来的 fail_timeout（30 秒）冷却期内，Nginx 不会向该实例转发任何流量。冷却期结束后，Nginx 会尝试向该实例发送一个真实的业务请求进行试探——如果这个请求成功，则恢复该实例的正常流量分配；如果失败，则再次进入冷却期。注意 A 选项中的「永久移除」是错误的，Nginx 有自动恢复机制；C 选项的渐进降权不是 Nginx 原生的行为；D 选项中 Nginx 开源版不支持主动健康检查。"
+        },
+        {
+          "id": "q4",
+          "question": "HAProxy 配置中 server s1 10.0.1.10:8080 check inter 5s fall 3 rise 2 的 rise 2 表示什么含义？",
+          "choices": [
+            { "id": "A", "text": "当实例被标记为 DOWN 后，需要连续 2 次探测成功才会恢复为 UP 状态" },
+            { "id": "B", "text": "每次探测时同时发送 2 个请求，取多数结果作为判定依据" },
+            { "id": "C", "text": "当实例恢复后，将其权重提升为正常值的 2 倍作为补偿" },
+            { "id": "D", "text": "实例从 DOWN 恢复为 UP 后需要等待 2 秒才开始接收流量" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "HAProxy 的 rise 参数定义了一个 DOWN 状态的实例恢复为 UP 所需的连续成功探测次数。在本例中 rise 2 意味着实例被标记为 DOWN 后，必须连续 2 次探测都成功才能重新标记为 UP 并开始接收流量。这个机制的设计目的是防止抖动（flapping）——如果一台刚恢复的实例只是偶尔能响应成功，rise 参数可以确保它真正稳定后才恢复流量。与之对应的 fall 3 表示连续 3 次探测失败才标记为 DOWN，同样是为了避免因偶发的网络抖动而误判。B 选项描述的是并行探测，HAProxy 不这么工作。C 和 D 选项都不是 rise 的实际语义。"
+        },
+        {
+          "id": "q5",
+          "question": "在 HAProxy stats 页面上看到某台 server 的状态显示为 L7STS，这意味着什么？",
+          "choices": [
+            { "id": "A", "text": "L4 层 TCP 连接成功，但 L7 层 HTTP 状态码不符合预期（如收到 503 而非 200），实例被标记为不健康" },
+            { "id": "B", "text": "L7 层 SSL/TLS 握手失败，证书过期或不匹配" },
+            { "id": "C", "text": "L7 层连接超时，服务器在规定时间内未返回任何响应" },
+            { "id": "D", "text": "L7 层 DNS 解析失败，无法将域名解析为 IP 地址" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "HAProxy 的健康检查状态码（check status）能精确反映故障发生在哪一层。L7STS 的含义是「Layer 7 Status」，表示 TCP 连接成功建立、HTTP 请求也成功发送并收到了响应，但响应的 HTTP 状态码不符合 http-check expect 的预期。例如配置了 http-check expect status 200 但后端返回了 503，就会触发 L7STS。与之对比，L4CON 表示 L4 层 TCP 连接被拒绝（connection refused），L4TOUT 表示 TCP 连接超时，L7TOUT 表示 HTTP 层面的响应超时。理解这些状态码对生产环境中的故障排查非常有帮助——看到 L7STS 说明进程本身还活着，问题出在应用层面（如依赖不可用导致返回错误状态码）。"
+        },
+        {
+          "id": "q6",
+          "question": "在 Kubernetes 中，一位工程师将 livenessProbe 配置为检查 MySQL 数据库连接是否可用。当 MySQL 主库发生短暂故障时，最可能发生什么问题？",
+          "choices": [
+            { "id": "A", "text": "只有正在处理 MySQL 查询的 Pod 会被重启，其他 Pod 不受影响" },
+            { "id": "B", "text": "所有 Pod 的 livenessProbe 同时失败，kubelet 将它们全部重启，形成雪崩效应——重启后的连接风暴可能进一步压垮 MySQL" },
+            { "id": "C", "text": "Kubernetes 会自动将流量切换到 MySQL 从库，Pod 不受影响" },
+            { "id": "D", "text": "livenessProbe 会自动降级为 TCP 探测，跳过 MySQL 检查" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 K8s 健康检查中最经典的反模式。livenessProbe 失败的后果是容器被杀掉并重建，这是一个非常重的操作。如果 livenessProbe 依赖外部服务（如 MySQL），当该外部服务短暂不可用时，所有 Pod 的 liveness 探测会同时失败，kubelet 会同时重启所有 Pod。重启后的 Pod 会同时尝试建立数据库连接，形成连接风暴（thundering herd），可能在 MySQL 恢复后再次将其压垮，导致恶性循环。正确做法是 livenessProbe 只检查进程本身的存活状态（如是否死锁），外部依赖的检查放在 readinessProbe 中——readiness 失败只是摘流，不会重启容器。"
+        },
+        {
+          "id": "q7",
+          "question": "K8s 中 livenessProbe 与 readinessProbe 探测失败后的行为有什么关键区别？",
+          "choices": [
+            { "id": "A", "text": "livenessProbe 失败导致 kubelet 重启容器；readinessProbe 失败只是将 Pod 从 Service Endpoints 中摘除，不重启容器" },
+            { "id": "B", "text": "livenessProbe 失败会触发 Pod 的自动扩容；readinessProbe 失败会触发 Pod 的自动缩容" },
+            { "id": "C", "text": "livenessProbe 每秒执行一次，readinessProbe 每分钟执行一次，区别只在频率" },
+            { "id": "D", "text": "livenessProbe 检查 TCP 端口，readinessProbe 检查 HTTP 状态码，区别在检查方式" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是面试中的高频考点。livenessProbe 和 readinessProbe 的探测方式完全相同（都支持 httpGet、tcpSocket、exec 三种），它们的本质区别在于探测失败后的处理动作。livenessProbe 失败达到 failureThreshold 后，kubelet 会杀死容器并根据 restartPolicy 重建，这是一个「强制重启」的操作。readinessProbe 失败后，Pod 从 Service 的 Endpoints 列表中移除，kube-proxy 不再将新流量路由到该 Pod，但容器本身继续运行——当 readinessProbe 再次成功后，Pod 会自动回到 Endpoints 中恢复流量。因此 liveness 用于检测「需要重启才能恢复的故障」（如死锁），readiness 用于检测「暂时不能服务但会自行恢复的状态」（如依赖暂时不可用）。"
+        },
+        {
+          "id": "q8",
+          "question": "在生产环境中进行滚动更新（Rolling Update）时，如何利用健康检查实现零停机部署？",
+          "choices": [
+            { "id": "A", "text": "新 Pod 启动后立即接收流量，同时立即终止旧 Pod，依靠客户端重试保证可用性" },
+            { "id": "B", "text": "新 Pod 的 readinessProbe 通过后才加入 Service 接收流量，旧 Pod 收到 SIGTERM 后先标记为不健康、等待 LB 摘流、处理完存量请求后再退出" },
+            { "id": "C", "text": "先将所有旧 Pod 停止，等待 60 秒后再启动新 Pod，利用 DNS TTL 过期实现切换" },
+            { "id": "D", "text": "新旧 Pod 同时运行但分配不同的端口号，通过修改 Service 的 targetPort 实现瞬间切换" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "零停机滚动更新的关键在于两个阶段的健康检查配合。首先是新 Pod 的上线阶段：K8s 创建新 Pod 后，只有当其 readinessProbe 连续成功达到 successThreshold 后，才会将其加入 Service 的 Endpoints 列表开始接收流量。这确保了新实例真正就绪后才承接业务。然后是旧 Pod 的下线阶段：旧 Pod 收到 SIGTERM 信号后，应用程序应先将自己的 /health/ready 端点切换为返回 503，等待负载均衡器感知并摘除流量（通常需要一个探测周期），然后在 terminationGracePeriodSeconds 的宽限期内处理完所有存量请求，最后退出。A 选项没有等待就绪的过程，C 选项会导致完全停机，D 选项的端口切换方案不现实。"
+        },
+        {
+          "id": "q9",
+          "question": "如果负载均衡器后面的所有后端实例同时健康检查失败，Nginx 的默认行为是什么？",
+          "choices": [
+            { "id": "A", "text": "Nginx 对所有请求返回 502 Bad Gateway，直到至少有一台实例恢复健康" },
+            { "id": "B", "text": "Nginx 将所有实例重新标记为可用并继续转发流量，因为全部不可用比全部拒绝服务更糟糕" },
+            { "id": "C", "text": "Nginx 自动重启所有后端实例的进程" },
+            { "id": "D", "text": "Nginx 将请求缓存在本地磁盘，等待后端恢复后再转发" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个重要的边界情况。当 Nginx upstream 中所有 server 都被被动健康检查标记为不可用（unavailable）时，Nginx 不会简单地拒绝所有请求返回 502。相反，它会将所有 server 重新视为可用，并按正常的负载均衡策略继续转发流量。这种「全部不可用则全部恢复」的策略背后的逻辑是：与其让服务完全中断（100% 错误率），不如尝试转发请求——也许某些实例已经恢复但还没被探测到，或者某些请求类型仍然能被正常处理。HAProxy 则有不同的处理方式，可以通过配置 backup server 在所有主 server 都 DOWN 时将流量切换到备份实例。这个行为差异是面试中区分候选人深度的好问题。"
+        },
+        {
+          "id": "q10",
+          "question": "线上服务的健康检查端点 /health/ready 持续返回 200，但用户反馈部分请求超时。最可能的排查方向是什么？",
+          "choices": [
+            { "id": "A", "text": "健康检查端点可能没有真正检测关键依赖，只是返回硬编码的 200；或者检查的依赖不全面，遗漏了实际出问题的依赖" },
+            { "id": "B", "text": "用户的 DNS 缓存过期了，需要清除客户端的 DNS 缓存" },
+            { "id": "C", "text": "TLS 证书即将过期，部分客户端拒绝连接" },
+            { "id": "D", "text": "Nginx 的 worker_connections 配置太低，需要调大" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "当健康检查显示一切正常但用户实际体验到超时时，首先要怀疑的就是健康检查的有效性。最常见的问题有两种：第一，/health/ready 端点是「假健康检查」，只返回硬编码的 200 而没有实际检测任何依赖，例如数据库连接池虽然耗尽但 /health 不知道；第二，/health/ready 检测了部分依赖但遗漏了真正出问题的那个——比如它检查了 MySQL 和 Redis，但实际超时是因为下游微服务不可用，而 /health 没有覆盖这个依赖。排查方法是先 curl 该端点查看返回内容是否包含各依赖的详细状态，再对照实际请求路径上的所有依赖逐一排查。B、C、D 虽然都可能导致用户问题，但与「健康检查通过」这个条件不直接相关。"
+        }
+      ],
+      "references": [
+        "https://nginx.org/en/docs/http/ngx_http_upstream_module.html",
+        "https://docs.haproxy.org/2.8/configuration.html#option%20httpchk",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
+        "https://docs.nginx.com/nginx/admin-guide/load-balancer/http-health-check/"
+      ]
+    }
+  ]
+}
