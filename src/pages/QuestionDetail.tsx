@@ -149,10 +149,10 @@ export function QuestionDetail() {
 
       {/* Tab bar */}
       {hasQuiz && (
-        <div className="mb-6 flex items-center gap-1 overflow-x-auto border-b border-[var(--color-notion-border)]">
+        <div className="mb-6 flex min-w-0 items-stretch gap-1 border-b border-[var(--color-notion-border)]">
           <button
             onClick={() => setActiveTab('content')}
-            className={`-mb-px flex shrink-0 items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 ${
+            className={`-mb-px flex min-w-0 flex-1 items-center justify-center gap-1.5 border-b-2 px-3 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 sm:flex-none sm:px-4 ${
               activeTab === 'content'
                 ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
                 : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
@@ -162,7 +162,7 @@ export function QuestionDetail() {
           </button>
           <button
             onClick={() => setActiveTab('quiz')}
-            className={`-mb-px flex shrink-0 items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 ${
+            className={`-mb-px flex min-w-0 flex-1 items-center justify-center gap-1.5 border-b-2 px-3 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 sm:flex-none sm:px-4 ${
               activeTab === 'quiz'
                 ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
                 : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
