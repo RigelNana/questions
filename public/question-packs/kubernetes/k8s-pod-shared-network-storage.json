@@ -1,0 +1,158 @@
+{
+  "id": "k8s-pod-shared-network-storage",
+  "name": "Pod 多容器共享网络与存储",
+  "domain": "kubernetes",
+  "description": "深入理解 Pod 内多容器共享网络和存储的底层原理，涵盖 pause 容器、Network Namespace、emptyDir Volume 及进程间通信机制",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-pod-shared-network-storage-q1",
+      "domain": "kubernetes",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["Pod", "网络共享", "存储共享", "pause容器", "Linux namespace"],
+      "title": "Pod 中多个容器如何共享网络和存储？",
+      "content": "面试到 Kubernetes 的 Pod 部分，「Pod 内多个容器是怎么共享网络和存储的」这个问题出现频率非常高。面试官想听的绝不是一句「它们共享同一个 IP」就完事了。他更想知道的是：这个共享到底是怎么实现的？背后的 pause 容器是什么角色？网络共享和存储共享的实现机制有什么本质区别？如果两个容器监听了同一个端口会发生什么？\n\n大部分候选人能说出「同一个 Pod 内容器共享网络」，但再往下问一层就卡住了。能把 pause 容器创建 Network Namespace、业务容器 join 进去、Volume 作为 Pod 级资源被多容器挂载这条线讲清楚的人，在面试中会非常亮眼。\n\n我们先从一个多容器 Pod 的实例说起，建立直观感受。下面是一个典型的 sidecar 模式 Pod，一个 nginx 容器提供 HTTP 服务，一个 busybox 容器负责实时采集 nginx 的访问日志：\n\n```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: shared-demo\nspec:\n  containers:\n  - name: nginx\n    image: nginx:1.25.4\n    ports:\n    - containerPort: 80\n    volumeMounts:\n    - name: shared-logs\n      mountPath: /var/log/nginx\n  - name: log-reader\n    image: busybox:1.36\n    command: [\"sh\", \"-c\", \"tail -F /logs/access.log\"]\n    volumeMounts:\n    - name: shared-logs\n      mountPath: /logs\n  volumes:\n  - name: shared-logs\n    emptyDir: {}\n```\n\n注意两个细节：第一，两个容器把同一个 `shared-logs` 卷挂载到了不同的路径（nginx 挂到 `/var/log/nginx`，log-reader 挂到 `/logs`），但底层指向同一块磁盘目录；第二，log-reader 容器如果想访问 nginx 的 HTTP 服务，可以直接 `wget localhost:80`，不需要知道任何 IP 地址，因为它们共享同一个网络栈。\n\n创建这个 Pod 后验证一下网络共享：\n\n```bash\n$ kubectl exec shared-demo -c log-reader -- wget -qO- localhost:80\n<!DOCTYPE html>\n<html>\n<head><title>Welcome to nginx!</title></head>\n...\n```\n\nlog-reader 容器通过 `localhost:80` 直接访问到了 nginx 的页面——两个「看起来独立」的容器，网络层面就像运行在同一台机器上的两个进程。这是怎么做到的？接下来我们从底层机制开始拆解。",
+      "answer": "## Pod 基础概念回顾\n\nPod 是 Kubernetes 中最小的可调度和可部署单元。一个 Pod 封装了一组（一个或多个）容器，这些容器共享网络、存储以及部分 Linux Namespace，被 Kubernetes 调度器作为一个不可分割的整体调度到同一个节点上运行。理解 Pod 内多容器共享机制，首先要明白一个核心事实：Pod 的「共享」并不是 Kubernetes 在应用层做的什么魔法，它完完全全建立在 Linux 内核的 Namespace 机制之上。\n\nLinux Namespace 是内核提供的资源隔离手段，不同类型的 Namespace 隔离不同种类的资源。其中与 Pod 共享机制直接相关的有这几种：Network Namespace 隔离网络栈（IP 地址、路由表、端口空间、iptables 规则等），IPC Namespace 隔离 System V IPC 和 POSIX 消息队列，UTS Namespace 隔离 hostname，PID Namespace 隔离进程 ID 空间，Mount Namespace 隔离文件系统挂载点。Pod 的做法是：让所有容器共享 Network Namespace、IPC Namespace 和 UTS Namespace，但每个容器保持独立的 Mount Namespace 和（默认情况下）PID Namespace。这样一来，容器之间网络互通、可以通过 IPC 通信、看到相同的 hostname，但文件系统彼此隔离，各自有独立的进程视图。\n\n## 网络共享：pause 容器与 Network Namespace\n\n### pause 容器——Pod 网络的基石\n\n当 kubelet 要创建一个 Pod 时，它做的第一件事并不是启动你在 YAML 里定义的业务容器，而是通过 CRI（Container Runtime Interface）调用容器运行时创建一个特殊容器——**pause 容器**（在 containerd 中叫 sandbox container）。这个容器使用的镜像是 `registry.k8s.io/pause:3.10`（Kubernetes v1.30 默认版本），它的整个源代码只有几十行 C 代码，核心逻辑就是调用 `pause()` 系统调用无限期挂起自己。\n\npause 容器的源代码位于 Kubernetes 仓库的 `build/pause/linux/pause.c`，核心部分如下：\n\n```c\nstatic void sigdown(int signo) {\n  psignal(signo, \"Shutting down, got signal\");\n  exit(0);\n}\n\nstatic void sigreap(int signo) {\n  while (waitpid(-1, NULL, WNOHANG) > 0)\n    ;\n}\n\nint main(int argc, char **argv) {\n  if (getpid() != 1)\n    /* Not an error because pause sees use outside of infra containers. */\n    fprintf(stderr, \"Warning: pause should be the first process\\n\");\n\n  if (sigaction(SIGINT, &(struct sigaction){.sa_handler = sigdown}, NULL) < 0)\n    return 1;\n  if (sigaction(SIGTERM, &(struct sigaction){.sa_handler = sigdown}, NULL) < 0)\n    return 2;\n  if (sigaction(SIGCHLD, &(struct sigaction){.sa_handler = sigreap,\n                                             .sa_flags = SA_NOCLDSTOP}, NULL) < 0)\n    return 3;\n\n  for (;;)\n    pause();\n  fprintf(stderr, \"Error: infinite loop terminated\\n\");\n  return 42;\n}\n```\n\n这段代码做了三件事：注册 SIGINT/SIGTERM 信号处理器以便优雅退出，注册 SIGCHLD 处理器回收僵尸进程（这是 PID 1 的职责），然后进入一个无限 `pause()` 循环。它不做任何业务逻辑，内存占用约 250KB，CPU 使用率为零。但正是这个几乎「什么都不做」的容器，承担了整个 Pod 网络命名空间的锚点角色。\n\n### 业务容器如何 join Network Namespace\n\n容器运行时（以 containerd 为例）创建 pause 容器时，会为它创建一套全新的 Namespace，其中就包括 Network Namespace。随后 CNI 插件（如 Calico、Cilium）会被调用，为这个 Network Namespace 配置网络——分配 IP 地址、设置路由规则、创建 veth pair 连接到节点网络。到这一步，Pod 的网络环境就绑定好了。\n\n接下来创建业务容器时，容器运行时不会为它们创建新的 Network Namespace，而是通过 Linux 的 `setns()` 系统调用，让业务容器的进程 join 到 pause 容器已经创建好的 Network Namespace 中。用 OCI runtime spec 的术语来说，就是在容器的 `config.json` 中指定 network namespace 的 path 为 `/proc/<pause_pid>/ns/net`。\n\n这种设计带来一个关键好处：**业务容器的生命周期与网络命名空间的生命周期解耦**。假设 nginx 容器因 OOM 被杀掉，kubelet 会重启它。新的 nginx 容器进程会重新 join 到同一个 pause 容器的 Network Namespace 中，IP 地址不变，路由规则不变，其他容器（比如 log-reader）的网络连接完全不受影响。如果没有 pause 容器这个中间层，网络命名空间的所有者就是某个业务容器，它一旦重启，整个 Pod 的网络就要重建——所有容器的 TCP 连接都会断开。\n\n我们可以在节点上验证这一点：\n\n```bash\n# 在 worker 节点上查看 Pod 内所有容器的 Network Namespace inode\n$ PAUSE_PID=$(crictl inspect $(crictl ps -q --label io.kubernetes.container.name=POD \\\n  --pod $(crictl pods --name shared-demo -q)) | jq .info.pid)\n$ NGINX_PID=$(crictl inspect $(crictl ps -q --label io.kubernetes.container.name=nginx \\\n  --pod $(crictl pods --name shared-demo -q)) | jq .info.pid)\n$ READER_PID=$(crictl inspect $(crictl ps -q --label io.kubernetes.container.name=log-reader \\\n  --pod $(crictl pods --name shared-demo -q)) | jq .info.pid)\n\n$ readlink /proc/$PAUSE_PID/ns/net\nnet:[4026532680]\n$ readlink /proc/$NGINX_PID/ns/net\nnet:[4026532680]\n$ readlink /proc/$READER_PID/ns/net\nnet:[4026532680]\n```\n\n三个容器的 `net` namespace inode 号完全相同，证明它们共享同一个 Network Namespace。\n\n### 共享网络的实际表现与端口冲突\n\n共享 Network Namespace 意味着 Pod 内所有容器看到的是同一个网络栈：相同的 IP 地址、相同的端口空间、相同的 loopback 接口、相同的路由表。容器之间通信直接走 `localhost`（loopback 接口），数据包不经过任何虚拟网桥或 iptables 规则，延迟极低（通常在微秒级）。\n\n但这也带来一个必须注意的约束——**端口冲突**。既然所有容器共享同一个端口空间，那么两个容器就不能同时监听同一个端口。如果你在一个 Pod 里放了两个都想监听 80 端口的容器，后启动的那个容器会因为 `bind: address already in use` 而启动失败。这不是 Kubernetes 的 bug，而是 Network Namespace 共享的固有约束，就跟你不能在同一台 Linux 机器上运行两个都绑定 80 端口的进程是一个道理。\n\n在实践中，Pod 的 YAML spec 中 `ports` 字段其实只是一个文档性的声明（informational），Kubernetes 本身不会用它来做端口冲突检查。端口冲突的报错只会在容器运行时尝试 `bind()` 的时候才暴露出来，表现为容器不断 CrashLoopBackOff。排查这类问题时，看 `kubectl logs <pod> -c <container>` 通常就能看到 `bind: address already in use` 的错误信息。\n\n## 存储共享：Volume 与 volumeMounts\n\n### emptyDir——最常用的 Pod 内共享卷\n\nPod 内多容器共享存储的机制与共享网络完全不同。网络共享靠的是 Linux Namespace，而存储共享靠的是 **Kubernetes Volume**——在 Pod 层面声明一个卷，然后让多个容器分别挂载它。\n\n最常用于 Pod 内共享的卷类型是 `emptyDir`。它的语义很简单：Pod 被调度到某个节点后，Kubernetes 在该节点上创建一个空目录（默认路径在 `/var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~empty-dir/<volume-name>/`），Pod 内的任意容器都可以对这个目录进行读写，Pod 被删除时这个目录也随之删除。\n\n一个关键细节：**不同容器可以把同一个 Volume 挂载到不同的路径**。在前面的示例中，nginx 把 `shared-logs` 挂到 `/var/log/nginx`，log-reader 挂到 `/logs`。虽然容器内看到的路径不同，但底层指向的是宿主机上的同一个目录。nginx 写入 `/var/log/nginx/access.log` 的内容，log-reader 在 `/logs/access.log` 能立刻看到。这是因为 Volume 的挂载是通过 Linux 的 `mount --bind` 实现的，每个容器有自己独立的 Mount Namespace，但 bind mount 让不同路径指向了同一个底层 inode。\n\n我们可以用一个完整的示例来验证存储共享：\n\n```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: volume-share-demo\nspec:\n  containers:\n  - name: writer\n    image: busybox:1.36\n    command: [\"sh\", \"-c\", \"while true; do date >> /data/output.txt; sleep 5; done\"]\n    volumeMounts:\n    - name: shared-data\n      mountPath: /data\n  - name: reader\n    image: busybox:1.36\n    command: [\"sh\", \"-c\", \"tail -F /read/output.txt\"]\n    volumeMounts:\n    - name: shared-data\n      mountPath: /read\n  volumes:\n  - name: shared-data\n    emptyDir: {}\n```\n\n```bash\n$ kubectl logs volume-share-demo -c reader --follow\nSun Jun 15 10:30:00 UTC 2025\nSun Jun 15 10:30:05 UTC 2025\nSun Jun 15 10:30:10 UTC 2025\n```\n\nwriter 容器每 5 秒向 `/data/output.txt` 写入当前时间，reader 容器在 `/read/output.txt` 实时读取到了内容，证明两个容器通过 Volume 实现了文件级别的数据共享。\n\n### emptyDir 的 medium 选项\n\n`emptyDir` 还支持一个 `medium` 字段。默认值为空字符串，表示使用节点的磁盘存储。如果设置为 `Memory`，Kubernetes 会使用 tmpfs（基于内存的文件系统）来提供这个卷，读写速度远快于磁盘，但数据不持久化且受内存 limit 约束：\n\n```yaml\nvolumes:\n- name: cache\n  emptyDir:\n    medium: Memory\n    sizeLimit: 256Mi  # 限制最大使用 256Mi 内存\n```\n\n这种配置常用于需要高速临时存储的场景，比如 sidecar 容器缓存加解密中间产物。需要注意的是，tmpfs 的 emptyDir 会计入容器的内存使用量（在 cgroup v2 环境下），如果超出 `sizeLimit` 或容器的 memory limit，Pod 会被驱逐。\n\n## 进程间通信：共享 PID Namespace\n\n除了网络和存储，Pod 还有一个经常被忽略的共享维度——**PID Namespace**。默认情况下，Pod 内的每个容器有独立的 PID Namespace，每个容器内的主进程 PID 都是 1。但从 Kubernetes v1.17 开始，你可以通过设置 `shareProcessNamespace: true` 来让所有容器共享同一个 PID Namespace：\n\n```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: shared-pid-demo\nspec:\n  shareProcessNamespace: true\n  containers:\n  - name: app\n    image: nginx:1.25.4\n  - name: debug\n    image: busybox:1.36\n    command: [\"sh\", \"-c\", \"sleep infinity\"]\n    securityContext:\n      capabilities:\n        add: [\"SYS_PTRACE\"]\n```\n\n开启后，在 debug 容器内 `ps aux` 可以看到 nginx 容器的所有进程：\n\n```bash\n$ kubectl exec shared-pid-demo -c debug -- ps aux\nPID   USER     TIME  COMMAND\n    1 65535     0:00 /pause\n    7 root      0:00 nginx: master process nginx -g daemon off;\n   37 101       0:00 nginx: worker process\n   38 root      0:00 sleep infinity\n   44 root      0:00 ps aux\n```\n\n注意 PID 1 是 pause 容器，nginx master 进程的 PID 是 7 而不是 1。这意味着开启 `shareProcessNamespace` 后，业务容器内的进程 PID 不再是 1，某些依赖「自己是 PID 1」来处理信号的应用可能需要适配。实际场景中，`shareProcessNamespace` 主要用于调试（在 sidecar 中 strace 主容器进程）和需要进程间信号传递的场景。\n\n## 体系化扩展\n\n### 容器间通过 Unix Socket 通信\n\n除了 localhost TCP/UDP 通信，Pod 内的容器还有一种高效的通信方式——通过共享 Volume 中的 Unix Domain Socket。这种方式比 TCP 延迟更低（省去了 TCP/IP 协议栈的开销），且可以传递文件描述符。Envoy 作为 sidecar 代理时就支持通过 UDS 与业务容器通信。典型做法是在 emptyDir 卷中创建一个 socket 文件，服务端在一个容器中 listen，客户端在另一个容器中 connect：\n\n```yaml\nvolumes:\n- name: uds\n  emptyDir: {}\n# 容器 A volumeMount: /run/app/app.sock\n# 容器 B volumeMount: /run/app/app.sock\n```\n\n### 共享网络与 Service Mesh\n\n理解 Pod 内网络共享是理解 Service Mesh 架构的基础。Istio 的工作原理就是在每个 Pod 中注入一个 Envoy sidecar 容器，利用 Pod 内共享 Network Namespace 的特性，通过 iptables 规则将 Pod 的所有出入流量劫持到 Envoy。因为 Envoy 和业务容器在同一个 Network Namespace 中，iptables 规则可以透明地重定向流量，业务代码完全不需要修改。如果 Pod 内容器的网络不是共享的，Service Mesh 的透明代理模型根本无法实现。\n\n### 面试追问点\n\n在实际面试中，围绕这道题通常会有几个经典的追问方向。第一个是「如果 pause 容器挂了会怎样」——答案是如果 pause 容器退出，kubelet 会认为整个 Pod 的 sandbox 已经失效，会重建整个 Pod（所有容器都会被重启），而不是只重启 pause 容器。第二个是「Pod 内容器的文件系统是否共享」——答案是默认不共享，每个容器有独立的 rootfs（通过独立的 Mount Namespace 实现），只有通过 Volume 显式声明的部分才共享。第三个是「同一个 Pod 内容器的 Cgroup 是怎么组织的」——在 cgroup v2 环境下，Pod 有一个 Pod 级别的 Cgroup（路径类似 `/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/`），每个容器在这个 Pod Cgroup 下有自己的子 Cgroup，Pod 级别的资源限制（如 overhead）在 Pod Cgroup 上设置，容器级别的 requests/limits 在各自的子 Cgroup 上设置。",
+      "keyPoints": [
+        "Pod 内所有容器共享同一个 Network Namespace，拥有相同的 IP、端口空间和路由表，容器间通过 localhost 通信，延迟在微秒级，不经过任何虚拟网桥",
+        "pause 容器（registry.k8s.io/pause:3.10）是每个 Pod 中第一个创建的容器，它通过无限 pause() 系统调用占住 Network Namespace，使得业务容器崩溃重启时网络命名空间不会被销毁",
+        "业务容器通过 Linux setns() 系统调用加入 pause 容器的 Network Namespace，OCI runtime spec 中通过指定 /proc/<pause_pid>/ns/net 路径实现",
+        "Pod 内共享端口空间意味着两个容器不能监听同一端口，否则后启动的容器会报 bind: address already in use 错误并进入 CrashLoopBackOff",
+        "存储共享通过 Pod 级别声明 Volume 实现，最常用的 emptyDir 在节点上创建临时目录，多个容器可将同一 Volume 挂载到不同路径，底层通过 mount --bind 指向同一目录",
+        "emptyDir 的 medium: Memory 选项使用 tmpfs 提供内存级读写速度，但会计入容器内存使用量，超限会导致 Pod 被驱逐",
+        "通过 shareProcessNamespace: true 可开启 PID Namespace 共享，开启后容器可以看到彼此的进程，pause 容器成为 PID 1 承担僵尸进程回收职责",
+        "Pod 内容器还可通过共享 Volume 中的 Unix Domain Socket 通信，比 TCP 更低延迟且支持传递文件描述符，是 Envoy sidecar 推荐的通信方式"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz1",
+          "question": "Pod 内多个容器能通过 localhost 互相访问的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Kubernetes 在 Pod 内部署了一个虚拟交换机，所有容器通过 veth pair 连接到这个交换机上"},
+            {"id": "B", "text": "所有容器共享同一个 Network Namespace，看到的是同一个网络栈和 loopback 接口"},
+            {"id": "C", "text": "kube-proxy 在每个 Pod 内维护了一张 iptables 规则表，将 localhost 流量转发到目标容器"},
+            {"id": "D", "text": "CNI 插件为 Pod 内每个容器分配了同网段的 IP 地址，它们通过三层路由互通"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Pod 内多容器共享网络的底层机制是 Linux Network Namespace 共享。pause 容器创建 Network Namespace 后，所有业务容器通过 setns() 加入同一个 Namespace，因此它们看到的是完全相同的网络栈——相同的 IP、端口空间、路由表和 loopback 接口。通过 localhost 通信实际上就是在同一个 Namespace 内走 loopback，不经过任何虚拟网桥或 iptables 规则。A 选项描述的是 Docker bridge 网络的工作方式，不适用于 Pod 内部；C 选项中 kube-proxy 负责的是 Service 到 Pod 的流量转发，不介入 Pod 内部通信；D 选项描述的是 Pod 之间的通信模式，Pod 内容器共享的是同一个 IP 而非各自分配。"
+        },
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz2",
+          "question": "pause 容器在 Pod 中承担的核心职责是什么？",
+          "choices": [
+            {"id": "A", "text": "运行健康检查探针（liveness/readiness probe），监控业务容器的健康状态"},
+            {"id": "B", "text": "作为 Network Namespace 的持有者，为 Pod 提供稳定的网络命名空间锚点，并作为 PID 1 回收僵尸进程"},
+            {"id": "C", "text": "负责拉取 Pod 内所有容器的镜像，并按顺序启动 init container 和业务容器"},
+            {"id": "D", "text": "运行 CNI 插件为 Pod 分配 IP 地址，并维护 Pod 到 Service 的路由规则"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "pause 容器的核心职责有两个：第一，作为 Network Namespace（以及 IPC、UTS Namespace）的创建者和持有者，确保即使业务容器崩溃重启，网络命名空间依然存在，IP 地址和路由不会丢失；第二，在开启 shareProcessNamespace 的场景下，pause 作为 PID 1 负责回收僵尸进程（通过 SIGCHLD 信号处理器中的 waitpid）。A 选项错误，健康检查由 kubelet 执行而非 pause 容器；C 选项错误，镜像拉取和容器启动由 kubelet 通过 CRI 调用容器运行时完成；D 选项错误，CNI 插件由 kubelet 调用，不运行在 pause 容器内部。"
+        },
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz3",
+          "question": "业务容器加入 pause 容器的 Network Namespace 使用的 Linux 系统调用是什么？",
+          "choices": [
+            {"id": "A", "text": "clone() 配合 CLONE_NEWNET 标志创建新的 Network Namespace"},
+            {"id": "B", "text": "unshare() 将当前进程从已有的 Network Namespace 分离"},
+            {"id": "C", "text": "setns() 将当前进程加入指定的已有 Network Namespace"},
+            {"id": "D", "text": "mount() 将 pause 容器的 /proc/net 挂载到业务容器的文件系统"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Linux 提供三个与 Namespace 相关的系统调用：clone() 在创建新进程时同时创建新的 Namespace，unshare() 让当前进程脱离某个 Namespace 并加入新创建的 Namespace，setns() 让当前进程加入一个已经存在的 Namespace。Pod 的网络共享就是通过 setns() 实现的——容器运行时在启动业务容器时，将容器进程通过 setns() 加入 pause 容器已创建好的 Network Namespace（路径为 /proc/<pause_pid>/ns/net）。A 选项中的 clone()+CLONE_NEWNET 是创建新 Namespace 而非加入已有的；B 选项中 unshare() 也是创建新 Namespace；D 选项描述的操作与 Namespace 加入无关。"
+        },
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz4",
+          "question": "如果 Pod 内两个容器都尝试监听 TCP 80 端口，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Kubernetes 会自动为第二个容器分配一个随机端口，避免冲突"},
+            {"id": "B", "text": "两个容器可以同时监听 80 端口，流量会被轮询分配到两个容器"},
+            {"id": "C", "text": "后启动的容器在 bind() 时收到 address already in use 错误，容器启动失败并可能进入 CrashLoopBackOff"},
+            {"id": "D", "text": "Pod 创建阶段 API Server 的 admission webhook 会拒绝该配置"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "因为 Pod 内所有容器共享同一个 Network Namespace，它们看到的是同一个端口空间。这与在同一台 Linux 机器上运行两个进程绑定同一端口的效果完全一致——先绑定的成功，后绑定的收到 EADDRINUSE 错误。Kubernetes 不会在 API 层面检查端口冲突（spec 中的 ports 字段只是文档声明），冲突只在容器运行时实际调用 bind() 时才暴露。A 选项错误，Kubernetes 没有端口自动映射机制；B 选项描述的是 SO_REUSEPORT 行为，但容器并非刻意配置了该选项；D 选项错误，标准 admission controller 不检查 Pod 内容器间的端口冲突。"
+        },
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz5",
+          "question": "在 worker 节点上执行 readlink /proc/<nginx_pid>/ns/net 和 readlink /proc/<pause_pid>/ns/net，输出结果应该是怎样的？",
+          "choices": [
+            {"id": "A", "text": "两者输出不同的 inode 号，因为每个容器都有独立的 Network Namespace"},
+            {"id": "B", "text": "两者输出相同的 inode 号，证明它们共享同一个 Network Namespace"},
+            {"id": "C", "text": "nginx 容器的输出为空，因为它没有自己的 Network Namespace"},
+            {"id": "D", "text": "需要额外安装 nsenter 工具才能查看，readlink 无法读取 Namespace 信息"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "/proc/<pid>/ns/net 是 Linux 内核暴露的 Network Namespace 符号链接，readlink 读取它会返回形如 net:[4026532680] 的字符串，方括号中的数字就是该 Namespace 的 inode 号。同一个 Pod 内所有容器的进程——包括 pause 容器和所有业务容器——因为共享同一个 Network Namespace，它们的 /proc/<pid>/ns/net 会指向同一个 inode。这是验证 Pod 网络共享最直接的方法。A 选项与 Pod 的网络共享机制矛盾；C 选项错误，每个进程都有 /proc/ns/ 目录；D 选项错误，readlink 是标准 coreutils 工具，不需要额外安装。"
+        },
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz6",
+          "question": "关于 Pod 内容器的文件系统隔离，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "Pod 内容器共享 Network Namespace 的同时也自动共享文件系统，一个容器可以直接访问另一个容器的 rootfs"},
+            {"id": "B", "text": "每个容器有独立的 Mount Namespace，文件系统默认隔离，只有通过 Pod 级别 Volume 显式声明的部分才共享"},
+            {"id": "C", "text": "所有容器共享宿主机的文件系统，通过 chroot 进行路径隔离"},
+            {"id": "D", "text": "容器的文件系统隔离由 CNI 插件实现，不同 CNI 有不同的隔离策略"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个非常常见的误区。Pod 内容器虽然共享 Network、IPC 和 UTS Namespace，但每个容器有独立的 Mount Namespace，因此各自拥有独立的文件系统视图（rootfs 由各自的容器镜像决定）。如果需要在容器间共享文件，必须在 Pod 的 spec.volumes 中声明一个卷，然后在各容器的 volumeMounts 中挂载它。A 选项是最常见的误解，很多人以为共享网络就意味着共享一切；C 选项描述的是早期容器技术（如 LXC）的做法，现代容器使用 overlay/aufs 等联合文件系统；D 选项错误，文件系统隔离由 Linux Mount Namespace 实现，与 CNI 无关。"
+        },
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz7",
+          "question": "emptyDir 卷和 hostPath 卷在 Pod 内共享场景中的关键区别是什么？",
+          "choices": [
+            {"id": "A", "text": "emptyDir 生命周期绑定 Pod，Pod 删除数据即丢失；hostPath 直接使用节点目录，数据在 Pod 删除后仍保留在节点上"},
+            {"id": "B", "text": "emptyDir 支持内存介质（tmpfs），hostPath 只能使用磁盘存储"},
+            {"id": "C", "text": "emptyDir 只能被一个容器挂载，hostPath 可以被多个容器挂载"},
+            {"id": "D", "text": "emptyDir 的读写性能高于 hostPath，因为它使用了容器运行时优化的存储驱动"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "emptyDir 和 hostPath 的核心区别在于数据的生命周期和安全性。emptyDir 由 kubelet 管理，Pod 创建时自动分配空目录，Pod 删除时数据随之销毁，是 Pod 内容器间临时数据交换的首选。hostPath 直接映射节点上的一个路径，数据持久化在节点磁盘上，Pod 删除后数据仍在。但 hostPath 存在安全隐患——容器可以访问节点文件系统中的任意路径，且绑定了特定节点，不利于 Pod 漂移。B 选项错误，hostPath 当然可以指向任意路径包括 tmpfs 挂载点；C 选项错误，emptyDir 和 hostPath 都可以被多个容器挂载；D 选项错误，emptyDir 默认使用的就是节点磁盘，性能与 hostPath 相当。"
+        },
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz8",
+          "question": "在生产环境中，一个 Envoy sidecar 容器需要与业务容器高效通信，以下哪种方式延迟最低？",
+          "choices": [
+            {"id": "A", "text": "通过 Pod 的 ClusterIP 地址走 kube-proxy 规则转发"},
+            {"id": "B", "text": "通过 localhost + TCP 端口通信"},
+            {"id": "C", "text": "通过共享 emptyDir 卷中的 Unix Domain Socket 通信"},
+            {"id": "D", "text": "通过 Kubernetes Service 的 DNS 名称进行服务发现后通信"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Unix Domain Socket（UDS）在同一内核中通过 socket buffer 直接传递数据，完全跳过了 TCP/IP 协议栈（没有三次握手、没有序列号管理、没有校验和计算），延迟比 localhost TCP 更低，吞吐量更高。在 Envoy 的官方文档中，UDS 就是推荐的 sidecar 与业务容器通信方式。具体实现是在 emptyDir 卷中创建一个 .sock 文件，两个容器分别挂载这个卷后进行 listen/connect。A 选项走 kube-proxy 会经过 iptables/IPVS 规则，延迟最高；B 选项 localhost TCP 虽然不出节点，但仍走完整 TCP 协议栈；D 选项需要经过 DNS 解析和 Service 转发，延迟更高。"
+        },
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz9",
+          "question": "开启 shareProcessNamespace: true 后，Pod 内容器会发生什么变化？",
+          "choices": [
+            {"id": "A", "text": "所有容器共享 PID Namespace，容器内可以看到彼此的进程，pause 容器成为 PID 1"},
+            {"id": "B", "text": "所有容器共享 PID 和 Mount Namespace，容器内可以看到彼此的进程和文件系统"},
+            {"id": "C", "text": "只有 init container 的进程对业务容器可见，业务容器之间的进程仍然隔离"},
+            {"id": "D", "text": "容器内的进程 PID 保持不变（主进程仍为 PID 1），但可以通过 /proc 看到其他容器的进程"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "设置 shareProcessNamespace: true 后，Pod 内所有容器加入同一个 PID Namespace。此时 pause 容器成为 PID 1（因为它最先启动），业务容器的主进程不再是 PID 1。在任何容器内执行 ps aux 都能看到所有容器的进程。这意味着：第一，某些依赖「自己是 PID 1」来处理信号的应用需要适配（比如使用 tini 作为 init 进程的场景）；第二，容器内的 /proc 文件系统会暴露其他容器进程的信息，可能涉及安全考量。B 选项错误，PID Namespace 共享不影响 Mount Namespace；C 选项错误，所有容器的进程都互相可见；D 选项错误，PID 会重新分配，主进程不再是 PID 1。"
+        },
+        {
+          "id": "k8s-pod-shared-network-storage-q1-quiz10",
+          "question": "如果 Pod 中的 pause 容器意外退出，kubelet 会如何处理？",
+          "choices": [
+            {"id": "A", "text": "只重启 pause 容器本身，业务容器不受影响继续运行"},
+            {"id": "B", "text": "kubelet 认为 Pod 的 sandbox 失效，会重建整个 Pod（所有容器都会被重启）"},
+            {"id": "C", "text": "kubelet 会将 Pod 标记为 Failed 状态并触发 Deployment 的滚动更新"},
+            {"id": "D", "text": "其他容器自动接管 Network Namespace 的所有权，网络服务不中断"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "pause 容器是整个 Pod sandbox 的锚点。当 pause 容器退出时，kubelet 通过 CRI 的 PodSandboxStatus 接口检测到 sandbox 状态异常，会触发 sandbox 的重建流程。重建 sandbox 意味着创建新的 pause 容器和新的 Network Namespace，所有业务容器都需要重新创建以加入新的 Namespace，因此整个 Pod 会经历一次完全重启。A 选项描述的「只重启 pause」在技术上不可行，因为 Network Namespace 已经随旧 pause 进程销毁；C 选项混淆了 Pod 状态和控制器行为；D 选项描述的「所有权转移」在 Linux Namespace 机制中不支持。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/workloads/pods/#how-pods-manage-multiple-containers",
+        "https://github.com/kubernetes/kubernetes/blob/master/build/pause/linux/pause.c",
+        "https://kubernetes.io/docs/concepts/storage/volumes/#emptydir",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/share-process-namespace/",
+        "https://man7.org/linux/man-pages/man2/setns.2.html"
+      ]
+    }
+  ]
+}

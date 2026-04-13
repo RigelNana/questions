@@ -1,0 +1,156 @@
+{
+  "id": "k8s-pod-graceful-shutdown",
+  "name": "Pod 优雅停机",
+  "domain": "kubernetes",
+  "description": "深入解析 Pod 终止的完整流程，包括 preStop Hook、SIGTERM/SIGKILL 信号机制、竞态问题与滚动更新零中断最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-pod-graceful-shutdown-q1",
+      "domain": "kubernetes",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": ["优雅停机", "SIGTERM", "preStop", "terminationGracePeriodSeconds", "滚动更新"],
+      "title": "如何在 Pod 中实现优雅停机（Graceful Shutdown）？",
+      "content": "周五下午四点，你的团队在对一个日活 200 万的电商平台做滚动发版。Deployment 的 `strategy.rollingUpdate` 配置了 `maxSurge: 1, maxUnavailable: 0`，按理说应该是零中断发布。但 Grafana 上的监控面板啪的一下跳出了一串 5xx 毛刺——每次有旧 Pod 被终止时，大约有 2-5 秒的窗口期内出现 `Connection refused` 或 `502 Bad Gateway` 错误。Prometheus 的 `http_requests_total{code=\"502\"}` 在每次发版时都会跳涨 50-100 个。\n\n你的同事翻了一下 Pod spec，发现没有配置 `preStop` Hook，应用代码里也没有做任何 SIGTERM 信号处理——收到终止信号后进程直接退出，正在处理的请求全部断开。更隐蔽的问题是，即使你在应用里加了信号处理，如果 kube-proxy 的 iptables 规则还没来得及更新，新请求仍然会被路由到一个正在关闭的 Pod 上。\n\n你用 `kubectl describe pod` 查看一个刚被终止的 Pod 的 Events：\n\n```\nEvents:\n  Type    Reason     Age   From               Message\n  ----    ------     ----  ----               -------\n  Normal  Killing    2s    kubelet            Stopping container order-service\n```\n\n没有 preStop 的执行日志，说明容器是被直接 SIGTERM 然后很快停止的。再看应用日志的最后几行：\n\n```\n2024-06-20T16:02:33.182Z INFO  [main] Server listening on :8080\n2024-06-20T16:15:47.891Z INFO  [main] Received request POST /api/orders\n2024-06-20T16:15:47.903Z WARN  [main] write tcp 10.244.1.15:8080->10.244.0.8:43210: use of closed network connection\n```\n\n最后一行是典型的「连接在处理过程中被强制关闭」的报错。客户端侧看到的就是 502。\n\n现在问题摆在面前：如何让这个服务在滚动更新时做到真正的零中断？Pod 从收到删除指令到最终停止的完整流程是什么？你需要在基础设施层面（Pod spec）和应用代码层面分别做哪些配置？那个隐蔽的「竞态窗口」到底是怎么回事，怎么解决？",
+      "answer": "## 优雅停机的基础概念：为什么 Pod 不能直接杀掉\n\n在传统的物理机运维时代，停掉一个服务通常就是 `kill -9 <pid>` 或者 `systemctl stop`。应用进程瞬间消失，正在处理的请求全部中断，数据库连接池里的连接没有正确释放，半写入的文件可能损坏。这在单机时代已经够头疼了，到了 Kubernetes 这种大规模编排环境下，问题被成倍放大——一个 Deployment 可能管理着几十上百个 Pod，每次滚动更新都意味着一批旧 Pod 被终止、一批新 Pod 被创建。如果每个 Pod 的终止都会丢失正在处理的请求，那每次发版都会产生一波 5xx 错误，用户体验会非常糟糕。\n\n优雅停机（Graceful Shutdown）解决的核心问题是：**在 Pod 被终止的过程中，确保正在处理的请求能够正常完成，新的请求不再被路由到这个 Pod，同时应用有机会执行必要的清理工作**——比如关闭数据库连接、刷新内存中的缓冲区到磁盘、向注册中心注销自己、完成正在进行的消息消费确认等。\n\nKubernetes 在设计 Pod 终止流程时就考虑了这一点。它不是简单地杀进程，而是提供了一套「信号 + Hook + 超时」的终止协议。但这套协议要真正生效，需要基础设施配置和应用代码的双重配合。很多团队只做了其中一半——要么只在应用里处理了 SIGTERM 但没配 preStop，导致竞态窗口内仍然有错误；要么只加了 preStop sleep 但应用本身收到 SIGTERM 后直接退出，导致 sleep 期间收到的请求能路由进来却没有进程处理。\n\n下面我们从 Pod 被删除的那一刻开始，逐步拆解整个终止流程中每一步发生了什么、存在什么陷阱、应该怎么配置。\n\n## Pod 终止的完整流程：从 API Server 到 SIGKILL\n\n当你执行 `kubectl delete pod` 或者 Deployment Controller 在滚动更新中决定终止一个旧 Pod 时，Kubernetes 内部会触发一个精确的多步骤终止序列。理解这个序列的每一步及其时序关系，是解决优雅停机问题的关键。整个流程可以用下面这张时间线图来描述：\n\n```\n时间轴 ──────────────────────────────────────────────────────────────────────►\n\nt=0s  API Server 设置 Pod 的 deletionTimestamp\n  │\n  ├─── 路径 A（网络层）：Endpoint Controller watch 到变化\n  │    │  从 Endpoints 对象中移除该 Pod IP\n  │    │  kube-proxy watch 到 Endpoints 变化\n  │    │  更新 iptables/IPVS 规则\n  │    │  （耗时通常 1-5 秒，取决于集群规模和 watch 延迟）\n  │    ▼\n  │    新请求不再路由到该 Pod\n  │\n  ├─── 路径 B（Pod 层）：kubelet watch 到 deletionTimestamp\n  │    │\n  │    ├── t=0~Xs   执行 preStop Hook（如果配置了）\n  │    │             preStop 期间容器仍在运行，可以正常处理请求\n  │    │\n  │    ├── t=Xs      preStop 完成，kubelet 向容器 PID 1 发送 SIGTERM\n  │    │             应用捕获 SIGTERM，开始：\n  │    │               - 停止接受新连接\n  │    │               - 等待正在处理的请求完成\n  │    │               - 关闭数据库连接池\n  │    │               - 刷新缓冲区\n  │    │\n  │    ├── t=Xs~30s  等待应用自行退出\n  │    │\n  │    └── t=30s     如果应用还没退出，发送 SIGKILL 强制终止\n  │                  （30s 是 terminationGracePeriodSeconds 的默认值）\n  ▼\n  Pod 对象从 etcd 中删除\n```\n\n这里有一个极其关键的细节：**路径 A（网络层摘除）和路径 B（Pod 终止）是并行发生的**。API Server 设置 deletionTimestamp 后，Endpoint Controller 和 kubelet 各自通过 watch 机制独立感知到这个事件，然后各自开始自己的工作。没有任何机制保证「Endpoints 先更新完毕，kubelet 再开始终止容器」。这就是竞态问题的根源。\n\n在一个大规模集群中（比如 200+ 节点），Endpoint Controller 感知到变化 → 更新 Endpoints 对象 → kube-proxy watch 到变化 → 重新生成 iptables 规则，这整个链路可能需要 2-5 秒甚至更长。而如果 Pod 没有 preStop Hook，kubelet 会在感知到 deletionTimestamp 后几乎立刻发送 SIGTERM。假设你的应用收到 SIGTERM 后在 500ms 内就关闭了监听端口，但此时 kube-proxy 的 iptables 规则还没有更新——新请求仍然会被路由到这个已经关闭端口的 Pod IP 上，结果就是 `Connection refused`。如果你的前面还有 Ingress Controller 或者 Service Mesh Sidecar，整个传播链路会更长。\n\n## preStop Hook：解决竞态的关键配置\n\npreStop Hook 的作用就是在 SIGTERM 发送之前插入一段延迟，给网络层足够的时间完成 Endpoints 更新。最简单也是最常用的做法是在 preStop 里执行一个 `sleep`：\n\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: order-service\n  namespace: production\nspec:\n  replicas: 3\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 1\n      maxUnavailable: 0    # 保证滚动更新期间不减少可用 Pod 数\n  selector:\n    matchLabels:\n      app: order-service\n  template:\n    metadata:\n      labels:\n        app: order-service\n    spec:\n      terminationGracePeriodSeconds: 45  # 给足时间：preStop(5s) + 应用清理(最多40s)\n      containers:\n      - name: order-service\n        image: registry.example.com/order-service:v2.3.1\n        ports:\n        - containerPort: 8080\n        readinessProbe:\n          httpGet:\n            path: /healthz\n            port: 8080\n          initialDelaySeconds: 5\n          periodSeconds: 5\n        lifecycle:\n          preStop:\n            exec:\n              command: [\"sh\", \"-c\", \"sleep 5\"]\n        resources:\n          requests:\n            cpu: 200m\n            memory: 256Mi\n          limits:\n            cpu: \"1\"\n            memory: 512Mi\n```\n\n这里 `sleep 5` 的含义是：kubelet 在发送 SIGTERM 之前先等 5 秒。这 5 秒里容器仍然在正常运行，可以继续处理已经路由过来的请求。同时网络层也在并行更新 iptables 规则。5 秒之后 SIGTERM 到达时，绝大多数情况下 Endpoints 已经更新完毕，不会再有新请求路由过来了。\n\n`terminationGracePeriodSeconds` 是整个终止流程的总超时（从 API Server 设置 deletionTimestamp 算起），preStop 的执行时间也包含在这个超时之内。默认值是 30 秒。如果你的 preStop sleep 5 秒，应用处理 SIGTERM 后需要最多 30 秒来清理，那 `terminationGracePeriodSeconds` 应该设为至少 35-40 秒，留出余量。如果 preStop + 应用清理的总时间超过了这个值，kubelet 会直接发送 SIGKILL——前面所有的优雅处理全部白费。这是一个非常常见的配置错误：只加了 preStop 但没调大 `terminationGracePeriodSeconds`。\n\n关于 preStop sleep 的时长，业界普遍的推荐是 **5-10 秒**。对于绝大部分集群来说 5 秒就够了，但如果你的集群节点数非常多（500+）、使用了 Service Mesh（Istio/Linkerd 增加了额外的控制平面传播延迟）、或者 Ingress Controller 有较长的配置刷新周期，可以适当增加到 10-15 秒。设置过长也没有意义——超过网络层收敛时间的等待纯粹是浪费时间，拖慢发版速度。\n\n## 应用代码层面的信号处理\n\n基础设施层面的 preStop 解决了竞态问题，但应用代码本身也必须正确处理 SIGTERM 信号。如果你的应用收到 SIGTERM 后直接 `os.Exit(0)` 或者进程崩溃，那 preStop 期间积攒的那些正在处理的请求照样会断掉。\n\n正确的做法是：收到 SIGTERM 后，应用停止接受新的连接（关闭 Listener），等待正在处理的请求全部完成（drain），然后执行清理逻辑（关闭数据库连接、flush 缓冲区等），最后正常退出。\n\n以下是一个 Go 服务的标准优雅停机实现：\n\n```go\npackage main\n\nimport (\n\t\"context\"\n\t\"log\"\n\t\"net/http\"\n\t\"os\"\n\t\"os/signal\"\n\t\"syscall\"\n\t\"time\"\n)\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"/api/orders\", handleOrders)\n\tmux.HandleFunc(\"/healthz\", func(w http.ResponseWriter, r *http.Request) {\n\t\tw.WriteHeader(http.StatusOK)\n\t})\n\n\tsrv := &http.Server{\n\t\tAddr:    \":8080\",\n\t\tHandler: mux,\n\t}\n\n\t// 在独立 goroutine 中启动 HTTP 服务器\n\tgo func() {\n\t\tlog.Println(\"Server listening on :8080\")\n\t\tif err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {\n\t\t\tlog.Fatalf(\"listen error: %v\", err)\n\t\t}\n\t}()\n\n\t// 监听 SIGTERM 和 SIGINT 信号\n\tquit := make(chan os.Signal, 1)\n\tsignal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)\n\tsig := <-quit\n\tlog.Printf(\"Received signal %v, starting graceful shutdown...\", sig)\n\n\t// 创建一个带超时的 context，给正在处理的请求最多 30 秒完成\n\tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)\n\tdefer cancel()\n\n\t// Shutdown 会停止接受新连接，等待活跃请求完成后返回\n\tif err := srv.Shutdown(ctx); err != nil {\n\t\tlog.Printf(\"Graceful shutdown error: %v\", err)\n\t}\n\n\t// 在这里执行其他清理工作：关闭 DB 连接池、flush 日志缓冲区等\n\tlog.Println(\"Server stopped gracefully\")\n}\n\nfunc handleOrders(w http.ResponseWriter, r *http.Request) {\n\t// 模拟一个需要 2 秒处理的请求\n\ttime.Sleep(2 * time.Second)\n\tw.Write([]byte(`{\"status\": \"created\"}`))\n}\n```\n\n这段代码的关键是 `http.Server.Shutdown(ctx)` 方法——它会立刻关闭所有 Listener（不再接受新连接），然后等待所有活跃的连接处理完毕后才返回。如果等待时间超过 context 的 deadline，Shutdown 会返回 context 的错误，但已有的连接会被强制关闭。在 Go 1.8+ 中这是标准库内置的功能，不需要任何第三方库。\n\n对于 Spring Boot 应用（2.3+ 版本），优雅停机已经是内置功能，只需要在 `application.yml` 中配置：\n\n```yaml\nserver:\n  shutdown: graceful\nspring:\n  lifecycle:\n    timeout-per-shutdown-phase: 30s\n```\n\n这会让 Spring Boot 在收到 SIGTERM 后停止接受新请求，等待活跃请求完成，超时后强制关闭。在此之前的版本需要手动注册 `@PreDestroy` 回调或实现 `SmartLifecycle` 接口。\n\nNode.js 应用则需要手动处理，一个常见的模式是：\n\n```javascript\nconst server = app.listen(8080, () => {\n  console.log('Server listening on :8080');\n});\n\nprocess.on('SIGTERM', () => {\n  console.log('SIGTERM received, draining connections...');\n  server.close(() => {\n    // server.close 会停止接受新连接，等现有连接完成后触发回调\n    console.log('All connections drained, exiting');\n    process.exit(0);\n  });\n\n  // 安全兜底：如果 30 秒后还有连接没断开，强制退出\n  setTimeout(() => {\n    console.error('Forced shutdown after timeout');\n    process.exit(1);\n  }, 30000);\n});\n```\n\n需要注意的是 Node.js 的 `server.close()` 只停止接受新的 TCP 连接，但不会主动断开已有的 keep-alive 连接。如果客户端持有 keep-alive 连接不释放，server.close 的回调可能永远不会触发。生产环境中通常需要结合 `server.closeAllConnections()`（Node.js 18.2+ 引入）或第三方库如 `stoppable` 来处理这种情况。\n\n## PID 1 问题：你的进程真的能收到 SIGTERM 吗\n\nkubelet 发送 SIGTERM 的目标是容器中的 PID 1 进程。如果你的 Dockerfile 用的是 shell 格式的 ENTRYPOINT（比如 `ENTRYPOINT node server.js`），Docker 实际上会启动 `/bin/sh -c node server.js`——此时 PID 1 是 shell 进程，你的 Node.js 进程是 shell 的子进程。问题在于 shell 不会将 SIGTERM 转发给子进程，它自己收到 SIGTERM 后直接退出，子进程变成孤儿进程，最终被 SIGKILL 杀掉。\n\n解决方案有两个。第一个是使用 exec 格式的 ENTRYPOINT：`ENTRYPOINT [\"node\", \"server.js\"]`，这样 node 进程就是 PID 1，能直接收到 SIGTERM。第二个是在 shell 脚本中使用 `exec` 命令来替换 shell 进程：`exec node server.js`，exec 会让 node 进程接管 PID 1。\n\n你可以用 `kubectl exec` 进入容器验证 PID 1 是否是你的应用进程：\n\n```bash\n$ kubectl exec -it order-service-6d8f9b7c4-xk2p9 -- cat /proc/1/cmdline | tr '\\0' ' '\nnode server.js\n```\n\n如果看到的是 `/bin/sh -c node server.js`，就说明存在 PID 1 问题，需要修复 Dockerfile。\n\n## 滚动更新零中断：完整的配置清单\n\n把上面所有的点串联起来，实现零中断滚动更新需要以下配置的协同：\n\n第一，Pod Spec 层面要配置 `preStop: exec: sleep 5`（或更长，取决于集群规模）来解决网络层竞态。`terminationGracePeriodSeconds` 要设为 preStop 时长 + 应用最大清理时间 + 安全余量。\n\n第二，应用代码必须捕获 SIGTERM 信号，执行 graceful shutdown——停止接受新连接，drain 正在处理的请求，完成清理后正常退出。不同语言有不同的标准做法，前面已经给出了 Go、Spring Boot、Node.js 三种语言的示例。\n\n第三，Readiness Probe 必须正确配置。当 Pod 开始终止时，如果 Readiness Probe 配置了 HTTP 检查而应用已经关闭了健康检查端点，Readiness Probe 会失败，Pod 的 Ready Condition 会变为 False，这会加速 Endpoints 的更新——Endpoint Controller 不仅通过 deletionTimestamp 判断，也通过 Ready Condition 判断是否移除 Pod。\n\n第四，Deployment 的 `strategy.rollingUpdate.maxUnavailable: 0` 保证在新 Pod Ready 之前不会终止旧 Pod。配合 PodDisruptionBudget（PDB）可以进一步控制同一时间最多有几个 Pod 处于不可用状态，防止滚动更新和节点维护同时发生导致服务雪崩。一个典型的 PDB 配置：\n\n```yaml\napiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: order-service-pdb\n  namespace: production\nspec:\n  minAvailable: 2          # 任何时候至少保证 2 个 Pod 可用\n  selector:\n    matchLabels:\n      app: order-service\n```\n\n第五，Dockerfile 要使用 exec 格式的 ENTRYPOINT，确保应用进程是 PID 1 能直接收到信号。如果你使用的是 tini 或 dumb-init 这样的轻量级 init 进程作为 PID 1，它们会正确地将信号转发给子进程，也是可以的。\n\n## 面试追问点与进阶话题\n\n面试中如果你把上面的流程讲清楚了，面试官大概率会追问几个进阶问题。第一个常见追问是「preStop 和 terminationGracePeriodSeconds 的计时关系」：preStop 的执行时间包含在 terminationGracePeriodSeconds 之内。也就是说如果 grace period 是 30 秒、preStop sleep 了 10 秒，那留给应用处理 SIGTERM 后清理的时间只剩 20 秒。如果 preStop 本身就超过了 grace period，kubelet 会直接发 SIGKILL——preStop 也会被中断。\n\n第二个追问是「如果 Pod 有多个容器怎么办」：kubelet 会同时向所有容器发送 SIGTERM（在各自的 preStop 执行完毕之后），并行等待它们退出。如果有 Sidecar 容器（比如 Envoy 代理），需要注意 Sidecar 的退出顺序——如果主容器还在 drain 请求但 Sidecar 已经退出了，请求同样会失败。Kubernetes 1.28 引入了原生的 Sidecar Container 支持（通过 `restartPolicy: Always` 的 Init Container），Sidecar 会在所有普通容器退出之后再收到 SIGTERM，解决了退出顺序问题。\n\n第三个追问是「长连接场景怎么办」：如果你的服务使用 WebSocket 或 gRPC 长连接，客户端可能持有连接长达几分钟甚至几小时。这种情况下 30 秒的 grace period 显然不够。方案有两种：一是在应用层面收到 SIGTERM 后主动通知客户端断开重连（比如 gRPC 的 GOAWAY 帧），客户端重连时会被路由到新 Pod；二是适当加大 `terminationGracePeriodSeconds`（比如设为 300 秒），但这会拖慢发版速度，需要权衡。\n\n第四个追问是关于「preStop 还能做什么」：除了 sleep 之外，preStop 还可以执行更复杂的操作——比如调用服务注册中心的反注册 API（如果你用的是 Eureka 或 Consul 而不是 Kubernetes Service）、触发一个 HTTP 请求通知网关摘除自己、或者执行一个脚本将内存中的数据持久化。preStop 支持 `exec`（执行命令）和 `httpGet`（发送 HTTP 请求）两种类型。",
+      "keyPoints": [
+        "Pod 终止时网络层摘除（Endpoint Controller 更新 iptables）和 kubelet 执行 preStop/SIGTERM 是并行发生的，存在 1-5 秒的竞态窗口，这是滚动更新产生 5xx 的根本原因",
+        "preStop Hook 的核心作用是在 SIGTERM 发送前插入一段延迟（推荐 sleep 5-10 秒），让 kube-proxy 有足够时间完成 Endpoints 更新，消除竞态窗口",
+        "terminationGracePeriodSeconds 是整个终止流程的总超时（默认 30 秒），preStop 执行时间包含在内，超时后 kubelet 直接发送 SIGKILL 强制终止",
+        "应用代码必须捕获 SIGTERM 信号并执行 graceful shutdown：停止接受新连接、等待活跃请求完成（drain）、关闭数据库连接池和缓冲区，然后正常退出",
+        "Dockerfile 必须使用 exec 格式 ENTRYPOINT（如 ENTRYPOINT [\"node\", \"server.js\"]），确保应用进程是 PID 1 能直接收到 SIGTERM，否则 shell 会吞掉信号",
+        "Deployment 设置 maxUnavailable: 0 配合 PodDisruptionBudget 的 minAvailable 可以保证滚动更新和节点维护期间的最低可用性",
+        "Kubernetes 1.28 引入的原生 Sidecar Container 支持解决了多容器 Pod 的退出顺序问题，Sidecar 会在所有普通容器退出后才收到 SIGTERM"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz1",
+          "question": "Pod 终止流程中，Endpoint Controller 从 Service 移除 Pod IP 和 kubelet 执行 preStop Hook 的时序关系是？",
+          "choices": [
+            {"id": "A", "text": "两者并行发生：API Server 设置 deletionTimestamp 后，Endpoint Controller 和 kubelet 各自独立感知并开始处理"},
+            {"id": "B", "text": "串行执行：Endpoint Controller 先从 Service 移除 Pod IP，完成后通知 kubelet 开始执行 preStop"},
+            {"id": "C", "text": "串行执行：kubelet 先执行完 preStop 并发送 SIGTERM，然后 Endpoint Controller 才移除 Pod IP"},
+            {"id": "D", "text": "由 API Server 统一调度：根据集群负载决定先执行哪一步"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是理解 Pod 优雅停机最关键的知识点。API Server 设置 deletionTimestamp 后，Endpoint Controller 和 kubelet 各自通过独立的 watch 机制感知到这个事件，然后并行开始各自的工作。没有任何同步机制保证顺序——这就是竞态问题的根源。B 和 C 的错误在于把两条并行路径理解成了串行的。很多人想当然地认为 Kubernetes 会先摘流量再停容器，但实际上并非如此，所以才需要 preStop sleep 来手动补偿这个时间差。D 选项描述的「统一调度」机制在 Kubernetes 中并不存在。"
+        },
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz2",
+          "question": "terminationGracePeriodSeconds 的默认值是多少？它的计时起点是什么？",
+          "choices": [
+            {"id": "A", "text": "默认 30 秒，从 API Server 设置 deletionTimestamp 开始计时，preStop 执行时间包含在内"},
+            {"id": "B", "text": "默认 30 秒，从 SIGTERM 发送给容器开始计时，preStop 执行时间不包含在内"},
+            {"id": "C", "text": "默认 60 秒，从 API Server 设置 deletionTimestamp 开始计时"},
+            {"id": "D", "text": "默认 30 秒，preStop 和 SIGTERM 后的等待分别有各自独立的 30 秒超时"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "terminationGracePeriodSeconds 默认值是 30 秒，计时起点是 API Server 在 Pod 对象上设置 deletionTimestamp 的时刻。这个超时覆盖了 preStop 执行和 SIGTERM 后的等待——两者共用同一个时间预算。B 选项是一个非常常见的误解，很多人以为 preStop 有自己独立的时间预算，实际上不是。如果 preStop sleep 了 20 秒，留给应用处理 SIGTERM 的时间就只剩 10 秒。C 的默认值错误。D 描述的「各自独立超时」机制并不存在，实际上只有一个总超时。"
+        },
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz3",
+          "question": "以下 Dockerfile 的 ENTRYPOINT 写法中，哪一种可能导致容器内的应用进程收不到 SIGTERM 信号？",
+          "choices": [
+            {"id": "A", "text": "ENTRYPOINT [\"java\", \"-jar\", \"app.jar\"]"},
+            {"id": "B", "text": "ENTRYPOINT java -jar app.jar"},
+            {"id": "C", "text": "ENTRYPOINT [\"tini\", \"--\", \"java\", \"-jar\", \"app.jar\"]"},
+            {"id": "D", "text": "CMD [\"java\", \"-jar\", \"app.jar\"]（无 ENTRYPOINT）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 使用的是 shell 格式的 ENTRYPOINT，Docker 会将其转换为 `/bin/sh -c java -jar app.jar`。此时 PID 1 是 shell 进程（/bin/sh），Java 进程是 shell 的子进程。问题在于 `/bin/sh` 默认不会将收到的 SIGTERM 信号转发给子进程——它自己退出后，Java 进程变成孤儿，最终被 SIGKILL 杀掉而不是 SIGTERM。A 是 exec 格式，Java 进程直接作为 PID 1 运行，能正确收到信号。C 使用 tini 作为 init 进程，tini 会正确转发信号给子进程。D 虽然使用 CMD 而非 ENTRYPOINT，但 exec 格式的行为相同，不影响信号接收。"
+        },
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz4",
+          "question": "配置 preStop: exec: command: [\"sleep\", \"5\"] 的主要目的是什么？",
+          "choices": [
+            {"id": "A", "text": "给 kube-proxy/iptables 足够时间更新规则，确保新请求不再路由到即将终止的 Pod"},
+            {"id": "B", "text": "给容器中的应用额外 5 秒时间来完成初始化"},
+            {"id": "C", "text": "等待 Kubernetes 自动备份容器内的数据"},
+            {"id": "D", "text": "让 kubelet 等待其他 Pod 先启动后再终止当前 Pod"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "preStop sleep 的核心目的是解决网络层和 Pod 层并行处理的竞态问题。当 Pod 开始终止时，Endpoint Controller 需要时间将 Pod IP 从 Service Endpoints 中移除，kube-proxy 需要时间更新 iptables/IPVS 规则。preStop sleep 5 秒让容器在 SIGTERM 到来之前保持运行，给网络层足够时间收敛。如果不加这个 sleep，应用可能在 iptables 更新完成之前就关闭了监听端口，导致新请求被路由到已关闭的端口上出现 Connection refused。B 描述的是 postStart 或 startupProbe 的职责。C 和 D 都不是 preStop 的功能。"
+        },
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz5",
+          "question": "一个 Pod 配置了 terminationGracePeriodSeconds: 30 和 preStop: exec: command: [\"sleep\", \"25\"]。应用收到 SIGTERM 后需要 10 秒完成请求 drain。这个 Pod 在终止时会发生什么？",
+          "choices": [
+            {"id": "A", "text": "preStop sleep 25 秒后发送 SIGTERM，但 5 秒后 grace period 到期，应用的 10 秒 drain 只完成了一半就被 SIGKILL 杀掉"},
+            {"id": "B", "text": "preStop 25 秒 + SIGTERM 后 10 秒 drain = 35 秒，Kubernetes 会自动把 grace period 延长到 35 秒"},
+            {"id": "C", "text": "preStop 被跳过，直接发送 SIGTERM 给应用 10 秒完成 drain"},
+            {"id": "D", "text": "preStop 25 秒 + SIGTERM 后 30 秒 drain 超时 = 55 秒后才发 SIGKILL"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这道题考察 terminationGracePeriodSeconds 与 preStop 的时间关系。grace period 是 30 秒，preStop sleep 占了 25 秒，留给 SIGTERM 后应用清理的时间只有 5 秒。而应用需要 10 秒来完成 drain，5 秒明显不够。grace period 到期后 kubelet 直接发送 SIGKILL，应用被强制杀掉，正在处理的请求中断。B 的错误在于 Kubernetes 不会自动延长 grace period——它是一个硬性超时。C 不对因为 preStop 不会被跳过（除非 grace period 已经到期）。D 混淆了 preStop 和 SIGTERM 后等待的超时关系——它们共用同一个 30 秒预算。这个案例说明了合理分配 grace period 的重要性。"
+        },
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz6",
+          "question": "以下关于 Go 标准库中 http.Server.Shutdown(ctx) 方法的描述，哪一个是错误的？",
+          "choices": [
+            {"id": "A", "text": "Shutdown 会立刻关闭 Listener，不再接受新的 TCP 连接"},
+            {"id": "B", "text": "Shutdown 会等待所有活跃的连接处理完毕后才返回"},
+            {"id": "C", "text": "Shutdown 会向所有活跃连接发送 RST 包强制断开，然后立刻返回"},
+            {"id": "D", "text": "如果传入的 context 超时，Shutdown 返回错误但不再等待活跃连接"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "http.Server.Shutdown 的行为是优雅的而非暴力的——它关闭 Listener 停止接受新连接（A 正确），然后等待已建立的连接上的请求处理完成后才返回（B 正确）。C 选项描述的「发送 RST 强制断开」是 http.Server.Close() 的行为，不是 Shutdown 的。如果 context 超时，Shutdown 会返回 context.DeadlineExceeded 错误（D 正确），此时仍有活跃连接的请求可能尚未完成。所以实际中通常还需要在 Shutdown 返回后调用 Close 来兜底。Go 1.8 引入了这个方法，是实现 HTTP 服务优雅停机的标准方式。"
+        },
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz7",
+          "question": "在滚动更新中，以下哪个组合配置可以实现零中断发布？",
+          "choices": [
+            {"id": "A", "text": "maxSurge: 1 + maxUnavailable: 0 + preStop sleep + 应用 SIGTERM 处理 + Readiness Probe"},
+            {"id": "B", "text": "maxSurge: 0 + maxUnavailable: 1 + preStop sleep + 应用 SIGTERM 处理"},
+            {"id": "C", "text": "maxSurge: 1 + maxUnavailable: 0 + 仅 preStop sleep（无需应用代码改动）"},
+            {"id": "D", "text": "maxSurge: 1 + maxUnavailable: 0 + 仅应用 SIGTERM 处理（无需 preStop）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "零中断发布需要基础设施和应用代码的全面配合。A 是完整的方案：maxUnavailable: 0 保证在新 Pod Ready 之前不终止旧 Pod；maxSurge: 1 允许多创建一个 Pod 来过渡；preStop sleep 解决网络层竞态窗口；应用 SIGTERM 处理确保正在处理的请求能完成 drain；Readiness Probe 确保新 Pod 真正就绪后才接收流量。B 的 maxUnavailable: 1 意味着会先终止一个旧 Pod 再启动新 Pod，在旧 Pod 终止到新 Pod Ready 之间有可用性缺口。C 只有 preStop 没有应用代码配合，sleep 期间收到的请求在 SIGTERM 后仍会被中断。D 没有 preStop，竞态窗口内的新请求仍会路由到正在关闭的 Pod。"
+        },
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz8",
+          "question": "生产环境中一个 gRPC 长连接服务需要做优雅停机，以下哪种方案最合理？",
+          "choices": [
+            {"id": "A", "text": "收到 SIGTERM 后发送 GOAWAY 帧通知客户端断开重连，同时适当增大 terminationGracePeriodSeconds"},
+            {"id": "B", "text": "把 terminationGracePeriodSeconds 设为 3600（1小时），等所有长连接自然断开"},
+            {"id": "C", "text": "直接 SIGKILL，gRPC 客户端会自动重连所以不需要优雅停机"},
+            {"id": "D", "text": "在 preStop 中 sleep 300 秒等待所有连接完成"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "gRPC 协议原生支持 GOAWAY 帧，这是为优雅停机设计的机制。服务端收到 SIGTERM 后发送 GOAWAY 帧，客户端收到后会停止在该连接上发送新请求，已有的 RPC 调用正常完成，然后客户端重建连接——新连接会被路由到其他健康的 Pod。同时适当增大 grace period（比如 60-120 秒）给正在进行的 RPC 足够时间完成。B 的 1 小时 grace period 会严重拖慢发版速度，完全不实际。C 的 SIGKILL 虽然 gRPC 客户端会重连，但正在处理的 RPC 会失败返回 UNAVAILABLE 错误。D 把 300 秒都花在 preStop sleep 上，不仅浪费了 grace period 的时间预算，而且 sleep 本身并不会触发连接断开。"
+        },
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz9",
+          "question": "Kubernetes 1.28 引入了原生 Sidecar Container 支持（通过 initContainers 中 restartPolicy: Always 实现）。关于 Sidecar 的终止顺序，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "Sidecar Container 会在所有普通容器退出之后才收到 SIGTERM，确保主容器在 drain 请求时 Sidecar 仍然可用"},
+            {"id": "B", "text": "Sidecar Container 和普通容器同时收到 SIGTERM，退出顺序由各自的处理速度决定"},
+            {"id": "C", "text": "Sidecar Container 会先于普通容器收到 SIGTERM，为普通容器的优雅停机做准备"},
+            {"id": "D", "text": "Sidecar Container 在 Pod 终止时不会收到任何信号，由 kubelet 在最后统一清理"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在 Kubernetes 1.28 之前，所有容器（包括充当 Sidecar 角色的容器）都会同时收到 SIGTERM，这带来了一个经典问题：如果 Envoy Sidecar 比主容器先退出，主容器在 drain 请求时就失去了网络代理能力，导致请求失败。1.28 引入的原生 Sidecar 支持通过在 initContainers 中设置 restartPolicy: Always 来声明 Sidecar 容器，kubelet 会保证 Sidecar 在所有普通容器退出后才收到终止信号。这解决了长期困扰 Service Mesh 用户的退出顺序问题。B 描述的是 1.28 之前的旧行为。C 和 D 都不符合实际行为。"
+        },
+        {
+          "id": "k8s-pod-graceful-shutdown-q1-quiz10",
+          "question": "你在排查一个 Pod 的优雅停机问题，发现 preStop Hook 配置正确但从未被执行。以下哪种情况最可能导致这个问题？",
+          "choices": [
+            {"id": "A", "text": "容器自身进程崩溃（CrashLoopBackOff）导致容器终止，此时 kubelet 不会执行 preStop"},
+            {"id": "B", "text": "Pod 所在的节点有 NoSchedule 的 taint"},
+            {"id": "C", "text": "Pod 配置了 Readiness Probe 但没有配置 Liveness Probe"},
+            {"id": "D", "text": "Pod 的 restartPolicy 设置为 Always"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "preStop Hook 只在 Pod 被外部请求终止（比如 kubectl delete、Deployment 滚动更新、节点驱逐等设置 deletionTimestamp 的场景）时才会执行。如果容器自身进程崩溃退出（比如 OOM、未捕获异常、段错误），kubelet 的处理流程是直接根据 restartPolicy 决定是否重启容器——不会执行 preStop Hook。这是一个常见的误解：很多人以为 preStop 在任何容器终止时都会执行。B 的 NoSchedule taint 影响的是调度而非终止。C 的 Probe 配置与 preStop 执行无关。D 的 restartPolicy 影响的是容器退出后的重启行为，不影响 preStop 是否执行。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination",
+        "https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/#hook-handler-execution",
+        "https://cloud.google.com/blog/products/containers-kubernetes/kubernetes-best-practices-terminating-with-grace",
+        "https://learnk8s.io/graceful-shutdown"
+      ]
+    }
+  ]
+}
