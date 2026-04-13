@@ -124,7 +124,7 @@ export function QuestionDetail() {
   return (
     <div className="animate-fade-in">
       {/* Breadcrumb */}
-      <div className="text-sm text-[var(--color-notion-text-secondary)] mb-5 flex items-center flex-wrap">
+      <div className="text-sm text-[var(--color-notion-text-secondary)] mb-5 flex items-center flex-wrap gap-y-1">
         <Link to="/" className="hover:text-[var(--color-notion-accent)] no-underline transition-colors">首页</Link>
         <span className="mx-2 opacity-40">/</span>
         <Link to={`/domains/${domain}`} className="hover:text-[var(--color-notion-accent)] no-underline flex items-center gap-1 transition-colors">
@@ -155,10 +155,10 @@ export function QuestionDetail() {
 
       {/* Tab bar */}
       {hasQuiz && (
-        <div className="flex items-center gap-1 mb-6 border-b border-[var(--color-notion-border)]">
+        <div className="mb-6 flex items-center gap-1 overflow-x-auto border-b border-[var(--color-notion-border)]">
           <button
             onClick={() => setActiveTab('content')}
-            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-all duration-200 -mb-px ${
+            className={`-mb-px flex shrink-0 items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 ${
               activeTab === 'content'
                 ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
                 : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
@@ -168,7 +168,7 @@ export function QuestionDetail() {
           </button>
           <button
             onClick={() => setActiveTab('quiz')}
-            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-all duration-200 -mb-px ${
+            className={`-mb-px flex shrink-0 items-center gap-1.5 border-b-2 px-4 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 ${
               activeTab === 'quiz'
                 ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
                 : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
@@ -188,16 +188,16 @@ export function QuestionDetail() {
           </div>
 
           {/* Action buttons */}
-          <div className="flex items-center gap-3 mb-5">
+          <div className="mb-5 flex flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center">
             <button
               onClick={handleToggleAnswer}
-              className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] transition-all duration-200 text-[var(--color-notion-text)]"
+              className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-4 py-2 text-sm font-medium text-[var(--color-notion-text)] transition-all duration-200 hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:justify-start sm:py-2.5"
             >
               {showAnswer ? <><ChevronUp className="w-4 h-4" /> 收起答案</> : <><Lightbulb className="w-4 h-4 text-[var(--color-notion-warning)]" /> 显示答案</>}
             </button>
             <button
               onClick={() => questionId && toggleBookmark(questionId)}
-              className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg border transition-all duration-200 ${
+              className={`flex w-full items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-all duration-200 sm:w-auto sm:justify-start sm:py-2.5 ${
                 bookmarked
                   ? 'border-[var(--color-notion-warning)] bg-[var(--color-notion-warning-light)] text-[var(--color-notion-warning)]'
                   : 'border-[var(--color-notion-border)] text-[var(--color-notion-text-secondary)] hover:border-[var(--color-notion-warning)] hover:bg-[var(--color-notion-warning-light)]'
@@ -209,7 +209,7 @@ export function QuestionDetail() {
             {hasQuiz && (
               <button
                 onClick={() => setActiveTab('quiz')}
-                className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] transition-all duration-200 text-[var(--color-notion-text)]"
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-4 py-2 text-sm font-medium text-[var(--color-notion-text)] transition-all duration-200 hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:justify-start sm:py-2.5"
               >
                 <ClipboardCheck className="w-4 h-4" /> 开始做题
               </button>

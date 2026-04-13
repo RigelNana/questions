@@ -130,12 +130,12 @@ export function QuestionList() {
           className="w-full sm:flex-1 sm:min-w-[200px] px-3.5 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] focus:outline-none focus:border-[var(--color-notion-accent)] focus:ring-2 focus:ring-[var(--color-notion-accent)]/10 transition-all"
         />
 
-        <div className="grid grid-cols-3 gap-2 sm:flex sm:gap-3">
+        <div className="grid grid-cols-1 gap-2 min-[560px]:grid-cols-3 sm:flex sm:gap-3">
           {/* Type filter */}
           <select
             value={typeFilter}
             onChange={(e) => setTypeFilter(e.target.value as QuestionType | 'all')}
-            className="px-3 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] w-full sm:w-auto transition-colors hover:border-[var(--color-notion-accent)]"
+            className="w-full rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-3 py-2 text-sm text-[var(--color-notion-text)] transition-colors hover:border-[var(--color-notion-accent)] sm:w-auto"
           >
             <option value="all">全部类型</option>
             <optgroup label="八股题">
@@ -154,7 +154,7 @@ export function QuestionList() {
           <select
             value={difficultyFilter}
             onChange={(e) => setDifficultyFilter(Number(e.target.value) as Difficulty | 0)}
-            className="px-3 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] w-full sm:w-auto transition-colors hover:border-[var(--color-notion-accent)]"
+            className="w-full rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-3 py-2 text-sm text-[var(--color-notion-text)] transition-colors hover:border-[var(--color-notion-accent)] sm:w-auto"
           >
             <option value={0}>全部难度</option>
             <option value={1}>⭐ 基础</option>
@@ -167,7 +167,7 @@ export function QuestionList() {
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
-            className="px-3 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] w-full sm:w-auto transition-colors hover:border-[var(--color-notion-accent)]"
+            className="w-full rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-3 py-2 text-sm text-[var(--color-notion-text)] transition-colors hover:border-[var(--color-notion-accent)] sm:w-auto"
           >
             <option value="all">全部状态</option>
             <option value="completed">已完成</option>
@@ -199,7 +199,7 @@ export function QuestionList() {
 
           {/* Pagination */}
           {totalPages > 1 && (
-            <div className="flex items-center justify-between mt-6 pt-4 mb-8">
+            <div className="mt-6 mb-8 flex flex-col gap-3 pt-4 sm:flex-row sm:items-center sm:justify-between">
               <span className="text-sm text-[var(--color-notion-text-secondary)]">
                 {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, filteredQuestions.length)} / {filteredQuestions.length}
               </span>

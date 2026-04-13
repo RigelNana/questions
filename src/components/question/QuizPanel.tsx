@@ -128,11 +128,20 @@ export function QuizPanel({
             <button
               key={q.id}
               onClick={() => jumpTo(i)}
-              className={`w-2.5 h-2.5 rounded-full transition-all duration-200 ${dotColor} ${
-                isCurrent ? 'scale-150 ring-2 ring-[var(--color-notion-accent)]/40 ring-offset-1' : 'hover:scale-125'
+              className={`compact-control group flex h-7 w-7 items-center justify-center rounded-full transition-all duration-200 ${
+                isCurrent
+                  ? 'bg-[var(--color-notion-accent-light)]'
+                  : 'hover:bg-[var(--color-notion-bg-hover)]'
               }`}
               title={`Q${i + 1}`}
-            />
+              aria-label={`跳转到第 ${i + 1} 题`}
+            >
+              <span
+                className={`block h-2.5 w-2.5 rounded-full transition-transform duration-200 ${dotColor} ${
+                  isCurrent ? 'scale-150' : 'group-hover:scale-125'
+                }`}
+              />
+            </button>
           );
         })}
       </div>
@@ -188,11 +197,11 @@ export function QuizPanel({
 
         {/* Submit button */}
         {!isAnswered && (
-          <div className="flex items-center gap-3 mt-4">
+          <div className="mt-4 flex flex-col gap-2.5 sm:flex-row sm:items-center">
             <button
               onClick={handleSubmit}
               disabled={!selectedAnswer}
-              className="px-5 py-2.5 bg-[var(--color-notion-accent)] text-white rounded-lg text-sm font-medium hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-200"
+              className="w-full rounded-lg bg-[var(--color-notion-accent)] px-5 py-2.5 text-sm font-medium text-white transition-all duration-200 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30 sm:w-auto"
             >
               提交答案
             </button>

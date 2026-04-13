@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Outlet } from 'react-router-dom';
+import { Outlet, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { Header } from './Header';
 import { BottomNav } from './BottomNav';
@@ -10,6 +10,7 @@ export function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const { settings } = useProgressStore();
+  const location = useLocation();
 
   const openSearch = useCallback(() => setSearchOpen(true), []);
   const closeSearch = useCallback(() => setSearchOpen(false), []);
@@ -43,7 +44,7 @@ export function Layout() {
   }, []);
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[var(--color-notion-bg)]">
+    <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden bg-[var(--color-notion-bg)]">
       <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
       <div className="flex-1 flex flex-col overflow-hidden">
@@ -52,9 +53,11 @@ export function Layout() {
           onOpenSearch={openSearch}
         />
 
-        <main className="flex-1 overflow-y-auto">
-          <div className="max-w-7xl mx-auto px-5 py-6 sm:px-8 sm:py-10 pb-28 lg:pb-12 safe-bottom">
-            <Outlet />
+        <main className="flex-1 overflow-y-auto overflow-x-hidden">
+          <div className="mobile-nav-offset max-w-7xl mx-auto px-4 py-5 sm:px-8 sm:py-10 lg:pb-12">
+            <div key={location.pathname}>
+              <Outlet />
+            </div>
           </div>
         </main>
       </div>
