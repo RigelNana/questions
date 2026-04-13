@@ -1,0 +1,158 @@
+{
+  "id": "k8s-hpa-custom-metrics",
+  "name": "HPA 自定义指标配置",
+  "domain": "kubernetes",
+  "description": "深入理解 HPA 的默认指标体系、四种 metrics 类型（Resource/Pods/Object/External）、Prometheus Adapter 接入自定义指标的完整流程以及 KEDA 方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-hpa-custom-metrics-q1",
+      "domain": "kubernetes",
+      "type": "env-config",
+      "difficulty": 2,
+      "tags": ["kubernetes", "HPA", "autoscaling", "metrics", "Prometheus Adapter", "custom metrics", "KEDA", "CPU", "扩缩容"],
+      "title": "HPA 默认根据什么指标进行扩缩容？如何配置基于自定义指标？",
+      "content": "你的团队在 Kubernetes v1.30 集群上运行一个订单处理微服务，Deployment 配置了 HPA，但你发现一个反直觉的现象：高峰期订单队列堆积了上万条消息，消费延迟已经飙到 30 秒，但 HPA 纹丝不动——因为每个 Pod 的 CPU 使用率只有 15%。这个服务是 IO 密集型的，瓶颈在等待下游支付网关返回，CPU 根本跑不满。你的同事说「把 HPA 的 CPU 阈值调低到 10% 不就好了」，但你知道这是治标不治本——真正应该触发扩容的指标不是 CPU，而是队列深度或者请求延迟。\n\n当前的 HPA 配置如下：\n\n```yaml\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: order-processor\n  namespace: production\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: order-processor\n  minReplicas: 3\n  maxReplicas: 20\n  metrics:\n  - type: Resource\n    resource:\n      name: cpu\n      target:\n        type: Utilization\n        averageUtilization: 60\n```\n\n问题来了：HPA 默认只能根据 CPU 和内存扩缩容吗？如果要基于业务指标（比如 Kafka 消费延迟、RabbitMQ 队列深度、HTTP 请求的 P99 延迟）来触发扩缩容，整个链路应该怎么搭建？Prometheus 已经在集群里采集了这些业务指标，怎么让 HPA「看到」它们？",
+      "answer": "## HPA 基础概念与指标体系全貌\n\nHorizontal Pod Autoscaler（HPA）是 Kubernetes 内置的水平自动扩缩容控制器，它的核心职责是根据观测到的指标值，动态调整 Deployment、ReplicaSet 或 StatefulSet 的副本数。HPA 本身是一个标准的 Kubernetes 资源对象（API Group 为 `autoscaling`），由 kube-controller-manager 中的 HPA Controller 每隔固定周期（默认 15 秒，由 `--horizontal-pod-autoscaler-sync-period` 控制）执行一次调谐循环。每次循环中，HPA Controller 从 Metrics API 拉取当前指标值，与目标值对比，计算出期望的副本数，然后更新目标资源的 `spec.replicas` 字段。\n\n要理解 HPA 怎么用，先看一个最简的创建方式。`kubectl autoscale` 命令可以一行创建一个基于 CPU 的 HPA：\n\n```bash\n# 为 order-processor 创建 HPA：最少 3 副本，最多 20 副本，目标 CPU 利用率 60%\n$ kubectl autoscale deployment order-processor \\\n    --min=3 --max=20 --cpu-percent=60 -n production\nhorizontalpodautoscaler.autoscaling/order-processor autoscaled\n\n# 查看 HPA 状态\n$ kubectl get hpa order-processor -n production\nNAME              REFERENCE                    TARGETS   MINPODS   MAXPODS   REPLICAS   AGE\norder-processor   Deployment/order-processor   15%/60%   3         20        3          5m\n```\n\n输出中的 `TARGETS` 列 `15%/60%` 表示当前 CPU 平均利用率是 15%，目标是 60%。因为 15% 远低于 60%，HPA 不会触发扩容，维持 3 个副本不变。\n\nHPA 的核心运行逻辑是一个简洁的公式：`期望副本数 = ceil(当前副本数 × (当前指标值 / 目标指标值))`。比如当前 3 副本，CPU 利用率平均 90%，目标 60%，那期望副本数就是 `ceil(3 × 90/60) = ceil(4.5) = 5`。HPA Controller 会将副本数从 3 调整到 5。反过来如果 CPU 利用率降到 30%，期望副本数是 `ceil(3 × 30/60) = ceil(1.5) = 2`，但因为 `minReplicas` 是 3，所以不会缩到 2 以下。这个公式看起来简单，但里面有一个重要的细节：如果计算结果与当前副本数的比值在 `--horizontal-pod-autoscaler-tolerance`（默认 0.1，即 10%）范围内，HPA 不会执行任何操作，避免因为微小波动导致频繁扩缩。\n\n现在进入关键问题：HPA 能感知哪些指标？在 `autoscaling/v2` API（Kubernetes v1.23+ GA）中，HPA 支持四种指标类型，每种对应一个不同的 Metrics API 源，这四种类型构成了 HPA 完整的指标体系。\n\n第一种是 **Resource 类型**，这也是 HPA 最基础、最常用的指标来源。Resource 类型只支持 CPU 和内存这两种内置资源指标，数据来自 Metrics Server（实现了 `metrics.k8s.io` API）。当你写 `type: Resource, resource.name: cpu` 时，HPA Controller 调用的是 `metrics.k8s.io/v1beta1` API 获取每个 Pod 的 CPU 使用量，然后除以该 Pod 的 `resources.requests.cpu` 得到利用率百分比。这意味着如果你的 Pod 没有设置 `resources.requests.cpu`，基于 Utilization 的 Resource 类型指标会直接报错。你可以改用 `AverageValue` 目标类型来规避这个问题，它直接看绝对值而不是百分比。\n\n第二种是 **Pods 类型**，描述的是与目标 Pod 直接关联的自定义指标，比如每个 Pod 的每秒请求数（QPS）或者每个 Pod 的连接数。这类指标的数据来自 Custom Metrics API（`custom.metrics.k8s.io`），HPA Controller 会获取目标 Deployment 管理的所有 Pod 的指标值，计算平均值后与目标值对比。\n\n第三种是 **Object 类型**，描述的是与某个 Kubernetes 对象关联的指标，但这个对象不是 Pod 本身。典型场景是 Ingress 的请求数——你想根据某个 Ingress 对象的总 QPS 来扩缩后端 Deployment。Object 类型的数据也来自 Custom Metrics API，但查询时指定的是一个具体的 Kubernetes 对象（比如 `kind: Ingress, name: order-api`）。\n\n第四种是 **External 类型**，描述的是完全不与任何 Kubernetes 对象关联的外部指标，比如云厂商消息队列的积压深度、外部负载均衡器的请求数。这类指标的数据来自 External Metrics API（`external.metrics.k8s.io`），查询时不指定 Kubernetes 对象，而是通过 `metric.name` 加 `metric.selector` 标签来定位指标。\n\n用一张清晰的对照来总结：Resource 类型走 `metrics.k8s.io`，只支持 CPU/内存；Pods 类型走 `custom.metrics.k8s.io`，指标与目标 Pod 关联；Object 类型也走 `custom.metrics.k8s.io`，指标与任意 K8s 对象关联；External 类型走 `external.metrics.k8s.io`，指标来自集群外部。后三种都不是开箱即用的——你需要部署一个实现了对应 API 的 Adapter 组件。\n\n## 默认 CPU 指标的工作机制与 Prometheus Adapter 接入自定义指标\n\n大部分 Kubernetes 集群在安装时都会部署 Metrics Server，它是 `metrics.k8s.io` API 的默认实现。Metrics Server 通过 kubelet 内置的 `/metrics/resource` 端点采集每个节点上所有容器的 CPU 和内存使用数据（底层来自 cAdvisor），存储在内存中（不做持久化，只保留最近一次的值），然后通过 API Aggregation 的方式注册到 API Server。当 HPA Controller 需要获取某个 Pod 的 CPU 利用率时，它向 API Server 发起请求 `GET /apis/metrics.k8s.io/v1beta1/namespaces/{ns}/pods/{name}`，API Server 将请求转发给 Metrics Server，Metrics Server 返回该 Pod 最近一次采集到的 CPU 使用量（单位是 nanocores）。\n\n你可以直接用 kubectl 调用这个 API 来验证：\n\n```bash\n$ kubectl get --raw /apis/metrics.k8s.io/v1beta1/namespaces/production/pods/order-processor-6d8f9b7c4d-x2k9j | jq .\n{\n  \"kind\": \"PodMetrics\",\n  \"apiVersion\": \"metrics.k8s.io/v1beta1\",\n  \"metadata\": {\n    \"name\": \"order-processor-6d8f9b7c4d-x2k9j\",\n    \"namespace\": \"production\",\n    \"creationTimestamp\": \"2024-08-15T10:30:00Z\"\n  },\n  \"timestamp\": \"2024-08-15T10:29:45Z\",\n  \"window\": \"15s\",\n  \"containers\": [\n    {\n      \"name\": \"app\",\n      \"usage\": {\n        \"cpu\": \"37500000n\",\n        \"memory\": \"164233216\"\n      }\n    }\n  ]\n}\n```\n\n`37500000n` 就是 37.5m（37.5 millicore），如果这个 Pod 的 `requests.cpu` 是 250m，那 CPU 利用率就是 37.5/250 = 15%，与前面 `kubectl get hpa` 看到的吻合。Metrics Server 能覆盖的就这么多了——只有 CPU 和内存，没有任何业务指标的概念。\n\n接下来就是核心环节：怎么让 HPA 看到 Prometheus 中的自定义指标？答案是部署 **Prometheus Adapter**（项目地址 `kubernetes-sigs/prometheus-adapter`）。Prometheus Adapter 的作用是充当 `custom.metrics.k8s.io` 和 `external.metrics.k8s.io` 两个 API 的实现，它定期从 Prometheus 查询指标数据，然后以 Kubernetes API 的标准格式暴露出来，这样 HPA Controller 就能像查 Metrics Server 一样查到自定义指标。\n\n完整的接入流程分为四步。\n\n**第一步：部署 Prometheus Adapter。** 推荐用 Helm Chart 安装，这是社区维护最活跃的方式：\n\n```bash\n$ helm repo add prometheus-community https://prometheus-community.github.io/helm-charts\n$ helm repo update\n$ helm install prometheus-adapter prometheus-community/prometheus-adapter \\\n    --namespace monitoring \\\n    --set prometheus.url=http://prometheus-server.monitoring.svc \\\n    --set prometheus.port=9090 \\\n    --version 4.10.0\n```\n\n安装完成后验证 API 是否注册成功：\n\n```bash\n$ kubectl get apiservices | grep custom.metrics\nv1beta1.custom.metrics.k8s.io   monitoring/prometheus-adapter   True   2m\nv1beta1.external.metrics.k8s.io monitoring/prometheus-adapter   True   2m\n\n# 如果 AVAILABLE 列显示 True，说明 Adapter 已经正确注册到 API Server\n```\n\n**第二步：配置指标映射规则。** 这是最关键也最容易出错的一步。Prometheus Adapter 的配置文件（通常挂载为 ConfigMap）定义了如何将 Prometheus 中的原始指标转换为 Kubernetes Custom Metrics API 能识别的格式。假设你的 Prometheus 中有一个指标 `http_requests_per_second`，标签包含 `namespace` 和 `pod`，你想让 HPA 能用它来扩缩容。配置如下：\n\n```yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: prometheus-adapter\n  namespace: monitoring\ndata:\n  config.yaml: |\n    rules:\n    # 规则一：将 Prometheus 指标暴露为 Pod 级别的自定义指标\n    - seriesQuery: 'http_requests_per_second{namespace!=\"\",pod!=\"\"}'\n      resources:\n        overrides:\n          namespace: {resource: \"namespace\"}\n          pod: {resource: \"pod\"}\n      name:\n        matches: \"^(.*)$\"\n        as: \"${1}\"  # 保持原指标名\n      metricsQuery: 'sum(rate(http_requests_per_second{<<.LabelMatchers>>}[2m])) by (<<.GroupBy>>)'\n    \n    # 规则二：将 Kafka 消费延迟暴露为外部指标\n    - seriesQuery: 'kafka_consumergroup_lag{consumergroup!=\"\"}'\n      resources:\n        overrides:\n          namespace: {resource: \"namespace\"}\n      name:\n        as: \"kafka_consumer_lag\"\n      metricsQuery: 'sum(kafka_consumergroup_lag{<<.LabelMatchers>>}) by (<<.GroupBy>>)'\n```\n\n配置中的 `seriesQuery` 告诉 Adapter 去 Prometheus 中查哪个指标序列；`resources.overrides` 建立 Prometheus 标签到 Kubernetes 资源的映射关系——`pod` 标签对应 Pod 资源，`namespace` 标签对应 Namespace 资源；`metricsQuery` 是实际执行的 PromQL 查询，其中 `<<.LabelMatchers>>` 和 `<<.GroupBy>>` 是 Adapter 的模板变量，会在运行时被替换为具体的标签匹配器和分组字段。\n\n**第三步：验证自定义指标是否可查。** 配置好 Adapter 后，用 kubectl 直接查询 Custom Metrics API：\n\n```bash\n# 列出所有可用的自定义指标\n$ kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1 | jq '.resources[].name'\n\"pods/http_requests_per_second\"\n\"namespaces/kafka_consumer_lag\"\n\n# 查询特定 Pod 的指标值\n$ kubectl get --raw \"/apis/custom.metrics.k8s.io/v1beta1/namespaces/production/pods/*/http_requests_per_second\" | jq .\n{\n  \"kind\": \"MetricValueList\",\n  \"apiVersion\": \"custom.metrics.k8s.io/v1beta1\",\n  \"metadata\": {},\n  \"items\": [\n    {\n      \"describedObject\": {\n        \"kind\": \"Pod\",\n        \"namespace\": \"production\",\n        \"name\": \"order-processor-6d8f9b7c4d-x2k9j\",\n        \"apiVersion\": \"/v1\"\n      },\n      \"metricName\": \"http_requests_per_second\",\n      \"timestamp\": \"2024-08-15T10:35:00Z\",\n      \"value\": \"142\"\n    }\n  ]\n}\n```\n\n如果这一步能看到指标值，说明整条链路已经打通了。如果返回空或报错，最常见的原因有三个：Adapter 配置的 `seriesQuery` 匹配不到任何 Prometheus 时间序列（检查标签名是否写对）；`resources.overrides` 中的标签到资源映射不正确（Prometheus 中的标签名可能是 `kubernetes_pod_name` 而不是 `pod`）；或者 Prometheus 本身没有采集到这个指标（先在 Prometheus UI 中确认指标存在）。\n\n**第四步：配置 HPA 使用自定义指标。** 现在可以创建一个基于自定义指标的 HPA 了。以下配置同时使用 CPU 利用率和每秒请求数两个指标，HPA 会取两个指标中计算出的较大副本数：\n\n```yaml\napiVersion: autoscaling/v2\nkind: HorizontalPodAutoscaler\nmetadata:\n  name: order-processor\n  namespace: production\nspec:\n  scaleTargetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: order-processor\n  minReplicas: 3\n  maxReplicas: 20\n  metrics:\n  # 指标一：CPU 利用率（Resource 类型，兜底）\n  - type: Resource\n    resource:\n      name: cpu\n      target:\n        type: Utilization\n        averageUtilization: 60\n  # 指标二：每个 Pod 的 QPS（Pods 类型）\n  - type: Pods\n    pods:\n      metric:\n        name: http_requests_per_second\n      target:\n        type: AverageValue\n        averageValue: \"100\"   # 每个 Pod 目标处理 100 req/s\n  behavior:\n    scaleDown:\n      stabilizationWindowSeconds: 300  # 缩容前等 5 分钟，防止流量抖动\n      policies:\n      - type: Percent\n        value: 10\n        periodSeconds: 60              # 每分钟最多缩 10%\n    scaleUp:\n      stabilizationWindowSeconds: 0    # 扩容不等待，立即响应\n      policies:\n      - type: Percent\n        value: 100\n        periodSeconds: 15              # 每 15 秒最多扩一倍\n      - type: Pods\n        value: 4\n        periodSeconds: 15              # 或每 15 秒最多扩 4 个\n      selectPolicy: Max                # 两个策略取较大值\n```\n\n配置中 `behavior` 字段是 `autoscaling/v2` 引入的扩缩容行为控制，生产环境必须配置。`scaleDown.stabilizationWindowSeconds: 300` 的含义是：在过去 300 秒内计算出的所有期望副本数中取最大值作为最终缩容目标，这样可以防止流量瞬间下降后立刻缩容、流量回来又要扩容的抖动问题。`scaleUp.stabilizationWindowSeconds: 0` 则让扩容立即生效——面对突发流量，快速扩容比避免抖动更重要。\n\n应用这个 HPA 后，验证它是否正常工作：\n\n```bash\n$ kubectl get hpa order-processor -n production\nNAME              REFERENCE                    TARGETS                        MINPODS   MAXPODS   REPLICAS   AGE\norder-processor   Deployment/order-processor   15%/60%, 142/100 (avg)         3         20        5          10m\n```\n\n`TARGETS` 列现在有两组值：CPU 是 15%/60%（不需要扩容），QPS 是 142/100（需要扩容）。HPA 取两者中计算出的较大副本数：CPU 算出 `ceil(5 × 15/60) = 2` 个，QPS 算出 `ceil(5 × 142/100) = 8` 个，最终副本数会朝 8 个方向调整。\n\n## 体系化扩展：custom.metrics.k8s.io 架构、KEDA 方案与生产坑点\n\n理解了 Prometheus Adapter 的接入方式之后，值得进一步看看整个 Custom Metrics 体系的架构设计。Kubernetes 的 Metrics API 采用了 API Aggregation Layer（AA 层）的扩展机制——API Server 本身不实现 `custom.metrics.k8s.io`，而是通过 APIService 资源将这个 API Group 的请求代理到后端的 Adapter 服务。这个设计的好处是完全可插拔：你可以用 Prometheus Adapter，也可以用 Datadog Cluster Agent、Azure Monitor Adapter、Google Stackdriver Adapter，甚至自己写一个实现了 `custom.metrics.k8s.io` 接口的服务。只要在集群中注册对应的 APIService，HPA Controller 就能无缝对接。\n\n但 Prometheus Adapter 有一个架构上的限制：它是轮询模式，定期（默认 30 秒）从 Prometheus 拉取指标并缓存在内存中。这意味着从业务指标变化到 HPA 感知到变化，延迟链路是：应用产生指标 → Prometheus 抓取（默认 15 秒） → Adapter 轮询 Prometheus（默认 30 秒） → HPA Controller 调谐循环（默认 15 秒） → 修改副本数 → 新 Pod 启动就绪。整条链路的端到端延迟在 30 秒到 90 秒之间。对于大部分业务场景这是可接受的，但对于秒杀、直播开播这种瞬时流量暴涨的场景，可能还是太慢了。\n\n这就引出了另一个更强大的方案：**KEDA（Kubernetes Event-Driven Autoscaling）**。KEDA 是 CNCF 的毕业项目（v2.15 是当前最新版本），它不是 Prometheus Adapter 的替代品，而是一个更高层次的抽象。KEDA 引入了两个 CRD：`ScaledObject`（替代 HPA）和 `ScaledJob`（用于扩缩 Job）。KEDA 的核心优势在于它内置了 60 多个 Scaler（触发器），开箱支持 Kafka、RabbitMQ、AWS SQS、Azure Queue、Prometheus、MySQL、PostgreSQL、Redis 等几十种事件源——你不需要自己配置 Adapter 的映射规则，只需要声明「我要根据 Kafka topic X 的消费延迟来扩缩」就行了。\n\n一个基于 Kafka 消费延迟的 KEDA ScaledObject 配置示例：\n\n```yaml\napiVersion: keda.sh/v1alpha1\nkind: ScaledObject\nmetadata:\n  name: order-processor\n  namespace: production\nspec:\n  scaleTargetRef:\n    name: order-processor\n  minReplicaCount: 3\n  maxReplicaCount: 20\n  pollingInterval: 10          # 每 10 秒检查一次指标\n  cooldownPeriod: 300          # 缩容冷却期 5 分钟\n  triggers:\n  - type: kafka\n    metadata:\n      bootstrapServers: kafka-broker.kafka.svc:9092\n      consumerGroup: order-processor-group\n      topic: orders\n      lagThreshold: \"50\"       # 每个分区 lag 超过 50 就扩容\n      offsetResetPolicy: latest\n  - type: prometheus\n    metadata:\n      serverAddress: http://prometheus-server.monitoring.svc:9090\n      metricName: http_request_duration_p99\n      query: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{namespace=\"production\",deployment=\"order-processor\"}[2m])) by (le))\n      threshold: \"0.5\"         # P99 延迟超过 500ms 就扩容\n```\n\nKEDA 的工作原理是：它自己的 Metrics Adapter 组件实现了 `external.metrics.k8s.io` API，然后自动为每个 ScaledObject 创建一个标准的 HPA 资源，把 external metrics 类型的指标填进去。也就是说 KEDA 并不是绕开了 HPA，而是在 HPA 之上封装了一层——最终的扩缩容决策仍然由 HPA Controller 执行。这个设计让 KEDA 与原生 HPA 完全兼容。此外，KEDA 还有一个 HPA 不具备的能力：缩容到 0。原生 HPA 的 `minReplicas` 最小是 1，而 KEDA 可以设置 `minReplicaCount: 0`，当没有任何事件时把副本数缩到 0，有事件进来时再从 0 扩上去——这对于低频任务或 Serverless 风格的工作负载非常有用。\n\n最后讲几个生产环境中高频踩坑的点。第一个坑是 **Metrics Server 没装或者挂了导致 HPA 完全失效**。如果 `metrics.k8s.io` API 不可用，即使你配了自定义指标，HPA 也可能无法正常工作，因为某些版本的 HPA Controller 在无法获取 Resource 类型指标时会报错并跳过整个调谐循环。你可以用 `kubectl get apiservices v1beta1.metrics.k8s.io` 检查 Metrics Server 的健康状态，也可以通过 `kubectl describe hpa` 查看 Events 中有没有 `FailedGetResourceMetric` 类型的错误。\n\n第二个坑是 **HPA 和 VPA 同时作用于同一个 Deployment 导致冲突**。HPA 调整副本数，VPA 调整单 Pod 的 resources.requests。如果两者同时基于 CPU 指标工作，就会出现 HPA 说「CPU 高了要加副本」、VPA 同时说「CPU 高了要加 requests」的矛盾。Kubernetes 官方文档明确建议：如果同时使用 HPA 和 VPA，HPA 不要用 CPU/内存作为指标，改用自定义指标；VPA 的 `updateMode` 设为 `Off` 或 `Initial`，只做推荐不做自动调整。\n\n第三个坑是 **自定义指标查询的 PromQL 写错导致 HPA 看到错误的值**。最常见的错误是忘记在 PromQL 中加 `rate()` 或 `irate()`——比如你的 Prometheus 指标是一个 Counter 类型的 `http_requests_total`，如果 Adapter 的 `metricsQuery` 直接写 `http_requests_total{...}` 而不是 `rate(http_requests_total{...}[2m])`，HPA 看到的就是一个单调递增的累积值，永远只会扩容不会缩容。另一个常见错误是 `<<.LabelMatchers>>` 模板变量放错位置——它必须出现在 PromQL 的标签匹配器中，不能放在函数外面。调试 Adapter 的 PromQL 时，建议先把生成的查询语句复制到 Prometheus UI 手动执行，确认返回值符合预期。\n\n第四个坑是 **扩缩容震荡（flapping）**。如果你的指标波动很大（比如每秒 QPS 忽高忽低），HPA 可能在短时间内反复扩容-缩容-扩容。解决办法就是用前面提到的 `behavior` 字段配置稳定窗口：缩容方向设置 300 秒甚至更长的 `stabilizationWindowSeconds`，扩容方向设置为 0 让它快速响应。同时，在 Prometheus Adapter 的 `metricsQuery` 中使用更长的时间窗口（比如 `rate(...[5m])` 而不是 `rate(...[1m])`）也能平滑指标波动。",
+      "keyPoints": [
+        "HPA 默认依赖 Metrics Server 提供的 CPU 和内存指标（Resource 类型），通过 metrics.k8s.io API 获取数据，如果 Pod 未设置 resources.requests 则基于 Utilization 的 CPU 指标会报错",
+        "autoscaling/v2 API 支持四种指标类型：Resource（CPU/内存，走 metrics.k8s.io）、Pods（Pod 级自定义指标）、Object（K8s 对象关联指标）、External（集群外部指标），后三种均需部署额外的 Adapter 组件",
+        "Prometheus Adapter 实现了 custom.metrics.k8s.io 和 external.metrics.k8s.io 两个 API，通过配置 seriesQuery、resources.overrides 和 metricsQuery 三个字段将 Prometheus 指标映射为 K8s API 可查询的格式",
+        "HPA 扩缩容公式为 ceil(当前副本数 × 当前指标值/目标指标值)，配置多个指标时取计算出的最大副本数，且存在默认 10% 的容忍度避免频繁扩缩",
+        "KEDA 是 CNCF 毕业项目，内置 60+ Scaler 开箱支持 Kafka/RabbitMQ/SQS 等事件源，底层仍通过创建标准 HPA 资源来执行扩缩容，额外支持缩容到 0 副本",
+        "behavior 字段控制扩缩容节奏：scaleDown.stabilizationWindowSeconds 设为 300 秒防止缩容震荡，scaleUp.stabilizationWindowSeconds 设为 0 实现快速响应突发流量",
+        "HPA 和 VPA 同时使用时不应基于相同指标（如 CPU），否则会产生冲突；官方建议 HPA 用自定义指标，VPA 仅做推荐模式",
+        "从指标变化到 HPA 执行扩容的端到端延迟约 30-90 秒（Prometheus 抓取 15s + Adapter 轮询 30s + HPA 调谐 15s），秒杀等极端场景需预扩容或用 KEDA 缩短轮询间隔"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz1",
+          "question": "HPA 使用 Resource 类型指标（如 CPU Utilization）时，CPU 利用率的计算基准是什么？",
+          "choices": [
+            {"id": "A", "text": "Pod 所在节点的 CPU 总核数"},
+            {"id": "B", "text": "Pod 中容器的 resources.requests.cpu 声明值"},
+            {"id": "C", "text": "Pod 中容器的 resources.limits.cpu 声明值"},
+            {"id": "D", "text": "Kubernetes 集群所有节点的 CPU 平均可用量"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "HPA 的 Resource 类型指标在计算 CPU Utilization 时，分母是容器声明的 resources.requests.cpu，不是 limits 也不是节点总资源。具体来说，HPA Controller 从 Metrics Server 获取每个 Pod 的 CPU 使用量（单位 nanocores），然后除以该 Pod 所有容器的 requests.cpu 之和得到百分比。这也是为什么如果 Pod 没有设置 requests.cpu，基于 Utilization 目标类型的 HPA 会直接报错 FailedGetResourceMetric。选 A 的常见误区是以为利用率是相对于节点的，选 C 是混淆了 requests 和 limits 的作用。"
+        },
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz2",
+          "question": "在 autoscaling/v2 API 中，如果要根据 Kafka 消息队列的积压深度（与 Kubernetes 对象无关的外部指标）来扩缩容，应该使用哪种 metrics 类型？",
+          "choices": [
+            {"id": "A", "text": "Resource 类型，因为消息队列积压会导致 CPU 升高"},
+            {"id": "B", "text": "Pods 类型，因为积压消息需要分配到每个 Pod"},
+            {"id": "C", "text": "Object 类型，因为可以关联到 Kafka 的 StatefulSet 对象"},
+            {"id": "D", "text": "External 类型，因为指标来自集群外部且不与任何 K8s 对象关联"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Kafka 消息队列积压深度是一个纯外部指标，它不直接关联任何 Kubernetes 资源对象（不是 Pod 级别的，也不能挂在某个 K8s Object 上），所以必须用 External 类型。External 类型的数据来源是 external.metrics.k8s.io API，由 Prometheus Adapter 或 KEDA 等组件实现。选 A 的误区是试图用间接指标替代直接指标——CPU 升高只是可能的副作用，不能精确反映队列积压状况。选 B 和 C 的误区是没有理解 Pods 和 Object 类型要求指标必须与 Kubernetes 资源对象有关联关系。"
+        },
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz3",
+          "question": "Prometheus Adapter 配置中 resources.overrides 字段的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "覆盖 Prometheus 查询的时间范围，将默认的 5 分钟改为自定义值"},
+            {"id": "B", "text": "建立 Prometheus 指标标签到 Kubernetes 资源类型的映射关系，让 API 能按 Pod/Namespace 维度查询"},
+            {"id": "C", "text": "覆盖 HPA 的 resources.requests 设置，自动调整 Pod 的资源配额"},
+            {"id": "D", "text": "设置 Adapter 组件自身的 CPU 和内存 resources 限制"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "resources.overrides 是 Prometheus Adapter 配置中最容易出错的部分。它的作用是告诉 Adapter：Prometheus 指标中的哪个标签对应 Kubernetes 的哪个资源维度。比如 `pod: {resource: \"pod\"}` 表示 Prometheus 指标里的 pod 标签对应 Kubernetes 的 Pod 资源，这样当 HPA Controller 请求「production 命名空间下所有 Pod 的 http_requests_per_second」时，Adapter 才知道要在 PromQL 中加上 `namespace=\"production\"` 的过滤条件。如果这个映射配错了（比如 Prometheus 中的标签名是 kubernetes_pod_name 而不是 pod），Adapter 会查不到数据返回空值。"
+        },
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz4",
+          "question": "HPA 同时配置了 CPU（目标 60%）和 QPS（目标 100/pod）两个指标，当前 5 个副本，CPU 平均 30%，QPS 平均 180/pod。HPA 会将副本数调整到多少？",
+          "choices": [
+            {"id": "A", "text": "3 个，因为 CPU 只需要 ceil(5×30/60)=3 个"},
+            {"id": "B", "text": "9 个，因为 QPS 需要 ceil(5×180/100)=9 个"},
+            {"id": "C", "text": "6 个，取 CPU 和 QPS 计算结果的平均值"},
+            {"id": "D", "text": "5 个，两个指标给出了矛盾的信号所以保持不变"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 HPA 配置了多个指标时，它会分别用每个指标的公式 ceil(当前副本数 × 当前值/目标值) 计算期望副本数，然后取其中的最大值。CPU 指标算出 ceil(5×30/60)=3，QPS 指标算出 ceil(5×180/100)=9，最终取较大值 9。这个「取最大值」的策略确保了任何一个指标出现压力时都能触发扩容——宁可多扩不可少扩。HPA 不会求平均值也不会因为指标矛盾就保持不变。如果最终值超过 maxReplicas 则取 maxReplicas，低于 minReplicas 则取 minReplicas。"
+        },
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz5",
+          "question": "你执行 kubectl describe hpa 看到以下事件：`FailedGetResourceMetric: unable to get metrics for resource cpu: no metrics returned from resource metrics API`。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "HPA 的 CPU 目标阈值设置得太高导致无法获取"},
+            {"id": "B", "text": "Metrics Server 未部署或不健康，metrics.k8s.io API 不可用"},
+            {"id": "C", "text": "Pod 的 CPU 使用率为 0，所以 Metrics Server 不返回数据"},
+            {"id": "D", "text": "Prometheus Adapter 的配置中缺少 CPU 指标的映射规则"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "FailedGetResourceMetric 这个事件明确说明 HPA Controller 无法从 Resource Metrics API（即 metrics.k8s.io）获取 CPU 指标数据。Resource 类型指标的数据源是 Metrics Server 而不是 Prometheus Adapter，所以 D 不对。CPU 使用率为 0 时 Metrics Server 仍然会正常返回数据（值为 0），所以 C 也不对。HPA 的目标阈值只影响扩缩容决策，不影响指标获取，A 也不对。排查这个问题应该先检查 `kubectl get apiservices v1beta1.metrics.k8s.io` 的 AVAILABLE 状态，以及 `kubectl top nodes` 是否能正常输出。"
+        },
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz6",
+          "question": "团队在 Prometheus Adapter 的 metricsQuery 中写了 `http_requests_total{<<.LabelMatchers>>}`（没有加 rate 函数），会导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "HPA 无法获取指标数据，直接报错"},
+            {"id": "B", "text": "HPA 看到的是一个单调递增的累积值，副本数会持续增长直到 maxReplicas 且永远不会缩容"},
+            {"id": "C", "text": "HPA 看到的值始终为 0，不会触发任何扩缩容动作"},
+            {"id": "D", "text": "没有影响，Prometheus Adapter 会自动对 Counter 类型指标取速率"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "http_requests_total 是 Prometheus 的 Counter 类型指标，它的值只增不减（除非进程重启归零）。如果 metricsQuery 直接使用原始 Counter 值而不套 rate() 或 irate()，HPA 看到的将是一个持续增长的数字——比如从 10000 涨到 50000 再到 100000。按照 HPA 的公式 ceil(副本数 × 当前值/目标值)，这个永远在增长的数字会让计算出的期望副本数越来越大，最终卡在 maxReplicas 不下来。这是生产环境中自定义指标 HPA 最常见的配置错误之一。Prometheus Adapter 不会自动识别指标类型并做转换，必须在 metricsQuery 中显式使用 rate() 或 irate() 将 Counter 转为速率值。"
+        },
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz7",
+          "question": "Prometheus Adapter 方案与 KEDA 方案的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "Prometheus Adapter 基于推送模式，KEDA 基于拉取模式"},
+            {"id": "B", "text": "Prometheus Adapter 需要手动配置指标映射规则，KEDA 内置 60+ Scaler 开箱支持多种事件源且能缩容到 0 副本"},
+            {"id": "C", "text": "Prometheus Adapter 只支持 CPU/内存指标，KEDA 支持自定义指标"},
+            {"id": "D", "text": "Prometheus Adapter 绕开了 HPA 直接修改副本数，KEDA 通过标准 HPA 工作"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Prometheus Adapter 和 KEDA 都是拉取模式（定期从数据源查询指标），A 不对。Prometheus Adapter 本身就是为自定义指标设计的，不是只支持 CPU/内存，C 不对。实际上是 KEDA 底层会自动创建标准 HPA 资源来执行扩缩容，而 Prometheus Adapter 作为 Metrics API 的实现被 HPA Controller 调用——两者都通过 HPA 机制工作，D 描述反了。B 是核心区别：Prometheus Adapter 是一个通用的 Metrics API 适配器，需要你手写 seriesQuery 和 metricsQuery 映射规则；而 KEDA 封装了具体数据源的对接逻辑，内置了 Kafka、RabbitMQ、SQS 等几十种 Scaler，配置更声明式，且独有缩容到 0 的能力。"
+        },
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz8",
+          "question": "电商系统在大促前需要提前扩容，但 HPA 是被动响应型的（指标超阈值才扩）。以下哪种方案最适合应对可预见的流量高峰？",
+          "choices": [
+            {"id": "A", "text": "把 HPA 的 CPU 目标阈值从 60% 降到 10%，让它提前触发扩容"},
+            {"id": "B", "text": "在大促前手动调高 Deployment 的 replicas 和 HPA 的 minReplicas，大促结束后恢复"},
+            {"id": "C", "text": "删除 HPA 让 Deployment 始终运行 maxReplicas 个副本"},
+            {"id": "D", "text": "将 HPA 的 stabilizationWindowSeconds 设为 0 让扩容更快"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "对于可预见的流量高峰（如大促、直播开播），最佳实践是提前手动扩容（调高 minReplicas）而不是指望 HPA 被动响应。原因有二：第一，HPA 从感知到指标变化到新 Pod 就绪需要 30 秒到数分钟（包括指标采集延迟、Pod 调度、镜像拉取、就绪探针通过），对于瞬时流量暴涨可能来不及；第二，新扩出的 Pod 可能有冷启动问题（连接池初始化、JIT 编译、缓存预热），需要时间才能承载全量流量。选 A 会导致日常流量下也过度扩容浪费资源，选 C 是极端做法且完全放弃了自动化，选 D 只是加速了响应但无法解决冷启动和调度延迟问题。大促后将 minReplicas 恢复原值，HPA 会按缩容策略逐步缩回。"
+        },
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz9",
+          "question": "HPA 的 behavior.scaleDown.stabilizationWindowSeconds 设为 300 的含义是什么？",
+          "choices": [
+            {"id": "A", "text": "缩容操作执行后，在 300 秒内禁止再次缩容"},
+            {"id": "B", "text": "缩容前等待 300 秒确认指标持续低于阈值才执行"},
+            {"id": "C", "text": "在过去 300 秒内所有调谐循环计算出的期望副本数中取最大值，作为实际缩容目标"},
+            {"id": "D", "text": "缩容时每 300 秒减少一个副本，实现渐进式缩容"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "stabilizationWindowSeconds 的工作机制不是简单的「等 N 秒再缩」或「冷却期」，而是一个滑动窗口取最大值的算法。HPA Controller 每个调谐周期（默认 15 秒）都会计算当前的期望副本数并记录下来。当需要缩容时，它会回顾过去 stabilizationWindowSeconds 秒内所有记录的期望副本数，取其中的最大值作为最终的缩容目标。比如在过去 300 秒内，期望副本数分别是 8、5、3、4、6，那最终取 8——这意味着只要 300 秒内曾经有过高峰，就不会急于缩容。这个机制比简单的冷却期更智能，能有效防止流量抖动导致的扩缩震荡。"
+        },
+        {
+          "id": "k8s-hpa-custom-metrics-q1-quiz10",
+          "question": "部署 Prometheus Adapter 后，执行 `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` 返回空列表。以下哪个排查步骤最应该首先执行？",
+          "choices": [
+            {"id": "A", "text": "重启 kube-controller-manager 让它重新发现 Custom Metrics API"},
+            {"id": "B", "text": "检查 Prometheus Adapter 的配置文件中 seriesQuery 是否能在 Prometheus 中匹配到时间序列"},
+            {"id": "C", "text": "升级 Kubernetes 集群到最新版本以获得更好的 API Aggregation 支持"},
+            {"id": "D", "text": "在 HPA 的 YAML 中把 apiVersion 从 autoscaling/v2 改为 autoscaling/v1"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Custom Metrics API 返回空列表说明 Adapter 已经正确注册到 API Server（否则会返回 404 或连接拒绝），但没有暴露出任何指标。最常见的原因是 Adapter 的配置规则中 seriesQuery 匹配不到 Prometheus 中的任何时间序列——可能是指标名拼写错误、标签过滤条件太严格、或者 Prometheus 根本没有采集到这个指标。正确的排查步骤是：先到 Prometheus UI 执行 seriesQuery 中的表达式确认有数据返回，再检查 resources.overrides 中的标签名是否与 Prometheus 实际标签一致，最后看 Adapter Pod 的日志（kubectl logs）中有没有 PromQL 执行错误。重启 kube-controller-manager 不会帮助解决 Adapter 配置问题，升级集群和改 apiVersion 更是无关。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/",
+        "https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/",
+        "https://github.com/kubernetes-sigs/prometheus-adapter",
+        "https://keda.sh/docs/2.15/concepts/",
+        "https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#support-for-custom-metrics"
+      ]
+    }
+  ]
+}

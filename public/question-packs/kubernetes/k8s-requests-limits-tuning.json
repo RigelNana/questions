@@ -1,0 +1,159 @@
+{
+  "id": "k8s-requests-limits-tuning",
+  "name": "合理设置 requests 和 limits",
+  "domain": "kubernetes",
+  "description": "从压测观察、VPA 推荐、ratio 策略到 Goldilocks 与 LimitRange 兜底，系统讲解生产环境中如何科学设置容器资源配置以避免浪费和故障",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-requests-limits-tuning-q1",
+      "domain": "kubernetes",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["kubernetes", "requests", "limits", "资源调优", "VPA", "Goldilocks", "LimitRange", "over-commit", "CFS throttle", "OOMKill"],
+      "title": "如何合理设置 requests 和 limits 避免资源浪费？",
+      "content": "你所在的团队运维着一个 Kubernetes 1.30 集群，节点规格为 8C32G，共 40 个 worker 节点。集群上跑着大约 200 个微服务，总计 1200 多个 Pod。最近 FinOps 团队拉了一份账单过来，发现集群的 CPU 实际利用率只有 12%，内存实际利用率 35%，但调度层面 requests 已经分配了 78%——也就是说大量资源被「占着茅坑不拉屎」。与此同时，SRE 值班群里每周还会有三四个 OOMKilled 告警，主要集中在几个 Java 服务上。\n\n你用 `kubectl top node` 拉了一份快照：\n\n```\n$ kubectl top node\nNAME         CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%\nworker-01    876m         10%    11284Mi         35%\nworker-02    1124m        14%    12036Mi         37%\nworker-03    642m         8%     9872Mi          30%\nworker-04    1536m        19%    14208Mi         44%\n...\n```\n\n然后又看了一下 requests 的分配情况：\n\n```\n$ kubectl describe node worker-01 | grep -A5 'Allocated resources'\nAllocated resources:\n  Resource           Requests      Limits\n  --------           --------      ------\n  cpu                6240m (78%)   15600m (195%)\n  memory             24576Mi (76%) 49152Mi (153%)\n```\n\n问题很典型：requests 设得太高导致调度瓶颈和资源浪费，limits 和 requests 的比例不合理导致部分服务 OOMKilled、部分服务被严重 CFS 节流。技术负责人让你出一套方案，系统性地优化全集群的资源配置。\n\n你会怎么做？从数据采集、分析策略、工具选型到落地流程，请给出完整的调优方案。",
+      "answer": "## requests 与 limits 的核心机制快速回顾\n\n在动手调优之前，有必要先把 requests 和 limits 的底层语义梳理清楚，因为很多团队设错资源配置的根源就是对这两个字段的作用理解得不够精确。在 Kubernetes（本文基于 v1.30）中，`resources.requests` 是容器对集群资源的「预订」——kube-scheduler 在做调度决策时，会把节点上所有 Pod 的 requests 累加，然后跟节点的 Allocatable（总资源减去 system-reserved 和 kube-reserved）做对比，只要累加值不超过 Allocatable，就认为这个节点还有空间。这里的关键点是：调度器看的是 requests 的账面数字，而不是容器的实际使用量。一个 requests 声明了 4Gi 内存但实际只用了 200Mi 的容器，在调度器眼里跟一个真的用了 4Gi 的容器占位是一样的。这就是所谓的「over-commit gap」——requests 账面值和实际使用量之间的差距越大，集群的资源浪费就越严重。\n\n`resources.limits` 则是内核级别的硬约束。对于 CPU，limits 映射到 cgroup v2 的 `cpu.max`（或 v1 的 `cpu.cfs_quota_us`），每 100ms 的调度周期内容器最多能用多少 CPU 时间，超了就被 CFS throttle——线程挂起等下一个周期，表现为延迟毛刺。对于内存，limits 映射到 `memory.max`（v1 的 `memory.limit_in_bytes`），一旦容器的 RSS + page cache 触达这条线，内核直接触发 OOM Killer 杀进程。CPU 超限是「变慢」，内存超限是「被杀」——这个区别直接决定了 CPU 和内存在调优策略上应该采取完全不同的思路。\n\n再说 over-commit。Kubernetes 允许节点上所有 Pod 的 limits 总和超过节点的物理资源，这就是超卖。适度超卖能提高利用率，因为不是所有容器都会同时跑满。但超卖的风险是：如果容器们真的同时突发到 limits 上限，CPU 会发生严重争抢（所有人都慢），内存则会触发 OOM Kill 连环杀。所以调优的核心目标很明确：把 requests 调低到接近真实用量以释放调度空间，同时把 limits 设置在一个既能覆盖突发又不会过度超卖的合理区间。\n\n## 数据驱动的调优方法论\n\n### 第一步：压测观察法——建立基线\n\n任何调优的起点都是数据，不是猜测。你需要先搞清楚每个服务「真正用了多少资源」。最直接的方式是通过 Prometheus 查询历史 metrics。假设你的集群已经部署了 kube-state-metrics 和 cAdvisor（这是标配），那你可以用以下 PromQL 来获取过去 7 天内每个容器的 CPU 和内存使用分布：\n\n```promql\n# 过去 7 天 CPU 使用的 P95（单位：核）\nquantile_over_time(0.95,\n  rate(container_cpu_usage_seconds_total{container!=\"\", container!=\"POD\"}[5m])[7d:1m]\n)\n\n# 过去 7 天内存 working set 的 P95（单位：字节）\nquantile_over_time(0.95,\n  container_memory_working_set_bytes{container!=\"\", container!=\"POD\"}[7d:1m]\n)\n```\n\n这里有一个细节：内存指标要用 `container_memory_working_set_bytes` 而不是 `container_memory_usage_bytes`。后者包含了可回收的 page cache，会虚高；前者是 kubelet 判断 OOM 时真正参考的指标，更接近容器的「真实内存占用」。\n\n拿到 P95 数据之后，你就有了一个基线。比如某个 Go 写的 API 服务，当前配置是 `requests.cpu: 1000m, limits.cpu: 2000m, requests.memory: 2Gi, limits.memory: 4Gi`，但过去 7 天的 P95 实际使用是 CPU 180m、内存 420Mi。requests 设成了实际用量的 5 倍多——这就是典型的资源浪费。\n\n对于没有历史数据的新服务，或者负载模式不稳定的服务，需要在预发布环境做压力测试。用 `wrk`、`vegeta` 或 `k6` 按照预期 QPS 的 1.5 倍进行压测，同时用 `kubectl top pod --containers` 实时观察资源消耗的峰值：\n\n```bash\n# 用 vegeta 对服务做 30 秒、500 QPS 的压测\n$ echo \"GET http://api-service.production.svc.cluster.local/health\" | \\\n    vegeta attack -rate=500/s -duration=30s | vegeta report\n\nRequests      [total, rate, throughput]  15000, 500.03, 498.71\nDuration      [total, attack, wait]      30.078s, 29.998s, 79.893ms\nLatencies     [min, mean, 50, 90, 95, 99, max]  2.1ms, 12.3ms, 8.7ms, 22.4ms, 35.6ms, 89.2ms, 312.4ms\nSuccess       [ratio]  99.87%\nStatus Codes  [code:count]  200:14981  503:19\n\n# 同时在另一个终端观察 Pod 资源消耗\n$ kubectl top pod -l app=api-service --containers\nPOD                              NAME   CPU(cores)   MEMORY(bytes)\napi-service-5d8f7b9c4d-x2k9j    app    287m         486Mi\napi-service-5d8f7b9c4d-a4n1z    app    312m         491Mi\n```\n\n压测期间 CPU 峰值是 312m，内存峰值是 491Mi。那 requests 可以设为 CPU 350m、内存 512Mi（在峰值基础上加 10-15% 的安全余量），这比之前的 1000m CPU 和 2Gi 内存合理得多。\n\n### 第二步：VPA Recommender——让算法帮你算\n\n手动分析 200 个服务的资源数据是不现实的。Kubernetes 社区提供了 VPA（Vertical Pod Autoscaler，当前稳定版本 v1.2.1）来自动化这个过程。VPA 由三个组件组成：Recommender 负责采集 metrics-server 的数据并计算推荐值，Updater 负责驱逐 Pod 以应用新的资源配置（在 Auto 模式下），Admission Controller 负责在 Pod 创建时注入推荐的资源值。\n\n在调优初期，强烈建议只用 `Off` 模式（也叫推荐模式）——只看推荐值，不自动修改。这样你可以先验证推荐值是否合理，避免 VPA 自动改配置导致线上问题：\n\n```yaml\napiVersion: autoscaling.k8s.io/v1\nkind: VerticalPodAutoscaler\nmetadata:\n  name: api-service-vpa\n  namespace: production\nspec:\n  targetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: api-service\n  updatePolicy:\n    updateMode: \"Off\"   # 只推荐，不自动更新\n  resourcePolicy:\n    containerPolicies:\n    - containerName: app\n      minAllowed:\n        cpu: 100m\n        memory: 128Mi\n      maxAllowed:\n        cpu: 4\n        memory: 8Gi\n      controlledResources: [\"cpu\", \"memory\"]\n```\n\n部署之后等待 24-48 小时（至少要覆盖一个完整的业务周期），然后查看推荐结果：\n\n```bash\n$ kubectl describe vpa api-service-vpa -n production\nStatus:\n  Recommendation:\n    Container Recommendations:\n      Container Name: app\n      Lower Bound:\n        Cpu:     120m\n        Memory:  280Mi\n      Target:\n        Cpu:     210m\n        Memory:  380Mi\n      Uncapped Target:\n        Cpu:     210m\n        Memory:  380Mi\n      Upper Bound:\n        Cpu:     680m\n        Memory:  1200Mi\n```\n\nVPA 输出的四个值含义如下：`Target` 是推荐的 requests 值，相当于 VPA 认为的「这个容器正常运行需要多少资源」；`Lower Bound` 是最低安全值，低于这个值容器可能会频繁资源不足；`Upper Bound` 是 VPA 观测到的使用上限，可以作为 limits 的参考；`Uncapped Target` 是不考虑 minAllowed/maxAllowed 约束时的原始推荐值。\n\n实践中，一个比较好的策略是：把 requests 设为 `Target` 值再上浮 10-20%（覆盖 VPA 采样窗口之外的突发），把 limits 设为 `Upper Bound` 或 `Target` 的 2-3 倍（取较小值）。以上面的例子为例，最终配置可以是 `requests.cpu: 250m, requests.memory: 450Mi, limits.cpu: 680m, limits.memory: 1200Mi`。\n\n### 第三步：CPU 与内存的差异化 ratio 策略\n\n调优的一个核心认知是：CPU 和内存的 limits 策略应该完全不同，因为超限的后果天差地别。\n\n**CPU：考虑不设 limits，或设较宽的 ratio。** Google 的 Borg 系统和 Kubernetes 社区中越来越多的声音建议：对 CPU 只设 requests 不设 limits。原因很直接——CPU 是可压缩资源，当多个容器争抢 CPU 时，内核按 `cpu.weight`（cgroup v2）的比例分配时间片，requests 已经保证了公平性。设了 CPU limits 之后，即使节点上有大量空闲 CPU，容器也会因为 CFS quota 用尽而被 throttle。你可以通过以下 Prometheus 查询来检查集群中有多少 CPU throttle 发生：\n\n```promql\n# 每个容器的 CPU 节流率\nrate(container_cpu_cfs_throttled_periods_total[5m])\n/\nrate(container_cpu_cfs_periods_total[5m])\n```\n\n如果某个容器的节流率超过 25%，说明它的 CPU limits 设得太紧了。在 Shopify 的实践中，他们在取消 CPU limits 后，服务的 P99 延迟平均下降了 40%，集群 CPU 利用率从 20% 提升到了 55%。但取消 CPU limits 有一个前提：你的集群不是公有多租户的（即不存在一个恶意容器吃光所有 CPU 的风险），并且你有完善的 CPU 使用监控和告警。如果你的团队没有信心做到这一点，那设一个宽松的 ratio——比如 limits = 5 × requests 或者干脆 limits = 节点 CPU 核数——也比紧巴巴地卡 2 倍要好。\n\n**内存：必须设 limits，且 ratio 要保守。** 内存超限是不可逆的——进程直接被杀，不是变慢而是宕掉。所以内存 limits 必须设，而且不能太激进。推荐的 ratio 是 `limits = requests × 1.2 ~ 1.5`。内存的 requests 本身要设得比 CPU 更贴近实际峰值（而不是 P95），因为内存的突发通常不像 CPU 那样短暂——一次 GC、一次大查询结果的加载，内存可能在几十秒内持续处于高位。对于 Java 服务尤其要注意：JVM 的堆内存（-Xmx）加上堆外内存（Metaspace、thread stack、NIO direct buffer、JNI）的总和才是真正的内存占用。一个常见的坑是 `-Xmx` 设了 2G 但 limits 也设了 2Gi，结果堆外内存一多就 OOM。经验公式是 `limits.memory ≈ Xmx × 1.5 + 256Mi`，至少要给堆外留 30-50% 的空间。\n\n一份典型的差异化配置长这样：\n\n```yaml\nresources:\n  requests:\n    cpu: 250m       # 基于 VPA Target 上浮 20%\n    memory: 512Mi   # 基于实际 P99 working set\n  limits:\n    # cpu: 不设置，允许使用节点空闲 CPU\n    memory: 768Mi   # requests × 1.5，覆盖 GC 和突发\n```\n\n这种配置模式在 Google、Shopify、Datadog 等公司的大规模集群中被广泛采用。Pod 的 QoS Class 会变成 Burstable（因为 CPU 没有 limits），但只要内存 requests 和 limits 设得合理，被 OOM Kill 的风险很低。如果你的核心服务必须是 Guaranteed 级别以获得最高的驱逐保护优先级，那就老老实实把 CPU 和内存的 requests 都设成跟 limits 一样——但接受由此带来的 CFS throttle 和更高的调度碎片。\n\n## 工具化落地与体系化兜底\n\n### Goldilocks：全集群可视化推荐\n\n对 200 个服务逐一创建 VPA 对象太麻烦了。FairwindsOps 开源的 Goldilocks（v4.11+）可以自动为 Namespace 下的每一个 Deployment 创建 VPA 对象（Off 模式），然后提供一个 Web Dashboard 展示所有服务的推荐值与当前值的对比。部署方式是一条 Helm 命令：\n\n```bash\n$ helm install goldilocks fairwinds-stable/goldilocks \\\n    --namespace goldilocks --create-namespace \\\n    --set dashboard.enabled=true\n\n# 然后给需要分析的 namespace 打上标签\n$ kubectl label namespace production goldilocks.fairwinds.com/enabled=true\n```\n\n等待数据采集 24 小时后，打开 Goldilocks Dashboard 你会看到类似这样的推荐报告——每个 Deployment 的每个容器都有当前值、推荐值、以及 Lower/Upper Bound 的可视化对比。实际操作中，Goldilocks 最大的价值不是它的推荐算法（底层就是 VPA Recommender），而是它把「哪些服务资源配置最离谱」这个问题变成了一张排序表。你可以优先处理 requests 超配最严重的 Top 20 服务，用一两个迭代就能把集群利用率拉上来。\n\n### Namespace 级 LimitRange 兜底\n\n调优不是一次性的事。团队会持续部署新服务，新来的开发者可能根本不知道资源配置的最佳实践，直接复制一个旧的 YAML 就上线了。所以你需要一个「防线」——LimitRange。它的作用是给 Namespace 设置默认值和上下限，确保即使开发者不写 resources 字段，Pod 也不会以 BestEffort 裸跑：\n\n```yaml\napiVersion: v1\nkind: LimitRange\nmetadata:\n  name: resource-guardrails\n  namespace: production\nspec:\n  limits:\n  - type: Container\n    default:            # 未设置 limits 时的默认值\n      cpu: \"1\"\n      memory: 512Mi\n    defaultRequest:     # 未设置 requests 时的默认值\n      cpu: 200m\n      memory: 256Mi\n    max:                # 单个容器 limits 的上限\n      cpu: \"8\"\n      memory: 16Gi\n    min:                # 单个容器 requests 的下限\n      cpu: 50m\n      memory: 64Mi\n    maxLimitRequestRatio:  # limits/requests 的最大比例\n      cpu: \"10\"\n      memory: \"3\"\n```\n\n这里的 `maxLimitRequestRatio` 特别重要——它限制了 limits 和 requests 的比值。如果有人写了 `requests.memory: 128Mi, limits.memory: 16Gi`（ratio = 128 倍），这个 Pod 创建会被 LimitRange 拒绝。这能防止极端的超卖配置进入集群。配合 ResourceQuota 限制 Namespace 级别的 requests/limits 总量，你就有了从单容器到整个 Namespace 的资源治理体系。\n\n### 生产最佳实践清单\n\n最后把实战中验证过的经验总结成一个落地流程。第一步是数据采集阶段：部署 Goldilocks 或者给关键服务创建 VPA（Off 模式），采集至少 7 天的数据，覆盖工作日和周末的流量差异。第二步是分析阶段：把 VPA Target 和当前 requests 做对比，按超配比例排序，先挑超配超过 3 倍的服务下手。第三步是灰度调整阶段：不要一次性改所有服务——先选 3-5 个非核心服务作为试点，调低 requests 到 VPA Target 的 1.2 倍，观察一周有没有调度失败或 OOM。第四步是全面推广：试点没问题后，按照服务优先级分批推进，核心服务放在最后一批。第五步是持续治理：配置 LimitRange 和 ResourceQuota 防止回退，设置 Prometheus 告警监控 `kube_pod_container_resource_requests` 和实际使用量的偏差率，偏差超过 3 倍就自动创建 Jira ticket 跟进。\n\n关于 Java 服务的专项建议：务必在 Dockerfile 或 JVM 启动参数中加上 `-XX:+UseContainerSupport`（JDK 10+ 默认开启）和 `-XX:MaxRAMPercentage=70.0`，让 JVM 感知 cgroup 内存限制并将堆大小设为 limits 的 70%。剩余 30% 留给 Metaspace（默认上限约 256MB）、线程栈（每线程 1MB × 线程数）、NIO direct buffer 和 JNI。一个典型的 Java 服务资源配置示例：\n\n```yaml\ncontainers:\n- name: java-app\n  image: java-app:2.1.0\n  env:\n  - name: JAVA_OPTS\n    value: \"-XX:MaxRAMPercentage=70.0 -XX:+UseContainerSupport\"\n  resources:\n    requests:\n      cpu: 500m\n      memory: 1Gi      # 实际观测 P99 working set\n    limits:\n      # cpu: 不设置\n      memory: 1536Mi   # 1Gi × 1.5，给堆外留空间\n```\n\n另一个常被忽略的点是 init container 的资源配置。Kubernetes 在调度时取的是 init container 和普通 container 的 requests 最大值（而不是累加值，因为 init container 是顺序执行且在普通容器启动前结束）。如果你有一个 init container 的 requests 设了 4Gi 内存但实际只用了 200Mi，它会影响调度但不影响运行——这种情况同样需要排查和优化。\n\n归根结底，资源配置调优不是一个技术问题，而是一个工程纪律问题。工具（VPA、Goldilocks）解决的是「怎么知道该设多少」，制度（LimitRange、ResourceQuota、CI 检查）解决的是「怎么保证大家都设对了」，而持续监控解决的是「配置漂移了怎么及时发现」。三者缺一不可。",
+      "keyPoints": [
+        "requests 是调度账面值而非实际用量，over-commit gap（requests 与真实使用的差距）是资源浪费的根源，调度器只看 requests 累加值与 Allocatable 的对比",
+        "通过 Prometheus 的 container_cpu_usage_seconds_total 和 container_memory_working_set_bytes 指标获取 P95/P99 历史用量，以此作为 requests 的数据基础而非拍脑袋",
+        "VPA Recommender 的 Target 值是推荐的 requests，Upper Bound 可作为 limits 参考，生产中应先用 Off 模式观察 24-48 小时再决策",
+        "CPU 和内存的 limits 策略应差异化：CPU 是可压缩资源，超限只会 throttle 不会杀进程，可以不设 limits 或设宽松 ratio；内存超限直接 OOMKill，必须设 limits 且 ratio 控制在 1.2-1.5 倍",
+        "Java 服务要特别注意堆外内存，limits.memory 应至少是 Xmx 的 1.5 倍加 256Mi，并开启 -XX:MaxRAMPercentage=70.0 让 JVM 感知 cgroup 限制",
+        "Goldilocks 可以自动为 Namespace 下所有 Deployment 创建 VPA 对象并可视化推荐值，适合大规模集群的批量排查",
+        "LimitRange 的 defaultRequest/default/maxLimitRequestRatio 三级配置形成兜底防线，防止未配置资源的 BestEffort Pod 和极端超卖进入集群",
+        "资源调优是持续过程而非一次性操作，需要数据采集、灰度调整、制度兜底、持续监控四个环节形成闭环"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz1",
+          "question": "当集群 CPU 实际利用率只有 15% 但 requests 分配率已达 80% 时，根本原因最可能是什么？",
+          "choices": [
+            {"id": "A", "text": "节点的 kubelet 配置了过高的 system-reserved，导致 Allocatable 偏低"},
+            {"id": "B", "text": "大量 Pod 的 requests.cpu 远高于实际使用量，调度账面值虚高"},
+            {"id": "C", "text": "kube-scheduler 的调度算法存在 bug，没有正确计算节点可用资源"},
+            {"id": "D", "text": "集群开启了 CPU limits 导致所有容器都被 CFS 节流，实际利用率被压低"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是典型的 over-commit gap 问题。调度器只看 requests 的累加值，不看实际使用量。如果 Pod 的 requests 设成了实际用量的 3-5 倍，调度层面 80% 满了但真实利用率只有 15% 就完全说得通。A 选项中 system-reserved 通常只占几个百分点，不会导致如此大的差距。D 选项中 CFS 节流会降低 CPU 上限但不会让利用率从 80% 降到 15%，因为 throttle 只是限制了上限而非压低了基线使用量。C 选项中调度器的资源计算逻辑是 Kubernetes 最基础最稳定的功能之一，不太可能是 bug。"
+        },
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz2",
+          "question": "在评估容器的真实内存使用量时，应该优先参考哪个 Prometheus 指标？",
+          "choices": [
+            {"id": "A", "text": "container_memory_usage_bytes，它是容器的总内存使用量"},
+            {"id": "B", "text": "container_memory_working_set_bytes，它排除了可回收的 page cache"},
+            {"id": "C", "text": "container_memory_rss，它只统计进程的常驻内存"},
+            {"id": "D", "text": "container_memory_max_usage_bytes，它记录了历史峰值"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "container_memory_working_set_bytes 是 kubelet 在判断是否触发 OOM Kill 时实际参考的指标，它等于总使用量减去可回收的 inactive file page cache。container_memory_usage_bytes（A 选项）包含了内核可以随时回收的 page cache，会显著虚高——一个读了大量文件的容器 usage 可能是 2Gi 但 working_set 只有 400Mi。container_memory_rss（C 选项）只统计匿名页不包含 active file cache，可能偏低。container_memory_max_usage_bytes（D 选项）是历史峰值不是当前状态，无法反映持续的资源需求模式。"
+        },
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz3",
+          "question": "VPA 部署为 Off 模式时，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "VPA 不会采集任何数据，只是一个占位的空壳对象"},
+            {"id": "B", "text": "VPA 会采集数据并生成推荐值，但不会自动修改 Pod 的资源配置"},
+            {"id": "C", "text": "VPA 会在 Pod 重新创建时通过 Admission Webhook 注入推荐值"},
+            {"id": "D", "text": "VPA 会直接修改 Deployment 的 spec.template.resources 字段"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Off 模式（也称推荐模式）是 VPA 最安全的使用方式。Recommender 组件仍然会持续采集 metrics-server 提供的资源使用数据，基于指数直方图算法计算出 Lower Bound、Target、Upper Bound 三档推荐值，你可以通过 kubectl describe vpa 查看。但 Updater 不会驱逐 Pod，Admission Controller 也不会在 Pod 创建时注入推荐值——一切都只是建议，需要人工确认后手动修改。C 选项描述的是 Initial 模式的行为，D 选项描述的行为在任何模式下都不会发生（VPA 不修改 Deployment spec，而是通过 Pod mutation 实现）。"
+        },
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz4",
+          "question": "CPU limits 映射到 cgroup v2 的哪个参数来实现硬限制？",
+          "choices": [
+            {"id": "A", "text": "cpu.weight，通过权重比例限制 CPU 分配"},
+            {"id": "B", "text": "cpu.max，通过 CFS bandwidth control 限制每个周期的 CPU 时间配额"},
+            {"id": "C", "text": "cpu.pressure，通过 PSI（Pressure Stall Information）来限制 CPU 使用"},
+            {"id": "D", "text": "cpu.stat 中的 nr_throttled 计数器，累积到阈值后限制容器"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 cgroup v2 中，CPU limits 映射到 cpu.max 文件，其内容格式为「quota period」两个数字，比如「50000 100000」表示每 100ms 的调度周期内最多使用 50ms 的 CPU 时间（对应 500m limits）。这是 CFS bandwidth control 机制，超出配额后线程会被挂起直到下个周期——即 CFS throttle。cpu.weight（A 选项）对应的是 requests 而非 limits，它是一个相对权重只在 CPU 争抢时生效。cpu.pressure（C 选项）是 PSI 监控接口，只读不可写，不是限制机制。cpu.stat（D 选项）中的 nr_throttled 是统计计数器，记录被节流次数，不是控制参数。"
+        },
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz5",
+          "question": "以下 VPA 推荐输出中，你应该如何使用这些数据来设置 requests 和 limits？\n\n```\nLower Bound:  Cpu: 120m, Memory: 280Mi\nTarget:       Cpu: 210m, Memory: 380Mi\nUpper Bound:  Cpu: 680m, Memory: 1200Mi\n```",
+          "choices": [
+            {"id": "A", "text": "requests 设为 Lower Bound（120m/280Mi），limits 设为 Upper Bound（680m/1200Mi）"},
+            {"id": "B", "text": "requests 和 limits 都设为 Target（210m/380Mi），使 QoS 为 Guaranteed"},
+            {"id": "C", "text": "requests 设为 Target 上浮 10-20%（约 250m/450Mi），limits 参考 Upper Bound 或 Target 的 2-3 倍取较小值"},
+            {"id": "D", "text": "requests 设为 Upper Bound（680m/1200Mi）以确保不会资源不足，limits 不设"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Target 是 VPA 基于历史数据计算出的「正常运行所需资源量」，相当于推荐 requests。但直接用 Target 作为 requests 没有安全余量，上浮 10-20% 可以覆盖采样窗口之外的突发。limits 取 Upper Bound 和 Target × 2-3 倍的较小值，既能覆盖极端场景又不过度超卖。A 选项中 Lower Bound 设为 requests 太激进，容器可能在负载稍高时就资源不足。B 选项虽然得到 Guaranteed QoS，但 Target 值本身偏紧，且完全没有 burst 空间。D 选项把 Upper Bound 设为 requests 相当于把极端值当常态值，又回到了资源浪费的老路。"
+        },
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz6",
+          "question": "一个 Java 服务配置了 -Xmx2g，容器的 limits.memory 也设成了 2Gi，为什么这个配置几乎必然导致 OOMKilled？",
+          "choices": [
+            {"id": "A", "text": "因为 2g 和 2Gi 的单位不一样，2g = 2,000,000,000 字节而 2Gi = 2,147,483,648 字节，堆实际超出了限制"},
+            {"id": "B", "text": "因为 JVM 的总内存 = 堆内存 + Metaspace + 线程栈 + NIO direct buffer + JNI 等堆外内存，总量远超 2Gi"},
+            {"id": "C", "text": "因为 Kubernetes 的 memory limits 不包含 page cache，JVM 的堆内存会被重复计算"},
+            {"id": "D", "text": "因为 cgroup 的 memory.max 有 5% 的保留开销，实际可用只有 1.9Gi"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "JVM 的 -Xmx 只控制堆内存的上限。但 JVM 进程的实际内存占用远不止堆——Metaspace 默认上限约 256MB（存储类元数据），每个线程的栈默认 1MB（200 个线程就是 200MB），NIO direct buffer、Code Cache、GC 自身的工作内存、JNI 分配的 native memory 等加起来通常还要 300-500MB。一个 -Xmx2g 的 JVM 实际 RSS 可能达到 2.8-3.2Gi。把 limits 也设成 2Gi 几乎没给堆外留任何空间，只要一有点压力就会触碰 cgroup memory.max 被 OOM Kill。正确做法是 limits 至少设为 Xmx 的 1.5 倍再加 256Mi。"
+        },
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz7",
+          "question": "关于「CPU 不设 limits」和「CPU 设 limits = 2 × requests」两种策略的对比，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "不设 CPU limits 会导致 Pod 的 QoS 降为 BestEffort，在内存压力时最先被驱逐"},
+            {"id": "B", "text": "不设 CPU limits 时容器可以使用节点上所有空闲 CPU，但在 CPU 争抢时仍然按 requests 比例分配，不会影响其他容器的保障"},
+            {"id": "C", "text": "设 CPU limits = 2 × requests 可以完全消除 CFS 节流，因为 2 倍余量足够覆盖所有突发"},
+            {"id": "D", "text": "不设 CPU limits 意味着 cgroup 中 cpu.max 被设为 0，容器完全无法使用 CPU"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "不设 CPU limits 时，cgroup 的 cpu.max 被设为「max 100000」（即不限制），容器可以在 CPU 空闲时使用任意多的 CPU 时间。但 cpu.weight（由 requests 决定）仍然生效——当多个容器同时争抢 CPU 时，内核按 weight 比例分配，requests 高的容器分到更多时间片。A 选项错误：QoS 降为 BestEffort 的条件是所有资源（CPU 和内存）的 requests 和 limits 都不设置，只要内存设了 requests 就至少是 Burstable。C 选项错误：2 倍 ratio 不一定够，取决于应用的突发特征，很多服务在尖峰时刻 CPU 用量可能是均值的 5-10 倍。D 选项错误：不设 limits 时 cpu.max 为「max」（无限制）而非 0。"
+        },
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz8",
+          "question": "你接手一个 200+ 微服务的集群，需要批量分析所有服务的资源配置合理性。以下哪种工具和方法最适合？",
+          "choices": [
+            {"id": "A", "text": "对每个 Deployment 手动执行 kubectl top pod 并记录到表格中逐一分析"},
+            {"id": "B", "text": "部署 Goldilocks，给目标 Namespace 打上标签，等待 24 小时后通过 Dashboard 查看推荐值排序"},
+            {"id": "C", "text": "直接部署 VPA 为 Auto 模式让它自动调整所有服务的资源配置"},
+            {"id": "D", "text": "通过 ResourceQuota 把 Namespace 的总资源限制砍半，迫使开发者自己调低配置"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Goldilocks 的核心价值就是解决大规模集群的批量资源分析问题。它自动为 Namespace 下的每个 Deployment 创建 Off 模式的 VPA 对象，收集数据后通过 Web Dashboard 展示每个服务的当前配置 vs 推荐配置对比，还能按超配比例排序——让你一眼看出哪些服务最「浪费」。A 选项的手动分析在 200 个服务面前完全不可行。C 选项直接上 Auto 模式风险极高，VPA 会通过驱逐 Pod 来应用新配置，大规模自动调整可能导致连锁重启事故。D 选项是粗暴的行政手段，不基于数据分析，可能导致正常服务资源不足。"
+        },
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz9",
+          "question": "如果一个 Pod 有两个 init container（分别声明 requests.memory 为 4Gi 和 1Gi）和一个普通 container（声明 requests.memory 为 2Gi），kube-scheduler 在调度时会认为这个 Pod 需要多少内存？",
+          "choices": [
+            {"id": "A", "text": "7Gi（4Gi + 1Gi + 2Gi 三者累加）"},
+            {"id": "B", "text": "4Gi（取 init container 中的最大值 4Gi，因为它大于普通 container 的 2Gi）"},
+            {"id": "C", "text": "2Gi（只看普通 container，init container 执行完就退出不占资源）"},
+            {"id": "D", "text": "6Gi（init container 的最大值 4Gi 加上普通 container 的 2Gi）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kubernetes 调度器计算 Pod 的 effective requests 时，对 init container 取最大值（不是累加，因为 init container 是按顺序串行执行的，同一时刻最多只有一个在跑），然后跟所有普通 container 的 requests 累加值做比较，取两者中的较大值。本题中 init container 的最大值是 max(4Gi, 1Gi) = 4Gi，普通 container 的累加值是 2Gi，最终 effective requests = max(4Gi, 2Gi) = 4Gi。这意味着即使 init container 只运行几秒钟，它的高 requests 也会占用调度配额。如果 init container 实际只用了 200Mi 却声明了 4Gi，这就是典型的调度浪费，需要优化。"
+        },
+        {
+          "id": "k8s-requests-limits-tuning-q1-quiz10",
+          "question": "某服务上线后频繁出现 P99 延迟周期性飙高（每隔几百毫秒出现一次尖峰），但 CPU 使用率均值只有 30%。你怀疑是 CFS throttle，应该用什么命令或指标来确认？",
+          "choices": [
+            {"id": "A", "text": "kubectl top pod 查看 CPU 使用率是否接近 limits"},
+            {"id": "B", "text": "查看 Prometheus 指标 container_cpu_cfs_throttled_periods_total 的变化率，确认是否有大量 CFS 节流周期"},
+            {"id": "C", "text": "kubectl describe pod 查看 Events 中是否有 CPU throttle 相关告警"},
+            {"id": "D", "text": "在节点上执行 top 命令观察容器进程的 CPU 利用率是否达到 100%"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CFS throttle 是一个非常隐蔽的性能问题——应用不会报错、不会 crash，kubectl describe pod 的 Events 里也不会有任何记录，所以 C 选项无效。kubectl top pod（A 选项）显示的是平均 CPU 使用率，一个均值 30% 的容器完全可能在某些毫秒级的窗口内突发到 100% 然后被 throttle，均值看不出来。节点上的 top 命令（D 选项）同理，粒度太粗。正确的排查方式是查看 container_cpu_cfs_throttled_periods_total（被节流的 CFS 周期数）和 container_cpu_cfs_periods_total（总 CFS 周期数）的比值，如果节流率超过 5-10% 就说明 CPU limits 设得太紧。也可以直接在节点上读取 cgroup 的 cpu.stat 文件中的 nr_throttled 和 throttled_usec 字段来确认。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/manage-resources/memory-default-namespace/",
+        "https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler",
+        "https://goldilocks.docs.fairwinds.com/",
+        "https://home.robusta.dev/blog/stop-using-cpu-limits",
+        "https://engineering.shopify.com/blogs/engineering/autoscaling-pods-kubernetes-vpa"
+      ]
+    }
+  ]
+}
