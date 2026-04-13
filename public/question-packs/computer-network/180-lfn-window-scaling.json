@@ -1,0 +1,157 @@
+{
+  "id": "computer-network-180",
+  "name": "长肥管道（LFN）问题及 TCP 窗口缩放",
+  "domain": "computer-network",
+  "description": "深入解析长肥网络（Long Fat Network）的定义、BDP 计算、TCP 窗口缩放选项的协商机制与内核调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "computer-network-180-q1",
+      "domain": "computer-network",
+      "type": "tuning",
+      "difficulty": 4,
+      "tags": ["LFN", "BDP", "窗口缩放", "TCP性能", "长肥管道"],
+      "title": "什么是长肥管道（LFN）？为什么传统 TCP 在上面跑不快，窗口缩放是怎么解决这个问题的？",
+      "content": "## 场景：跨洲数据库同步吞吐量不到理论值的 5%\n\n你的团队在上海和法兰克福各有一组 PostgreSQL 集群，之间通过一条 10Gbps MPLS 专线做逻辑复制。链路 RTT 实测约 180ms，丢包率低于 0.05%。DBA 反馈每天凌晨的增量同步越来越慢——昨晚一个 120GB 的 WAL 归档传了接近 6 小时。按 10Gbps 算，120GB 理论上只需要 96 秒，实际花了 21600 秒，带宽利用率不到 0.5%。\n\n运维组先在两端各跑了一轮 iperf3 单流基准测试：\n\n```bash\n$ iperf3 -c de-fra-pgdb01.internal -t 30 -P 1\nConnecting to host de-fra-pgdb01.internal, port 5201\n[  5] local 10.20.1.8 port 51204 connected to 172.16.88.3 port 5201\n[ ID] Interval           Transfer     Bitrate         Retr  Cwnd\n[  5]   0.00-5.00   sec  24.3 MBytes  40.8 Mbits/sec   214   428 KBytes\n[  5]   5.00-10.00  sec  25.1 MBytes  42.1 Mbits/sec   187   395 KBytes\n[  5]  10.00-15.00  sec  24.7 MBytes  41.4 Mbits/sec   203   412 KBytes\n[  5]  15.00-20.00  sec  25.4 MBytes  42.6 Mbits/sec   176   441 KBytes\n[  5]  20.00-25.00  sec  24.9 MBytes  41.8 Mbits/sec   195   407 KBytes\n[  5]  25.00-30.00  sec  25.2 MBytes  42.3 Mbits/sec   182   423 KBytes\n- - - - - - - - - - - - - - - - - - - - - - - - -\n[ ID] Interval           Transfer     Bitrate         Retr\n[  5]   0.00-30.00  sec   150 MBytes  41.8 Mbits/sec  1157             sender\n[  5]   0.00-30.04  sec   148 MBytes  41.4 Mbits/sec                  receiver\n```\n\n10Gbps 的专线只跑到了 42Mbps——连线速的 0.4% 都不到。Cwnd 在 400KB 左右徘徊，30 秒内重传 1157 次。你用 `ss -ti` 抓了一下连接内部状态：\n\n```bash\n$ ss -ti dst 172.16.88.3\nState  Recv-Q  Send-Q  Local Address:Port   Peer Address:Port\nESTAB  0       892416  10.20.1.8:51204     172.16.88.3:5201\n\tcubic wscale:0,0 rto:560 rtt:181.2/4.8 ato:40 mss:1448\n\tcwnd:296 ssthresh:241 bytes_sent:157286400 bytes_acked:157184000\n\tsegs_out:108632 segs_in:76244 send 18.9Mbps\n\tpacing_rate 22.7Mbps delivery_rate 17.8Mbps\n\tretrans:0/1157 rcv_space:29200 rcv_ssthresh:29200\n```\n\n几个数字一看就不对劲。首先 `wscale:0,0`——双方的 Window Scale 缩放因子都是 0，意味着 TCP 窗口没有经过任何缩放，接收窗口最大只能到 TCP 头部 Window 字段的原始上限 65535 字节。再看 `rcv_space:29200`，接收缓冲区只开了 29KB。cwnd 虽然涨到了 296（296 × 1448 ≈ 428KB），但 rwnd 被卡在 65535 字节，有效窗口 = min(cwnd, rwnd) ≈ 64KB。吞吐量上限 = 64KB / 181ms ≈ 354KB/s ≈ 2.8Mbps——理论值甚至比实测的 42Mbps 还低（实际稍高是因为 ACK 会逐步释放窗口空间形成流水线效应），无论如何离 10Gbps 差了三个数量级。\n\n这条链路就是一根典型的「长肥管道」（Long Fat Network，LFN）。它的 BDP = 10Gbps × 180ms ÷ 8 = **225MB**。要灌满这根管道，TCP 的有效窗口至少要开到 225MB，而现在被锁在了 64KB。问题出在哪里？为什么 `wscale:0,0`？TCP 窗口缩放到底是怎么工作的？怎么调才能让吞吐量从 42Mbps 逼近 10Gbps 线速？",
+      "answer": "## 一、TCP 窗口与长肥管道：核心基础详解\n\n### TCP 滑动窗口的本质\n\nTCP（Transmission Control Protocol）在传输层通过滑动窗口实现流量控制与可靠传输。所谓「滑动窗口」，是指发送方不必逐包等待确认，而是可以在收到 ACK 之前连续发出多个报文段，只要已发送但未确认的数据总量不超过一个「窗口」上限。这个窗口大小由两个值共同决定：接收方在每个 ACK 中通告的接收窗口 `rwnd`（Receiver Window，告诉发送方「我的接收缓冲区还能装多少数据」），以及发送方自己维护的拥塞窗口 `cwnd`（Congestion Window，发送方对当前网络承载能力的估计值）。实际可用窗口取二者较小值：`effective_window = min(cwnd, rwnd)`。\n\nTCP 吞吐量的理论上限由一个非常简洁的公式决定：**吞吐量 ≤ effective_window / RTT**。这个公式的物理含义很直观——发送方在一个往返时间（RTT）内最多能发出 effective_window 大小的数据。在局域网中 RTT 通常只有零点几毫秒，窗口再小也不会成为瓶颈。但当链路延伸到跨洲级别，RTT 飙升到 100ms 甚至几百毫秒时，窗口大小就成了决定吞吐量的第一要素。\n\n要理解 TCP 窗口字段的原始设计限制，得回到 1981 年 RFC 793 定义 TCP 头部的时代。TCP 头部的 Window 字段是一个 16 位无符号整数，取值范围 0 ~ 65535，单位是字节。也就是说，在不做任何扩展的情况下，接收方能通告的最大窗口就是 65535 字节（约 64KB）。1981 年 ARPANET 的骨干链路带宽只有 56Kbps，64KB 的窗口足以支撑 56Kbps × 任意 RTT 的 BDP，所以 16 位绰绰有余。但四十多年后的今天，10Gbps 甚至 100Gbps 的洲际链路已经稀松平常，64KB 的窗口远远不够了。\n\n### 什么是长肥管道（LFN）\n\n长肥管道的概念最早由 RFC 1072（1988 年）提出，后来在 RFC 1323（1992 年）和其更新版 RFC 7323（2014 年）中被正式定义。LFN 全称 Long Fat Network，读音是「elephant」（大象），指的是带宽延迟积（Bandwidth-Delay Product，BDP）很大的网络路径。RFC 7323 的原文是：「A path operating with a large bandwidth-delay product is referred to as a Long Fat Network (LFN, pronounced 'elephant').」\n\nBDP 的计算公式是 **BDP = Bandwidth × RTT**，它的物理含义是：在任意时刻，网络管道中「正在飞行」的数据总量。把网络想象成一根水管——带宽是管子的横截面积（单位时间能灌多少水），RTT 是水从管子一端流到另一端再折返回来的时间，BDP 就是这根管子的总容积。要让管子里充满水（带宽被 100% 利用），你必须在管子里同时维持至少 BDP 大小的在途数据。\n\n下面这张 BDP 计算表可以直观感受不同链路场景下管道有多「肥」：\n\n| 场景 | 带宽 | RTT | BDP（字节） | 64KB 窗口利用率 |\n|------|------|-----|------------|----------------|\n| 同机房 | 10Gbps | 0.2ms | 250KB | 26.2% |\n| 同城双活 | 10Gbps | 2ms | 2.5MB | 2.6% |\n| 京沪专线 | 10Gbps | 30ms | 37.5MB | 0.17% |\n| 中欧专线 | 10Gbps | 180ms | 225MB | 0.028% |\n| 中美专线 | 10Gbps | 160ms | 200MB | 0.032% |\n| GEO 卫星 | 100Mbps | 600ms | 7.5MB | 0.85% |\n\n从这张表可以清楚看到：只要 RTT 超过几毫秒且带宽在 Gbps 级别，64KB 的窗口就完全无法填满管道。题目中的场景 BDP = 225MB，64KB 的窗口只能利用 0.028% 的管道容量——相当于一条 8 车道高速公路上只放了一辆自行车。\n\n### 传统 TCP 在 LFN 上遇到的三大瓶颈\n\nRFC 7323 总结了传统 TCP 在 LFN 上面临的三个核心问题，它们分别对应三个 TCP 扩展选项。\n\n第一个问题是窗口大小限制。TCP 头部 Window 字段 16 位最大 65535 字节，在 BDP = 225MB 的链路上吞吐量被锁死在 65535 / 0.18 ≈ 355KB/s。解决方案是 Window Scale 选项，通过位移因子将窗口扩展到最高 1GB。\n\n第二个问题是 RTT 测量精度不足。TCP 原始规范中 RTT 的测量依赖于记录发送时间和收到 ACK 的时间差，但在高 BDP 链路上大量报文段在途，传统的「每 RTT 采样一次」方式粒度太粗，导致 RTO（Retransmission Timeout）计算不准确——要么太大（超时等待过长），要么太小（误判超时触发不必要的重传）。解决方案是 TCP Timestamps 选项（TSopt），在每个报文段中携带时间戳，实现逐包 RTT 测量。\n\n第三个问题是序列号回绕（Sequence Number Wraparound）。TCP 序列号是 32 位无符号整数，最大值约 4.29GB。在 10Gbps 链路上，4.29GB 的数据只需要 3.4 秒就能发完，之后序列号就「绕回」到起点。如果一个延迟到达的旧报文段恰好携带了回绕后的合法序列号，接收方可能误收旧数据。解决方案是 PAWS（Protection Against Wrapped Sequences），利用 Timestamps 选项中的时间戳单调递增特性来拒绝过期报文段。\n\n## 二、TCP 窗口缩放选项的深度解析\n\n### Window Scale 的协商机制\n\nWindow Scale 选项（RFC 7323 Section 2）是一个只在三次握手阶段出现的 TCP 选项。它的格式非常简单：Kind = 3，Length = 3，后跟 1 字节的 shift count 值。shift count 的取值范围是 0 到 14，接收方实际通告的窗口 = TCP 头部 Window 字段值 × 2^shift。\n\n协商过程是这样的：在 SYN 包中，主动连接方（客户端）携带自己的 Window Scale 选项，声明「我的 shift count 是 X」；在 SYN-ACK 包中，被动连接方（服务端）携带自己的 Window Scale 选项，声明「我的 shift count 是 Y」。如果 SYN 中没有 Window Scale 选项，SYN-ACK 也不允许携带——这保证了与不支持 Window Scale 的旧设备的向后兼容性。连接建立之后，每个方向的窗口缩放因子独立生效：发送方用对端的 shift count 来解释对端通告的 Window 字段值。\n\n用 `tcpdump` 可以直观看到 Window Scale 的协商过程：\n\n```bash\n$ sudo tcpdump -i eth0 -nn 'tcp[tcpflags] & (tcp-syn) != 0' -v host 172.16.88.3\n# 正常情况（Window Scale 已开启）：\n10:22:01.234567 IP 10.20.1.8.51204 > 172.16.88.3.5201: Flags [S],\n  seq 1829473625, win 65535, options [mss 1448,sackOK,TS val 1234567890 ecr 0,\n  nop,wscale 7], length 0\n10:22:01.415832 IP 172.16.88.3.5201 > 10.20.1.8.51204: Flags [S.],\n  seq 3847291056, ack 1829473626, win 65535, options [mss 1448,sackOK,\n  TS val 9876543210 ecr 1234567890,nop,wscale 7], length 0\n```\n\n这里双方都携带了 `wscale 7`，表示各自的 shift count = 7，2^7 = 128。连接建立后，如果某个 ACK 中 Window 字段值为 512，实际接收窗口 = 512 × 128 = 65536 字节。当 shift count = 14（最大值）时，窗口最大可达 65535 × 2^14 = 65535 × 16384 = 1,073,725,440 字节 ≈ 1GB。这个上限足以覆盖地球上任何现实网络的 BDP——即便是 100Gbps × 300ms（洲际光纤极限场景）的 BDP 也只有 3.75GB，用两三条并行流就能填满。\n\n### 题目场景中 wscale:0,0 的根因排查\n\n回到题目中 `ss -ti` 输出的 `wscale:0,0`。Linux 从 2.6.8 起就默认开启 Window Scale（`net.ipv4.tcp_window_scaling = 1`），为什么这个连接的 wscale 还是 0？有三种典型原因。\n\n第一种可能：中间设备（防火墙、负载均衡器、NAT 网关）剥除了 TCP 选项。某些老旧的防火墙或安全设备在做深度包检测（DPI）时会「优化」TCP 选项，把它认为不必要的选项字段删掉。如果 SYN 包中的 Window Scale 选项被中间设备剥掉了，对端看不到 wscale，回复的 SYN-ACK 自然也不带 wscale，结果就是 `wscale:0,0`。用 `tcpdump` 在两端同时抓包，对比 SYN 包中的 options 字段就能定位。\n\n第二种可能：对端操作系统或应用程序显式禁用了 Window Scale。某些嵌入式设备或老旧操作系统（如 Windows XP SP2 之前的版本）默认不支持或不启用 Window Scale。在 Linux 上可以通过 `sysctl net.ipv4.tcp_window_scaling` 检查是否为 1。\n\n第三种可能：应用程序在 `connect()` 之前通过 `setsockopt(SO_RCVBUF)` 手动设置了一个很小的接收缓冲区。当应用程序显式设置 SO_RCVBUF 时，Linux 内核会关闭这条连接的 TCP 自动调优（autotuning），接收窗口被锁定在应用程序设置的值。如果设置的值 ≤ 65535，内核可能不需要 Window Scale（shift count = 0）就能表达这个窗口值。\n\n在生产中，第一种原因最常见——尤其是跨国专线中间经过的安全设备特别多。排查方法是在发送端和接收端同时抓包，对比 SYN 中的 TCP 选项：\n\n```bash\n# 发送端抓包\n$ sudo tcpdump -i eth0 -w /data/capture-sender.pcap 'host 172.16.88.3 and tcp'\n\n# 接收端抓包\n$ sudo tcpdump -i eth0 -w /data/capture-receiver.pcap 'host 10.20.1.8 and tcp'\n\n# 然后用 tshark 解析 SYN 包的选项\n$ tshark -r capture-sender.pcap -Y 'tcp.flags.syn==1 && tcp.flags.ack==0' \\\n  -T fields -e tcp.options.wscale.shift\n7\n\n$ tshark -r capture-receiver.pcap -Y 'tcp.flags.syn==1 && tcp.flags.ack==0' \\\n  -T fields -e tcp.options.wscale.shift\n<empty>\n```\n\n如果发送端抓包看到 SYN 带了 `wscale 7`，但接收端抓包发现 SYN 中没有 wscale 选项，说明中间设备把它剥掉了。解决方案是联系网络团队在防火墙/安全设备上放行 TCP 选项，或者把安全策略从「白名单」改为「黑名单」模式。\n\n### TCP Timestamps 与精确 RTT 测量\n\nTCP Timestamps 选项（TSopt，RFC 7323 Section 3）在每个报文段中携带两个 32 位时间戳：TSval（Timestamp Value，发送方的当前时间戳）和 TSecr（Timestamp Echo Reply，回显对端最近一次收到的 TSval）。发送方在发包时填入自己的 TSval，接收方在回复 ACK 时把收到的 TSval 原封不动地放进 TSecr 字段。发送方收到 ACK 后，用当前时间减去 TSecr 就得到了这个报文段的精确 RTT。\n\n在高 BDP 链路上，一个 RTT 内可能有成千上万个报文段在途。没有 Timestamps 的传统 TCP 每个 RTT 只能测量一次 RTT 样本（选择一个未确认的报文段作为计时起点，等到它被 ACK 后记录时间差），测量粒度太粗。有了 Timestamps，每个 ACK 都携带精确的 RTT 信息，RTO 的计算（Jacobson 算法：SRTT、RTTVAR、RTO = SRTT + 4 × RTTVAR）就更准确，能有效避免误超时重传和超时等待过长这两种极端情况。\n\n用 `ss -ti` 可以直接看到 RTT 测量结果：\n\n```bash\n$ ss -ti dst 172.16.88.3 | grep rtt\n\trtt:181.2/4.8\n```\n\n这里 `181.2` 是 SRTT（平滑 RTT），`4.8` 是 RTTVAR（RTT 方差）。RTO = 181.2 + 4 × 4.8 = 200.4ms，但实际 RTO 有一个最小值限制（Linux 默认 200ms），所以 `rto:560` 反映的是经过多次重传后的退避值。\n\nTimestamps 的另一个重要作用是 PAWS。在 10Gbps 链路上 TCP 序列号 3.4 秒就会回绕一圈。假设一个报文段在网络中延迟了 5 秒后到达，它的序列号可能恰好落在当前的合法接收窗口内。没有 PAWS 的话接收方会误收这个过期数据。PAWS 的判断逻辑很简单：如果收到的报文段的 TSval 小于该连接上最近一次记录的 TSval（说明这是一个「更老的」报文段），就直接丢弃。\n\n### SACK 选择性确认\n\nSACK（Selective Acknowledgment，RFC 2018）允许接收方在 ACK 中告知发送方具体哪些报文段已经收到、哪些缺失，而不是只能通告「我连续收到了第 N 字节之前的所有数据」（累积确认）。在高 BDP 链路上，一个 RTT 内有大量在途报文段，如果中间丢了几个包，累积确认只能告诉发送方「我卡在第 N 字节了」，发送方不知道 N 之后哪些包已经到了、哪些没到，只能要么重传 N 之后的所有数据（Go-Back-N），要么靠猜测逐个重传。SACK 让发送方精确知道缺口在哪里，只重传真正丢失的报文段，极大减少了不必要的重传量。\n\n在 BDP = 225MB 的链路上，一个 RTT 内在途的报文段数量 = 225MB / 1448 ≈ 155,387 个。如果丢了其中 3 个，没有 SACK 的传统 TCP 可能需要多个 RTT 才能逐个重传恢复，每多花一个 RTT 就损失 180ms。有了 SACK，发送方在收到第一个带 SACK 块的重复 ACK 后就精确知道哪 3 个包丢了，一轮重传搞定。在这种场景下，SACK 能把丢包恢复时间从 3-5 个 RTT（540-900ms）缩短到 1 个 RTT（180ms）。\n\nLinux 默认开启 SACK（`net.ipv4.tcp_sack = 1`），可以通过 `ss -ti` 输出中是否有 `sack` 关键字确认：\n\n```bash\n$ ss -ti dst 172.16.88.3 | head -5\nESTAB 0 0 10.20.1.8:51204 172.16.88.3:5201\n\tcubic sack wscale:7,7 rto:380 rtt:181.5/3.2 ...\n```\n\n看到 `sack` 就表示双方在三次握手时成功协商了 SACK 支持。\n\n## 三、完整调优方案与效果验证\n\n### 第一步：确认并修复 Window Scale 协商\n\n先确认 `tcp_window_scaling` 在两端都是开启状态：\n\n```bash\n$ sysctl net.ipv4.tcp_window_scaling\nnet.ipv4.tcp_window_scaling = 1\n```\n\n如果值为 1 但 `ss` 仍然显示 `wscale:0,0`，按前面的排查方法用 `tcpdump` 定位中间设备剥选项的问题。假设排查后发现是公司的 Palo Alto 防火墙开启了「TCP Option Strip」策略，联系安全团队关闭该策略后重新测试。\n\n### 第二步：调大内核 TCP 缓冲区\n\nWindow Scale 解除了协议层 64KB 的限制，但实际窗口能开多大取决于内核分配的 TCP 缓冲区。BDP = 225MB，缓冲区 max 至少设为 BDP 的 1.5-2 倍以留出 TCP 内部开销余量：\n\n```bash\n# /etc/sysctl.d/99-lfn-tuning.conf\n\n# === TCP 缓冲区 ===\n# 格式: min default max (字节)\n# min=4KB: 内存紧张时的最小值\n# default=1MB: 新连接的初始缓冲区\n# max=512MB: 自动调优的上限，覆盖 BDP=225MB 的 2 倍+\nnet.ipv4.tcp_rmem = 4096 1048576 536870912\nnet.ipv4.tcp_wmem = 4096 1048576 536870912\n\n# === Socket 级缓冲区上限 ===\n# 必须 >= tcp_rmem/wmem 的 max，否则自动调优被卡住\nnet.core.rmem_max = 536870912\nnet.core.wmem_max = 536870912\n\n# === 全局 TCP 内存限制 ===\n# 单位: 内存页（通常 4KB/页）\n# low=4GB, pressure=6GB, max=8GB（根据物理内存调整）\nnet.ipv4.tcp_mem = 1048576 1572864 2097152\n\n# === 确保 Window Scale 和 Timestamps 开启 ===\nnet.ipv4.tcp_window_scaling = 1\nnet.ipv4.tcp_timestamps = 1\nnet.ipv4.tcp_sack = 1\n\n# === 拥塞控制切换为 BBR ===\nnet.ipv4.tcp_congestion_control = bbr\nnet.core.default_qdisc = fq\n```\n\n应用配置并验证：\n\n```bash\n$ sudo sysctl -p /etc/sysctl.d/99-lfn-tuning.conf\n$ sysctl net.ipv4.tcp_rmem\nnet.ipv4.tcp_rmem = 4096\t1048576\t536870912\n$ sysctl net.core.rmem_max\nnet.core.rmem_max = 536870912\n$ sysctl net.ipv4.tcp_congestion_control\nnet.ipv4.tcp_congestion_control = bbr\n```\n\n### 第三步：验证优化效果\n\n两端都应用配置后，重新跑 iperf3：\n\n```bash\n$ iperf3 -c de-fra-pgdb01.internal -t 30 -P 1\nConnecting to host de-fra-pgdb01.internal, port 5201\n[  5] local 10.20.1.8 port 52108 connected to 172.16.88.3 port 5201\n[ ID] Interval           Transfer     Bitrate         Retr  Cwnd\n[  5]   0.00-5.00   sec  4.26 GBytes  7.31 Gbits/sec    8   198 MBytes\n[  5]   5.00-10.00  sec  4.41 GBytes  7.57 Gbits/sec    3   212 MBytes\n[  5]  10.00-15.00  sec  4.38 GBytes  7.52 Gbits/sec    5   205 MBytes\n[  5]  15.00-20.00  sec  4.44 GBytes  7.62 Gbits/sec    2   218 MBytes\n[  5]  20.00-25.00  sec  4.40 GBytes  7.55 Gbits/sec    4   209 MBytes\n[  5]  25.00-30.00  sec  4.43 GBytes  7.60 Gbits/sec    3   214 MBytes\n- - - - - - - - - - - - - - - - - - - - - - - - -\n[ ID] Interval           Transfer     Bitrate         Retr\n[  5]   0.00-30.00  sec  26.3 GBytes  7.53 Gbits/sec   25             sender\n[  5]   0.00-30.06  sec  26.3 GBytes  7.51 Gbits/sec                  receiver\n```\n\n吞吐量从 42Mbps 飙升到 7.53Gbps，提升了 **179 倍**。重传从 1157 次降到 25 次。用 `ss -ti` 确认窗口状态：\n\n```bash\n$ ss -ti dst 172.16.88.3\nESTAB  0  0  10.20.1.8:52108  172.16.88.3:5201\n\tbbr wscale:14,14 rto:384 rtt:181.5/2.1 ato:40 mss:1448\n\tcwnd:154820 ssthresh:142560\n\tsend 9.88Gbps pacing_rate 7.56Gbps delivery_rate 7.48Gbps\n\trcv_space:230686720 rcv_ssthresh:230686720\n```\n\n`wscale:14,14` 说明双方都协商到了最大缩放因子，`rcv_space:230686720`（约 220MB）接近 BDP 的 225MB，`cwnd:154820`（154820 × 1448 ≈ 224MB）也接近 BDP。管道终于被灌满了。之所以没有完全跑满 10Gbps 线速（实际 7.53Gbps），是因为 10Gbps 链路的实际可用带宽要扣除以太网帧头开销、IP 头部、TCP 头部、以及 BBR 会有意留出约 25% 的余量避免持续占满缓冲区。\n\n## 四、体系化扩展\n\n### 进阶：Jumbo Frame 与 MTU 优化\n\n在 LFN 调优中，除了窗口和拥塞控制之外，MTU 也是一个重要变量。标准以太网 MTU 为 1500 字节（MSS ≈ 1448），这意味着 225MB 的 BDP 需要约 155,000 个报文段在途。每个报文段都有 54 字节的头部开销（14 以太网 + 20 IP + 20 TCP），协议开销占比 54/1500 ≈ 3.6%。如果专线两端以及所有中间设备都支持 Jumbo Frame（MTU 9000），MSS 提升到 8960 字节，在途报文段数降到 225MB / 8960 ≈ 25,112 个，协议开销降到 54/9000 ≈ 0.6%。更重要的是，报文段数量减少了 6 倍，CPU 处理中断和协议栈的开销也相应降低，在 10Gbps+ 链路上这往往是另一个隐藏瓶颈。\n\n但 Jumbo Frame 有一个硬性前提：路径上所有设备的 MTU 必须一致。如果某个中间路由器的 MTU 是 1500 而两端设的是 9000，IP 层要么分片（会严重降低性能），要么因为 DF（Don't Fragment）位被设置而直接丢包形成 PMTU 黑洞。生产中通常用 `tracepath` 或 `ping -M do -s 8972`（8972 + 28 = 9000）探测路径 MTU，确认全链路支持后再开启。\n\n### 常见坑点：应用程序覆盖内核自动调优\n\n一个生产中非常隐蔽的坑是应用程序通过 `setsockopt(SO_RCVBUF)` 或 `setsockopt(SO_SNDBUF)` 显式设置了 socket 缓冲区大小。一旦应用程序调用了这两个 setsockopt，Linux 内核就会关闭该连接的 TCP 自动调优（autotuning），缓冲区被钉死在应用程序设置的值，不再随 BDP 自动增长。很多数据库客户端库、文件传输工具的默认配置中都会设置一个「安全」的缓冲区值（比如 64KB 或 256KB），这直接废掉了你精心调好的 `tcp_rmem` max。\n\n排查方法是用 `strace` 跟踪应用程序的 socket 系统调用：\n\n```bash\n$ strace -e trace=setsockopt -f -p $(pgrep pg_basebackup) 2>&1 | grep SO_RCVBUF\nsetsockopt(5, SOL_SOCKET, SO_RCVBUF, [65536], 4) = 0\n```\n\n如果看到了 `SO_RCVBUF` 调用，说明应用程序主动设了缓冲区。解决方案有两个：一是修改应用程序配置（如果支持），去掉或调大缓冲区设置；二是在应用程序不可改的情况下，用 `net.core.rmem_default` 设一个较大的默认值，但注意这影响所有新建连接，可能增加内存消耗。\n\n### 生产最佳实践：BBR 对 LFN 的根本改善\n\n传统的 Cubic 拥塞控制在 LFN 上的表现很差，因为它基于丢包判断拥塞。在 BDP = 225MB 的链路上，Cubic 需要把 cwnd 涨到 155,000 个 MSS 才能填满管道。按拥塞避免阶段每 RTT 加 1 MSS 的速率，从 ssthresh（假设 50,000 MSS）线性涨到 155,000 需要 105,000 个 RTT = 105,000 × 0.18s ≈ 5.25 小时。而中途任何一次丢包都会把 cwnd 乘以 0.7 砍回去，形成锯齿形波动，实际吞吐量始终在 BDP 的 20-40% 之间徘徊。\n\nBBR（Bottleneck Bandwidth and Round-trip propagation time，RFC 9002 描述了类似理念）从根本上改变了思路：它不看丢包，而是通过持续测量链路的瓶颈带宽（BtlBw，取滑动窗口内最大的 delivery rate）和最小传播延迟（RTprop，取滑动窗口内最小的 RTT 样本）来估算 BDP，然后把 inflight 数据量控制在 BDP 附近。偶发的随机丢包（光纤噪声、设备缓冲区波动）对 BtlBw 的最大值几乎没有影响，所以 BBR 能在有丢包的 LFN 上维持高吞吐。Google 的实测数据显示，在 1% 丢包率的跨洋链路上，BBR 的吞吐量是 Cubic 的 2700 倍。\n\n部署 BBR 时有两个关键注意点。第一，必须同时设置 `net.core.default_qdisc = fq`——BBR 依赖 fq 调度器实现精确的发送速率控制（pacing），如果队列调度器还是默认的 `pfifo_fast`，BBR 的 pacing 机制失效，退化为纯 cwnd 控制，在突发场景下反而可能比 Cubic 更差。第二，BBR 只需要在发送端部署——它是发送端的拥塞控制算法，接收端用什么算法不影响 BBR 的行为。这意味着你可以在自己的服务器上单方面部署 BBR，不需要对端配合。\n\n### 面试高频追问方向\n\n围绕 LFN 和窗口缩放的面试追问通常有四个层次。第一层考 BDP 的定义和计算——面试官给你一个带宽和 RTT，你必须能秒算出 BDP 并转换为字节数（注意 bit 和 byte 的换算）。第二层考窗口缩放的协商机制——在哪个阶段协商、shift count 的范围、最大窗口是多少、如果一端不支持会怎样。第三层考实际调优——具体哪些 sysctl 参数、为什么 rmem_max 要和 tcp_rmem 配合调、BBR 为什么要配 fq。第四层考排查能力——给你一段 `ss -ti` 输出，你能不能看出瓶颈在 rwnd 还是 cwnd、wscale 是不是正常、应该从哪里入手。能把这四层都答到位并配合真实的命令输出和数字，这道题就稳了。",
+      "keyPoints": [
+        "LFN（Long Fat Network）指带宽延迟积（BDP = Bandwidth × RTT）很大的网络路径，RFC 7323 将其读作「elephant」；BDP 代表管道在途数据的总容量，TCP 有效窗口必须达到 BDP 才能充分利用带宽",
+        "TCP 头部 Window 字段仅 16 位（最大 65535 字节），在高 BDP 链路上成为致命瓶颈；Window Scale 选项通过三次握手中 SYN/SYN-ACK 携带 1 字节 shift count（0-14）实现窗口扩展，最大可达 65535 × 2^14 ≈ 1GB",
+        "Window Scale 只在三次握手阶段协商且不可更改，如果 SYN 中不带 wscale 则 SYN-ACK 也不允许带，保证了与旧设备的向后兼容；中间设备剥除 TCP 选项是生产中 wscale:0,0 的最常见根因",
+        "TCP Timestamps 选项实现逐包 RTT 测量（而非传统的每 RTT 采样一次），同时支持 PAWS 防止高速链路上序列号回绕导致的旧数据误收；SACK 让接收方精确报告已收报文段的边界，避免 Go-Back-N 式冗余重传",
+        "内核 tcp_rmem/tcp_wmem 的 max 值决定 TCP 自动调优的缓冲区上限，必须同步调大 net.core.rmem_max/wmem_max（socket 级上限），否则缓冲区增长会被卡住——这是最常见的配置遗漏",
+        "应用程序通过 setsockopt(SO_RCVBUF/SO_SNDBUF) 显式设置缓冲区会关闭该连接的 TCP 自动调优，缓冲区被钉死在设置值；用 strace 跟踪 setsockopt 调用可快速定位此类问题",
+        "BBR 通过测量 BtlBw 和 RTprop 估算 BDP 并控制发送速率，不把丢包当拥塞信号，在有随机丢包的 LFN 上吞吐量远超 Cubic；部署 BBR 必须配合 fq 队列调度器否则 pacing 失效"
+      ],
+      "quiz": [
+        {
+          "id": "computer-network-180-q1-quiz1",
+          "question": "RFC 7323 中将 BDP 很大的网络路径称为什么？",
+          "choices": [
+            { "id": "A", "text": "LFN（Long Fat Network），读作「elephant」，指高带宽与高延迟叠加导致在途数据量巨大的网络路径" },
+            { "id": "B", "text": "WAN（Wide Area Network），泛指所有跨地域的广域网链路" },
+            { "id": "C", "text": "HBN（High Bandwidth Network），特指带宽超过 1Gbps 的网络" },
+            { "id": "D", "text": "HDL（High Delay Link），特指 RTT 超过 100ms 的高延迟链路" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "RFC 7323（TCP Extensions for High Performance）明确定义：「A path operating with a large bandwidth-delay product is referred to as a Long Fat Network (LFN, pronounced 'elephant').」LFN 的核心特征是 BDP 大，而 BDP = 带宽 × RTT，所以 LFN 强调的是带宽和延迟的乘积效应，而非单独的高带宽或高延迟。B 选项的 WAN 是一个范围更广的概念，不特指 BDP 大的链路。C 和 D 选项分别只关注了带宽或延迟的单一维度——一条 10Gbps 但 RTT 0.1ms 的局域网链路 BDP 只有 125KB，根本不算 LFN；同理一条 56Kbps × 200ms 的老式拨号链路 BDP 只有 1.4KB，延迟虽高但也不算 LFN。"
+        },
+        {
+          "id": "computer-network-180-q1-quiz2",
+          "question": "一条 10Gbps 带宽、RTT 180ms 的链路，BDP 是多少？",
+          "choices": [
+            { "id": "A", "text": "1.8GB（10Gbps × 180ms = 1,800,000,000 bytes）" },
+            { "id": "B", "text": "225MB（10,000,000,000 bit/s × 0.18s ÷ 8 = 225,000,000 bytes）" },
+            { "id": "C", "text": "1800Mb（10Gbps × 180ms = 1,800,000,000 bits，不需要转字节）" },
+            { "id": "D", "text": "22.5MB（10Gbps × 180ms ÷ 80 = 22,500,000 bytes）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "BDP = 10,000,000,000 bit/s × 0.18s = 1,800,000,000 bits。换算成字节要除以 8：1,800,000,000 ÷ 8 = 225,000,000 bytes = 225MB。A 选项把 Gbps（Giga bit per second）当成了 GBps（Giga byte per second），直接乘了 0.18 再当字节数，多了 8 倍。C 选项虽然 bit 数算对了（1.8Gbit），但 BDP 最终要对应到 TCP 窗口和缓冲区配置时必须用字节，而且声称「不需要转字节」会在实际调参时出错。D 选项除以了 80 而非 8，多除了一个 10，这是典型的把 G 和 Gbps 单位搞混的错误。面试中 BDP 计算一定要注意 bit 和 byte 的换算。"
+        },
+        {
+          "id": "computer-network-180-q1-quiz3",
+          "question": "TCP Window Scale 选项在连接生命周期的哪个阶段协商？协商失败会怎样？",
+          "choices": [
+            { "id": "A", "text": "在三次握手阶段通过 SYN 和 SYN-ACK 中的选项字段协商；如果 SYN 不带 wscale，SYN-ACK 也不允许带，连接回退到 64KB 窗口上限" },
+            { "id": "B", "text": "在连接建立后的第一个数据包中协商；任何一端都可以随时发起重新协商" },
+            { "id": "C", "text": "在三次握手的第三步（ACK 包）中由客户端单方面声明；服务端必须接受" },
+            { "id": "D", "text": "由操作系统在 socket 创建时自动设置，不需要通过网络协商；缩放因子取决于本机 tcp_rmem 配置" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Window Scale 选项只能在三次握手阶段协商，且一旦连接建立就不可更改。协商规则很明确：客户端在 SYN 中携带自己的 shift count，服务端在 SYN-ACK 中携带自己的 shift count。两个方向的 shift count 独立生效。关键的向后兼容规则是：如果 SYN 中没有 Window Scale 选项，服务端的 SYN-ACK 不允许携带——这保证了与不支持 Window Scale 的旧系统的兼容性，连接自动回退到 16 位窗口上限。B 选项错误——Window Scale 不能在数据传输阶段协商或重新协商。C 选项把协商简化成了单方面声明，忽略了双向独立协商的机制。D 选项混淆了内核配置和协议协商——shift count 虽然受缓冲区配置影响，但必须通过网络协议交换。"
+        },
+        {
+          "id": "computer-network-180-q1-quiz4",
+          "question": "Window Scale 的 shift count 最大为 14，此时 TCP 窗口最大值是多少？为什么选 14 而非更大？",
+          "choices": [
+            { "id": "A", "text": "最大约 1GB（65535 × 2^14 ≈ 1,073,725,440 字节）；14 是因为 shift count 用 1 字节存储但 RFC 规定上限为 14，足以覆盖现实中任何 BDP" },
+            { "id": "B", "text": "最大约 16MB（65535 × 2^8），因为 shift count 虽然能到 14 但内核硬编码限制在 8" },
+            { "id": "C", "text": "最大约 1GB；选 14 是因为 1 字节能表示的最大值是 255，但 RFC 截断到 14 以节省选项空间" },
+            { "id": "D", "text": "最大约 917KB（65535 × 14），因为 shift count 是线性乘数而非指数" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "shift count 占 1 字节，理论上可以取 0-255，但 RFC 7323 明确规定上限为 14。原因是 65535 × 2^14 ≈ 1GB 已经远超任何现实网络的 BDP——即便 100Gbps × 300ms 的极限场景 BDP 也只有 3.75GB，用几条并行流就能覆盖。更大的 shift count 没有实际意义，反而会增加内核内存管理的复杂度。B 选项声称内核限制在 8 是错误的，Linux 内核完全支持 shift count 到 14。C 选项关于「截断到 14 以节省选项空间」的说法不对——选项空间固定 1 字节不会因为上限不同而变化。D 选项把 shift（位移/指数）理解成了线性乘数，这是对 Window Scale 机制最常见的误解：wscale 7 不是窗口乘以 7，而是窗口乘以 2^7 = 128。"
+        },
+        {
+          "id": "computer-network-180-q1-quiz5",
+          "question": "以下 ss -ti 输出中，哪个指标最直接反映了 Window Scale 未协商成功？\n\n```\ncubic wscale:0,0 rto:560 rtt:181.2/4.8 mss:1448\ncwnd:296 ssthresh:241\nsend 18.9Mbps rcv_space:29200 rcv_ssthresh:29200\n```",
+          "choices": [
+            { "id": "A", "text": "cwnd:296 表示拥塞窗口太小" },
+            { "id": "B", "text": "wscale:0,0 表示双方的窗口缩放因子都是 0，窗口没有被缩放，最大只能到 65535 字节" },
+            { "id": "C", "text": "rcv_space:29200 低于 65535 说明接收缓冲区不足" },
+            { "id": "D", "text": "ssthresh:241 说明发生过拥塞导致阈值被压低" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`wscale:0,0` 是最直接的证据——它表示发送方和接收方的 Window Scale shift count 都是 0。shift count = 0 意味着实际窗口 = Window 字段值 × 2^0 = Window 字段值本身，没有任何缩放，窗口最大只能到 TCP 头部 Window 字段的 16 位上限 65535 字节。在 BDP = 225MB 的链路上，65535 字节的窗口意味着吞吐量上限 = 65535 / 0.18 ≈ 355KB/s ≈ 2.8Mbps。A 选项指出的 cwnd 偏低是拥塞控制的问题，不直接反映 Window Scale 状态。C 选项的 rcv_space 低确实是问题，但它是 Window Scale 未协商导致的「果」——没有缩放，缓冲区自然开不大。D 选项反映的是拥塞历史，与 Window Scale 协商无关。"
+        },
+        {
+          "id": "computer-network-180-q1-quiz6",
+          "question": "你在两端都确认 tcp_window_scaling=1，但 ss 仍显示 wscale:0,0。以下哪个排查方向最有效？",
+          "choices": [
+            { "id": "A", "text": "重启两端的网络服务和 TCP 协议栈" },
+            { "id": "B", "text": "在两端同时用 tcpdump 抓取 SYN 包，对比发送端 SYN 中是否携带 wscale 选项以及接收端看到的 SYN 中是否还有 wscale，定位是否有中间设备剥除了 TCP 选项" },
+            { "id": "C", "text": "把 tcp_window_scaling 设为 2 以强制开启更高级别的窗口缩放" },
+            { "id": "D", "text": "升级两端的操作系统到最新版本，旧版内核不支持 Window Scale" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "当两端都开启了 tcp_window_scaling 但 wscale 仍为 0 时，最可能的原因是中间设备（防火墙、IDS/IPS、NAT 网关、负载均衡器）在做深度包检测时剥除了 SYN 包中的 TCP 选项。排查方法是在发送端和接收端同时抓包，用 tcpdump 或 tshark 对比 SYN 包中的 options 字段。如果发送端抓到的 SYN 有 wscale 但接收端收到的没有，说明中间链路上某个设备把它剥掉了。A 选项的重启通常无效——如果配置没问题那就不是软件 bug。C 选项中 tcp_window_scaling 是布尔值（0 或 1），设为 2 没有意义。D 选项方向偏了——Linux 从 2.6.8（2004 年）就默认支持 Window Scale，即便是 CentOS 6（内核 2.6.32）也支持。"
+        },
+        {
+          "id": "computer-network-180-q1-quiz7",
+          "question": "TCP Timestamps 选项在 LFN 中解决了哪两个问题？",
+          "choices": [
+            { "id": "A", "text": "实现逐包精确 RTT 测量以提高 RTO 计算精度，以及通过 PAWS 机制防止高速链路上序列号回绕导致旧数据被误收" },
+            { "id": "B", "text": "实现 TCP 连接的时间同步以及防止 SYN Flood 攻击" },
+            { "id": "C", "text": "记录每个报文段的发送时间以便事后审计，以及实现 TCP 连接的超时自动断开" },
+            { "id": "D", "text": "替代 Window Scale 实现窗口扩展，以及替代 SACK 实现选择性重传" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "TCP Timestamps 选项（RFC 7323 Section 3）在 LFN 中解决两个核心问题。第一个是 RTT 测量精度：传统 TCP 每 RTT 只采样一次，在高 BDP 链路上一个 RTT 内可能有十万级报文段在途，粒度太粗导致 RTO 不准确。Timestamps 让每个 ACK 都携带精确的 RTT 信息（通过 TSval/TSecr 回显机制），SRTT 和 RTTVAR 的估计更平滑准确。第二个是 PAWS（Protection Against Wrapped Sequences）：10Gbps 链路上 32 位序列号仅 3.4 秒就回绕一圈，延迟到达的旧报文段可能携带回绕后的合法序列号。PAWS 通过比较时间戳的单调递增性拒绝过期报文。B 选项中 Timestamps 不做时间同步也不防 SYN Flood。D 选项完全错误——Timestamps 不能替代 Window Scale 或 SACK。"
+        },
+        {
+          "id": "computer-network-180-q1-quiz8",
+          "question": "你调大了 tcp_rmem max 到 512MB 并切换了 BBR，但 iperf3 吞吐量只从 42Mbps 涨到 58Mbps。用 strace 跟踪 iperf3 进程发现 `setsockopt(5, SOL_SOCKET, SO_RCVBUF, [65536], 4) = 0`，这意味着什么？",
+          "choices": [
+            { "id": "A", "text": "iperf3 设置了 SO_RCVBUF=65536，内核为这条连接关闭了 TCP 自动调优，接收缓冲区被钉死在 64KB 不再增长" },
+            { "id": "B", "text": "SO_RCVBUF=65536 只是初始值，TCP 自动调优之后会继续增长" },
+            { "id": "C", "text": "SO_RCVBUF 只影响用户态缓冲区，不影响内核 TCP 缓冲区" },
+            { "id": "D", "text": "65536 是 Linux 默认的 SO_RCVBUF 值，说明配置正常" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个非常隐蔽的生产坑。Linux 内核的规则是：一旦应用程序通过 setsockopt(SO_RCVBUF) 显式设置了接收缓冲区大小，内核就关闭该连接的 TCP 自动调优（autotuning），缓冲区被锁定在应用程序设置的值，不再根据 BDP 自动增长。strace 看到 SO_RCVBUF=65536，意味着接收窗口最大 64KB，在 BDP=225MB 的链路上吞吐量被限制在 64KB/180ms ≈ 355KB/s 理论值附近。B 选项错误——显式 setsockopt 后自动调优就关闭了。C 选项混淆了 SO_RCVBUF 的作用域——它直接控制内核为 socket 分配的接收缓冲区。D 选项把问题当正常行为了。解决方案：用 iperf3 的 `-w` 参数设一个大窗口，或修改应用配置去掉 SO_RCVBUF 设置。"
+        },
+        {
+          "id": "computer-network-180-q1-quiz9",
+          "question": "在 10Gbps 链路上，TCP 32 位序列号多久会回绕一圈？PAWS 怎么解决这个问题？",
+          "choices": [
+            { "id": "A", "text": "约 3.4 秒回绕一圈（2^32 字节 ÷ 10Gbps ÷ 8）；PAWS 通过比较 TCP Timestamps 的 TSval 单调递增性拒绝时间戳过旧的延迟报文段" },
+            { "id": "B", "text": "约 34 秒回绕一圈；PAWS 通过扩展序列号到 64 位来彻底解决回绕问题" },
+            { "id": "C", "text": "约 3.4 秒回绕一圈；PAWS 通过 Window Scale 扩展序列号空间来防止回绕" },
+            { "id": "D", "text": "序列号不会回绕，因为 TCP 在到达最大值时会自动重置连接" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "TCP 序列号是 32 位无符号整数，最大值 2^32 = 4,294,967,296 字节 ≈ 4.29GB。在 10Gbps（= 1.25GB/s）的链路上，4.29GB / 1.25GB/s ≈ 3.43 秒就会用完所有序列号并回绕到 0。如果一个报文段在网络中延迟了 5 秒后到达，它的序列号可能恰好落在接收窗口内。PAWS 的判断逻辑是：每个 TCP 连接维护一个「最近收到的 TSval」，如果新到达的报文段的 TSval 小于这个记录值（说明它是更早发出的），就直接丢弃。这利用了时间戳单调递增的特性来判断报文段的新旧。B 选项的计算多了 10 倍，且 PAWS 不扩展序列号。C 选项混淆了 Window Scale（扩展窗口）和 PAWS（防止回绕）。D 选项完全错误——TCP 不会因为序列号到达最大值而重置连接。"
+        },
+        {
+          "id": "computer-network-180-q1-quiz10",
+          "question": "你为一条中欧专线（10Gbps, RTT 180ms）做了完整的 LFN 调优（Window Scale + 缓冲区 + BBR），单流 iperf3 跑到了 7.5Gbps。但业务侧的 PostgreSQL 逻辑复制吞吐量只有 800Mbps，最可能的瓶颈在哪？",
+          "choices": [
+            { "id": "A", "text": "PostgreSQL 的 WAL sender 进程是单线程的，受限于单核 CPU 处理能力和磁盘顺序读 I/O；需要拆分成多个复制槽并行传输或使用 pgBackRest 等多线程归档工具" },
+            { "id": "B", "text": "PostgreSQL 使用 UDP 传输 WAL，没有受益于 TCP 调优" },
+            { "id": "C", "text": "iperf3 测试不准确，实际带宽就是 800Mbps" },
+            { "id": "D", "text": "BBR 只对 iperf3 有效，对数据库连接不生效" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "iperf3 已经证明网络层面能跑 7.5Gbps，说明 TCP 调优完全有效。PostgreSQL 的 WAL sender 进程是单线程架构——它从磁盘读取 WAL 文件，通过单个 TCP 连接发送到备库。在这种模型下，吞吐量瓶颈通常在应用层：单核 CPU 处理 WAL 解析和网络发送的能力、磁盘顺序读速度（尤其是如果 WAL 不在 page cache 中）、以及 PostgreSQL 内部的流复制协议开销。解决方案包括：使用多个复制槽（每个复制一个数据库或表空间）实现并行化、使用 pgBackRest 的并行传输功能做基础备份、或者在传输层面用 bbcp 等多流工具替代原生复制做离线归档传输。B 选项错误——PostgreSQL 逻辑复制基于 TCP。C 选项与 iperf3 结果矛盾。D 选项错误——BBR 是内核层面的拥塞控制算法，对所有 TCP 连接生效。"
+        }
+      ],
+      "references": [
+        "https://www.rfc-editor.org/rfc/rfc7323",
+        "https://www.rfc-editor.org/rfc/rfc2018",
+        "https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html",
+        "https://fasterdata.es.net/host-tuning/linux/",
+        "https://queue.acm.org/detail.cfm?id=3022184"
+      ]
+    }
+  ]
+}
