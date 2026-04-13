@@ -1,0 +1,158 @@
+{
+  "id": "computer-network-236",
+  "name": "RPC 超时与重试策略",
+  "domain": "computer-network",
+  "description": "微服务间 RPC 通信中超时分级、重试策略、幂等保障与熔断器的系统化设计",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "computer-network-236-q1",
+      "domain": "computer-network",
+      "type": "requirement",
+      "difficulty": 3,
+      "tags": ["RPC", "超时", "重试", "幂等", "熔断"],
+      "title": "微服务间 RPC 通信的超时与重试策略怎么设计？",
+      "content": "你所在的团队维护着一套电商核心链路：用户下单时，Order 服务通过 gRPC 调用 Inventory 服务扣库存，再调用 Payment 服务创建支付单，最后调用 Notification 服务发送确认消息。四个服务部署在 Kubernetes 上，平时 P99 延迟在 50ms 以内，一切正常。\n\n周五晚高峰，Inventory 服务因为数据库慢查询导致响应时间从 20ms 飙升到 3 秒。然后诡异的事情发生了——Order 服务的错误日志里出现了大量 `DeadlineExceeded` 错误，但同时 Inventory 服务的 QPS 监控从正常的 2000 飙到了 12000。你的同事看着 Grafana 大盘困惑地说：「Inventory 已经快挂了，为什么请求量反而涨了 6 倍？」\n\n答案很快浮出水面：Order 服务对 Inventory 的调用配置了 500ms 超时和最多 3 次重试，但没有任何退避策略。Inventory 响应变慢后，每个原始请求都会超时 3 次重试，等于把 2000 QPS 放大成了 2000 × 3 = 6000。更糟的是，Payment 服务也有类似的重试配置，它发现 Order 服务变慢后也开始重试，形成了级联放大。最终 Inventory 服务被重试风暴彻底打垮，从「慢」变成了「完全不可用」，整个下单链路瘫痪了 47 分钟。\n\n事故复盘会上，CTO 要求你重新设计整条调用链路的超时与重试策略。你需要回答以下问题：超时应该怎么分级？链路上的超时如何传递？什么条件下才允许重试？重试策略应该怎么配置才能避免重试风暴？熔断器在其中扮演什么角色？请给出完整的设计方案，并附带 gRPC 和 Envoy 层面的具体配置。",
+      "answer": "## 第一步：基础概念——RPC 通信与超时重试的必要性\n\n### 什么是 RPC\n\nRPC（Remote Procedure Call，远程过程调用）是分布式系统中服务间通信的基础范式。它的核心思想是让调用远程服务的代码看起来像调用本地函数一样简单——客户端调用一个本地的 stub 方法，底层框架负责把参数序列化、通过网络发送到服务端、服务端执行实际逻辑后把结果返回。gRPC 是当前最主流的 RPC 框架之一，由 Google 开源，基于 HTTP/2 传输、Protocol Buffers 序列化，支持流式通信、双向流、拦截器链等特性。一个最简单的 gRPC 调用在 Go 中长这样：\n\n```go\n// 客户端调用远程的 DeductStock 方法，看起来就像调本地函数\nresp, err := inventoryClient.DeductStock(ctx, &pb.DeductRequest{\n    SkuId:    \"SKU-12345\",\n    Quantity: 1,\n})\nif err != nil {\n    // 处理错误：可能是超时、网络不通、服务端返回业务错误\n    log.Printf(\"扣库存失败: %v\", err)\n}\n```\n\n但 RPC 和本地函数调用有一个根本区别：中间隔着网络。网络是不可靠的——数据包可能丢失、可能乱序、链路可能中断、对端服务可能过载。Peter Deutsch 在 1994 年总结的「分布式计算的八大谬误」（Eight Fallacies of Distributed Computing）中第一条就是「网络是可靠的」——这恰恰是最常见的错误假设。在本地函数调用中，调用要么成功要么抛异常，不存在「不知道结果」的状态；但在 RPC 中，客户端发出请求后可能永远收不到响应——服务端可能已经执行成功但响应包丢了，也可能服务端根本没收到请求。这种「不确定状态」是分布式系统最棘手的问题之一。\n\n### 为什么必须有超时\n\n设想一下没有超时的世界：Order 服务调用 Inventory 服务，Inventory 因为某种原因卡住了（数据库死锁、GC 停顿、网络分区），如果 Order 服务不设超时，这个 goroutine（Go 语言中的轻量级线程）就会一直阻塞等待。高峰期每秒 2000 个请求，每个都阻塞，10 秒后就有 20000 个 goroutine 卡住，连接池耗尽，Order 服务自己也无法处理任何请求了。这就是所谓的「故障传播」——一个下游服务的故障通过无限等待传播到上游，最终导致整条链路雪崩。\n\n超时机制的本质就是给每次远程调用设置一个「最长等待时间」。超过这个时间还没收到响应，客户端就放弃等待、释放资源、返回错误。这看起来简单，但「超时时间设多少」是一个非常有讲究的问题，后面会详细展开。\n\n### 为什么需要重试，以及重试为什么危险\n\n超时解决了「不要无限等待」的问题，但超时之后呢？有些失败是瞬时的——网络抖动丢了一个包、服务端刚好在滚动更新导致某个 Pod 短暂不可用。这种情况下，重新发一次请求很可能就成功了。重试机制就是为了应对这类瞬时故障，提高系统的整体可用性。\n\n但重试是一把双刃剑，用不好会成为杀死系统的凶手。这就是本题事故场景中发生的事情——重试风暴（retry storm）。重试风暴的形成机制是这样的：当下游服务因为过载而变慢时，上游的每个请求都超时后重试，重试请求进一步加重下游负载，导致更多请求超时，触发更多重试。这是一个正反馈循环，会在几秒内把下游服务从「有点慢」推到「完全不可用」。如果调用链有多层，每一层都重试，放大效应是指数级的：假设链路有 3 层，每层最多重试 3 次，一个原始请求最多会产生 3 × 3 × 3 = 27 个请求打到最底层的服务。\n\n理解了这个背景，我们就知道超时与重试的设计不是简单地配两个参数，而是需要一套系统化的策略来平衡「提高可用性」和「避免雪崩」。\n\n## 第二步：核心设计——超时分级、重试策略与熔断器\n\n### 设计要点一：超时分级\n\n超时不是一个单一的数字，而是需要分层设置。在一次 RPC 调用中，至少存在两层超时：\n\n连接超时（Connection Timeout）控制的是 TCP 握手建立连接的最长等待时间。在同一个 Kubernetes 集群内，Pod 之间的网络延迟通常在亚毫秒级别，TCP 握手（SYN → SYN-ACK → ACK）正常情况下 1-2ms 就能完成。如果连接超时都触发了（比如设了 200ms 还连不上），说明不是「服务有点慢」的问题，而是网络不通或者服务完全挂了——这种情况下重试大概率也没用。所以连接超时应该设得比较短，通常 100-500ms。\n\n请求超时（Request Timeout）控制的是从发出请求到收到完整响应的最长等待时间。这个时间需要覆盖服务端实际处理请求的耗时，所以通常比连接超时长得多。设置请求超时的关键原则是：参考下游服务的 P99 延迟，在此基础上加一个合理的缓冲。比如 Inventory 服务的 P99 延迟是 40ms，那请求超时可以设为 200ms（留 5 倍缓冲），而不是 5 秒。设得太长等于没设——5 秒超时在高并发下照样会耗尽连接池；设得太短会导致正常的 P99 请求被误杀。\n\n在 Go 的 gRPC 客户端中，这两层超时可以这样配置：\n\n```go\nimport (\n    \"context\"\n    \"time\"\n    \"google.golang.org/grpc\"\n    \"google.golang.org/grpc/keepalive\"\n)\n\n// 连接级别的超时和 keepalive 参数\nconn, err := grpc.Dial(\n    \"inventory-service:50051\",\n    grpc.WithKeepaliveParams(keepalive.ClientParameters{\n        Time:                10 * time.Second, // 每 10 秒发送 keepalive ping\n        Timeout:             3 * time.Second,  // ping 3 秒没回应认为连接断了\n        PermitWithoutStream: true,\n    }),\n    // 连接超时通常在 DialContext 中通过 context 控制\n)\n\n// 请求级别的超时通过 context.WithTimeout 控制\nctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)\ndefer cancel()\nresp, err := inventoryClient.DeductStock(ctx, &pb.DeductRequest{\n    SkuId: \"SKU-12345\", Quantity: 1,\n})\n```\n\n### 设计要点二：链路超时传递\n\n在微服务调用链中，一个至关重要但经常被忽视的设计是超时传递（Timeout Propagation）。场景是这样的：用户请求 → API Gateway（总超时 3 秒） → Order 服务 → Inventory 服务。如果 Order 服务在自己的逻辑上花了 2 秒（比如参数校验、查数据库），那么当它调用 Inventory 时，留给 Inventory 的时间实际上只剩 1 秒了。但如果 Order 对 Inventory 的调用写死了 2 秒超时，就会出现一个荒谬的情况：Order 还在等 Inventory 的响应，但 API Gateway 已经超时返回错误给用户了——Order 即使最终拿到了 Inventory 的结果也是白做，因为上游已经放弃了。\n\n正确的做法是：上游把自己的剩余截止时间（deadline）传递给下游，下游用上游的剩余时间和自己的超时配置取较小值。gRPC 原生支持这个机制——当你在 Go 中用 `context.WithTimeout` 创建一个带超时的 context，并把这个 context 传给 gRPC 调用时，gRPC 会自动把截止时间通过 HTTP/2 header 中的 `grpc-timeout` 字段传递给下游。下游的 gRPC 服务端收到请求后，会自动把 context 的 deadline 设置为上游传来的截止时间。这意味着如果上游只剩 500ms，下游无论自己配了多长的超时，实际可用时间也只有 500ms。\n\n```go\n// Order 服务中的超时传递示例\nfunc (s *OrderService) CreateOrder(ctx context.Context, req *pb.CreateOrderRequest) (*pb.CreateOrderResponse, error) {\n    // ctx 已经携带了上游（API Gateway）传来的 deadline\n    // 假设上游设了 3 秒，到达 Order 时已过 200ms，剩余 2.8 秒\n\n    // 本地处理耗时约 100ms\n    order, err := s.validateAndPersist(ctx, req)\n    if err != nil {\n        return nil, err\n    }\n\n    // 检查上游还剩多少时间\n    deadline, ok := ctx.Deadline()\n    if ok {\n        remaining := time.Until(deadline)\n        log.Printf(\"上游剩余时间: %v\", remaining) // 约 2.7 秒\n        // 如果剩余时间已经不够完成下游调用，直接快速失败\n        if remaining < 50*time.Millisecond {\n            return nil, status.Error(codes.DeadlineExceeded, \"剩余时间不足，快速失败\")\n        }\n    }\n\n    // 调用 Inventory 时直接传递 ctx，gRPC 会自动传递 deadline\n    // 下游实际可用时间 = min(上游剩余时间, 自身超时配置)\n    _, err = s.inventoryClient.DeductStock(ctx, &pb.DeductRequest{\n        SkuId: order.SkuId, Quantity: order.Quantity,\n    })\n    if err != nil {\n        return nil, fmt.Errorf(\"扣库存失败: %w\", err)\n    }\n\n    return &pb.CreateOrderResponse{OrderId: order.Id}, nil\n}\n```\n\n### 设计要点三：重试的前提——幂等性\n\n重试最危险的地方在于：你不知道上一次请求到底有没有执行成功。客户端看到超时，可能是服务端根本没收到请求，也可能是服务端已经执行成功但响应在网络上丢了。如果是后者，重试就会导致操作被执行两次。\n\n对于天然幂等的操作，重试是安全的。GET 请求是读操作，调几次结果一样。PUT 请求在语义上是「用给定的值覆盖资源」，调两次和调一次效果一样（前提是 PUT 的语义确实是全量替换而非追加）。DELETE 通常也是幂等的——删一个已经不存在的资源大部分系统会返回 404 或静默成功。\n\n但 POST 请求通常不是幂等的——「创建一个订单」调两次就会创建两个订单。对于这类操作，要实现安全重试就必须引入幂等键（Idempotency Key）。客户端在首次请求时生成一个唯一的 ID（通常是 UUID），放在请求头或请求体中。服务端收到请求后，先检查这个 ID 是否已经处理过：如果处理过，直接返回之前的结果；如果没有，执行操作并把 ID 和结果存起来。这样即使客户端重试，服务端也只会执行一次。\n\n```go\n// 服务端幂等处理示例（基于 Redis 的幂等键）\nfunc (s *PaymentService) CreatePayment(ctx context.Context, req *pb.CreatePaymentRequest) (*pb.CreatePaymentResponse, error) {\n    idempotencyKey := req.GetIdempotencyKey()\n    if idempotencyKey == \"\" {\n        return nil, status.Error(codes.InvalidArgument, \"创建支付单必须携带 idempotency_key\")\n    }\n\n    // 先查 Redis 看是否已经处理过\n    cached, err := s.redis.Get(ctx, \"idempotent:\"+idempotencyKey).Result()\n    if err == nil {\n        // 已处理过，直接返回缓存的结果\n        var resp pb.CreatePaymentResponse\n        proto.Unmarshal([]byte(cached), &resp)\n        return &resp, nil\n    }\n\n    // 首次处理：执行业务逻辑\n    payment, err := s.processPayment(ctx, req)\n    if err != nil {\n        return nil, err\n    }\n\n    // 缓存结果，TTL 设为 24 小时\n    respBytes, _ := proto.Marshal(payment)\n    s.redis.Set(ctx, \"idempotent:\"+idempotencyKey, respBytes, 24*time.Hour)\n\n    return payment, nil\n}\n```\n\n在 gRPC 层面，重试策略可以通过 service config 来声明哪些方法允许重试。只有在 `retryableStatusCodes` 中列出的错误码才会触发重试，这意味着业务逻辑错误（比如库存不足返回 `FAILED_PRECONDITION`）不会被重试，只有基础设施层面的瞬时故障才会：\n\n```json\n{\n  \"methodConfig\": [\n    {\n      \"name\": [\n        { \"service\": \"inventory.InventoryService\", \"method\": \"GetStock\" }\n      ],\n      \"timeout\": \"0.5s\",\n      \"retryPolicy\": {\n        \"maxAttempts\": 3,\n        \"initialBackoff\": \"0.1s\",\n        \"maxBackoff\": \"1s\",\n        \"backoffMultiplier\": 2,\n        \"retryableStatusCodes\": [\"UNAVAILABLE\", \"DEADLINE_EXCEEDED\"]\n      }\n    },\n    {\n      \"name\": [\n        { \"service\": \"inventory.InventoryService\", \"method\": \"DeductStock\" }\n      ],\n      \"timeout\": \"0.3s\",\n      \"retryPolicy\": {\n        \"maxAttempts\": 2,\n        \"initialBackoff\": \"0.05s\",\n        \"maxBackoff\": \"0.2s\",\n        \"backoffMultiplier\": 2,\n        \"retryableStatusCodes\": [\"UNAVAILABLE\"]\n      }\n    }\n  ]\n}\n```\n\n注意这里 `GetStock`（读操作，天然幂等）配了 3 次最大重试和更宽松的超时，而 `DeductStock`（写操作）只配了 2 次最大重试且不对 `DEADLINE_EXCEEDED` 重试——因为超时意味着服务端可能已经执行了扣减，在没有幂等键的情况下重试可能导致多扣。\n\n### 设计要点四：重试策略——指数退避与抖动\n\n确认可以重试之后，下一个问题是「隔多久重试」。最差的策略是立即重试——第一次超时了马上发第二次，如果下游正在过载，立即重试只会火上浇油。正确的做法是指数退避加随机抖动（Exponential Backoff with Jitter）。\n\n指数退避的意思是每次重试的等待时间翻倍：第一次等 100ms，第二次等 200ms，第三次等 400ms，以此类推。这样在下游短暂故障时，重试请求会随着时间逐渐稀疏，给下游恢复的喘息空间。但纯粹的指数退避有一个问题：如果 1000 个客户端同时超时，它们都会在 100ms 后同时重试，形成「惊群效应」（Thundering Herd）。随机抖动就是在退避时间的基础上加一个随机偏移量，让重试请求在时间轴上打散。AWS 的官方博客推荐的「full jitter」策略是：实际等待时间 = random(0, min(maxBackoff, initialBackoff × 2^attempt))。\n\n同时必须设定最大重试次数的硬上限。实践中，对于同步 RPC 调用，最大重试 2-3 次是比较合理的值。重试 3 次还不成功的请求，继续重试大概率也不会成功——要么是下游真的挂了，要么是网络真的断了，这种情况应该快速失败而不是继续消耗资源。\n\n### 设计要点五：重试预算（Retry Budget）\n\n单个客户端限制最大重试次数还不够。考虑这个场景：下游服务有 10% 的请求超时，每个客户端最多重试 3 次。如果有 1000 个并发请求，其中 100 个超时并各重试 3 次，总请求量从 1000 变成 1000 + 300 = 1300。看起来还好。但如果下游进一步恶化到 50% 超时呢？总请求量变成 1000 + 1500 = 2500——重试请求比原始请求还多，下游彻底被压垮。\n\n重试预算（Retry Budget）的思路是：不限制单个请求的重试次数，而是限制整个客户端实例在一个时间窗口内的重试比例。Google SRE Book 中推荐的经验值是：重试请求不应超过总请求量的 10%。也就是说，如果过去 10 秒内发了 1000 个请求，那么这 10 秒内最多允许 100 个重试请求。一旦达到上限，后续的失败请求直接返回错误，不再重试。\n\n这个机制的精妙之处在于：当下游健康时（只有 0.1% 的请求超时），重试预算几乎不会被触发，每个失败请求都能正常重试；当下游恶化时（大量请求超时），重试预算会自动限流，避免重试风暴。Envoy 代理内置了 retry budget 支持：\n\n```yaml\n# Envoy 路由配置中的重试策略\nroute_config:\n  virtual_hosts:\n    - name: inventory-service\n      domains: [\"inventory-service\"]\n      routes:\n        - match: { prefix: \"/\" }\n          route:\n            cluster: inventory-cluster\n            timeout: 0.5s\n            retry_policy:\n              retry_on: \"5xx,reset,connect-failure,retriable-status-codes\"\n              num_retries: 3\n              per_try_timeout: 0.2s\n              retry_back_off:\n                base_interval: 0.05s   # 初始退避 50ms\n                max_interval: 0.5s     # 最大退避 500ms\n              retriable_status_codes:\n                - 503\n              retry_budget:\n                budget_percent:\n                  default_value: 10.0  # 重试请求不超过总请求的 10%\n                min_retry_concurrency: 3  # 至少允许 3 个并发重试（低流量时保底）\n```\n\n这段 Envoy 配置将超时、退避、重试次数和重试预算组合在一起，形成了一个完整的防御体系。`per_try_timeout` 控制每次重试的单独超时（200ms），`timeout` 控制整个请求（包括所有重试）的总超时（500ms），`retry_back_off` 控制重试间隔，`retry_budget` 限制重试比例。\n\n### 设计要点六：熔断器（Circuit Breaker）\n\n重试预算控制的是「重试请求的比例」，熔断器控制的是「要不要继续发请求」。两者是互补的防线。\n\n熔断器的工作模式借鉴自电路中的断路器——当下游服务连续失败达到阈值时，熔断器「跳闸」（Open 状态），后续所有请求直接返回错误，不再实际发送到下游。这一方面保护了下游（不再承受无效流量），另一方面也保护了上游（不浪费时间等待一个已知不可用的服务，实现快速失败）。经过一段冷却时间后，熔断器进入「半开」（Half-Open）状态，放行少量探测请求。如果探测成功，说明下游恢复了，熔断器关闭（Closed 状态），流量恢复正常；如果探测失败，熔断器重新打开，继续等待。\n\n在 Envoy 中，熔断通过 Outlier Detection（异常检测）和 Circuit Breaker 两个机制配合实现：\n\n```yaml\n# Envoy 集群配置中的熔断与异常检测\nclusters:\n  - name: inventory-cluster\n    connect_timeout: 0.25s\n    type: STRICT_DNS\n    lb_policy: ROUND_ROBIN\n    circuit_breakers:\n      thresholds:\n        - priority: DEFAULT\n          max_connections: 1024       # 最大连接数\n          max_pending_requests: 1024  # 最大等待请求数\n          max_requests: 1024          # 最大并发请求数\n          max_retries: 3              # 最大并发重试数\n    outlier_detection:\n      consecutive_5xx: 5                # 连续 5 个 5xx 就将该节点摘除\n      interval: 10s                     # 每 10 秒检测一次\n      base_ejection_time: 30s           # 首次摘除持续 30 秒\n      max_ejection_percent: 50          # 最多摘除 50% 的节点（防止全部摘除）\n      consecutive_gateway_failure: 5    # 连续 5 次网关错误触发摘除\n```\n\n`outlier_detection` 是节点级别的熔断：如果集群中某个 Pod 连续返回 5 次 5xx 错误，就把它从负载均衡池中摘除 30 秒。注意 `max_ejection_percent` 设为 50%——即使所有节点都不健康，也至少保留一半在池中，否则客户端就完全没有可用的后端了。`circuit_breakers` 中的 `max_retries: 3` 限制了整个集群同时进行的重试请求数量，这是另一种维度的重试限流。\n\n## 第三步：体系化扩展——进阶策略与面试高频追问\n\n### Hedged Request——对冲请求\n\n重试的一个变体是 Hedged Request（对冲请求）。传统重试是「等第一个请求失败了再发第二个」，对冲请求是「第一个请求发出后，如果在 P95 延迟时间内没有收到响应，不等超时就立即发第二个请求到另一个节点，谁先返回用谁的结果」。这种策略适用于读操作场景，能显著降低尾部延迟。Google 在论文「The Tail at Scale」中详细讨论了这种技术：他们发现在大规模分布式系统中，对冲请求可以将 P99.9 延迟降低一个数量级，而额外的请求量只增加约 2-5%。gRPC 从 v1.41 开始支持 hedging policy：\n\n```json\n{\n  \"methodConfig\": [{\n    \"name\": [{\"service\": \"inventory.InventoryService\", \"method\": \"GetStock\"}],\n    \"hedgingPolicy\": {\n      \"maxAttempts\": 2,\n      \"hedgingDelay\": \"0.05s\",\n      \"nonFatalStatusCodes\": [\"UNAVAILABLE\", \"INTERNAL\"]\n    }\n  }]\n}\n```\n\n这段配置的意思是：发出第一个请求后，如果 50ms 内没有收到响应，立即发第二个请求。两个请求中任何一个成功就返回结果，另一个取消。需要特别注意的是，hedging policy 和 retry policy 不能同时配置在同一个方法上——你要么选择「失败后重试」，要么选择「延迟后对冲」。对于写操作，对冲请求需要服务端具备幂等能力，否则可能产生重复写入。\n\n### 超时传递的进阶：gRPC metadata 与 OpenTelemetry Baggage\n\n前面提到 gRPC 会自动通过 `grpc-timeout` header 传递 deadline，但在异构系统中（比如链路中有 gRPC 服务也有 HTTP REST 服务），你可能需要手动传递剩余超时。常见做法是在 HTTP header 中加一个自定义字段（如 `X-Request-Timeout`），middleware 负责读取这个值并设置到 context 中。OpenTelemetry 的 Baggage 机制也可以用来在整条链路中传递超时信息，不过 Baggage 主要设计用于观测数据透传，用于超时传递时需要注意性能开销。\n\n更成熟的做法是在 Service Mesh 层面统一处理。Istio/Envoy 作为 sidecar 代理，可以在配置中为每条路由指定超时，并且 Envoy 会自动追踪整个请求链的剩余时间。通过在 `x-envoy-upstream-rq-timeout-ms` header 中传递剩余毫秒数，即使链路中的服务不感知超时传递，Envoy sidecar 也能自动执行截止时间。\n\n### 生产环境最佳实践\n\n第一，所有超时都应该可配置、可动态调整。不要把超时时间硬编码在代码里，而是通过配置中心（如 Consul KV、Apollo、Nacos）下发。当下游服务升级导致延迟特征变化时，你需要能够在不重新部署的情况下调整超时。第二，重试必须有全链路视角。最理想的做法是只在最靠近用户的那一层（API Gateway 或 BFF 层）做重试，中间的微服务层不做重试。如果每一层都重试，前面分析过的指数放大效应会把系统搞垮。如果必须在中间层重试，一定要配合重试预算和链路超时传递。第三，监控重试比例是关键指标。如果你的重试率从平时的 0.5% 突然飙升到 5%，这本身就是一个预警信号，说明下游正在恶化，需要立即关注。Prometheus 中可以通过 `grpc_client_handled_total` 指标的 `grpc_code` label 来计算重试率。\n\n### 面试高频追问\n\n面试官在你讲完超时重试策略后，最常见的追问方向有三个。第一个是「如果重试全部失败了怎么办」——答案是降级和补偿，比如扣库存失败可以先记录一条待处理的消息到 Kafka，后续通过消费者异步重试或者人工介入。第二个是「怎么区分可重试错误和不可重试错误」——基础设施错误（UNAVAILABLE、连接被重置）可以重试，业务逻辑错误（INVALID_ARGUMENT、PERMISSION_DENIED、ALREADY_EXISTS）不应重试。gRPC 的状态码设计天然支持这种区分。第三个是「重试和幂等的关系」——这是核心追问，你必须讲清楚：重试的安全前提是幂等，读操作天然幂等，写操作需要通过幂等键机制保证。如果一个写操作既没有幂等键也没有其他去重机制，那就不应该配置自动重试，而应该返回错误让上层决策。",
+      "keyPoints": [
+        "超时必须分级设置：连接超时（100-500ms）控制 TCP 握手耗时，请求超时参考下游 P99 延迟的 3-5 倍，两者分开配置、分别监控",
+        "链路超时传递（Timeout Propagation）是避免无效等待的关键：上游通过 gRPC 的 grpc-timeout header 或 context deadline 把剩余时间传给下游，下游取 min(上游剩余, 自身配置) 作为实际超时",
+        "重试的安全前提是幂等性：GET/PUT/DELETE 天然幂等可直接重试，POST 等创建操作必须引入幂等键（Idempotency Key）由服务端去重后才能安全重试",
+        "重试策略必须使用指数退避加随机抖动（Exponential Backoff with Full Jitter），避免所有客户端在同一时刻集中重试形成惊群效应",
+        "重试预算（Retry Budget）从全局维度限制重试比例不超过总请求量的 10%，防止下游过载时重试风暴导致级联雪崩",
+        "熔断器（Circuit Breaker）通过 Closed → Open → Half-Open 三态切换，在下游连续失败时自动切断流量、保护双方，冷却后用探测请求验证恢复",
+        "Hedged Request 在读操作场景下可显著降低尾部延迟：不等超时、在 P95 延迟后立即发对冲请求到另一个节点，谁先返回用谁的结果",
+        "生产环境中应优先在最靠近用户的一层（API Gateway）做重试，中间微服务层避免多层重试导致请求量指数级放大"
+      ],
+      "quiz": [
+        {
+          "id": "computer-network-236-q1-quiz1",
+          "question": "在微服务 RPC 调用中，连接超时和请求超时的本质区别是什么？",
+          "choices": [
+            { "id": "A", "text": "连接超时控制 TCP 握手建连的等待时间，通常较短（100-500ms）；请求超时控制从发出请求到收到完整响应的等待时间，通常较长" },
+            { "id": "B", "text": "连接超时是客户端设置的，请求超时是服务端设置的，两者分属不同端" },
+            { "id": "C", "text": "连接超时只在首次建立连接时生效，请求超时在连接复用时生效，两者作用于不同的连接阶段" },
+            { "id": "D", "text": "连接超时控制的是 HTTP 请求头的传输时间，请求超时控制的是 HTTP 响应体的接收时间" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "连接超时和请求超时控制的是两个完全不同的阶段。连接超时管的是 TCP 三次握手——客户端发出 SYN 后等 SYN-ACK 的时间。在同集群内网络延迟通常亚毫秒级，如果连接超时都触发了，说明网络不通或服务完全挂了。请求超时管的是整个请求-响应周期，需要覆盖服务端的实际处理耗时，所以通常比连接超时长得多。B 选项错误，两者都是客户端配置的。C 选项的说法不准确，连接超时在每次新建连接时都生效，不仅仅是首次。D 选项混淆了超时的作用对象。"
+        },
+        {
+          "id": "computer-network-236-q1-quiz2",
+          "question": "gRPC 的链路超时传递（Timeout Propagation）是通过什么机制实现的？",
+          "choices": [
+            { "id": "A", "text": "客户端在 context 中设置 deadline，gRPC 自动通过 HTTP/2 header 中的 grpc-timeout 字段传递给下游，下游 context 自动携带上游的截止时间" },
+            { "id": "B", "text": "gRPC 在 Protocol Buffers 消息体中自动插入一个 timeout 字段，由服务端手动解析" },
+            { "id": "C", "text": "gRPC 使用独立的心跳通道（keepalive）来同步各节点的超时配置" },
+            { "id": "D", "text": "gRPC 不支持超时传递，需要开发者在每个请求的 metadata 中手动传递剩余时间" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "gRPC 原生支持超时传递，这是它相对于很多 HTTP REST 框架的一个优势。当你在 Go 中用 context.WithTimeout 创建一个带截止时间的 context 并传给 gRPC 调用时，gRPC 框架会自动将剩余时间编码为 grpc-timeout header 放在 HTTP/2 HEADERS 帧中发送给下游。下游的 gRPC 服务端收到请求后，会自动把收到的 deadline 设置到请求 context 中。B 选项错误，超时信息走的是 HTTP/2 header 而非 Protobuf 消息体。C 选项混淆了 keepalive 和超时传递。D 选项完全错误，gRPC 正是因为内置了这个功能才被广泛用于微服务架构。"
+        },
+        {
+          "id": "computer-network-236-q1-quiz3",
+          "question": "以下哪种操作在没有幂等键的情况下可以安全重试？",
+          "choices": [
+            { "id": "A", "text": "GET /api/inventory/stock?sku=SKU-12345（查询库存）" },
+            { "id": "B", "text": "POST /api/orders（创建新订单）" },
+            { "id": "C", "text": "POST /api/notifications/send（发送通知消息）" },
+            { "id": "D", "text": "PATCH /api/inventory/stock（扣减库存数量 -1）" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "GET 请求是纯读操作，无论调用多少次都不会改变服务端状态，天然幂等，无需幂等键就能安全重试。B 选项的 POST 创建订单是典型的非幂等操作——重试可能创建两个重复订单，必须有幂等键。C 选项的发送通知也是非幂等的——重试会导致用户收到重复通知。D 选项的 PATCH 扣减库存是增量操作而非全量覆盖，重试一次就多扣一次，同样不幂等。注意如果 D 改成 PUT /api/inventory/stock { quantity: 99 }（设置库存为确定值），则变为幂等操作，可以安全重试。"
+        },
+        {
+          "id": "computer-network-236-q1-quiz4",
+          "question": "指数退避加随机抖动（Exponential Backoff with Jitter）相比固定间隔重试的核心优势是什么？",
+          "choices": [
+            { "id": "A", "text": "指数增长的间隔给下游恢复时间，随机抖动将重试请求在时间轴上打散避免惊群效应，两者配合防止集中重试压垮下游" },
+            { "id": "B", "text": "指数退避能保证每次重试一定成功，随机抖动确保不同客户端之间不会产生资源竞争" },
+            { "id": "C", "text": "指数退避减少了总的重试次数，随机抖动保证了重试的公平性使每个客户端获得相同的重试机会" },
+            { "id": "D", "text": "指数退避让重试间隔越来越短以更快恢复，随机抖动是为了绕过服务端的限流策略" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "固定间隔重试的问题是：如果 1000 个客户端在同一时刻超时，它们都会在固定间隔（比如 1 秒）后同时重试，形成「惊群效应」，相当于一波流量脉冲打到下游。指数退避让间隔越来越长（100ms → 200ms → 400ms），给下游越来越多的恢复时间。随机抖动在退避基础上加随机偏移（AWS 推荐的 full jitter：random(0, backoff)），让不同客户端的重试时间错开分散。B 选项错误——退避不能保证成功。C 选项错误——退避不减少次数。D 选项完全反了——指数退避是间隔越来越长，不是越来越短。"
+        },
+        {
+          "id": "computer-network-236-q1-quiz5",
+          "question": "某服务在过去 10 秒内发出了 2000 个请求，其中 400 个超时需要重试。如果配置了 10% 的 retry budget，实际会发出多少个重试请求？",
+          "choices": [
+            { "id": "A", "text": "200 个重试请求（2000 × 10% = 200），其余 200 个超时请求直接返回错误" },
+            { "id": "B", "text": "400 个重试请求，retry budget 只是告警阈值不会实际限制重试" },
+            { "id": "C", "text": "40 个重试请求（400 × 10% = 40），budget 按失败请求数计算" },
+            { "id": "D", "text": "0 个重试请求，因为 400/2000 = 20% 已经超过了 10% 的 budget 阈值，所有重试被禁止" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Retry budget 的计算基准是总请求量（包括原始请求和重试请求），10% 的 budget 意味着在 2000 个总请求中最多允许 200 个是重试请求。当 400 个请求超时时，只有前 200 个能获得重试机会，后 200 个直接返回错误给调用方。B 选项错误——retry budget 是硬限制，不只是告警。C 选项错误——budget 是按总请求量的比例计算，不是按失败请求量。D 选项的逻辑也不对——budget 不是看失败率是否超过 10%，而是限制重试请求的绝对数量占总量的比例。"
+        },
+        {
+          "id": "computer-network-236-q1-quiz6",
+          "question": "关于重试风暴（Retry Storm），以下哪个说法是错误的？",
+          "choices": [
+            { "id": "A", "text": "重试风暴是一个正反馈循环：下游过载 → 请求超时 → 触发重试 → 下游负载更重 → 更多超时 → 更多重试" },
+            { "id": "B", "text": "在三层调用链中如果每层最多重试 3 次，一个原始请求最多可能产生 27 次请求打到最底层" },
+            { "id": "C", "text": "配置了指数退避就能完全避免重试风暴，因为退避时间越来越长会自然消解过载" },
+            { "id": "D", "text": "重试风暴可以将一个服务从「响应变慢」推到「完全不可用」，导致级联故障" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "指数退避能缓解重试风暴但不能完全避免。退避只是让重试请求在时间上分散，但如果下游持续过载、大量客户端都在重试，即使有退避，累积的重试请求总量依然可能压垮下游。要真正防止重试风暴，需要指数退避、重试预算、熔断器三者配合：退避让重试分散，预算限制重试总量，熔断器在连续失败时直接切断流量。A 选项准确描述了重试风暴的正反馈机制。B 选项计算正确——3 层每层重试 3 次就是 3^3 = 27。D 选项描述了重试风暴的实际后果。"
+        },
+        {
+          "id": "computer-network-236-q1-quiz7",
+          "question": "熔断器的三种状态 Closed → Open → Half-Open 的切换逻辑是什么？",
+          "choices": [
+            { "id": "A", "text": "Closed 状态下正常放行请求；连续失败达到阈值后切换到 Open 状态直接拒绝所有请求；经过冷却时间后进入 Half-Open 放行少量探测请求，成功则回到 Closed，失败则回到 Open" },
+            { "id": "B", "text": "Closed 表示电路断开不允许请求通过；Open 表示电路接通允许所有请求通过；Half-Open 是过渡状态" },
+            { "id": "C", "text": "三种状态由服务端控制：服务端健康时设为 Closed，过载时主动通知客户端设为 Open，恢复后设为 Half-Open" },
+            { "id": "D", "text": "Closed 状态下所有请求被缓存排队；Open 状态下请求正常发送；Half-Open 状态下只允许读请求不允许写请求" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "熔断器的命名借鉴自电气工程中的断路器（Circuit Breaker）。Closed（闭合）状态表示电路通畅，请求正常通过——这是健康状态。当下游连续失败（比如连续 5 个 5xx）达到阈值，熔断器「跳闸」切换到 Open（断开）状态，此时所有请求直接返回错误，不再发送到下游，实现快速失败。经过设定的冷却时间后，熔断器进入 Half-Open 状态，允许少量探测请求通过来检验下游是否恢复。B 选项把 Closed 和 Open 的含义搞反了——Closed 表示正常通行。C 选项错误，熔断器是客户端侧的机制。D 选项完全错误。"
+        },
+        {
+          "id": "computer-network-236-q1-quiz8",
+          "question": "在生产环境的微服务调用链中，重试应该放在哪一层最合理？",
+          "choices": [
+            { "id": "A", "text": "优先在最靠近用户的那一层（API Gateway 或 BFF 层）做重试，中间微服务层尽量不做重试以避免多层重试导致的请求放大" },
+            { "id": "B", "text": "在每一层都配置重试以实现最高可用性，因为任何一层都可能遇到瞬时故障" },
+            { "id": "C", "text": "只在最底层的服务做重试，因为底层最接近数据源，能最准确地判断是否需要重试" },
+            { "id": "D", "text": "不应该做任何自动重试，所有重试都应该由用户手动触发以避免风险" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "多层重试是生产环境中最常见的超时重试设计失误。假设有 3 层服务，每层最多重试 3 次，一个原始请求最坏情况下会产生 3^3 = 27 个请求打到最底层，这就是指数放大效应。正确做法是在最靠近用户的入口层（API Gateway 或 BFF）做重试，因为这一层最清楚整个请求的全局超时预算。中间层如果必须重试，一定要配合 retry budget 和链路超时传递。B 选项是典型的反模式——每层都重试会导致灾难性的请求放大。C 选项不合理——底层服务不了解上游的超时预算。D 选项过于保守，自动重试对于瞬时故障的恢复是必要的。"
+        },
+        {
+          "id": "computer-network-236-q1-quiz9",
+          "question": "Hedged Request（对冲请求）和传统重试的核心区别是什么？",
+          "choices": [
+            { "id": "A", "text": "传统重试等第一个请求失败后才发第二个；对冲请求在第一个请求的 P95 延迟内未响应时就立即发第二个到不同节点，谁先返回用谁" },
+            { "id": "B", "text": "对冲请求是同时发送多个完全相同的请求到所有节点，然后取最快的结果" },
+            { "id": "C", "text": "对冲请求不需要考虑幂等性，因为它只发给不同的节点所以不会重复执行" },
+            { "id": "D", "text": "对冲请求只用于写操作的去重，传统重试只用于读操作的容错" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "传统重试的模式是「失败 → 等待退避 → 重试」，用于容错。Hedged Request 的模式是「发出请求 → 如果在设定的延迟（通常是 P95 延迟）内没收到响应 → 立即发第二个请求到另一个节点 → 取先返回的结果」，用于降低尾部延迟。Google 在「The Tail at Scale」论文中证明对冲请求可以将 P99.9 延迟降低一个数量级，额外请求量只增加约 2-5%。B 选项描述的是广播模式而非对冲。C 选项错误——对冲请求仍然需要幂等保障，因为两个请求可能都被服务端执行。D 选项完全反了——对冲主要用于读操作的延迟优化。"
+        },
+        {
+          "id": "computer-network-236-q1-quiz10",
+          "question": "一个 gRPC 服务返回 FAILED_PRECONDITION（库存不足），客户端应该如何处理？",
+          "choices": [
+            { "id": "A", "text": "不应重试，直接将业务错误返回给上层。FAILED_PRECONDITION 是业务逻辑层面的明确拒绝，重试不会改变结果" },
+            { "id": "B", "text": "应该立即重试 3 次，因为库存可能很快被其他订单释放" },
+            { "id": "C", "text": "应该用指数退避重试，等待一段时间后库存可能恢复" },
+            { "id": "D", "text": "应该触发熔断器进入 Open 状态，因为 FAILED_PRECONDITION 说明服务端有问题" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "区分可重试错误和不可重试错误是超时重试设计的关键一环。gRPC 的状态码体系天然支持这种区分：UNAVAILABLE（服务暂时不可用）、DEADLINE_EXCEEDED（超时）属于基础设施层面的瞬时故障，可以重试。FAILED_PRECONDITION（前提条件不满足，如库存不足）、INVALID_ARGUMENT（参数错误）、PERMISSION_DENIED（权限不足）、ALREADY_EXISTS（资源已存在）属于业务逻辑层面的明确拒绝，重试不会改变结果，只会浪费资源。B 和 C 选项都在对一个确定性的业务拒绝做无意义的重试。D 选项会错误地触发熔断——这不是服务端故障，而是正常的业务拒绝。"
+        }
+      ],
+      "references": [
+        "https://sre.google/sre-book/handling-overload/",
+        "https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/",
+        "https://grpc.io/docs/guides/retry/",
+        "https://research.google/pubs/pub40801/",
+        "https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/router_filter#retry-semantics"
+      ]
+    }
+  ]
+}

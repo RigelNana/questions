@@ -1,0 +1,157 @@
+{
+  "id": "computer-network-240",
+  "name": "DNS 缓存 TTL 策略调优",
+  "domain": "computer-network",
+  "description": "深入解析 DNS TTL 如何在解析实时性与查询性能之间做权衡，涵盖迁移切换、Java 缓存坑和 Kubernetes CoreDNS 场景",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "computer-network-240-q1",
+      "domain": "computer-network",
+      "type": "tuning",
+      "difficulty": 2,
+      "tags": ["DNS", "TTL", "缓存", "调优", "故障切换"],
+      "title": "DNS 缓存 TTL 策略如何平衡实时性与性能？",
+      "content": "## 场景背景\n\n你所在的团队负责一个日均 PV 超过 3000 万的电商平台，后端由 12 个微服务组成，部署在两个云可用区（AZ-A 和 AZ-B）的 Kubernetes 集群上，前面挂着 CDN 和云厂商的负载均衡器。某天凌晨 2 点，AZ-A 的机房出现网络故障，你需要把所有流量切到 AZ-B。运维同事修改了 DNS 记录指向 AZ-B 的 VIP，但切换后整整 40 分钟，监控还在显示大量请求打向 AZ-A 的旧 IP，5xx 错误率飙到 38%。事后复盘发现，你们域名的 DNS TTL 设置为 3600 秒（1 小时），全球各级递归解析器的缓存还没过期，客户端拿到的仍然是旧 IP。\n\n更麻烦的是，你们的 Java 微服务之间通过域名互调，其中几个服务用的是 JDK 8 默认配置，`networkaddress.cache.ttl` 值为 -1（永久缓存），意味着即使 DNS 记录已经更新，这些 Java 进程不重启就永远不会感知到 IP 变化。\n\n下面是故障期间你用 `dig` 查看域名解析的输出：\n\n```bash\n$ dig api.example.com\n\n;; ANSWER SECTION:\napi.example.com.    2847    IN    A    10.0.1.100   ;; 旧 IP，还剩 2847 秒过期\n\n;; Query time: 2 msec        ;; 命中递归缓存，没有回源权威\n;; SERVER: 10.0.0.2#53(10.0.0.2)\n```\n\n2847 秒——接近 47 分钟之后这条缓存才会过期。在这 47 分钟里，所有使用这个递归解析器的客户端都会继续访问故障机房。\n\n**核心问题**：如何设计 DNS TTL 策略，在日常运行时最大化缓存命中率降低解析延迟，在需要故障切换或服务迁移时又能快速生效？",
+      "answer": "## 一、DNS 缓存体系：基础概念与核心机制\n\nDNS（Domain Name System，域名系统）是互联网最基础的基础设施之一，它的本质工作是把人类可读的域名（如 `api.example.com`）翻译成机器可路由的 IP 地址（如 `10.0.1.100`）。这个翻译过程叫做「域名解析」（Name Resolution），看起来简单，但一次完整的递归解析可能要经过根域名服务器、顶级域服务器、权威域名服务器三到四次网络往返，每次往返的延迟取决于客户端到 DNS 服务器的网络距离，通常在 5ms 到 200ms 之间。如果每次访问网页都要走完整的递归解析，HTTP 请求还没发出去，光 DNS 就消耗了几百毫秒，对用户体验和系统性能都是不可接受的。\n\n正因如此，DNS 在设计之初就内置了多级缓存机制，而 TTL（Time To Live，生存时间）就是控制这套缓存机制的核心参数。TTL 的值由权威域名服务器在 DNS 响应的资源记录（Resource Record）里设定，单位是秒。它的含义是：「这条解析记录可以被缓存多久，过期之后必须重新向上游查询」。\n\n要理解 TTL 的实际影响，你必须先搞清楚 DNS 解析链路上到底有哪些缓存层。一条 DNS 查询从客户端发出到拿到最终结果，会经过至少四层缓存，每一层都受 TTL 控制：\n\n第一层是**客户端本地缓存**。操作系统的 DNS 解析器（stub resolver）会缓存查询结果。在 Linux 上，如果跑了 `systemd-resolved` 或 `nscd`，解析结果会被缓存在本地；在 macOS 上是 `mDNSResponder`；在 Windows 上是 DNS Client 服务。你可以用以下命令查看和刷新本地缓存：\n\n```bash\n# Linux (systemd-resolved)\n$ resolvectl statistics        # 查看缓存命中率\nCurrent Cache Size: 142\nCache Hits: 8734\nCache Misses: 1203\n\n$ resolvectl flush-caches       # 清空本地缓存\n\n# macOS\n$ sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder\n\n# Windows\n> ipconfig /displaydns          # 查看缓存\n> ipconfig /flushdns            # 清空缓存\n```\n\n第二层是**应用程序内部缓存**。很多编程语言和运行时有自己的 DNS 缓存，独立于操作系统之外。最出名的坑就是 Java 的 `InetAddress` 缓存，后面会详细展开。Go 语言默认使用系统解析器不做额外缓存，Node.js 的 `dns.lookup` 也是直接调用系统 API，但如果你用了连接池或 HTTP client 库，连接复用本身就会「隐式缓存」DNS 结果——连接不断开，就不会重新解析。\n\n第三层是**本地递归解析器**（Local Recursive Resolver），通常由企业内网的 DNS 服务器或公共 DNS（如 8.8.8.8、1.1.1.1、114.114.114.114）充当。递归解析器收到客户端查询后，如果本地缓存中有未过期的记录就直接返回（这就是 `dig` 输出里 Query time: 2 msec 且没有 AA flag 的情况），否则它会代替客户端向上游迭代查询。递归解析器是 TTL 消耗的主战场——绝大部分 DNS 查询在这一层就被拦截了。\n\n第四层是**权威域名服务器**（Authoritative Name Server），它是 TTL 值的「源头」。你在域名管理面板（Cloudflare、AWS Route 53、阿里云解析等）里设置的 TTL，最终会被写进权威服务器的 zone 文件。当递归解析器来查询时，权威服务器返回的应答里包含你设定的 TTL 值，递归解析器以此为准缓存对应的时间。\n\n用 `dig` 可以非常直观地看到 TTL 在缓存链路中的递减过程：\n\n```bash\n# 第一次查询：递归解析器回源权威，拿到完整 TTL\n$ dig api.example.com\n;; ANSWER SECTION:\napi.example.com.    300    IN    A    10.0.2.50\n;; Query time: 87 msec    ;; 回源了，耗时较长\n\n# 10 秒后再查：命中递归缓存，TTL 已减少\n$ dig api.example.com\n;; ANSWER SECTION:\napi.example.com.    290    IN    A    10.0.2.50\n;; Query time: 1 msec     ;; 缓存命中，几乎无延迟\n\n# 150 秒后再查：TTL 继续递减\n$ dig api.example.com\n;; ANSWER SECTION:\napi.example.com.    140    IN    A    10.0.2.50\n;; Query time: 1 msec\n```\n\n注意 TTL 从 300 递减到 290 再到 140，这不是权威服务器在倒计时，而是递归解析器在本地缓存中记录了这条记录的到期时间，每次被查询时计算剩余秒数返回给客户端。当 TTL 递减到 0，递归解析器就会丢弃这条缓存，下一次查询重新回源权威。\n\n## 二、TTL 长短的核心权衡分析\n\n理解了缓存链路之后，TTL 值的调优本质上就是在两个相互矛盾的目标之间找平衡点：**查询性能**和**变更实时性**。\n\n### TTL 设得长（如 3600 秒 / 1 小时）\n\n优点是显而易见的。递归解析器在一整个小时内都会用缓存应答，不会回源权威服务器。这意味着三件好事：第一，客户端的 DNS 解析延迟极低（1-2ms 缓存命中 vs 50-200ms 回源），对于高频调用的 API 域名，每个请求省下几十毫秒累积起来非常可观。第二，权威服务器的查询压力大幅降低，如果你用的是按查询量计费的托管 DNS（如 Route 53 每百万查询 0.4 美元），长 TTL 直接省钱。第三，即使权威服务器短暂不可用，递归解析器的缓存还能兜底一阵子，相当于多了一层容灾。\n\n缺点在场景背景里已经血淋淋地展示过了。当你需要变更 DNS 记录——无论是故障切换、机房迁移还是更换云厂商——你修改了权威记录之后，全球各地的递归解析器要等缓存过期后才会回源拿到新记录。TTL 3600 秒意味着最坏情况下要等一个小时。而且这一个小时不是统一过期的：不同递归解析器在不同时间缓存了这条记录，所以它们会在不同时间过期，造成一个长达一小时的「渐进切换窗口」，这期间有的用户已经访问新 IP，有的还在打旧 IP。\n\n### TTL 设得短（如 60 秒 / 1 分钟）\n\n优点是变更生效快。你修改了 DNS 记录后，最多 60 秒全球所有递归解析器的缓存都会过期，客户端重新查询就能拿到新 IP。对于需要频繁切换的场景（如基于 DNS 的负载均衡、灰度发布、故障自动切换），短 TTL 是必须的。AWS Route 53 的健康检查+故障转移功能就要求 TTL 设为 60 秒才能发挥最佳效果。\n\n缺点也很明显。60 秒的 TTL 意味着每分钟每个递归解析器都要回源一次。假设你的域名被 10 万个递归解析器缓存着，TTL 3600 秒时每小时回源 10 万次，TTL 60 秒时每小时回源 600 万次——查询量直接涨了 60 倍。对于权威服务器来说这是巨大的压力，对于客户端来说每 60 秒就要经历一次回源的高延迟查询。在弱网环境下（移动端、海外用户），频繁的 DNS 回源会显著恶化用户体验。\n\n### 生产环境的最佳实践：动态 TTL 策略\n\n老练的 SRE 不会选择一个固定的 TTL 然后一成不变。正确的做法是**根据运维阶段动态调整 TTL**，这是一个三阶段操作流程：\n\n**阶段一：日常运行——中等 TTL（300 秒）**。300 秒（5 分钟）是业界公认的均衡值，AWS、Cloudflare、Google Cloud 的官方文档都推荐这个量级。它足够短，让变更在 5 分钟内全球生效；又足够长，递归解析器的缓存命中率能维持在一个合理水平。如果你的域名变更频率极低（一年改不了几次），可以放到 600-1800 秒；如果你的域名背后有基于 DNS 的负载均衡或健康检查，300 秒是上限。\n\n**阶段二：迁移/切换前——降低 TTL（60 秒）并等待旧 TTL 过期**。这是最关键也最容易被忽略的一步。假设你的域名当前 TTL 是 300 秒，你计划明天凌晨 2 点做机房迁移。正确的操作是：今天先把 TTL 从 300 降低到 60，然后**至少等 300 秒**（旧 TTL 的完整周期），确保全球所有递归解析器中旧的 300 秒缓存都已过期，新缓存的 TTL 已经是 60 秒了。这样到了凌晨 2 点你修改 IP 时，最坏情况下 60 秒就能全球生效。\n\n完整的迁移操作步骤如下：\n\n```bash\n# T-24h：提前一天降低 TTL（保守做法，留足缓冲）\n# 在 DNS 管理面板将 api.example.com 的 TTL 从 300 改为 60\n# 或者通过 CLI：\n$ aws route53 change-resource-record-sets --hosted-zone-id Z1234 \\\n  --change-batch '{\n    \"Changes\": [{\n      \"Action\": \"UPSERT\",\n      \"ResourceRecordSet\": {\n        \"Name\": \"api.example.com\",\n        \"Type\": \"A\",\n        \"TTL\": 60,\n        \"ResourceRecords\": [{\"Value\": \"10.0.1.100\"}]\n      }\n    }]\n  }'\n\n# T-1h：验证新 TTL 已生效，全球递归解析器返回的 TTL ≤ 60\n$ dig api.example.com @8.8.8.8 +short\n10.0.1.100\n$ dig api.example.com @8.8.8.8 | grep TTL\napi.example.com.    47    IN    A    10.0.1.100   ;; TTL ≤ 60，确认生效\n\n# T=0：执行切换，修改 IP 指向新机房\n$ aws route53 change-resource-record-sets --hosted-zone-id Z1234 \\\n  --change-batch '{\n    \"Changes\": [{\n      \"Action\": \"UPSERT\",\n      \"ResourceRecordSet\": {\n        \"Name\": \"api.example.com\",\n        \"Type\": \"A\",\n        \"TTL\": 60,\n        \"ResourceRecords\": [{\"Value\": \"10.0.2.50\"}]\n      }\n    }]\n  }'\n\n# T+5m：验证切换生效\n$ dig api.example.com @8.8.8.8 +short\n10.0.2.50     ;; 新 IP，切换成功\n$ dig api.example.com @1.1.1.1 +short\n10.0.2.50     ;; 多个公共 DNS 交叉验证\n```\n\n**阶段三：切换完成后——恢复长 TTL**。迁移确认成功、监控指标稳定后，把 TTL 恢复到 300 秒或更长。很多团队切换完就忘了这一步，域名一直挂着 60 秒的 TTL，白白增加 DNS 查询量和延迟。\n\n### 负 TTL 与 NXDOMAIN 缓存\n\n除了正常记录的 TTL，还有一个容易被忽略的概念叫「负缓存」（Negative Caching）。当递归解析器查询一个不存在的域名时，权威服务器返回 NXDOMAIN（Non-Existent Domain）响应，这个 NXDOMAIN 也会被缓存。缓存多久由权威服务器 SOA 记录中的 `minimum` 字段决定（RFC 2308），通常叫做 Negative TTL。\n\n这在生产环境中有一个隐蔽的坑：你新建了一条 DNS 记录 `new-api.example.com`，但在记录生效之前某个递归解析器已经查询过这个域名并缓存了 NXDOMAIN。如果负 TTL 设的是 3600 秒，那接下来一小时这个递归解析器都会直接返回 NXDOMAIN，即使记录已经在权威服务器上了。所以 SOA 的 minimum 值不要设太大，300 秒是比较合理的。\n\n### Java DNS 缓存：最臭名昭著的坑\n\nJava 的 `InetAddress` 类有自己独立的 DNS 缓存，完全绕过操作系统的缓存机制。这个缓存的 TTL 由 JVM 安全属性 `networkaddress.cache.ttl` 控制。在 JDK 8 及更早版本中，如果安装了 SecurityManager（大部分应用服务器默认会装），这个值默认是 **-1，也就是永久缓存**。一旦 JVM 解析了某个域名拿到 IP，它就再也不会重新查询了，除非进程重启。\n\n这在容器化和云原生环境中是灾难性的。你的 Kubernetes Service 换了 ClusterIP，你的 RDS 做了主从切换换了 endpoint IP，你的 Redis 集群做了故障转移——Java 进程全部无感知，继续打旧 IP，然后抛出 `java.net.ConnectException: Connection refused`。\n\n正确的配置方式有两种：\n\n```java\n// 方式一：在代码中设置（推荐放在 main 方法最开头）\njava.security.Security.setProperty(\"networkaddress.cache.ttl\", \"30\");\njava.security.Security.setProperty(\"networkaddress.cache.negative.ttl\", \"10\");\n\n// 方式二：通过 JVM 启动参数设置（推荐用于容器化部署）\n// 在 $JAVA_HOME/conf/security/java.security 文件中修改：\n// networkaddress.cache.ttl=30\n// networkaddress.cache.negative.ttl=10\n\n// 方式三：JVM 参数（注意是 -Dsun.net.inetaddr.ttl，不是 security property）\n// java -Dsun.net.inetaddr.ttl=30 -jar app.jar\n```\n\n这里有一个微妙的区别：`networkaddress.cache.ttl` 是 Security Property，要用 `Security.setProperty()` 设置；而 `sun.net.inetaddr.ttl` 是 System Property，可以用 `-D` 参数。两者效果一样，但 Security Property 优先级更高。JDK 9+ 在没有 SecurityManager 时默认 TTL 改为了 30 秒，但如果你还在用 JDK 8（2024 年很多企业还在用），必须显式配置。\n\n## 三、体系化扩展：Kubernetes、CDN 与高级场景\n\n### Kubernetes CoreDNS 的 TTL 处理\n\n在 Kubernetes 集群内部，Pod 访问 Service 域名（如 `my-svc.default.svc.cluster.local`）的解析由 CoreDNS 处理。CoreDNS 的默认 TTL 是 30 秒，这个值在 Corefile 的 `kubernetes` 插件中通过 `ttl` 参数配置：\n\n```\n.:53 {\n    kubernetes cluster.local in-addr.arpa ip6.arpa {\n        pods insecure\n        fallthrough in-addr.arpa ip6.arpa\n        ttl 30          # Service 域名的 TTL，默认 30 秒\n    }\n    cache 30            # CoreDNS 自身的缓存 TTL\n    forward . /etc/resolv.conf\n}\n```\n\n但实际上，Kubernetes 集群内 DNS 查询量往往非常大。一个 200 Pod 的集群，每个 Pod 每秒可能发起几十次 DNS 查询（服务间调用、外部 API、数据库连接等），CoreDNS 很容易成为瓶颈。Kubernetes 1.18 引入了 **NodeLocal DNSCache**（以 DaemonSet 方式在每个节点运行一个 DNS 缓存代理），大幅降低了跨节点的 DNS 查询。NodeLocal DNSCache 使用 `node-local-dns` ConfigMap 配置，默认缓存 TTL 也是 30 秒，跟 CoreDNS 保持一致。\n\n一个常见的生产问题是：Java 应用跑在 Kubernetes 里，Java 自己缓存了 DNS 结果，CoreDNS 也缓存了，两层缓存叠加后实际的 TTL 可能远超你的预期。假设 CoreDNS TTL 30 秒、Java 缓存 TTL 30 秒，最坏情况下一次 DNS 变更要 60 秒才能被 Java Pod 感知到。如果你的 Java 缓存没有显式配置还是 -1（永久），那就是前面说的灾难场景。\n\n### CDN 场景下的 CNAME TTL 策略\n\n当域名接入 CDN 时，你的 DNS 配置通常是一条 CNAME 记录指向 CDN 厂商的域名，然后 CDN 厂商再通过自己的智能 DNS 解析到最近的边缘节点 IP：\n\n```\nwww.example.com.   300   IN   CNAME   www.example.com.cdn.cloudflare.net.\nwww.example.com.cdn.cloudflare.net.  60  IN  A  104.16.132.229\n```\n\n这里有两个 TTL 需要注意。CNAME 记录的 TTL（300 秒）控制的是「域名到 CDN 域名的映射」多久刷新一次，通常可以设得较长，因为你不会频繁更换 CDN 厂商。而 CDN 厂商自己的 A 记录 TTL（60 秒）通常设得很短，因为 CDN 需要根据用户地理位置、节点负载、节点健康状况动态调整返回的边缘 IP。\n\n如果你要从 CDN A 切换到 CDN B（比如从 Cloudflare 迁移到 AWS CloudFront），需要修改的是 CNAME 记录。迁移策略跟前面一样：先降 CNAME TTL 到 60 秒，等旧 TTL 过期，执行切换，验证后恢复 TTL。\n\n### 面试追问点与高频考察形式\n\n面试官在听完你对 TTL 调优的回答后，通常会追问以下几个方向：\n\n第一个追问是「TTL 设为 0 可以吗」。答案是技术上可以，但不推荐。TTL=0 意味着递归解析器不应缓存这条记录，每次查询都回源权威。但实际上很多递归解析器会对 TTL=0 做最低缓存保护（比如 Google Public DNS 至少缓存 15-30 秒），所以 TTL=0 并不能保证「实时生效」，反而会造成大量无谓的查询。\n\n第二个追问是「DNS 解析有没有可能完全不遵守 TTL」。答案是肯定的。部分 ISP 的递归解析器为了降低自身的回源压力，会故意把 TTL 延长（称为 TTL capping 或 TTL enforcement），尤其是一些国内小运营商。此外，某些企业防火墙、网络设备也会缓存 DNS 并忽略 TTL。这就是为什么 TTL 60 秒不意味着 60 秒一定生效——在实践中，你应该假设 TTL 的 2-3 倍时间作为安全窗口。\n\n第三个追问是「如果需要秒级切换怎么办」。单靠 DNS TTL 无法实现秒级切换。要做到秒级，需要在 DNS 之上叠加其他机制：Anycast IP（同一个 IP 通过 BGP 宣告到多个机房，故障时撤回 BGP 路由，几十秒内全球收敛）、GSLB（Global Server Load Balancing，如 F5 或 Citrix 的方案，结合健康检查和 DNS 实时响应）、或者干脆在应用层做切换（客户端内置多 IP 列表 + 主动探活，类似 gRPC 的 name resolution 机制）。",
+      "keyPoints": [
+        "DNS TTL 由权威服务器设定，控制递归解析器和客户端缓存一条记录的最长时间，递减到 0 后缓存失效触发回源查询",
+        "DNS 缓存链路有四层：客户端本地缓存（OS resolver）→ 应用程序内部缓存（如 Java InetAddress）→ 递归解析器缓存 → 权威服务器，TTL 在每一层独立生效",
+        "TTL 设长（3600s）可降低查询量和延迟但故障切换慢，TTL 设短（60s）可快速切换但查询量大增，300 秒是日常运行的业界推荐均衡值",
+        "DNS 迁移的标准操作是三阶段：提前降低 TTL 到 60 秒并等待旧 TTL 完全过期，执行 IP 切换并多 DNS 交叉验证，稳定后恢复长 TTL",
+        "Java JDK 8 默认 networkaddress.cache.ttl=-1 表示永久缓存 DNS 结果，必须显式设为 30 秒，否则 IP 变更后 Java 进程不重启永远感知不到",
+        "负缓存（Negative Caching）会缓存 NXDOMAIN 响应，由 SOA 记录的 minimum 字段控制，新建 DNS 记录前如果域名已被查询过会导致新记录延迟生效",
+        "Kubernetes CoreDNS 默认 TTL 30 秒，叠加 Java 应用自身 DNS 缓存后实际感知延迟可能翻倍，NodeLocal DNSCache 可缓解集群内 DNS 查询压力",
+        "部分 ISP 递归解析器会不遵守 TTL 做 TTL capping 延长缓存时间，实际迁移时应以 TTL 的 2-3 倍作为安全等待窗口"
+      ],
+      "quiz": [
+        {
+          "id": "computer-network-240-q1-quiz1",
+          "question": "DNS 中 TTL 值最初由谁设定，并在哪里开始递减？",
+          "choices": [
+            {"id": "A", "text": "由客户端操作系统设定，在客户端本地缓存中递减"},
+            {"id": "B", "text": "由权威域名服务器在资源记录中设定，在递归解析器的缓存中递减"},
+            {"id": "C", "text": "由递归解析器根据网络状况自动设定，在每一层缓存中递减"},
+            {"id": "D", "text": "由 ICMP 协议中的 TTL 字段设定，在每经过一个路由器时递减"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "DNS 记录的 TTL 由权威域名服务器在 DNS 响应的资源记录（Resource Record）中设定，递归解析器收到后以此为依据缓存记录并在本地做倒计时递减。选 A 错在客户端只是被动接收 TTL，不能自行设定。选 C 错在递归解析器是缓存 TTL 的消费者而非生产者，它不会自动调整权威设定的 TTL（虽然部分 ISP 会做 TTL capping，但这不是标准行为）。选 D 混淆了 IP 协议头的 TTL（控制数据包生存跳数，每经过路由器减 1）和 DNS 记录的 TTL（控制缓存时间，单位是秒），两者名字相同但含义完全不同。"
+        },
+        {
+          "id": "computer-network-240-q1-quiz2",
+          "question": "以下哪个 TTL 值被业界普遍认为是日常运行时平衡性能与实时性的推荐值？",
+          "choices": [
+            {"id": "A", "text": "30 秒，确保最快的变更生效速度"},
+            {"id": "B", "text": "300 秒（5 分钟），在缓存命中率和变更生效速度之间取得均衡"},
+            {"id": "C", "text": "3600 秒（1 小时），最大化缓存命中率降低 DNS 查询成本"},
+            {"id": "D", "text": "86400 秒（1 天），减少权威服务器压力至最低"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "300 秒（5 分钟）是 AWS Route 53、Cloudflare、Google Cloud DNS 等主流服务商文档推荐的日常运行 TTL。选 A 的 30 秒太短，虽然切换快但会导致递归解析器频繁回源，增加 DNS 查询量和延迟，通常只在迁移窗口期临时使用。选 C 的 3600 秒在需要故障切换时代价太高，场景背景中 40 分钟无法切换就是这个值造成的。选 D 的 86400 秒只适用于几乎永远不变的记录（如 MX 记录指向固定邮件网关），用在 A 记录上风险极大。"
+        },
+        {
+          "id": "computer-network-240-q1-quiz3",
+          "question": "在执行 DNS 迁移前降低 TTL 后，为什么必须等待旧 TTL 完全过期才能执行 IP 切换？",
+          "choices": [
+            {"id": "A", "text": "因为权威服务器需要时间同步新 TTL 到所有从服务器"},
+            {"id": "B", "text": "因为全球递归解析器中仍缓存着旧 TTL 的记录，在旧缓存未过期前切换 IP 后仍有部分用户长时间访问旧 IP"},
+            {"id": "C", "text": "因为 DNS 协议规定 TTL 变更后必须等待一个完整的传播周期才能修改其他字段"},
+            {"id": "D", "text": "因为降低 TTL 会触发全球递归解析器的缓存清除操作，需要等待清除完成"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "降低 TTL 只是修改权威服务器上的值，全球递归解析器中已经缓存的旧记录仍然按旧 TTL 倒计时。如果旧 TTL 是 3600 秒、你在修改 TTL 后立刻切换 IP，那些刚缓存了旧记录的递归解析器还要等最多 3600 秒才会回源拿到新 IP。必须等旧 TTL 完全过期，确保所有递归解析器的缓存已更新为新 TTL（60 秒），这样切换 IP 后最坏只需等 60 秒。选 A 描述的是权威 DNS 的主从同步，与此无关。选 C 不存在这种协议规定。选 D 错在降低 TTL 不会触发缓存清除，缓存只会自然过期。"
+        },
+        {
+          "id": "computer-network-240-q1-quiz4",
+          "question": "Java JDK 8 中 networkaddress.cache.ttl 的默认行为是什么？",
+          "choices": [
+            {"id": "A", "text": "默认值为 30 秒，与操作系统 DNS 缓存保持一致"},
+            {"id": "B", "text": "默认值为 0，不做任何 DNS 缓存直接使用操作系统的缓存"},
+            {"id": "C", "text": "在安装 SecurityManager 的情况下默认值为 -1，表示永久缓存 DNS 解析结果直到 JVM 重启"},
+            {"id": "D", "text": "默认值为 60 秒，是 JDK 团队权衡后的推荐值"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Java JDK 8 在安装了 SecurityManager 的情况下，`networkaddress.cache.ttl` 默认值为 -1，含义是 DNS 解析结果被永久缓存，只有 JVM 重启才会刷新。这是为了防止 DNS 欺骗攻击而做的安全设计，但在云原生和微服务环境中会导致 IP 变更无法被感知。选 A 是 JDK 9+ 在没有 SecurityManager 时的默认行为。选 B 描述的行为需要显式设置 TTL=0。选 D 的 60 秒不是任何 JDK 版本的默认值。生产环境建议显式设置为 30 秒。"
+        },
+        {
+          "id": "computer-network-240-q1-quiz5",
+          "question": "以下 dig 输出说明了什么？\n\n```\n$ dig api.example.com\n;; ANSWER SECTION:\napi.example.com. 47 IN A 10.0.1.100\n;; Query time: 1 msec\n;; SERVER: 10.0.0.2#53\n```",
+          "choices": [
+            {"id": "A", "text": "权威服务器设置的 TTL 为 47 秒，这是一条新鲜的权威应答"},
+            {"id": "B", "text": "该记录命中了 10.0.0.2 递归解析器的缓存，剩余缓存时间 47 秒，原始 TTL 大于 47 秒"},
+            {"id": "C", "text": "该域名即将过期，47 秒后 DNS 记录会被删除"},
+            {"id": "D", "text": "该记录经过了 47 跳路由器到达客户端"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Query time 仅 1ms 说明没有回源权威服务器，直接从递归解析器 10.0.0.2 的本地缓存中返回了结果。TTL 显示为 47 说明这条记录最初被缓存时 TTL 大于 47（比如原始 TTL 是 300，已经过了 253 秒），当前还剩 47 秒过期。选 A 错在如果是权威应答 Query time 应该更长（几十到上百毫秒），且应答中会带有 AA（Authoritative Answer）标志。选 C 混淆了缓存过期和域名注册过期，TTL 到 0 只是缓存失效需要重新查询。选 D 混淆了 DNS TTL 和 IP TTL。"
+        },
+        {
+          "id": "computer-network-240-q1-quiz6",
+          "question": "某团队的域名 TTL 为 300 秒，临时改为 60 秒后立刻切换了 IP，结果仍有用户在 5 分钟后才看到新 IP。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "权威服务器的主从同步延迟导致部分从服务器仍返回旧 IP"},
+            {"id": "B", "text": "修改 TTL 后没有等待旧 TTL（300 秒）过期就切换了 IP，部分递归解析器仍缓存着 300 秒 TTL 的旧记录"},
+            {"id": "C", "text": "60 秒的 TTL 太短，被递归解析器自动延长到了 300 秒"},
+            {"id": "D", "text": "CDN 的边缘节点缓存了旧的 DNS 结果需要手动清除"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 DNS 迁移中最经典的错误。修改 TTL 后，全球递归解析器中已缓存的旧记录并不会立刻刷新，它们仍按旧的 300 秒 TTL 倒计时。如果降低 TTL 后没有等旧缓存过期就切换 IP，那些刚在 TTL 修改前缓存了记录的递归解析器会继续使用旧 IP 长达 300 秒。正确做法是降低 TTL 后等待至少 300 秒再切换。选 A 虽然可能，但主流 DNS 服务商的主从同步通常在秒级完成。选 C 虽然部分 ISP 会做 TTL capping，但不会普遍地把 60 秒延长到 300 秒。选 D 描述的是 HTTP 缓存而非 DNS 缓存问题。"
+        },
+        {
+          "id": "computer-network-240-q1-quiz7",
+          "question": "关于 DNS 负缓存（Negative Caching），以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "负缓存只缓存 SERVFAIL 响应，不缓存 NXDOMAIN 响应"},
+            {"id": "B", "text": "负缓存的 TTL 由 A 记录的 TTL 字段控制"},
+            {"id": "C", "text": "负缓存会缓存 NXDOMAIN 响应，其 TTL 由 SOA 记录的 minimum 字段控制，可能导致新建记录延迟生效"},
+            {"id": "D", "text": "负缓存是客户端特有的行为，递归解析器不会缓存否定应答"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "根据 RFC 2308，当权威服务器返回 NXDOMAIN（域名不存在）时，递归解析器会缓存这个否定应答，缓存时间由 SOA 记录的 minimum 字段决定。这意味着如果你在创建 DNS 记录之前有人查询了这个域名，NXDOMAIN 会被缓存，即使你随后创建了记录，在负缓存过期前递归解析器仍会返回 NXDOMAIN。选 A 错在负缓存主要针对 NXDOMAIN，SERVFAIL 的缓存行为因实现而异。选 B 错在 NXDOMAIN 响应中没有 A 记录，TTL 来自 SOA。选 D 错在递归解析器是负缓存的主要执行者。"
+        },
+        {
+          "id": "computer-network-240-q1-quiz8",
+          "question": "在 Kubernetes 集群中，一个 Java 8 应用（未配置 networkaddress.cache.ttl）通过 Service 域名调用另一个服务。如果目标 Service 的 ClusterIP 发生变化，这个 Java 应用会怎样？",
+          "choices": [
+            {"id": "A", "text": "30 秒内自动感知到新 IP，因为 CoreDNS 默认 TTL 为 30 秒"},
+            {"id": "B", "text": "60 秒内自动感知到新 IP，因为 CoreDNS TTL 和 Java 缓存各 30 秒叠加"},
+            {"id": "C", "text": "永远不会感知到新 IP，除非重启 Java 进程，因为 JDK 8 默认永久缓存 DNS 结果"},
+            {"id": "D", "text": "5 分钟内自动感知到新 IP，因为 Kubernetes 的默认 DNS 刷新周期是 5 分钟"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "JDK 8 在安装 SecurityManager 时 networkaddress.cache.ttl 默认为 -1（永久缓存）。Java 的 InetAddress 缓存是独立于 CoreDNS 的，它在 JVM 内部维护了一份 DNS 解析结果的缓存。即使 CoreDNS 已经返回了新 IP，Java 进程根本不会再去查询，因为它认为缓存永不过期。这就是为什么生产环境中必须显式配置 networkaddress.cache.ttl=30。选 A 只描述了 CoreDNS 侧的行为，忽略了 Java 侧的缓存。选 B 假设 Java 缓存 TTL 是 30 秒，但默认是永久。选 D 不存在这个刷新周期。"
+        },
+        {
+          "id": "computer-network-240-q1-quiz9",
+          "question": "将 DNS TTL 设为 0 会产生什么效果？",
+          "choices": [
+            {"id": "A", "text": "DNS 记录立即在全球生效，所有递归解析器实时返回最新结果"},
+            {"id": "B", "text": "递归解析器理论上不应缓存该记录，但实际上许多公共 DNS 会设置最低缓存时间（如 15-30 秒），不能保证真正的零缓存"},
+            {"id": "C", "text": "DNS 记录会被标记为无效，递归解析器会拒绝解析该域名"},
+            {"id": "D", "text": "与 TTL=1 效果完全相同，1 秒后缓存过期"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "RFC 规定 TTL=0 意味着接收方不应缓存该记录，但实际实现中，许多递归解析器为了自身性能和稳定性会设置最低缓存时间。例如 Google Public DNS（8.8.8.8）文档明确说明即使 TTL=0 也会短暂缓存。因此 TTL=0 不能保证实时生效，反而会给权威服务器带来巨大的查询压力。选 A 过于理想化，忽略了递归解析器的实际行为。选 C 完全错误，TTL=0 只是不缓存，不影响解析。选 D 错在 TTL=0 和 TTL=1 在语义上不同，TTL=0 是明确要求不缓存。"
+        },
+        {
+          "id": "computer-network-240-q1-quiz10",
+          "question": "如果需要实现秒级的故障切换（<10 秒），仅靠调整 DNS TTL 是否足够？最佳方案是什么？",
+          "choices": [
+            {"id": "A", "text": "足够，将 TTL 设为 1 秒即可实现秒级切换"},
+            {"id": "B", "text": "足够，配合 DNS NOTIFY 协议可以主动推送变更到所有递归解析器"},
+            {"id": "C", "text": "不够，应使用 Anycast IP + BGP 路由撤回，或在应用层实现多 IP 探活和自动切换"},
+            {"id": "D", "text": "不够，需要将权威 DNS 服务器部署到每个客户端所在的网络才能实现秒级响应"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "DNS 是一个基于缓存的松耦合系统，即使 TTL 设为 1 秒，由于递归解析器的最低缓存时间、客户端缓存、应用程序缓存等因素叠加，实际切换时间远超 1 秒。要实现秒级故障切换，需要绕过 DNS 缓存层。Anycast 方案让多个机房宣告同一个 IP，故障时撤回 BGP 路由，全球收敛时间在 30-90 秒。更快的方案是在应用层做切换：客户端内置多 IP 列表并主动探活，如 gRPC 的 name resolution 和 health checking 机制。选 A 忽略了 TTL capping 和多层缓存。选 B 错在 NOTIFY 是权威服务器之间的同步协议，不能推送到递归解析器。选 D 不现实且不解决根本问题。"
+        }
+      ],
+      "references": [
+        "https://datatracker.ietf.org/doc/html/rfc1035",
+        "https://datatracker.ietf.org/doc/html/rfc2308",
+        "https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-choosing-alias-non-alias.html",
+        "https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/"
+      ]
+    }
+  ]
+}

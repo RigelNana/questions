@@ -1,0 +1,158 @@
+{
+  "id": "computer-network-233",
+  "name": "设计一个高可用 DNS 解析系统需要满足哪些要求？",
+  "domain": "computer-network",
+  "description": "从多层缓存、主备多活部署、Anycast 路由、健康检查、防攻击到监控告警，系统性拆解高可用 DNS 架构的设计要求与生产落地方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "computer-network-233-q1",
+      "domain": "computer-network",
+      "type": "requirement",
+      "difficulty": 3,
+      "tags": ["DNS", "高可用", "系统设计", "容灾", "CoreDNS"],
+      "title": "设计一个高可用 DNS 解析系统需要满足哪些要求？",
+      "content": "你所在的公司正在做基础设施自建。之前全量使用某云厂商的 DNS 服务，上个月该厂商的 DNS 集群出了一次 23 分钟的全局故障，导致公司所有对外服务、内部微服务调用、甚至监控系统本身（因为 Alertmanager 也要解析 SMTP 域名来发邮件）全部瘫痪。故障复盘会上，CTO 决定自建一套高可用 DNS 解析系统，同时保留云 DNS 作为备份。你是这个项目的技术负责人，团队有 3 个 SRE 工程师。\n\n当前的技术栈是 Kubernetes 1.28 集群（3 个 Master + 50 个 Worker Node），内部服务用 CoreDNS 做集群 DNS，对外域名托管在云厂商。故障期间的监控数据如下：\n\n```\n# 故障期间 Prometheus 告警（已触发但邮件未发出）\nALERT DnsResolutionFailure\n  expr: probe_dns_lookup_time_seconds == 0 and probe_success == 0\n  for: 2m\n  labels:\n    severity: critical\n  annotations:\n    summary: \"DNS resolution failed for {{ $labels.instance }}\"\n\n# 故障期间 CoreDNS 日志\n[ERROR] plugin/forward: no nameservers available\n[ERROR] plugin/forward: unreachable backend: read udp 10.0.0.2:53: i/o timeout\n[ERROR] plugin/forward: unreachable backend: read udp 10.0.0.3:53: i/o timeout\n2024-01-15T08:12:33.421Z [INFO] Returning SERVFAIL for \"api.example.com.\" from 10.244.3.17\n\n# kubectl 查看 CoreDNS Pod 状态\nNAME                       READY   STATUS    RESTARTS   AGE\ncoredns-5d78c9869d-k7g2x   1/1     Running   0          14d\ncoredns-5d78c9869d-m9f4p   1/1     Running   0          14d\n```\n\n面试官问你：如果让你从零设计这套高可用 DNS 系统，你需要满足哪些要求？从缓存策略、部署架构、流量调度、故障切换、安全防护到监控告警，做一个完整的需求分析。",
+      "answer": "## 第一步：DNS 在基础设施中的核心地位与基础概念\n\nDNS（Domain Name System，域名系统）是互联网最基础的基础设施之一，它的核心工作只有一件事：把人类可读的域名（比如 `api.example.com`）翻译成机器可路由的 IP 地址（比如 `10.0.1.23`）。这件事听起来简单，但它的影响面大到几乎不可想象——当 DNS 挂了，不是某个服务挂了，而是所有服务都挂了。你的 HTTP 请求发不出去，因为不知道目标 IP；你的微服务间 gRPC 调用失败，因为 Service Discovery 底层也依赖 DNS；你的监控告警发不出来，因为 Alertmanager 解析不了邮件服务器的域名；甚至你想登录跳板机排查故障，SSH 连接如果配的是域名而不是 IP，也连不上。DNS 是那种「平时完全感知不到，一旦挂了就是世界末日」的组件。\n\n一条完整的 DNS 解析过程涉及多个层级。以浏览器访问 `api.example.com` 为例：浏览器首先检查自己的 DNS 缓存，没有命中就调用操作系统的 resolver（在 Linux 上就是 glibc 的 `getaddrinfo()`，它会读 `/etc/resolv.conf` 里配置的 nameserver），操作系统的 resolver 把查询发给本地配置的递归 DNS 服务器（比如公司内部的 DNS 或者运营商的 DNS），递归 DNS 服务器如果缓存里也没有，就从根域名服务器开始逐级查询：先问根服务器「.com 的权威 DNS 在哪」，再问 .com 的 TLD 服务器「example.com 的权威 DNS 在哪」，最后问 `example.com` 的权威 DNS 服务器「api.example.com 的 A 记录是什么」。拿到结果后，每一层都会根据 TTL（Time To Live）缓存这个结果。\n\n用最简单的 `dig` 命令就能观察这个过程：\n\n```bash\n# 完整解析链路追踪，+trace 会从根服务器开始逐级查询\ndig +trace api.example.com\n\n# 查看某条记录的 TTL（剩余缓存时间）\ndig api.example.com +noall +answer\n# 输出示例：\n# api.example.com.   42   IN   A   10.0.1.23\n# 这里的 42 表示这条缓存记录还有 42 秒过期\n\n# 指定使用某个 DNS 服务器查询\ndig @8.8.8.8 api.example.com\n```\n\n理解了 DNS 的分层架构和缓存机制，才能明白为什么高可用 DNS 的设计不是简单地「多部署几个 DNS 服务器」就行了——你需要在每一个层级都做冗余和容错。\n\n## 第二步：高可用 DNS 系统的六大核心要求\n\n### 要求一：多层缓存策略，每层 TTL 精细控制\n\n高可用 DNS 的第一道防线不是服务器冗余，而是缓存。DNS 天然就是一个多级缓存系统，但大部分团队从来没有认真设计过每一层的 TTL 策略，直到出事了才发现默认值不合理。\n\n从客户端到权威 DNS，至少有四层缓存：浏览器/应用缓存（Chrome 默认缓存 60 秒，Go 的 `net.Resolver` 默认不缓存）、操作系统 DNS 缓存（Linux 的 systemd-resolved 默认缓存 TTL 秒，macOS 的 mDNSResponder 类似）、本地递归 resolver 缓存（公司内部的 DNS 服务器，缓存最大可达 TTL 指定的时间）、以及 ISP/公共 DNS 的缓存层（8.8.8.8、114.114.114.114 等）。\n\nTTL 的设置是一个核心权衡：TTL 设得太长（比如 86400 秒即一天），当你需要紧急切换 IP（比如服务器被攻击、机房故障需要切流量）时，全网缓存刷新需要等一天，这段时间用户还是会访问旧 IP；TTL 设得太短（比如 30 秒），每 30 秒所有客户端都要重新查询一次 DNS，你的权威 DNS 服务器会承受巨大的查询压力，而且每次解析都增加了一个额外的网络往返延迟。生产环境的最佳实践是分场景设置：对外服务的 A 记录设 300 秒（5 分钟），这是一个平衡故障切换速度和查询压力的甜点值；内部微服务的记录可以设 60 秒甚至更短，因为内网 DNS 查询延迟极低；而 NS 记录和 MX 记录这种几乎不变的可以设 3600 秒甚至更长。\n\n这里有一个生产中很容易踩的坑：很多人以为设了 TTL 300 秒，故障后 5 分钟全网就切过来了。实际上不是这样的。有些递归 DNS 服务器（尤其是运营商的）会无视你设置的 TTL，自己加一个最小缓存时间（有的甚至是 1 小时）。CloudFlare 曾经统计过，设置 TTL 300 秒的记录，实际全网缓存清除时间的 P95 大约是 15-20 分钟。所以在做故障切换方案时，不能完全依赖 TTL 过期，还需要有主动推送或者多级 failover 机制。\n\n### 要求二：主备多活部署，多 NS 记录指向不同节点\n\n单点故障是高可用的天敌。一个域名的权威 DNS 必须由多个独立节点提供服务，具体做法是在上级域名注册商处配置多条 NS 记录，每条指向不同的 DNS 服务器。RFC 2182 明确建议至少配置两个权威 DNS 服务器，并且它们应该部署在不同的网络和物理位置。\n\n```bash\n# 查看某个域名的 NS 记录\ndig example.com NS +short\n# 输出示例：\n# ns1.example.com.    -> 部署在北京机房\n# ns2.example.com.    -> 部署在上海机房\n# ns3.example.com.    -> 部署在云厂商 A\n# ns4.example.com.    -> 部署在云厂商 B\n```\n\n这里的关键是「独立」二字。如果你的 ns1 和 ns2 跑在同一个机柜、同一个交换机下面，那一次机柜断电就全挂了。最佳实践是至少跨两个物理机房部署自建 DNS，同时保留一两个云厂商的 DNS 作为兜底。这就是题目中 CTO 说「保留云 DNS 作为备份」的原因——自建解决依赖单一厂商的问题，保留云 DNS 解决自建单点的问题。\n\n主从同步方面，DNS 有一套成熟的区域传送（Zone Transfer）机制：主服务器的记录发生变化时，通过 AXFR（全量传送）或 IXFR（增量传送）将变更推送给从服务器。BIND 和 PowerDNS 都原生支持这个功能。在 CoreDNS 中可以通过 `transfer` 插件实现，或者更现代的做法是用 Git + CI/CD 管理 zone 文件，变更后自动推送到所有节点。\n\n### 要求三：Anycast 路由，同 IP 多节点就近响应\n\nAnycast 是大规模 DNS 服务的核心武器。它的原理是：多个 DNS 服务器节点配置同一个 IP 地址，然后通过 BGP 路由协议向各自的上游网络宣告这个 IP 的路由。这样当客户端向这个 IP 发送 DNS 查询时，BGP 路由会自动把数据包送到网络拓扑距离最近的那个节点。全球 13 组根域名服务器就是这样工作的——比如 `f.root-servers.net` 实际上有超过 200 个物理节点分布在全球各地，但它们对外只暴露一个 IP 地址 `192.5.5.241`。\n\nAnycast 对 DNS 高可用的价值在于：当某个节点挂了，BGP 路由会自动收敛到下一个最近的节点，客户端完全无感知，不需要修改任何配置。收敛时间取决于 BGP 的配置，通常在几秒到几十秒。但 Anycast 也有一个重要限制：它只适用于无状态的 UDP 协议。DNS 查询天然是 UDP 无状态的（一个请求一个响应），所以是 Anycast 的完美应用场景。但如果是 DNS-over-TCP（大响应包、Zone Transfer 等场景），Anycast 的路由切换可能导致 TCP 连接中断。\n\n对于大部分公司来说，自建 Anycast 网络成本太高（需要自己的 AS 号和 BGP Peering），更务实的做法是使用支持 Anycast 的商业 DNS 服务（CloudFlare DNS、AWS Route53、Google Cloud DNS），它们背后都已经部署了全球 Anycast 网络。如果是纯内网 DNS（比如 Kubernetes 集群内部），就不需要 Anycast，靠多副本 + 负载均衡就够了。\n\n### 要求四：健康检查与自动切换（DNS Failover）\n\nDNS 记录本身是静态的，它不知道后端服务器是不是真的在正常服务。DNS Failover 的核心思路是：有一个独立于 DNS 的健康检查系统，定期探测后端服务器的可用性，当发现某个 IP 不可用时，自动把对应的 DNS 记录切换到备用 IP。\n\nAWS Route53 的 Health Check 是一个典型实现：你创建一个 Health Check 配置（目标 IP、端口、检查路径、检查间隔、失败阈值），Route53 会从全球多个区域同时探测。当连续 3 次（可配置）探测失败时，Route53 自动将该 IP 从 DNS 记录中摘除，流量切到健康的 IP 上。CloudFlare 的 Load Balancer 也有类似的机制。\n\n自建 DNS Failover 的话，可以用 CoreDNS 的 `health` 插件配合外部脚本实现，但更推荐的方案是用 Consul 或者 etcd 做服务发现，DNS 记录从服务发现系统动态生成。CoreDNS 有 `etcd` 插件可以直接从 etcd 读取记录，当服务注册/注销时 DNS 记录自动更新。下面是一个配置示例：\n\n```\n# CoreDNS Corefile - 带健康检查的 forward 配置\n. {\n    # 转发到多个上游 DNS，启用健康检查\n    forward . 10.0.0.2 10.0.0.3 10.0.0.4 {\n        # 每 5 秒检查一次上游 DNS 健康状态\n        health_check 5s\n        # 使用轮询策略分散查询压力\n        policy round_robin\n        # 单次查询超时 2 秒\n        expire 10s\n    }\n\n    # 缓存配置：成功记录缓存 300 秒，失败记录（NXDOMAIN/SERVFAIL）缓存 30 秒\n    cache 300 {\n        success 9984 300\n        denial 9984 30\n    }\n\n    # 日志和错误处理\n    errors\n    log\n\n    # Prometheus 指标暴露\n    prometheus :9153\n}\n\n# 内部域名从 etcd 动态读取\ninternal.example.com {\n    etcd {\n        path /skydns\n        endpoint http://etcd1:2379 http://etcd2:2379 http://etcd3:2379\n    }\n    cache 60\n}\n```\n\n### 要求五：安全防护——DNS 放大攻击与限速\n\nDNS 是 DDoS 攻击的高频目标，其中最经典的是 DNS 放大攻击（DNS Amplification Attack）。攻击原理是：攻击者伪造受害者的源 IP，向开放的 DNS 递归服务器发送大量查询请求（通常查询 ANY 类型，因为响应包最大），DNS 服务器把几倍甚至几十倍大小的响应包发给受害者，造成带宽耗尽。一个 60 字节的 DNS 查询可以引发一个 3000-4000 字节的 ANY 响应，放大倍数高达 50-70 倍。\n\n防御措施需要多层叠加：第一层是限制递归查询范围——权威 DNS 服务器应该关闭递归功能（只回答自己负责的域名），递归 DNS 服务器只对内网 IP 开放（通过 ACL 限制源 IP）；第二层是查询限速（Rate Limiting），对单个源 IP 的查询频率做限制，CoreDNS 的 `ratelimit` 插件可以配置每秒最大查询数；第三层是响应大小限制（Response Rate Limiting，简称 RRL），对大响应包做限速，避免被利用做放大攻击。BIND 9.10+ 原生支持 RRL，CoreDNS 可以通过 `rrl` 插件实现。\n\n另外，DNSSEC（DNS Security Extensions）可以防止 DNS 缓存投毒攻击——攻击者伪造 DNS 响应把域名解析到恶意 IP。DNSSEC 通过数字签名确保 DNS 响应没有被篡改。但 DNSSEC 的部署成本较高（需要管理密钥轮换），而且会增加 DNS 响应包的大小，在国内的实际部署率很低。对大部分公司来说，DNS-over-HTTPS（DoH）或 DNS-over-TLS（DoT）是更现实的安全增强方案。\n\n### 要求六：监控告警——解析成功率、延迟 P99、缓存命中率\n\n题目中的故障场景有一个让人哭笑不得的细节：告警触发了但邮件没发出去，因为邮件服务器也依赖 DNS。这暴露了监控系统设计中一个常见的盲区——监控链路本身不能依赖被监控的组件。DNS 监控的告警通道必须有一个不依赖 DNS 的备份通道，比如直接用 IP 地址调用的 Webhook，或者短信网关。\n\n对于 DNS 系统需要监控的核心指标，用 Prometheus + CoreDNS 的 metrics 端点可以收集以下数据：\n\n```yaml\n# Prometheus 告警规则：DNS 监控\ngroups:\n  - name: dns-ha-alerts\n    rules:\n      # 解析成功率低于 99.9% 时告警\n      - alert: DnsResolutionSuccessRateLow\n        expr: |\n          (\n            sum(rate(coredns_dns_responses_total{rcode=\"NOERROR\"}[5m]))\n            /\n            sum(rate(coredns_dns_responses_total[5m]))\n          ) < 0.999\n        for: 3m\n        labels:\n          severity: critical\n        annotations:\n          summary: \"DNS 解析成功率低于 99.9%，当前 {{ $value | humanizePercentage }}\"\n\n      # DNS 查询延迟 P99 超过 100ms 时告警\n      - alert: DnsLatencyP99High\n        expr: |\n          histogram_quantile(0.99,\n            sum(rate(coredns_dns_request_duration_seconds_bucket[5m])) by (le)\n          ) > 0.1\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"DNS P99 延迟超过 100ms，当前 {{ $value | humanize }}s\"\n\n      # 缓存命中率低于 80% 时告警（可能存在缓存配置问题或异常查询模式）\n      - alert: DnsCacheHitRateLow\n        expr: |\n          (\n            sum(rate(coredns_cache_hits_total[5m]))\n            /\n            (\n              sum(rate(coredns_cache_hits_total[5m]))\n              +\n              sum(rate(coredns_cache_misses_total[5m]))\n            )\n          ) < 0.8\n        for: 10m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"DNS 缓存命中率低于 80%，当前 {{ $value | humanizePercentage }}\"\n\n      # CoreDNS Pod 可用数量低于 2 时告警\n      - alert: CoreDnsPodsInsufficient\n        expr: |\n          kube_deployment_status_replicas_available{deployment=\"coredns\", namespace=\"kube-system\"} < 2\n        for: 1m\n        labels:\n          severity: critical\n        annotations:\n          summary: \"CoreDNS 可用副本数不足 2，当前 {{ $value }}\"\n\n      # 上游 DNS 转发失败率过高\n      - alert: DnsForwardErrorRateHigh\n        expr: |\n          sum(rate(coredns_forward_responses_total{rcode=~\"SERVFAIL|REFUSED\"}[5m]))\n          /\n          sum(rate(coredns_forward_responses_total[5m]))\n          > 0.05\n        for: 3m\n        labels:\n          severity: critical\n        annotations:\n          summary: \"DNS 上游转发错误率超过 5%，当前 {{ $value | humanizePercentage }}\"\n```\n\n### CoreDNS 在 Kubernetes 中的高可用部署方案\n\n回到题目中的 Kubernetes 环境，CoreDNS 是集群内部 DNS 的默认实现，它的高可用部署需要三个组件配合：多副本 Deployment 保证冗余、Pod Anti-Affinity 保证副本分散在不同节点、PodDisruptionBudget（PDB）保证滚动更新或节点维护时至少有足够副本在线。\n\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: coredns\n  namespace: kube-system\n  labels:\n    k8s-app: kube-dns\nspec:\n  # 50 个 Worker Node 的集群，3-5 副本通常足够\n  # 经验公式：每个 CoreDNS Pod 约可处理 30000 QPS\n  replicas: 3\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 1\n      maxSurge: 1\n  selector:\n    matchLabels:\n      k8s-app: kube-dns\n  template:\n    metadata:\n      labels:\n        k8s-app: kube-dns\n    spec:\n      # 优先级最高，保证节点资源紧张时不会被驱逐\n      priorityClassName: system-cluster-critical\n      affinity:\n        podAntiAffinity:\n          # 强制反亲和：同一个 Node 上最多只能有一个 CoreDNS Pod\n          requiredDuringSchedulingIgnoredDuringExecution:\n            - labelSelector:\n                matchExpressions:\n                  - key: k8s-app\n                    operator: In\n                    values:\n                      - kube-dns\n              topologyKey: kubernetes.io/hostname\n      containers:\n        - name: coredns\n          image: registry.k8s.io/coredns/coredns:v1.11.1\n          resources:\n            requests:\n              cpu: 100m\n              memory: 70Mi\n            limits:\n              cpu: 500m\n              memory: 256Mi\n          ports:\n            - containerPort: 53\n              name: dns\n              protocol: UDP\n            - containerPort: 53\n              name: dns-tcp\n              protocol: TCP\n            - containerPort: 9153\n              name: metrics\n              protocol: TCP\n          livenessProbe:\n            httpGet:\n              path: /health\n              port: 8080\n              scheme: HTTP\n            initialDelaySeconds: 60\n            timeoutSeconds: 5\n            periodSeconds: 10\n            failureThreshold: 5\n          readinessProbe:\n            httpGet:\n              path: /ready\n              port: 8181\n              scheme: HTTP\n            periodSeconds: 5\n            failureThreshold: 3\n          volumeMounts:\n            - name: config-volume\n              mountPath: /etc/coredns\n              readOnly: true\n      volumes:\n        - name: config-volume\n          configMap:\n            name: coredns\n---\napiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: coredns-pdb\n  namespace: kube-system\nspec:\n  # 任何时候至少保证 2 个 CoreDNS Pod 在线\n  minAvailable: 2\n  selector:\n    matchLabels:\n      k8s-app: kube-dns\n```\n\n这套部署有几个关键细节值得注意。`priorityClassName: system-cluster-critical` 确保 CoreDNS Pod 在节点资源紧张时不会被驱逐——DNS 是整个集群的生命线，宁可驱逐业务 Pod 也不能让 DNS 挂掉。`requiredDuringSchedulingIgnoredDuringExecution` 的强制反亲和确保三个 CoreDNS Pod 分布在三个不同节点上，一台 Node 宕机最多影响一个 Pod。PDB 的 `minAvailable: 2` 确保 `kubectl drain` 一个节点时，如果 drain 后 CoreDNS 可用副本数会低于 2，操作会被阻止。\n\n对于 50 个 Worker Node 的集群，还可以考虑 NodeLocal DNSCache（即 `node-local-dns`）——在每个节点上跑一个 DNS 缓存 DaemonSet，Pod 的 DNS 请求先打到本节点的缓存，只有 cache miss 才转发到 CoreDNS Service。这不仅减轻了 CoreDNS 的查询压力，还消除了 conntrack 表在 UDP DNS 场景下的竞争条件问题（这是 Kubernetes 社区一个著名的 DNS 间歇性 5 秒超时的 bug，详见 kubernetes/kubernetes#56903）。\n\n### 商业方案的 SLA 对标\n\n设计自建方案时，有必要了解商业 DNS 服务的 SLA 作为对标基准。AWS Route53 承诺 100% 可用性 SLA（是的，100%，这在云服务中极为罕见），CloudFlare DNS 的实测可用性常年在 99.999% 以上（全年停机不超过 5 分钟），Google Cloud DNS 承诺 99.99%。这些服务之所以能做到如此高的可用性，核心就是本文讲的这些技术——全球 Anycast 网络、多数据中心冗余、自动故障切换。自建方案在预算有限的情况下很难达到这个级别，所以最务实的策略是「自建 + 商业兜底」的混合架构。\n\n## 第三步：体系化扩展——进阶方案与面试追问\n\n### Split-Horizon DNS（分视角 DNS）\n\n在大型企业中，同一个域名在内网和外网需要解析到不同的 IP。比如 `api.example.com` 在公网解析到负载均衡器的公网 IP，在内网解析到服务的内网 VIP。这就是 Split-Horizon DNS（也叫 Split-Brain DNS）。实现方式是在 DNS 服务器上根据查询来源 IP 判断返回不同的记录。CoreDNS 可以通过 `view` 插件（社区插件）或者用多个 server block + `acl` 插件实现。BIND 用 `view` 指令原生支持。这个功能在高可用设计中的意义在于：内网流量不走公网负载均衡器可以减少延迟和故障面——公网入口挂了，内网服务间调用不受影响。\n\n### DNS-over-HTTPS 对缓存体系的影响\n\nDoH（DNS-over-HTTPS）正在逐渐普及——Firefox 默认启用了 DoH，Chrome 也在逐步推进。DoH 把 DNS 查询封装在 HTTPS 请求中发送到特定的 DNS 服务商（比如 CloudFlare 的 `1.1.1.1` 或 Google 的 `8.8.8.8`），这意味着操作系统层面的 DNS 缓存和你公司内部的递归 DNS 会被完全绕过。对企业来说，这是一个安全和运维挑战：内部 DNS 策略不生效了，Split-Horizon DNS 也可能失效。如果你的高可用 DNS 方案依赖内部递归 DNS 的缓存来抗故障，DoH 的普及会削弱这层缓存的覆盖面。应对方案是在企业网络出口部署 DoH 拦截策略，或者自建 DoH 服务端让内部用户指向企业自己的 DoH 端点。\n\n### 面试常见追问点\n\n面试官在你回答完高可用 DNS 设计后，通常会从以下角度追问。第一个方向是「DNS 和服务发现的关系」——在 Kubernetes 中 CoreDNS 是服务发现的基础，但它是通过轮询 Kubernetes API 来同步 Service/Endpoint 信息的，如果 API Server 也挂了怎么办？答案是 CoreDNS 会使用本地缓存继续服务，但不再能感知新的 Service 变更。第二个方向是「DNS TTL 和连接池的交互」——很多人不知道 HTTP 连接池（比如 Go 的 `http.Transport`）建立的长连接会绕过 DNS TTL，即使 DNS 记录已经切到了新 IP，老连接还是会打到旧 IP 上。这就是为什么紧急切流量时除了改 DNS 还要考虑触发客户端重建连接。第三个方向是「多集群 DNS 方案」——当你有多个 Kubernetes 集群时，集群间的服务发现怎么做？常见方案是 ExternalDNS 配合 Route53 自动同步 Service 到公共 DNS，或者用 CoreDNS 的 `multicluster` 插件。",
+      "keyPoints": [
+        "DNS 是基础设施中的「单点依赖之王」，故障时不仅业务服务不可用，连监控告警、SSH 登录等运维操作都会受影响，因此 DNS 高可用是所有高可用建设的前置条件",
+        "多层缓存的 TTL 策略需要分场景设计：对外 A 记录建议 300 秒平衡切换速度和查询压力，内部服务可短至 60 秒，NS/MX 等稳定记录可设 3600 秒以上",
+        "主备多活部署要求多条 NS 记录指向跨机房、跨厂商的独立 DNS 节点，配合 Zone Transfer（AXFR/IXFR）实现记录同步，避免所有鸡蛋放一个篮子",
+        "Anycast 技术让多个 DNS 节点共享同一个 IP，通过 BGP 路由实现就近响应和自动故障切换，是大规模 DNS 服务（如根域名服务器）的核心高可用手段",
+        "DNS Failover 依赖独立于 DNS 本身的健康检查系统，当后端 IP 不可用时自动摘除对应记录，Route53 Health Check 和 CoreDNS forward 的 health_check 参数是典型实现",
+        "DNS 放大攻击防御需要多层叠加：关闭不必要的递归、ACL 限制查询来源、查询限速（Rate Limiting）、响应限速（RRL），以及考虑 DNSSEC 防止缓存投毒",
+        "CoreDNS 在 K8s 中的高可用三件套是：多副本 Deployment + Pod Anti-Affinity 强制分散节点 + PDB 保证最小可用数，再配合 NodeLocal DNSCache 消除 conntrack 竞争和减轻中心化压力",
+        "DNS 监控的告警通道本身不能依赖 DNS（否则 DNS 挂了告警也发不出去），必须有基于 IP 直连的备份告警通道如 Webhook 或短信网关"
+      ],
+      "quiz": [
+        {
+          "id": "computer-network-233-q1-quiz01",
+          "question": "DNS 故障为什么会导致整个技术栈几乎全部瘫痪？",
+          "choices": [
+            {"id": "A", "text": "因为 DNS 服务器同时承担了负载均衡和流量路由的功能，DNS 挂了流量就无法分发"},
+            {"id": "B", "text": "因为现代分布式系统中几乎所有网络通信都依赖域名解析，包括服务间调用、监控告警、甚至运维工具本身"},
+            {"id": "C", "text": "因为 DNS 故障会导致 IP 地址被回收，所有服务器失去网络连接"},
+            {"id": "D", "text": "因为 DNS 是 TCP/IP 协议栈的一部分，DNS 服务停止后 TCP 连接也无法建立"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "DNS 的特殊性在于它是一个「隐形依赖」——几乎所有网络通信都通过域名发起，包括微服务间的 gRPC/HTTP 调用、Alertmanager 发送告警邮件需要解析 SMTP 域名、kubectl 连接 API Server 如果配的是域名也会失败。A 选项混淆了 DNS 和负载均衡器的职责，虽然 DNS 可以做简单的流量分发，但它的核心功能是域名解析而非负载均衡。C 选项完全错误，DNS 故障不会影响 IP 地址分配。D 选项也不对，DNS 运行在应用层而非传输层，TCP 连接本身不依赖 DNS，只是建连前需要先解析目标域名获取 IP。"
+        },
+        {
+          "id": "computer-network-233-q1-quiz02",
+          "question": "将对外服务的 DNS A 记录 TTL 设置为 300 秒，当发生故障需要切换 IP 时，全网缓存实际清除的 P95 时间大约是多少？",
+          "choices": [
+            {"id": "A", "text": "正好 300 秒（5 分钟），因为所有 DNS 服务器严格遵守 TTL"},
+            {"id": "B", "text": "大约 15-20 分钟，因为部分递归 DNS 服务器会无视设置的 TTL 加上自己的最小缓存时间"},
+            {"id": "C", "text": "大约 1 秒，因为 DNS 记录变更会通过 NOTIFY 机制实时推送到所有缓存服务器"},
+            {"id": "D", "text": "大约 24 小时，因为 ISP 的 DNS 缓存固定为一天刷新一次"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "虽然 TTL 设为 300 秒，但实际全网缓存清除时间远不止 5 分钟。原因有几个：部分运营商和公共 DNS 递归服务器会设置自己的最小缓存时间（minimum TTL），即使你设了 300 秒它也可能缓存 600 秒甚至更久；不同地区的 DNS 缓存刷新存在长尾效应；浏览器和操作系统也有自己的缓存层。CloudFlare 的统计数据显示 TTL 300 秒的记录实际 P95 清除时间约 15-20 分钟。A 选项过于理想化，C 选项描述的 NOTIFY 机制只用于权威 DNS 主从同步而非缓存刷新，D 选项过于极端。"
+        },
+        {
+          "id": "computer-network-233-q1-quiz03",
+          "question": "Anycast 技术在 DNS 高可用中的作用原理是什么？",
+          "choices": [
+            {"id": "A", "text": "通过 DNS 轮询（Round Robin）将不同的查询请求分发到不同的 DNS 服务器节点"},
+            {"id": "B", "text": "多个 DNS 节点配置同一个 IP 地址，通过 BGP 路由协议让查询自动到达网络拓扑距离最近的节点"},
+            {"id": "C", "text": "客户端内置多个 DNS 服务器 IP 列表，自动选择延迟最低的服务器发送查询"},
+            {"id": "D", "text": "通过 CDN 边缘节点代理 DNS 查询请求，将请求转发到最近的 DNS 数据中心"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Anycast 的核心是「一个 IP 地址对应多个物理节点」，依靠 BGP 路由协议在网络层面实现就近分发。当某个节点故障时，BGP 路由自动收敛到下一个最近的节点，客户端完全无感知。全球 13 组根域名服务器就是用 Anycast 实现的，比如 f-root 有超过 200 个物理节点但只暴露一个 IP。A 选项描述的是 DNS Round Robin，这是 DNS 层面的负载均衡而非网络层面的 Anycast。C 选项描述的是客户端重试机制，不是 Anycast。D 选项混淆了 CDN 和 Anycast 的概念，虽然很多 CDN 底层确实用 Anycast，但 Anycast 本身是一种网络路由技术。"
+        },
+        {
+          "id": "computer-network-233-q1-quiz04",
+          "question": "CoreDNS 在 Kubernetes 中配置 Pod Anti-Affinity 使用 `requiredDuringSchedulingIgnoredDuringExecution` 而非 `preferredDuringSchedulingIgnoredDuringExecution` 的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "required 策略性能更好，调度器处理速度更快"},
+            {"id": "B", "text": "preferred 策略在 kube-system 命名空间中不生效，只能用 required"},
+            {"id": "C", "text": "DNS 是集群生命线，必须强制保证副本分散在不同节点，不允许调度器在资源紧张时把多个 DNS Pod 调度到同一节点"},
+            {"id": "D", "text": "required 策略可以自动驱逐已经运行在同一节点上的 Pod，而 preferred 不能"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "对于 CoreDNS 这种集群生命线组件，反亲和策略必须是强制的（required）而非偏好的（preferred）。如果使用 preferred，调度器在节点资源不足时可能把两个甚至三个 CoreDNS Pod 调度到同一个节点上，一旦这个节点宕机所有 DNS 副本同时失效。required 策略确保调度器在无法满足反亲和条件时宁可让 Pod 处于 Pending 状态也不违反约束。A 选项不对，required 和 preferred 的性能差异不是选择依据；B 选项完全错误，preferred 在任何命名空间都生效；D 选项也不对，required 影响的是调度决策而非驱逐行为，注意策略名中的 `IgnoredDuringExecution` 明确表示执行阶段不受影响。"
+        },
+        {
+          "id": "computer-network-233-q1-quiz05",
+          "question": "题目中 CoreDNS 日志出现 `[ERROR] plugin/forward: no nameservers available` 错误，直接原因是什么？",
+          "choices": [
+            {"id": "A", "text": "CoreDNS 的配置文件 Corefile 中没有配置任何 forward 指令"},
+            {"id": "B", "text": "CoreDNS forward 插件的健康检查发现所有上游 DNS 服务器都不可达，将它们全部标记为不可用"},
+            {"id": "C", "text": "Kubernetes API Server 不可用导致 CoreDNS 无法读取 Service 信息"},
+            {"id": "D", "text": "CoreDNS Pod 的网络策略（NetworkPolicy）阻止了对上游 DNS 的出站流量"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "结合题目中的日志分析，`no nameservers available` 之前有两条 `unreachable backend: read udp 10.0.0.2:53: i/o timeout` 和 `unreachable backend: read udp 10.0.0.3:53: i/o timeout`，这说明 CoreDNS 的 forward 插件尝试向上游 DNS 服务器 10.0.0.2 和 10.0.0.3 发送查询但均超时。当所有上游服务器都被标记为不健康后，forward 插件报出 `no nameservers available`，后续查询就返回 SERVFAIL。这正是云厂商 DNS 集群故障导致的连锁反应。A 选项不对，如果没配 forward 指令根本不会有这个错误日志；C 选项描述的是另一种故障场景；D 选项虽然理论上可能但与日志中的超时报错模式不匹配。"
+        },
+        {
+          "id": "computer-network-233-q1-quiz06",
+          "question": "以下哪个做法是 DNS 高可用设计中常见的错误？",
+          "choices": [
+            {"id": "A", "text": "将所有 NS 记录指向的 DNS 服务器部署在同一个云厂商的同一个可用区"},
+            {"id": "B", "text": "同时保留自建 DNS 和云厂商 DNS 作为权威服务器"},
+            {"id": "C", "text": "在 CoreDNS 的 forward 配置中指定多个上游 DNS 并开启 health_check"},
+            {"id": "D", "text": "对 DNS 查询响应启用缓存并设置合理的 TTL"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "将所有 NS 服务器放在同一个云厂商的同一个可用区是典型的「伪高可用」——看起来有多个 NS 记录，但实际上共享同一个故障域。一次可用区故障或者云厂商 DNS 集群故障（就像题目中描述的场景）就会导致全部 NS 不可用。RFC 2182 明确建议权威 DNS 服务器应部署在不同的网络和物理位置。B 选项是正确的混合架构策略；C 选项是 CoreDNS 上游容错的标准配置；D 选项是 DNS 缓存的基本最佳实践。这三个选项都是高可用 DNS 的正确做法。"
+        },
+        {
+          "id": "computer-network-233-q1-quiz07",
+          "question": "DNS 放大攻击和 DNS 缓存投毒分别针对 DNS 系统的什么弱点？",
+          "choices": [
+            {"id": "A", "text": "放大攻击利用 DNS 查询和响应的大小不对称消耗目标带宽，缓存投毒利用 DNS 响应缺乏身份验证伪造解析结果"},
+            {"id": "B", "text": "放大攻击利用 DNS 明文传输窃取查询内容，缓存投毒利用 TTL 过期时间窗口替换正确记录"},
+            {"id": "C", "text": "放大攻击和缓存投毒都是利用 DNS 协议的 UDP 传输不可靠性实现的，区别只在于攻击目标不同"},
+            {"id": "D", "text": "放大攻击针对权威 DNS 服务器的处理能力，缓存投毒针对递归 DNS 服务器的内存容量"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "DNS 放大攻击的核心是利用「请求小、响应大」的不对称性。攻击者伪造受害者的源 IP 向开放的递归 DNS 发送 ANY 类型查询（60 字节请求可能得到 3000-4000 字节响应，放大 50-70 倍），海量的响应包涌向受害者消耗其带宽。DNS 缓存投毒的核心则是利用 DNS 响应在传统 DNS 协议中没有加密和签名验证，攻击者可以伪造一个「看起来合法」的 DNS 响应注入到递归 DNS 的缓存中，让后续查询返回恶意 IP。B 选项中「窃取查询内容」不是放大攻击的目标；C 选项过于笼统；D 选项中「内存容量」和缓存投毒无关。"
+        },
+        {
+          "id": "computer-network-233-q1-quiz08",
+          "question": "你的 Kubernetes 集群中 CoreDNS 部署了 3 副本并配置了 PDB `minAvailable: 2`，当你执行 `kubectl drain node-3`（node-3 上恰好运行着一个 CoreDNS Pod）时会发生什么？",
+          "choices": [
+            {"id": "A", "text": "drain 操作会直接驱逐 node-3 上的 CoreDNS Pod，副本数临时降为 2，调度器随后在其他节点创建新 Pod"},
+            {"id": "B", "text": "drain 操作会先等待新的 CoreDNS Pod 在其他节点启动并就绪后，才驱逐 node-3 上的旧 Pod"},
+            {"id": "C", "text": "如果驱逐后可用副本数仍然 ≥ 2 则允许，否则 drain 操作会被 PDB 阻止直到条件满足"},
+            {"id": "D", "text": "PDB 对 drain 操作不生效，只对 Pod 自愿驱逐（voluntary eviction）生效"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "PodDisruptionBudget 正是为了保护 drain、rolling update 等自愿中断场景而设计的。当执行 `kubectl drain node-3` 时，drain 操作会通过 Eviction API 尝试驱逐 Pod，此时 PDB 控制器会检查：如果驱逐这个 CoreDNS Pod 后可用副本数会低于 `minAvailable: 2`（即从 3 降到 2 仍然 ≥ 2），则允许驱逐；如果此时已经有一个 Pod 不可用（可用数为 2），再驱逐一个会降到 1，低于 minAvailable，drain 就会被阻止。A 选项忽略了 PDB 的保护机制；B 选项描述的更像 `maxUnavailable` 的 rolling update 行为而非 PDB 机制；D 选项恰恰说反了，kubectl drain 使用的 Eviction API 就是 PDB 生效的场景。"
+        },
+        {
+          "id": "computer-network-233-q1-quiz09",
+          "question": "DNS-over-HTTPS（DoH）的普及对企业内部 DNS 高可用架构有什么潜在影响？",
+          "choices": [
+            {"id": "A", "text": "DoH 加密了 DNS 查询，使企业内部 DNS 缓存无法被缓存投毒攻击，增强了高可用性"},
+            {"id": "B", "text": "DoH 会绕过企业内部的递归 DNS 和缓存层，导致 Split-Horizon DNS 策略失效，削弱内部 DNS 缓存对故障的缓冲作用"},
+            {"id": "C", "text": "DoH 只影响浏览器流量，对后端微服务间的 DNS 解析没有任何影响"},
+            {"id": "D", "text": "DoH 会自动把 DNS 查询路由到最近的 Anycast 节点，提升了 DNS 解析的可用性"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "DoH 将 DNS 查询封装在 HTTPS 中直接发送到 CloudFlare（1.1.1.1）或 Google（8.8.8.8）等公共 DNS 服务商，完全绕过了企业内部部署的递归 DNS 服务器。这意味着：企业内部精心设计的多层 DNS 缓存在 DoH 客户端上不起作用了，当外部 DNS 故障时内部缓存无法为这些客户端兜底；Split-Horizon DNS 策略也会失效，因为内网请求不再经过能够区分内外网的企业 DNS。C 选项部分正确——DoH 目前确实主要影响浏览器，但随着 DoH 在操作系统层面的普及（如 Windows 11 已原生支持），后端服务也可能受到影响。A 和 D 选项的描述不准确。"
+        },
+        {
+          "id": "computer-network-233-q1-quiz10",
+          "question": "在设计 DNS 监控告警系统时，为什么告警通道不能完全依赖域名解析？",
+          "choices": [
+            {"id": "A", "text": "因为 DNS 查询本身会产生额外延迟，导致告警通知不够及时"},
+            {"id": "B", "text": "因为 DNS 故障时基于域名的告警通道（如邮件、Slack Webhook）本身也无法工作，形成「监控盲区」"},
+            {"id": "C", "text": "因为 Prometheus 的 Alertmanager 不支持 DNS 解析，只能使用 IP 地址配置通知目标"},
+            {"id": "D", "text": "因为 DNS 监控的查询流量太大，会对正在故障的 DNS 服务器造成额外负担"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是题目场景中最具讽刺性的细节——DNS 故障导致 Alertmanager 无法解析 SMTP 服务器域名，告警邮件发不出去。这就是经典的「监控依赖了被监控组件」反模式。DNS 是几乎所有网络通信的基础，如果告警通道全部依赖域名解析（邮件需要解析 SMTP 域名，Slack/企微 Webhook 需要解析 API 域名），那 DNS 挂的时候恰恰是你最需要告警的时候却收不到告警。解决方案是配置一个不依赖 DNS 的备份告警通道，比如直接用 IP 地址调用的内部 Webhook 接口，或者短信网关（短信走运营商网络不依赖 DNS）。C 选项完全不对，Alertmanager 正常支持 DNS 解析。"
+        }
+      ],
+      "references": [
+        "https://datatracker.ietf.org/doc/html/rfc2182",
+        "https://coredns.io/manual/toc/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/dns-debugging-resolution/",
+        "https://aws.amazon.com/route53/sla/",
+        "https://github.com/kubernetes/enhancements/tree/master/keps/sig-network/1024-nodelocal-cache-dns"
+      ]
+    }
+  ]
+}
