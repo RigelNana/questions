@@ -49,12 +49,6 @@ export function QuestionDetail() {
     }
   }, [domain, questionId, setLastVisited]);
 
-  // Reset tab on question change
-  useEffect(() => {
-    setActiveTab('content');
-    setShowAnswer(false);
-  }, [questionId]);
-
   const domainKey = domain as Domain;
   const question = questionId ? getQuestionById(questionId) : undefined;
   const allQuestions = getQuestionsForDomain(domainKey);

@@ -26,16 +26,14 @@ export function QuizPanel({
   const [showExplanation, setShowExplanation] = useState(false);
 
   const currentQuiz = quizzes[currentIndex];
-  if (!currentQuiz) return null;
-
-  const existingAttempt = existingAttempts.find(
-    (a) => a.quizId === currentQuiz.id,
-  );
+  const existingAttempt = currentQuiz
+    ? existingAttempts.find((a) => a.quizId === currentQuiz.id)
+    : undefined;
   const isAnswered = !!existingAttempt || showExplanation;
   const correctCount = existingAttempts.filter((a) => a.isCorrect).length;
 
   const handleSubmit = useCallback(() => {
-    if (!selectedAnswer) return;
+    if (!selectedAnswer || !currentQuiz) return;
 
     const isCorrect = selectedAnswer === currentQuiz.correctAnswer;
     const attempt: QuizAttempt = {
@@ -96,7 +94,11 @@ export function QuizPanel({
   }, [isAnswered, selectedAnswer, handleSubmit, handleNext]);
 
   const displayAnswer = existingAttempt?.selectedAnswer ?? selectedAnswer;
-  const isCorrect = existingAttempt?.isCorrect ?? (showExplanation ? displayAnswer === currentQuiz.correctAnswer : undefined);
+  const isCorrect = currentQuiz
+    ? existingAttempt?.isCorrect ?? (showExplanation ? displayAnswer === currentQuiz.correctAnswer : undefined)
+    : undefined;
+
+  if (!currentQuiz) return null;
 
   return (
     <div className="border border-[var(--color-notion-border)] rounded-xl overflow-hidden">

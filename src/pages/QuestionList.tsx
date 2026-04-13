@@ -33,6 +33,26 @@ export function QuestionList() {
   const [searchQuery, setSearchQuery] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
 
+  const handleTypeFilterChange = (value: QuestionType | 'all') => {
+    setTypeFilter(value);
+    setCurrentPage(1);
+  };
+
+  const handleDifficultyFilterChange = (value: Difficulty | 0) => {
+    setDifficultyFilter(value);
+    setCurrentPage(1);
+  };
+
+  const handleStatusFilterChange = (value: StatusFilter) => {
+    setStatusFilter(value);
+    setCurrentPage(1);
+  };
+
+  const handleSearchQueryChange = (value: string) => {
+    setSearchQuery(value);
+    setCurrentPage(1);
+  };
+
   useEffect(() => {
     fetchRegistry();
   }, [fetchRegistry]);
@@ -42,11 +62,6 @@ export function QuestionList() {
       fetchPacksForDomain(domain as Domain);
     }
   }, [registry, domain, fetchPacksForDomain]);
-
-  // Reset page when filters change
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [typeFilter, difficultyFilter, statusFilter, searchQuery, domain]);
 
   const allQuestions = getQuestionsForDomain(domain as Domain);
 
@@ -126,7 +141,7 @@ export function QuestionList() {
           type="text"
           placeholder="搜索题目..."
           value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
+          onChange={(e) => handleSearchQueryChange(e.target.value)}
           className="w-full sm:flex-1 sm:min-w-[200px] px-3.5 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] focus:outline-none focus:border-[var(--color-notion-accent)] focus:ring-2 focus:ring-[var(--color-notion-accent)]/10 transition-all"
         />
 
@@ -134,7 +149,7 @@ export function QuestionList() {
           {/* Type filter */}
           <select
             value={typeFilter}
-            onChange={(e) => setTypeFilter(e.target.value as QuestionType | 'all')}
+            onChange={(e) => handleTypeFilterChange(e.target.value as QuestionType | 'all')}
             className="w-full rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-3 py-2 text-sm text-[var(--color-notion-text)] transition-colors hover:border-[var(--color-notion-accent)] sm:w-auto"
           >
             <option value="all">全部类型</option>
@@ -153,7 +168,7 @@ export function QuestionList() {
           {/* Difficulty filter */}
           <select
             value={difficultyFilter}
-            onChange={(e) => setDifficultyFilter(Number(e.target.value) as Difficulty | 0)}
+            onChange={(e) => handleDifficultyFilterChange(Number(e.target.value) as Difficulty | 0)}
             className="w-full rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-3 py-2 text-sm text-[var(--color-notion-text)] transition-colors hover:border-[var(--color-notion-accent)] sm:w-auto"
           >
             <option value={0}>全部难度</option>
@@ -166,7 +181,7 @@ export function QuestionList() {
           {/* Status filter */}
           <select
             value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
+            onChange={(e) => handleStatusFilterChange(e.target.value as StatusFilter)}
             className="w-full rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-3 py-2 text-sm text-[var(--color-notion-text)] transition-colors hover:border-[var(--color-notion-accent)] sm:w-auto"
           >
             <option value="all">全部状态</option>
