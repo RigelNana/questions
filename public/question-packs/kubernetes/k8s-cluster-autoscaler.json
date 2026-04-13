@@ -1,0 +1,158 @@
+{
+  "id": "k8s-cluster-autoscaler",
+  "name": "Cluster Autoscaler 节点自动伸缩",
+  "domain": "kubernetes",
+  "description": "深入解析 Cluster Autoscaler 的 Scale-up/Scale-down 决策机制、与云厂商 ASG/MIG 集成原理、Expander 策略选择，以及与 Karpenter 的对比和生产最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-cluster-autoscaler-q1",
+      "domain": "kubernetes",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Cluster Autoscaler", "节点伸缩", "Scale-up", "Scale-down", "ASG", "Karpenter", "HPA"],
+      "title": "Cluster Autoscaler 如何实现节点级别的自动伸缩？",
+      "content": "面试官问你「Cluster Autoscaler 是怎么实现节点级别自动伸缩的」，他不是想听你说「Pod 调度不上去就加节点、节点空了就删」。他真正考察的是三件事：第一，你是否清楚 Cluster Autoscaler（CA）在 Kubernetes 自动伸缩体系中的定位——它和 HPA、VPA 各管哪一层，三者之间如何协同；第二，Scale-up 的触发条件到底是什么，CA 是怎么从一堆 Pending Pod 中推算出需要几个什么规格的节点的；第三，Scale-down 的决策逻辑有哪些安全阀——utilization 阈值怎么算、10 分钟冷却期是怎么回事、哪些节点永远不会被缩掉。\n\n先来看一个你在生产中一定会碰到的场景。你维护着一个运行在 AWS EKS 1.30 上的集群，后端有 3 个 Auto Scaling Group（ASG）：一个 `general-pool`（m6i.xlarge，4C16G）、一个 `compute-pool`（c6i.2xlarge，8C16G）、一个 `memory-pool`（r6i.xlarge，4C32G）。平时集群跑着 120 个节点，某天早高峰流量比预期高出 40%，HPA 把核心服务的 Pod 副本数从 60 拉到了 90，但新增的 30 个 Pod 全部卡在 Pending：\n\n```\n$ kubectl get pods -n production --field-selector=status.phase=Pending\nNAME                          READY   STATUS    RESTARTS   AGE\norder-svc-7d4f8b-q2x9k       0/1     Pending   0          4m12s\norder-svc-7d4f8b-m8n3j       0/1     Pending   0          4m12s\norder-svc-7d4f8b-p5v7w       0/1     Pending   0          4m12s\npayment-svc-5c9e1a-r6t2y     0/1     Pending   0          3m48s\n... (26 more Pending pods)\n\n$ kubectl describe pod order-svc-7d4f8b-q2x9k -n production\nEvents:\n  Type     Reason            Age    From               Message\n  ----     ------            ----   ----               -------\n  Warning  FailedScheduling  3m50s  default-scheduler  0/120 nodes are available:\n    45 node(s) had insufficient cpu, 75 node(s) had insufficient memory.\n```\n\n这时候你查看 Cluster Autoscaler 的日志：\n\n```\n$ kubectl logs -n kube-system deployment/cluster-autoscaler --tail=20\nI0415 09:12:33.456789  1 scale_up.go:468] Pod order-svc-7d4f8b-q2x9k is unschedulable\nI0415 09:12:33.456801  1 scale_up.go:468] Pod payment-svc-5c9e1a-r6t2y is unschedulable\nI0415 09:12:33.567890  1 scale_up.go:542] Best option to resize: general-pool\nI0415 09:12:33.567901  1 scale_up.go:546] Estimated 8 nodes needed in general-pool\nI0415 09:12:33.678901  1 scale_up.go:603] Scale-up: setting group general-pool size to 53 (current: 45)\n```\n\nCA 检测到 Pending Pod，推算出需要 8 个 `general-pool` 节点，然后调整 ASG 的 desired capacity。3 分钟后新节点 Ready，Pending Pod 全部调度成功。这整个过程背后的决策逻辑、节点选择策略、以及它和云厂商基础设施的交互方式，就是这道题要深入探讨的。",
+      "answer": "## 第一步：Cluster Autoscaler 在 Kubernetes 自动伸缩体系中的定位\n\nKubernetes 的自动伸缩能力分为三个层次，每一层解决不同粒度的弹性问题。最底层是 Cluster Autoscaler（CA），它负责节点级别的伸缩——当集群的计算资源总量不够用时增加节点，当节点长期空闲时移除节点。中间层是 Horizontal Pod Autoscaler（HPA），它根据 CPU、内存或自定义指标调整 Pod 副本数。最上层是 Vertical Pod Autoscaler（VPA），它调整单个 Pod 的 resource requests/limits。三者的协作关系是这样的：HPA 发现流量上涨，把 Pod 从 10 个扩到 20 个；调度器发现集群没有足够资源放下这 10 个新 Pod，它们全部 Pending；CA 检测到这些 Pending Pod，判断需要增加节点，于是通知云厂商扩容——这是一个自下而上的级联触发链。\n\nCluster Autoscaler 是 Kubernetes 官方维护的组件（仓库在 `kubernetes/autoscaler`），以 Deployment 形式运行在集群内部，通常部署在 `kube-system` namespace。它的核心工作循环非常简单：大约每 10 秒（由 `--scan-interval` 参数控制，默认 10s）执行一次扫描，检查是否有 Pod 因为资源不足而 Pending（触发 Scale-up），以及是否有节点的资源利用率长时间低于阈值（触发 Scale-down）。CA 本身不直接创建或删除虚拟机，它通过云厂商提供的 API 来操作节点组——在 AWS 上是 Auto Scaling Group（ASG），在 GCP 上是 Managed Instance Group（MIG），在 Azure 上是 Virtual Machine Scale Set（VMSS）。\n\n一个典型的 CA 部署配置长这样（Helm values 片段）：\n\n```yaml\n# cluster-autoscaler Helm values (v9.37.0, app version 1.30.1)\nautoscalingGroups:\n  - name: general-pool\n    minSize: 3\n    maxSize: 100\n  - name: compute-pool\n    minSize: 2\n    maxSize: 50\n  - name: memory-pool\n    minSize: 1\n    maxSize: 30\nextraArgs:\n  scan-interval: 10s\n  scale-down-delay-after-add: 10m\n  scale-down-unneeded-time: 10m\n  scale-down-utilization-threshold: \"0.5\"\n  max-graceful-termination-sec: 600\n  balance-similar-node-groups: true\n  expander: least-waste\n```\n\n这段配置告诉 CA：管理三个节点组，每个组有最小和最大节点数限制；每 10 秒扫描一次；新节点加入后 10 分钟内不考虑缩容；节点资源利用率低于 50% 且持续 10 分钟才标记为可缩容；使用 least-waste 策略选择扩容目标节点组。\n\n## 第二步：Scale-up 与 Scale-down 的核心决策机制\n\n### Scale-up：从 Pending Pod 到新增节点\n\nCA 的 Scale-up 逻辑是整个组件最核心的部分。触发条件非常明确：调度器（kube-scheduler）尝试调度一个 Pod 但找不到合适的节点，Pod 进入 Pending 状态并且 Event 中出现 `FailedScheduling`。CA 在每次扫描周期中会遍历所有 Pending Pod，过滤掉那些不是因为资源不足而 Pending 的（比如 nodeSelector 不匹配、toleration 缺失等调度约束问题），只关注「如果有更多资源就能调度成功」的 Pod。\n\n接下来 CA 需要回答一个关键问题：应该扩容哪个节点组，扩多少个节点？这里的实现比大多数人想象的要复杂。CA 不是简单地用 Pending Pod 的 requests 总量除以单节点容量。它会对每个候选节点组执行一次模拟调度（simulation）：假设在该节点组中新增一个节点，然后用和 kube-scheduler 相同的 Filter 逻辑检查这些 Pending Pod 能否被调度到这个模拟节点上。如果一个节点组的节点规格根本不满足某些 Pod 的需求（比如 Pod 要求 GPU 但节点组是 CPU 实例），CA 会跳过这个组。模拟通过后，CA 计算需要多少个该规格的节点才能消化所有 Pending Pod，然后调用云厂商 API 调整节点组的 desired size。\n\n这个模拟调度的过程可以通过 CA 的 status configmap 来观察：\n\n```\n$ kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml\napiVersion: v1\ndata:\n  status: |\n    Cluster-autoscaler status at 2024-04-15 09:12:33.456789 +0000 UTC:\n    Health:\n      Ready:            3 node group(s) (ready=120, unready=0, ...)\n      LastProbeTime:    2024-04-15 09:12:33.456789 +0000 UTC\n    ScaleUp:\n      Status:           InProgress\n      LastActivity:     2024-04-15 09:12:33.567890 +0000 UTC\n    ScaleDown:\n      Status:           NoCandidates\n      LastActivity:     2024-04-15 08:45:12.345678 +0000 UTC\n```\n\n当多个节点组都能满足 Pending Pod 的需求时，CA 使用 Expander 策略来决定优先扩容哪个组。默认的 `random` 策略随机选择，生产中常用的 `least-waste` 策略会选择扩容后资源浪费最少的节点组——如果 Pending Pod 总共需要 12C48G，`least-waste` 会优先选择 4C16G 的 general-pool（3 个节点刚好 12C48G）而不是 8C16G 的 compute-pool（2 个节点给出 16C32G，内存不够还得加第 3 个变成 24C48G，CPU 浪费严重）。\n\n### Scale-down：多重安全阀保护的缩容流程\n\nScale-down 的设计比 Scale-up 谨慎得多，因为缩容意味着驱逐正在运行的 Pod，处理不当会造成服务中断。CA 的缩容决策经过多层检查。\n\n第一层是利用率检查。CA 计算每个节点的资源利用率，公式是「节点上所有 Pod 的 requests 之和 / 节点的 allocatable 资源」。注意这里用的是 requests 而不是实际使用量（actual usage），因为 requests 代表调度器为 Pod 预留的资源，是确定性的。当一个节点的 CPU 和内存利用率都低于 `--scale-down-utilization-threshold`（默认 0.5，即 50%）时，CA 将其标记为「underutilized」。\n\n第二层是持续时间检查。节点必须连续处于 underutilized 状态超过 `--scale-down-unneeded-time`（默认 10 分钟）才会被真正考虑缩容。这个冷却期防止了因为短暂的负载波动而反复增删节点导致的「节点抖动」（flapping）。\n\n第三层是 Pod 可迁移性检查。即使节点满足利用率和时间条件，CA 还要确认节点上的所有 Pod 都可以安全迁移到其他节点。以下几类 Pod 会阻止节点缩容：由 DaemonSet 管理的 Pod（每个节点都有，不算）不阻止缩容，但没有 controller 的裸 Pod（bare pod）、带有 `cluster-autoscaler.kubernetes.io/safe-to-evict: \"false\"` annotation 的 Pod、使用 local storage（emptyDir 或 hostPath）的 Pod（除非设置了 safe-to-evict: true）、以及违反 PodDisruptionBudget 的驱逐操作，这些都会阻止缩容。CA 还会模拟「如果把这个节点上的 Pod 全部赶走，其他节点能不能接住」，只有模拟调度成功才会执行缩容。\n\n第四层是扩容保护期。`--scale-down-delay-after-add` 参数（默认 10 分钟）规定新节点加入集群后的一段时间内不考虑缩容，避免刚扩容出来的节点因为 Pod 还没调度上去就被判定为空闲而缩掉。\n\n当 CA 决定缩容一个节点时，它会先对节点执行 cordon（标记为不可调度），然后 drain（逐个驱逐 Pod，尊重 PDB 和 graceful termination），最后调用云厂商 API 将该实例从节点组中移除并终止。整个过程可以通过节点事件观察到：\n\n```\n$ kubectl describe node ip-10-0-3-47.ec2.internal\nEvents:\n  Type    Reason              Age   From                Message\n  ----    ------              ----  ----                -------\n  Normal  ScaleDown           5m    cluster-autoscaler  marked the node as toBeDeleted/unschedulable\n  Normal  DeletingAllPods     5m    cluster-autoscaler  deleting all pods\n  Normal  DeletedAllPods      4m    cluster-autoscaler  all pods deleted\n  Normal  RemovedFromGroup    4m    cluster-autoscaler  node removed from ASG general-pool\n```\n\n### 与云厂商基础设施的集成\n\nCA 本身不管虚拟机的生命周期，它通过 Cloud Provider 接口与各云厂商的节点组 API 交互。在 AWS 上，CA 调用 Auto Scaling API 修改 ASG 的 DesiredCapacity；ASG 控制器负责启动新的 EC2 实例，实例通过 user-data 脚本自动执行 `kubelet --register-node` 加入集群。在 GCP 上对应的是 MIG，在 Azure 上是 VMSS。这意味着 CA 不关心节点怎么启动、怎么配置，它只告诉节点组「我要 N 个节点」，剩下的交给云厂商的基础设施。这也是为什么 CA 的扩容速度受限于云厂商的实例启动时间——AWS 上通常 2-4 分钟一个新节点从创建到 Ready，GCP 上稍快一些约 1.5-3 分钟。\n\n## 第三步：Expander 策略、Karpenter 对比与生产最佳实践\n\n### Expander 策略深入\n\nExpander 是 CA 在多节点组场景下选择扩容目标的策略引擎，通过 `--expander` 参数配置，CA 1.30 支持以下几种：`random`（默认，随机选择一个可行的节点组）、`least-waste`（选择扩容后资源浪费最少的组）、`most-pods`（选择能容纳最多 Pending Pod 的组）、`price`（选择成本最低的组，需要配合 pricing API）、`priority`（按用户定义的优先级顺序选择）。生产环境中 `least-waste` 是最常见的选择，因为它能有效降低资源碎片和成本。`priority` expander 适合混合实例类型的场景——比如优先使用 Spot 实例，Spot 不可用时 fallback 到 On-Demand：\n\n```yaml\n# priority expander 配置示例（ConfigMap）\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cluster-autoscaler-priority-expander\n  namespace: kube-system\ndata:\n  priorities: |\n    50:\n      - spot-pool-.*\n    30:\n      - ondemand-pool-.*\n```\n\n这段配置让 CA 优先从名字匹配 `spot-pool-.*` 的节点组扩容（优先级 50），只有 Spot 节点组不可用或已到达 maxSize 时才会 fallback 到 `ondemand-pool-.*`（优先级 30）。\n\n### Karpenter 对比：下一代节点伸缩\n\nAWS 在 2021 年推出了 Karpenter（v0.1），到 2024 年已经发展到 v1.0（改名为 Karpenter，从 AWS 捐给了 CNCF 成为 SIG-Autoscaling 下的子项目）。Karpenter 和 CA 解决的是同一个问题，但设计哲学完全不同。CA 的核心思路是「管理节点组」——你预先定义好几个固定规格的节点组，CA 在这些组之间做选择和扩缩容。Karpenter 的思路是「直接管理节点」——它不依赖 ASG/MIG，而是根据 Pending Pod 的具体 requests 实时计算最优实例类型，直接调用 EC2 RunInstances API 创建恰好满足需求的实例。\n\n这带来了几个关键差异。第一，Karpenter 的实例选择更灵活。CA 受限于你预先定义的节点组规格，如果 Pending Pod 需要 6C24G，但你的节点组只有 4C16G 和 8C32G，CA 只能选 8C32G 造成浪费。Karpenter 会从 AWS 提供的几百种实例类型中自动选择最匹配的（比如 m6i.2xlarge 的 8C32G 或 r6i.xlarge 的 4C32G），通过 NodePool CRD 的 requirements 字段约束可选范围。第二，Karpenter 的扩容速度更快，因为它省去了 ASG 这个中间层，直接调 EC2 API，通常能在 60-90 秒内完成节点创建和注册。第三，Karpenter 内置了节点整合（consolidation）能力——它会持续检查是否可以通过替换实例类型或合并节点来降低成本，这比 CA 单纯的 Scale-down 更加智能。\n\n但 Karpenter 也有局限：截至 2024 年底，Karpenter 的多云支持还在早期阶段，核心生产能力集中在 AWS；而 CA 是所有主流云厂商的标配，GKE、AKS、EKS 都原生支持。如果你的集群跑在 GCP 或 Azure 上，CA 仍然是唯一成熟的选择。\n\n### 生产最佳实践\n\n在真实生产环境中部署 CA，有几个经验值得特别注意。第一，始终为关键 Pod 设置 PodDisruptionBudget。CA 在 Scale-down 时会尊重 PDB，没有 PDB 的 Pod 可能在缩容过程中所有副本同时被驱逐。第二，合理设置 `--max-node-provision-time`（默认 15 分钟），如果云厂商在这个时间内没有把新节点交付到 Ready 状态，CA 会认为扩容失败并尝试其他节点组。第三，使用 `--balance-similar-node-groups=true` 让 CA 在多个相同规格的节点组之间均衡分布节点——这在多可用区部署时特别重要，能避免所有新节点都扎堆到同一个 AZ。第四，给不希望被缩容的节点打上 annotation `cluster-autoscaler.kubernetes.io/scale-down-disabled: \"true\"`，比如运行有状态服务（数据库、Kafka broker）的节点。第五，监控 CA 的健康状态和决策效率，Prometheus metrics `cluster_autoscaler_scaled_up_nodes_total`、`cluster_autoscaler_scaled_down_nodes_total`、`cluster_autoscaler_unschedulable_pods_count` 是最关键的三个指标。\n\n最后一个经常被忽略的点：CA 对 resource requests 极度敏感。如果你的 Pod 没有设置 requests 或者 requests 设得很低，CA 会认为这些 Pod 「不需要资源」，导致不触发扩容或者过早缩容。这就是为什么在使用 CA 的集群中，所有 Pod 必须设置合理的 resource requests——这不仅是调度器的需要，也是 CA 做出正确伸缩决策的前提。",
+      "keyPoints": [
+        "Cluster Autoscaler 每 10 秒扫描一次 Pending Pod，通过模拟调度判断需要扩容哪个节点组以及扩多少个节点，而非简单地用 requests 总量除以节点容量",
+        "Scale-up 触发条件是存在因资源不足而 FailedScheduling 的 Pending Pod，CA 会过滤掉因 nodeSelector、toleration 等调度约束导致的 Pending",
+        "Scale-down 经过四层安全检查：利用率阈值（默认 50%，基于 requests 而非实际使用量）、持续时间（默认 10 分钟）、Pod 可迁移性模拟、以及扩容后保护期",
+        "CA 不直接创建或删除虚拟机，而是通过 Cloud Provider 接口操作节点组（AWS ASG / GCP MIG / Azure VMSS），扩容速度受限于云厂商实例启动时间（通常 2-4 分钟）",
+        "Expander 策略决定多节点组场景下的扩容选择，生产中 least-waste 最常用，priority expander 可实现 Spot 优先 + On-Demand fallback",
+        "Karpenter 绕过节点组直接调用 EC2 API 创建最优实例类型，扩容更快（60-90 秒）且支持自动节点整合，但多云支持尚不成熟",
+        "使用 CA 的集群中所有 Pod 必须设置合理的 resource requests，否则 CA 的利用率计算和扩容触发都会出现偏差",
+        "通过 cluster-autoscaler-status ConfigMap 和 Prometheus metrics（scaled_up_nodes_total、unschedulable_pods_count）监控 CA 的决策状态和健康程度"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz1",
+          "question": "Cluster Autoscaler 的 Scale-up 触发条件是什么？",
+          "choices": [
+            {"id": "A", "text": "节点的 CPU 实际使用率超过 80% 时自动扩容"},
+            {"id": "B", "text": "存在因集群资源不足而处于 Pending 状态且 FailedScheduling 的 Pod"},
+            {"id": "C", "text": "HPA 发出扩容请求后，CA 自动同步增加节点"},
+            {"id": "D", "text": "节点组中的节点数低于 minSize 时触发扩容"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Cluster Autoscaler 的 Scale-up 完全由 Pending Pod 驱动。CA 每个扫描周期都会遍历所有 Pending Pod，筛选出那些因为集群资源不足（CPU 或内存不够）而无法被调度器放置的 Pod。注意 CA 会过滤掉因为 nodeSelector 不匹配、toleration 缺失等非资源原因导致的 Pending。A 选项混淆了实际使用率和调度决策——CA 关注的是 requests 层面的资源是否足够，而非实际使用率。C 选项理解反了因果关系：HPA 增加 Pod 副本数，新 Pod Pending 后 CA 才介入，两者没有直接通信。D 选项描述的是 ASG 自身的最小实例数保证，不是 CA 的 Scale-up 逻辑。"
+        },
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz2",
+          "question": "在 Kubernetes 自动伸缩体系中，HPA、VPA 和 Cluster Autoscaler 的协作关系是什么？",
+          "choices": [
+            {"id": "A", "text": "三者并行工作互不关联，分别独立决策 Pod 副本数、Pod 资源配额和节点数量"},
+            {"id": "B", "text": "HPA 调整 Pod 副本数 → 新 Pod 可能 Pending → CA 检测到 Pending 后扩容节点，形成级联触发链"},
+            {"id": "C", "text": "CA 先扩容节点，然后通知 HPA 可以增加 Pod 副本数，最后 VPA 调整 requests"},
+            {"id": "D", "text": "VPA 负责触发 HPA 和 CA，是三者中的控制中枢"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "三者形成一个自下而上的级联链。当流量上涨时，HPA 根据指标（CPU、内存或自定义指标）增加 Pod 副本数。如果集群资源足够，新 Pod 直接被调度器放置到现有节点上，CA 不需要介入。但如果现有节点资源不足，新 Pod 进入 Pending 状态，这时 CA 检测到 Pending Pod 并触发节点扩容。VPA 则独立地调整单个 Pod 的 requests/limits，通常不和 HPA 同时作用于同一个 Deployment 的 CPU/Memory 指标。A 选项说的「互不关联」不准确，HPA 和 CA 通过 Pending Pod 这个中间状态隐式关联。C 和 D 选项的触发顺序完全反了。"
+        },
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz3",
+          "question": "CA 在 Scale-up 时如何决定需要扩容多少个节点？",
+          "choices": [
+            {"id": "A", "text": "用所有 Pending Pod 的 requests 总量除以单节点 allocatable 容量，向上取整"},
+            {"id": "B", "text": "对每个候选节点组执行模拟调度，逐个添加虚拟节点直到所有 Pending Pod 都能被调度"},
+            {"id": "C", "text": "直接将节点组扩容到 maxSize，确保有充足的预留资源"},
+            {"id": "D", "text": "根据过去 24 小时的 CPU 使用趋势预测所需节点数"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CA 使用模拟调度（simulation）来精确计算所需节点数。它不是简单地做除法，因为 Pod 之间的调度约束（affinity、anti-affinity、topology spread）可能导致资源无法完全填满。CA 的做法是：对每个候选节点组，模拟创建一个该规格的新节点，然后用和 kube-scheduler 相同的 Filter 逻辑检查哪些 Pending Pod 能放上去，反复添加虚拟节点直到所有可调度的 Pending Pod 都被消化或者达到节点组的 maxSize。A 选项的简单除法忽略了调度约束和资源碎片问题。C 选项会造成巨大的资源浪费。D 选项描述的是预测性伸缩，CA 是响应式的，不做趋势预测。"
+        },
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz4",
+          "question": "CA 的 Scale-down 利用率计算使用的是什么数据？",
+          "choices": [
+            {"id": "A", "text": "节点上所有容器的实际 CPU 和内存使用量（来自 metrics-server 或 cAdvisor）"},
+            {"id": "B", "text": "节点上所有 Pod 的 resource requests 之和与节点 allocatable 资源的比值"},
+            {"id": "C", "text": "节点上正在运行的 Pod 数量与节点最大 Pod 数的比值"},
+            {"id": "D", "text": "节点的 kubelet 上报的 Capacity 减去 Reserved 后的剩余百分比"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CA 计算 Scale-down 利用率时使用的是 Pod 的 resource requests 之和，而不是实际资源使用量。公式是：Sum(pod.requests) / node.allocatable。这个设计选择有明确的工程考量——requests 代表调度器为 Pod 预留的资源量，是确定性的值，不会随负载波动；而实际使用量（usage）是动态变化的，用它来做缩容决策容易导致误判。比如一个 Java 应用的 requests 设为 2Gi 内存，但当前堆只用了 800Mi，如果用 usage 来算利用率可能很低触发缩容，但一旦来了流量堆内存会立即飙到 2Gi，此时 Pod 已经没节点可去了。A 选项是常见误解，很多人以为 CA 看的是实际使用量。C 选项混淆了 Pod 数量和资源量。D 选项描述的是 kubelet 层面的资源管理，不是 CA 的计算方式。"
+        },
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz5",
+          "question": "以下 Cluster Autoscaler 日志片段中，哪一行表明 CA 决定不缩容某个节点？\n\n```\n1. I0415 10:30:00 scale_down.go:186] Node ip-10-0-3-47 utilization: 0.35 (threshold 0.50)\n2. I0415 10:30:00 scale_down.go:210] Node ip-10-0-3-47 unneeded since 2024-04-15 10:20:00\n3. I0415 10:30:00 scale_down.go:350] Skipping ip-10-0-3-47: pod local-storage-pod has local storage\n4. I0415 10:30:00 scale_down.go:412] No candidates for scale down\n```",
+          "choices": [
+            {"id": "A", "text": "第 1 行，利用率 0.35 低于阈值说明节点不应该被缩容"},
+            {"id": "B", "text": "第 2 行，unneeded since 说明节点还在冷却期中"},
+            {"id": "C", "text": "第 3 行，Skipping 表示因为节点上有 Pod 使用了 local storage 而跳过缩容"},
+            {"id": "D", "text": "第 4 行，No candidates 表示所有节点都在正常使用中"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "第 3 行是关键。它明确显示 CA 在 Pod 可迁移性检查阶段跳过了这个节点——原因是节点上有一个使用 local storage（emptyDir 或 hostPath）的 Pod。使用 local storage 的 Pod 默认不可被驱逐，因为它的数据无法迁移到其他节点。除非该 Pod 设置了 annotation `cluster-autoscaler.kubernetes.io/safe-to-evict: \"true\"`，否则 CA 会跳过包含此类 Pod 的节点。第 1 行只是说利用率 0.35 低于阈值 0.50，这意味着节点有可能是缩容候选，不是「不缩容」的信号。第 2 行记录的是节点从什么时候开始被标记为 unneeded，说明已经过了冷却期。第 4 行是最终总结，是因为第 3 行的检查失败导致的，不是根本原因。"
+        },
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz6",
+          "question": "一个常见的生产错误：Pod 没有设置 resource requests 的情况下，CA 的行为会出现什么问题？",
+          "choices": [
+            {"id": "A", "text": "CA 无法启动，因为没有 requests 的 Pod 会导致 CA 计算崩溃"},
+            {"id": "B", "text": "CA 会使用 limits 作为替代值来计算资源需求和节点利用率"},
+            {"id": "C", "text": "CA 认为这些 Pod 不需要资源，可能不触发 Scale-up 且 Scale-down 时高估节点空闲度"},
+            {"id": "D", "text": "CA 自动为没有 requests 的 Pod 设置一个默认的 100m CPU / 128Mi 内存"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "没有设置 requests 的 Pod 在 CA 眼中就是「零资源需求」的 Pod。这导致两个严重问题。第一，Scale-up 失灵：如果 Pending Pod 的 requests 为 0，CA 的模拟调度会认为任何节点都能容纳这个 Pod（因为 0 资源需求谁都能满足），不会触发扩容，但实际上节点可能已经没有可用资源了。第二，Scale-down 误判：CA 计算节点利用率时用 requests 之和，没有 requests 的 Pod 贡献为 0，导致节点看起来利用率很低，CA 可能错误地缩掉一个实际负载很高的节点。这就是为什么在使用 CA 的集群中，必须通过 LimitRange 或 admission webhook 强制所有 Pod 设置合理的 requests。A 选项不会发生；B 选项不存在此 fallback 机制；D 选项的自动设置也不存在。"
+        },
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz7",
+          "question": "Cluster Autoscaler 和 Karpenter 在节点伸缩方式上的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "CA 操作预定义的节点组（ASG/MIG），Karpenter 绕过节点组直接按 Pod 需求选择最优实例类型并调用云 API 创建"},
+            {"id": "B", "text": "CA 只支持 Scale-up，Karpenter 同时支持 Scale-up 和 Scale-down"},
+            {"id": "C", "text": "两者实现完全相同，只是 Karpenter 是 CA 的 AWS 专属商业版"},
+            {"id": "D", "text": "CA 在集群外部运行，Karpenter 在集群内部运行，其他逻辑一致"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是两者最本质的架构差异。CA 的工作模式是「管理节点组」——你事先定义好几种规格的节点组（比如 m6i.xlarge 组和 c6i.2xlarge 组），CA 在这些固定规格之间做选择和扩缩容。Karpenter 完全不依赖预定义节点组，它根据 Pending Pod 的具体 requests、nodeAffinity、topology spread 等约束，从云厂商提供的数百种实例类型中实时计算最优选择，然后直接调用 EC2 RunInstances（或等价 API）创建实例。这让 Karpenter 能更精确地匹配工作负载需求，减少资源浪费，扩容也更快（省去了 ASG 这个中间层）。B 选项错误，CA 同时支持 Scale-up 和 Scale-down。C 选项错误，Karpenter 是开源项目且已捐给 CNCF。D 选项错误，CA 和 Karpenter 都以 Pod 形式运行在集群内部。"
+        },
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz8",
+          "question": "在一个多可用区（3 AZ）的 EKS 集群中，CA 配置了 3 个同规格的节点组（每个 AZ 一个），但扩容时所有新节点都集中在同一个 AZ。应该启用哪个参数来解决这个问题？",
+          "choices": [
+            {"id": "A", "text": "设置 --expander=random 让 CA 随机选择节点组"},
+            {"id": "B", "text": "设置 --balance-similar-node-groups=true 让 CA 在同规格节点组之间均衡分布节点"},
+            {"id": "C", "text": "设置 --scale-down-utilization-threshold=0 让所有 AZ 保持相同的节点数"},
+            {"id": "D", "text": "为每个 AZ 的节点组设置不同的 maxSize 来强制均衡"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`--balance-similar-node-groups=true` 是解决多 AZ 节点不均衡的标准方案。当启用这个参数时，CA 会将具有相同实例类型和标签的节点组视为「similar groups」，在扩容时尽量让这些组的节点数保持一致。如果 AZ-a 有 10 个节点、AZ-b 有 8 个、AZ-c 有 8 个，CA 扩容时会优先向 AZ-b 和 AZ-c 添加节点来追平。这在多 AZ 部署中至关重要，因为节点分布不均会导致 topology spread constraints 无法满足、单 AZ 故障影响面扩大。A 选项的 random 不保证均衡，可能连续选中同一个组。C 选项完全无关。D 选项治标不治本，且限制了弹性空间。"
+        },
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz9",
+          "question": "CA 的 Scale-down 在以下哪种边界情况下会永远无法缩容某个低利用率节点？",
+          "choices": [
+            {"id": "A", "text": "节点上运行了一个没有任何 controller（非 Deployment / ReplicaSet / DaemonSet 管理）的裸 Pod"},
+            {"id": "B", "text": "节点上运行了 3 个 DaemonSet Pod 和 1 个 ReplicaSet 管理的 Pod"},
+            {"id": "C", "text": "节点上所有 Pod 都设置了 requests 但没设 limits"},
+            {"id": "D", "text": "节点上有 Pod 使用了 PVC 挂载的网络存储（如 EBS）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "没有 controller 的裸 Pod（directly created without a Deployment, ReplicaSet, StatefulSet, or Job 等控制器）是 CA 的 Scale-down 黑名单之一。因为裸 Pod 被驱逐后没有控制器会在其他节点上重新创建它，数据和状态会永久丢失。CA 默认不会驱逐这类 Pod，除非它们设置了 annotation `cluster-autoscaler.kubernetes.io/safe-to-evict: \"true\"`。B 选项中的 DaemonSet Pod 会被 CA 忽略（不算入利用率，不阻止缩容），ReplicaSet Pod 可以被安全驱逐后重建。C 选项与缩容决策无关。D 选项中的 PVC 挂载的网络存储（如 EBS）不阻止缩容，因为 PVC 是通过 CSI 接口动态绑定的，Pod 迁移后可以重新挂载（需要在同一 AZ 内）。"
+        },
+        {
+          "id": "k8s-cluster-autoscaler-q1-quiz10",
+          "question": "CA 扩容后新节点迟迟没有变为 Ready 状态，你应该首先检查哪里来定位问题？",
+          "choices": [
+            {"id": "A", "text": "检查 CA 的日志看是否有 MaxNodeProvisionTime 超时错误，并检查云厂商的 ASG/MIG 活动日志确认实例是否成功启动"},
+            {"id": "B", "text": "重启 CA 的 Pod 让它重新触发扩容流程"},
+            {"id": "C", "text": "检查 HPA 的指标来源是否正常，因为 HPA 故障会阻止节点加入"},
+            {"id": "D", "text": "删除所有 Pending Pod 让 CA 重新计算需要的节点数"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "节点长时间不 Ready 的问题链通常涉及三个环节，排查应从 CA 日志和云厂商活动日志两端同时入手。CA 侧：检查日志是否出现 `MaxNodeProvisionTime exceeded`（默认 15 分钟），如果出现说明 CA 已经放弃等待并可能尝试其他节点组。云厂商侧：查看 ASG Activity History（AWS Console 或 `aws autoscaling describe-scaling-activities`）确认实例是否成功创建——可能的失败原因包括实例配额不足（InsufficientInstanceCapacity）、Spot 容量不可用、Launch Template 配置错误、IAM 权限缺失。节点侧：如果实例已启动但没加入集群，检查 kubelet 日志——通常是 kubelet 无法连接 API Server（安全组/网络问题）或 bootstrap token 过期。B 选项的重启 CA 不解决根本问题。C 选项 HPA 与节点注册无关。D 选项只会导致业务中断。"
+        }
+      ],
+      "references": [
+        "https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler",
+        "https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md",
+        "https://kubernetes.io/docs/concepts/cluster-administration/cluster-autoscaling/",
+        "https://karpenter.sh/docs/",
+        "https://aws.github.io/aws-eks-best-practices/cluster-autoscaling/"
+      ]
+    }
+  ]
+}

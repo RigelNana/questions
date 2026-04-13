@@ -1,0 +1,157 @@
+{
+  "id": "k8s-exceed-memory-cpu-limit",
+  "name": "超过 Memory/CPU Limit 的行为差异",
+  "domain": "kubernetes",
+  "description": "深入解析 Pod 超过 Memory Limit 触发 OOMKilled 与超过 CPU Limit 触发 CFS 节流的底层 cgroup 机制、内核行为差异以及生产环境排查与最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-exceed-memory-cpu-limit-q1",
+      "domain": "kubernetes",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["kubernetes", "memory", "CPU", "limits", "OOMKilled", "throttle", "cgroup", "资源管理"],
+      "title": "如果 Pod 超过了 Memory Limit 会怎样？超过 CPU Limit 呢？",
+      "content": "面试官问你「Pod 超过 Memory Limit 和超过 CPU Limit 分别会怎样」时，他不是在考你能不能回答出「内存被杀、CPU 被限速」这种一句话结论。他真正想知道的是你理不理解 Kubernetes 资源限制的底层执行机制——为什么内存超限是致命的，而 CPU 超限只是变慢？这个区别的根源在操作系统层面还是在 Kubernetes 层面？你在生产环境中有没有真正遇到过 OOMKilled 和 CPU 节流的问题，又是怎么排查和解决的？\n\n来看一个生产中非常典型的场景。你的团队有一个 Java 微服务跑在 Kubernetes v1.30 集群上，Pod 的资源配置如下：\n\n```yaml\napiVersion: v1\nkind: Pod\nmetadata:\n  name: order-service\n  namespace: production\nspec:\n  containers:\n  - name: app\n    image: order-service:2.8.1\n    resources:\n      requests:\n        cpu: \"500m\"\n        memory: \"512Mi\"\n      limits:\n        cpu: \"1\"          # 最多 1 核\n        memory: \"1Gi\"     # 最多 1 GiB 内存\n    env:\n    - name: JAVA_OPTS\n      value: \"-Xmx768m -Xms512m\"\n```\n\n某天大促期间，运维群里几乎同时收到两条告警。第一条是 order-service 的某个 Pod 状态变成了 `OOMKilled`，`kubectl describe pod` 显示 `Last State: Terminated, Reason: OOMKilled, Exit Code: 137`，这个 Pod 在 30 秒内被 kubelet 重启了。第二条告警来自同集群的另一个服务 inventory-service，Grafana 上 P99 延迟从平时的 15ms 飙到了 200ms，但 Pod 状态一直是 Running，没有重启记录。\n\n第一个是内存超限，第二个是 CPU 超限——两者的表现完全不同，一个是进程被杀，一个是进程变慢。为什么同样是「超过了 Limit」，行为差异如此巨大？要回答好这道题，你得从 Linux 内核对 CPU 和内存这两种资源的本质区别讲起，再深入到 cgroup 的具体实现，最后落地到生产环境中的排查手段和设置策略。",
+      "answer": "## Kubernetes 资源限制的基础机制\n\n在 Kubernetes（当前稳定版 v1.30）中，每个容器可以通过 `spec.containers[].resources.limits` 字段声明它能使用的资源上限。当你在 YAML 中写下 `limits.cpu: \"1\"` 和 `limits.memory: \"1Gi\"` 时，Kubernetes 并不是自己来执行这些限制的——它只是一个「翻译层」，把你的声明翻译成 Linux 内核的 cgroup 配置参数，真正执行资源限制的是内核本身。\n\n具体来说，kubelet 在创建容器时会通过 CRI（Container Runtime Interface）告诉容器运行时（比如 containerd 1.7+）为这个容器配置对应的 cgroup。在 cgroup v2 环境下（Kubernetes v1.25+ 默认启用），CPU limits 会被写入 `cpu.max` 文件，内存 limits 会被写入 `memory.max` 文件。你可以在节点上直接验证这一点：\n\n```bash\n# 找到容器对应的 cgroup 路径\n$ crictl inspect <container-id> | grep cgroupsPath\n\"cgroupsPath\": \"kubepods-burstable-pod7a3b9c2d.slice:cri-containerd:a1b2c3d4e5f6\"\n\n# 查看 CPU limits 的 cgroup 配置\n$ cat /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod7a3b9c2d.slice/cri-containerd-a1b2c3d4e5f6.scope/cpu.max\n100000 100000\n# 含义：每 100000μs（100ms）周期内最多使用 100000μs，即 1 核\n\n# 查看内存 limits 的 cgroup 配置\n$ cat /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod7a3b9c2d.slice/cri-containerd-a1b2c3d4e5f6.scope/memory.max\n1073741824\n# 1073741824 字节 = 1 GiB\n```\n\n理解了这个「Kubernetes → cgroup → 内核」的链路后，「超过 Limit 会怎样」这个问题就变成了一个纯粹的操作系统问题：Linux 内核在容器资源使用超过 cgroup 上限时会怎么处理？答案取决于资源的物理本质——CPU 是**可压缩资源（Compressible Resource）**，内存是**不可压缩资源（Incompressible Resource）**。这个分类不是 Kubernetes 发明的，而是由 CPU 和内存的物理特性决定的。\n\nCPU 时间片是「流动」的，这一秒你没用到的 CPU 时间，下一秒其他进程就可以用。内核可以通过「暂停你的线程、让别人先跑」来回收 CPU 时间，你的进程不会因此丢失任何数据或状态。但内存不一样——你的进程 `malloc` 了一块内存并往里面写了数据，这块内存就被你「占住」了，内核没法像 CPU 那样把它「匀」给别人（除非触发 swap，但 Kubernetes 环境下通常禁用 swap）。当内存真的不够了，内核唯一能做的就是杀掉进程来释放内存。这就是 CPU 超限和内存超限行为差异如此巨大的根本原因。\n\n## 内存超过 Limit：OOM Kill 的完整链路\n\n当容器的内存使用量（RSS + page cache 中的 active 部分）触及 `memory.max` 的上限时，内核首先会尝试回收该 cgroup 内的可回收内存——主要是 page cache 中的 inactive 页面。如果回收之后内存使用仍然超过上限（说明大部分内存都是 RSS，无法回收），内核就会触发 cgroup 级别的 OOM Killer。\n\n这个 OOM Killer 和整个系统级别的 OOM Killer 是不同的。系统级 OOM Killer 在整个节点内存耗尽时触发，会根据所有进程的 `oom_score` 来选择杀谁；而 cgroup 级别的 OOM Killer 只在特定 cgroup 内存超限时触发，只会杀该 cgroup 内的进程。对于 Kubernetes 容器来说，通常一个容器的 cgroup 内只有一个主进程（PID 1），所以被杀的就是容器的主进程。\n\n从 Kubernetes 的视角看，容器主进程被杀后会产生以下连锁反应：容器运行时（containerd）检测到进程退出，向 kubelet 上报容器状态变更；kubelet 将容器状态标记为 `Terminated`，reason 设为 `OOMKilled`，exit code 设为 137（128 + 9，因为进程收到的是 SIGKILL 信号）；随后 kubelet 根据 Pod 的 `restartPolicy` 决定是否重启容器——如果是 `Always`（Deployment 管理的 Pod 默认值），容器会被立即重启，但如果连续重启失败，backoff 时间会从 10 秒指数增长到最长 5 分钟，Pod 状态变成 `CrashLoopBackOff`。\n\n你可以通过 `kubectl describe pod` 看到完整的 OOMKill 记录：\n\n```bash\n$ kubectl describe pod order-service -n production\n# ...\nContainers:\n  app:\n    State:          Running\n      Started:      Thu, 15 Aug 2024 14:23:18 +0800\n    Last State:     Terminated\n      Reason:       OOMKilled\n      Exit Code:    137\n      Started:      Thu, 15 Aug 2024 14:20:01 +0800\n      Finished:     Thu, 15 Aug 2024 14:23:05 +0800\n    Ready:          True\n    Restart Count:  3\n    Limits:\n      cpu:     1\n      memory:  1Gi\n    Requests:\n      cpu:     500m\n      memory:  512Mi\n# ...\nEvents:\n  Type     Reason      Age   From     Message\n  ----     ------      ----  ----     -------\n  Warning  OOMKilling  5m    kubelet  Memory cgroup out of memory: Killed process 28451 (java)\n```\n\n注意 `Exit Code: 137` 这个数字——它是面试高频考点。137 = 128 + 9，其中 9 是 SIGKILL 的信号编号。OOM Killer 发送的永远是 SIGKILL 而不是 SIGTERM，这意味着进程没有机会做任何清理工作（比如关闭数据库连接、刷新缓冲区），直接被强制终止。这也是为什么内存超限比 CPU 超限危险得多——不仅进程被杀了，而且是不可优雅退出的暴力杀死。\n\n一个生产中很容易踩的坑是 Java 应用的内存配置。上面那个 Pod 设了 `limits.memory: 1Gi`，JVM 参数是 `-Xmx768m`。看起来留了 256MB 给堆外内存（线程栈、Metaspace、DirectByteBuffer、JNI 等），但实际上 JVM 进程的总内存消耗（包括 native memory）往往比 `-Xmx` 大很多。你可以用 `jcmd <pid> VM.native_memory summary` 来查看 JVM 的真实内存使用：\n\n```bash\n$ jcmd 1 VM.native_memory summary\nTotal: reserved=1823MB, committed=987MB\n-                 Java Heap (reserved=768MB, committed=768MB)\n-                     Class (reserved=512MB, committed=78MB)\n-                    Thread (reserved=128MB, committed=128MB)  # 256个线程 × 512KB 栈\n-                      Code (reserved=250MB, committed=42MB)\n-                        GC (reserved=38MB, committed=38MB)\n-                  Internal (reserved=12MB, committed=12MB)\n-                    Symbol (reserved=15MB, committed=15MB)\n```\n\n可以看到 JVM committed 的内存已经接近 987MB，加上一些 cgroup 记账的 overhead，随时可能突破 1Gi 的 limit。正确的做法是把 `-Xmx` 控制在 limits 的 60%-70%（即约 650m），或者更现代的方案是使用 JDK 10+ 的 `-XX:MaxRAMPercentage=70.0` 让 JVM 自己根据容器内存限制来调整堆大小。\n\n## CPU 超过 Limit：CFS 节流的工作原理\n\n当容器的 CPU 使用量超过 `cpu.max` 设定的配额时，行为完全不同——内核不会杀任何进程，而是通过 CFS（Completely Fair Scheduler）带宽控制器对容器进行**节流（throttle）**。\n\nCFS 带宽控制的工作方式是周期性的。以 `cpu.max` 值为 `100000 100000` 为例（对应 limits.cpu = 1），内核把时间划分成一个个 100ms 的周期（即 `cfs_period`），在每个周期开始时给容器分配 100ms 的 CPU 配额（即 `cfs_quota`）。容器内的所有线程共享这个配额。当配额在一个周期内被用完后，该容器内的所有线程会被内核强制挂起（dequeue from runqueue），直到下一个周期开始、配额被重新填充。这段被挂起的时间就是「节流时间」。\n\n关键细节在于：多线程应用会加速配额消耗。如果你的 Go 服务设了 `GOMAXPROCS=4`（或者自动检测到了 4 核），并且 CPU limits 是 1 核（quota = 100ms/period），那么 4 个 goroutine 如果同时满载运行，每个周期的 100ms 配额会在 25ms 内被 4 个线程瓜分完毕——剩下的 75ms 里所有线程都会被挂起。实际表现就是你的服务有 75% 的时间在「睡觉」，P99 延迟会灾难性地飙升。\n\n你可以通过 cgroup 的 `cpu.stat` 文件直接观测节流情况：\n\n```bash\n$ cat /sys/fs/cgroup/kubepods.slice/.../cpu.stat\nusage_usec 845923108\nuser_usec 728103445\nsystem_usec 117819663\nnr_periods 8459231        # 总调度周期数\nnr_throttled 3127914      # 被节流的周期数\nthrottled_usec 234593700  # 累计被节流的微秒数\n```\n\n在这个例子中，`nr_throttled / nr_periods = 3127914 / 8459231 ≈ 37%`——意味着有 37% 的调度周期里容器被节流了。这是一个相当严重的节流程度。在 Prometheus 中，你可以用 `container_cpu_cfs_throttled_periods_total` 和 `container_cpu_cfs_periods_total` 这两个指标来计算节流比例：\n\n```promql\n# CPU 节流比例（按 Pod 分组，5 分钟窗口）\nrate(container_cpu_cfs_throttled_periods_total{namespace=\"production\"}[5m])\n/\nrate(container_cpu_cfs_periods_total{namespace=\"production\"}[5m])\n```\n\n一般来说，节流比例超过 5% 就值得关注，超过 25% 就需要立即调整 CPU limits 或优化代码了。\n\nCPU 节流的隐蔽性是它最危险的地方。不像 OOMKilled 会在 Pod 状态中留下清晰的记录，CPU 节流不会产生任何事件、不会在 `kubectl describe pod` 中显示、不会触发容器重启。你的服务就是「默默地」变慢了。如果没有专门的节流监控看板，很容易误以为是应用本身的性能问题而花大量时间去 profiling 代码，实际上只需要把 CPU limits 调高就能解决。\n\n## 生产环境排查与最佳实践\n\n**OOMKilled 的排查路径。** 首先通过 `kubectl describe pod` 确认 `Last State: OOMKilled, Exit Code: 137`。然后区分是容器内存确实不够还是有内存泄漏：如果 Pod 每次启动后运行几分钟就 OOM，且重启后时间越来越短，大概率是内存泄漏；如果只在流量高峰时 OOM，说明 limits 设低了。对于 Java 应用，检查 `-Xmx` 是否超过 limits 的 70%、是否有大量 DirectByteBuffer 或 native 内存使用。对于 Go 应用，用 `pprof heap` 查看内存分配热点，关注 `inuse_space` 和 `alloc_space` 的差距。节点层面可以通过 `dmesg | grep -i oom` 查看内核 OOM 日志，日志中会包含被杀进程的 PID、RSS 大小和 oom_score。\n\n**CPU 节流的排查路径。** 首先在 Grafana 中查看 `container_cpu_cfs_throttled_periods_total` 指标确认存在节流。然后判断原因：如果节流发生在固定时段（如高峰期），说明 limits 设低了，需要调高或扩容副本数；如果节流在非高峰期也持续发生，检查 `GOMAXPROCS`（Go）或线程池大小（Java）是否远大于 CPU limits——这是最常见的原因。Go 应用推荐使用 `go.uber.org/automaxprocs` 库自动将 `GOMAXPROCS` 设为与 CPU limits 一致，避免创建过多操作系统线程争抢有限的 CPU 配额。Java 应用在 JDK 11+ 中会自动感知容器的 CPU limits（通过 `-XX:+UseContainerSupport`，默认开启），但 JDK 8u191 之前的版本可能识别到宿主机的 CPU 核心数而创建过多线程。\n\n**limits 设置的生产建议。** 对于内存 limits，必须设置，且要留足余量——建议 limits 为应用稳态内存使用量的 1.5 倍以上。因为内存超限的后果是进程被不可恢复地杀死，不留余量就是在赌。对于 CPU limits，社区存在争议。Google SRE 和 Shopify 等团队在生产中选择不设 CPU limits、只设 CPU requests，理由是 CPU 是可压缩资源，requests 对应的 `cpu.shares`/`cpu.weight` 已经能保证在争抢时的公平分配，设了 limits 反而导致容器在节点 CPU 空闲时也被节流。但如果你的集群缺乏精细的容量规划和监控体系，不设 CPU limits 可能导致个别容器把整个节点的 CPU 吃满，影响同节点其他服务。对于大多数团队，一个折中方案是把 CPU limits 设为 requests 的 3-5 倍，既给突发留空间，又防止无限制使用。\n\n**一个常被忽略的边界情况：** 如果 Pod 只设了 `limits` 而没有设 `requests`，Kubernetes 会自动把 requests 设成与 limits 相同的值。这意味着你的 Pod 变成了 Guaranteed QoS（requests = limits），调度时会预留全部 limits 对应的资源量——可能远超实际需要，导致集群调度效率下降。相反，如果你只设了 `requests` 不设 `limits`，容器在运行时没有上限约束，内存可以一直涨到节点级 OOM。正确的做法是同时设置 requests 和 limits，requests 反映真实需求，limits 反映可容忍的上限。",
+      "keyPoints": [
+        "内存是不可压缩资源，容器内存使用超过 memory.max 时内核触发 cgroup 级别 OOM Killer，发送 SIGKILL（信号 9）直接杀掉进程，退出码为 137（128+9），进程无法做任何优雅退出处理",
+        "CPU 是可压缩资源，容器 CPU 使用超过 cpu.max 配额时 CFS 带宽控制器在当前周期内挂起所有线程直到下一周期配额刷新，表现为延迟升高但进程不会被杀且不会重启",
+        "Kubernetes 本身不执行资源限制，而是将 limits 翻译为 Linux cgroup 参数（cpu.max 和 memory.max），真正的限制由内核 CFS 调度器和内存控制器执行",
+        "多线程应用会加速 CPU 配额消耗——4 个线程同时运行时 1 核的配额在每个 100ms 周期内 25ms 就会耗尽，剩余 75ms 全部被节流，GOMAXPROCS 或线程池大小应与 CPU limits 匹配",
+        "CPU 节流不产生任何 Kubernetes 事件或 Pod 状态变更，只能通过 cgroup cpu.stat 中的 nr_throttled 或 Prometheus 指标 container_cpu_cfs_throttled_periods_total 来发现",
+        "Java 应用的 -Xmx 应控制在 memory limits 的 60%-70%，因为 JVM 的 Metaspace、线程栈、DirectByteBuffer、GC 开销等堆外内存会额外消耗数百 MB",
+        "生产中对内存 limits 必须设置且留 1.5 倍以上余量，对 CPU limits 社区存在争议——Google SRE 建议只设 requests 不设 limits 以避免不必要的节流，但需要精细的容量规划做前提"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz1",
+          "question": "当容器的内存使用超过 limits.memory 时，Linux 内核会采取什么行为？",
+          "choices": [
+            {"id": "A", "text": "内核暂停容器内的所有进程，等待内存使用降低后自动恢复"},
+            {"id": "B", "text": "内核触发 cgroup OOM Killer，向容器主进程发送 SIGKILL 信号强制终止"},
+            {"id": "C", "text": "内核启用 swap 将超出的内存页面交换到磁盘，保持进程运行"},
+            {"id": "D", "text": "内核向容器发送 SIGTERM 信号，给进程 30 秒的优雅退出时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当容器的内存使用触及 cgroup 的 memory.max 上限时，内核首先尝试回收 page cache 中的可回收页面。如果回收后仍然超限，内核会触发 cgroup 级别的 OOM Killer，直接发送 SIGKILL（信号编号 9）杀掉容器内占内存最多的进程。SIGKILL 不可被捕获或忽略，进程无法做任何清理工作就被强制终止。A 选项描述的是 CPU 节流的行为而非内存；C 选项不适用，因为 Kubernetes 集群通常禁用 swap（kubelet 默认要求 --fail-swap-on=true）；D 选项混淆了 OOM Kill 和 Pod 正常删除时的 graceful shutdown 流程——OOM Kill 用的是 SIGKILL 而非 SIGTERM，不存在优雅退出期。"
+        },
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz2",
+          "question": "一个 Pod 因为 OOMKilled 被终止，通过 kubectl describe pod 看到 Exit Code 是 137。这个数字的来源是什么？",
+          "choices": [
+            {"id": "A", "text": "137 是 Kubernetes 定义的 OOM 错误码常量，写死在 kubelet 源码中"},
+            {"id": "B", "text": "137 = 128 + 9，其中 128 是信号终止的偏移量，9 是 SIGKILL 的信号编号"},
+            {"id": "C", "text": "137 = 128 + 9，其中 128 是信号终止的偏移量，9 是 SIGTERM 的信号编号"},
+            {"id": "D", "text": "137 是容器运行时（containerd）返回的内部错误代码，与信号无关"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 Linux 中，当进程被信号终止而非正常退出时，退出码的计算规则是 128 + 信号编号。SIGKILL 的编号是 9，所以退出码是 128 + 9 = 137。C 选项把 SIGKILL 和 SIGTERM 搞混了——SIGTERM 的编号是 15，对应的退出码是 143（128 + 15），而 OOM Killer 使用的永远是不可捕获的 SIGKILL，而不是可以被程序处理的 SIGTERM。A 和 D 选项都是错误的——137 不是 Kubernetes 或 containerd 的人为定义，而是 Linux 进程信号退出的标准约定。"
+        },
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz3",
+          "question": "CPU limits 在 cgroup v2 中通过哪个文件实现限制？其工作原理是什么？",
+          "choices": [
+            {"id": "A", "text": "通过 cpu.weight 文件设置 CPU 权重，在资源争抢时按比例分配 CPU 时间"},
+            {"id": "B", "text": "通过 cpu.max 文件设置配额和周期（如 100000 100000），每个周期内配额用完后线程被挂起直到下一周期"},
+            {"id": "C", "text": "通过 cpu.pressure 文件设置 CPU 压力阈值，超过阈值后内核降低进程优先级"},
+            {"id": "D", "text": "通过 cpuset.cpus 文件绑定容器到指定 CPU 核心，限制只能使用这些核心"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CPU limits 在 cgroup v2 中映射到 cpu.max 文件，格式为「quota period」（单位微秒）。例如 limits.cpu = 1 对应 cpu.max 的值是「100000 100000」，意味着每 100ms 的调度周期内最多使用 100ms 的 CPU 时间。当配额在一个周期内被耗尽后，CFS 带宽控制器会将该 cgroup 内的所有线程从运行队列中移除（dequeue），直到下一个周期配额刷新。A 选项描述的是 requests 的映射（cpu.weight 对应 requests，不是 limits）；C 选项中 cpu.pressure 是 PSI（Pressure Stall Information）的只读监控文件，不用于设置限制；D 选项描述的是 cpuset 子系统，这是 CPU 亲和性绑定而非带宽限制。"
+        },
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz4",
+          "question": "一个 Go 服务设置了 CPU limits 为 1 核，但 GOMAXPROCS 为 4。在高负载下，该服务的 CPU 节流比例约为多少？",
+          "choices": [
+            {"id": "A", "text": "约 25%，因为只有 1/4 的线程会被节流"},
+            {"id": "B", "text": "约 75%，因为 4 个线程在 25ms 内耗尽 100ms 配额，剩余 75ms 被节流"},
+            {"id": "C", "text": "0%，因为 GOMAXPROCS 只影响 goroutine 调度，不影响 cgroup 的 CPU 配额"},
+            {"id": "D", "text": "100%，因为 GOMAXPROCS 大于 CPU limits 核数时内核会直接拒绝创建线程"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CFS 带宽控制的配额是由所有线程共享的。当 GOMAXPROCS=4 时，Go runtime 会创建 4 个操作系统线程来执行 goroutine。如果这 4 个线程同时满载运行，每个线程每毫秒消耗 1ms 的配额，4 个线程就是 4ms/ms 的消耗速率。1 核对应 100ms/period 的配额在 25ms 内就被 4 个线程瓜分完毕（4 × 25ms = 100ms），剩余 75ms 所有线程都被挂起。所以节流比例约为 75/100 = 75%。C 选项错误——GOMAXPROCS 直接决定了并行执行的操作系统线程数，这些线程会真实消耗 CPU 配额。D 选项错误——内核不会拒绝创建线程，只是在配额用完时挂起它们。"
+        },
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz5",
+          "question": "以下是某容器 cgroup 的 cpu.stat 输出，如何解读该容器的 CPU 节流情况？\n\n```\nnr_periods 1000000\nnr_throttled 350000\nthrottled_usec 26250000000\n```",
+          "choices": [
+            {"id": "A", "text": "节流比例为 35%，累计被节流约 26250 秒，属于严重节流需要调高 CPU limits"},
+            {"id": "B", "text": "节流比例为 35%，累计被节流约 7.3 小时，可以接受不需要调整"},
+            {"id": "C", "text": "节流比例为 65%，因为有 65% 的周期是正常运行的"},
+            {"id": "D", "text": "无法判断节流严重程度，需要结合 CPU 使用率才能下结论"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "节流比例 = nr_throttled / nr_periods = 350000 / 1000000 = 35%。throttled_usec = 26250000000 微秒 = 26250 秒 ≈ 7.3 小时，这是累计被节流的总时间。35% 的节流比例远超 5% 的告警阈值，属于严重节流，说明 CPU limits 设得过低（或者线程数过多），需要调高 CPU limits 或降低 GOMAXPROCS/线程池大小。B 选项虽然数据计算正确，但 35% 的节流比例绝不是「可以接受」的，一般超过 5% 就需要关注，超过 25% 就需要立即处理。C 选项错误地计算了节流比例——应该用被节流的周期数除以总周期数。D 选项错误——cpu.stat 提供的信息已足够判断节流严重程度。"
+        },
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz6",
+          "question": "一个常见的误区是：「只要 Pod 的内存使用没有超过 limits，就不会被 OOMKilled。」这个说法为什么不完全正确？",
+          "choices": [
+            {"id": "A", "text": "因为 cgroup 的内存记账包含 page cache，即使应用的 RSS 没有超过 limits，page cache 加上 RSS 超限也会触发 OOM"},
+            {"id": "B", "text": "因为即使容器自身内存没超限，节点级别的内存耗尽也可能触发系统 OOM Killer 杀掉该容器"},
+            {"id": "C", "text": "因为 kubelet 的 eviction manager 会在节点内存压力下驱逐实际内存使用超过 requests 的 Pod，即使没超过 limits"},
+            {"id": "D", "text": "以上三种情况都成立，Pod 被 OOMKilled 的原因不止「超过自身 limits」一种"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Pod 被终止的内存相关原因至少有三种，不限于超过自身 limits。第一，cgroup 的内存记账（memory.current）包含 RSS 和 active page cache，即使应用自身的堆内存（RSS）没有超过 limits，大量的文件 I/O 产生的 page cache 也可能导致 cgroup 内存总量触及 memory.max 上限。第二，如果节点上其他容器导致整个节点的内存被耗尽，Linux 系统级 OOM Killer 会根据 oom_score 选择杀进程，你的容器即使没超自身 limits 也可能被选中（尤其是 BestEffort 和 Burstable QoS 的 Pod）。第三，kubelet 的 eviction manager 在节点内存低于 eviction threshold 时会优先驱逐实际内存使用超过 requests 的 Pod。所以 D 是最完整的答案。"
+        },
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz7",
+          "question": "CPU 超过 limits 和内存超过 limits 的行为差异，根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "因为 Kubernetes 的调度器对 CPU 和内存采用了不同的调度算法"},
+            {"id": "B", "text": "因为 CPU 时间片是可压缩的流动资源可以暂停回收，而内存是不可压缩的占用资源只能通过杀进程释放"},
+            {"id": "C", "text": "因为 cgroup 对 CPU 使用了软限制（soft limit），对内存使用了硬限制（hard limit）"},
+            {"id": "D", "text": "因为 Linux 内核在设计时就决定了 CPU 的 cgroup 不支持 OOM Kill 功能"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "根本原因在于 CPU 和内存这两种物理资源的本质不同。CPU 时间片是「流动的」——这一毫秒你没用完的 CPU 时间，下一毫秒别人就可以用，内核只需要暂停你的线程就能把 CPU 时间「回收」给其他进程，你的进程不会丢失任何状态。但内存是「占用的」——你 malloc 了一块内存并写入数据后，这块内存就被你占住了，内核无法在不杀进程的情况下释放这块 RSS 内存。这是操作系统层面的物理本质差异，与 Kubernetes 或 cgroup 的实现无关。C 选项不准确——cgroup 对 CPU 和内存的 limits 都是硬限制，区别在于超限后的处理方式不同。"
+        },
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz8",
+          "question": "你的 Java 服务设置了 limits.memory: 2Gi，JVM 参数 -Xmx=1800m。服务运行一段时间后频繁 OOMKilled。最可能的原因和解决方案是什么？",
+          "choices": [
+            {"id": "A", "text": "JVM 堆外内存（Metaspace、线程栈、DirectByteBuffer 等）加上堆内存超过了 2Gi，应将 -Xmx 降至 1200m-1400m 或使用 -XX:MaxRAMPercentage=70.0"},
+            {"id": "B", "text": "Java GC 导致内存临时翻倍，应将 limits 提高到 4Gi 即 -Xmx 的两倍以上"},
+            {"id": "C", "text": "2Gi 的 limits 对 Java 服务来说太小了，应该取消 memory limits 让容器自由使用内存"},
+            {"id": "D", "text": "OOMKilled 是因为堆内存泄漏，应该用 jmap dump 分析堆内存而不是调整配置"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "JVM 进程的总内存消耗远不止 -Xmx 设定的堆大小。Metaspace（类元数据）可能占用 100-300MB，每个线程的栈默认 1MB（256 个线程就是 256MB），DirectByteBuffer（NIO 使用）可能占用数百 MB，再加上 JIT 编译代码缓存、GC 数据结构等。-Xmx=1800m 意味着仅堆就占了 2Gi 中的 90%，只给堆外留了 200MB 余量，这几乎肯定不够。正确做法是将 -Xmx 控制在 limits 的 60%-70%，即 1200m-1400m，或者使用 JDK 10+ 的 -XX:MaxRAMPercentage=70.0 自动根据容器内存上限调整。B 选项过度提高 limits 浪费资源；C 选项取消 limits 在生产环境极其危险；D 选项虽然泄漏也有可能，但 -Xmx=1800m 配 limits=2Gi 本身就是配置不当。"
+        },
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz9",
+          "question": "如果一个 Pod 只设置了 limits 而没有设置 requests，Kubernetes 会如何处理？这对调度有什么影响？",
+          "choices": [
+            {"id": "A", "text": "Kubernetes 自动将 requests 设为 0，Pod 的 QoS 为 BestEffort，调度器认为它不需要任何资源"},
+            {"id": "B", "text": "Kubernetes 自动将 requests 设为与 limits 相同的值，Pod 的 QoS 为 Guaranteed，调度时会预留全部 limits 对应的资源"},
+            {"id": "C", "text": "Pod 会被拒绝创建，因为 requests 是必填字段"},
+            {"id": "D", "text": "Kubernetes 将 requests 设为 limits 的 50%，Pod 的 QoS 为 Burstable"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Kubernetes 的一个默认行为：如果容器只设置了 limits 而没有显式设置 requests，API Server 的 admission 阶段会自动将 requests 的值设为与 limits 相同。这意味着该容器的 requests = limits，满足 Guaranteed QoS 的条件。调度时 kube-scheduler 会按照这个 requests 值预留资源，相当于为这个容器预留了 limits 大小的资源份额。这可能导致实际只需要少量资源的容器占用了大量调度配额，降低集群利用率。A 选项错误——requests 不会被设为 0；C 选项错误——requests 不是必填字段；D 选项错误——没有「自动设为 50%」的逻辑。"
+        },
+        {
+          "id": "k8s-exceed-memory-cpu-limit-q1-quiz10",
+          "question": "你的服务 P99 延迟周期性飙升，但 CPU 使用率平均只有 30%，Pod 没有重启记录。你怀疑是 CPU 节流，应该如何确认？",
+          "choices": [
+            {"id": "A", "text": "查看 kubectl top pod 的 CPU 使用率，如果低于 limits 说明不是节流问题"},
+            {"id": "B", "text": "查看 kubectl describe pod 的 Events 部分，CPU 节流会产生 Warning 事件"},
+            {"id": "C", "text": "查看 Prometheus 指标 container_cpu_cfs_throttled_periods_total / container_cpu_cfs_periods_total，如果比值超过 5% 则确认存在节流"},
+            {"id": "D", "text": "在节点上执行 dmesg | grep throttle 查看内核节流日志"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "CPU 节流是一种「沉默」的性能问题——它不会在 kubectl describe pod 中产生任何事件（B 错误），也不会在 dmesg 中留下日志（D 错误）。kubectl top pod 显示的是平均 CPU 使用率（A 错误），平均 30% 不代表没有节流——CFS 节流发生在 100ms 的微观周期内，某些周期可能满载被节流，但平均下来看起来不高。唯一可靠的确认方式是查看 CFS 节流相关的 cgroup 指标。在 Prometheus 中，使用 rate(container_cpu_cfs_throttled_periods_total[5m]) / rate(container_cpu_cfs_periods_total[5m]) 计算节流比例，或者直接在节点上查看容器 cgroup 的 cpu.stat 文件中的 nr_throttled 和 nr_periods。超过 5% 就值得关注，超过 25% 需要立即调整。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/assign-memory-resource/",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/assign-cpu-resource/",
+        "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html",
+        "https://engineering.shopify.com/blogs/engineering/cpu-limits-in-kubernetes"
+      ]
+    }
+  ]
+}
