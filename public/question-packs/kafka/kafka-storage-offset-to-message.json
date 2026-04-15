@@ -1,0 +1,157 @@
+{
+  "id": "kafka-storage-offset-to-message",
+  "name": "通过 Offset 定位消息的流程",
+  "domain": "kafka",
+  "description": "深入解析 Kafka 通过二分查找和稀疏索引从 Offset 快速定位到 Segment 中消息的完整流程",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-storage-offset-to-message-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Kafka", "Offset", "稀疏索引", "消息定位", "二分查找"],
+      "title": "如何通过 Offset 快速定位到 Segment 中的消息？",
+      "content": "## 核心问题\n\n面试官问你「Kafka 怎么通过 offset 找到消息」的时候，他考察的不是你能不能说出「Kafka 有 .log 和 .index 文件」这种表面认知。他真正想听的是：一个 Partition 积累了 50GB 数据、分散在 50 个 Segment 文件中，Consumer 发起一次 fetch 请求说「给我 offset = 38745612 的消息」——Broker 从接到请求到找到那条消息的字节位置，中间经历了哪些数据结构和算法步骤，每一步的时间复杂度是多少，为什么这个查找能在微秒级完成。\n\n这个问题是理解 Kafka 为什么快的核心拼图之一。很多人知道 Kafka 写入快是因为顺序 I/O，但对「读取同样快」的原因说不清楚。如果你能完整、准确地描述 offset 到消息的定位链路，面试官基本可以确认你对 Kafka 存储层有真正的理解。\n\n假设你面前有一个 Kafka 3.6 集群的 Partition 目录，结构如下：\n\n```bash\n$ ls -lh /data/kafka/logs/trade-events-5/\ntotal 4.8G\n-rw-r--r-- 1 kafka kafka 1.0G Jan 10 02:15 00000000000000000000.log\n-rw-r--r-- 1 kafka kafka 2.5M Jan 10 02:15 00000000000000000000.index\n-rw-r--r-- 1 kafka kafka 1.5M Jan 10 02:15 00000000000000000000.timeindex\n-rw-r--r-- 1 kafka kafka 1.0G Jan 11 14:30 00000000000001048576.log\n-rw-r--r-- 1 kafka kafka 2.4M Jan 11 14:30 00000000000001048576.index\n-rw-r--r-- 1 kafka kafka 1.4M Jan 11 14:30 00000000000001048576.timeindex\n-rw-r--r-- 1 kafka kafka 1.0G Jan 13 03:45 00000000000002097152.log\n-rw-r--r-- 1 kafka kafka 2.6M Jan 13 03:45 00000000000002097152.index\n-rw-r--r-- 1 kafka kafka 1.5M Jan 13 03:45 00000000000002097152.timeindex\n-rw-r--r-- 1 kafka kafka 1.0G Jan 14 16:20 00000000000003145728.log\n-rw-r--r-- 1 kafka kafka 2.5M Jan 14 16:20 00000000000003145728.index\n-rw-r--r-- 1 kafka kafka 1.5M Jan 14 16:20 00000000000003145728.timeindex\n-rw-r--r-- 1 kafka kafka 782M Jan 15 09:40 00000000000004194304.log\n-rw-r--r-- 1 kafka kafka  10M Jan 15 09:40 00000000000004194304.index\n-rw-r--r-- 1 kafka kafka  10M Jan 15 09:40 00000000000004194304.timeindex\n```\n\n### 思考\n\n注意最后一组 Segment 的 .index 和 .timeindex 是 10MB 而 .log 才 782MB——这说明它是 active segment，索引文件按默认值预分配了空间还没有被裁剪。前面四组 Segment 的 .index 都只有 2.5MB 左右，那是因为 Segment 关闭后索引被 truncate 到了实际使用大小。\n\n现在 Consumer 发起请求：fetch offset = 3874561。这个 offset 落在哪个 Segment 里？你怎么知道的？找到 Segment 之后，如何在 1GB 的 .log 文件中跳到正确的字节位置？为什么这个过程几乎不涉及磁盘随机 I/O？",
+      "answer": "## 第一步：核心概念基础——消息定位问题的本质\n\n### 为什么消息定位是一个值得专门讨论的问题\n\n在关系数据库中，你通过主键查一行数据，底层走的是 B+ 树索引，一路从根节点往下找到叶子节点，再拿到行数据的物理地址。这个过程很经典，也很成熟。但 Kafka 面对的是一个完全不同的存储场景：它的数据是 append-only 的日志流，每条消息只有一个单调递增的 offset 作为标识，没有复杂的查询条件，不需要支持 UPDATE 或 DELETE，不需要支持范围索引或多列组合索引。在这种极度简化的访问模式下，B+ 树就显得太「重」了——每次写入都要维护树结构的平衡，节点分裂和合并的开销在 Kafka 每秒百万级写入的场景下完全不可接受。\n\nKafka 选择的方案是稀疏索引（sparse index）。思路很简单：不对每条消息建索引，而是每隔一段距离打一个「路标」，记录这个位置对应的 offset 和它在文件中的字节偏移。要查某个 offset 的消息时，先用二分查找找到最近的路标，然后从路标位置开始往后顺序扫描一小段数据就行了。这个设计让索引文件极小（1GB 的数据文件对应的索引通常只有 2-3MB），写入时维护成本接近于零，而查找时多出来的那一小段顺序扫描在操作系统 page cache 的加持下几乎无感知。\n\n### 定位过程涉及的三种文件\n\n每个 Segment 由三种文件构成，各自承担不同的定位职责。`.log` 文件存储实际的消息数据，以 RecordBatch 为单位追加写入，单个文件默认上限 1GB（`log.segment.bytes`）。`.index` 文件存储 offset 到 `.log` 物理字节位置的稀疏映射，每条记录固定 8 字节——4 字节相对偏移量加 4 字节物理位置。`.timeindex` 文件存储时间戳到 offset 的稀疏映射，每条记录 12 字节——8 字节时间戳加 4 字节相对偏移量。三种文件的文件名完全相同，都是 Segment 第一条消息的 offset 零填充到 20 位。\n\n用 `kafka-dump-log.sh` 可以直接窥探 `.index` 文件的内部结构。以下是 Kafka 3.6 环境下的真实输出：\n\n```bash\n$ bin/kafka-dump-log.sh --files /data/kafka/logs/trade-events-5/00000000000003145728.index\n\nDumping /data/kafka/logs/trade-events-5/00000000000003145728.index\noffset: 3145728 position: 0\noffset: 3145754 position: 4172\noffset: 3145780 position: 8344\noffset: 3145806 position: 12516\noffset: 3145832 position: 16688\noffset: 3145858 position: 20860\n...\noffset: 3874520 position: 985464832\noffset: 3874546 position: 985469004\noffset: 3874572 position: 985473176\n...\noffset: 4194278 position: 1073709060\n```\n\n两个关键观察。第一，offset 不是逐条递增的，每两条索引之间隔了大约 26 条消息——这就是稀疏索引的直观体现，间隔大小取决于 `log.index.interval.bytes`（默认 4096 字节）和消息平均大小。第二，position 值从 0 到约 1GB，正好对应 `.log` 文件从头到尾的字节范围。每条 8 字节的索引记录就是一个「路标」：offset 3145754 的消息在 `.log` 文件的第 4172 字节处。\n\n---\n\n## 第二步：两步定位的完整流程拆解\n\n### Step 1：二分查找 Segment 文件名，锁定目标 Segment\n\nKafka Broker 在启动时会扫描每个 Partition 目录，提取所有 Segment 文件名中的 baseOffset，构建一个 `ConcurrentSkipListMap<Long, LogSegment>` 保存在内存中。这个跳表的 key 是 baseOffset，value 是包含文件句柄和索引引用的 `LogSegment` 对象。\n\n当 Consumer 请求 offset = 3874561 时，Kafka 调用跳表的 `floorEntry(3874561)` 方法。这个方法返回 key 不大于 3874561 的最大条目。在我们的例子中，五个 Segment 的 baseOffset 分别是 0、1048576、2097152、3145728、4194304。满足条件的最大 baseOffset 是 3145728（因为 3145728 ≤ 3874561 < 4194304），于是 Kafka 锁定了以 `00000000000003145728` 为前缀的这组文件。\n\n跳表查找的时间复杂度是 O(log N)，N 是 Segment 数量。典型的 Partition 有几十到几百个 Segment，这步在内存中完成，耗时在纳秒到微秒级别。有人会问为什么不用 HashMap——因为 HashMap 不支持 `floorEntry` 这种「找不大于目标 key 的最大 key」的范围操作。也有人问为什么不用 TreeMap——因为 `ConcurrentSkipListMap` 提供无锁读取，在 Broker 同时处理多个 Consumer fetch 请求和 Segment 滚动创建的并发场景下更合适。\n\n### Step 2：.index 文件二分查找，找到最近的物理位置\n\n锁定 Segment 后，Kafka 需要在该 Segment 的 `.index` 文件中找到离目标 offset 最近的物理位置。`.index` 文件在 Kafka 启动时通过 Java NIO 的 `FileChannel.map()` 映射为 `MappedByteBuffer`，即操作系统层面的 mmap。这意味着 `.index` 的内容直接从 page cache 映射到了 JVM 进程的虚拟地址空间，读取时不需要 `read()` 系统调用，也不需要从内核态到用户态的数据拷贝。\n\n`.index` 内部是一个按相对偏移量严格递增的定长数组。每个元素 8 字节：前 4 字节是相对偏移量（`relativeOffset = absoluteOffset - baseOffset`），后 4 字节是 `.log` 文件中的物理字节位置。Kafka 源码中的 `OffsetIndex.lookup()` 方法在这个数组上执行标准的二分查找，找到不大于目标相对偏移量的最大条目。\n\n具体到我们的例子。目标 offset = 3874561，Segment baseOffset = 3145728，相对偏移量 = 3874561 - 3145728 = 728833。在 `.index` 的 mmap 内存中做二分查找，假设命中了 `relativeOffset: 728792, position: 985464832`——对应绝对 offset 3874520。这意味着 offset 3874520 的消息从 `.log` 文件的第 985464832 字节开始。\n\n从这里可以直接算出：目标 offset 3874561 比索引命中的 offset 3874520 多了 41 条消息。假设消息平均大小 160 字节，需要向后扫描大约 41 × 160 = 6.5KB。这就是稀疏索引的代价——最后一段无法精确定位，必须顺序扫描。但 6.5KB 在 page cache 命中的情况下只需要微秒级别的时间，完全可以忽略。\n\n### Step 3：.log 文件顺序扫描到目标消息\n\n从 `.index` 拿到 position 后，Kafka 通过 `FileChannel.read()` 从 `.log` 文件的指定位置开始读取数据。具体来说，它逐个读取 RecordBatch 的 header（包含 baseOffset、lastOffset、batchLength 等字段），检查目标 offset 是否落在当前 batch 的 `[baseOffset, lastOffset]` 范围内。不在范围内就跳过整个 batch（直接 seek 到 position + batchLength），在范围内就解析 batch 中的 Record，通过每条 Record 的 offsetDelta 计算出绝对 offset，逐条比对直到命中。\n\n整个流程用 ASCII 图表示：\n\n```\nConsumer: fetch offset = 3874561\n    │\n    ▼\n┌──────────────────────────────────────────┐\n│ Step 1: ConcurrentSkipListMap            │\n│ floorEntry(3874561)                      │\n│ baseOffsets: [0, 1048576, 2097152,       │\n│               3145728, 4194304]          │\n│ 命中: 3145728                            │\n│ 复杂度: O(log N), N = Segment 数         │\n└────────────────┬─────────────────────────┘\n                 │\n                 ▼\n┌──────────────────────────────────────────┐\n│ Step 2: .index 二分查找 (mmap 内存)      │\n│ 相对 offset = 3874561 - 3145728 = 728833│\n│                                          │\n│ 索引条目 (8B each):                      │\n│   ... | 728766:985460660 |               │\n│       | 728792:985464832 | ◄── 命中      │\n│       | 728818:985469004 |               │\n│                                          │\n│ 结果: position = 985464832               │\n│ 复杂度: O(log M), M = 索引条目数         │\n└────────────────┬─────────────────────────┘\n                 │\n                 ▼\n┌──────────────────────────────────────────┐\n│ Step 3: .log 顺序扫描                    │\n│ 从 position 985464832 开始               │\n│ 逐个读取 RecordBatch header              │\n│                                          │\n│ batch[3874520-3874545] → 跳过            │\n│ batch[3874546-3874571] → 命中!           │\n│   在 batch 内定位 offsetDelta = 15       │\n│   即 3874546 + 15 = 3874561             │\n│                                          │\n│ 扫描范围: ~6.5KB (page cache 命中)       │\n└──────────────────────────────────────────┘\n```\n\n### 用 kafka-dump-log.sh 验证完整链路\n\n你可以用 `--index-sanity-check` 参数验证索引文件与 `.log` 文件的一致性。如果索引损坏，这个命令会报出具体的不一致条目：\n\n```bash\n$ bin/kafka-dump-log.sh --files /data/kafka/logs/trade-events-5/00000000000003145728.log \\\n    --index-sanity-check\n\nDumping /data/kafka/logs/trade-events-5/00000000000003145728.log\nLog starting offset: 3145728\nLog end offset: 4194304\nLog is valid.\n\nMismatches in :/data/kafka/logs/trade-events-5/00000000000003145728.index\n  Index offset: 3145728, log offset: 3145728\n  Index offset: 3145754, log offset: 3145754\n  ...\nIndex 00000000000003145728.index is valid.\n```\n\n输出中「Mismatches」这个词容易让人紧张，但如果后续紧跟的 offset 都是匹配的，最终输出 `is valid` 就说明索引完好。真正的损坏场景会输出 `MISMATCH` 并给出具体的偏差值。\n\n你也可以查看 `.log` 文件中特定 offset 范围的 batch 信息：\n\n```bash\n$ bin/kafka-dump-log.sh --files /data/kafka/logs/trade-events-5/00000000000003145728.log \\\n    --print-data-log --max-message-size 1048576 | grep -A2 'baseOffset: 3874546'\n\nbaseOffset: 3874546 lastOffset: 3874571 count: 26 baseSequence: 0\n partitionLeaderEpoch: 45 isTransactional: false isControl: false\n position: 985469004 CreateTime: 1705312840567 size: 4172\n```\n\n这条输出精确印证了索引链路的结论：offset 3874546-3874571 的 batch 位于 `.log` 文件 position 985469004 处，batch 大小 4172 字节，包含 26 条消息。目标 offset 3874561 的 offsetDelta = 3874561 - 3874546 = 15，即这个 batch 中的第 16 条 record（从 0 计数第 15 条）。\n\n---\n\n## 第三步：体系化扩展——时间索引、调优与性能特征\n\n### .timeindex 的两跳查找：时间戳 → offset → position\n\n除了按 offset 查找，Kafka 还支持通过 `offsetsForTimes()` API 按时间戳定位消息。这个能力依赖 `.timeindex` 文件，其内部查找是一个「两跳」过程。\n\n第一跳：在目标 Segment 的 `.timeindex` 中做二分查找，找到不大于目标时间戳的最大条目，拿到对应的 offset。`.timeindex` 每条记录 12 字节——8 字节时间戳加 4 字节相对偏移量。\n\n```bash\n$ bin/kafka-dump-log.sh --files /data/kafka/logs/trade-events-5/00000000000003145728.timeindex\n\nDumping /data/kafka/logs/trade-events-5/00000000000003145728.timeindex\ntimestamp: 1705190400123 offset: 3145728\ntimestamp: 1705190404287 offset: 3145754\ntimestamp: 1705190408451 offset: 3145780\n...\ntimestamp: 1705312836403 offset: 3874494\ntimestamp: 1705312840567 offset: 3874520\ntimestamp: 1705312844731 offset: 3874546\n...\n```\n\n假设 Consumer 请求「给我时间戳 ≥ 1705312842000 的最早消息」。在 `.timeindex` 中二分查找，命中 `timestamp: 1705312840567, offset: 3874520`（它是不大于目标时间戳的最大条目）。第二跳：用这个 offset 3874520 走前面描述的 `.index` 查找流程（Step 2 + Step 3），在 `.log` 中逐条扫描消息的 CreateTime，返回第一条 timestamp ≥ 1705312842000 的消息。\n\n整条链路可以概括为：`.timeindex` → offset → `.index` → position → `.log` 顺序扫描。本质上 `.timeindex` 把一个模糊的时间查询转化成了精确的 offset 查询，然后复用已有的定位机制。\n\n### log.index.interval.bytes 调优：索引密度的空间-时间权衡\n\n`log.index.interval.bytes` 是控制稀疏索引密度的核心参数，默认值 4096 字节。它的含义是：Kafka 每累计写入 4096 字节的消息数据后，在 `.index` 和 `.timeindex` 中各新增一条索引记录。注意单位是字节而不是消息条数，这是面试中最容易踩的坑。\n\n这个参数直接影响定位过程中 Step 3 顺序扫描的范围。以下是不同配置下的索引密度对比（假设消息平均大小 160 字节）：\n\n```\nlog.index.interval.bytes = 4096 (默认)\n  → 每 ~26 条消息建一条索引\n  → 最坏情况顺序扫描 ~4KB\n  → 1GB .log 对应 ~2.5MB .index\n\nlog.index.interval.bytes = 1024\n  → 每 ~6 条消息建一条索引\n  → 最坏情况顺序扫描 ~1KB\n  → 1GB .log 对应 ~10MB .index\n\nlog.index.interval.bytes = 512\n  → 每 ~3 条消息建一条索引\n  → 最坏情况顺序扫描 ~512B\n  → 1GB .log 对应 ~20MB .index\n```\n\n对于消息体很小（50-100 字节，比如 IoT 设备上报的指标数据）的 Topic，默认 4096 意味着两条索引之间可能隔了 40-80 条消息，顺序扫描范围可达几十 KB。如果对消费延迟有极致要求，可以把这个值调小。调整方法支持 Topic 级别覆盖：\n\n```bash\n$ bin/kafka-configs.sh --bootstrap-server localhost:9092 \\\n  --alter --entity-type topics --entity-name iot-metrics \\\n  --add-config index.interval.bytes=512\n\nCompleted updating config for topic iot-metrics.\n\n$ bin/kafka-configs.sh --bootstrap-server localhost:9092 \\\n  --describe --entity-type topics --entity-name iot-metrics\n\nDynamic configs for topic iot-metrics are:\n  index.interval.bytes=512 sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:index.interval.bytes=512}\n```\n\n但要注意这是一个经典的空间-时间权衡。更密的索引让 `.index` 文件更大，占用更多 page cache，写入时索引维护的开销也会略微增加。在大多数生产场景中，默认的 4096 已经是一个很好的平衡点——最后几 KB 的顺序扫描在 page cache 命中的情况下根本不是瓶颈。\n\n### 与传统 B-tree 索引的本质区别\n\n理解 Kafka 为什么不用 B+ 树而选择稀疏索引，是抓住其存储设计哲学的关键。两者面对的写入模式根本不同：MySQL InnoDB 的 B+ 树需要支持随机插入（任意位置 INSERT）、原地更新（UPDATE）和删除（DELETE），每次写操作都可能触发节点分裂或合并，维护成本随数据量增长而上升。Kafka 的 offset 天然单调递增，写入永远是追加到文件末尾，永远不修改已有数据。在这种 append-only 模式下，有序数组 + 二分查找就是最优解——写入时只需在数组末尾追加一条 8 字节记录，维护成本 O(1)；查找时 O(log M) 的二分查找在几 MB 大小的 mmap 内存上只需几次比较。\n\n另一个重要区别是索引与数据的耦合度。B+ 树的叶子节点直接关联行数据的物理地址，树结构本身就是数据组织的一部分。Kafka 的 `.index` 文件完全是「附属」的——即使 `.index` 损坏或丢失，Kafka 也能通过扫描 `.log` 文件完整重建索引（`LogSegment.recover()` 方法），数据不会有任何损失。这种「数据文件自包含、索引随时可重建」的设计让 Kafka 的存储层异常健壮。\n\n### mmap 与 page cache 对查找性能的影响\n\n`.index` 和 `.timeindex` 文件都通过 mmap 映射到进程虚拟地址空间。mmap 的好处是读取时不需要经过 `read()` 系统调用和内核态到用户态的数据拷贝——进程直接通过虚拟地址访问 page cache 中的索引页面。但 mmap 的前提是索引页面确实在 page cache 中。如果 Broker 物理内存不足，操作系统会将不活跃的 page cache 页面换出。此时每次 `.index` 的二分查找都会触发缺页中断（page fault），查找延迟从内存级的微秒退化到磁盘级的毫秒。\n\n生产环境的经验法则是：Broker 的可用内存至少要覆盖所有 active segment 的索引文件大小。以一台管理 2000 个 Partition 的 Broker 为例，每个 Partition 一个 active segment，每个 segment 有 10MB 的 `.index` 和 10MB 的 `.timeindex`——总共需要 2000 × 20MB = 40GB 的 page cache 来保证索引常驻内存。如果 Broker 只有 32GB 物理内存，索引就会被频繁换出，消费延迟会出现明显的毛刺。\n\n此外还需要确保内核参数 `vm.max_map_count` 足够大。每个 mmap 映射占用一个 VMA（Virtual Memory Area），默认的 65530 在 Partition 数量超过一万时可能不够用：\n\n```bash\n$ sysctl vm.max_map_count\nvm.max_map_count = 65530\n\n$ sysctl -w vm.max_map_count=262144\n$ echo 'vm.max_map_count=262144' >> /etc/sysctl.conf\n```",
+      "keyPoints": [
+        "消息定位是一个两步查找过程：先用 ConcurrentSkipListMap.floorEntry() 在 O(log N) 时间内定位目标 Segment，再在 .index 的 mmap 内存中做 O(log M) 二分查找定位物理位置",
+        ".index 文件是稀疏索引，每条记录固定 8 字节（4 字节相对偏移量 + 4 字节物理位置），间隔由 log.index.interval.bytes（默认 4096 字节）控制，不是每条消息都建索引",
+        "二分查找命中的是「不大于目标 offset 的最大索引条目」，从该位置到目标消息之间的几 KB 数据通过 .log 顺序扫描完成，page cache 命中时耗时可忽略",
+        ".index 和 .timeindex 都通过 Java NIO MappedByteBuffer（mmap）映射到虚拟地址空间，读取时直接走 page cache，不涉及 read() 系统调用和内核态拷贝",
+        ".timeindex 支持按时间戳查找，查找链路是两跳：timeindex 二分查找得到 offset → 再走 .index 二分查找得到 position → .log 顺序扫描",
+        "Kafka 不用 B+ 树是因为 offset 天然递增且写入 append-only，稀疏索引写入成本 O(1)、查找 O(log M)，而 B+ 树的节点分裂合并在高吞吐场景下开销过大",
+        "log.index.interval.bytes 越小索引越密，顺序扫描范围越小但索引文件越大；默认 4096 是大多数场景下空间与性能的最优平衡点",
+        "生产环境需确保 Broker 可用内存覆盖所有 active segment 的索引文件，否则 mmap 页面被换出后消费延迟会从微秒退化到毫秒"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz1",
+          "question": "Consumer 请求 fetch offset = 7340100，Partition 下有 baseOffset 为 0、2097152、4194304、6291456、8388608 的五个 Segment。Kafka 会选中哪个 Segment？",
+          "choices": [
+            {"id": "A", "text": "baseOffset = 8388608 的 Segment，因为它是最新的"},
+            {"id": "B", "text": "baseOffset = 6291456 的 Segment，因为 6291456 ≤ 7340100 < 8388608"},
+            {"id": "C", "text": "baseOffset = 4194304 的 Segment，因为要取目标 offset 的前一个 Segment 做兜底"},
+            {"id": "D", "text": "需要遍历所有 Segment 的 .log 文件头部才能确定"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 通过 ConcurrentSkipListMap 的 floorEntry(7340100) 方法查找 key 不大于 7340100 的最大条目。在给定的 baseOffset 集合中，6291456 是满足 ≤ 7340100 的最大值（下一个 8388608 已经大于目标了），所以命中 baseOffset = 6291456 的 Segment。A 选项错在 8388608 > 7340100，目标 offset 还没到这个 Segment 的范围。C 选项的「前一个 Segment 做兜底」纯属编造。D 选项不对，Kafka 根本不需要打开 .log 文件，在内存中的跳表里直接完成定位。"
+        },
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz2",
+          "question": "Kafka .index 文件中每条索引记录存储的 offset 是什么形式？",
+          "choices": [
+            {"id": "A", "text": "4 字节的相对偏移量（absoluteOffset - baseOffset），配合 4 字节物理位置，每条共 8 字节"},
+            {"id": "B", "text": "8 字节的绝对 offset，配合 8 字节物理位置，每条共 16 字节"},
+            {"id": "C", "text": "4 字节的绝对 offset，配合 4 字节物理位置，每条共 8 字节"},
+            {"id": "D", "text": "可变长度编码的 offset（varint），配合 4 字节物理位置，每条长度不固定"}
+          ],
+          "correctAnswer": "A",
+          "explanation": ".index 文件中每条记录固定 8 字节，前 4 字节是相对偏移量（消息的绝对 offset 减去该 Segment 的 baseOffset），后 4 字节是该消息在 .log 文件中的物理字节位置。使用相对偏移量而非绝对 offset 是为了节省空间——4 字节最大能表示约 42 亿的偏移差值，对单个 Segment 绰绰有余。B 选项的 16 字节记录太大了，会让索引文件膨胀一倍。C 选项虽然大小对了，但 4 字节绝对 offset 最大只能表示约 42 亿，对于高吞吐 Topic 的绝对 offset 来说很快就会溢出。D 选项的可变长度编码无法支持二分查找——二分查找要求每条记录定长才能通过下标直接寻址。"
+        },
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz3",
+          "question": "以下是 .index 的 dump 输出片段。Consumer 请求 offset = 5244000（baseOffset = 5242880），二分查找会命中哪条索引？\n\n```\noffset: 5242880 position: 0\noffset: 5243136 position: 40960\noffset: 5243392 position: 81920\noffset: 5243648 position: 122880\noffset: 5243904 position: 163840\noffset: 5244160 position: 204800\n```",
+          "choices": [
+            {"id": "A", "text": "offset: 5244160 position: 204800，因为它最接近目标"},
+            {"id": "B", "text": "offset: 5243904 position: 163840，因为它是不大于 5244000 的最大索引条目"},
+            {"id": "C", "text": "offset: 5242880 position: 0，因为找不到精确匹配就从头开始"},
+            {"id": "D", "text": "查找失败并抛出 OffsetNotFoundException，因为 5244000 不在索引中"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的 .index 二分查找遵循「floor」语义——找到不大于目标的最大索引条目。目标相对偏移量 = 5244000 - 5242880 = 1120，索引中 5243904（相对偏移量 1024）≤ 5244000 < 5244160（相对偏移量 1280），所以命中 5243904。然后从 .log 文件的 position 163840 开始向后顺序扫描约 96 条消息（1120 - 1024 = 96 条偏移差）即可找到目标。A 选项的 5244160 > 5244000，取了大于目标的条目会跳过目标消息。C 选项完全不理解二分查找的 floor 语义。D 选项不对——稀疏索引的设计就不要求精确匹配。"
+        },
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz4",
+          "question": "Kafka 为什么选择 ConcurrentSkipListMap 而不是 HashMap 来管理 Segment 索引？",
+          "choices": [
+            {"id": "A", "text": "HashMap 不支持 floorEntry 范围查询，无法找到「不大于目标 offset 的最大 baseOffset」"},
+            {"id": "B", "text": "HashMap 在高并发下性能不如 SkipListMap"},
+            {"id": "C", "text": "HashMap 不支持按 key 排序遍历，无法按 offset 顺序列出所有 Segment"},
+            {"id": "D", "text": "HashMap 的内存开销比 SkipListMap 大"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "最根本的原因是 HashMap 是一个无序的散列结构，它只支持精确的 key 查找（get），不支持 floorEntry、ceilingEntry 这类有序范围查询。而 Kafka 定位 Segment 时需要的操作是「找到 baseOffset 不大于目标 offset 的最大 Segment」，这是一个 floor 查询，HashMap 做不到。B 选项虽然并发性能也是考虑因素之一，但 ConcurrentHashMap 同样有很好的并发性能，不是选 SkipListMap 的核心原因。C 选项的排序遍历是次要需求。D 选项不对，SkipListMap 因为维护了多层索引链表，内存开销通常比 HashMap 更大。"
+        },
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz5",
+          "question": "关于 log.index.interval.bytes 参数，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "默认值 4096，含义是每累计写入 4096 字节的消息数据后在 .index 中新增一条索引记录"},
+            {"id": "B", "text": "默认值 4096，含义是每写入 4096 条消息后在 .index 中新增一条索引记录"},
+            {"id": "C", "text": "默认值 4096，含义是 .index 文件的最大大小为 4096 字节"},
+            {"id": "D", "text": "默认值 4096，含义是每个 RecordBatch 超过 4096 字节时才建索引"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "log.index.interval.bytes 的单位是字节，不是消息条数，也不是文件大小限制。它控制的是索引的「稀疏度」：每当 Kafka 累计写入指定字节数的消息数据后，才在 .index 中追加一条新的索引记录。默认 4096 意味着如果消息平均 160 字节，大约每 26 条消息建一条索引。B 选项把字节误解为条数，这是最常见的面试错误——实际的索引间隔取决于消息大小，并非固定条数。C 选项描述的是 log.index.size.max.bytes 的功能。D 选项曲解了参数含义，batch 大小和索引间隔是两个独立的概念。"
+        },
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz6",
+          "question": "将 log.index.interval.bytes 从默认的 4096 调小到 512，会产生什么影响？",
+          "choices": [
+            {"id": "A", "text": "索引更密集，顺序扫描范围从 ~4KB 缩小到 ~512B，但 .index 文件会膨胀约 8 倍，占用更多 page cache"},
+            {"id": "B", "text": "索引更密集，消费延迟显著降低，而 .index 文件大小不变因为记录格式没变"},
+            {"id": "C", "text": "索引变稀疏，每 512 条消息才建一条索引，消费延迟会增加"},
+            {"id": "D", "text": "该参数只影响新创建的 Topic，已有 Topic 不受影响"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "log.index.interval.bytes 从 4096 降到 512，意味着索引密度提升约 8 倍——原来每 4KB 消息数据建一条索引，现在每 512 字节就建一条。好处是定位过程中最后的顺序扫描范围从最坏 ~4KB 缩小到 ~512B。代价是 .index 文件的条目数增加约 8 倍，文件大小相应膨胀，占用更多 page cache 空间。这是一个经典的空间-时间权衡。B 选项说文件大小不变是错的——更多条目意味着更大的文件。C 选项把「更小的间隔字节数」误解为「更稀疏」，逻辑完全反了。D 选项不对，该参数既支持 Broker 级别也支持 Topic 级别动态配置，Topic 级别配置对已有 Topic 的新 Segment 生效。"
+        },
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz7",
+          "question": "Consumer 调用 offsetsForTimes() 请求「时间戳 ≥ T 的最早消息」，Kafka 的查找链路是怎样的？",
+          "choices": [
+            {"id": "A", "text": ".timeindex 二分查找得到 offset → .index 二分查找得到 position → .log 顺序扫描验证时间戳"},
+            {"id": "B", "text": ".index 二分查找得到 position → .log 顺序扫描检查每条消息的时间戳"},
+            {"id": "C", "text": "遍历所有 .log 文件，逐条消息比对时间戳，返回第一条满足条件的"},
+            {"id": "D", "text": ".timeindex 直接存储了时间戳到 .log position 的映射，一步定位无需经过 .index"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "按时间戳查找是一个两跳过程。第一跳：在目标 Segment 的 .timeindex 中做二分查找，找到不大于目标时间戳 T 的最大条目，拿到对应的 offset。第二跳：用这个 offset 走标准的 .index 查找流程——在 .index 中二分查找得到物理 position，再从该 position 在 .log 中顺序扫描，逐条检查消息的 CreateTime 是否 ≥ T。B 选项跳过了 .timeindex，无法将时间戳转化为 offset。C 选项的全量遍历在几十 GB 的数据量下完全不可行。D 选项不对，.timeindex 存储的是时间戳→offset 的映射而非时间戳→position，必须再经过 .index 才能得到物理位置。"
+        },
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz8",
+          "question": "Kafka 的稀疏索引相比 MySQL InnoDB 的 B+ 树索引，核心优势是什么？",
+          "choices": [
+            {"id": "A", "text": "写入维护成本接近零——只需在数组末尾追加记录，不涉及 B+ 树的节点分裂与合并，适配 Kafka 的 append-only 写入模式"},
+            {"id": "B", "text": "查找时间复杂度是 O(1)，比 B+ 树的 O(log N) 更快"},
+            {"id": "C", "text": "稀疏索引不需要任何内存，而 B+ 树必须将所有节点加载到内存"},
+            {"id": "D", "text": "稀疏索引支持更复杂的查询条件，比如多列组合查询和模糊匹配"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka 的写入模式是 append-only，offset 天然单调递增，不存在随机插入和更新。在这种模式下，维护 B+ 树的节点分裂、合并、再平衡完全是多余的开销。稀疏索引只需要在有序数组末尾追加一条 8 字节记录，写入维护成本 O(1)。而 B+ 树每次插入都可能触发叶子节点分裂并向上传播，在 Kafka 每秒百万级写入的场景下这个开销不可忽视。B 选项不对，稀疏索引的查找也是 O(log M) 的二分查找，不是 O(1)。C 选项不对，mmap 映射的索引仍然需要 page cache 内存。D 选项完全相反，稀疏索引只支持单维的 offset 查找，B+ 树的灵活性远高于它。"
+        },
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz9",
+          "question": "Broker 的 .index 文件从 page cache 中被换出后，最直接的表现是什么？",
+          "choices": [
+            {"id": "A", "text": "Consumer 消费延迟从微秒级退化到毫秒级，因为每次 .index 二分查找都要触发缺页中断从磁盘加载索引页面"},
+            {"id": "B", "text": "Broker 主动关闭 .index 文件的 mmap 映射并切换到堆内存模式，性能不受影响"},
+            {"id": "C", "text": "Producer 写入延迟显著增加，因为新消息的索引记录无法写入"},
+            {"id": "D", "text": ".index 文件自动损坏，触发 Kafka 的索引重建流程"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "mmap 映射的 .index 文件，其实际数据页面由操作系统 page cache 托管。当物理内存不足时，内核会将不活跃的索引页面换出到磁盘。此后每次 .index 的二分查找命中已换出的页面时，CPU 会触发缺页中断（page fault），内核需要从磁盘重新读取该页面到 page cache，这个过程将查找延迟从纳秒/微秒级拉到毫秒级。B 选项不对，Kafka 不会自动切换索引的内存管理模式。C 选项有一定关联但不准确，写入受影响较小因为写入是追加到末尾，通常在活跃的 page cache 页面上。D 选项不对，page cache 换出不会导致文件内容损坏。"
+        },
+        {
+          "id": "kafka-storage-offset-to-message-q1-quiz10",
+          "question": "以下 kafka-dump-log.sh 输出显示一个 .index 文件的部分内容。根据索引条目间的 offset 间隔和 position 间隔，可以推断出什么？\n\n```\noffset: 1000000 position: 0\noffset: 1000050 position: 8192\noffset: 1000100 position: 16384\noffset: 1000150 position: 24576\n```",
+          "choices": [
+            {"id": "A", "text": "每两条索引间隔 50 个 offset，对应 ~8KB 的消息数据，说明 log.index.interval.bytes ≈ 8192 且消息平均大小约 164 字节"},
+            {"id": "B", "text": "索引是全量索引（每条消息都建了索引），只是这里只显示了每隔 50 条的采样"},
+            {"id": "C", "text": "这些 position 值都是 8192 的整数倍纯属巧合，无法推断任何配置信息"},
+            {"id": "D", "text": "每两条索引间隔 50 个 offset，说明 log.index.interval.bytes = 50"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "从输出可以看到两条相邻索引记录之间间隔了 50 个 offset，对应的 .log 文件 position 增量是 8192 字节。这意味着每 8192 字节的消息数据对应 50 条消息，所以消息平均大小 ≈ 8192 / 50 ≈ 164 字节。而 log.index.interval.bytes 的值正是这个 position 增量 8192——因为 Kafka 每累计写入 log.index.interval.bytes 字节的消息后才新增一条索引。B 选项不对，如果是全量索引每条间隔应该是 1 而不是 50。C 选项放弃分析不可取——整齐的 8192 增量恰恰反映了配置参数的控制。D 选项把字节单位和条数单位搞混了。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#log",
+        "https://kafka.apache.org/documentation/#brokerconfigs_log.index.interval.bytes",
+        "https://github.com/apache/kafka/blob/trunk/storage/src/main/java/org/apache/kafka/storage/internals/log/OffsetIndex.java",
+        "https://github.com/apache/kafka/blob/trunk/storage/src/main/java/org/apache/kafka/storage/internals/log/LogSegment.java"
+      ]
+    }
+  ]
+}
