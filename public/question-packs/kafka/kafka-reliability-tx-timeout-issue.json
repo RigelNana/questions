@@ -1,0 +1,156 @@
+{
+  "id": "kafka-reliability-tx-timeout-issue",
+  "name": "transaction.timeout.ms 过短的问题",
+  "domain": "kafka",
+  "description": "排查分析 transaction.timeout.ms 设置过短导致的事务异常中止与 ProducerFencedException 问题",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-reliability-tx-timeout-issue-q1",
+      "domain": "kafka",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["Kafka", "事务", "transaction.timeout.ms", "超时", "故障排查"],
+      "title": "transaction.timeout.ms 设置过短会导致什么问题？",
+      "content": "你的团队刚刚上线了一个新的订单聚合服务。这个服务使用 Kafka Transactional API 实现 consume-transform-produce 模式：从 `raw-events` Topic 消费用户行为事件，聚合计算后写入 `aggregated-orders` Topic，同时在同一个事务中提交消费 offset，保证 exactly-once 语义。服务在测试环境运行了两周，一切正常。但上线到生产环境的第一天下午高峰期，监控告警开始疯狂响——Producer 端大量抛出 `ProducerFencedException`，服务不断重启，下游消费者看到数据出现了间歇性的空洞。\n\n你登上机器查看日志，看到的是这样的报错：\n\n```\n[2024-03-15 14:23:17.892] ERROR [order-aggregator-txn-03] o.a.k.c.producer.internals.TransactionManager - \n  Transactional Id order-aggregator-txn-03: ProducerFenced exception occurred. The producer with \n  transactional.id=order-aggregator-txn-03 and epoch 47 has been fenced by a newer producer with epoch 48.\norg.apache.kafka.common.errors.ProducerFencedException: Producer attempted an operation with an old epoch. \n  Either there is a newer producer with the same transactional.id, or the producer's transaction has been \n  expired by the broker.\n```\n\n你的第一反应是「脑裂了？有两个实例在用同一个 transactional.id？」但检查了 Kubernetes Deployment 之后确认只有一个 Pod 在运行。你又怀疑是 Broker 端发生了 Leader 切换导致的瞬时错误，但 Broker 集群的 UnderReplicatedPartitions 指标全部为 0，集群一切正常。\n\n百思不得其解之际，你翻开了服务的配置文件，发现了一行不起眼的配置：\n\n```properties\ntransaction.timeout.ms=10000\n```\n\n10 秒。有人把事务超时设成了 10 秒。在测试环境中，单批消息只有几十条，处理耗时不到 1 秒，所以这个配置没有暴露问题。但在生产环境的高峰期，单次 `poll()` 拉取的消息量暴增到上千条，聚合计算本身耗时 3-5 秒，再加上 Broker 端因为高负载导致 `send()` 的响应延迟从平时的 5ms 飙升到 200ms，一批消息的事务总耗时轻松超过 10 秒。\n\n当一个事务超过 `transaction.timeout.ms` 还没有提交，Broker 端的 TransactionCoordinator 会发生什么？Producer 会收到什么异常？已经写入但未提交的消息会怎么处理？为什么日志里出现的是 `ProducerFencedException` 而不是一个简单的 timeout error？这一系列连锁反应的底层机制是什么？如何设置合理的超时值来避免这个问题？",
+      "answer": "## 一、transaction.timeout.ms 核心概念基础详解\n\n### 1.1 Kafka 事务超时机制的基础定义\n\n`transaction.timeout.ms` 是 Kafka Producer 端的一个配置参数，定义了单个事务从 `beginTransaction()` 开始到 `commitTransaction()` 或 `abortTransaction()` 完成的最长允许时间。默认值为 60000 毫秒（60 秒）。这个参数在 Producer 调用 `initTransactions()` 时通过 `InitProducerId` 请求传递给 Broker 端的 TransactionCoordinator，由 Coordinator 负责实际的超时检测和强制终止。\n\n从设计哲学上理解，这个超时机制的核心目的是防止「僵尸事务」长时间占用系统资源。一个未完成的事务有两个严重的副作用：第一，它持有 Partition 的 LSO（Last Stable Offset）锁——所有 `isolation.level=read_committed` 的 Consumer 在该 Partition 上只能读到 LSO 之前的消息，一个卡住的事务会导致 LSO 停滞不前，下游消费端出现严重的延迟。第二，`__transaction_state` Topic 中该事务的状态记录持续存在且无法被 compaction 清理，占用存储和内存。设想一下，如果一个 Producer 在 `beginTransaction()` 之后崩溃，永远不会调用 `commitTransaction()` 或 `abortTransaction()`——没有超时机制的话，这个事务会永远停留在 `Ongoing` 状态，关联的所有 Partition 的 LSO 被永久卡住。\n\n### 1.2 超时值的约束关系\n\n`transaction.timeout.ms` 并不是你可以随意设置的值，它受到 Broker 端 `transaction.max.timeout.ms` 参数的约束。`transaction.max.timeout.ms` 的默认值为 900000 毫秒（15 分钟），它定义了 Broker 允许的事务超时上限。如果 Producer 配置的 `transaction.timeout.ms` 超过了 Broker 的 `transaction.max.timeout.ms`，Producer 在调用 `initTransactions()` 时会直接收到 `InvalidTransactionTimeout` 错误并抛出异常，无法完成初始化。这个设计的意图是让集群管理员能够在 Broker 侧设置一个合理的上限，防止应用方配置出极端的超长事务。\n\n此外，`transaction.timeout.ms` 和 Producer 端其他几个超时参数之间存在微妙的关系。`delivery.timeout.ms`（默认 120000ms）控制的是单条消息从 `send()` 调用到收到 Broker 响应（包括所有重试）的最长时间。`max.block.ms`（默认 60000ms）控制的是 `send()` 和 `partitionsFor()` 方法在 buffer 满或 metadata 不可用时的最大阻塞时间。`request.timeout.ms`（默认 30000ms）控制的是单次请求到 Broker 的超时。如果 `transaction.timeout.ms` 小于 `delivery.timeout.ms`，就可能出现一种诡异的情况：消息还在重试发送（还没超过 `delivery.timeout.ms`），但事务已经被 Coordinator 超时终止了。\n\n## 二、事务超时的完整故障链条精准解析\n\n### 2.1 TransactionCoordinator 的超时检测机制\n\n当 Producer 调用 `initTransactions()` 时，TransactionCoordinator 为该 `transactional.id` 创建一个内部定时器，超时周期就是 Producer 传来的 `transaction.timeout.ms`。这个定时器在每次事务状态发生变更时重置——具体来说，`AddPartitionsToTxn`（第一次 send 时触发）、`AddOffsetsToTxn`（sendOffsetsToTransaction 时触发）以及 `EndTxn`（commit/abort 时触发）这些请求都会刷新定时器。但 `Produce`（实际发送消息的请求）不会刷新定时器。\n\n这意味着什么？假设你的事务流程是：`beginTransaction()` → 发送 1000 条消息 → `sendOffsetsToTransaction()` → `commitTransaction()`。在第一次 `send()` 触发 `AddPartitionsToTxn` 之后，定时器开始计时。如果接下来的 999 条消息因为 Broker 高负载导致每条消息的 Produce 响应都需要 200ms，发送完 1000 条需要约 200 秒——但这期间没有任何操作会刷新定时器。如果你的 `transaction.timeout.ms` 是 10 秒，那么在第 50 条消息发送完之后，事务就已经被 Coordinator 超时终止了，而 Producer 端还浑然不知。\n\nCoordinator 超时终止事务的具体操作是：将事务状态从 `Ongoing` 推进到 `PrepareAbort`，然后向事务涉及的每个 Partition 写入 `ABORT` 类型的 Transaction Marker，最终将状态推进到 `CompleteAbort`。最关键的一步是——Coordinator 会将该 `transactional.id` 对应的 PID 的 Epoch 递增 1。这就是 Zombie Fencing 机制的一部分，它确保旧 Epoch 的 Producer 不能再继续写入属于已被终止事务的消息。\n\n### 2.2 Producer 端的异常表现\n\n当 Coordinator 完成事务超时终止并递增了 Epoch 之后，Producer 端还在继续发送消息——它并不知道事务已经被 Coordinator 杀掉了。当 Producer 的下一个 `Produce` 请求到达 Broker 时，Broker 检测到请求携带的 Epoch 已经过期（旧 Epoch = 47，而 Coordinator 已经递增到 48），于是返回 `PRODUCER_FENCED` 错误码。Producer 客户端收到这个错误后，将其转化为 `ProducerFencedException` 并抛出。\n\n这就是为什么你在日志中看到的是 `ProducerFencedException` 而不是 `TransactionTimeoutException`——从 Producer 的视角看，它不知道是因为超时导致的 fence，它只知道自己被一个「更新的 Producer」fence 掉了。错误日志里的那句「Either there is a newer producer with the same transactional.id, or the producer's transaction has been expired by the broker」其实已经暗示了两种可能的原因，但很多工程师看到「newer producer」就直奔脑裂方向排查，忽略了后半句「transaction has been expired」。\n\n以下是完整的错误堆栈，在真实生产环境中你会看到：\n\n```\n[2024-03-15 14:23:17.892] ERROR [order-aggregator-03] o.a.k.c.producer.internals.Sender - \n  [Producer clientId=order-aggregator-03, transactionalId=order-aggregator-txn-03] Aborting producer \n  batches due to fatal error\norg.apache.kafka.common.errors.ProducerFencedException: Producer attempted an operation with an old epoch. \n  Either there is a newer producer with the same transactional.id, or the producer's transaction has been \n  expired by the broker.\n\n[2024-03-15 14:23:17.895] ERROR [order-aggregator-03] o.a.k.c.producer.internals.TransactionManager - \n  [Producer clientId=order-aggregator-03, transactionalId=order-aggregator-txn-03] Transition from state \n  IN_TRANSACTION to error state FATAL_ERROR\n\n[2024-03-15 14:23:17.896] WARN  [order-aggregator-03] o.a.k.c.producer.KafkaProducer - \n  [Producer clientId=order-aggregator-03, transactionalId=order-aggregator-txn-03] Proceeding to force \n  close the producer since pending requests could not be completed within timeout 30000 ms.\n```\n\n注意第二行日志中的状态转换：`IN_TRANSACTION → FATAL_ERROR`。一旦 TransactionManager 进入 `FATAL_ERROR` 状态，这个 Producer 实例就彻底不可用了——你不能调用 `abortTransaction()` 来恢复，也不能开启新的事务，唯一的选择是关闭并重新创建 Producer 实例。\n\n### 2.3 已写入消息的回滚机制\n\n在事务被超时终止之前，Producer 可能已经成功将部分消息写入了目标 Partition 的 Log。这些消息在物理上已经存在于 Broker 的磁盘上——Kafka 的事务回滚并不会删除已写入的消息。回滚的实现方式是：Coordinator 向涉及的每个 Partition 写入 `ABORT` Transaction Marker。`isolation.level=read_committed` 的 Consumer 在消费时，会根据这个 Marker 过滤掉属于已回滚事务的所有消息。而 `isolation.level=read_uncommitted`（默认值）的 Consumer 则不受影响，仍然能读到这些消息。\n\n这意味着如果你的下游 Consumer 没有正确设置 `isolation.level=read_committed`，它会看到「幽灵数据」——那些本应被回滚的事务中的消息。这也是为什么在使用 Transactional API 时，下游 Consumer 的 `isolation.level` 配置是一个必须检查的项目。\n\n通过 `kafka-transactions.sh` 工具可以看到被超时终止的事务：\n\n```bash\n$ kafka-transactions.sh --bootstrap-server broker-1:9092 --list\n\nTransactionalId             CoordinatorId  ProducerId  ProducerEpoch  TransactionState  \norder-aggregator-txn-01     2              18003       48             CompleteAbort     \norder-aggregator-txn-02     0              18004       52             Ongoing           \norder-aggregator-txn-03     1              18005       48             CompleteAbort     \norder-aggregator-txn-04     2              18006       35             CompleteAbort     \n```\n\n上面的输出中，`order-aggregator-txn-01`、`txn-03`、`txn-04` 都处于 `CompleteAbort` 状态——这些就是被 Coordinator 超时终止的事务。而 `txn-02` 仍然处于 `Ongoing` 状态，如果它长时间不提交，也终将面临同样的命运。\n\n进一步用 `--describe` 查看具体事务的详情：\n\n```bash\n$ kafka-transactions.sh --bootstrap-server broker-1:9092 \\\n    --describe --transactional-id order-aggregator-txn-03\n\nCoordinatorId:  1\nTransactionalId: order-aggregator-txn-03\nProducerId:     18005\nProducerEpoch:  48\nTransactionState: CompleteAbort\nTransactionTimeoutMs: 10000\nCurrentTransactionStartTimeMs: 1710490987892\nTransactionDurationMs: 10234\nTopicPartitions: aggregated-orders-0, aggregated-orders-3, aggregated-orders-7\n```\n\n`TransactionDurationMs: 10234` 明确告诉你事务存活了约 10.2 秒就被终止了，和 `TransactionTimeoutMs: 10000` 几乎吻合。`TopicPartitions` 字段显示这个事务涉及了 3 个 Partition，这些 Partition 上已经写入但未提交的消息都被 ABORT Marker 标记为无效。\n\n### 2.4 连锁故障：超时 → Fence → 重启 → 再超时\n\n在真实的生产事故中，问题往往不止一次超时这么简单。想象一下这个恶性循环：事务超时被 Abort，Producer 收到 `ProducerFencedException` 并崩溃退出。服务管理框架（Kubernetes、Supervisor 等）立刻重启服务。新的 Producer 实例调用 `initTransactions()`，获得新的 Epoch，开始新的事务。但此时 Broker 集群仍然处于高负载状态，消息发送延迟依旧很高。新事务又在 10 秒后被超时终止，Producer 再次被 fence，服务再次重启。如此循环往复，服务在高峰期完全不可用，监控上看到的是不断的 CrashLoopBackOff。\n\n更隐蔽的是对下游消费者的影响。每次事务被 Abort，对应 Partition 的 LSO 会经历一次「停滞 → 跳跃」——在事务 Ongoing 期间 LSO 被锁定，事务 Abort 后 LSO 向前推进。如果多个 Partition 的事务此起彼伏地超时和回滚，下游 `read_committed` Consumer 看到的数据会出现时间线上的空洞和乱序，给业务方造成「数据丢失」的错觉——实际上数据没丢，只是在等待 LSO 推进。\n\n## 三、体系化扩展延伸\n\n### 3.1 如何设置合理的 transaction.timeout.ms\n\n正确设置事务超时值需要量化你的事务处理链路的各段耗时。一个典型的 consume-transform-produce 事务包含以下阶段：`poll()` 返回后开始 `beginTransaction()`，处理消息（CPU 计算），`send()` 到目标 Topic（网络 I/O + Broker 写入），`sendOffsetsToTransaction()`（网络 I/O），`commitTransaction()`（两阶段提交，涉及 `__transaction_state` 写入和 Transaction Marker 写入）。你需要估算在最坏情况下（高峰期、Broker 高负载、网络抖动）这个链路的总耗时，然后在此基础上增加 50%-100% 的安全裕量。\n\n一个实用的做法是先在 Producer 端通过 JMX 监控事务各阶段的耗时指标，观察一段时间的 P99 数据：\n\n```\n# Producer JMX 指标\nkafka.producer:type=producer-metrics,client-id=order-aggregator-03\n  txn-begin-time-ns-total\n  txn-send-offsets-time-ns-total  \n  txn-commit-time-ns-total\n  txn-abort-time-ns-total\n```\n\n假设在高峰期观察到：消息处理耗时 P99 = 5s，send() 批量发送耗时 P99 = 8s，commitTransaction() 耗时 P99 = 3s，总计约 16s。那么 `transaction.timeout.ms` 至少应设为 30000-45000ms（16s × 2~3 倍裕量）。以下是一组推荐的配置对比：\n\n```properties\n# ❌ 过短 — 生产环境高峰期极易触发超时\ntransaction.timeout.ms=10000\nmax.block.ms=60000\ndelivery.timeout.ms=120000\n\n# ✅ 推荐 — 留足安全裕量，与其他超时参数协调\ntransaction.timeout.ms=60000\nmax.block.ms=60000\ndelivery.timeout.ms=120000\nrequest.timeout.ms=30000\n```\n\n关键原则是：`transaction.timeout.ms` 应大于单个事务内所有 `send()` 操作可能花费的总时间（含重试），同时不超过 Broker 端的 `transaction.max.timeout.ms`。如果你发现默认的 60 秒在极端情况下仍不够，首先应该考虑减少单个事务中的消息量（降低 `max.poll.records`），而不是一味加大超时值——因为过长的事务会卡住 LSO，影响下游消费延迟。\n\n### 3.2 监控事务耗时与告警策略\n\n生产环境应该对事务耗时建立主动监控，而不是等到超时才发现问题。关键的 Broker 端 JMX 指标包括 `kafka.coordinator:type=transaction-coordinator,name=TxnAbortRate`——这个指标如果突然飙升，通常意味着出现了批量事务超时。Producer 端需要监控的指标是自定义的事务耗时打点，在 `beginTransaction()` 和 `commitTransaction()` 之间记录耗时，将 P50、P95、P99 推送到你的监控系统（Prometheus、DataDog 等）。\n\n告警策略建议设置两层。第一层：当事务 P99 耗时超过 `transaction.timeout.ms` 的 70% 时触发预警（Warning），提示你事务耗时在逼近超时阈值。第二层：当出现 `ProducerFencedException` 或事务 Abort 率超过 1% 时触发紧急告警（Critical），需要立即排查。\n\n### 3.3 排查「事务卡住」的完整流程\n\n当你怀疑事务超时时，按以下步骤排查。第一步，用 `kafka-transactions.sh --list` 检查是否有大量 `CompleteAbort` 状态的事务，确认是否是超时导致的。第二步，用 `kafka-transactions.sh --describe` 查看具体事务的 `TransactionTimeoutMs` 和 `TransactionDurationMs`，确认超时值是否合理。第三步，在 Producer 日志中搜索 `ProducerFencedException` 和 `expired by the broker` 关键字，确认 fence 原因是超时而非真正的脑裂。第四步，检查 Broker 端 `kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce` 的 P99，确认是否因为 Broker 高负载导致消息发送延迟飙升。第五步，检查 `transaction.timeout.ms` 的配置值，结合事务实际耗时的监控数据，判断是需要增大超时值还是减少单事务消息量。\n\n如果遇到事务长时间卡在 `Ongoing` 状态且 Producer 已经不存在（比如 Pod 被强制删除），可以手动终止：\n\n```bash\n# 手动 abort 一个卡住的事务（Kafka 2.7+）\nkafka-transactions.sh --bootstrap-server broker-1:9092 \\\n    --abort --transactional-id order-aggregator-txn-03 \\\n    --producer-id 18005 --producer-epoch 48 --coordinator-epoch 12\n```\n\n### 3.4 transaction.timeout.ms 与 Kafka Streams\n\nKafka Streams 框架在内部使用 Transactional API，但它的事务超时管理有自己的逻辑。Streams 会在每次 `commit.interval.ms`（默认 30000ms）触发一次事务提交。这意味着 Streams 的事务超时实际上受两个参数共同控制：`transaction.timeout.ms` 和 `commit.interval.ms`。如果 `commit.interval.ms` 接近 `transaction.timeout.ms`，在处理延迟较高的场景下就容易触发超时。Confluent 官方推荐 Streams 应用的 `transaction.timeout.ms` 至少是 `commit.interval.ms` 的 2 倍以上。\n\n### 3.5 面试中的高频考点关联\n\n事务超时问题在面试中通常以故障排查的形式出现，和以下知识点紧密关联。第一，与 Zombie Fencing 机制的关系——超时终止本质上就是 Coordinator 主动执行了一次 fence，将旧 Epoch 的 Producer 标记为非法，理解了这一点就能解释为什么超时后看到的是 `ProducerFencedException` 而非 `TimeoutException`。第二，与 LSO 机制的关系——未完成的事务卡住 LSO，导致 `read_committed` Consumer 消费延迟，这是事务超时的最大业务影响。第三，与 `__transaction_state` Topic 的关系——每次事务超时 Abort 都会产生对该 Topic 的写入，频繁的超时回滚会增加 Coordinator 所在 Broker 的负载。第四，与 `delivery.timeout.ms` 的矛盾——如果消息还在重试中但事务已被超时终止，Producer 端会出现「消息发送成功但事务已 Abort」的矛盾状态，这些消息最终会被 ABORT Marker 标记为无效。",
+      "keyPoints": [
+        "transaction.timeout.ms 默认值 60000ms，定义单个事务的最大存活时间，由 Broker 端 TransactionCoordinator 负责超时检测，超时后 Coordinator 主动将事务推进到 PrepareAbort → CompleteAbort 状态",
+        "事务超时后 Coordinator 会递增该 transactional.id 对应的 Producer Epoch，导致旧 Producer 收到 ProducerFencedException 而非简单的 TimeoutException，这是因为超时终止本质上复用了 Zombie Fencing 机制",
+        "transaction.timeout.ms 受 Broker 端 transaction.max.timeout.ms（默认 900000ms）的上限约束，Producer 配置的值不能超过 Broker 允许的最大值，否则 initTransactions() 会直接失败",
+        "事务超时期间已写入 Partition 的消息不会被物理删除，而是通过写入 ABORT Transaction Marker 标记为无效，仅对 isolation.level=read_committed 的 Consumer 不可见",
+        "未完成的事务会卡住对应 Partition 的 LSO（Last Stable Offset），导致 read_committed Consumer 消费延迟，这是事务超时对下游的最大业务影响",
+        "合理设置 transaction.timeout.ms 的原则是：基于事务链路 P99 耗时乘以 2-3 倍安全裕量，同时确保大于 delivery.timeout.ms 内所有消息可能的发送总耗时",
+        "排查事务超时的关键工具是 kafka-transactions.sh --list 和 --describe，通过 TransactionState、TransactionDurationMs 和 TransactionTimeoutMs 字段可以快速定位问题"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz1",
+          "question": "transaction.timeout.ms 的默认值是多少？它由哪个组件负责超时检测？",
+          "choices": [
+            {"id": "A", "text": "默认 60000ms，由 Producer 端的 TransactionManager 负责检测并自动 abort"},
+            {"id": "B", "text": "默认 60000ms，由 Broker 端的 TransactionCoordinator 负责检测并强制终止事务"},
+            {"id": "C", "text": "默认 30000ms，由 Broker 端的 GroupCoordinator 负责检测，和消费者组管理共用一套机制"},
+            {"id": "D", "text": "默认 120000ms，由 ZooKeeper 的临时节点 TTL 机制负责检测并通知 Broker 终止事务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "transaction.timeout.ms 的默认值是 60000ms（60 秒），超时检测由 Broker 端的 TransactionCoordinator 负责。Producer 在 initTransactions() 时将此值传给 Coordinator，Coordinator 据此设置内部定时器。选项 A 错在检测主体——Producer 端无法自行检测超时，它只能在收到 Broker 返回的 PRODUCER_FENCED 错误时才知道事务已被终止。选项 C 混淆了 TransactionCoordinator 和 GroupCoordinator，两者是完全不同的组件。选项 D 完全错误，Kafka 事务机制不依赖 ZooKeeper。"
+        },
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz2",
+          "question": "当事务超时后 Producer 端收到的异常是什么？为什么不是 TimeoutException？",
+          "choices": [
+            {"id": "A", "text": "收到 TransactionTimedOutException，因为 Coordinator 会发送专门的超时通知给 Producer"},
+            {"id": "B", "text": "收到 ProducerFencedException，因为 Coordinator 超时终止事务时会递增 Epoch，旧 Epoch 的请求被拒绝触发 fence 错误"},
+            {"id": "C", "text": "收到 InvalidProducerEpochException，因为 Broker 检测到 Producer 的 PID 已被回收"},
+            {"id": "D", "text": "收到 TimeoutException，因为 Producer 的 request.timeout.ms 会先于 transaction.timeout.ms 触发"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "事务超时后 Coordinator 将事务 Abort 并递增 Epoch，当旧 Epoch 的 Producer 继续发送请求时，Broker 检测到 Epoch 已过期，返回 PRODUCER_FENCED 错误码，Producer 客户端将其转化为 ProducerFencedException。这是因为超时终止在内部复用了 Zombie Fencing 机制——对 Broker 来说，超时终止和另一个 Producer 抢占 transactional.id 的处理逻辑是相同的。选项 A 的异常类型不存在于 Kafka 客户端 API 中。选项 C 中 InvalidProducerEpochException 虽然存在但在事务超时场景中 Producer 端实际抛出的是 ProducerFencedException。"
+        },
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz3",
+          "question": "事务超时被 Abort 后，已经写入 Partition 的消息会怎么处理？",
+          "choices": [
+            {"id": "A", "text": "Broker 会从 Partition Log 中物理删除这些消息，释放磁盘空间"},
+            {"id": "B", "text": "消息保留在 Partition Log 中不变，但 Coordinator 会写入 ABORT Transaction Marker，read_committed 的 Consumer 据此过滤掉这些消息"},
+            {"id": "C", "text": "消息被标记为 tombstone 记录，等待 Log Compaction 时被清理"},
+            {"id": "D", "text": "消息被移动到一个专门的 dead letter Topic 中，供人工审查和重处理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的事务回滚不会物理删除已写入的消息。回滚的实现方式是 TransactionCoordinator 向事务涉及的每个 Partition 写入 ABORT 类型的 Transaction Marker（Control Record）。isolation.level=read_committed 的 Consumer 在消费时根据这个 Marker 过滤掉属于已回滚事务的消息。选项 A 错在物理删除——Kafka 是 append-only log，不会删除中间的消息。选项 C 混淆了 tombstone 和 Transaction Marker 的概念。选项 D 的 dead letter 机制在 Kafka 事务中不存在。"
+        },
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz4",
+          "question": "transaction.timeout.ms 和 Broker 端的 transaction.max.timeout.ms 是什么关系？",
+          "choices": [
+            {"id": "A", "text": "两者没有关系，transaction.max.timeout.ms 控制的是 __transaction_state Topic 中记录的最大保留时间"},
+            {"id": "B", "text": "transaction.max.timeout.ms 是 Broker 允许的事务超时上限，Producer 配置的 transaction.timeout.ms 不能超过这个值，否则 initTransactions() 会失败"},
+            {"id": "C", "text": "transaction.max.timeout.ms 是所有事务的全局超时值，会覆盖 Producer 端配置的 transaction.timeout.ms"},
+            {"id": "D", "text": "transaction.timeout.ms 是 Broker 端配置，transaction.max.timeout.ms 是 Producer 端配置，两者互为约束"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "transaction.max.timeout.ms 是 Broker 端配置（默认 900000ms，即 15 分钟），定义了 Broker 允许 Producer 设置的事务超时上限。如果 Producer 的 transaction.timeout.ms 超过这个值，initTransactions() 时 Coordinator 会返回 InvalidTransactionTimeout 错误。选项 A 混淆了 transactional.id.expiration.ms（控制不活跃 transactional.id 的过期清理）。选项 C 错在「覆盖」——Broker 端参数是上限约束，不是覆盖。选项 D 混淆了两个参数的所属端。"
+        },
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz5",
+          "question": "为什么 transaction.timeout.ms 设置过短会导致 read_committed Consumer 的消费延迟？",
+          "choices": [
+            {"id": "A", "text": "因为事务频繁超时会导致 Broker CPU 飙升，处理 Consumer fetch 请求变慢"},
+            {"id": "B", "text": "因为未完成的事务会卡住 Partition 的 LSO，事务频繁超时意味着 LSO 频繁停滞，read_committed Consumer 只能读到 LSO 之前的数据"},
+            {"id": "C", "text": "因为 ABORT Marker 会占用大量磁盘空间，导致 Broker 磁盘 I/O 成为瓶颈"},
+            {"id": "D", "text": "因为 Consumer 需要重新连接 TransactionCoordinator 获取最新的事务状态，这个 RPC 开销很大"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "read_committed Consumer 的可见范围受 LSO（Last Stable Offset）限制——LSO 等于当前 Partition 中第一个未完成事务的起始 Offset。事务频繁超时意味着持续有处于 Ongoing 状态的事务存在，LSO 被反复卡住。即使事务最终被 Abort 后 LSO 向前推进，短暂的停滞也会让 Consumer 的数据可见性出现波动。选项 A 虽然频繁 Abort 确实增加 Broker 负载但不是消费延迟的主要原因。选项 C 中 ABORT Marker 本身很小，不会造成磁盘瓶颈。选项 D 错在 Consumer 不直接与 TransactionCoordinator 交互。"
+        },
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz6",
+          "question": "在事务执行过程中，哪些操作会刷新 TransactionCoordinator 的超时定时器？",
+          "choices": [
+            {"id": "A", "text": "每一次 Produce 请求（发送消息到 Partition）都会刷新定时器"},
+            {"id": "B", "text": "AddPartitionsToTxn、AddOffsetsToTxn 和 EndTxn 请求会刷新，普通的 Produce 请求不会"},
+            {"id": "C", "text": "只有 commitTransaction() 触发的 EndTxn 请求才会刷新，其他操作都不会"},
+            {"id": "D", "text": "定时器在 beginTransaction() 时启动后不会被任何操作刷新，一旦启动就只能等超时或提交"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "TransactionCoordinator 的超时定时器在收到 AddPartitionsToTxn（首次 send 时触发）、AddOffsetsToTxn（sendOffsetsToTransaction 时触发）和 EndTxn（commit/abort 时触发）请求时会刷新。普通的 Produce 请求直接发给 Partition Leader，不经过 Coordinator，因此不会刷新定时器。这是一个重要的细节——即使你在持续发送大量消息，如果它们都发往同一个 Partition（不触发新的 AddPartitionsToTxn），定时器不会被刷新。选项 A 是最常见的误解。"
+        },
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz7",
+          "question": "Producer 收到 ProducerFencedException 后应该怎么处理？",
+          "choices": [
+            {"id": "A", "text": "调用 abortTransaction() 回滚当前事务，然后开启新事务重试"},
+            {"id": "B", "text": "增大 transaction.timeout.ms 的值并重新调用 initTransactions() 即可恢复"},
+            {"id": "C", "text": "必须关闭当前 Producer 实例并重新创建，因为 TransactionManager 已进入 FATAL_ERROR 状态不可恢复"},
+            {"id": "D", "text": "忽略异常继续发送下一批消息，Broker 会自动为 Producer 分配新的 Epoch"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "ProducerFencedException 是不可恢复的致命错误。收到这个异常后，Producer 内部的 TransactionManager 会从 IN_TRANSACTION 状态转移到 FATAL_ERROR 状态，此后任何事务操作都会立即抛出异常。唯一的恢复方式是调用 producer.close() 关闭当前实例，然后创建新的 KafkaProducer 并重新调用 initTransactions()。选项 A 错在 abortTransaction() 在 FATAL_ERROR 状态下不可调用。选项 B 错在不能在已有 Producer 实例上重新调用 initTransactions()。"
+        },
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz8",
+          "question": "如何通过命令行工具检查被超时终止的事务？",
+          "choices": [
+            {"id": "A", "text": "使用 kafka-consumer-groups.sh --describe 查看消费者组的 lag 数据，lag 飙升说明有事务超时"},
+            {"id": "B", "text": "使用 kafka-transactions.sh --list 查看所有事务状态，大量 CompleteAbort 状态的事务说明存在超时问题"},
+            {"id": "C", "text": "使用 kafka-configs.sh --describe 查看 __transaction_state Topic 的配置，超时信息记录在 Topic 属性中"},
+            {"id": "D", "text": "使用 kafka-log-dirs.sh 查看事务日志的磁盘占用，超时事务会产生大量临时日志文件"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "kafka-transactions.sh 是排查事务问题的核心工具。使用 --list 可以列出所有事务的当前状态，如果大量事务处于 CompleteAbort 状态，结合 --describe 查看具体事务的 TransactionDurationMs 和 TransactionTimeoutMs 即可确认超时。选项 A 中 kafka-consumer-groups.sh 用于查看消费者组信息，不直接显示事务状态。选项 C 中 kafka-configs.sh 用于管理配置，不显示事务运行状态。选项 D 中 kafka-log-dirs.sh 用于磁盘管理，与事务排查无关。"
+        },
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz9",
+          "question": "以下哪组配置可能导致「消息还在重试但事务已被超时终止」的矛盾情况？",
+          "choices": [
+            {"id": "A", "text": "transaction.timeout.ms=60000, delivery.timeout.ms=30000"},
+            {"id": "B", "text": "transaction.timeout.ms=10000, delivery.timeout.ms=120000"},
+            {"id": "C", "text": "transaction.timeout.ms=120000, delivery.timeout.ms=120000"},
+            {"id": "D", "text": "transaction.timeout.ms=60000, request.timeout.ms=5000"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 中 transaction.timeout.ms=10000 远小于 delivery.timeout.ms=120000。当 Broker 高负载导致消息发送延迟时，Producer 的消息重试可能持续长达 120 秒（delivery.timeout.ms），但事务在 10 秒后就会被 Coordinator 超时终止。此时消息可能还在 Producer 的 buffer 中等待重试或刚刚发送成功，但事务已经被 Abort，这些消息最终被 ABORT Marker 标记为无效。选项 A 中 delivery.timeout.ms 小于 transaction.timeout.ms，消息发送超时会先于事务超时触发，不会出现矛盾。选项 C 两者相等，合理。选项 D 中 request.timeout.ms 是单次请求超时，超时后会触发重试但不会直接导致事务超时。"
+        },
+        {
+          "id": "kafka-reliability-tx-timeout-issue-q1-quiz10",
+          "question": "在 Kafka Streams 中，transaction.timeout.ms 和哪个参数的关系需要特别注意？",
+          "choices": [
+            {"id": "A", "text": "和 cache.max.bytes.buffering 有关，缓存越大事务越容易超时"},
+            {"id": "B", "text": "和 commit.interval.ms 有关，transaction.timeout.ms 应至少是 commit.interval.ms 的 2 倍以上"},
+            {"id": "C", "text": "和 poll.ms 有关，poll 超时会直接触发事务超时"},
+            {"id": "D", "text": "和 state.dir 有关，状态存储 I/O 延迟会影响事务超时计时"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka Streams 在每个 commit.interval.ms（默认 30000ms）周期提交一次事务。如果 transaction.timeout.ms 过于接近 commit.interval.ms，在处理延迟较高的场景下，事务从开始到提交的实际耗时可能超过 transaction.timeout.ms。Confluent 官方推荐 transaction.timeout.ms 至少是 commit.interval.ms 的 2 倍以上。选项 A 中缓存大小不直接影响事务超时。选项 C 中 poll.ms 是 Consumer 的 poll 超时，不触发事务超时。选项 D 中状态存储的 I/O 延迟虽然可能间接影响处理时间但不是直接关联的参数。"
+        }
+      ],
+      "references": [
+        "KIP-98: Exactly Once Delivery and Transactional Messaging — https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging",
+        "Kafka Documentation: Producer Configs — transaction.timeout.ms — https://kafka.apache.org/documentation/#producerconfigs_transaction.timeout.ms",
+        "Kafka Documentation: Broker Configs — transaction.max.timeout.ms — https://kafka.apache.org/documentation/#brokerconfigs_transaction.max.timeout.ms",
+        "Confluent Blog: Transactions in Apache Kafka — https://www.confluent.io/blog/transactions-apache-kafka/"
+      ]
+    }
+  ]
+}
