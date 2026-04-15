@@ -1,0 +1,156 @@
+{
+  "id": "kafka-consumer-offset-commit-failure",
+  "name": "Offset 提交失败分析",
+  "domain": "kafka",
+  "description": "分析 Consumer Offset 提交失败的原因、后果及应对策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-consumer-offset-commit-failure-q1",
+      "domain": "kafka",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["Consumer", "Offset提交", "CommitFailedException", "重复消费", "异常处理"],
+      "title": "消费者 Offset 提交失败会导致什么后果？",
+      "content": "你所在团队维护一个风控系统的实时事件处理服务，Consumer 从 `risk-events` Topic 消费用户行为事件，每条消息经过规则引擎计算后写入风控决策表。服务上线两个月一直稳定运行，但上周四下午 16:45，运营同学报告有一批用户被重复限制交易，排查发现这些用户的风控事件在 15 分钟内被处理了两次。\n\n你拉出 Consumer 的日志，看到大量 `CommitFailedException`：\n\n```\n2024-06-13 16:32:17.893 [consumer-thread-1] ERROR o.a.k.c.c.internals.ConsumerCoordinator\n  - [Consumer clientId=risk-consumer-3, groupId=risk-event-group]\n    Offset commit failed on partition risk-events-7 at offset 2847291:\norg.apache.kafka.clients.consumer.CommitFailedException:\n    Commit cannot be completed since the group has already rebalanced and assigned\n    the partitions to another member. This means that the time between subsequent\n    calls to poll() was longer than the configured max.poll.interval.ms, which\n    typically implies that the poll loop is spending too much time message processing.\n    You can address this either by increasing max.poll.interval.ms or by reducing\n    the maximum size of batches returned in poll() with max.poll.records.\n        at org.apache.kafka.clients.consumer.internals.ConsumerCoordinator.sendOffsetCommitRequest(ConsumerCoordinator.java:1193)\n        at org.apache.kafka.clients.consumer.internals.ConsumerCoordinator.commitOffsetsSync(ConsumerCoordinator.java:1060)\n        at org.apache.kafka.clients.consumer.KafkaConsumer.commitSync(KafkaConsumer.java:1521)\n        at com.example.risk.RiskEventConsumer.consumeLoop(RiskEventConsumer.java:87)\n        at com.example.risk.RiskEventConsumer.run(RiskEventConsumer.java:42)\n```\n\n同一时段还穿插着大量 `commitAsync` 回调中的失败日志：\n\n```\n2024-06-13 16:31:58.107 [consumer-thread-1] WARN  c.e.risk.RiskEventConsumer\n  - Async offset commit failed for {risk-events-7=OffsetAndMetadata{offset=2847156}}:\n    org.apache.kafka.clients.consumer.RetriableCommitFailedException:\n    Offset commit failed with a retriable exception. You should retry committing the\n    latest consumed offsets.\n    Caused by: org.apache.kafka.common.errors.RebalanceInProgressException:\n    REBALANCE_IN_PROGRESS: The group is rebalancing, so a rejoin is needed.\n```\n\n你查看 Consumer 的配置：\n\n```properties\nbootstrap.servers=broker-1:9092,broker-2:9092,broker-3:9092\ngroup.id=risk-event-group\nenable.auto.commit=false\nmax.poll.records=500\nmax.poll.interval.ms=300000\nsession.timeout.ms=45000\nheartbeat.interval.ms=15000\n```\n\n进一步排查发现，16:30 左右有一次规则引擎的热更新导致单条消息处理耗时从 50ms 飙升到 8 秒，一批 500 条消息的处理总耗时从 25 秒暴涨到约 67 分钟，远超 `max.poll.interval.ms` 的 5 分钟上限。Consumer 被 Group Coordinator 判定为「死亡」并踢出消费组，触发 Rebalance。此时 Consumer 手里已经处理到 Offset 2847291 的消息，但提交请求全部失败——无论是 `commitSync` 还是 `commitAsync` 都返回了错误。Rebalance 完成后，Partition `risk-events-7` 被分配给了另一个 Consumer 实例，从上一次成功提交的 Offset 2846800 开始消费，导致 491 条已处理的风控事件被重复执行。\n\n面试官问你：Offset 提交失败会导致什么后果？请从 `commitSync` 和 `commitAsync` 两种提交方式分别分析失败行为，说明常见的失败原因和最终后果，并给出应对策略。",
+      "answer": "## 一、Kafka Consumer Offset 提交机制基础\n\n### 1.1 Offset 提交在消费模型中的定位\n\nKafka 的消费模型与传统消息队列（如 RabbitMQ、ActiveMQ）有一个根本区别：Broker 不负责追踪每条消息的消费状态，消费进度完全由 Consumer 端管理。Consumer 通过「提交 Offset」这个动作告诉 Kafka 集群：「我已经消费到了这个位置，下次从这里之后继续。」提交的目标是 Kafka 内部的 `__consumer_offsets` Topic，这是一个默认 50 个 Partition 的压缩（compacted）Topic，每条记录的 key 是 `(groupId, topic, partition)` 三元组，value 是 Offset 值和可选的元数据。\n\n提交时机的精确控制是 Kafka 消费可靠性的核心。提交成功意味着「这个位置之前的消息我负责了」，提交失败则意味着 Kafka 不知道你已经消费到哪里了。一旦发生 Consumer 崩溃、重启或 Rebalance，Consumer 只能回退到上一次成功提交的 Offset 重新开始，已处理但未成功提交的消息会被重复消费。\n\n### 1.2 两种手动提交方式回顾\n\n关闭 `enable.auto.commit` 之后，开发者通过 `commitSync()` 和 `commitAsync()` 两个 API 手动控制提交时机。这两个方法的核心区别在于「失败后的行为」，而这正是本题的关键。\n\n`commitSync()` 是同步阻塞调用。它向 Group Coordinator（负责管理消费组的那个 Broker 节点）发送 OffsetCommitRequest，然后阻塞等待 Broker 响应。如果网络超时或 Broker 返回可重试错误（如 `COORDINATOR_NOT_AVAILABLE`、`NOT_COORDINATOR`），`commitSync()` 会在内部自动重试，直到成功或遇到不可重试的错误。默认的阻塞超时由 `default.api.timeout.ms` 控制（Kafka 2.0+ 默认 60 秒）。一个标准的使用姿势是在每批消息处理完后调用：\n\n```java\nwhile (running) {\n    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));\n    for (ConsumerRecord<String, String> record : records) {\n        processRecord(record);\n    }\n    // 阻塞直到提交成功或抛出不可重试异常\n    consumer.commitSync();\n}\n```\n\n`commitAsync()` 是异步非阻塞调用。它把提交请求发出去就立即返回，不等待 Broker 的响应。提交结果通过回调函数 `OffsetCommitCallback` 通知调用方。关键的设计决策是：`commitAsync()` 内部不做重试。原因是异步提交的回调可能在很久之后才被调用，如果此时自动重试一个过期的 Offset，可能会覆盖掉后续已经成功提交的更大 Offset，导致消费进度回退。标准用法：\n\n```java\nconsumer.commitAsync((offsets, exception) -> {\n    if (exception != null) {\n        log.error(\"Async commit failed for offsets: {}\", offsets, exception);\n    }\n});\n```\n\n理解了这两种提交方式的基本行为后，我们来深入分析「提交失败」到底意味着什么。\n\n## 二、Offset 提交失败的精准深度解析\n\n### 2.1 commitSync 失败：重试耗尽后的 CommitFailedException\n\n`commitSync()` 遇到可重试错误（如 Coordinator 临时不可用）时会在内部静默重试。但当它遇到不可重试的错误时，会直接抛出异常。最常见的不可重试错误就是题目中出现的 `CommitFailedException`，完整的异常堆栈是这样的：\n\n```\norg.apache.kafka.clients.consumer.CommitFailedException:\n    Commit cannot be completed since the group has already rebalanced and assigned\n    the partitions to another member. This means that the time between subsequent\n    calls to poll() was longer than the configured max.poll.interval.ms, which\n    typically implies that the poll loop is spending too much time message processing.\n        at org.apache.kafka.clients.consumer.internals.ConsumerCoordinator\n            .sendOffsetCommitRequest(ConsumerCoordinator.java:1193)\n        at org.apache.kafka.clients.consumer.internals.ConsumerCoordinator\n            .commitOffsetsSync(ConsumerCoordinator.java:1060)\n        at org.apache.kafka.clients.consumer.KafkaConsumer\n            .commitSync(KafkaConsumer.java:1521)\n```\n\n这个异常的根因是：Consumer 在两次 `poll()` 调用之间花费的时间超过了 `max.poll.interval.ms`。一旦超时，Group Coordinator 认为这个 Consumer 已经「死了」，把它踢出消费组并触发 Rebalance，它之前持有的 Partition 被重新分配给其他 Consumer。此后，被踢出的 Consumer 再尝试提交 Offset，Broker 会返回 `UNKNOWN_MEMBER_ID` 或 `ILLEGAL_GENERATION` 错误——因为这个 Consumer 的 memberId 和 generation 已经过期了，它不再有权提交这些 Partition 的 Offset。客户端库把这类错误包装成 `CommitFailedException` 抛出。\n\n`commitSync()` 对这类错误不会重试，因为重试也没用——Consumer 已经不是消费组的成员了，无论重试多少次 Broker 都会拒绝。这是一个终态错误。\n\n在题目的场景中，规则引擎热更新导致单条消息处理耗时飙升到 8 秒，500 条消息总耗时约 67 分钟，远超 `max.poll.interval.ms=300000`（5 分钟）。Consumer 在处理消息的过程中被踢出组，当它处理完所有消息后调用 `commitSync()`，Broker 直接拒绝了提交请求。\n\n### 2.2 commitAsync 失败：回调中的静默通知\n\n`commitAsync()` 失败时不会抛异常，而是通过回调函数传递错误信息。题目日志中出现的 `RetriableCommitFailedException` 就是异步提交在 Rebalance 期间失败的典型表现：\n\n```\norg.apache.kafka.clients.consumer.RetriableCommitFailedException:\n    Offset commit failed with a retriable exception. You should retry committing\n    the latest consumed offsets.\n    Caused by: org.apache.kafka.common.errors.RebalanceInProgressException:\n    REBALANCE_IN_PROGRESS: The group is rebalancing, so a rejoin is needed.\n```\n\n注意这个异常名字里有「Retriable」，但 `commitAsync()` 内部并不会自动重试。客户端库把「是否重试」的决策权交给了开发者，理由前面说过了——异步场景下盲目重试旧 Offset 可能覆盖新 Offset。如果开发者在回调中不做任何处理（很多人确实只打了一条 warn 日志），这次提交就悄无声息地丢失了。\n\n`commitAsync()` 回调中可能收到的错误类型主要有三种。第一种是 `RebalanceInProgressException`，发生在 Rebalance 过程中，Consumer 正在重新加入消费组，提交请求被拒绝。第二种是 Coordinator 不可用——Group Coordinator 所在的 Broker 宕机或正在选举新的 Coordinator。第三种是 Consumer 已被踢出组，与 `commitSync` 的 `CommitFailedException` 同源，只是在异步回调中表现为 `RetriableCommitFailedException` 包装。\n\n最危险的情况是：开发者在正常消费循环中只用 `commitAsync()`（为了性能），但忽略了回调中的错误处理。如果连续多次 `commitAsync` 都因为 Coordinator 切换而失败，Consumer 端以为自己在稳定消费，实际上可能已经有大量 Offset 没有成功提交。一旦 Consumer 重启，就会从很久之前的 Offset 重新消费。\n\n### 2.3 Rebalance 期间的 REBALANCE_IN_PROGRESS 错误\n\nRebalance 是 Offset 提交失败最高频的触发场景。当消费组发生 Rebalance 时，所有正在进行的 Offset 提交请求都会被 Coordinator 拒绝，返回 `REBALANCE_IN_PROGRESS` 错误码。这是因为 Rebalance 过程中 Partition 的归属正在变更，Coordinator 无法确定提交请求来自合法的 Partition Owner。\n\nRebalance 的触发条件包括：新 Consumer 加入消费组、现有 Consumer 心跳超时（`session.timeout.ms`）、现有 Consumer 处理超时（`max.poll.interval.ms`）、Consumer 主动调用 `unsubscribe()` 或关闭、订阅的 Topic 分区数变更。在生产环境中最常见的触发场景是 Consumer 处理消息太慢导致 `max.poll.interval.ms` 超时，以及服务发布期间 Consumer 实例滚动重启。\n\n当 Consumer 在 `ConsumerRebalanceListener.onPartitionsRevoked()` 回调中尝试做最后一次 `commitSync()` 时，如果 Rebalance 是因为当前 Consumer 被踢出组而触发的，这次 `commitSync()` 同样会抛 `CommitFailedException`——因为 Consumer 已经不是消费组成员了。这形成了一个无解的死循环：Consumer 想在失去 Partition 之前提交 Offset，但正是因为它失去了成员身份才无法提交。\n\n### 2.4 常见的提交失败根因汇总\n\n从生产环境的实际经验来看，Offset 提交失败的根因可以归结为四类。\n\n第一类是 Consumer 处理超时。单条或整批消息的处理耗时超过 `max.poll.interval.ms`，Consumer 被踢出组。这是最常见的原因，尤其在消费逻辑涉及 RPC 调用、数据库写入、复杂计算的场景中。题目中的规则引擎热更新就属于这一类。\n\n第二类是 Group Coordinator 不可用。Coordinator 所在的 Broker 宕机、正在做 Leader 选举、或 `__consumer_offsets` 对应 Partition 的 Leader 正在迁移。这种情况通常是短暂的，`commitSync()` 的内部重试机制能扛过去，但 `commitAsync()` 因为不重试就会直接失败。\n\n第三类是网络问题。Consumer 与 Coordinator 之间的网络分区或严重延迟，导致提交请求超时。在跨机房部署的 Kafka 集群中，这种情况并不少见。\n\n第四类是 Consumer Generation 过期。Rebalance 完成后 Consumer 的 generation 号递增，持有旧 generation 的 Consumer 提交请求会被拒绝。这通常与第一类原因伴随出现。\n\n### 2.5 提交失败的直接后果：重复消费\n\n无论是哪种失败原因，Offset 提交失败的直接后果都是重复消费。因为 `__consumer_offsets` 中记录的仍然是上一次成功提交的 Offset，当 Partition 被（重新）分配给某个 Consumer 时，它会从那个旧 Offset 开始消费，已处理但未成功提交的消息会被再次消费。\n\n重复消费的影响范围取决于两个因素：上一次成功提交到当前处理位置之间的消息数量，以及 Consumer 提交 Offset 的频率。在题目的场景中，上一次成功提交的 Offset 是 2846800，当前处理到了 2847291，差距 491 条消息。如果团队采用的是「每处理 100 条消息提交一次」的策略，那么最大重复窗口就是 100 条。如果是「每批 poll 结果处理完再提交一次」，那重复窗口就是整批 `max.poll.records=500` 条。\n\n对于金融、支付、风控这类核心业务，重复消费如果不做防护就是生产事故。题目中 491 条风控事件被重复执行，导致用户被错误限制交易——这在任何一家金融公司都是 P1 级别的故障。\n\n## 三、体系化扩展与应对策略\n\n### 3.1 幂等消费设计：从根本上化解重复消费\n\nOffset 提交失败导致的重复消费是 Kafka At-Least-Once 语义的固有特性，无法通过调参完全避免。真正的解决之道是让消费端具备幂等性——同一条消息被消费多次的效果与消费一次完全相同。\n\n最常见的幂等方案是基于唯一键的去重。给每条 Kafka 消息分配一个全局唯一的业务 ID（如订单号、事件 ID），在消费端维护一张「已处理记录表」，每次处理前先查这张表。具体实现可以用数据库唯一约束：\n\n```java\npublic void processRecord(ConsumerRecord<String, String> record) {\n    String eventId = extractEventId(record);\n    // 利用数据库唯一键约束，重复 INSERT 会抛 DuplicateKeyException\n    try {\n        riskDecisionDao.insertWithDedup(eventId, computeDecision(record));\n        log.info(\"Processed event {} at offset {}\", eventId, record.offset());\n    } catch (DuplicateKeyException e) {\n        // 重复消费，跳过处理\n        log.warn(\"Duplicate event {} at offset {}, skipping\", eventId, record.offset());\n    }\n}\n```\n\n另一种方案是用 Redis 做快速去重，用 `SET eventId EX 86400 NX` 命令尝试写入事件 ID，如果返回 `nil` 说明已经处理过。Redis 去重的优势是速度快（亚毫秒级），劣势是 Redis 数据有过期时间，理论上存在极端情况下的重复风险。在风控这类对一致性要求高的场景中，建议用数据库唯一约束作为最终防线，Redis 去重作为前置过滤。\n\n### 3.2 Offset 提交重试策略\n\n前面说到 `commitAsync()` 不做内部重试是为了避免旧 Offset 覆盖新 Offset。但这不意味着开发者不能在回调中做有条件的重试。一个经典的策略是维护一个单调递增的序列号，只有当回调中的序列号等于当前最新序列号时才重试：\n\n```java\nprivate final AtomicLong commitSequence = new AtomicLong(0);\n\npublic void commitWithRetry(KafkaConsumer<String, String> consumer) {\n    long seq = commitSequence.incrementAndGet();\n    consumer.commitAsync((offsets, exception) -> {\n        if (exception != null) {\n            // 只有当没有更新的提交请求发出时才重试\n            if (commitSequence.get() == seq) {\n                log.warn(\"Async commit failed, retrying sync: {}\", offsets);\n                try {\n                    consumer.commitSync(Duration.ofSeconds(5));\n                } catch (Exception syncEx) {\n                    log.error(\"Sync retry also failed: {}\", offsets, syncEx);\n                }\n            } else {\n                log.debug(\"Skipping retry, newer commit in flight: {}\", offsets);\n            }\n        }\n    });\n}\n```\n\n更常见的生产实践是在正常消费循环中使用 `commitAsync()`（性能优先），在 Consumer 关闭（`finally` 块）和 Rebalance 回调（`onPartitionsRevoked`）中使用 `commitSync()` 兜底。这样既保证了日常消费的吞吐量，又在关键节点确保 Offset 落地：\n\n```java\nconsumer.subscribe(Collections.singletonList(\"risk-events\"),\n    new ConsumerRebalanceListener() {\n        @Override\n        public void onPartitionsRevoked(Collection<TopicPartition> partitions) {\n            // Rebalance 前同步提交，确保 Offset 不丢\n            try {\n                consumer.commitSync(Duration.ofSeconds(10));\n            } catch (CommitFailedException e) {\n                // Consumer 已被踢出组，无法提交，记录日志\n                log.error(\"Commit on revoke failed, possible duplicate on reassignment\", e);\n            }\n        }\n        @Override\n        public void onPartitionsAssigned(Collection<TopicPartition> partitions) {\n            log.info(\"Assigned partitions: {}\", partitions);\n        }\n    });\n```\n\n### 3.3 监控 Offset 提交成功率\n\n生产环境中，Offset 提交失败不应该是一个只存在于日志里的 WARN——它应该触发告警。建议监控以下几个指标：\n\nKafka Consumer JMX 指标中的 `commit-rate` 和 `commit-latency-avg` 反映了提交频率和延迟。如果 `commit-rate` 突然下降或 `commit-latency-avg` 突然飙升，说明提交链路出了问题。另一个关键指标是 Consumer Lag，即当前消费位置与 Partition 末尾的差距。如果 Consumer Lag 在提交失败期间不降反升，说明 Consumer 虽然在消费消息但 Offset 没有成功提交。使用 `kafka-consumer-groups.sh --describe` 或 Burrow 等工具可以实时监控 Lag。\n\n在应用层面，建议在 `commitAsync` 的回调和 `commitSync` 的 catch 块中对失败次数做计数并上报到 Prometheus 或 Grafana：\n\n```java\n// Prometheus 计数器\nprivate static final Counter COMMIT_FAILURES = Counter.build()\n    .name(\"kafka_consumer_offset_commit_failures_total\")\n    .help(\"Total number of offset commit failures\")\n    .labelNames(\"type\", \"error\")\n    .register();\n\n// 在 commitAsync 回调中\nconsumer.commitAsync((offsets, exception) -> {\n    if (exception != null) {\n        COMMIT_FAILURES.labels(\"async\", exception.getClass().getSimpleName()).inc();\n    }\n});\n```\n\n当 `kafka_consumer_offset_commit_failures_total` 在 5 分钟内超过阈值时触发 PagerDuty 告警，运维团队可以在重复消费大面积扩散之前介入。\n\n### 3.4 面试回答要点\n\n回答这道题时建议按四层递进组织。第一层讲基本机制：`commitSync()` 在可重试错误时自动重试直到超时，遇到不可重试错误（如 Consumer 被踢出组）抛 `CommitFailedException`；`commitAsync()` 不重试，通过回调通知失败。第二层讲核心后果：无论哪种提交方式失败，`__consumer_offsets` 中记录的仍是上一次成功提交的 Offset，导致 Partition 被重新分配后从旧 Offset 开始消费，产生重复消费。第三层讲根因分类：处理超时被踢出组、Coordinator 不可用、Rebalance 期间提交被拒、网络分区。第四层讲应对方案：消费端幂等设计是根本解法，`commitAsync` + `commitSync` 兜底的组合提交是工程最佳实践，Offset 提交成功率监控是运维保障。如果你能在回答中自然地提到 `REBALANCE_IN_PROGRESS` 和 `ILLEGAL_GENERATION` 这两个具体的 Broker 端错误码，面试官会认为你是真正读过源码或在生产中排查过这类问题的人。",
+      "keyPoints": [
+        "commitSync() 在遇到可重试错误时自动内部重试，但遇到 Consumer 被踢出组等不可重试错误时直接抛出 CommitFailedException，重试无法挽救",
+        "commitAsync() 设计上不做内部重试以避免旧 Offset 覆盖新 Offset，提交失败仅通过 OffsetCommitCallback 回调通知，如果回调中不处理则提交静默丢失",
+        "Rebalance 期间所有 Offset 提交请求被 Coordinator 拒绝，返回 REBALANCE_IN_PROGRESS 错误码，onPartitionsRevoked 回调中的 commitSync 也可能因 Consumer 已被踢出组而失败",
+        "Offset 提交失败的直接后果是重复消费：Partition 重新分配后新 Consumer 从上一次成功提交的 Offset 开始消费，已处理但未提交的消息被再次消费",
+        "Consumer 处理超时（超过 max.poll.interval.ms）是生产中最常见的提交失败根因，Consumer 被踢出组后 memberId 和 generation 过期，后续所有提交请求被 Broker 拒绝",
+        "幂等消费设计（数据库唯一键约束 / Redis NX 去重）是应对重复消费的根本解法，仅靠调整提交策略无法完全消除重复消费的可能性",
+        "生产环境推荐 commitAsync + commitSync 兜底的组合模式：正常循环用 commitAsync 保证吞吐，关闭和 Rebalance 回调中用 commitSync 确保 Offset 最终落地",
+        "监控 Offset 提交失败次数、commit-latency-avg、Consumer Lag 三个指标并设置告警，是防止提交失败悄悄扩散为大面积重复消费的运维保障"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz1",
+          "question": "commitSync() 遇到可重试错误（如 Coordinator 临时不可用）时，默认行为是什么？",
+          "choices": [
+            {"id": "A", "text": "立即抛出 CommitFailedException，由应用代码决定是否重试"},
+            {"id": "B", "text": "在内部自动重试直到成功或超过 default.api.timeout.ms，期间阻塞调用线程"},
+            {"id": "C", "text": "将提交请求放入内部重试队列，返回一个 Future 供应用代码异步等待结果"},
+            {"id": "D", "text": "忽略错误静默返回，下次 poll() 时自动补提交"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "commitSync() 的核心设计是同步阻塞+自动重试。当遇到可重试错误（如 COORDINATOR_NOT_AVAILABLE、NOT_COORDINATOR）时，它会在内部自动重试，阻塞调用线程直到提交成功或超过 default.api.timeout.ms（默认 60 秒）。A 选项的「立即抛异常」描述的是不可重试错误（如 UNKNOWN_MEMBER_ID）的行为，不是可重试错误。C 选项混淆了 commitSync 和 commitAsync 的语义——commitSync 不返回 Future。D 选项描述的是自动提交模式（enable.auto.commit=true）的行为，与手动 commitSync 无关。"
+        },
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz2",
+          "question": "commitAsync() 为什么被设计为不在内部自动重试失败的提交？",
+          "choices": [
+            {"id": "A", "text": "异步重试可能导致旧 Offset 覆盖已经成功提交的更大 Offset，造成消费进度意外回退"},
+            {"id": "B", "text": "异步重试会占用 Consumer 的心跳线程资源，导致 session.timeout.ms 超时"},
+            {"id": "C", "text": "Kafka 协议规定异步请求不允许重试，这是 Broker 端的限制"},
+            {"id": "D", "text": "commitAsync 已经在内部自动重试了 3 次，超过次数后才调用回调通知失败"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "commitAsync 不做自动重试的核心原因是 Offset 单调性保护。假设 Consumer 先异步提交了 Offset 100，网络超时后又异步提交了 Offset 200 且成功。如果此时 Offset 100 的重试也成功了，就会把已提交的 Offset 从 200 回退到 100，导致 100~200 之间的消息被重复消费。B 选项混淆了心跳线程和提交逻辑——心跳有独立线程（Kafka 0.10.1+），与提交重试无关。C 选项纯属捏造，Kafka 协议没有这个限制。D 选项的「3 次内部重试」是错误的，commitAsync 一次重试都不做。"
+        },
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz3",
+          "question": "Consumer 因超过 max.poll.interval.ms 被踢出消费组后，再调用 commitSync() 会发生什么？",
+          "choices": [
+            {"id": "A", "text": "commitSync 正常执行并成功提交，因为 __consumer_offsets 不检查 Consumer 的组成员身份"},
+            {"id": "B", "text": "commitSync 在内部重试直到 Rebalance 完成后自动提交成功"},
+            {"id": "C", "text": "commitSync 抛出 CommitFailedException，因为 Consumer 的 memberId 和 generation 已过期，Broker 拒绝提交"},
+            {"id": "D", "text": "commitSync 静默失败不抛异常，但返回一个 false 标志位表示提交未成功"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Consumer 被踢出消费组后，Coordinator 已经将它的 memberId 标记为无效并递增了 generation 号。被踢出的 Consumer 发送 OffsetCommitRequest 时携带的是旧的 memberId 和 generation，Coordinator 返回 UNKNOWN_MEMBER_ID 或 ILLEGAL_GENERATION 错误。这是不可重试错误，commitSync 不会内部重试，直接抛出 CommitFailedException。A 选项错误，__consumer_offsets 的写入由 Coordinator 控制，Coordinator 会校验成员身份。B 选项错误，这不是可重试错误。D 选项错误，commitSync 的失败通过异常而非返回值通知。"
+        },
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz4",
+          "question": "Rebalance 期间 Consumer 调用 commitAsync() 失败时，回调中收到的异常类型通常是什么？",
+          "choices": [
+            {"id": "A", "text": "CommitFailedException，与 commitSync 失败时完全相同的异常类型"},
+            {"id": "B", "text": "RetriableCommitFailedException，内部包裹 RebalanceInProgressException，提示 REBALANCE_IN_PROGRESS"},
+            {"id": "C", "text": "TimeoutException，因为 Rebalance 期间 Coordinator 不响应任何请求"},
+            {"id": "D", "text": "IllegalStateException，因为 Consumer 在 Rebalance 期间不允许调用任何 API"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Rebalance 期间 Coordinator 向 OffsetCommitRequest 返回 REBALANCE_IN_PROGRESS 错误码，Kafka 客户端库将其包装为 RebalanceInProgressException，再外层包装为 RetriableCommitFailedException 传递给 commitAsync 的回调。A 选项的 CommitFailedException 是 commitSync 在不可重试错误时抛出的异常类型，commitAsync 回调中使用的是不同的异常体系。C 选项错误，Coordinator 在 Rebalance 期间仍然响应请求，只是返回错误码拒绝提交。D 选项错误，Consumer 在 Rebalance 期间仍然可以调用 API，只是某些操作会失败。"
+        },
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz5",
+          "question": "以下日志片段表明了什么问题？\n```\nCommit cannot be completed since the group has already rebalanced\nand assigned the partitions to another member.\n```",
+          "choices": [
+            {"id": "A", "text": "Consumer 的心跳超过了 session.timeout.ms，被 Coordinator 踢出组后尝试提交 Offset"},
+            {"id": "B", "text": "Consumer 的 poll() 间隔超过了 max.poll.interval.ms，被踢出组后尝试提交 Offset"},
+            {"id": "C", "text": "__consumer_offsets Topic 的 Partition Leader 发生了迁移，导致提交请求被拒绝"},
+            {"id": "D", "text": "Consumer 订阅的 Topic 被删除后重建，导致 generation 不匹配"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这条错误信息的完整原文还包含「the time between subsequent calls to poll() was longer than the configured max.poll.interval.ms」，明确指向 poll 间隔超时。在 Kafka 0.10.1+ 中，心跳由独立后台线程发送，session.timeout.ms 超时不会产生这条特定的错误信息。A 选项的心跳超时会导致 Consumer 被踢出组，但日志中的措辞和触发条件不同——心跳超时是 Coordinator 主动发现 Consumer 失联，而 poll 超时是 Consumer 端主动检测到自己处理太慢。C 选项描述的是 NOT_COORDINATOR 错误，是可重试错误，不会产生这条日志。D 选项的场景极为罕见，且错误信息不同。"
+        },
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz6",
+          "question": "开发者在 commitAsync 回调中发现提交失败后立即调用 commitSync 重试，这种做法有什么潜在风险？",
+          "choices": [
+            {"id": "A", "text": "如果后续已有更新的 Offset 被成功提交，此处的 commitSync 可能会用旧 Offset 覆盖新 Offset，导致消费进度回退"},
+            {"id": "B", "text": "commitSync 和 commitAsync 不能在同一个 Consumer 实例上混用，会抛出 ConcurrentModificationException"},
+            {"id": "C", "text": "commitSync 在回调线程中调用会导致死锁，因为回调线程与 poll 线程是同一个线程"},
+            {"id": "D", "text": "没有风险，这是官方推荐的最佳实践，commitAsync + commitSync 兜底是标准模式"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这正是 commitAsync 不做自动重试的原因。假设 Consumer 在 T1 时刻异步提交 Offset 100 失败，T2 时刻异步提交 Offset 200 成功。如果 T1 的回调在 T2 之后执行并调用 commitSync(Offset 100)，就会把已提交的 Offset 从 200 回退到 100。正确做法是在回调中检查是否有更新的提交已经发出（如用单调递增序列号），只有没有更新提交时才重试。B 选项错误，commitSync 和 commitAsync 可以混用。C 选项部分正确但不完整——回调确实在 poll 线程中执行，但 commitSync 不会导致死锁，只是会阻塞 poll 线程。D 选项描述的组合模式是正确的，但不是在回调中无条件重试，而是在 finally 块和 onPartitionsRevoked 中用 commitSync 兜底。"
+        },
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz7",
+          "question": "commitSync() 和 commitAsync() 在提交失败时的行为差异，以下描述正确的是？",
+          "choices": [
+            {"id": "A", "text": "commitSync 自动重试可重试错误并阻塞直到成功或超时；commitAsync 不重试，通过回调通知失败，由开发者决定是否重试"},
+            {"id": "B", "text": "commitSync 不重试直接抛异常；commitAsync 在内部重试 3 次后通过回调通知失败"},
+            {"id": "C", "text": "两者行为相同，区别仅在于 commitSync 阻塞等待响应而 commitAsync 立即返回，重试策略完全一致"},
+            {"id": "D", "text": "commitSync 将失败的提交放入内存队列延迟重试；commitAsync 把失败请求写入本地磁盘的 WAL 防止丢失"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这道题考查两种提交方式的核心行为差异。commitSync 的设计哲学是「尽力成功」——对可重试错误自动内部重试，对不可重试错误抛出 CommitFailedException。commitAsync 的设计哲学是「快速返回，风险自担」——不做任何重试，通过回调告知结果，开发者在回调中自行决策。B 选项颠倒了两者的重试行为。C 选项忽略了重试策略的根本差异。D 选项纯属虚构，Kafka Consumer 没有本地 WAL 机制。"
+        },
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz8",
+          "question": "生产环境中，Consumer 因规则引擎升级导致处理耗时从 50ms 飙升到 8 秒，你应该优先采取哪个措施防止 Offset 提交失败？",
+          "choices": [
+            {"id": "A", "text": "把 max.poll.interval.ms 从 5 分钟调到 2 小时，给 Consumer 充足的处理时间"},
+            {"id": "B", "text": "减小 max.poll.records（如从 500 降到 50），确保单批处理时间不超过 max.poll.interval.ms"},
+            {"id": "C", "text": "把 session.timeout.ms 调到 30 分钟，防止心跳超时触发 Rebalance"},
+            {"id": "D", "text": "关闭 enable.auto.commit 改为手动提交，手动提交不受 max.poll.interval.ms 限制"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "核心思路是控制「单批处理总耗时 < max.poll.interval.ms」。将 max.poll.records 从 500 降到 50，单批处理耗时从 500 × 8s = 4000s 降为 50 × 8s = 400s ≈ 6.7 分钟，仍超 5 分钟——所以实际需要同时调大 max.poll.interval.ms 或进一步减小 max.poll.records。但思路方向是正确的：优先减小批次大小。A 选项把超时调到 2 小时虽然能暂时解决问题，但会严重延迟故障 Consumer 的检测，Rebalance 要等 2 小时才触发。C 选项混淆了 session.timeout.ms（心跳超时）和 max.poll.interval.ms（处理超时），两者由不同机制控制。D 选项错误，手动提交同样受 max.poll.interval.ms 限制——这个超时检测的是 poll 间隔，与提交模式无关。"
+        },
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz9",
+          "question": "在 ConsumerRebalanceListener.onPartitionsRevoked() 回调中调用 commitSync()，如果当前 Consumer 正是因为 max.poll.interval.ms 超时被踢出组而触发的 Rebalance，这次 commitSync 的结果是什么？",
+          "choices": [
+            {"id": "A", "text": "正常提交成功，onPartitionsRevoked 回调发生在 Consumer 正式离组之前，此时仍有提交权限"},
+            {"id": "B", "text": "抛出 CommitFailedException，因为 Consumer 已经被踢出组，memberId 和 generation 已失效"},
+            {"id": "C", "text": "提交会被挂起等待 Rebalance 完成，完成后自动提交成功"},
+            {"id": "D", "text": "不会到达 onPartitionsRevoked 回调，因为被踢出组时 Consumer 不触发 Rebalance 回调"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个精妙的边界情况。当 Consumer 因 max.poll.interval.ms 超时被踢出组时，Coordinator 已经在服务端将其标记为无效成员并推进了 generation。虽然客户端在离组流程中仍会执行 onPartitionsRevoked 回调（所以 D 选项错误），但此时 Consumer 向 Coordinator 发送的 OffsetCommitRequest 会因为 UNKNOWN_MEMBER_ID 被拒绝，commitSync 抛出 CommitFailedException。A 选项在「主动 close() 触发的 Rebalance」场景中是正确的，但在「被动超时踢出」场景中不成立。C 选项描述的挂起等待机制不存在。这意味着如果你依赖 onPartitionsRevoked 做最后的 Offset 提交，在超时踢出场景下这条防线会失效。"
+        },
+        {
+          "id": "kafka-consumer-offset-commit-failure-q1-quiz10",
+          "question": "某 Consumer 组有 3 个实例消费 6 个 Partition，其中一个实例频繁出现 Offset 提交失败日志。排查时你应该首先关注哪个指标？",
+          "choices": [
+            {"id": "A", "text": "该实例的 poll-latency-avg（poll 调用平均耗时），判断是否因为处理耗时过长导致 poll 间隔超过 max.poll.interval.ms"},
+            {"id": "B", "text": "该实例的 network-io-rate（网络吞吐），判断是否因为网络带宽不足导致提交请求超时"},
+            {"id": "C", "text": "Broker 端的 __consumer_offsets Topic 的 ISR 数量，判断是否因为 __consumer_offsets 副本不足导致提交失败"},
+            {"id": "D", "text": "该实例的 JVM GC 日志中的 Full GC 次数，判断是否因为 STW 停顿导致心跳超时"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "生产环境中 Offset 提交失败最常见的根因是 Consumer 处理消息太慢导致 max.poll.interval.ms 超时被踢出组。poll-latency-avg（或者更精确地说是两次 poll 之间的实际间隔 time-between-poll-avg）能直接反映这个问题——如果 poll 间隔接近或超过 max.poll.interval.ms，说明消费逻辑处理耗时过长。B 选项的网络带宽问题虽然可能导致提交超时，但在实际生产中远不如处理超时常见。C 选项关注的是 __consumer_offsets 的可用性，这个问题会影响所有 Consumer 而非单个实例。D 选项的 GC 停顿确实可能导致超时，但应作为第二步排查方向，不是首选。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#consumerconfigs",
+        "https://kafka.apache.org/documentation/#consumerapi",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-62%3A+Allow+consumer+to+send+heartbeats+from+a+background+thread"
+      ]
+    }
+  ]
+}
