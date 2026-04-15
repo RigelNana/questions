@@ -1,0 +1,156 @@
+{
+  "id": "kafka-consumer-adv-rolling-upgrade",
+  "name": "Consumer Group 滚动升级",
+  "domain": "kafka",
+  "description": "生产环境下 Consumer Group 的零停机滚动升级策略与 Rebalance 控制",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-consumer-adv-rolling-upgrade-q1",
+      "domain": "kafka",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": ["Consumer", "滚动升级", "Rebalance", "零停机", "部署策略"],
+      "title": "如何在不停服的情况下完成 Consumer Group 滚动升级？",
+      "content": "你的团队维护着一个订单事件处理服务，5 个 Consumer 实例组成一个 Consumer Group，订阅了 order-events topic 的 20 个 partition。日常流量大约 8000 msg/s，高峰期能到 2 万。服务用 Java 写的，依赖 kafka-clients 3.4.0，部署在 Kubernetes 上，每个实例是一个 Pod。\n\n这周你需要把 Consumer 服务从 v2.3 升级到 v3.0。新版本修改了消息反序列化逻辑和部分业务处理流程，但 Kafka 协议层没有变化。老板的要求很明确：升级期间不能停服，消息不能丢，Consumer Lag 不能飙到影响业务的程度。\n\n你之前做过一次「粗暴」的滚动升级——直接用 Kubernetes 的 RollingUpdate 策略逐个重启 Pod。结果每重启一个 Pod，整个 Consumer Group 就触发一次 Rebalance，5 个 Pod 全部暂停消费等待 Rebalance 完成，每次 Rebalance 耗时大约 30 秒。5 个 Pod 滚动一圈下来，累计触发了 5 次 Rebalance，消费暂停了将近 3 分钟。高峰期 Lag 飙到了 360 万条，下游系统收到大量延迟告警，SRE 群里炸了锅。\n\n这次升级，你需要一个更优雅的方案。具体来说，你需要回答这些问题：为什么默认的滚动升级会导致如此严重的消费中断？怎样配置 Consumer 才能把 Rebalance 的影响降到最低？整个升级流程应该怎么编排，才能做到真正的零停机？升级过程中应该监控哪些指标来确保安全？\n\n以下是当前的 Consumer 配置片段：\n\n```properties\ngroup.id=order-event-processor\nbootstrap.servers=kafka-prod-01:9092,kafka-prod-02:9092,kafka-prod-03:9092\nenable.auto.commit=false\nauto.offset.reset=earliest\nmax.poll.records=500\nmax.poll.interval.ms=300000\nsession.timeout.ms=10000\nheartbeat.interval.ms=3000\npartition.assignment.strategy=org.apache.kafka.clients.consumer.RangeAssignor\n```\n\n请给出完整的升级方案，包括配置变更、升级步骤和监控策略。",
+      "answer": "## 一、核心概念基础：为什么 Consumer Group 滚动升级是个棘手问题\n\n要理解这个问题，得先搞清楚 Kafka Consumer Group 的核心机制。Consumer Group 是 Kafka 实现消息并行消费的基本单元，同一个 Group 内的多个 Consumer 实例共同消费一个 topic 的所有 partition，每个 partition 在同一时刻只会被 Group 中的一个 Consumer 持有。这种 partition 到 Consumer 的映射关系不是静态的，而是通过一个叫 Rebalance 的协议动态分配的。\n\nRebalance 本质上是一次「全员重新洗牌」。当 Group 的成员发生变化——有人加入、有人离开、有人挂了——Group Coordinator（负责管理该 Group 的某个 Broker）就会发起一次 Rebalance。在 Kafka 2.4 之前，默认使用的是 Eager Rebalance 协议（也就是 Stop-The-World 式的 Rebalance）：所有 Consumer 先撤销自己持有的全部 partition，然后 Coordinator 重新计算分配方案，最后所有 Consumer 拿到新分配的 partition 再恢复消费。在这个过程中，整个 Consumer Group 是完全停止消费的。\n\n回到场景中的问题。你用 Kubernetes 的 RollingUpdate 逐个重启 Pod，每个 Pod 重启时，Coordinator 检测到这个 Consumer 的心跳超时（默认 `session.timeout.ms=10000`，也就是 10 秒），判定它「死了」，触发一次 Rebalance。由于使用的是 RangeAssignor（Eager 协议），所有 5 个 Consumer 必须暂停消费、撤销 partition、等待重新分配。即使只有一个 Pod 在重启，其他 4 个也得陪着停。更要命的是，新 Pod 启动后加入 Group，又会触发第二次 Rebalance。5 个 Pod 滚动一圈，理论上可能触发 10 次 Rebalance，每次暂停 20-40 秒。这就是为什么场景中累计暂停了近 3 分钟，Lag 飙到 360 万。\n\n滚动升级的核心目标很清晰：零消息丢失（这个通过手动提交 offset 配合 `enable.auto.commit=false` 已经有保障）、最小消费延迟（Rebalance 暂停时间尽可能短）、升级过程可观测可回滚。\n\n## 二、精准深度解答：滚动升级的完整方案\n\n### 第一步：启用 Static Membership 避免频繁 Rebalance\n\n这是整个方案的关键。Kafka 2.3 引入了 Static Membership（KIP-345），它的核心思想是给每个 Consumer 实例分配一个固定的 `group.instance.id`。当一个 Static Member 断开连接时，Coordinator 不会立即触发 Rebalance，而是在 `session.timeout.ms` 超时之后才触发。如果这个实例在超时之前以相同的 `group.instance.id` 重新连接回来，它会直接拿回之前持有的 partition，完全不触发 Rebalance。\n\n这意味着，只要你把单个 Pod 的重启时间控制在 `session.timeout.ms` 之内，整个升级过程就可以做到零次 Rebalance。配置如下：\n\n```properties\n# 每个实例分配唯一且稳定的 ID，在 K8s 中可以用 Pod 名称\ngroup.instance.id=order-processor-0\n# 设置为远大于单 Pod 重启时间的值，比如 Pod 重启需要 45 秒，设置为 180 秒\nsession.timeout.ms=180000\n# 心跳间隔保持默认即可\nheartbeat.interval.ms=3000\n```\n\n在 Kubernetes 中，如果你的 Consumer 部署为 StatefulSet，Pod 名称是稳定的（`order-processor-0`、`order-processor-1`），可以直接用 Pod 名称作为 `group.instance.id`。如果是 Deployment，Pod 名称不稳定，你需要通过环境变量注入一个稳定的标识符，比如用 Downward API 注入 Pod 的序号或者用一个 ConfigMap 维护实例 ID 映射。\n\n注意 `session.timeout.ms` 的设置需要权衡。设得太大，如果某个实例真的挂了（比如 OOM Kill），Coordinator 要等很久才能发现并重新分配它的 partition，这段时间内这些 partition 就没人消费了。生产环境建议设为单实例最大重启时间的 3-4 倍，比如重启最慢 45 秒，就设 180 秒。\n\n### 第二步：切换到 Cooperative Rebalance 协议\n\n即使有 Static Membership，也建议同步切换到 CooperativeStickyAssignor。与 Eager 协议「先全部撤销再重新分配」不同，Cooperative Rebalance 只迁移需要变动的 partition，其他 partition 的消费不受影响。万一因为某种原因还是触发了 Rebalance，影响范围也大大缩小。\n\n```properties\npartition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor\n```\n\n这里有一个重要的坑：从 RangeAssignor（Eager）切换到 CooperativeStickyAssignor（Cooperative）不能一步到位。如果你直接把所有实例的 assignor 全换了，Coordinator 会发现 Group 内的成员使用了不兼容的协议，整个 Group 会报错。正确的做法是分两轮升级。第一轮，把 assignor 配置为同时支持两种协议：\n\n```properties\npartition.assignment.strategy=org.apache.kafka.clients.consumer.RangeAssignor,org.apache.kafka.clients.consumer.CooperativeStickyAssignor\n```\n\n等所有实例都升级到这个配置之后，第二轮再去掉 RangeAssignor，只保留 CooperativeStickyAssignor。这个两阶段迁移过程在 Kafka 官方文档中有明确说明，忽略它会导致 Group 直接崩溃。\n\n### 第三步：编排升级流程\n\n综合以上配置变更，整个升级流程应该这样编排：\n\n首先，在代码层面，v3.0 的 Consumer 配置中加入 `group.instance.id`（从环境变量读取）和 CooperativeStickyAssignor。但因为协议迁移需要两阶段，第一次部署的配置应该同时包含两种 assignor。\n\n然后在 Kubernetes 层面，配置 StatefulSet 的滚动升级策略：\n\n```yaml\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: order-processor\nspec:\n  replicas: 5\n  podManagementPolicy: OrderedReady\n  updateStrategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 1\n      partition: 0\n  template:\n    spec:\n      terminationGracePeriodSeconds: 60\n      containers:\n      - name: consumer\n        env:\n        - name: GROUP_INSTANCE_ID\n          valueFrom:\n            fieldRef:\n              fieldPath: metadata.name\n```\n\n`terminationGracePeriodSeconds` 要设得足够大，让 Consumer 在收到 SIGTERM 后能从容地提交当前处理完的 offset 再关闭。`maxUnavailable: 1` 确保每次只滚动一个 Pod。\n\n逐个 Pod 升级时，流程是这样的：Kubernetes 发送 SIGTERM 给旧 Pod，Consumer 捕获信号后调用 `consumer.close()` 提交 offset 并离开 Group（但由于 Static Membership，Coordinator 不会立即触发 Rebalance）。旧 Pod 终止后新 Pod 启动，新 Consumer 以相同的 `group.instance.id` 加入 Group，Coordinator 直接把之前的 partition 分配给它，消费恢复。整个过程中其他 Pod 完全不受影响。\n\n每个 Pod 升级完成后，检查以下指标确认正常再继续下一个：Consumer Lag 是否回到升级前水平、新 Pod 的消费速率是否正常、没有反序列化错误或业务异常日志。可以用一个简单的脚本自动化这个检查：\n\n```bash\n#!/bin/bash\n# 检查指定 Consumer Group 的 Lag\nkafka-consumer-groups.sh --bootstrap-server kafka-prod-01:9092 \\\n  --group order-event-processor --describe 2>/dev/null \\\n  | awk 'NR>1 {sum += $6} END {print \"Total Lag:\", sum}'\n\n# 检查最近 1 分钟的 Rebalance 次数\nkafka-consumer-groups.sh --bootstrap-server kafka-prod-01:9092 \\\n  --group order-event-processor --describe --state 2>/dev/null \\\n  | grep -i \"state\" \n```\n\n### 第四步：升级期间的监控要点\n\n光靠脚本手动检查不够，还需要在 Grafana 或你用的监控平台上盯着几个关键指标。Consumer Lag（`kafka_consumergroup_lag`）是最核心的指标，升级期间允许有短暂的小幅波动，但如果某个 partition 的 Lag 持续增长超过 1 分钟就要暂停升级排查。Rebalance 次数（`kafka_consumer_coordinator_rebalance_total`）在理想情况下应该是零，如果出现了说明 Static Membership 没有生效，需要立即回查 `group.instance.id` 是否配置正确。每个 Consumer 的消费速率（`kafka_consumer_fetch_manager_records_consumed_rate`）要和升级前的基线对比，如果新版本处理速度明显下降，可能是业务逻辑变更引入了性能回退。另外还要关注 `last-heartbeat-seconds-ago` 指标，确保每个 Consumer 的心跳正常。\n\n## 三、体系化扩展\n\n### Kubernetes 部署策略的深度配合\n\n上面的方案基于 StatefulSet，但有些团队用 Deployment 部署 Consumer。Deployment 的问题是 Pod 名称不稳定，每次重建 Pod 名称都会变。解决办法有两个：一是切换到 StatefulSet（推荐，因为 Consumer 本身就是有状态的——它持有 partition 分配状态）；二是用外部配置（比如 Redis 或 ConfigMap）维护一个实例 ID 池，Pod 启动时领取一个可用的 ID。\n\n如果你想更精细地控制升级节奏，可以使用 StatefulSet 的 `partition` 参数做金丝雀发布。比如设置 `partition: 4`，只有序号 >= 4 的 Pod（也就是 order-processor-4）会被升级，跑一段时间确认没问题再逐步降低 partition 值。\n\n### 蓝绿部署 Consumer 的方案\n\n如果你的升级涉及不兼容的变更（比如改了消息格式），滚动升级可能不安全，因为升级过程中新旧版本会同时消费消息。这时候可以考虑蓝绿部署：部署一套全新的 Consumer Group（比如 `order-event-processor-v3`），让新 Group 从 latest offset 开始消费。验证新 Group 工作正常后，停掉旧 Group。这种方案的缺点是切换期间会有短暂的消息重复消费或遗漏，需要业务层做好幂等处理。另一个更精细的方案是用 MirrorMaker 2 把流量复制到一个影子 topic，新 Group 先在影子 topic 上验证，确认无误后再切换到正式 topic。\n\n### 版本兼容性注意事项\n\nStatic Membership 需要 Kafka Broker 2.3+，CooperativeStickyAssignor 需要 kafka-clients 2.4+。如果你的 Broker 版本比较老，只能用 Static Membership 而无法用 Cooperative Rebalance。另外，`group.instance.id` 一旦启用，如果你想缩容（减少 Consumer 实例数量），被移除的实例的 partition 要等 `session.timeout.ms` 超时后才会被重新分配，在这段等待期内这些 partition 是无人消费的。所以缩容时建议临时调小 `session.timeout.ms`。\n\n### 面试回答要点\n\n面试时回答这个问题，核心要展示你对 Rebalance 机制的理解以及真实的升级经验。开场先讲 Rebalance 的 STW 问题（说明你理解痛点），然后给出 Static Membership + Cooperative Rebalance 的组合方案（说明你知道解法），接着强调协议迁移需要两阶段（说明你踩过坑），最后提到监控和回滚策略（说明你有生产意识）。如果面试官追问「如果升级中途发现新版本有 Bug 怎么办」，你应该回答：立即暂停升级，已经升级的 Pod 回滚到旧镜像，由于 Static Membership 的存在回滚也不会触发 Rebalance。",
+      "keyPoints": [
+        "Static Membership（group.instance.id）让 Consumer 在重启时能以相同身份重新加入 Group，在 session.timeout.ms 内不触发 Rebalance",
+        "CooperativeStickyAssignor 将 Eager 的全局 STW Rebalance 改为增量式迁移，只移动需要变更的 partition 而不影响其他 Consumer",
+        "从 Eager 协议迁移到 Cooperative 协议必须分两阶段完成，否则 Group 内协议不兼容会导致整个 Consumer Group 报错崩溃",
+        "session.timeout.ms 必须大于单个实例的最大重启时间，但也不能设太大，否则实例真正故障时检测延迟会很高",
+        "Kubernetes StatefulSet 提供稳定的 Pod 名称作为 group.instance.id，配合 maxUnavailable=1 和足够的 terminationGracePeriodSeconds 实现有序滚动",
+        "升级期间必须实时监控 Consumer Lag、Rebalance 次数和每个实例的消费速率，任何异常都应立即暂停升级",
+        "蓝绿部署适用于涉及不兼容变更的场景，通过独立 Consumer Group 避免新旧版本混合消费的风险，但需要业务层保证幂等"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-1",
+          "question": "Kafka Consumer Group 的 Rebalance 机制在滚动升级时造成问题的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Eager Rebalance 协议要求所有 Consumer 先撤销全部 partition 再重新分配，导致整个 Group 暂停消费"},
+            {"id": "B", "text": "Rebalance 需要重新从 Broker 拉取所有未消费的消息，网络开销巨大"},
+            {"id": "C", "text": "Rebalance 会清除所有 Consumer 已提交的 offset，导致消息重复消费"},
+            {"id": "D", "text": "Rebalance 期间 Broker 会停止接收 Producer 的消息，造成上下游同时中断"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Eager Rebalance 协议的核心问题在于它的「全员停车」机制：任何一个 Consumer 成员变更，所有 Consumer 都必须先放弃当前持有的全部 partition，等 Coordinator 重新计算分配方案后再领取新的 partition。在这个过程中整个 Group 处于消费暂停状态。B 选项错误，Rebalance 只是重新分配 partition 映射关系，不需要重新拉取消息。C 选项错误，Rebalance 不会影响已提交的 offset，offset 保存在 __consumer_offsets topic 中。D 选项错误，Rebalance 只影响 Consumer 侧，Producer 写入不受任何影响。"
+        },
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-2",
+          "question": "Static Membership 通过哪个配置参数启用，它解决了什么核心问题？",
+          "choices": [
+            {"id": "A", "text": "通过 static.member.enabled=true 启用，将 partition 分配固化到磁盘避免重新计算"},
+            {"id": "B", "text": "通过 group.instance.id 启用，让 Consumer 重启后能以相同身份重新加入 Group 而不触发 Rebalance"},
+            {"id": "C", "text": "通过 client.id 启用，让 Coordinator 能识别重启后的 Consumer 是同一个实例"},
+            {"id": "D", "text": "通过 member.id 启用，在 Zookeeper 中持久化 Consumer 的成员信息"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Static Membership 通过 `group.instance.id` 参数启用（KIP-345），这个 ID 是用户自行分配的固定标识符。当设置了 group.instance.id 的 Consumer 断开连接后，Coordinator 不会立即触发 Rebalance，而是等待 session.timeout.ms 超时。如果 Consumer 在超时前以相同的 group.instance.id 重新连接，它会直接恢复之前的 partition 分配。A 选项捏造了一个不存在的配置参数。C 选项中的 client.id 是用于日志标识和监控的，与 Group 成员管理无关。D 选项中的 member.id 是 Coordinator 自动生成的内部标识，不能由用户设置，且现代 Kafka 不依赖 Zookeeper 管理 Consumer Group。"
+        },
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-3",
+          "question": "CooperativeStickyAssignor 相比 RangeAssignor 在 Rebalance 时的关键区别是什么？",
+          "choices": [
+            {"id": "A", "text": "CooperativeStickyAssignor 只迁移需要变更的 partition，其他 Consumer 不中断消费；RangeAssignor 要求所有 Consumer 先撤销全部 partition"},
+            {"id": "B", "text": "CooperativeStickyAssignor 在 Broker 端完成分配计算，RangeAssignor 在 Consumer Leader 端计算，所以前者更快"},
+            {"id": "C", "text": "CooperativeStickyAssignor 使用一致性哈希分配 partition，RangeAssignor 使用范围切分，前者更均匀"},
+            {"id": "D", "text": "CooperativeStickyAssignor 不需要 Group Coordinator 参与，Consumer 之间直接协商分配"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Cooperative 和 Eager 两种 Rebalance 协议的本质区别。Eager 协议（RangeAssignor、RoundRobinAssignor 使用的）在 Rebalance 时要求所有 Consumer 放弃全部 partition 再重新分配，是全局 STW。Cooperative 协议（CooperativeStickyAssignor 使用的）采用增量式方式，只有需要迁移的 partition 才会被撤销和重新分配，其他 partition 的消费照常进行。B 选项错误，两种 assignor 的分配计算都在 Consumer Leader 端完成。C 选项混淆了分配算法和 Rebalance 协议，Sticky 的「粘性」是指尽量保持现有分配不变，不是一致性哈希。D 选项错误，任何 assignor 都需要 Group Coordinator 协调 Rebalance 流程。"
+        },
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-4",
+          "question": "从 RangeAssignor 迁移到 CooperativeStickyAssignor 时，为什么必须分两阶段完成？",
+          "choices": [
+            {"id": "A", "text": "因为 Eager 和 Cooperative 协议不兼容，Group 内如果同时存在只支持 Eager 和只支持 Cooperative 的成员，Coordinator 无法协调 Rebalance"},
+            {"id": "B", "text": "因为 CooperativeStickyAssignor 需要先收集所有 Consumer 的历史分配数据才能计算最优方案"},
+            {"id": "C", "text": "因为 Broker 需要先升级到支持 Cooperative 协议的版本，然后 Consumer 才能切换"},
+            {"id": "D", "text": "因为两种 Assignor 使用不同的 offset 存储格式，需要先做 offset 数据迁移"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Rebalance 协议是 Group 级别的，所有成员必须使用兼容的协议才能完成 Rebalance。如果一部分 Consumer 只配置了 RangeAssignor（Eager），另一部分只配置了 CooperativeStickyAssignor（Cooperative），Coordinator 找不到所有成员都支持的共同协议，会导致 Rebalance 失败。所以第一阶段需要让所有实例同时配置两种 assignor，这样 Group 会选择双方都支持的 Eager 协议运行。等所有实例都完成第一阶段后，第二阶段再去掉 RangeAssignor，此时所有实例都支持 Cooperative 协议，Group 就会切换到 Cooperative 模式。B、C、D 三个选项都是编造的原因，与实际机制无关。"
+        },
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-5",
+          "question": "升级期间你在 Grafana 上看到 kafka_consumergroup_lag 某个 partition 的 Lag 持续增长超过 2 分钟，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "负责该 partition 的 Consumer 实例重启后未能成功恢复消费，可能 group.instance.id 配置错误导致被分配到了其他 partition"},
+            {"id": "B", "text": "Producer 端突然增加了该 partition 的写入量，与升级无关"},
+            {"id": "C", "text": "Broker 端的该 partition 副本正在做 ISR 同步，暂时无法响应消费请求"},
+            {"id": "D", "text": "Consumer Group 的 offset 提交失败，Lag 指标计算出错产生了虚假告警"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在滚动升级的上下文中，某个 partition 的 Lag 持续增长最可能的原因是该 partition 没有被任何 Consumer 消费。这通常发生在 Static Membership 配置出错的情况下——比如新启动的 Pod 使用了不同的 group.instance.id，Coordinator 认为它是一个新成员而不是旧成员的替代，原来的 partition 分配仍然保留给「已断开但未超时」的旧成员。B 选项虽然可能，但题目明确说是在升级期间且特定 partition，更指向升级操作导致的问题。C 选项中 ISR 同步不会阻塞消费者的 fetch 请求。D 选项中 offset 提交失败不影响 Lag 的实际计算（Lag = HW - committed offset，committed offset 不更新反而会让 Lag 看起来更大，但不是「持续增长」的根本原因）。"
+        },
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-6",
+          "question": "以下关于 session.timeout.ms 在 Static Membership 场景下的说法，哪个是常见的配置错误？",
+          "choices": [
+            {"id": "A", "text": "把 session.timeout.ms 设为 5 秒，小于 Pod 重启时间，导致 Consumer 还没起来 Coordinator 就认为它挂了并触发 Rebalance"},
+            {"id": "B", "text": "把 session.timeout.ms 设为 300 秒，虽然升级时不会触发 Rebalance，但实例真正故障时检测极慢"},
+            {"id": "C", "text": "把 session.timeout.ms 设为 30 秒，刚好等于 Pod 重启时间，没有留安全余量"},
+            {"id": "D", "text": "以上都是常见的配置错误"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "这三种都是真实生产环境中常见的 session.timeout.ms 配置问题。A 选项是最直接的错误：timeout 小于重启时间，Static Membership 形同虚设，每次重启都会触发 Rebalance。C 选项比 A 好一点但仍然危险：如果某次重启因为镜像拉取慢多花了几秒，就会超时触发 Rebalance。B 选项则是过度保守的反面问题：设太大意味着如果一个实例真的挂了（比如 OOM Kill 后无法自愈），该实例持有的 partition 要等 5 分钟才会被重新分配，这 5 分钟内这些 partition 无人消费。最佳实践是设置为单实例最大重启时间的 3-4 倍，既能覆盖正常重启的波动，又不会让故障检测延迟太久。"
+        },
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-7",
+          "question": "对比滚动升级和蓝绿部署两种 Consumer 升级策略，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "滚动升级适合协议兼容的版本更新，升级过程中新旧版本共存消费同一个 Group；蓝绿部署适合不兼容变更，使用两个独立 Group 避免混合消费"},
+            {"id": "B", "text": "蓝绿部署完全不存在消息重复或遗漏的风险，因为两个 Group 消费的 offset 互相独立"},
+            {"id": "C", "text": "滚动升级的资源开销更大，因为需要同时运行两倍的 Consumer 实例"},
+            {"id": "D", "text": "蓝绿部署不需要关心 Rebalance 问题，因为两个 Group 互不影响"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 准确描述了两种策略的适用场景和核心区别。滚动升级在同一个 Consumer Group 内逐步替换实例，适合消息处理逻辑向后兼容的版本更新。蓝绿部署创建一个全新的 Consumer Group 来消费相同的 topic，适合涉及不兼容变更的场景。B 选项错误，蓝绿部署切换时确实存在消息重复或遗漏的风险：新 Group 如果从 latest 开始消费，切换间隙的消息可能遗漏；如果从旧 Group 的 offset 开始，需要精确的 offset 同步，否则可能重复。C 选项搞反了，蓝绿部署才需要同时运行两套实例。D 选项虽然两个 Group 的 Rebalance 互不影响，但新 Group 启动时自身内部也会有 Rebalance，并非完全不需要关心。"
+        },
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-8",
+          "question": "你的 Consumer 部署在 Kubernetes Deployment（非 StatefulSet）上，Pod 名称每次重建都会变化。要使用 Static Membership，你应该怎么做？",
+          "choices": [
+            {"id": "A", "text": "改用 StatefulSet 部署，利用其稳定的 Pod 名称作为 group.instance.id；或者维护外部 ID 池让 Pod 启动时领取稳定 ID"},
+            {"id": "B", "text": "直接用 Pod IP 作为 group.instance.id，因为 Kubernetes 的 Pod IP 在同一个 Node 上是稳定的"},
+            {"id": "C", "text": "不需要额外处理，Kafka 会自动根据 client.id 识别是否是同一个 Consumer 实例"},
+            {"id": "D", "text": "在 Deployment 的 template 中设置固定的 Pod 名称来解决命名不稳定的问题"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Static Membership 要求 group.instance.id 在实例重启前后保持一致。Deployment 的 Pod 名称包含随机后缀，每次重建都会变化，直接用 Pod 名称不可行。最干净的方案是切换到 StatefulSet，因为它提供稳定的有序 Pod 名称（如 order-processor-0）。如果无法切换，可以用 ConfigMap 或 Redis 维护一个 ID 池，Pod 启动时通过 init container 领取一个可用的 ID 并写入环境变量。B 选项错误，Pod IP 在重建后几乎一定会变化，不具备稳定性。C 选项错误，client.id 与 group.instance.id 是完全不同的概念，前者不影响 Group 成员管理。D 选项错误，Deployment 不支持设置固定 Pod 名称，这是 StatefulSet 的特性。"
+        },
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-9",
+          "question": "如果在滚动升级进行到一半时发现新版本有 Bug 需要回滚，在 Static Membership 已启用的情况下，回滚操作会触发 Rebalance 吗？",
+          "choices": [
+            {"id": "A", "text": "不会，只要回滚后的 Pod 使用相同的 group.instance.id 并在 session.timeout.ms 内重新连接，就能直接恢复原有 partition 分配"},
+            {"id": "B", "text": "会触发一次全局 Rebalance，因为 Consumer 的版本号发生了变化，Coordinator 认为是不同的成员"},
+            {"id": "C", "text": "取决于 Broker 版本，Kafka 3.0 以上的 Broker 支持无 Rebalance 回滚，3.0 以下不支持"},
+            {"id": "D", "text": "不会触发 Rebalance，但回滚后的 Consumer 需要从最早的 offset 开始重新消费"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Static Membership 的核心机制就是基于 group.instance.id 来识别成员身份，它不关心 Consumer 的应用版本、代码逻辑或任何业务层面的差异。只要新启动的 Consumer 带着相同的 group.instance.id 在 session.timeout.ms 超时之前重新连接到 Coordinator，它就会被视为同一个成员并恢复之前的 partition 分配。所以回滚操作（本质上就是换回旧镜像重启 Pod）和正常升级在 Kafka 协议层面没有任何区别，不会触发 Rebalance。B 选项错误，Coordinator 不感知也不关心 Consumer 的应用版本号。C 选项编造了版本限制。D 选项错误，offset 在 __consumer_offsets 中持久化，不会因为回滚丢失。"
+        },
+        {
+          "id": "kafka-consumer-adv-rolling-upgrade-quiz-10",
+          "question": "在启用 Static Membership 后执行缩容（减少 Consumer 实例数量），被移除实例的 partition 何时会被重新分配？",
+          "choices": [
+            {"id": "A", "text": "要等 session.timeout.ms 超时后 Coordinator 才会判定该成员离开并触发 Rebalance 重新分配其 partition"},
+            {"id": "B", "text": "立即重新分配，因为缩容时 Consumer 会主动调用 close() 通知 Coordinator 自己要永久离开"},
+            {"id": "C", "text": "永远不会重新分配，需要手动调用 kafka-consumer-groups.sh 删除该成员后才能重新分配"},
+            {"id": "D", "text": "在下一次心跳检测周期（heartbeat.interval.ms）之后自动重新分配"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Static Membership 在缩容场景下的一个重要特性（也可以说是陷阱）。当一个 Static Member 离开时，即使它主动调用了 consumer.close()，Coordinator 也不会立即移除它的成员记录——这是 Static Membership 的设计初衷，就是为了避免短暂离开触发 Rebalance。Coordinator 会一直等到 session.timeout.ms 超时才认定该成员真正离开，然后才触发 Rebalance 将其 partition 分配给其他成员。这意味着如果 session.timeout.ms 设为 180 秒，缩容后这些 partition 会有长达 3 分钟无人消费。生产中的应对方式是缩容前临时调小 session.timeout.ms，或者在缩容操作完成后手动通过 API 移除该 Static Member（Kafka 2.4+ 支持 RemoveMemberFromGroup API）。B 选项描述的是普通（非 Static）Member 的行为。"
+        }
+      ],
+      "references": [
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol",
+        "https://kafka.apache.org/documentation/#consumerconfigs",
+        "https://www.confluent.io/blog/cooperative-rebalancing-in-kafka-streams-consumer-ksqldb/"
+      ]
+    }
+  ]
+}

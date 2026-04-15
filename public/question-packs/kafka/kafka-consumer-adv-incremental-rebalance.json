@@ -1,0 +1,157 @@
+{
+  "id": "kafka-consumer-adv-incremental-rebalance",
+  "name": "CooperativeStickyAssignor 增量 Rebalance",
+  "domain": "kafka",
+  "description": "深入剖析 CooperativeStickyAssignor 的两轮增量 Rebalance 协议流程与源码级交互细节",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-consumer-adv-incremental-rebalance-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 4,
+      "tags": ["Consumer", "CooperativeStickyAssignor", "增量Rebalance", "KIP-429", "协议流程"],
+      "title": "CooperativeStickyAssignor 的增量 Rebalance 流程是怎样的？",
+      "content": "Kafka Consumer Group 的 Rebalance 长期以来是消费端最令人头疼的问题。在 Eager 模式下，每次 Rebalance 都是一次全组「Stop-the-World」——所有 Consumer 同时放弃全部 Partition，等 Leader 重新算好分配方案后再一起恢复消费。对于一个 20 实例、100 Partition 的 Consumer Group，一次滚动发布可能触发 20 次 Rebalance，每次 STW 20 秒，累计消费中断长达数分钟。Kafka 2.4 通过 KIP-429 引入了 Cooperative Incremental Rebalance 协议，`CooperativeStickyAssignor` 是这个协议的旗舰实现。它的核心承诺是：Rebalance 时只停掉需要迁移的那几个 Partition，其余 Partition 继续消费不受影响。\n\n但这里有一个不那么直观的设计：为了实现「增量迁移」，CooperativeStickyAssignor 可能需要两轮甚至多轮 Rebalance 才能达到最终的分配状态。比如在下面这个场景中——\n\n你负责的订单消费服务有一个 Consumer Group `order-processor`，6 个实例（C0-C5）消费 Topic `order-events` 的 18 个 Partition（P0-P17），使用 `CooperativeStickyAssignor`，当前分配每人恰好 3 个 Partition：\n\n```\nC0: P0, P1, P2\nC1: P3, P4, P5\nC2: P6, P7, P8\nC3: P9, P10, P11\nC4: P12, P13, P14\nC5: P15, P16, P17\n```\n\n现在 C5 因为被运维重启而离组。你在 C0 的日志中看到了这样的输出：\n\n```\n[Consumer clientId=order-processor-0] Request joining group due to: \n  group is already rebalancing\n[Consumer clientId=order-processor-0] (Re)joining group order-processor\n[Consumer clientId=order-processor-0] Successfully joined group with generation 12\n[Consumer clientId=order-processor-0] Notifying assignor about the new Assignment(partitions=[P0, P1, P2])\n[Consumer clientId=order-processor-0] Adding newly assigned partitions: \n[Consumer clientId=order-processor-0] No partitions revoked, continuing consumption\n```\n\nC0 的 Partition 没有任何变化，消费完全不中断。但有意思的是，几秒后你看到了第二轮 Rebalance 的日志：\n\n```\n[Consumer clientId=order-processor-0] Request joining group due to: \n  group is already rebalancing  \n[Consumer clientId=order-processor-0] Successfully joined group with generation 13\n[Consumer clientId=order-processor-0] Notifying assignor about the new Assignment(partitions=[P0, P1, P2, P17])\n[Consumer clientId=order-processor-0] Adding newly assigned partitions: P17\n```\n\n为什么第一轮 Rebalance 没有直接把 C5 释放的 P15、P16、P17 分配给其他 Consumer？为什么需要两轮才能完成？在这两轮之间，P15-P17 处于什么状态？CooperativeStickyAssignor 在协议层面是怎样保证整个流程的正确性和收敛性的？",
+      "answer": "## 第一步：核心概念基础——Consumer Rebalance 协议与 CooperativeStickyAssignor 的定位\n\n### Kafka Consumer Rebalance 的本质\n\nKafka 的 Consumer Rebalance 是 Consumer Group 内 Partition 所有权的重新分配过程。每个 Topic Partition 在同一时刻只能被 Group 内的一个 Consumer 消费，这是 Kafka 消费语义的基本保证。当 Group 的成员关系发生变化（Consumer 加入、离开、崩溃）或 Topic 的 Partition 数量变化时，Coordinator（运行在某个 Broker 上，负责管理该 Group 的元数据和协调）需要重新将所有 Partition 分配给当前存活的 Consumer。这个重新分配的过程就是 Rebalance，它由 Group Coordinator 驱动，核心交互分为两个阶段：JoinGroup 阶段，所有 Consumer 向 Coordinator 报到并上报自己支持的分配策略和当前持有的 Partition 信息；SyncGroup 阶段，被 Coordinator 选中的 Leader Consumer（通常是第一个发送 JoinGroup 请求的成员）计算分配方案并通过 Coordinator 下发给每个成员。\n\n在 Kafka 2.4 之前，所有内置分配策略（`RangeAssignor`、`RoundRobinAssignor`、`StickyAssignor`）都使用 Eager 协议。Eager 协议要求每个 Consumer 在发送 JoinGroup 请求之前，必须先 revoke（释放）自己当前持有的全部 Partition。这意味着从第一个 Consumer 收到 Rebalance 通知开始 revoke，到所有 Consumer 完成 SyncGroup 拿到新分配并恢复消费为止，整个 Group 的消费吞吐量跌到零。一个有 20 个实例的 Group 做滚动发布时，每重启一个实例就触发一次全组 STW，生产环境中实测的单次 STW 时间通常在 10-30 秒之间，20 次滚动发布累计 STW 可以超过 5 分钟。对于延迟敏感的业务（支付、风控、实时推荐），这种程度的消费中断是完全不可接受的。\n\n### CooperativeStickyAssignor 的定位\n\n`CooperativeStickyAssignor` 是 Kafka 2.4（2019 年 12 月发布）通过 KIP-429（Kafka Consumer Incremental Rebalance Protocol）引入的分配策略，它的名字由两部分组成，精确地描述了它的两个核心特性。「Cooperative」指的是它使用 Cooperative Rebalance 协议（与 Eager 协议相对），Consumer 在 Rebalance 时不需要放弃全部 Partition，只需要 revoke 那些确实需要迁移的 Partition，其余 Partition 继续消费不受影响。「Sticky」指的是它继承了 `StickyAssignor`（KIP-54）的粘性分配算法，在计算新分配方案时会参考上一轮的分配结果，尽量让 Partition 留在原来的 Consumer 上，减少不必要的所有权变更。\n\n对应到 Java 客户端源码，`CooperativeStickyAssignor` 继承自 `AbstractStickyAssignor`，和旧版的 `StickyAssignor` 共享同一套分配算法。两者的关键区别在于 `supportedProtocols()` 方法的返回值：`StickyAssignor` 返回 `EAGER`，`CooperativeStickyAssignor` 返回 `COOPERATIVE`。这个返回值决定了 Consumer 在 Rebalance 时的 revoke 行为——Eager 意味着「先 revoke all 再 JoinGroup」，Cooperative 意味着「带着当前 assignment JoinGroup，按需 revoke」。\n\n配置 `CooperativeStickyAssignor` 只需要一行：\n\n```properties\npartition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor\n```\n\n## 第二步：精准深度解答——两轮增量 Rebalance 的协议级流程\n\n### 为什么需要两轮：单轮无法安全迁移 Partition\n\n增量 Rebalance 最关键的设计约束是：在任何时刻，一个 Partition 只能被一个 Consumer 持有。如果 Leader 在第一轮 Rebalance 中同时做两件事——告诉 Consumer-A「放弃 Partition-X」并告诉 Consumer-B「接管 Partition-X」——就会出现一个危险的时间窗口：Consumer-A 的 revoke 还没完成（offset 还没提交），Consumer-B 已经开始消费 Partition-X 了。两个 Consumer 同时消费同一个 Partition 会导致消息重复处理、offset 回退、甚至数据不一致。Eager 协议通过「全员 revoke 后再统一分配」来避免这个问题，但代价是全组 STW。Cooperative 协议的解法是把一次 Partition 迁移拆成两轮 Rebalance：第一轮只做 revoke，第二轮才做 assign。这样在 revoke 和 assign 之间有一个明确的「空窗期」，确保旧主人已经完全释放 Partition 后新主人才接管。\n\n### 第一轮 Rebalance：Diff 计算与定向 Revoke\n\n我们用题目中的场景（C5 离组）来逐步拆解协议交互。\n\n**触发：** C5 因重启而停止发送心跳，`session.timeout.ms`（默认 45 秒，Kafka 3.0+ 默认值）超时后，Coordinator 将 C5 标记为离组，Group 进入 `PreparingRebalance` 状态。Coordinator 在下一次心跳响应中向 C0-C4 返回 `REBALANCE_IN_PROGRESS` 错误码。\n\n**JoinGroup：** C0-C4 收到通知后，不执行任何 revoke 操作（这是与 Eager 的核心区别），直接发送 JoinGroup 请求。请求中携带两个关键信息：自己支持的 `RebalanceProtocol`（COOPERATIVE）以及当前持有的 Partition 列表（通过 `ConsumerProtocol.Metadata` 的 `ownedPartitions` 字段）。例如 C0 上报的 `ownedPartitions = [P0, P1, P2]`，C1 上报 `[P3, P4, P5]`，以此类推。\n\n**Leader 计算 Diff：** Coordinator 收集完所有 JoinGroup 请求后，选出 Leader（假设是 C0）。Leader 获得全组的 subscription 和 ownedPartitions 信息，执行 `CooperativeStickyAssignor.assign()` 方法。这个方法内部的核心逻辑在 `AbstractStickyAssignor` 中：\n\n1. 先收集所有 Consumer 上报的 `ownedPartitions`，汇总成 `prevAssignment`（上一轮的分配状态）。\n2. 基于当前存活的 Consumer 列表和所有待分配的 Partition，运行粘性分配算法，得出 `newAssignment`（理想的最终分配方案）。由于 C5 离组，其 P15/P16/P17 需要分给 C0-C4。算法可能得出：C0→[P0,P1,P2,P17]，C1→[P3,P4,P5,P16]，C2→[P6,P7,P8,P15]，C3→[P9,P10,P11]，C4→[P12,P13,P14]（C0/C1/C2 各多分一个，保持均衡）。\n3. 关键一步——Diff 计算：将 `newAssignment` 和 `prevAssignment` 做对比。对于每个 Consumer，找出需要 revoke 的 Partition（在 prev 中有但在 new 中没有的）和需要新增的 Partition（在 new 中有但在 prev 中没有的）。在本场景中，C0-C4 原有的 15 个 Partition 全部保留，没有任何一个 Consumer 需要 revoke。P15/P16/P17 是 C5 释放的「无主 Partition」。\n4. 然而，Leader 在第一轮中不会把无主 Partition 分配给任何人。`CooperativeStickyAssignor` 的源码中有一段关键逻辑（`AbstractStickyAssignor#assign` 方法）：如果一个 Partition 在上一轮被某个 Consumer 持有（C5 持有 P15/P16/P17），但该 Consumer 没有出现在本轮的 JoinGroup 中（C5 已离组），Leader 仍然会把这些 Partition 标记为「待回收」而不是立即重新分配——因为 Leader 无法确定 C5 是否已经完成了 offset 提交和资源清理。实际上在很多场景下（比如 Consumer 是被 Coordinator 判定为超时离组的），C5 可能还在处理最后一批消息。\n\n**SyncGroup 下发：** Leader 通过 SyncGroup 把第一轮的分配结果下发给每个 Consumer。由于没有任何 Partition 需要迁移，C0-C4 收到的分配结果与之前完全相同。每个 Consumer 对比自己的 `previousAssignment` 和 `newAssignment`，发现没有需要 revoke 的 Partition，也没有需要新增的 Partition。`ConsumerCoordinator` 调用 `onPartitionsRevoked(emptyList)` 和 `onPartitionsAssigned(emptyList)`——什么都没变，消费全程不中断。\n\n但第一轮结束时，Leader 检测到有「应该被分配但没有被分配」的 Partition（P15/P16/P17），于是在 SyncGroup 响应中设置一个标志，通知 Coordinator 需要立即发起第二轮 Rebalance。\n\n### 第二轮 Rebalance：无主 Partition 的分配\n\n第二轮 Rebalance 在第一轮结束后几乎立即触发（延迟通常在毫秒到秒级，取决于心跳间隔 `heartbeat.interval.ms` 的配置，默认 3 秒）。\n\n**JoinGroup：** C0-C4 再次发送 JoinGroup 请求，上报自己当前持有的 Partition（和第一轮结束时相同）。这次没有 C5 的干扰，Coordinator 的成员列表是稳定的。\n\n**Leader 再次计算分配：** Leader 运行分配算法，这次 P15/P16/P17 已经确认为无主状态（没有任何 Consumer 在 `ownedPartitions` 中声明持有它们），可以安全地分配出去。算法基于粘性原则，将这 3 个 Partition 均匀分给负载最轻的 Consumer：C0 获得 P17，C1 获得 P16，C2 获得 P15（具体分配取决于算法实现细节，但保证均衡性——最终 C0/C1/C2 各 4 个，C3/C4 各 3 个，差值不超过 1）。\n\n**SyncGroup 下发：** C0 收到新分配 `[P0, P1, P2, P17]`，对比之前的 `[P0, P1, P2]`，发现新增了 P17。`ConsumerCoordinator` 调用 `onPartitionsAssigned([P17])`，C0 开始消费 P17。C1 和 C2 的流程类似。C3 和 C4 没有变化，仍然消费原来的 3 个 Partition。\n\n整个过程的时序可以这样描述：\n\n```\n第一轮 Rebalance（Generation 12）:\nT0  Coordinator 检测到 C5 超时，Group → PreparingRebalance\nT1  C0-C4 收到 REBALANCE_IN_PROGRESS，带着 ownedPartitions 发送 JoinGroup\n    → C0: [P0,P1,P2]  C1: [P3,P4,P5]  C2: [P6,P7,P8]  C3: [P9,P10,P11]  C4: [P12,P13,P14]\nT2  Leader(C0) 计算 Diff：无需 revoke，P15/P16/P17 暂不分配\nT3  SyncGroup 下发：C0-C4 分配不变，全部继续消费\n    → onPartitionsRevoked([])  onPartitionsAssigned([])  \n    → P15/P16/P17 处于「无主」状态，无人消费\n    → Leader 标记：有未分配 Partition，需要第二轮\n\n第二轮 Rebalance（Generation 13）:\nT4  Coordinator 立即触发第二轮，C0-C4 再次 JoinGroup\nT5  Leader(C0) 计算分配：P15→C2, P16→C1, P17→C0\nT6  SyncGroup 下发：\n    → C0: onPartitionsAssigned([P17])  开始消费 P17\n    → C1: onPartitionsAssigned([P16])  开始消费 P16\n    → C2: onPartitionsAssigned([P15])  开始消费 P15\n    → C3, C4: 无变化\n\n影响范围：P15/P16/P17 在 T0-T6 之间无消费（约 3-10 秒）\n           其余 15 个 Partition 全程正常消费，零中断\n```\n\n### 更复杂的场景：有 Partition 在存活 Consumer 之间迁移\n\n上面 C5 离组的场景相对简单，因为不需要从任何存活 Consumer 身上 revoke Partition。更有意思的场景是新 Consumer 加入时。假设在 C0-C5 都在线的稳态下（每人 3 个 Partition），一个新的 C6 加入了 Group。为了实现均衡（18 个 Partition / 7 个 Consumer = 每人约 2-3 个），Leader 需要从某些 Consumer 身上「借」Partition 给 C6。\n\nCooperativeStickyAssignor 的处理方式是：\n\n第一轮 Rebalance 中，Leader 计算出理想分配——C0-C3 各保留 3 个，C4 和 C5 各让出 1 个给 C6（具体哪个 Consumer 让出由粘性算法决定，原则是最小迁移）。假设 Leader 决定让 C4 释放 P14，C5 释放 P17。Leader 在第一轮的 SyncGroup 中，将 C4 的新分配设为 `[P12, P13]`（去掉了 P14），将 C5 的新分配设为 `[P15, P16]`（去掉了 P17），C6 的新分配暂时是空集 `[]`。C4 收到新分配后，对比发现自己丢失了 P14，于是调用 `onPartitionsRevoked([P14])` 并提交 P14 的 offset。C5 类似地 revoke P17。其余 Consumer（C0-C3、C6）没有任何 Partition 变化（C6 是新加入的，本来就没有 Partition）。\n\n第二轮 Rebalance 中，P14 和 P17 已经被明确释放，Leader 安全地将它们分配给 C6：`C6 → [P14, P17]`。C6 调用 `onPartitionsAssigned([P14, P17])` 开始消费。\n\n注意在整个过程中，`onPartitionsRevoked` 只包含真正需要迁移的 Partition（C4 的回调只收到 `[P14]`，不是全部的 `[P12, P13, P14]`）。这与 Eager 模式形成鲜明对比：Eager 模式下 C4 的 `onPartitionsRevoked` 会收到 `[P12, P13, P14]`，然后 `onPartitionsAssigned` 收到 `[P12, P13]`——虽然 P12 和 P13 最终还是回到了 C4 手上，但在 revoke 到 assign 之间的窗口期它们是停止消费的。\n\n### 源码关键路径\n\n理解这个流程在源码中的实现有助于面试中展现深度。`ConsumerCoordinator`（`org.apache.kafka.clients.consumer.internals.ConsumerCoordinator`）是客户端侧协调 Rebalance 的核心类。当 Consumer 收到 `REBALANCE_IN_PROGRESS` 信号后，`ConsumerCoordinator#onJoinPrepare()` 被调用。在 Eager 模式下，这个方法会调用 `assignor.onPartitionsRevoked(allOwnedPartitions)` 释放全部 Partition；在 Cooperative 模式下，这个方法什么都不做——revoke 推迟到 SyncGroup 之后。\n\n`ConsumerCoordinator#onJoinComplete()` 在收到 SyncGroup 响应后被调用。Cooperative 模式下，它将 `newAssignment` 和 `ownedPartitions` 做 Diff：`revokedPartitions = ownedPartitions - newAssignment`，`addedPartitions = newAssignment - ownedPartitions`。如果 `revokedPartitions` 非空，先调用 `onPartitionsRevoked(revokedPartitions)` 让 Consumer 提交 offset 并清理资源，然后自动触发一轮新的 Rebalance（通过调用 `requestRejoin()`）。如果 `addedPartitions` 非空，调用 `onPartitionsAssigned(addedPartitions)` 让 Consumer 开始消费新 Partition。\n\n在 Leader 侧，`AbstractStickyAssignor#assign()` 方法是分配算法的入口。它的核心逻辑是一个贪心优化：首先尝试保留所有 Consumer 当前的分配，然后对需要重新分配的 Partition（无主 Partition 或均衡性调整需要释放的 Partition）做最小迁移量的重分配。算法的时间复杂度在 O(N × M) 级别（N 为 Consumer 数，M 为 Partition 数），对于绝大多数生产环境规模（Consumer 数十个、Partition 数百个）来说计算耗时在毫秒级。\n\n## 第三步：体系化扩展\n\n### 多轮 Rebalance 的收敛性保证\n\n一个自然的担忧是：如果每次 Rebalance 都只做增量调整，会不会出现无限循环、永远达不到稳态的情况？KIP-429 的设计文档对此给出了明确的收敛性证明：每一轮 Rebalance 结束后，Group 的状态必然更接近最终稳态——因为每一轮要么成功 revoke 了一些需要迁移的 Partition（使它们变为无主），要么成功将无主 Partition 分配出去。由于 Partition 总数是有限的，迁移动作也是有限的，所以算法保证在有限轮数内收敛。在最常见的场景中（单个 Consumer 加入或离开），收敛只需要两轮。在极端场景中（比如同时有多个 Consumer 加入和离开，导致需要在存活 Consumer 之间大规模重新分配），可能需要三轮甚至更多轮，但实践中很少超过三轮。\n\n值得注意的是，多轮 Rebalance 的间隔非常短（由 `heartbeat.interval.ms` 控制，默认 3 秒），所以两轮 Rebalance 的总耗时通常在 5-10 秒之内。而 Eager 模式下单轮 Rebalance 的 STW 时间就可能有 20-30 秒，因为它需要等待所有 Consumer 完成全量 revoke 和 offset 提交。\n\n### 与 Eager 模式的性能对比\n\n在生产环境中，Cooperative 和 Eager 模式的性能差异主要体现在三个维度。第一是消费中断范围：Eager 模式每次 Rebalance 影响全部 Partition，Cooperative 模式只影响需要迁移的 Partition。以 20 个 Consumer 消费 100 个 Partition 为例，一个 Consumer 离组后，Eager 模式下 100 个 Partition 全部中断约 20 秒，Cooperative 模式下只有 5 个 Partition（离组 Consumer 释放的）中断约 6-10 秒（两轮 Rebalance 间隔），其余 95 个 Partition 全程正常。第二是滚动发布的累计影响：20 个实例滚动发布，Eager 模式触发 20 次全组 STW，累计中断约 20 × 20 = 400 秒（Consumer 视角）；Cooperative 模式每次只有约 5 个 Partition 短暂中断，累计影响缩小到原来的 1/20。第三是 offset 提交的安全性：Eager 模式下所有 Consumer 同时 revoke 并提交 offset，对 `__consumer_offsets` Topic 形成写入尖峰；Cooperative 模式下 revoke 是分散的，对 offset Topic 的压力更平滑。\n\nLinkedIn 在 KIP-429 的设计文档中给出了内部测试数据：在一个 90 个 Consumer、900 个 Partition 的大规模 Group 中，从 Eager 切换到 Cooperative 后，滚动发布期间的消费 lag 峰值下降了 90% 以上，P99 端到端延迟从分钟级改善到秒级。\n\n### Kafka 3.1+ 默认策略变化与 KIP-848\n\n从 Kafka 3.1 开始，官方文档开始推荐 `CooperativeStickyAssignor` 作为生产环境的首选策略，尽管此时默认值仍然是 `RangeAssignor`。到了 Kafka 4.0，新版 Consumer（基于 KIP-848 的 Server-side Rebalance Protocol）已经将 Cooperative 作为默认行为。KIP-848 是一个更彻底的架构变革：它把 Partition 分配的计算从 Client 端的 Leader Consumer 移到了 Broker 端的 Group Coordinator，完全消除了 Leader 选举、JoinGroup/SyncGroup 两阶段协议的开销。在新协议下，Consumer 只需要向 Coordinator 上报自己的 subscription，Coordinator 直接计算并下发分配结果，Rebalance 的延迟进一步降低到毫秒级。但截至目前，KIP-848 仍在逐步推进中，大部分生产环境仍然运行在经典的 JoinGroup/SyncGroup 协议上，`CooperativeStickyAssignor` 是当下最成熟的最优选择。\n\n### 迁移注意事项\n\nEager 和 Cooperative 是两种不兼容的协议类型。如果 Group 中一部分 Consumer 使用 Eager 策略，另一部分使用 Cooperative 策略，Coordinator 在进行协议协商时会发现两者的 `supportedProtocols` 集合没有交集，直接报错 `INCONSISTENT_GROUP_PROTOCOL`，导致整个 Group 无法完成 Rebalance。因此从 Eager 迁移到 Cooperative 必须分两步：第一步，将所有 Consumer 的配置改为 `partition.assignment.strategy=RangeAssignor,CooperativeStickyAssignor`（同时支持两种协议），然后滚动重启全部实例。在这个阶段 Group 实际运行在 Eager 模式（因为 Eager 是两者的「最大公约数」），但所有 Consumer 都声明了对 Cooperative 的支持。第二步，将配置改为只保留 `CooperativeStickyAssignor`，再次滚动重启。当最后一个旧实例重启完毕后，Group 正式切换到 Cooperative 模式。跳过第一步直接改成 `CooperativeStickyAssignor` 会在滚动重启过程中导致协议不兼容，造成全组消费停止。\n\n### 面试深度回答框架\n\n面试中回答这道题的最佳策略是先讲「Why」再讲「How」。开场用一句话点明 Eager 的 STW 问题是增量 Rebalance 诞生的动机。然后用「两轮 Rebalance」这个关键词作为主线：第一轮做 Diff 和定向 revoke，第二轮把释放的 Partition 分配给新目标。解释为什么不能一轮完成——同一 Partition 不能同时被两个 Consumer 持有。接着画一个简单的时序图，标注哪些 Partition 在哪个时间段中断消费、哪些全程不受影响。最后补充收敛性保证和版本演进（3.1 推荐、4.0 默认、KIP-848 下一代协议），展示你对 Kafka 生态全局的把握。如果面试官追问「Cooperative 有什么缺点」，可以指出：多轮 Rebalance 之间被迁移的 Partition 有短暂的无主窗口（数秒级），在这个窗口内这些 Partition 的消息会积压。另外，如果 Consumer Group 处于高频变更状态（比如频繁扩缩容），多轮 Rebalance 可能叠加导致收敛时间拉长。但这些都是可控的 trade-off，远优于 Eager 模式的全组 STW。",
+      "keyPoints": [
+        "CooperativeStickyAssignor 结合了 Cooperative 协议（增量 revoke）和 Sticky 算法（粘性分配），Consumer 在 Rebalance 时不需要放弃全部 Partition，只 revoke 需要迁移的部分",
+        "增量 Rebalance 需要两轮才能完成一次 Partition 迁移：第一轮 Leader 计算 Diff 并通知源 Consumer revoke 特定 Partition，第二轮将释放的 Partition 分配给目标 Consumer",
+        "两轮设计的根本原因是保证同一 Partition 在任意时刻只被一个 Consumer 持有，如果单轮同时 revoke 和 assign 会产生双重持有的危险窗口",
+        "onPartitionsRevoked 回调只包含真正需要迁移的 Partition 列表，不再是 Eager 模式下的全量 Partition 列表，不需要迁移的 Consumer 收到的是空列表",
+        "ConsumerCoordinator 在 Cooperative 模式下将 revoke 推迟到 SyncGroup 之后执行：对比 newAssignment 和 ownedPartitions 的 Diff 来决定 revoke 哪些 Partition",
+        "KIP-429 提供了收敛性保证：每轮 Rebalance 都使 Group 状态更接近稳态，由于 Partition 总数有限，算法保证在有限轮数内收敛，实践中通常两轮即可",
+        "从 Eager 迁移到 Cooperative 必须分两步走（先同时配置两种策略再只保留 Cooperative），跳步会导致 INCONSISTENT_GROUP_PROTOCOL 错误使全组消费停止",
+        "Kafka 3.1 开始推荐 CooperativeStickyAssignor 为生产首选，Kafka 4.0 新版 Consumer 已将其设为默认策略，KIP-848 进一步将分配计算移到 Broker 端"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz1",
+          "question": "CooperativeStickyAssignor 的名称中「Cooperative」和「Sticky」分别对应什么能力？",
+          "choices": [
+            {"id": "A", "text": "Cooperative 指增量 revoke 协议（只 revoke 需要迁移的 Partition），Sticky 指粘性分配算法（尽量保持上一轮分配不变）"},
+            {"id": "B", "text": "Cooperative 指多个 Consumer 协作计算分配方案，Sticky 指 Partition 与 Consumer 的绑定关系永远不变"},
+            {"id": "C", "text": "Cooperative 指 Consumer 与 Coordinator 之间的协作心跳机制，Sticky 指 offset 提交后的持久化保证"},
+            {"id": "D", "text": "Cooperative 指 Consumer 之间共享消费进度，Sticky 指消息按 key 粘性路由到固定 Partition"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "CooperativeStickyAssignor 的名称精确描述了两个独立的特性。Cooperative 对应 Rebalance 协议层面的改进——使用 COOPERATIVE 协议而非 EAGER 协议，Consumer 在 Rebalance 时只 revoke 需要迁移的 Partition 而不是全量 revoke。Sticky 对应分配算法层面的特性——继承自 StickyAssignor（KIP-54），在计算新方案时参考上一轮分配结果，尽量保持 Partition 留在原 Consumer 上。B 错在「永远不变」，粘性是尽力而为，均衡性优先级更高。C 和 D 完全偏离了这两个术语在 Kafka 语境下的含义。"
+        },
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz2",
+          "question": "为什么 CooperativeStickyAssignor 不能在一轮 Rebalance 中同时完成 Partition 的 revoke 和 assign？",
+          "choices": [
+            {"id": "A", "text": "因为一轮 Rebalance 的时间预算不够完成两个操作"},
+            {"id": "B", "text": "因为 Coordinator 每轮只能处理一种类型的请求"},
+            {"id": "C", "text": "因为如果同一轮中对 Partition-X 同时执行 revoke（旧 Consumer）和 assign（新 Consumer），会出现两个 Consumer 同时持有同一 Partition 的危险窗口"},
+            {"id": "D", "text": "因为 Kafka Broker 端的分区元数据每轮 Rebalance 只能更新一次"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是增量 Rebalance 最核心的设计约束。Kafka 的消费语义要求每个 Partition 在同一时刻只能被一个 Consumer 消费。如果 Leader 在一轮 SyncGroup 中同时告诉 Consumer-A「释放 P-X」和 Consumer-B「接管 P-X」，由于两个 Consumer 处理 SyncGroup 响应的时间不同步，会出现 Consumer-A 还没完成 revoke（还没提交 offset）时 Consumer-B 已经开始消费 P-X 的情况，导致消息重复和 offset 回退。两轮设计确保第一轮 revoke 完成后才在第二轮 assign，彻底消除双重持有窗口。A、B、D 都不是真正的原因。"
+        },
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz3",
+          "question": "在 Cooperative 模式下，Consumer 收到 REBALANCE_IN_PROGRESS 通知后的第一个动作是什么？",
+          "choices": [
+            {"id": "A", "text": "立即 revoke 全部 Partition 并提交 offset，然后发送 JoinGroup"},
+            {"id": "B", "text": "不执行任何 revoke，直接带着当前持有的 Partition 列表发送 JoinGroup 请求"},
+            {"id": "C", "text": "先向 Coordinator 查询哪些 Partition 需要 revoke，再按需释放"},
+            {"id": "D", "text": "暂停消费但保留 Partition 所有权，等待 Coordinator 的进一步指令"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Cooperative 与 Eager 协议最根本的行为差异。Eager 模式下 Consumer 在 JoinGroup 前必须 revoke 全部 Partition（对应选项 A）。Cooperative 模式下 Consumer 不做任何 revoke，直接发送 JoinGroup 请求，并在请求的 metadata 中携带自己当前持有的 Partition 列表（ownedPartitions 字段）。revoke 操作被推迟到收到 SyncGroup 响应之后，此时 Consumer 对比新旧分配的 Diff 才知道需要释放哪些 Partition。C 不正确，Consumer 不需要预先查询；D 也不对，Consumer 不会暂停消费。"
+        },
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz4",
+          "question": "在源码层面，CooperativeStickyAssignor 和 StickyAssignor 的核心区别体现在哪里？",
+          "choices": [
+            {"id": "A", "text": "分配算法完全不同，CooperativeStickyAssignor 使用全新的贪心算法"},
+            {"id": "B", "text": "两者共享 AbstractStickyAssignor 的分配算法，区别在于 supportedProtocols() 返回 COOPERATIVE 还是 EAGER"},
+            {"id": "C", "text": "CooperativeStickyAssignor 在 Broker 端运行，StickyAssignor 在 Client 端运行"},
+            {"id": "D", "text": "CooperativeStickyAssignor 不需要 Leader 选举，由 Coordinator 直接计算分配方案"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 Kafka 客户端源码中，CooperativeStickyAssignor 和 StickyAssignor 都继承自 AbstractStickyAssignor，共享完全相同的粘性分配算法。两者的区别仅在于 supportedProtocols() 方法：StickyAssignor 返回 RebalanceProtocol.EAGER，CooperativeStickyAssignor 返回 RebalanceProtocol.COOPERATIVE。这个返回值决定了 ConsumerCoordinator 在 Rebalance 时的行为——EAGER 模式先全量 revoke 再 JoinGroup，COOPERATIVE 模式带着 ownedPartitions 直接 JoinGroup。A 错误，算法是一样的。C 和 D 描述的是 KIP-848 的新架构，不是当前 CooperativeStickyAssignor 的行为。"
+        },
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz5",
+          "question": "一个 Group 有 6 个 Consumer 消费 18 个 Partition（每人 3 个），使用 CooperativeStickyAssignor。C5 离组后经过两轮 Rebalance，在第一轮和第二轮之间，C5 原来持有的 3 个 Partition 处于什么状态？",
+          "choices": [
+            {"id": "A", "text": "被 Coordinator 临时接管，缓存在 Broker 端等待重新分配"},
+            {"id": "B", "text": "处于「无主」状态，没有任何 Consumer 在消费这些 Partition，消息在积压"},
+            {"id": "C", "text": "被随机分配给 C0-C4 中的某个 Consumer 临时消费"},
+            {"id": "D", "text": "仍然被标记为 C5 持有，等待 C5 重新上线"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在两轮 Rebalance 的间隔期间，C5 释放的 Partition 处于「无主」状态——没有任何 Consumer 声明持有它们（因为 C5 已经离组，C0-C4 在第一轮中没有被分配这些 Partition）。这些 Partition 上的新消息会持续写入但无人消费，lag 在这段时间内积压。这个无主窗口的持续时间通常只有几秒（取决于第二轮 Rebalance 的触发速度）。A 不正确，Coordinator 不消费消息。C 不正确，第一轮中 Leader 刻意不分配这些 Partition。D 也不对，C5 已被标记为离组。"
+        },
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz6",
+          "question": "以下关于从 Eager 迁移到 Cooperative 的操作步骤，哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "直接将所有 Consumer 的配置改为 CooperativeStickyAssignor，然后滚动重启即可"},
+            {"id": "B", "text": "先停掉整个 Group，统一改配置后再启动"},
+            {"id": "C", "text": "先同时配置 Eager 和 Cooperative 两种策略并滚动重启全部实例，再只保留 CooperativeStickyAssignor 后第二次滚动重启"},
+            {"id": "D", "text": "只需要升级 Broker 版本到 2.4+，Consumer 端不需要改任何配置"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "从 Eager 迁移到 Cooperative 必须分两步走，这是 Kafka 官方文档明确推荐的做法。第一步：将配置改为同时包含 Eager 和 Cooperative 策略（如 RangeAssignor,CooperativeStickyAssignor），滚动重启所有 Consumer。这一步确保所有实例都声明了对 Cooperative 协议的支持，但 Group 实际仍运行在 Eager 模式。第二步：将配置改为只保留 CooperativeStickyAssignor，再次滚动重启。如果跳过第一步直接执行 A，滚动重启过程中已重启的实例（COOPERATIVE）和未重启的实例（EAGER）会因协议不兼容触发 INCONSISTENT_GROUP_PROTOCOL 错误，导致全组无法 Rebalance。"
+        },
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz7",
+          "question": "对比 Eager 和 Cooperative 模式，以下哪项关于性能影响的描述是准确的？",
+          "choices": [
+            {"id": "A", "text": "Cooperative 模式在所有场景下都比 Eager 模式更快完成 Rebalance"},
+            {"id": "B", "text": "Eager 模式的优势是 Rebalance 一轮即可完成，Cooperative 需要多轮但每轮影响范围极小，总的消费中断面积远小于 Eager"},
+            {"id": "C", "text": "两者的消费中断时间相同，区别只在于分配算法的计算复杂度"},
+            {"id": "D", "text": "Cooperative 模式完全消除了 Rebalance 期间的消费中断"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考的是对两种模式性能特征的准确理解。B 是正确的：Eager 一轮完成但全组 STW，Cooperative 可能两轮但每轮只影响需要迁移的少量 Partition。A 不准确——Cooperative 的总 Rebalance 时间（两轮加起来）可能比 Eager 单轮更长，但消费中断的「面积」（受影响的 Partition 数 × 中断时间）远小于 Eager。C 完全错误，消费中断时间差异巨大。D 也不对，被迁移的 Partition 在两轮之间仍然有短暂的无主窗口，不是完全零中断。LinkedIn 的测试数据显示，在 90 Consumer / 900 Partition 的 Group 中切换到 Cooperative 后 lag 峰值下降了 90% 以上。"
+        },
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz8",
+          "question": "你的团队使用 CooperativeStickyAssignor，在一次发布过程中，监控显示某些 Partition 的 lag 在 Rebalance 后持续增长且不恢复。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "CooperativeStickyAssignor 的分配算法有 bug，某些 Partition 被遗漏了"},
+            {"id": "B", "text": "多轮 Rebalance 没有收敛，Group 陷入了无限循环的 Rebalance 状态，这些 Partition 始终处于无主状态"},
+            {"id": "C", "text": "Consumer Group 中混入了使用 Eager 策略的实例，导致 INCONSISTENT_GROUP_PROTOCOL 错误，整个 Group 无法完成 Rebalance"},
+            {"id": "D", "text": "Cooperative 模式不支持动态 Partition 数量变化的 Topic"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个典型的生产环境排查场景。如果 lag 持续增长不恢复，说明某些 Partition 长期无人消费。最常见的原因是迁移步骤不完整——Group 中混入了使用不同协议类型的 Consumer 实例。比如在从 Eager 迁移到 Cooperative 时跳过了「两步走」的第一步，导致部分实例声明 EAGER、部分声明 COOPERATIVE，Coordinator 无法找到共同支持的协议，报 INCONSISTENT_GROUP_PROTOCOL 错误，Rebalance 无法完成。排查方法是检查 Consumer 日志中是否有该错误码，以及确认所有实例的 partition.assignment.strategy 配置是否一致。B 在实践中极其罕见，KIP-429 有收敛性保证。"
+        },
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz9",
+          "question": "在 CooperativeStickyAssignor 的两轮 Rebalance 中，如果第一轮 revoke 完成后、第二轮开始前，又有一个新 Consumer 加入了 Group，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "第二轮 Rebalance 会失败并回滚到第一轮之前的状态"},
+            {"id": "B", "text": "新 Consumer 的加入被延迟到第二轮完成后才处理"},
+            {"id": "C", "text": "第二轮 Rebalance 会将新 Consumer 纳入成员列表，Leader 基于最新的成员状态重新计算分配方案，新 Consumer 可能在这一轮就获得 Partition"},
+            {"id": "D", "text": "Coordinator 拒绝新 Consumer 加入，要求它等待当前 Rebalance 完全结束"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Cooperative Rebalance 的每一轮都是独立的 JoinGroup/SyncGroup 周期。如果在两轮之间有新 Consumer 加入，它会参与第二轮的 JoinGroup。Leader 基于最新的成员列表（包括新加入的 Consumer）和最新的 Partition 状态（包括第一轮 revoke 释放的 Partition）重新计算分配方案。新 Consumer 完全有可能在第二轮就获得 Partition。如果新 Consumer 的加入导致需要额外的 Partition 迁移（从现有 Consumer 向新 Consumer 转移），则可能触发第三轮 Rebalance。这正体现了增量协议的灵活性——每一轮都处理当时的最新状态，不需要等待之前的计划完全执行完毕。"
+        },
+        {
+          "id": "kafka-consumer-adv-incremental-rebalance-q1-quiz10",
+          "question": "Kafka 4.0 的 KIP-848 对 Consumer Rebalance 协议做了什么根本性的改变？",
+          "choices": [
+            {"id": "A", "text": "将 Partition 分配的计算从 Client 端的 Leader Consumer 移到了 Broker 端的 Group Coordinator，消除了 Leader 选举和 SyncGroup 环节"},
+            {"id": "B", "text": "取消了 Consumer Group 机制，改为每个 Consumer 独立消费所有 Partition"},
+            {"id": "C", "text": "引入了基于 ZooKeeper 的新一代 Rebalance 协议以提高可靠性"},
+            {"id": "D", "text": "将 Rebalance 的触发条件从心跳超时改为了基于消费 lag 的自适应触发"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "KIP-848（New Consumer Group Protocol）是 Kafka 4.0 推进的下一代 Consumer Group 协议。它最核心的变化是将 Partition 分配计算从 Client 端移到了 Broker 端的 Group Coordinator。在经典协议中，Coordinator 只负责协调（收集 JoinGroup、选 Leader、转发 SyncGroup），实际的分配计算由 Client 端的 Leader Consumer 完成。KIP-848 让 Coordinator 直接运行分配算法并下发结果，完全消除了 Leader 选举环节和 SyncGroup 的两次网络往返，Rebalance 延迟进一步降低到毫秒级。B 和 C 完全不正确（Kafka 的方向是去 ZooKeeper 而不是加强 ZooKeeper）。D 也不是 KIP-848 的内容。"
+        }
+      ],
+      "references": [
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-54+-+Sticky+Partition+Assignment+Strategy",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol",
+        "https://kafka.apache.org/documentation/#consumerconfigs_partition.assignment.strategy"
+      ]
+    }
+  ]
+}

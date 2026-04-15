@@ -1,0 +1,155 @@
+{
+  "id": "kafka-consumer-adv-static-membership",
+  "name": "Static Membership 静态成员机制",
+  "domain": "kafka",
+  "description": "详解 Kafka Static Membership 的工作原理、group.instance.id 配置及 K8s 场景应用",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-consumer-adv-static-membership-q1",
+      "domain": "kafka",
+      "type": "concept",
+      "difficulty": 3,
+      "tags": ["Consumer", "Static Membership", "group.instance.id", "Rebalance优化", "KIP-345"],
+      "title": "什么是 Static Membership？group.instance.id 的作用",
+      "content": "如果你在 Kubernetes 上跑过 Kafka Consumer，大概率经历过这样的场景：你用 Deployment 部署了一组 Consumer 实例，滚动更新时 K8s 逐个杀掉旧 Pod 再拉起新 Pod，每杀一个 Pod 就触发一次 Consumer Group Rebalance。假设你的 Consumer Group 有 12 个实例、订阅了 60 个 Partition，一次滚动更新要触发 12 次 Rebalance。每次 Rebalance 期间所有 Consumer 停止消费，如果你用的是 Eager 协议，每轮 Rebalance 的 STW 时间取决于最慢的那个 Consumer 完成 revoke 的速度——在我们的生产环境中，这个时间通常在 15-30 秒。12 次乘以 20 秒，一次普通的滚动部署导致消费中断接近 4 分钟。\n\n更糟糕的是，如果你的滚动更新速度比 `max.poll.interval.ms` 还快（比如新 Pod 在 30 秒内就 Ready 了），理论上 Consumer Group 应该能很快恢复。但现实是：每个 Pod 被杀时都会发送 LeaveGroup 请求，Coordinator 立刻触发 Rebalance，完全不给你「旧 Pod 下线、新 Pod 马上顶上」的机会。\n\n你在 Broker 日志里会看到这样的记录：\n\n```\n[2024-03-15 10:23:01,234] INFO [GroupCoordinator 2]: Member consumer-order-service-1-xxxxxxxx\n  in group order-consumer-group has left, removing from group (kafka.coordinator.group.GroupCoordinator)\n[2024-03-15 10:23:01,235] INFO [GroupCoordinator 2]: Preparing to rebalance group order-consumer-group\n  in state PreparingRebalance with old generation 42 (kafka.coordinator.group.GroupCoordinator)\n[2024-03-15 10:23:01,240] INFO [GroupCoordinator 2]: Member consumer-order-service-3-yyyyyyyy\n  in group order-consumer-group has left, removing from group (kafka.coordinator.group.GroupCoordinator)\n[2024-03-15 10:23:01,241] INFO [GroupCoordinator 2]: Preparing to rebalance group order-consumer-group\n  in state PreparingRebalance with old generation 42 (kafka.coordinator.group.GroupCoordinator)\n```\n\n两个 Pod 几乎同时被杀，触发了两轮 Rebalance。这个问题在 Kafka 2.3 之前几乎无解——直到 KIP-345 引入了 Static Membership 机制。\n\n面试中问到「什么是 Static Membership」或「group.instance.id 有什么用」，本质上考的是你对 Consumer Group Rebalance 的理解深度，以及你在 K8s 这类弹性调度环境下如何优化 Kafka 消费的实战经验。",
+      "answer": "## 一、Kafka Consumer Group 基础：理解 Rebalance 为什么是核心痛点\n\nKafka 的 Consumer Group 是消息消费的核心抽象。多个 Consumer 实例组成一个 Group，共同消费一个或多个 Topic 的所有 Partition，每个 Partition 在同一时刻只会被 Group 内的一个 Consumer 消费。这种模型让 Kafka 天然支持水平扩展——想提高消费吞吐就加 Consumer 实例。但随之而来的问题是：当 Consumer 实例发生变化（加入、离开、崩溃）时，Partition 需要在存活的 Consumer 之间重新分配，这个过程就是 Rebalance。\n\nRebalance 的触发条件有三个：Consumer 主动加入 Group（新实例启动）、Consumer 主动离开 Group（实例关闭调用 `close()`）、Consumer 被判定为失联（超过 `session.timeout.ms` 没有发送心跳，或超过 `max.poll.interval.ms` 没有调用 `poll()`）。在 Kafka 2.3 之前，所有 Consumer 都是「动态成员」（Dynamic Member），Coordinator 通过一个随机生成的 `member.id` 来标识每个 Consumer。这个 `member.id` 每次 Consumer 重启都会变——即使同一个进程、同一台机器、消费同样的 Partition，重启之后 Coordinator 也不认识它了。\n\n这种设计在长期运行的虚拟机环境下问题不大，但在容器化、K8s 环境下就成了灾难。容器的生命周期本来就短，滚动更新、Pod 调度、HPA 自动扩缩容都会频繁触发 Consumer 重启，每次重启都是一次 Rebalance。\n\nRebalance 的基本流程是这样的：Coordinator 收到触发信号后，将 Group 状态设为 `PreparingRebalance`，等待所有 Consumer 发送 JoinGroup 请求。收齐后选出一个 Leader Consumer，由 Leader 执行分配算法（比如 RangeAssignor 或 CooperativeStickyAssignor），将分配结果通过 SyncGroup 请求同步给所有成员。在整个过程中，如果使用 Eager 协议，所有 Consumer 会先释放（revoke）自己持有的所有 Partition，等分配完成后再重新开始消费。这就是所谓的「Stop-The-World」——在 Rebalance 期间，没有任何 Partition 被消费。\n\n## 二、Static Membership 的核心机制：group.instance.id 如何改变游戏规则\n\nKIP-345 在 Kafka 2.3 中引入了 Static Membership，核心思想非常简单：给每个 Consumer 一个持久化的身份标识 `group.instance.id`，让 Coordinator 能够识别「这是同一个 Consumer 回来了」，而不是「一个新 Consumer 加入了」。\n\n配置方式极其简单，在 Consumer 的 Properties 中加一行：\n\n```java\n// Java Consumer 配置\nprops.put(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, \"order-consumer-pod-0\");\nprops.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, \"300000\"); // 5 分钟，配合滚动更新\n```\n\n设置了 `group.instance.id` 之后，Consumer 的行为发生了几个关键变化。\n\n第一，Consumer 不再自动发送 LeaveGroup 请求。在 Dynamic Membership 模式下，当你调用 `consumer.close()` 或者进程收到 SIGTERM 时，Consumer 会主动向 Coordinator 发送 LeaveGroup，Coordinator 立刻触发 Rebalance。但在 Static Membership 模式下，Consumer 被杀死时默认不发送 LeaveGroup——Coordinator 不会立刻感知到这个 Consumer 离开了。除非你在代码中显式调用 `consumer.close()` 并且 close 方法内部检测到设置了 `group.instance.id` 的情况下仍然选择发送（从 Kafka 2.4 开始，`KafkaConsumer.close()` 对 Static Member 也会发送 LeaveGroup，但进程被 `kill -9` 时不会）。在 K8s 场景下，Pod 被 terminate 时 kubelet 发送 SIGTERM，如果你的 shutdown hook 没有调用 `consumer.close()`，或者 `terminationGracePeriodSeconds` 太短导致进程被 SIGKILL，那么 LeaveGroup 就不会发出去。\n\n第二，Coordinator 用 `group.instance.id` 而非 `member.id` 来识别 Consumer。新的 Consumer 实例启动时，如果它的 `group.instance.id` 与一个已知的 Static Member 匹配，Coordinator 会认为这是「同一个 Consumer 重新连接」，直接将原来的 Partition 分配恢复给它，不触发 Rebalance。这个过程在 Broker 日志中的体现是：\n\n```\n[2024-03-15 10:23:45,678] INFO [GroupCoordinator 2]: Static member with instance id\n  order-consumer-pod-0 rejoined group order-consumer-group, replacing old member\n  consumer-order-service-1-xxxxxxxx with new member consumer-order-service-1-zzzzzzzz.\n  No rebalance triggered. (kafka.coordinator.group.GroupCoordinator)\n```\n\n注意最后那句「No rebalance triggered」——这就是 Static Membership 的核心价值。\n\n第三，`session.timeout.ms` 的含义变了。在 Dynamic Membership 模式下，`session.timeout.ms` 通常设为 10-30 秒，因为你希望尽快发现崩溃的 Consumer 并重新分配它的 Partition。但在 Static Membership 模式下，`session.timeout.ms` 变成了「Coordinator 愿意等这个 Static Member 回来的最长时间」。在这个时间窗口内，即使 Consumer 完全没有心跳，Coordinator 也不会触发 Rebalance，而是保留这个 Consumer 的 Partition 分配不动。所以在 Static Membership 模式下，你需要把 `session.timeout.ms` 设得更大——至少要覆盖你的滚动更新时间。一个典型的配置是 5 分钟（300000ms）甚至 10 分钟。\n\n这里有一个需要特别理解的权衡：`session.timeout.ms` 设得越大，Coordinator 等待失联 Consumer 回来的时间就越长。如果一个 Consumer 真的崩溃了不会再回来，它持有的 Partition 在 `session.timeout.ms` 到期之前不会被重新分配——这段时间这些 Partition 就是没人消费的。所以 `session.timeout.ms` 的值要根据你的业务容忍度来定：你能接受某个 Consumer 崩溃后多长时间内它的 Partition 没人消费？\n\n## 三、K8s 中 StatefulSet + Static Membership 最佳实践\n\n在 Kubernetes 环境下，Static Membership 和 StatefulSet 是天然搭档。StatefulSet 给每个 Pod 一个稳定的、可预期的名称（比如 `order-consumer-0`、`order-consumer-1`），这个名称正好可以用作 `group.instance.id`。\n\n以下是一个生产级的 StatefulSet 配置：\n\n```yaml\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: order-consumer\nspec:\n  replicas: 6\n  podManagementPolicy: Parallel    # 并行管理，加速滚动更新\n  updateStrategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxUnavailable: 1            # 每次只更新一个 Pod\n  template:\n    spec:\n      terminationGracePeriodSeconds: 60  # 给 Consumer 足够的时间完成 offset commit\n      containers:\n      - name: consumer\n        env:\n        - name: POD_NAME\n          valueFrom:\n            fieldRef:\n              fieldPath: metadata.name\n        - name: KAFKA_GROUP_INSTANCE_ID\n          value: \"$(POD_NAME)\"     # Pod 名称作为 instance.id\n        - name: KAFKA_SESSION_TIMEOUT_MS\n          value: \"300000\"          # 5 分钟，覆盖滚动更新窗口\n```\n\n在 Java 代码中读取这个环境变量：\n\n```java\nString instanceId = System.getenv(\"KAFKA_GROUP_INSTANCE_ID\");\nif (instanceId != null && !instanceId.isEmpty()) {\n    props.put(ConsumerConfig.GROUP_INSTANCE_ID_CONFIG, instanceId);\n    // Static Member 模式下，session.timeout.ms 要设大\n    props.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG,\n        System.getenv().getOrDefault(\"KAFKA_SESSION_TIMEOUT_MS\", \"300000\"));\n}\n```\n\n滚动更新时的行为变成了这样：K8s 杀掉 `order-consumer-0`，Coordinator 没有收到 LeaveGroup，开始计时 `session.timeout.ms`（5 分钟）。30 秒后新的 `order-consumer-0` Pod 启动完成，带着相同的 `group.instance.id` 加入 Group。Coordinator 识别出这是同一个 Static Member，直接恢复原来的 Partition 分配，不触发 Rebalance。整个过程中，只有 `order-consumer-0` 原本负责的那几个 Partition 有大约 30 秒的消费中断，其他 Consumer 完全不受影响。\n\n对比一下没有 Static Membership 的情况：杀掉一个 Pod → 触发 Rebalance → 所有 Consumer 停止消费 → 等待 JoinGroup → 重新分配 → 恢复消费。12 个 Pod 的滚动更新，12 次全量 Rebalance，消费中断时间从几十秒变成几分钟。\n\n这里有个常见的坑值得一提：如果你用 Deployment 而不是 StatefulSet，Pod 名称是随机的（比如 `order-consumer-7f8b9-x2k4j`），每次滚动更新后新 Pod 名称不同，`group.instance.id` 也就不同。Coordinator 会认为旧的 Static Member 消失了，同时一个新的 Static Member 加入了——这反而会触发 Rebalance，因为 Group 的成员组成确实变了。所以 Static Membership 必须搭配 StatefulSet 或者其他能保证 `group.instance.id` 稳定的机制使用。\n\n另一个生产中容易忽略的点：`group.instance.id` 在同一个 Consumer Group 内必须唯一。如果两个 Consumer 用了相同的 `group.instance.id` 加入同一个 Group，后加入的那个会把先加入的踢掉（fence out）。这个行为在 Kafka Connect 的 Distributed Worker 中尤其需要注意。\n\n## 四、面试回答框架与进阶关联\n\n面试中被问到这个话题时，建议按这个层次组织回答：先说 Rebalance 的痛点（1-2 句话），再说 Static Membership 的核心思路（用持久化 instance.id 替代随机 member.id），然后说三个关键行为变化（不自动发 LeaveGroup、用 instance.id 匹配、session.timeout.ms 变成等待窗口），最后结合 K8s 场景说明实践价值。如果面试官追问，可以展开到 CooperativeStickyAssignor 与 Static Membership 的组合优化——CooperativeStickyAssignor 本身就尽量保持分配稳定，再加上 Static Membership 减少不必要的 Rebalance 触发，两者叠加效果最好。\n\n还有一个进阶话题：Kafka 3.x 引入的新版 Consumer Group 协议（KIP-848，Server-Side Rebalance）从根本上改变了 Rebalance 的机制，将分配逻辑从 Client 端移到了 Server 端，使得单个 Consumer 的加入或离开只影响它自己持有的 Partition，不再需要全局 STW。在这个新协议下，Static Membership 的必要性会降低，但在 Kafka 2.x 和 3.x 的过渡期内，Static Membership 仍然是最实用的 Rebalance 优化手段。",
+      "keyPoints": [
+        "Static Membership（KIP-345，Kafka 2.3+）通过 group.instance.id 给 Consumer 一个持久化身份标识，让 Coordinator 在 Consumer 重启时识别出「同一个成员回来了」而不是「新成员加入」，从而跳过 Rebalance",
+        "设置 group.instance.id 后，Consumer 被杀死时默认不发送 LeaveGroup 请求（除非显式调用 close()），Coordinator 不会立刻感知 Consumer 离开，避免了因进程重启触发的不必要 Rebalance",
+        "session.timeout.ms 在 Static Membership 模式下变成了「等待 Static Member 回来的最长时间」，需要设置为足够覆盖滚动更新窗口的值（通常 5-10 分钟），但也意味着真正崩溃的 Consumer 被发现的时间更长",
+        "K8s 场景下 Static Membership 必须搭配 StatefulSet 使用，利用 Pod 稳定名称（如 order-consumer-0）作为 group.instance.id，Deployment 的随机 Pod 名称无法保证 instance.id 稳定",
+        "同一个 Consumer Group 内的 group.instance.id 必须唯一，如果两个 Consumer 使用相同的 instance.id，后加入的会将先加入的踢出（fencing 机制）",
+        "Static Membership 与 CooperativeStickyAssignor 配合效果最佳：前者减少不必要的 Rebalance 触发，后者在不可避免的 Rebalance 中保持分配稳定、避免全量 revoke",
+        "Kafka 3.x 的 KIP-848（Server-Side Rebalance）从根本上改进了 Rebalance 机制，但在 2.x 到 3.x 过渡期，Static Membership 仍然是最实用的 Rebalance 优化手段"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz1",
+          "question": "Static Membership 是在哪个 Kafka 版本中引入的，对应的提案编号是什么？",
+          "choices": [
+            {"id": "A", "text": "Kafka 2.3，KIP-345"},
+            {"id": "B", "text": "Kafka 2.0，KIP-283"},
+            {"id": "C", "text": "Kafka 3.0，KIP-500"},
+            {"id": "D", "text": "Kafka 2.4，KIP-392"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Static Membership 由 KIP-345 提出，在 Kafka 2.3 版本中正式引入。B 选项的 KIP-283 是关于 Consumer Group 协议改进但不是 Static Membership。C 选项的 KIP-500 是关于去除 ZooKeeper 依赖的提案，与 Consumer Group 成员机制无关。D 选项的 KIP-392 是关于改进 Consumer 拦截器的提案，也与 Static Membership 无关。"
+        },
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz2",
+          "question": "以下关于 group.instance.id 的描述，哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "group.instance.id 由 Broker 自动分配，Consumer 不需要手动配置"},
+            {"id": "B", "text": "group.instance.id 是 Consumer 手动配置的持久化标识，Coordinator 用它来识别 Static Member 的身份"},
+            {"id": "C", "text": "group.instance.id 和 member.id 是同一个东西，只是叫法不同"},
+            {"id": "D", "text": "group.instance.id 只在 Consumer 第一次加入 Group 时有效，后续重启不起作用"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "group.instance.id 是 Consumer 端手动配置的一个字符串标识，Coordinator 用它来持久化地识别 Static Member。A 选项错误，group.instance.id 必须由用户在 Consumer 配置中显式设置，Broker 不会自动分配（自动分配的是 member.id）。C 选项错误，member.id 是 Coordinator 分配的随机标识符，每次 Consumer 重启都会变；group.instance.id 是用户配置的固定标识。D ���项与 Static Membership 的核心价值完全相反——它的意义恰恰在于重启后仍然有效。"
+        },
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz3",
+          "question": "在 Static Membership 模式下，当一个 Consumer 进程被 kill -9 杀掉后，Coordinator 会立刻触发 Rebalance 吗？",
+          "choices": [
+            {"id": "A", "text": "会，因为 kill -9 是强制终止，Consumer 来不及做任何处理"},
+            {"id": "B", "text": "不会，Coordinator 会等待 session.timeout.ms 过期后才触发 Rebalance，在此期间如果同一个 instance.id 的 Consumer 重新连接则直接恢复分配"},
+            {"id": "C", "text": "不会，Static Member 的 Partition 分配是永久固定的，即使 Consumer 永远不回来也不会 Rebalance"},
+            {"id": "D", "text": "会，但只重新分配被杀 Consumer 持有的 Partition，不影响其他 Consumer"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Static Membership 的核心机制就是：Consumer 被杀死后（尤其是 kill -9 这种不发送 LeaveGroup 的情况），Coordinator 不会立刻触发 Rebalance，而是等待 session.timeout.ms 过期。在等待期间，如果带着相同 group.instance.id 的 Consumer 重新加入，Coordinator 直接恢复原分配。A 选项是 Dynamic Membership 的行为（虽然 kill -9 本身不发 LeaveGroup，但心跳停止后很快触发超时）。C 选项夸大了 Static Membership 的作用，session.timeout.ms 过期后仍然会触发 Rebalance。D 选项描述的是 CooperativeStickyAssignor 的增量 Rebalance 行为，与 Static Membership 的「延迟触发」机制不同。"
+        },
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz4",
+          "question": "在 Static Membership 模式下，session.timeout.ms 通常应该设为多大？",
+          "choices": [
+            {"id": "A", "text": "尽量小（如 6000ms），以便快速发现崩溃的 Consumer"},
+            {"id": "B", "text": "与 heartbeat.interval.ms 保持一致即可（如 3000ms）"},
+            {"id": "C", "text": "需要设得足够大以覆盖 Consumer 重启或滚动更新的时间窗口（通常 5-10 分钟）"},
+            {"id": "D", "text": "设为 0 可以完全禁用超时检测，让 Static Member 永远不超时"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "在 Static Membership 模式下，session.timeout.ms 的含义从「心跳超时检测」变成了「等待 Static Member 回来的最长时间」。这个值需要覆盖你的滚动更新窗口——如果一次滚动更新最长需要 3 分钟，session.timeout.ms 至少要设为 180000ms，通常推荐 5 分钟（300000ms）甚至更长。A 和 B 选项的小值在 Dynamic Membership 下合理，但在 Static Membership 下会导致 Consumer 刚被杀就触发超时 Rebalance，完全失去了 Static Membership 的意义。D 选项不可行，Kafka 不支持将 session.timeout.ms 设为 0，且即使能设为极大值，也意味着真正崩溃的 Consumer 永远不会被检测到。"
+        },
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz5",
+          "question": "以下 Broker 日志片段说明了什么？\n\n```\nStatic member with instance id order-consumer-pod-0 rejoined group order-consumer-group,\nreplacing old member consumer-xxx with new member consumer-yyy. No rebalance triggered.\n```",
+          "choices": [
+            {"id": "A", "text": "一个新的 Consumer 加入了 Group，但因为 Group 处于 Stable 状态所以暂不 Rebalance"},
+            {"id": "B", "text": "一个 Static Member 在 session.timeout.ms 内带着相同的 group.instance.id 重新连接，Coordinator 恢复了它原来的 Partition 分配，没有触发 Rebalance"},
+            {"id": "C", "text": "Coordinator 检测到重复的 instance.id，正在执行 fencing 把旧 Consumer 踢出"},
+            {"id": "D", "text": "Consumer 的 member.id 从 xxx 变成了 yyy，说明发生了一次静默的 Rebalance"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这段日志是 Static Membership 正常工作的典型输出。关键信息是：instance id 为 order-consumer-pod-0 的 Static Member 重新加入了 Group，Coordinator 将旧的 member.id（consumer-xxx）替换为新的 member.id（consumer-yyy），并且明确标注了「No rebalance triggered」。member.id ��化是正常的——每次 Consumer 启动都会生成新的 member.id，但 group.instance.id 不变，所以 Coordinator 知道这是同一个逻辑成员。A 选项的理由不对，Stable 状态并不会阻止 Rebalance。C 选项描述的 fencing 场景应该是两个 Consumer 同时在线且用了相同 instance.id。D 选项中的「静默 Rebalance」概念不存在，日志明确说了 No rebalance triggered。"
+        },
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz6",
+          "question": "你在 K8s 中使用 Deployment（而非 StatefulSet）部署 Consumer，并配置了 group.instance.id = $(POD_NAME)。滚动更新后，Rebalance 仍然频繁触发。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Deployment 的 Pod 名称是随机生成的，每次滚动更新后新 Pod 的名称不同，导致 group.instance.id 改变，Coordinator 认为是新成员加入"},
+            {"id": "B", "text": "Deployment 不支持 group.instance.id 参数，该配置在非 StatefulSet 环境下会被忽略"},
+            {"id": "C", "text": "Deployment 的滚动更新速度太快，新 Pod 在旧 Pod 完全退出之前就加入了 Group"},
+            {"id": "D", "text": "session.timeout.ms 设得太小，旧 Pod 还没来得及被新 Pod 替换就已经超时"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个非常常见的配置错误。Deployment 的 Pod 名称包含随机后缀（如 order-consumer-7f8b9-x2k4j），每次滚动更新后新 Pod 名称完全不同，导致 group.instance.id 也不同。Coordinator 会认为旧的 Static Member 消失了同时一个全新的 Static Member 加入了，这反而会触发 Rebalance。正确做法是使用 StatefulSet，它的 Pod 名称是稳定的（如 order-consumer-0、order-consumer-1）。B 选项错误，group.instance.id 是 Kafka Consumer 客户端的配置，与 K8s 资源类型无关。C 选项虽然有可能导致问题，但不是根本原因。D 选项也可能是辅助原因，但核心问题在于 instance.id 不稳定。"
+        },
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz7",
+          "question": "Static Membership 与 CooperativeStickyAssignor 的关系是什么？",
+          "choices": [
+            {"id": "A", "text": "它们是互斥的，使用 Static Membership 时不能使用 CooperativeStickyAssignor"},
+            {"id": "B", "text": "它们解决的是同一层面的问题，选一个用就够了"},
+            {"id": "C", "text": "它们解决不同层面的问题——Static Membership 减少不必要的 Rebalance 触发，CooperativeStickyAssignor 在发生 Rebalance 时减少 Partition 迁移和避免全量 STW，两者叠加效果最佳"},
+            {"id": "D", "text": "CooperativeStickyAssignor 已经包含了 Static Membership 的功能，无需额外配置 group.instance.id"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Static Membership 和 CooperativeStickyAssignor 是互补的优化手段，作用在不同层面。Static Membership 解决的是「什么时候触发 Rebalance」——通过 group.instance.id 减少不必要的 Rebalance 触发。CooperativeStickyAssignor 解决的是「触发 Rebalance 后怎么做」——使用增量协议避免全量 revoke，只迁移必要的 Partition。两者组合后，大部分 Consumer 重启不触发 Rebalance（Static Membership 的功劳），真正需要 Rebalance 时也只做增量调整（CooperativeStickyAssignor 的功劳）。A 选项错误，它们完全可以同时使用。B 选项错误，它们优化的维度不同。D 选项错误，CooperativeStickyAssignor 不提供 instance.id 持久化识别功能。"
+        },
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz8",
+          "question": "你的 Consumer Group 有 8 个 Static Member，其中一个 Consumer（instance.id = pod-3）真的崩溃了且不会再恢复。session.timeout.ms 设为 300000（5 分钟）。在 pod-3 崩溃后的这 5 分钟内会发生什么？",
+          "choices": [
+            {"id": "A", "text": "pod-3 持有的 Partition 会被其他 Consumer 接管，消费不中断"},
+            {"id": "B", "text": "Coordinator 立即触发 Rebalance 将 pod-3 的 Partition 分配给其他 Consumer"},
+            {"id": "C", "text": "pod-3 原来负责的 Partition 在这 5 分钟内没有任何 Consumer 消费，直到 session.timeout.ms 过期后触发 Rebalance 才会被重新分配"},
+            {"id": "D", "text": "其他 7 个 Consumer 也会停止消费，等待 pod-3 回来"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这就是 Static Membership 的核心权衡。Coordinator 不知道 pod-3 是「暂时下线等会儿就回来」还是「真的挂了不会再回来」，它只能按 session.timeout.ms 的设定等待。在这 5 分钟内，pod-3 原来负责的 Partition 处于无人消费的状态——消息在 Broker 端持续堆积，Consumer Lag 持续增长。5 分钟后 session.timeout.ms 过期，Coordinator 将 pod-3 移除并触发 Rebalance，其他 Consumer 才会接管这些 Partition。A 选项描述的行为在当前机制下不可能发生。B 选项是 Dynamic Membership 的行为。D 选项完全错误，其他 Consumer 不受影响继续正常消费自己的 Partition。"
+        },
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz9",
+          "question": "如果两个 Consumer 实例配置了相同的 group.instance.id 并同时尝试加入同一个 Consumer Group，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "两个 Consumer 会共享同一组 Partition，实现 Partition 级别的负载均衡"},
+            {"id": "B", "text": "后加入的 Consumer 会被拒绝，加入失败并抛出异常"},
+            {"id": "C", "text": "后加入的 Consumer 会把先加入的踢出（fencing），先加入的 Consumer 会收到异常并停止消费"},
+            {"id": "D", "text": "Coordinator 会为两个 Consumer 自动生成不同的 instance.id 后缀来区分它们"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Kafka 的 Static Membership 实现了 fencing 机制：当一个新 Consumer 带着已存在的 group.instance.id 加入 Group 时，Coordinator 认为这是「同一个成员重新连接」，会将旧的 Consumer 踢出（fence out），旧 Consumer 在下次心跳或 poll 时会收到 FENCED_INSTANCE_ID 异常。这个设计确保了同一个 instance.id 在任意时刻只有一个活跃的 Consumer。A 选项不可能，Kafka 不允许同一个 Partition 被同一 Group 内的多个 Consumer 同时消费。B 选项反了，是先加入的被踢出而非后加入的被拒绝。D 选项不存在这种自动修改行为，Coordinator 严格使用用户配置的值。"
+        },
+        {
+          "id": "kafka-consumer-adv-static-membership-q1-quiz10",
+          "question": "你的团队正在排查 Consumer Lag 突增问题。Broker 日志中发现 Static Member pod-5 在 session.timeout.ms 过期后才被移除，但 pod-5 实际上 10 分钟前就已经 OOM 被 K8s 杀掉了。你应该怎么优化？",
+          "choices": [
+            {"id": "A", "text": "去掉 Static Membership，改回 Dynamic Membership 模式以更快检测崩溃"},
+            {"id": "B", "text": "在 Consumer 的 shutdown hook 中确保调用 consumer.close()，同时适当缩短 session.timeout.ms，在「快速检测崩溃」和「避免滚动更新 Rebalance」之间找平衡"},
+            {"id": "C", "text": "把 session.timeout.ms 设为更大的值，避免 Consumer 被误判为超时"},
+            {"id": "D", "text": "设置 heartbeat.interval.ms 为更小的值，让 Coordinator 更频繁地检测 Consumer 存活状态"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个典型的生产调优场景。核心矛盾是：session.timeout.ms 设得越大，滚动更新越平滑（不触发 Rebalance），但真正崩溃的 Consumer 被发现得越晚。正确的优化方向是双管齐下：在 Consumer 代码中注册 shutdown hook，确保正常关闭时调用 consumer.close() 主动发送 LeaveGroup（这样正常关闭能快速触发 Rebalance），同时将 session.timeout.ms 设为一个合理值（比如滚动更新窗口的 1.5 倍），在两个目标之间取平衡。A 选项是因噎废食，会丢失 Static Membership 在滚动更新场景的收益。C 选项方向完全错误，会让问题更严重。D 选项无效，heartbeat.interval.ms 影响的是心跳发送频率，在 Static Membership 模式下 Coordinator 仍然以 session.timeout.ms 为准来判断超时。"
+        }
+      ],
+      "references": [
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances",
+        "https://kafka.apache.org/documentation/#consumerconfigs_group.instance.id",
+        "https://kafka.apache.org/documentation/#consumerconfigs_session.timeout.ms"
+      ]
+    }
+  ]
+}
