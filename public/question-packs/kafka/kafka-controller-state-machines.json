@@ -1,0 +1,158 @@
+{
+  "id": "kafka-controller-state-machines",
+  "name": "分区状态机与副本状态机",
+  "domain": "kafka",
+  "description": "深入解析 Kafka Controller 中 PartitionStateMachine 和 ReplicaStateMachine 的状态转换与协调机制",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-controller-state-machines-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 4,
+      "tags": ["Kafka", "状态机", "PartitionStateMachine", "ReplicaStateMachine", "Controller"],
+      "title": "Controller 中的分区状态机和副本状态机是怎么工作的？",
+      "content": "Kafka 集群里有几百个 Topic、上万个 Partition，每个 Partition 又有多个副本散布在不同 Broker 上。一个 Broker 宕机，它上面的 Leader Partition 要选举、Follower 副本要标记离线；一个 Topic 被删除，它的所有副本要依次走完删除流程；一次滚动升级，几十个 Broker 先后优雅下线再上线，所有受影响的 Partition 和副本状态要精确切换且不能互相冲突。如果没有一套统一的状态管理机制，Controller 的协调逻辑会退化成一堆难以维护的 if-else 嵌套。\n\nKafka 的做法是引入两台有限状态机——PartitionStateMachine 和 ReplicaStateMachine。它们分别管理 Partition 和 Replica 的完整生命周期，每个状态只允许特定的转换路径，非法转换直接拒绝并记录错误日志。这个设计把「某个 Partition 现在处于什么阶段、下一步该做什么」这个本来极其复杂的问题，收敛成了一张有限的状态转换表。\n\n下面这段日志来自一个 Kafka 3.6 集群的 Controller（Broker 0），记录了 Topic `events` 被创建后分区和副本的状态变迁过程：\n\n```\n[2024-06-10 10:15:02,341] INFO [Controller id=0] Topic creation callback for events-0 (kafka.controller.KafkaController)\n[2024-06-10 10:15:02,343] DEBUG [Controller id=0] Changed partition events-0 state from NonExistentPartition to NewPartition (kafka.controller.PartitionStateMachine)\n[2024-06-10 10:15:02,345] DEBUG [Controller id=0] Changed replica 1 for partition events-0 state from NonExistentReplica to NewReplica (kafka.controller.ReplicaStateMachine)\n[2024-06-10 10:15:02,346] DEBUG [Controller id=0] Changed replica 2 for partition events-0 state from NonExistentReplica to NewReplica (kafka.controller.ReplicaStateMachine)\n[2024-06-10 10:15:02,348] DEBUG [Controller id=0] Changed replica 3 for partition events-0 state from NonExistentReplica to NewReplica (kafka.controller.ReplicaStateMachine)\n[2024-06-10 10:15:02,355] DEBUG [Controller id=0] Changed partition events-0 state from NewPartition to OnlinePartition with leader 1, isr [1,2,3] (kafka.controller.PartitionStateMachine)\n[2024-06-10 10:15:02,362] DEBUG [Controller id=0] Changed replica 1 for partition events-0 state from NewReplica to OnlineReplica (kafka.controller.ReplicaStateMachine)\n[2024-06-10 10:15:02,363] DEBUG [Controller id=0] Changed replica 2 for partition events-0 state from NewReplica to OnlineReplica (kafka.controller.ReplicaStateMachine)\n[2024-06-10 10:15:02,364] DEBUG [Controller id=0] Changed replica 3 for partition events-0 state from NewReplica to OnlineReplica (kafka.controller.ReplicaStateMachine)\n```\n\n从日志里能看到一个清晰的编排顺序：先建分区（NonExistentPartition → NewPartition），再建副本（NonExistentReplica → NewReplica），然后分区上线选出 Leader（NewPartition → OnlinePartition），最后副本上线（NewReplica → OnlineReplica）。这套协调编排的底层机制是什么？两台状态机各自有哪些状态和合法转换？它们在 Broker 故障、Topic 删除、Controller Failover 等场景下又是怎么配合工作的？",
+      "answer": "## 一、核心概念基础：为什么用状态机管理 Partition 和 Replica 生命周期\n\n### 1.1 有限状态机在分布式协调中的价值\n\n有限状态机（Finite State Machine, FSM）是一种数学模型：系统在任意时刻处于有限个状态中的一个，通过事件驱动在状态之间转换，每次转换可以触发一组副作用（Side Effect）。Kafka Controller 用 FSM 管理 Partition 和 Replica 的核心原因是：分布式系统中的状态转换必须是确定性的、可审计的、可恢复的。\n\n举个例子。一个 Partition 的 Leader 所在 Broker 宕机了，Controller 要做一系列操作——标记 Partition 离线、从 ISR 中选新 Leader、发送 LeaderAndIsrRequest、更新元数据。如果没有状态机，这些操作的执行依赖于一堆散落在各处的标志位和条件判断。某一步失败了怎么重试？Controller Failover 后新 Controller 怎么知道上一任做到哪一步了？状态机把这些问题都收敛了：Partition 要么是 OnlinePartition，要么是 OfflinePartition——新 Controller 启动后只需要扫描所有 Partition 的当前状态，就知道哪些需要重新选举，不用猜上一任 Controller 执行到了哪个环节。\n\n### 1.2 Controller 的定位\n\n在 ZooKeeper 模式下，Kafka 集群中恰好有一个 Broker 持有 Controller 角色（通过在 ZK 的 `/controller` 路径上创建临时节点抢占）。Controller 负责所有集群级别的元数据管理：Topic 创建/删除、Partition 状态转换、副本分配、Leader 选举、ISR 变更广播。PartitionStateMachine 和 ReplicaStateMachine 是 Controller 内部的两个核心组件，它们不是独立进程，而是 `KafkaController` 类持有的两个对象实例，所有状态转换都在 Controller 的事件处理线程中执行。\n\n在 Kafka 源码中（以 3.6 为例），这两个状态机的实现位于 `kafka.controller.PartitionStateMachine` 和 `kafka.controller.ReplicaStateMachine`，它们共享 Controller 的 `ControllerContext`——一个内存中的元数据缓存，维护着所有 Partition 和 Replica 的当前状态。\n\n## 二、精准深度解答：两台状态机的状态、转换与协调\n\n### 2.1 PartitionStateMachine：4 个状态\n\nPartitionStateMachine 管理每个 Partition 的生命周期，定义了 4 个状态：\n\n```\n                  ┌──────────────────────┐\n                  │  NonExistentPartition │ ◄─── 分区尚未创建或已被删除\n                  └──────────┬───────────┘\n                             │ Topic 创建\n                             ▼\n                  ┌──────────────────────┐\n                  │    NewPartition       │ ◄─── 分区已分配副本，但还没有 Leader/ISR\n                  └──────────┬───────────┘\n                             │ Leader 选举完成\n                             ▼\n              ┌──────────────────────────────┐\n              │       OnlinePartition         │ ◄─── 正常服务状态，有 Leader 和 ISR\n              └──────┬───────────────┬───────┘\n                     │               │\n         Leader 所在  │               │  Topic 删除\n         Broker 宕机  │               │\n                     ▼               ▼\n        ┌──────────────────┐   ┌──────────────────────┐\n        │ OfflinePartition  │   │ NonExistentPartition  │\n        └────────┬─────────┘   └───────────────────────┘\n                 │ 重新选举成功\n                 ▼\n        ┌──────────────────────────────┐\n        │       OnlinePartition         │\n        └──────────────────────────────┘\n```\n\n**NonExistentPartition** 是初始态也是终态。分区还不存在，或者 Topic 已经被删除后回到这个状态。\n\n**NewPartition** 表示 Controller 已经在元数据中为这个 Partition 分配了副本列表（AR），但还没有执行 Leader 选举——此时 Partition 没有 Leader，不能服务任何请求。这个状态通常只存在很短暂的时间，在 Topic 创建的事务性流程中作为中间态。\n\n**OnlinePartition** 是正常工作状态。Partition 有一个活跃的 Leader 和一个非空的 ISR 列表。所有的 Produce 和 Fetch 请求都由 Leader 处理。从 NewPartition 转到 OnlinePartition 时触发初始 Leader 选举（通常选 AR 列表的第一个副本），从 OfflinePartition 转到 OnlinePartition 时触发故障恢复选举。OnlinePartition 还有一种自转换——当执行 Preferred Replica Election 或者 Reassignment Election 时，Partition 保持在 OnlinePartition 状态但 Leader 发生切换。\n\n**OfflinePartition** 表示 Partition 的 Leader 不可用了。触发条件通常是 Leader 所在 Broker 宕机或者离开 ISR 且没有新的可用 Leader。Controller 检测到后会尝试将 Partition 从 OfflinePartition 转回 OnlinePartition，转换过程就是执行 Leader 选举。如果选举成功，Partition 回到 OnlinePartition；如果 ISR 中没有存活副本且 `unclean.leader.election.enable=false`，Partition 会停留在 OfflinePartition，对应的 JMX 指标 `OfflinePartitionsCount` 大于 0。\n\n合法的状态转换只有以下几条路径，非法转换会被拒绝并在 controller.log 中输出 ERROR 级别日志：\n\n```\nNonExistentPartition → NewPartition          // Topic 创建\nNewPartition         → OnlinePartition        // 初始 Leader 选举\nOnlinePartition      → OnlinePartition        // Leader 切换（Preferred/Reassign）\nOnlinePartition      → OfflinePartition       // Leader 所在 Broker 宕机\nOfflinePartition     → OnlinePartition        // 故障恢复选举\nOnlinePartition      → NonExistentPartition   // Topic 删除\nOfflinePartition     → NonExistentPartition   // Topic 删除（离线分区）\n```\n\n### 2.2 ReplicaStateMachine：7 个状态\n\nReplicaStateMachine 管理每个副本的生命周期，状态数量更多是因为副本还需要处理删除流程中的各种中间状态：\n\n```\n                  ┌──────────────────────┐\n                  │  NonExistentReplica   │ ◄─── 副本不存在\n                  └──────────┬───────────┘\n                             │ 副本分配\n                             ▼\n                  ┌──────────────────────┐\n                  │     NewReplica        │ ◄─── 已分配但尚未开始同步\n                  └──────────┬───────────┘\n                             │ LeaderAndIsr 请求发送成功\n                             ▼\n                  ┌──────────────────────┐\n              ┌──►│    OnlineReplica      │ ◄─── 正常同步/服务\n              │   └───┬──────────┬───────┘\n              │       │          │\n              │  Broker│宕机   开始删除\n              │       │          │\n              │       ▼          ▼\n              │  ┌──────────┐  ┌──────────────────────────┐\n   Broker 恢复│  │ Offline  │  │ ReplicaDeletionStarted   │\n              │  │ Replica  │  └──────┬─────────┬─────────┘\n              │  └──────────┘         │         │\n              │                  删除成功    删除失败\n              │                       │         │\n              │                       ▼         ▼\n              │   ┌────────────────────────┐  ┌──────────────────────────────┐\n              │   │ReplicaDeletionSuccessful│  │ ReplicaDeletionIneligible    │\n              │   └───────────┬────────────┘  └──────────────┬───────────────┘\n              │               │                              │\n              │               ▼                              │ 重试删除\n              │   ┌──────────────────────┐                   │\n              │   │  NonExistentReplica   │                   │\n              │   └──────────────────────┘                   ▼\n              │                              ┌──────────────────────────┐\n              └──────────────────────────────►│ ReplicaDeletionStarted   │\n                                             └──────────────────────────┘\n```\n\n**NonExistentReplica** 是起始和终止状态。副本在元数据中不存在。\n\n**NewReplica** 表示 Controller 已经知道这个副本的存在（比如 Topic 创建时分配了副本列表），但还没有向对应 Broker 发送 LeaderAndIsrRequest，副本还没有开始从 Leader 拉取数据。\n\n**OnlineReplica** 是正常工作状态。如果这个副本是 Leader，它负责处理读写请求；如果是 Follower，它从 Leader 持续 Fetch 数据保持同步。副本从 NewReplica 或 OfflineReplica 转到 OnlineReplica 时，Controller 会向它所在的 Broker 发送 LeaderAndIsrRequest，通知它该 Partition 的 Leader 是谁、ISR 有哪些成员。\n\n**OfflineReplica** 表示副本所在 Broker 已经不可用。Controller 检测到 Broker 宕机后，会把该 Broker 上的所有副本从 OnlineReplica 转到 OfflineReplica，同时把这些副本从对应 Partition 的 ISR 中移除。当 Broker 恢复上线后，Controller 将这些副本重新转为 OnlineReplica。\n\n**ReplicaDeletionStarted** 表示 Controller 已经向副本所在 Broker 发送了 `StopReplicaRequest`（携带 `deletePartition=true`），请求删除本地日志数据。这个状态是删除流程的起点。\n\n**ReplicaDeletionSuccessful** 表示 Broker 成功响应了 StopReplicaRequest，副本的本地数据已被清除。接下来 Controller 将副本从内存元数据中移除，状态转为 NonExistentReplica。\n\n**ReplicaDeletionIneligible** 表示删除失败了——典型原因是副本所在 Broker 正好宕机、网络不可达、或者 Broker 返回了错误。Controller 会把副本标记为「暂时无法删除」，等 Broker 恢复后重试。在 controller.log 中你会看到类似这样的日志：\n\n```\n[2024-06-10 14:22:18,501] INFO [Controller id=0] Halting deletion of topic events\n    since replica 2 is in state ReplicaDeletionIneligible (kafka.controller.TopicDeletionManager)\n```\n\n### 2.3 两台状态机的协调编排\n\n两台状态机不是独立运行的——它们在 Controller 事件处理线程中被协调调用，一个事件往往同时驱动两台状态机的状态转换。以下是三个关键场景的编排流程：\n\n**场景一：Topic 创建。** Controller 收到 Topic 创建事件后的编排顺序是：(1) 为每个 Partition 调用 PartitionStateMachine，从 NonExistentPartition → NewPartition；(2) 为每个 Replica 调用 ReplicaStateMachine，从 NonExistentReplica → NewReplica；(3) 为每个 Partition 调用 PartitionStateMachine，从 NewPartition → OnlinePartition（此时触发初始 Leader 选举）；(4) 为每个 Replica 调用 ReplicaStateMachine，从 NewReplica → OnlineReplica。步骤 (3) 和 (4) 之间有因果依赖——只有 Partition 选出了 Leader，副本才知道自己是 Leader 还是 Follower。\n\n**场景二：Broker 故障。** Controller 检测到 Broker 宕机后：(1) 把该 Broker 上的所有副本从 OnlineReplica → OfflineReplica，同时将它们从各自 Partition 的 ISR 中移除；(2) 找出那些 Leader 在该 Broker 上的 Partition，把它们从 OnlinePartition → OfflinePartition；(3) 对这些 Offline Partition 执行 Leader 选举，从 OfflinePartition → OnlinePartition；(4) 向相关 Broker 发送 LeaderAndIsrRequest 和 UpdateMetadataRequest。注意步骤 (1) 必须在 (2) 之前——ISR 要先更新，选举算法才能基于正确的 ISR 列表工作。\n\n**场景三：Topic 删除。** Controller 收到 Topic 删除请求后：(1) 对该 Topic 所有 Partition 的副本调用 ReplicaStateMachine，从 OnlineReplica → ReplicaDeletionStarted，向对应 Broker 发送 StopReplicaRequest；(2) 收到成功响应后转为 ReplicaDeletionSuccessful → NonExistentReplica；(3) 所有副本删除完成后，Partition 从 OnlinePartition → NonExistentPartition。如果某个副本的 Broker 不可达，该副本转为 ReplicaDeletionIneligible，整个 Topic 的删除流程会被暂停（`TopicDeletionManager` 会持续重试），直到该 Broker 恢复上线或被手动标记为永久下线。\n\n## 三、体系化扩展延伸\n\n### 3.1 KIP-227：单线程事件模型\n\nKafka 2.2 之前，Controller 的状态机操作可能在多个线程中并发执行——ZooKeeper Watch 回调、定时任务、Admin API 请求各自在不同线程中触发状态转换，需要大量锁来保护共享的 ControllerContext。KIP-227（Kafka 2.2 引入）将 Controller 改为单线程事件队列模型：所有外部事件（Broker 注册/下线、Topic 创建/删除、ISR 变更）都被封装为 `ControllerEvent` 对象，投递到一个 `LinkedBlockingQueue` 中，由单独的 `ControllerEventThread` 按顺序逐个处理。这意味着 PartitionStateMachine 和 ReplicaStateMachine 的所有状态转换天然串行化，不再需要锁。\n\n在 controller.log 中你可以看到事件处理线程的踪迹：\n\n```\n[2024-06-10 10:15:02,340] DEBUG [Controller id=0] Processing event: TopicCreation(events)\n    queue.size=0 (kafka.controller.ControllerEventThread)\n```\n\n`queue.size` 表示事件队列当前积压量。如果这个值持续很大（比如上千），说明 Controller 事件处理出现瓶颈——常见原因是大规模 Broker 宕机导致上万个 Partition 同时需要选举，Controller 逐个处理耗时过长。Kafka 3.0 后 Controller 在批量选举上做了优化，将同一 Broker 上的多个 Partition 选举合并为一次批量 RPC 调用。\n\n### 3.2 Controller Failover 时状态机的恢复\n\n当 Controller 所在 Broker 宕机时，另一个 Broker 会通过 ZK 的 `/controller` 节点抢占成为新 Controller。新 Controller 上任后必须完整重建两台状态机的状态——它不能依赖旧 Controller 内存中的状态（已经丢失了），而是从 ZooKeeper 中读取所有元数据（`/brokers/topics/*`、`/brokers/ids/*`、各 Partition 的 state 节点）来重建 ControllerContext。\n\n重建完成后，新 Controller 扫描所有 Partition 和 Replica 的当前状态，对那些处于不正常状态的执行修复。比如，如果发现某些 Partition 处于 OfflinePartition（Leader 不可用），Controller 会尝试触发选举将它们恢复到 OnlinePartition。如果发现某些副本处于 ReplicaDeletionStarted 但删除未完成，Controller 会重试删除操作。这就是状态机的可恢复性——新 Controller 不需要知道旧 Controller 上次做到了哪一步，只需要根据当前状态决定下一步该做什么。\n\n### 3.3 KRaft 模式：从状态机到元数据日志\n\n在 KRaft 模式（Kafka 3.3+ Production Ready）下，Controller 不再依赖 ZooKeeper。集群元数据存储在内部 Topic `__cluster_metadata` 中，以 Raft log 的形式持久化。PartitionStateMachine 和 ReplicaStateMachine 的概念仍然存在于 Controller 的内存中，但状态变更的触发方式和持久化方式发生了根本变化：每次状态转换不再写 ZooKeeper 节点，而是作为一条元数据记录（Metadata Record）追加到 Raft log。常见的 Record 类型包括 `PartitionRecord`（记录 Partition 的 Leader、ISR、Epoch）和 `PartitionChangeRecord`（记录 Partition 状态变更）。\n\n新 Controller 上任后通过回放 `__cluster_metadata` 的 Raft log 重建状态，比从 ZooKeeper 读取元数据更快（顺序读 vs 大量随机读），在有数万 Partition 的大集群中 Controller Failover 时间可以从 ZK 模式的 30-60 秒缩短到几秒。\n\n### 3.4 调试状态机问题\n\n生产环境中排查状态机相关问题时，controller.log（不是 server.log）是第一手信息源。将 Controller 日志级别调到 DEBUG 可以看到每一次状态转换：\n\n```bash\n# 动态调整 Controller 日志级别（Kafka 2.4+）\n$ bin/kafka-configs.sh --bootstrap-server broker-0:9092 \\\n    --entity-type broker-loggers --entity-name 0 \\\n    --alter --add-config kafka.controller.PartitionStateMachine=DEBUG,kafka.controller.ReplicaStateMachine=DEBUG\n```\n\n另外，JMX 指标 `kafka.controller:type=KafkaController,name=OfflinePartitionsCount` 是最直接的健康指标——它持续大于 0 意味着有 Partition 卡在 OfflinePartition 状态。`kafka.controller:type=ControllerStats,name=TopicDeletionRateAndTimeMs` 可以监控 Topic 删除速率，如果有副本长期卡在 ReplicaDeletionIneligible 状态，Topic 删除会一直挂起。通过 `kafka-topics.sh --describe` 也可以看到 Partition 的 Leader、ISR、Replicas 信息，如果某个 Partition 的 Leader 显示为 -1 或者 none，说明它处于 OfflinePartition 状态。",
+      "keyPoints": [
+        "PartitionStateMachine 有 4 个状态（NonExistentPartition → NewPartition → OnlinePartition ↔ OfflinePartition），管理分区从创建、上线、故障到删除的完整生命周期",
+        "ReplicaStateMachine 有 7 个状态，其中 ReplicaDeletionStarted / ReplicaDeletionSuccessful / ReplicaDeletionIneligible 三个状态专门处理副本删除的中间态和异常重试",
+        "两台状态机在 Controller 事件线程中协调调用：Topic 创建时先分区 New 再副本 New 再分区 Online 再副本 Online；Broker 故障时先副本 Offline 再分区 Offline 再选举分区 Online",
+        "KIP-227（Kafka 2.2）将 Controller 改为单线程事件队列模型，PartitionStateMachine 和 ReplicaStateMachine 的所有状态转换天然串行化，不再需要锁",
+        "Controller Failover 后新 Controller 从 ZooKeeper（ZK 模式）或 __cluster_metadata Raft log（KRaft 模式）重建两台状态机的状态，根据当前状态决定下一步操作",
+        "Topic 删除时如果某副本所在 Broker 不可达，副本会卡在 ReplicaDeletionIneligible 状态，整个 Topic 删除流程被 TopicDeletionManager 暂停直到 Broker 恢复",
+        "KRaft 模式下状态变更以 Metadata Record（PartitionRecord / PartitionChangeRecord）形式写入 Raft log，Controller Failover 通过回放日志重建状态，比 ZK 模式显著更快",
+        "controller.log 的 DEBUG 级别可以看到每一次状态转换，OfflinePartitionsCount JMX 指标持续大于 0 是分区状态机异常的最直接信号"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-controller-state-machines-q1-quiz1",
+          "question": "PartitionStateMachine 定义了几个状态？",
+          "choices": [
+            {"id": "A", "text": "3 个：NewPartition、OnlinePartition、OfflinePartition"},
+            {"id": "B", "text": "4 个：NonExistentPartition、NewPartition、OnlinePartition、OfflinePartition"},
+            {"id": "C", "text": "5 个：NonExistentPartition、NewPartition、OnlinePartition、OfflinePartition、DeletingPartition"},
+            {"id": "D", "text": "7 个，与 ReplicaStateMachine 的状态数量相同"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PartitionStateMachine 有 4 个状态：NonExistentPartition（分区不存在）、NewPartition（已分配副本但未选举 Leader）、OnlinePartition（正常服务）、OfflinePartition（Leader 不可用）。没有独立的「DeletingPartition」状态——分区删除时直接从 OnlinePartition 或 OfflinePartition 转到 NonExistentPartition。选项 D 描述的 7 个状态是 ReplicaStateMachine 的，不是 PartitionStateMachine 的。"
+        },
+        {
+          "id": "kafka-controller-state-machines-q1-quiz2",
+          "question": "ReplicaStateMachine 中专门处理副本删除流程的三个状态是什么？",
+          "choices": [
+            {"id": "A", "text": "ReplicaDeletionPending、ReplicaDeletionRunning、ReplicaDeletionComplete"},
+            {"id": "B", "text": "ReplicaDeletionStarted、ReplicaDeletionSuccessful、ReplicaDeletionIneligible"},
+            {"id": "C", "text": "DeletingReplica、DeletedReplica、DeletionFailedReplica"},
+            {"id": "D", "text": "OfflineReplica、NonExistentReplica、ReplicaDeletionStarted"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ReplicaStateMachine 定义了三个与删除相关的状态：ReplicaDeletionStarted 表示 Controller 已发送 StopReplicaRequest 请求删除副本数据；ReplicaDeletionSuccessful 表示 Broker 确认删除成功，接下来转为 NonExistentReplica；ReplicaDeletionIneligible 表示删除失败（例如 Broker 宕机不可达），Controller 会在 Broker 恢复后重试。选项 D 中的 OfflineReplica 和 NonExistentReplica 虽然是真实状态，但它们不是专门为删除流程设计的。"
+        },
+        {
+          "id": "kafka-controller-state-machines-q1-quiz3",
+          "question": "Topic 创建时，PartitionStateMachine 和 ReplicaStateMachine 的状态转换顺序是什么？",
+          "choices": [
+            {"id": "A", "text": "副本 New → 副本 Online → 分区 New → 分区 Online"},
+            {"id": "B", "text": "分区 New → 分区 Online → 副本 New → 副本 Online"},
+            {"id": "C", "text": "分区 New → 副本 New → 分区 Online（选出 Leader）→ 副本 Online"},
+            {"id": "D", "text": "分区和副本的状态转换是并行的，没有固定顺序"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Topic 创建时的编排顺序是：先分区 NonExistent → New（在元数据中创建分区记录），再副本 NonExistent → New（在元数据中创建副本记录），然后分区 New → Online（执行初始 Leader 选举，确定 Leader 和 ISR），最后副本 New → Online（向各 Broker 发送 LeaderAndIsrRequest，副本开始工作）。分区必须先选出 Leader，副本才知道自己是 Leader 还是 Follower，所以这个顺序不能打乱。"
+        },
+        {
+          "id": "kafka-controller-state-machines-q1-quiz4",
+          "question": "当 Broker 宕机时，Controller 对其上的副本和分区状态处理的正确顺序是什么？",
+          "choices": [
+            {"id": "A", "text": "先分区 Online → Offline，再副本 Online → Offline"},
+            {"id": "B", "text": "先副本 Online → Offline（并从 ISR 中移除），再分区 Online → Offline，最后选举使分区回到 Online"},
+            {"id": "C", "text": "同时把分区和副本都标记为 Offline，然后统一处理"},
+            {"id": "D", "text": "只处理副本状态，分区状态由新 Leader 自动更新"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "顺序很关键：必须先把宕机 Broker 上的副本转为 OfflineReplica 并从 ISR 中移除——这样后续 Leader 选举算法才能基于正确的 ISR 列表工作。然后对那些 Leader 在宕机 Broker 上的分区标记为 OfflinePartition，最后执行选举恢复到 OnlinePartition。如果先处理分区再处理副本，选举算法可能会把已经宕机的副本选为 Leader（因为 ISR 还没更新）。"
+        },
+        {
+          "id": "kafka-controller-state-machines-q1-quiz5",
+          "question": "KIP-227 对 Controller 状态机处理模型做了什么关键改变？",
+          "choices": [
+            {"id": "A", "text": "引入了多线程并行处理状态转换，大幅提升 Controller 吞吐量"},
+            {"id": "B", "text": "将 Controller 改为单线程事件队列模型，所有状态转换在同一个 ControllerEventThread 中串行执行，消除了并发锁的需求"},
+            {"id": "C", "text": "将状态机逻辑从 Controller 移到每个 Broker 本地执行，减轻 Controller 负担"},
+            {"id": "D", "text": "用 Raft 协议替代了 ZooKeeper 来存储状态机状态"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "KIP-227（Kafka 2.2 引入）把 Controller 改为单线程事件队列模型。所有外部事件（Broker 上下线、Topic 创建删除、ISR 变更）被封装为 ControllerEvent 投递到 LinkedBlockingQueue，由唯一的 ControllerEventThread 按序处理。这让 PartitionStateMachine 和 ReplicaStateMachine 的所有转换天然串行化，不再需要锁保护 ControllerContext。选项 D 描述的是 KIP-500（KRaft），与 KIP-227 无关。"
+        },
+        {
+          "id": "kafka-controller-state-machines-q1-quiz6",
+          "question": "Topic 删除时，如果某个副本所在的 Broker 不可达，该副本会进入什么状态？",
+          "choices": [
+            {"id": "A", "text": "OfflineReplica，等待 Broker 恢复后再删除"},
+            {"id": "B", "text": "ReplicaDeletionStarted，一直等待 Broker 响应"},
+            {"id": "C", "text": "ReplicaDeletionIneligible，标记为暂时无法删除，Broker 恢复后 Controller 重试删除"},
+            {"id": "D", "text": "NonExistentReplica，直接标记为已删除跳过实际数据清理"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "当 Controller 向副本所在 Broker 发送 StopReplicaRequest 失败（Broker 宕机或网络不可达）时，该副本从 ReplicaDeletionStarted 转为 ReplicaDeletionIneligible。TopicDeletionManager 会暂停整个 Topic 的删除进度，等待该 Broker 恢复上线后重新将副本转为 ReplicaDeletionStarted 重试删除。这个设计保证了副本的本地日志数据一定会被清理，不会出现「元数据删了但磁盘上还残留数据」的不一致情况。"
+        },
+        {
+          "id": "kafka-controller-state-machines-q1-quiz7",
+          "question": "Controller Failover 后，新 Controller 如何恢复两台状态机的状态？",
+          "choices": [
+            {"id": "A", "text": "从旧 Controller 的持久化文件中读取状态快照"},
+            {"id": "B", "text": "ZK 模式下从 ZooKeeper 节点重建元数据并扫描当前状态，KRaft 模式下回放 __cluster_metadata Raft log 重建"},
+            {"id": "C", "text": "向所有 Broker 发送查询请求，收集每个 Partition 和 Replica 的实际状态"},
+            {"id": "D", "text": "等待所有 Partition 和 Replica 自行上报状态，被动重建"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "新 Controller 不依赖旧 Controller 的任何内存状态（已随进程消亡）。在 ZK 模式下，它从 ZooKeeper 读取所有元数据节点（/brokers/topics/*、/brokers/ids/* 等）重建 ControllerContext，然后扫描每个 Partition 和 Replica 的当前状态决定后续操作。在 KRaft 模式下，新 Controller 通过回放 __cluster_metadata 的 Raft log 重建状态，这是顺序读操作，比 ZK 模式的大量随机读更快。重建完成后，Controller 会自动修复异常状态，比如为 OfflinePartition 重新触发 Leader 选举。"
+        },
+        {
+          "id": "kafka-controller-state-machines-q1-quiz8",
+          "question": "OnlinePartition 状态可以转换到自身（自转换），以下哪种场景会触发这种自转换？",
+          "choices": [
+            {"id": "A", "text": "ISR 列表发生收缩，有 Follower 被踢出 ISR"},
+            {"id": "B", "text": "Preferred Replica Election 或 Reassignment Election，Partition 保持 Online 但 Leader 发生切换"},
+            {"id": "C", "text": "Producer 向 Leader 写入了新消息"},
+            {"id": "D", "text": "Follower 副本追上 Leader 重新加入 ISR"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "OnlinePartition → OnlinePartition 的自转换发生在 Partition 保持在线但 Leader 需要切换的场景。典型触发条件是 Preferred Replica Election（将 Leader 切回 Preferred Replica 实现负载均衡）和 Reassignment Election（分区重分配后在新副本集合中选 Leader）。ISR 收缩和扩展不改变 Partition 的状态机状态，它们只修改 ISR 列表元数据。Producer 写入和 Follower 追赶是正常数据面操作，不涉及状态机转换。"
+        },
+        {
+          "id": "kafka-controller-state-machines-q1-quiz9",
+          "question": "在 KRaft 模式下，状态机的状态变更以什么方式持久化？",
+          "choices": [
+            {"id": "A", "text": "写入 ZooKeeper 节点，与 ZK 模式相同"},
+            {"id": "B", "text": "以 Metadata Record（如 PartitionRecord、PartitionChangeRecord）形式追加到 __cluster_metadata Topic 的 Raft log 中"},
+            {"id": "C", "text": "写入 Controller 本地磁盘的 state.checkpoint 文件"},
+            {"id": "D", "text": "不持久化，全部保存在内存中，依赖 Broker 间的状态同步"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "KRaft 模式彻底去除了 ZooKeeper 依赖。Controller 的每次状态变更（Leader 切换、ISR 变更、Topic 创建/删除等）都生成对应的 Metadata Record，追加到 __cluster_metadata 内部 Topic 的 Raft log 中。常见的 Record 类型包括 PartitionRecord（完整分区元数据）和 PartitionChangeRecord（分区增量变更）。新 Controller 上任后回放这些日志即可重建完整状态，比 ZK 模式的元数据重建快得多。"
+        },
+        {
+          "id": "kafka-controller-state-machines-q1-quiz10",
+          "question": "以下哪项不是合法的 PartitionStateMachine 状态转换？",
+          "choices": [
+            {"id": "A", "text": "NewPartition → OnlinePartition"},
+            {"id": "B", "text": "OfflinePartition → OnlinePartition"},
+            {"id": "C", "text": "OfflinePartition → NewPartition"},
+            {"id": "D", "text": "OnlinePartition → OfflinePartition"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "PartitionStateMachine 的合法转换路径是严格定义的。OfflinePartition 只能转换到 OnlinePartition（通过 Leader 选举恢复）或 NonExistentPartition（Topic 删除），不能回退到 NewPartition。NewPartition 是 Topic 创建时的中间态，表示「副本已分配但 Leader 还未选出」，一旦分区上线后就不会再经历这个状态。如果 Controller 收到了 OfflinePartition → NewPartition 的转换请求，会直接拒绝并在 controller.log 中记录 ERROR 级别的非法转换日志。"
+        }
+      ],
+      "references": [
+        "Apache Kafka Source: kafka.controller.PartitionStateMachine — 分区状态机实现（4 个状态及转换逻辑）",
+        "Apache Kafka Source: kafka.controller.ReplicaStateMachine — 副本状态机实现（7 个状态及转换逻辑）",
+        "KIP-227: Introduce single-threaded event handler for controller: https://cwiki.apache.org/confluence/display/KAFKA/KIP-227",
+        "KIP-500: Replace ZooKeeper with a Self-Managed Metadata Quorum (KRaft): https://cwiki.apache.org/confluence/display/KAFKA/KIP-500",
+        "Apache Kafka Documentation — Controller Internals: https://kafka.apache.org/documentation/#design_replicamanagment"
+      ]
+    }
+  ]
+}
