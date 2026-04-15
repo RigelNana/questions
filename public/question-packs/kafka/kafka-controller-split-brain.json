@@ -1,0 +1,157 @@
+{
+  "id": "kafka-controller-split-brain",
+  "name": "Controller 脑裂防护",
+  "domain": "kafka",
+  "description": "深入解析 Kafka 通过 Controller Epoch 防止脑裂的 Fencing 机制与实战排查",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-controller-split-brain-q1",
+      "domain": "kafka",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["Kafka", "脑裂", "Split Brain", "Controller Epoch", "Fencing"],
+      "title": "如何防止 Controller 脑裂(Split Brain)？",
+      "content": "你们团队运维一个 Kafka 2.8 集群，5 台 Broker 使用 ZooKeeper 做协调。周五晚高峰期间，运维同事在 Grafana 上发现一个诡异的现象——`kafka.controller:type=KafkaController,name=ActiveControllerCount` 指标出现了异常：Broker 2 和 Broker 4 的这个值同时为 1，持续了大约 12 秒后恢复正常。与此同时，有几个 Consumer Group 报了短暂的 `NOT_CONTROLLER` 错误，部分 Topic 的 Partition Leader 选举出现了延迟。\n\n你登上 Broker 2 查看 controller.log，看到以下日志：\n\n```\n[2024-06-14 19:32:17,845] INFO [Controller id=2] Processing automatic preferred leader election (kafka.controller.KafkaController)\n[2024-06-14 19:32:18,102] WARN [Controller id=2] Epoch 47 is not valid since current controller epoch is 48. Resigning as controller (kafka.controller.KafkaController)\n[2024-06-14 19:32:18,103] INFO [Controller id=2] Resigned as active controller. New epoch is 48 (kafka.controller.KafkaController)\n```\n\n再看 Broker 4 的 server.log：\n\n```\n[2024-06-14 19:32:06,231] INFO [Controller id=4] Successfully elected as the controller. Epoch incremented to 48 (kafka.controller.KafkaController)\n[2024-06-14 19:32:06,289] INFO [Controller id=4] Starting partition state machine (kafka.controller.KafkaController)\n```\n\n同时在部分普通 Broker 的 server.log 中可以看到：\n\n```\n[2024-06-14 19:32:17,901] WARN [Broker id=3] Ignoring LeaderAndIsr request from controller 2 with epoch 47 since current controller epoch is 48 (kafka.server.KafkaApis)\n```\n\n从时间线来看，Broker 4 在 19:32:06 就已经当选为新 Controller（epoch=48），但 Broker 2 在 19:32:17 还试图以旧 epoch=47 发送 Controller 指令，中间有大约 11 秒的重叠期。\n\n事后你检查了 Broker 2 的 GC 日志，发现在 19:32:04 到 19:32:15 期间有一次长达 11 秒的 Full GC 停顿：\n\n```\n[2024-06-14 19:32:04,112] [GC (Allocation Failure) -- 3847M->3847M(4096M), 11.023 secs]\n[2024-06-14 19:32:15,135] [Full GC (Allocation Failure) 3847M->1923M(4096M), 6.700 secs]\n```\n\n现在问题来了：在这 11 秒的「双 Controller」窗口期内，集群是怎么保证数据不出问题的？Kafka 是通过什么机制防止旧 Controller 的过期指令被执行的？如果没有这套防护机制，最坏情况下会发生什么？你会怎么从根本上避免这类问题再次发生？",
+      "answer": "## 一、脑裂与分布式 Fencing 基础\n\n### 1.1 什么是脑裂\n\n脑裂（Split Brain）是分布式系统中最危险的故障模式之一。它指的是一个集群中本应只有一个 Leader/Master 的组件，由于网络分区或进程假死等原因，出现了两个节点同时认为自己是 Leader 的局面。这就像一家公司同时出现了两个 CEO，各自给员工下达互相矛盾的指令——结果必然是混乱。\n\n在 Kafka 的语境下，脑裂具体指的是两个 Broker 同时认为自己是 Controller 并向集群发送控制指令的状态。Controller 负责的工作包括分区 Leader 选举（通过 LeaderAndIsrRequest）、元数据广播（UpdateMetadataRequest）、副本停止（StopReplicaRequest）等——这些都是影响全局数据一致性的关键操作。如果两个 Controller 同时工作，一个说「Partition-0 的 Leader 是 Broker 3」，另一个说「Partition-0 的 Leader 是 Broker 5」，Producer 就会向不同 Broker 写入数据，造成数据分叉甚至丢失。\n\n### 1.2 Kafka 中脑裂是怎么发生的\n\n理解脑裂的成因需要先理解 Controller 选举的机制。在 ZooKeeper 模式下，Controller 通过在 ZK 上创建临时节点 `/controller` 来「宣示主权」。临时节点的生命周期与 ZooKeeper Session 绑定——如果 Controller 所在 Broker 与 ZooKeeper 的心跳中断超过 `zookeeper.session.timeout.ms`（默认 18000ms），ZooKeeper 就会删除这个临时节点，触发新一轮选举。\n\n问题在于，Session 超时不等于进程死亡。最典型的场景就是题目中出现的 JVM Full GC 停顿：Broker 2 作为 Controller 正常运行着，突然遭遇一次长时间的 Stop-The-World GC。在 GC 期间，所有 Java 线程被冻结，包括与 ZooKeeper 通信的心跳线程。ZooKeeper 等了 18 秒没收到心跳，判定 Session 过期，删除 `/controller` 节点。其他 Broker 收到 Watch 通知后竞选，Broker 4 成为新 Controller（epoch 从 47 递增到 48）。然而当 Broker 2 的 GC 结束后，它的 JVM 恢复运行，它的内存状态还停留在「我是 Controller，epoch=47」，于是继续发送控制指令——脑裂就这样发生了。\n\n这种场景在生产中并不罕见。除了 GC 停顿，还有网络闪断（Broker 和 ZooKeeper 之间的交换机重启）、操作系统层面的调度延迟（cgroup 限制导致的 CPU throttle）等都能触发类似情况。\n\n## 二、Controller Epoch：Kafka 的 Fencing 机制\n\n### 2.1 Epoch 的本质是 Fencing Token\n\n分布式系统领域有一个经典的解决脑裂的设计模式叫 Fencing（隔离/击剑），核心思想是给每一任 Leader 分配一个全局单调递增的编号（Fencing Token），所有执行节点在接受指令前先比对编号——只接受编号不小于自己已知最新编号的指令，拒绝一切过期编号。\n\nKafka 的 `controller.epoch` 就是这个 Fencing Token。它存储在 ZooKeeper 的 `/controller_epoch` 持久节点中（注意是持久节点，不会因为 Session 过期而被删除），值是一个从 1 开始单调递增的整数。你可以在 ZooKeeper Shell 中直接查看：\n\n```bash\n$ bin/zookeeper-shell.sh zk-1:2181\nget /controller_epoch\n48\ncZxid = 0x100000005\nctime = Mon Jan 08 10:00:00 CST 2024\nmZxid = 0x300000147\nmtime = Fri Jun 14 19:32:06 CST 2024\npZxid = 0x100000005\ncversion = 0\ndataVersion = 47        # 被修改了 47 次，从初始值 1 递增到 48\naversion = 0\nephemeralOwner = 0x0    # 注意是 0x0，说明是持久节点\ndataLength = 2\nnumChildren = 0\n```\n\n`dataVersion = 47` 表示这个节点的值被更新了 47 次（从 1 到 48，共 47 次递增），`ephemeralOwner = 0x0` 说明它是持久节点，不会因为任何 Broker 宕机而丢失。\n\n### 2.2 Epoch 的递增与 ZooKeeper 条件更新\n\n新 Controller 当选后做的第一件事不是发送控制指令，而是递增 `/controller_epoch`。这个递增操作使用了 ZooKeeper 的条件更新（Conditional Update，也就是 `setData` 时带上 `expectedVersion`）来保证原子性。流程是：新 Controller 先读取 `/controller_epoch` 的当前值和版本号，然后调用 `setData(\"/controller_epoch\", newEpoch, expectedVersion)`——如果版本号不匹配（说明有另一个节点已经修改过），更新会失败，新 Controller 就知道自己可能不是唯一的当选者。\n\n用伪代码表示这个过程：\n\n```java\n// KafkaController.scala 中 onControllerFailover() 的核心逻辑\ndef onControllerFailover(): Unit = {\n  // 第一步：读取当前 epoch 及其 ZK stat（包含 version）\n  val (currentEpoch, stat) = zkClient.getControllerEpoch()\n  \n  // 第二步：用条件更新递增 epoch（版本号必须匹配）\n  val newEpoch = currentEpoch + 1\n  zkClient.setControllerEpoch(newEpoch, stat.getVersion)\n  // 如果 stat.getVersion 不匹配 → 抛异常 → 放弃 Controller 角色\n  \n  controllerContext.epoch = newEpoch\n  controllerContext.epochZkVersion = stat.getVersion + 1\n  \n  // 第三步：epoch 递增成功后，才开始初始化状态机和发送指令\n  initializeControllerContext()\n  partitionStateMachine.startup()\n  replicaStateMachine.startup()\n}\n```\n\n关键点在于：epoch 递增必须在发送任何控制指令之前完成。如果 epoch 递增失败，新 Controller 直接放弃角色。这保证了一旦有指令被发出，它携带的 epoch 一定是全局最新的。\n\n### 2.3 Broker 端的 Epoch 校验\n\n防御的另一半在 Broker 端。每个 Broker 在内存中维护一个 `controllerEpoch` 字段，记录它见过的最大 epoch 值。当 Broker 收到 Controller 发来的请求时，处理逻辑如下：\n\n```\n收到请求(requestEpoch)\n  ├─ requestEpoch > localEpoch → 接受请求，更新 localEpoch = requestEpoch\n  ├─ requestEpoch == localEpoch → 接受请求\n  └─ requestEpoch < localEpoch → 拒绝请求，返回 STALE_CONTROLLER_EPOCH 错误\n```\n\n回到题目中的场景，完整的时间线是这样的：19:32:04 Broker 2（Controller，epoch=47）进入 Full GC，所有线程冻结。19:32:06 由于 ZooKeeper Session 超时（在此之前已经有一段时间心跳丢失），Broker 4 竞选成功，递增 epoch 到 48，开始向所有 Broker 发送 epoch=48 的 UpdateMetadataRequest。所有 Broker 将本地 `controllerEpoch` 更新为 48。19:32:15 Broker 2 的 GC 结束，JVM 恢复运行。Broker 2 不知道自己已经「下台」，继续以 epoch=47 发送 LeaderAndIsrRequest。19:32:17 Broker 3 收到 Broker 2 的请求，比对 epoch：47 < 48，直接拒绝并返回 `STALE_CONTROLLER_EPOCH`。19:32:18 Broker 2 收到拒绝响应，意识到自己不再是 Controller，执行 resign 逻辑，清理内部状态。\n\n从数据一致性的角度看，那 11 秒的「双 Controller」窗口期内，旧 Controller 的所有指令都被 Broker 端的 epoch 校验拦截了——没有任何一条过期指令被执行。这就是 Fencing 机制的精髓：不依赖旧 Leader 自己「意识到下台」，而是让所有执行者主动拒绝过期指令。\n\n### 2.4 如果没有 Epoch 会怎样\n\n假设 Kafka 没有 epoch 机制，上面这个场景的后果可能是灾难性的。Broker 2 的 GC 结束后继续发送 LeaderAndIsrRequest，指令中可能包含基于旧元数据的 Leader 分配——比如它认为 Broker 5 是某个 Partition 的 ISR 成员，但实际上 Broker 5 早已被新 Controller 从 ISR 中移除。如果这条指令被执行，可能导致一个数据落后的副本被选为 Leader，造成已提交消息的丢失（数据截断）。更严重的情况是两个 Controller 同时对同一个 Partition 指定不同的 Leader，Producer 向两个 Leader 写入不同的数据，形成数据分叉，后续合并几乎不可能。\n\n## 三、体系化扩展：从 ZK Epoch 到 KRaft Fencing\n\n### 3.1 KRaft 模式的改进：Raft Term 替代 ZK Epoch\n\n在 Kafka 3.3+ 的 KRaft 模式下，Fencing 机制从 ZooKeeper 的 `controller.epoch` 演变为 Raft 协议原生的 Term 概念。每次 Raft Leader 选举都会递增 Term，所有元数据日志条目都带上 Term 编号，Follower 只接受 Term 不低于自己当前 Term 的请求。原理与 ZK epoch 一致，但有两个显著优势：第一，不再依赖外部 ZooKeeper 做条件更新，减少了一个网络 round-trip 和一个外部故障点；第二，Raft 的 Leader Lease 机制可以让旧 Leader 更快地感知到自己已经失去领导权——如果它在一个 election timeout 内没有收到多数节点的心跳确认，就会自动 step down，而不是像 ZK 模式那样要等到某个 Broker 用 `STALE_CONTROLLER_EPOCH` 明确告知。\n\n### 3.2 Broker Epoch：Broker 级别的 Fencing\n\nKafka 2.0（KIP-380）引入了 `broker.epoch`，解决的是另一个维度的脑裂问题——Broker 层面的身份混淆。场景是这样的：Broker 3 宕机后快速重启，Controller 可能还持有旧 Broker 3 的连接状态，同时新 Broker 3 也注册上来了。`broker.epoch` 为每次 Broker 注册分配一个单调递增的 epoch，Controller 发给 Broker 的 StopReplicaRequest 等指令会携带目标 Broker 的 epoch，如果 epoch 不匹配，Broker 会拒绝执行。这与 `controller.epoch` 形成了双层 Fencing 保护：Controller 级别用 `controller.epoch` 防止僵尸 Controller，Broker 级别用 `broker.epoch` 防止指令发给错误的 Broker 实例。\n\n### 3.3 生产环境防护与监控\n\n从根本上避免题目中这类 GC 引发脑裂的方法，首先是优化 JVM GC 配置。Kafka 官方推荐使用 G1GC，关键参数包括：\n\n```properties\n# kafka-server-start.sh 中的 JVM 参数\nexport KAFKA_HEAP_OPTS=\"-Xms6g -Xmx6g\"\nexport KAFKA_JVM_PERFORMANCE_OPTS=\"-server -XX:+UseG1GC \\\n  -XX:MaxGCPauseMillis=20 \\\n  -XX:InitiatingHeapOccupancyPercent=35 \\\n  -XX:G1HeapRegionSize=16M \\\n  -XX:MetaspaceSize=96m\"\n```\n\n`MaxGCPauseMillis=20` 告诉 G1 尽量把每次 GC 停顿控制在 20ms 以内。如果你发现 Full GC 频繁出现，通常意味着堆内存不够或者存在内存泄漏，需要用 `jmap -histo` 或 async-profiler 排查。\n\n其次是合理设置 `zookeeper.session.timeout.ms`。默认 18 秒在大多数场景下是合理的，但如果你的 Broker JVM 经常出现超过 18 秒的 GC 停顿，要么增大这个值（代价是 Controller 故障转移变慢），要么解决 GC 问题本身。一个经验公式是：`zookeeper.session.timeout.ms` 应该大于最坏情况下的 GC 停顿时间至少 2-3 倍。\n\n监控方面，除了 `ActiveControllerCount` 之外，还需要关注以下 JMX 指标：\n\n```\n# Controller 选举频率——如果这个值在短时间内快速增长，说明 Controller 在频繁切换\nkafka.controller:type=ControllerStats,name=UncleanLeaderElectionsPerSec\n\n# 控制器事件队列积压——如果积压严重，Controller 可能过载\nkafka.controller:type=ControllerStats,name=ControllerEventQueueSize\n```\n\n一个实用的 Prometheus 告警规则：\n\n```yaml\n- alert: KafkaMultipleActiveControllers\n  expr: sum(kafka_controller_kafkacontroller_activecontrollercount) > 1\n  for: 10s\n  labels:\n    severity: critical\n  annotations:\n    summary: \"检测到多个 Active Controller，可能存在脑裂\"\n```\n\n### 3.4 与其他系统 Fencing 机制的对比\n\n脑裂防护不是 Kafka 独有的问题，几乎所有分布式系统都面临类似挑战。etcd 使用 Raft Term + Lease 机制——Leader 持有一个有时限的 Lease，Lease 过期后 Leader 自动 step down，比被动等待 Fencing 更主动。Consul 使用 Session 机制——Session 关联到 KV 中的锁，Session 失效时锁自动释放，与 ZK 临时节点类似但基于 Gossip 协议做故障检测。Redis Sentinel 在进行主从切换时使用 Configuration Epoch——每次 failover 递增 epoch，Sentinel 只执行 epoch 最新的切换指令，与 Kafka 的 controller.epoch 如出一辙。这些系统的核心思想完全一致：用单调递增的编号作为 Fencing Token，让执行者自主判断指令的有效性，而不是依赖旧 Leader 的自觉性。\n\n理解了 Fencing Token 这个通用模式，你会发现它在数据库的 Write-Ahead Log 里也有体现（LSN 序号保证日志顺序）、在 Kubernetes 的 ResourceVersion 里也有体现（乐观锁防止并发更新冲突）。分布式系统中几乎所有需要「保证唯一领导权」的场景都离不开这个模式。",
+      "keyPoints": [
+        "脑裂（Split Brain）指两个节点同时认为自己是 Leader 并发出互相矛盾的控制指令，在 Kafka 中表现为两个 Broker 同时以 Controller 身份发送 LeaderAndIsr/UpdateMetadata 请求",
+        "controller.epoch 是存储在 ZooKeeper /controller_epoch 持久节点中的单调递增整数，充当 Fencing Token——新 Controller 当选后第一件事是递增 epoch，在发送任何指令之前完成",
+        "新 Controller 通过 ZooKeeper 的 setData 条件更新（携带 expectedVersion）递增 epoch，保证多个竞选者只有一个能成功递增，避免并发冲突",
+        "所有 Broker 在内存中维护已知的最大 controllerEpoch，收到请求时比对 epoch——小于本地值的请求直接拒绝并返回 STALE_CONTROLLER_EPOCH 错误",
+        "最典型的脑裂触发场景是 JVM Full GC 停顿超过 zookeeper.session.timeout.ms，导致旧 Controller 的 ZK Session 过期、新 Controller 当选，但旧 Controller GC 恢复后仍以旧 epoch 发送指令",
+        "KRaft 模式（Kafka 3.3+）用 Raft 协议的 Term 替代 ZK epoch，减少外部依赖且通过 Leader Lease 让旧 Leader 更快感知失权",
+        "Kafka 2.0 引入 broker.epoch（KIP-380）形成双层 Fencing：controller.epoch 防止僵尸 Controller，broker.epoch 防止指令发给错误的 Broker 实例",
+        "生产环境防护的关键是优化 JVM GC（G1GC + MaxGCPauseMillis=20）、合理设置 zookeeper.session.timeout.ms、并通过 ActiveControllerCount 指标告警检测异常"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-controller-split-brain-q1-quiz1",
+          "question": "什么是分布式系统中的「脑裂」问题？",
+          "choices": [
+            {"id": "A", "text": "集群中所有节点同时宕机，导致服务完全不可用"},
+            {"id": "B", "text": "两个或多个节点同时认为自己是 Leader，各自独立做出互相矛盾的决策"},
+            {"id": "C", "text": "数据在主从复制过程中出现延迟，导致读到旧数据"},
+            {"id": "D", "text": "网络分区导致集群分成两半，但每半都能正确选出唯一的 Leader"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "脑裂的核心定义是「多个节点同时认为自己是 Leader」并各自做出决策——这才是脑裂的危险所在。A 描述的是全集群故障，不是脑裂。C 描述的是主从复制延迟（replication lag），这是正常现象不是脑裂。D 描述的网络分区如果每半都「正确」选出了唯一 Leader，其实就是脑裂——但选项说「正确选出唯一 Leader」有暗示「没问题」的意思，容易误导。真正的问题在于两个 Leader 同时存在并做出矛盾决策。"
+        },
+        {
+          "id": "kafka-controller-split-brain-q1-quiz2",
+          "question": "Kafka 的 controller.epoch 存储在 ZooKeeper 的什么类型的节点中？",
+          "choices": [
+            {"id": "A", "text": "临时节点（ephemeral node），与 Controller 的 ZK Session 绑定"},
+            {"id": "B", "text": "持久节点（persistent node），不会因为任何 Broker 宕机而消失"},
+            {"id": "C", "text": "临时顺序节点（ephemeral sequential node），用于排队选举"},
+            {"id": "D", "text": "持久顺序节点（persistent sequential node），按创建顺序递增"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "controller.epoch 存储在 /controller_epoch 持久节点中，ephemeralOwner 为 0x0。这是一个关键设计——如果 epoch 存在临时节点中，Controller 宕机时 epoch 也会被删除，新 Controller 就无法知道上一任的 epoch 是多少，Fencing 机制就失效了。A 描述的临时节点是 /controller 节点的类型，用于 Controller 身份标识，跟 epoch 节点不同。C 和 D 的顺序节点在 Controller 选举中没有使用。"
+        },
+        {
+          "id": "kafka-controller-split-brain-q1-quiz3",
+          "question": "新 Controller 当选后，递增 epoch 的操作为什么要使用 ZooKeeper 的条件更新（Conditional Update）？",
+          "choices": [
+            {"id": "A", "text": "条件更新比普通更新性能更好，可以减少 ZooKeeper 的 IO 压力"},
+            {"id": "B", "text": "条件更新会在 ZK 集群的所有节点上加锁，保证全局互斥"},
+            {"id": "C", "text": "条件更新通过版本号校验保证原子性——如果有其他节点已经修改了 epoch，更新会失败，防止多个节点同时递增"},
+            {"id": "D", "text": "条件更新可以在 ZK 不可用时回退到本地更新，提高可用性"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "条件更新（setData 带 expectedVersion）的核心目的是防止并发冲突。假设两个 Broker 几乎同时当选并都尝试将 epoch 从 47 递增到 48——如果使用普通 setData，两个都可能成功，导致两个 Controller 持有相同的 epoch，Fencing 机制就失效了。条件更新确保只有一个能成功，另一个因版本号不匹配而失败。A 关于性能的说法是错误的，条件更新实际上多了一次版本校验。B 描述的全局加锁不是 ZK 条件更新的机制。D 也是错误的，条件更新依赖 ZK 可用性，不存在本地回退。"
+        },
+        {
+          "id": "kafka-controller-split-brain-q1-quiz4",
+          "question": "当 Broker 收到一个 Controller 请求，发现请求中的 epoch 小于本地记录的 epoch 时，会返回什么错误？",
+          "choices": [
+            {"id": "A", "text": "UNKNOWN_CONTROLLER_ID，表示不认识这个 Controller"},
+            {"id": "B", "text": "STALE_CONTROLLER_EPOCH，表示请求携带的 epoch 已过期"},
+            {"id": "C", "text": "CONTROLLER_NOT_AVAILABLE，表示集群当前没有可用的 Controller"},
+            {"id": "D", "text": "INVALID_REQUEST，表示请求格式不合法"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 为这种情况专门定义了错误码 STALE_CONTROLLER_EPOCH，语义非常明确——请求中的 controller epoch 已经过期。旧 Controller 收到这个错误后会执行 resign 逻辑，清理内部状态。A 的 UNKNOWN_CONTROLLER_ID 不存在于 Kafka 错误码中。C 的 CONTROLLER_NOT_AVAILABLE 表示集群当前没有 Controller（比如选举过程中），而非 epoch 过期。D 的 INVALID_REQUEST 用于请求格式错误，跟 epoch 校验无关。"
+        },
+        {
+          "id": "kafka-controller-split-brain-q1-quiz5",
+          "question": "题目场景中 Broker 2 在 GC 恢复后继续发送 epoch=47 的指令，其他 Broker 已经接受了 epoch=48。在这 11 秒的「双 Controller」窗口期内，以下哪种情况最准确？",
+          "choices": [
+            {"id": "A", "text": "Broker 2 的所有指令都被其他 Broker 拒绝，不会造成任何数据不一致"},
+            {"id": "B", "text": "部分 Broker 可能还没收到 epoch=48 的消息，会接受 Broker 2 的旧指令"},
+            {"id": "C", "text": "Broker 2 的指令会被排队等待，等到它自己更新 epoch 后再执行"},
+            {"id": "D", "text": "ZooKeeper 会主动通知 Broker 2 它已经不是 Controller，阻止它发送指令"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Broker 4 在 19:32:06 当选后立刻向所有 Broker 发送了 epoch=48 的 UpdateMetadataRequest，所有 Broker 已经将本地 controllerEpoch 更新为 48。Broker 2 在 19:32:15 GC 恢复后发送的 epoch=47 指令到达任何 Broker 时都会被拒绝。B 选项描述的「部分 Broker 还没收到 epoch=48」理论上有可能发生，但新 Controller 的第一步就是广播 UpdateMetadata，时间窗口非常短。C 描述的排队机制不存在，过期指令直接拒绝。D 是错误的，ZooKeeper 不会主动推送通知，Broker 2 在 GC 期间线程冻结也无法接收任何通知。"
+        },
+        {
+          "id": "kafka-controller-split-brain-q1-quiz6",
+          "question": "以下哪种场景不会触发 Controller 脑裂风险？",
+          "choices": [
+            {"id": "A", "text": "Controller 所在 Broker 发生长时间 Full GC，超过 ZK Session 超时时间"},
+            {"id": "B", "text": "Controller 与 ZooKeeper 之间的网络闪断超过 Session 超时时间"},
+            {"id": "C", "text": "Controller 所在 Broker 正常处理了一个耗时 30 秒的大批量 Topic 创建请求"},
+            {"id": "D", "text": "Controller 所在 Broker 被 cgroup 限制导致 CPU 被严重 throttle"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Topic 创建请求虽然耗时长，但这属于 Kafka 的应用层逻辑，ZooKeeper 心跳线程独立运行不受影响，Session 不会超时。A 中 Full GC 冻结所有 Java 线程包括 ZK 心跳线程，会导致 Session 超时。B 中网络闪断直接导致心跳无法到达 ZooKeeper。D 中 CPU throttle 可能导致所有线程调度延迟，包括心跳线程，严重时也会导致 Session 超时。这三种情况都可能触发旧 Controller 被判定失效而自己不知道。"
+        },
+        {
+          "id": "kafka-controller-split-brain-q1-quiz7",
+          "question": "KRaft 模式相比 ZooKeeper 模式，在防止脑裂方面有什么改进？",
+          "choices": [
+            {"id": "A", "text": "KRaft 完全消除了脑裂的可能性，因为 Raft 协议天然不存在 Leader 重叠"},
+            {"id": "B", "text": "KRaft 用 Raft Term 替代 ZK epoch，同时 Leader Lease 机制让旧 Leader 更快感知失权，减少脑裂窗口期"},
+            {"id": "C", "text": "KRaft 模式下不需要 Fencing Token，因为所有决策都通过多数投票完成"},
+            {"id": "D", "text": "KRaft 通过加密签名验证 Controller 身份，比 epoch 数字更安全"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "KRaft 并没有完全消除脑裂的可能性（旧 Leader 在网络隔离期间仍可能短暂不知道自己失去领导权），但它通过两个机制显著缩短了脑裂窗口：第一，Raft Term 替代 ZK epoch，减少外部依赖；第二，Raft 的 Leader Lease 让旧 Leader 在一个 election timeout 内无法收到多数节点确认时主动 step down，而不是被动等待 STALE_CONTROLLER_EPOCH。A 夸大了 Raft 的能力。C 错误，Raft 协议依然需要 Term 作为 Fencing Token。D 编造了不存在的机制。"
+        },
+        {
+          "id": "kafka-controller-split-brain-q1-quiz8",
+          "question": "生产环境中你发现 Prometheus 告警 sum(kafka_controller_kafkacontroller_activecontrollercount) == 0 持续 30 秒。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "所有 Broker 都宕机了，集群完全不可用"},
+            {"id": "B", "text": "ZooKeeper 不可用或所有 Broker 与 ZK 的连接都中断，无法完成 Controller 选举"},
+            {"id": "C", "text": "脑裂正在发生，两个 Controller 互相冲突导致都放弃了角色"},
+            {"id": "D", "text": "这是正常的 Controller 选举过渡期，不需要关注"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ActiveControllerCount 全为 0 意味着集群中没有任何 Broker 认为自己是 Controller。最常见的原因是 ZooKeeper 不可用——所有 Broker 无法连接 ZK 就无法创建 /controller 临时节点，选举无法完成。A 不完全准确，即使 Broker 进程在运行但无法连接 ZK 也会出现这种情况。C 中脑裂的表现是 ActiveControllerCount > 1 而不是 0。D 是错误的，正常选举过渡期通常在几秒内完成，持续 30 秒的无 Controller 状态一定是异常。"
+        },
+        {
+          "id": "kafka-controller-split-brain-q1-quiz9",
+          "question": "Kafka 2.0 引入的 broker.epoch（KIP-380）解决的是什么问题？",
+          "choices": [
+            {"id": "A", "text": "替代 controller.epoch，成为新的 Controller 级别 Fencing 机制"},
+            {"id": "B", "text": "防止 Broker 快速重启后，Controller 将指令发给错误的 Broker 实例（旧连接的残留）"},
+            {"id": "C", "text": "记录 Broker 的启动次数，用于集群健康统计和报表"},
+            {"id": "D", "text": "控制 Broker 之间副本同步的顺序，防止乱序写入"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "broker.epoch 解决的是 Broker 级别的身份混淆问题。当 Broker 宕机后快速重启，Controller 可能还持有旧 Broker 实例的连接信息，同时新实例也注册上来了。Controller 发送的 StopReplicaRequest 等指令携带目标 Broker 的 epoch，如果 epoch 不匹配则拒绝执行，避免指令被错误的实例处理。A 错误，broker.epoch 与 controller.epoch 是两个独立的 Fencing 层级，各自解决不同维度的问题。C 纯属编造的用途。D 描述的副本同步顺序由 HW/LEO 机制控制，跟 broker.epoch 无关。"
+        },
+        {
+          "id": "kafka-controller-split-brain-q1-quiz10",
+          "question": "为了从根本上减少 JVM Full GC 导致 Controller 脑裂的风险，以下哪个 JVM 参数配置最为关键？",
+          "choices": [
+            {"id": "A", "text": "-XX:+UseSerialGC，使用串行 GC 减少线程开销"},
+            {"id": "B", "text": "-XX:+UseG1GC 配合 -XX:MaxGCPauseMillis=20，将 GC 停顿目标控制在 20ms"},
+            {"id": "C", "text": "-XX:+DisableExplicitGC，禁止显式调用 System.gc()"},
+            {"id": "D", "text": "-XX:NewRatio=1，将新生代和老年代设为 1:1 比例"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "G1GC 是 Kafka 官方推荐的垃圾回收器，MaxGCPauseMillis=20 告诉 G1 尽量将每次 GC 停顿控制在 20ms——远低于 zookeeper.session.timeout.ms 的默认 18 秒，从根本上避免了 GC 停顿触发 ZK Session 超时的问题。A 中的 SerialGC 是单线程 GC，停顿时间更长，会加剧脑裂风险。C 中禁止显式 GC 只能阻止代码中手动调用 System.gc()，对自动触发的 Full GC 无效。D 中调整 NewRatio 影响的是内存分配比例，不能直接控制 GC 停顿时间上限。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#brokerconfigs_controller.epoch",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-380%3A+Detect+outdated+control+requests+and+bounced+brokers+using+broker+generation",
+        "https://kafka.apache.org/documentation/#kraft",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-631%3A+The+Quorum-based+Kafka+Controller"
+      ]
+    }
+  ]
+}
