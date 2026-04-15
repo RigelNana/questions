@@ -1,0 +1,158 @@
+{
+  "id": "kafka-replica-osr-rejoin-isr",
+  "name": "OSR 与 Follower 重新加入 ISR 机制",
+  "domain": "kafka",
+  "description": "深入解析 Out-of-Sync Replicas 的成因及 Follower 副本重新追上并加入 ISR 的完整流程",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-replica-osr-rejoin-isr-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Kafka", "OSR", "ISR", "副本同步", "Follower恢复"],
+      "title": "什么是 OSR（Out-of-Sync Replicas）？Follower 如何重新加入 ISR？",
+      "content": "凌晨两点，你被告警叫醒。Grafana 面板上 `kafka_server_ReplicaManager_UnderReplicatedPartitions` 指标从 0 跳到了 37，同时 `kafka_server_ReplicaManager_IsrShrinksPerSec` 出现了一个明显的尖刺。你 SSH 到集群，用 `kafka-topics.sh` 看了一下核心 Topic 的状态：\n\n```bash\n$ bin/kafka-topics.sh --bootstrap-server broker-1:9092 \\\n    --describe --topic order-events\nTopic: order-events  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,3\nTopic: order-events  Partition: 1  Leader: 2  Replicas: 2,3,1  Isr: 2,1\nTopic: order-events  Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1\n```\n\n三个 Partition 的 Replicas 列表里都有 Broker 2，但 ISR 列表里全部缺少了 Broker 2。这意味着 Broker 2 上的所有 Follower 副本都落后了，被从 ISR 中移除，进入了所谓的 OSR（Out-of-Sync Replicas）状态。翻看 Broker 2 的 GC 日志发现一次长达 45 秒的 Full GC 停顿——在这期间 Follower 完全无法向 Leader 发起 Fetch 请求，超过了默认的 `replica.lag.time.max.ms=30000`（30 秒）阈值，于是 Leader 判定该 Follower 已「失联」，将其踢出了 ISR。\n\n在 Kafka 的副本体系中，每个 Partition 的全部副本集合叫做 AR（Assigned Replicas），其中能与 Leader 保持同步的子集叫做 ISR（In-Sync Replicas），落后于 Leader 的部分就是 OSR。三者的关系非常简洁：AR = ISR + OSR。在正常运行时 OSR 应该是空集，一旦 OSR 非空就意味着集群的容错能力正在降低——如果此时 Leader 再宕机，可选的新 Leader 候选就少了。\n\n这道题的核心考察点有两个。第一，Follower 是怎么被判定为「不同步」然后被踢出 ISR 的？第二，也是更重要的，被踢出去的 Follower 要经过什么样的流程才能重新追上 Leader 并回到 ISR？这个「重新加入」的过程涉及到 Log Truncation、High Watermark 推进、Controller 通知等多个环节，是 Kafka 副本机制中最值得深挖的知识链条之一。",
+      "answer": "## 一、Kafka 副本同步核心概念基础\n\n### 1.1 副本体系的基础模型\n\n在深入 OSR 之前，需要先把 Kafka 副本体系的几个核心概念建立起来。Kafka 的每一个 Partition 都可以配置多个副本（由 `replication.factor` 决定），这些副本分散在不同的 Broker 上。在任意时刻，一个 Partition 有且仅有一个 Leader 副本负责处理所有的 Produce 和 Consume 请求（Kafka 2.4 之前 Follower 不提供读服务），其余副本都是 Follower，它们通过向 Leader 发送 Fetch 请求来拉取新写入的消息，保持数据同步。\n\n这套模型中有三个关键的偏移量（offset）标记。第一个是 LEO（Log End Offset），代表每个副本本地日志中下一条待写入消息的 offset，也就是该副本目前「有多少数据」。第二个是 HW（High Watermark），代表 ISR 中所有副本都已经同步到的最大 offset——Consumer 只能读到 HW 之前的消息，这是 Kafka 保证一致性的核心机制。第三个是 Leader Epoch，用于在 Leader 切换后帮助 Follower 正确截断日志，避免数据不一致（Kafka 0.11 引入，替代了早期基于 HW 的截断方式）。\n\n### 1.2 AR、ISR、OSR 三者的关系\n\nAR（Assigned Replicas）是 Partition 创建时分配的全部副本集合，它是固定的，除非你手动做 Partition Reassignment。ISR（In-Sync Replicas）是 AR 的一个动态子集，包含当前与 Leader 保持同步的所有副本（Leader 自身始终在 ISR 中）。OSR（Out-of-Sync Replicas）则是 AR 中不在 ISR 里的那部分，用集合表示就是 OSR = AR - ISR。在健康的集群中，OSR 应该始终为空集，AR 和 ISR 完全相等。\n\n值得一提的是，ISR 不是一个静态列表，它是动态收缩和扩张的。当一个 Follower 落后太多，ISR 会缩小（shrink）；当 Follower 追上来，ISR 又会扩大（expand）。这个动态变化由 Leader 副本所在的 Broker 检测并发起，然后通过 Controller 广播给集群中所有 Broker 更新元数据。\n\n## 二、ISR 收缩与 OSR 产生的精准机制\n\n### 2.1 Follower 是如何被踢出 ISR 的\n\n在 Kafka 0.9 之前，判定 Follower 是否「失联」有两个维度：一个是时间维度的 `replica.lag.time.max.ms`，另一个是消息数量维度的 `replica.lag.max.messages`。后者在 0.9 版本中被移除了（KIP-16），原因很简单——在突发流量下 Producer 瞬间写入大量消息会导致所有 Follower 暂时落后超过阈值，引发整个 ISR 的抖动，这个参数几乎不可能设置出一个合理的值。\n\n从 Kafka 0.9 开始，唯一的判定标准就是 `replica.lag.time.max.ms`（默认 30000ms，即 30 秒）。它的含义是：如果一个 Follower 副本在这个时间窗口内没有向 Leader 发起过 Fetch 请求，或者虽然发起了 Fetch 请求但其 LEO 一直没有追上 Leader 的 LEO，那么 Leader 就会认为该 Follower「不同步」。具体的检测逻辑在 Leader 所在 Broker 的 `ReplicaManager` 中，由一个定时任务 `maybeShrinkIsr()` 周期性执行（检查间隔由 `replica.lag.time.max.ms` 本身决定）。\n\n源码层面（Kafka 3.6，`kafka.cluster.Partition` 类），判定逻辑大致如下：Leader 维护着每个 Follower 最后一次发送 Fetch 请求的时间戳（`lastCaughtUpTimeMs`）。每当 Follower 发来 Fetch 请求，如果该请求中携带的 fetch offset 大于等于 Leader 当前的 LEO，说明 Follower 已经完全追平，Leader 就会更新 `lastCaughtUpTimeMs` 为当前时间。`maybeShrinkIsr()` 定时任务检查：如果 `now - lastCaughtUpTimeMs > replica.lag.time.max.ms`，就将该 Follower 从 ISR 中移除。\n\nISR 变更后，Leader 会将新的 ISR 列表通过 `AlterPartition` RPC（Kafka 3.x KRaft 模式）或写入 ZooKeeper 的 `/brokers/topics/{topic}/partitions/{partition}/state` 节点（ZK 模式）来持久化。Controller 感知到变化后，将更新后的元数据通过 `UpdateMetadata` 请求广播给集群中所有 Broker。整个过程在 Broker 日志中的体现如下：\n\n```\n[2024-03-15 02:01:33,456] INFO [Partition order-events-0 broker=1] Shrinking ISR from 1,2,3 to 1,3. Leader: (highWatermark: 287456, endOffset: 287501). Out of sync replica: (brokerId: 2, endOffset: 274892) (kafka.cluster.Partition)\n[2024-03-15 02:01:33,512] INFO [ReplicaManager broker=1] Partition order-events-0 ISR shrunk from [1,2,3] to [1,3] (kafka.server.ReplicaManager)\n```\n\n注意日志中打印了 Leader 的 `endOffset`（287501）和落后 Follower 的 `endOffset`（274892），差值大约 12600 条消息——这正是 Follower 在 GC 停顿期间累积的落后量。\n\n### 2.2 ISR 收缩的连锁影响\n\nISR 收缩本身不是灾难，但它直接影响两个核心机制。第一，High Watermark 的推进逻辑。HW 取的是 ISR 中所有副本 LEO 的最小值，ISR 缩小后参与 HW 计算的副本减少了，HW 可能反而推进得更快——但这是以牺牲容错性为代价的。第二，`min.insync.replicas` 的约束。如果你配置了 `min.insync.replicas=2`（生产环境标配），那么当 ISR 只剩 1 个副本（Leader 自己）时，使用 `acks=all` 的 Producer 会收到 `NotEnoughReplicasException`，写入被拒绝。这是 Kafka 保护数据安全的最后一道防线——宁可拒绝写入也不让数据处于只有一个副本的危险状态。\n\n## 三、Follower 重新加入 ISR 的完整流程\n\n### 3.1 第一阶段：Follower 恢复并发起 Fetch\n\n当导致 Follower 落后的问题解除后（GC 完成、磁盘 I/O 恢复、网络恢复），Follower 上的 `ReplicaFetcherThread` 线程会自动恢复向 Leader 发送 Fetch 请求。这个线程在 Follower 启动时就已经创建好了，它以 `replica.fetch.wait.max.ms`（默认 500ms）为间隔持续拉取数据。Follower 不需要做任何特殊操作来「申请重新加入 ISR」——只要它持续 Fetch 并逐步追上 Leader，Leader 会自动将它加回来。\n\n但有一个关键的前提：Follower 恢复后，它首先需要确认自己本地日志的一致性。如果 Follower 落后期间发生过 Leader 切换（虽然在本场景中没有），新 Leader 的日志可能与 Follower 本地日志产生分歧。Kafka 0.11 之后引入了 Leader Epoch 机制来处理这种情况：Follower 在恢复 Fetch 之前，会先向 Leader 发送 `OffsetsForLeaderEpoch` 请求，询问「对于我本地记录的 Leader Epoch，你那边对应的 end offset 是多少？」如果 Leader 返回的 end offset 比 Follower 本地 LEO 小，说明 Follower 有一部分数据是在旧 Leader 时期写入但没有被提交的「脏数据」，Follower 需要将本地日志截断（truncate）到 Leader 指示的 offset，然后再从该位置开始 Fetch。\n\n### 3.2 第二阶段：Log Truncation（日志截断）\n\n日志截断是 Follower 回归 ISR 之前非常关键的一步。截断的目的是确保 Follower 的日志和当前 Leader 完全一致——不允许 Follower 上存在 Leader 没有的消息。截断的过程在 Broker 日志中会体现为：\n\n```\n[2024-03-15 02:03:15,789] INFO [Log partition=order-events-0, dir=/data/kafka-logs] Truncating to offset 287456 (kafka.log.UnifiedLog)\n[2024-03-15 02:03:15,802] INFO [ReplicaFetcherThread-0-1] Truncated log for partition order-events-0 to offset 287456 based on leader's epoch cache (kafka.server.ReplicaFetcherThread)\n```\n\n在大多数常见场景中（Follower 只是暂时落后，没有发生过 Leader 切换），实际上不需要截断——Follower 的日志只是比 Leader 少，不存在分歧数据。但 Kafka 依然会走 Leader Epoch 校验流程，只是校验结果会是「无需截断」，Follower 直接从自己当前的 LEO 开始继续 Fetch。\n\n### 3.3 第三阶段：追赶 Leader 的 LEO\n\nFollower 开始持续从 Leader 拉取数据后，它的 LEO 会逐步增长，与 Leader 的差距逐渐缩小。追赶速度取决于几个因素：`replica.fetch.max.bytes`（默认 1MB，单次 Fetch 最大数据量）、`num.replica.fetchers`（默认 1，Fetch 线程数）、以及网络带宽和磁盘写入速度。如果落后的数据量很大（比如 Follower 离线了好几个小时），可以临时调大 `num.replica.fetchers` 和 `replica.fetch.max.bytes` 来加速追赶，但注意这会增加 Leader 的网络和磁盘负载。\n\n在追赶过程中，你可以通过以下命令实时监控 Follower 的落后量：\n\n```bash\n$ bin/kafka-replica-verification.sh --broker-list broker-1:9092,broker-2:9092,broker-3:9092 \\\n    --topic-white-list 'order-events'\n2024-03-15 02:05:30: max lag is 8234 for partition order-events-0 at offset 279267 among 3 partitions\n2024-03-15 02:05:40: max lag is 5102 for partition order-events-0 at offset 282399 among 3 partitions\n2024-03-15 02:05:50: max lag is 1847 for partition order-events-0 at offset 285654 among 3 partitions\n2024-03-15 02:06:00: max lag is 0 for partition order-events-0 at offset 287501 among 3 partitions\n```\n\n可以看到 lag 从 8234 逐步降到 0，说明 Follower 正在快速追上。\n\n### 3.4 第四阶段：Leader 判定追上并扩展 ISR\n\n当 Follower 的 Fetch 请求中携带的 fetch offset 追上了 Leader 当前的 LEO（即 Follower 已经拉取了 Leader 上所有已有的消息），Leader 的 `ReplicaManager` 会更新该 Follower 的 `lastCaughtUpTimeMs`。随后，`maybeShrinkIsr()` 的对应逻辑 `maybeExpandIsr()` 检测到该 Follower 已经满足同步条件——Follower 的 LEO 大于等于 Leader 的 HW，并且最近一次 caught-up 时间在 `replica.lag.time.max.ms` 窗口之内——就会将该 Follower 重新加入 ISR。\n\nISR 扩展同样需要通过 Controller 持久化和广播。在 Broker 日志中你会看到：\n\n```\n[2024-03-15 02:06:05,123] INFO [Partition order-events-0 broker=1] Expanding ISR from 1,3 to 1,2,3 (kafka.cluster.Partition)\n[2024-03-15 02:06:05,189] INFO [ReplicaManager broker=1] Partition order-events-0 ISR expanded from [1,3] to [1,2,3] (kafka.server.ReplicaManager)\n```\n\n此时用 `kafka-topics.sh` 再看 Partition 状态，ISR 已经恢复完整：\n\n```bash\n$ bin/kafka-topics.sh --bootstrap-server broker-1:9092 \\\n    --describe --topic order-events\nTopic: order-events  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3\nTopic: order-events  Partition: 1  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1\nTopic: order-events  Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1,2\n```\n\n## 四、体系化扩展与生产实践\n\n### 4.1 Follower 长期滞留 OSR 的排查思路\n\n生产环境中最让人头疼的不是 Follower 短暂掉出 ISR——这通常会自动恢复。真正棘手的是 Follower 长时间待在 OSR 中不回来。常见原因有这么几类。第一类是磁盘问题：Follower 所在 Broker 的磁盘出现了坏道或 I/O 饱和，写入速度远低于 Leader 产生消息的速度，导致 Follower 永远追不上。排查方法是检查 `iostat -x 1` 的 `%util` 和 `await`，如果 `%util` 持续 100% 且 `await` 超过 50ms，基本可以确认是磁盘瓶颈。第二类是网络问题：跨机架或跨 AZ 部署时，Follower 到 Leader 的网络带宽不足或延迟过高。第三类是 GC 问题：Broker 的 JVM 频繁发生长时间 GC 停顿，可以通过 GC 日志中的 `pause` 时间来确认。第四类是配置不当：`num.replica.fetchers` 太小（默认 1）而 Partition 数量很多，单个 Fetch 线程成为瓶颈。\n\n### 4.2 Unclean Leader Election 的风险\n\n当一个 Partition 的 ISR 中只剩下 Leader 一个副本，而 Leader 又宕机了，这时集群面临一个两难选择：是选择一个 OSR 中的 Follower 作为新 Leader（可能丢失数据），还是让这个 Partition 持续不可用直到原 Leader 恢复？这个选择由参数 `unclean.leader.election.enable` 控制（默认 false，自 Kafka 0.11.0 起）。设为 false 意味着宁可不可用也不丢数据；设为 true 则优先保可用性。在金融、订单、支付等场景下，务必保持 false。但在日志采集、监控数据等允许少量丢失的场景中，有些团队会权衡后设为 true。\n\n### 4.3 OSR 监控最佳实践\n\n运维 Kafka 集群时，OSR 相关的监控是必不可少的。以下是必须配置的几个核心指标和对应的告警阈值：\n\n```\n# JMX 指标 → Prometheus 采集\nkafka_server_ReplicaManager_UnderReplicatedPartitions  → 告警阈值: > 0 持续 5 分钟\nkafka_server_ReplicaManager_IsrShrinksPerSec           → 告警阈值: > 0（ISR 收缩速率）\nkafka_server_ReplicaManager_IsrExpandsPerSec           → 辅助观察（ISR 恢复速率）\nkafka_server_ReplicaManager_UnderMinIsrPartitionCount  → 告警阈值: > 0（低于 min.insync.replicas 的 Partition 数）\n```\n\n`UnderReplicatedPartitions` 是最核心的指标，正常值应该恒为 0。如果这个指标非零，用以下命令快速定位哪些 Partition 有问题：\n\n```bash\n$ bin/kafka-topics.sh --bootstrap-server broker-1:9092 \\\n    --describe --under-replicated-partitions\nTopic: order-events  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,3\nTopic: payment-events  Partition: 2  Leader: 3  Replicas: 3,2,1  Isr: 3,1\n```\n\n这条命令只会输出 ISR 不完整的 Partition，是排查 OSR 问题的第一步。\n\n### 4.4 影响 ISR 行为的关键配置汇总\n\n在生产环境中，以下配置参数共同决定了 ISR 的收缩与扩展行为：\n\n```properties\n# Broker 端 — ISR 判定\nreplica.lag.time.max.ms=30000          # Follower 最大允许落后时间，默认 30s\nreplica.fetch.wait.max.ms=500          # Follower Fetch 请求的最大等待时间\nreplica.fetch.max.bytes=1048576        # 单次 Fetch 最大拉取字节数（1MB）\nnum.replica.fetchers=1                 # 每个 Broker 到源 Broker 的 Fetch 线程数\n\n# Broker 端 — 数据安全\nmin.insync.replicas=2                  # ISR 最小副本数，配合 acks=all 使用\nunclean.leader.election.enable=false   # 禁止非 ISR 副本当选 Leader\n\n# Topic 级别覆盖（优先级高于 Broker 级别）\n# kafka-configs.sh --alter --topic order-events \\\n#   --add-config min.insync.replicas=2,unclean.leader.election.enable=false\n```\n\n生产环境的推荐组合是 `replication.factor=3` + `min.insync.replicas=2` + `acks=all` + `unclean.leader.election.enable=false`。这套配置保证了任意一个 Broker 宕机时既不丢数据又不中断服务，同时允许最多一个 Follower 暂时处于 OSR 而不影响写入。",
+      "keyPoints": [
+        "AR = ISR + OSR：AR 是 Partition 分配的全部副本集合，ISR 是与 Leader 保持同步的动态子集，OSR 是落后于 Leader 被移出 ISR 的副本，健康集群中 OSR 应始终为空",
+        "ISR 收缩的唯一判定标准是 replica.lag.time.max.ms（默认 30s）：Follower 在该时间窗口内未能追上 Leader 的 LEO，就会被 Leader 的 maybeShrinkIsr() 定时任务踢出 ISR",
+        "Kafka 0.9 移除了基于消息数量的 replica.lag.max.messages 判定标准（KIP-16），因为突发流量会导致所有 Follower 暂时落后超过阈值引发 ISR 整体抖动",
+        "Follower 恢复后通过 Leader Epoch 机制（OffsetsForLeaderEpoch 请求）校验日志一致性，必要时先执行 Log Truncation 截断分歧数据，再从截断点开始 Fetch 追赶",
+        "Follower 的 LEO 追上 Leader 的 HW 且最近一次 caught-up 时间在 replica.lag.time.max.ms 窗口内时，Leader 的 maybeExpandIsr() 将其重新加入 ISR 并通过 Controller 广播",
+        "ISR 收缩直接影响 min.insync.replicas 约束：当 ISR 副本数低于该值时，acks=all 的 Producer 会收到 NotEnoughReplicasException 拒绝写入",
+        "unclean.leader.election.enable（默认 false）决定了 ISR 为空时是否允许 OSR 副本当选 Leader，设为 true 可能丢数据，金融等关键场景必须保持 false",
+        "排查 Follower 长期滞留 OSR 需要从磁盘 I/O（iostat）、网络带宽、JVM GC 停顿、num.replica.fetchers 配置四个维度逐一排查"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz1",
+          "question": "以下关于 AR、ISR、OSR 三者关系的描述，哪一项是正确的？",
+          "choices": [
+            {"id": "A", "text": "AR = ISR + OSR，其中 ISR 是与 Leader 保持同步的副本子集，OSR 是落后的副本子集"},
+            {"id": "B", "text": "AR = ISR × OSR，ISR 和 OSR 的交集构成了全部副本"},
+            {"id": "C", "text": "ISR 包含 AR 和 OSR，是三者中范围最大的集合"},
+            {"id": "D", "text": "OSR 是固定不变的，一旦被标记为 OSR 就不能再回到 ISR"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "AR（Assigned Replicas）是 Partition 创建时分配的全部副本集合，ISR（In-Sync Replicas）是其中与 Leader 保持同步的动态子集，OSR（Out-of-Sync Replicas）是落后的部分，三者的关系是 AR = ISR + OSR。选项 B 杜撰了乘积关系，不存在这种概念。选项 C 颠倒了包含关系，ISR 是 AR 的子集而非反过来。选项 D 错在「固定不变」——OSR 中的 Follower 追上 Leader 后完全可以重新回到 ISR，这正是本题讨论的核心机制。"
+        },
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz2",
+          "question": "在 Kafka 0.9+ 中，Leader 判定 Follower「不同步」并将其踢出 ISR 的依据是什么？",
+          "choices": [
+            {"id": "A", "text": "Follower 的 LEO 与 Leader 的 LEO 差值超过 replica.lag.max.messages 条消息"},
+            {"id": "B", "text": "Follower 在 replica.lag.time.max.ms 时间窗口内未能追上 Leader 的 LEO"},
+            {"id": "C", "text": "Follower 的磁盘使用率超过 90%，被 Broker 自动标记为不同步"},
+            {"id": "D", "text": "Controller 定期轮询所有 Follower 的健康状态，发现无响应后踢出 ISR"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 0.9 之后移除了基于消息数量的 replica.lag.max.messages 参数（KIP-16），唯一的判定标准变为 replica.lag.time.max.ms（默认 30s）。如果 Follower 在该时间窗口内没有追上 Leader 的 LEO，Leader 就会将其踢出 ISR。选项 A 使用的是已被移除的旧参数。选项 C 完全杜撰了磁盘使用率的判定机制，Kafka 没有这个逻辑。选项 D 错在主体——ISR 的收缩判定是由 Leader 副本所在 Broker 执行的，不是 Controller 轮询。"
+        },
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz3",
+          "question": "为什么 Kafka 0.9 移除了 replica.lag.max.messages 这个参数？",
+          "choices": [
+            {"id": "A", "text": "因为该参数在 KRaft 模式下不兼容，只能在 ZooKeeper 模式下使用"},
+            {"id": "B", "text": "因为突发流量下 Producer 瞬间写入大量消息会导致所有 Follower 暂时落后超过阈值，引发 ISR 整体抖动"},
+            {"id": "C", "text": "因为 Kafka 0.9 引入了自动 Partition Reassignment，消息数量不再有意义"},
+            {"id": "D", "text": "因为 Follower 改为推模式同步后，消息延迟可以忽略不计"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "replica.lag.max.messages 被移除的核心原因是它在突发流量场景下几乎不可用。当 Producer 瞬间写入大量消息时，所有 Follower 都会暂时落后超过阈值，导致整个 ISR 发生无意义的大规模收缩和扩展抖动。这个参数的值无论设多大都不合理——设小了正常流量也会触发，设大了又失去监控意义。选项 A 时间线错误，KRaft 在 3.x 才引入，与 0.9 无关。选项 C 和 D 都是杜撰的功能变更。"
+        },
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz4",
+          "question": "Follower 在重新加入 ISR 之前，可能需要执行 Log Truncation 的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Follower 本地日志可能包含旧 Leader 时期写入但未被提交的「脏数据」，需要截断到与当前 Leader 一致的 offset"},
+            {"id": "B", "text": "Follower 的日志文件太大，需要截断以释放磁盘空间"},
+            {"id": "C", "text": "Kafka 要求所有副本的日志从 offset 0 开始，Follower 需要清空重建"},
+            {"id": "D", "text": "Log Truncation 是 Consumer 端的操作，与 Follower 副本同步无关"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Log Truncation 的目的是确保 Follower 的日志与当前 Leader 完全一致。在 Follower 落后期间如果发生过 Leader 切换，新 Leader 的日志可能与 Follower 本地存在分歧——Follower 上可能有旧 Leader 写入但未被提交到 ISR 的消息。Follower 通过 Leader Epoch 机制向新 Leader 确认正确的截断点，将分歧数据截断后再从该位置开始 Fetch。选项 B 混淆了截断与日志清理。选项 C 完全错误，副本不需要从 offset 0 重建。选项 D 混淆了 Follower 副本同步与 Consumer 消费。"
+        },
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz5",
+          "question": "Follower 重新加入 ISR 的判定条件是什么？",
+          "choices": [
+            {"id": "A", "text": "Follower 的 LEO 追上 Leader 的 HW 且最近一次 caught-up 时间在 replica.lag.time.max.ms 窗口内"},
+            {"id": "B", "text": "Follower 向 Controller 发送加入请求，Controller 批准后加入"},
+            {"id": "C", "text": "Follower 连续 10 次 Fetch 请求都成功返回数据"},
+            {"id": "D", "text": "运维人员手动执行 kafka-reassign-partitions.sh 命令将 Follower 加回 ISR"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Follower 重新加入 ISR 是一个自动过程。当 Follower 的 Fetch offset 追上 Leader 的 LEO 时，Leader 会更新该 Follower 的 lastCaughtUpTimeMs。Leader 的 maybeExpandIsr() 检测到 Follower 的 LEO 大于等于 Leader 的 HW 且最近一次 caught-up 在时间窗口内，就会自动将其加回 ISR。选项 B 错在 Follower 不需要主动「申请」，这个判定完全由 Leader 执行。选项 C 杜撰了连续成功次数的判定机制。选项 D 混淆了 ISR 管理与 Partition Reassignment——后者是改变副本分配关系，与 ISR 动态变化是两回事。"
+        },
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz6",
+          "question": "当 ISR 中只剩 Leader 一个副本且 min.insync.replicas=2 时，使用 acks=all 的 Producer 会遇到什么情况？",
+          "choices": [
+            {"id": "A", "text": "Producer 正常写入，Broker 会在后台等待 Follower 追上后再确认"},
+            {"id": "B", "text": "Producer 收到 NotEnoughReplicasException，写入被拒绝"},
+            {"id": "C", "text": "Producer 自动降级为 acks=1 模式继续写入"},
+            {"id": "D", "text": "Broker 会自动创建新的 Follower 副本来满足 min.insync.replicas 要求"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "min.insync.replicas 定义了 acks=all 场景下 ISR 中必须存在的最小副本数。当 ISR 副本数低于该阈值时，Broker 会直接拒绝 acks=all 的 Produce 请求，返回 NotEnoughReplicasException。这是 Kafka 保护数据安全的设计——宁可暂时不可写也不让数据只有一个副本。选项 A 描述的等待机制不存在。选项 C 杜撰了自动降级逻辑，Kafka 不会擅自修改 Producer 的 acks 语义。选项 D 也不存在，副本数量变更需要手动执行 Partition Reassignment。"
+        },
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz7",
+          "question": "以下哪个 JMX 指标最适合用于监控 OSR 状态？",
+          "choices": [
+            {"id": "A", "text": "kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions"},
+            {"id": "B", "text": "kafka.server:type=BrokerTopicMetrics,name=MessagesInPerSec"},
+            {"id": "C", "text": "kafka.controller:type=KafkaController,name=ActiveControllerCount"},
+            {"id": "D", "text": "kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "UnderReplicatedPartitions 直接反映了有多少 Partition 的 ISR 不完整（即存在 OSR 副本），正常值应恒为 0。这是监控 OSR 最直接和最核心的指标。选项 B 是消息写入速率指标，与副本同步状态无关。选项 C 是 Controller 存活指标，用于判断集群是否有活跃 Controller。选项 D 是 Produce 请求延迟指标，虽然 ISR 收缩可能间接影响写入延迟，但它不是直接反映 OSR 状态的指标。"
+        },
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz8",
+          "question": "关于 unclean.leader.election.enable 参数，以下描述正确的是？",
+          "choices": [
+            {"id": "A", "text": "默认为 true，允许 OSR 中的副本当选 Leader 以保证可用性"},
+            {"id": "B", "text": "默认为 false（Kafka 0.11.0+），禁止 OSR 副本当选 Leader，ISR 为空时 Partition 不可用而非丢数据"},
+            {"id": "C", "text": "该参数仅在 KRaft 模式下生效，ZooKeeper 模式下无效"},
+            {"id": "D", "text": "该参数控制的是 Follower 何时可以重新加入 ISR，与 Leader 选举无关"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "从 Kafka 0.11.0 开始，unclean.leader.election.enable 的默认值从 true 改为 false。设为 false 意味着当 ISR 中只剩 Leader 一个副本且 Leader 宕机时，不会从 OSR 中选举新 Leader——Partition 会变为不可用直到原 Leader 恢复，以此保证不丢数据。选项 A 给出的默认值在 0.11.0 之前是对的，但现在不是。选项 C 是错误的，该参数在 ZK 和 KRaft 两种模式下都生效。选项 D 混淆了 Leader 选举和 ISR 重新加入这两个完全不同的概念。"
+        },
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz9",
+          "question": "Follower 长期滞留在 OSR 中不恢复，以下哪个不是常见原因？",
+          "choices": [
+            {"id": "A", "text": "Follower 所在 Broker 的磁盘 I/O 饱和，写入速度跟不上 Leader 产生消息的速度"},
+            {"id": "B", "text": "Follower 到 Leader 的网络带宽不足或跨 AZ 延迟过高"},
+            {"id": "C", "text": "Topic 的 replication.factor 设置为 1，没有 Follower 副本"},
+            {"id": "D", "text": "Broker 的 JVM 频繁发生长时间 Full GC 停顿"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "如果 replication.factor=1，那么 Partition 只有一个副本（Leader 自身），根本就没有 Follower 副本，也就不存在 OSR 的概念——不是「滞留在 OSR」的原因，而是没有 OSR 这个场景。选项 A 的磁盘瓶颈、选项 B 的网络问题、选项 D 的 GC 停顿都是导致 Follower 持续落后无法追上 Leader 的经典原因，需要分别通过 iostat、网络监控和 GC 日志来排查。"
+        },
+        {
+          "id": "kafka-replica-osr-rejoin-isr-q1-quiz10",
+          "question": "以下哪条命令可以快速列出集群中所有 ISR 不完整的 Partition？",
+          "choices": [
+            {"id": "A", "text": "kafka-topics.sh --describe --under-replicated-partitions"},
+            {"id": "B", "text": "kafka-consumer-groups.sh --describe --all-groups"},
+            {"id": "C", "text": "kafka-configs.sh --describe --entity-type brokers"},
+            {"id": "D", "text": "kafka-log-dirs.sh --describe --topic-list all"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "kafka-topics.sh 的 --under-replicated-partitions 参数专门用于过滤和显示 ISR 不完整的 Partition，只会输出存在 OSR 副本的 Partition 信息，是排查副本同步问题的第一步工具。选项 B 是查看 Consumer Group 状态的命令，与副本同步无关。选项 C 是查看 Broker 配置的命令。选项 D 是查看日志目录磁盘占用的命令，虽然能看到 lag 信息但不能直接筛选 under-replicated 状态。"
+        }
+      ],
+      "references": [
+        "Apache Kafka 官方文档 — Replication: https://kafka.apache.org/documentation/#replication",
+        "KIP-16: Remove replica.lag.max.messages config: https://cwiki.apache.org/confluence/display/KAFKA/KIP-16+-+Automated+Replica+Lag+Tuning",
+        "KIP-101: Leader Epoch: https://cwiki.apache.org/confluence/display/KAFKA/KIP-101+-+Alter+Replication+Protocol+to+use+Leader+Epoch+rather+than+High+Watermark+for+Truncation",
+        "Kafka 源码 — kafka.cluster.Partition（maybeShrinkIsr / maybeExpandIsr）",
+        "Confluent Blog — Hands-free Kafka Replication: https://www.confluent.io/blog/hands-free-kafka-replication-a-lesson-in-operational-simplicity/"
+      ]
+    }
+  ]
+}

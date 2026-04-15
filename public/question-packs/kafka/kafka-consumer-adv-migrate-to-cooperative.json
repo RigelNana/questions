@@ -1,0 +1,155 @@
+{
+  "id": "kafka-consumer-adv-migrate-to-cooperative",
+  "name": "Eager 迁移到 Cooperative 协议",
+  "domain": "kafka",
+  "description": "详解如何通过两步滚动升级将 Consumer Group 从 Eager 协议安全迁移到 Cooperative 增量 Rebalance 协议",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-consumer-adv-migrate-to-cooperative-q1",
+      "domain": "kafka",
+      "type": "modification",
+      "difficulty": 3,
+      "tags": ["Consumer", "Cooperative迁移", "滚动升级", "partition.assignment.strategy", "兼容性"],
+      "title": "如何将现有 Consumer Group 从 Eager 迁移到 Cooperative 协议？",
+      "content": "你所在的团队维护着一个订单处理平台，技术栈是 Java 17 + Spring Boot 3.1 + Kafka 3.6。核心 Consumer Group `order-processor-group` 有 8 个实例，消费 Topic `order-events`（32 个 Partition），每个实例分到 4 个 Partition。当前使用默认的 RangeAssignor（Eager 模式），每次滚动发布时 Grafana 上都会出现 8 个明显的 lag 尖刺——每重启一个实例，整个 Group 的消费中断 15-25 秒。产品经理已经多次抱怨「每次发版都掉消息处理速度」。\n\n团队 Tech Lead 在周会上提出：「我们把 Consumer 的分配策略从 RangeAssignor 切换到 CooperativeStickyAssignor，Cooperative 模式下滚动发布就不会 Stop-the-World 了。」你觉得这个方向是对的，于是直接修改了 `application.yml`：\n\n```yaml\n# application.yml — 你做的修改\nspring:\n  kafka:\n    consumer:\n      properties:\n        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor\n```\n\n然后开始滚动发布。第一个实例重启成功，但当它尝试加入 Group 时，你在日志里看到了这样的错误：\n\n```\n[Consumer clientId=order-processor-1] JoinGroup failed: \n  The group member's supported protocols are incompatible with those of existing members.\norg.apache.kafka.common.errors.InconsistentGroupProtocolException: \n  The group member's supported protocols are incompatible with those of existing members.\n```\n\n与此同时，其余 7 个还在运行的旧实例也开始不断打出 Rebalance 日志，但 Rebalance 始终无法完成，因为新实例（Cooperative 协议）和旧实例（Eager 协议）协议不兼容，Coordinator 无法协调它们。整个 Group 的消费完全停止了，`consumer_lag` 在以每秒数千条的速度飙升。\n\n你紧急回滚了那个实例，Group 恢复了正常。但问题摆在眼前：Cooperative 模式确实是目标，直接切换却行不通。正确的迁移方案是什么？如何在不中断业务的前提下，把整个 Group 安全地从 Eager 迁移到 Cooperative？",
+      "answer": "## 一、核心概念基础：Kafka Consumer Rebalance 协议与 partition.assignment.strategy\n\n### 1.1 partition.assignment.strategy 的定义与作用\n\nKafka Consumer 端的 `partition.assignment.strategy` 配置决定了 Consumer Group 在 Rebalance 时使用哪种分区分配策略。这个配置的值是一个或多个实现了 `ConsumerPartitionAssignor` 接口的类的全限定名，多个策略之间用逗号分隔。当 Group 内所有 Consumer 都支持某个策略时，Group Coordinator 会选择该策略来执行 Rebalance。如果配置了多个策略，Coordinator 会选择所有成员都支持的「交集」中的第一个策略。\n\nKafka 内置了四种分配策略。RangeAssignor 是 Kafka 3.x 及之前版本的默认策略，它按 Topic 维度对 Partition 做连续分段分配，使用 Eager 协议。RoundRobinAssignor 按全局 Partition 排序后轮询分配，同样使用 Eager 协议。StickyAssignor 在保证均衡性的前提下尽量保持上一次的分配结果不变，但它仍然使用 Eager 协议——Rebalance 时所有 Consumer 必须先 Revoke 全部 Partition。CooperativeStickyAssignor 是 Kafka 2.4（KIP-429）引入的，它的分配算法和 StickyAssignor 基本相同，但使用 Cooperative 协议——Rebalance 时只 Revoke 需要迁移的 Partition，其余 Partition 继续消费。\n\n### 1.2 Eager 与 Cooperative 协议的根本差异\n\n两种协议的区别不在分配算法层面，而在 Rebalance 流程的「Revoke 阶段」。Eager 协议要求每个 Consumer 在发送 JoinGroup 请求之前，先放弃自己当前持有的全部 Partition，整个 Group 进入 Stop-the-World 状态，直到 Leader 重新算好分配方案并通过 SyncGroup 下发后，所有 Consumer 才恢复消费。Cooperative 协议允许 Consumer 带着当前的分配信息加入 JoinGroup，Leader 计算出 diff 后，只通知需要让出 Partition 的 Consumer 去 Revoke 那些特定的 Partition，不需要迁移的 Partition 全程不受影响。\n\n这两种协议在 Kafka 的协议层面由 `ConsumerPartitionAssignor.RebalanceProtocol` 枚举标识，取值为 `EAGER` 或 `COOPERATIVE`。当 Consumer 向 Coordinator 发送 JoinGroup 请求时，请求体中会携带该 Consumer 支持的协议列表。Coordinator 必须为整个 Group 选定一个统一的协议——如果 Group 中所有成员都支持 `COOPERATIVE`，就用 `COOPERATIVE`；如果有任何一个成员只支持 `EAGER`，就退回到 `EAGER`。但这里有一个关键的约束：如果 Group 当前正在使用 `EAGER` 协议，而一个新加入的成员只支持 `COOPERATIVE` 协议（两者不存在交集），Coordinator 会直接拒绝该成员加入，抛出 `InconsistentGroupProtocolException`。\n\n### 1.3 为什么直接切换会失败\n\n回到题目的场景。旧的 8 个实例配置了 `RangeAssignor`，它只支持 `EAGER` 协议。你重启的第一个实例改成了 `CooperativeStickyAssignor`，它只支持 `COOPERATIVE` 协议。当这个新实例尝试加入 Group 时，Coordinator 发现 Group 当前的协议是 `EAGER`，而新成员只支持 `COOPERATIVE`，两者没有交集。Coordinator 无法为 Group 选定一个所有成员都支持的协议，所以拒绝新成员加入并返回 `InconsistentGroupProtocolException`。\n\n这不是 Kafka 的 bug，而是刻意的设计。试想如果 Coordinator 允许混合协议的 Consumer 共存，会发生什么：Eager 的 Consumer 在 Rebalance 时会先 Revoke 全部 Partition，而 Cooperative 的 Consumer 不会。这会导致 Leader 在 SyncGroup 阶段看到的「当前分配状态」是混乱的——一些 Consumer 已经清空了自己的 Partition，另一些还持有。分配算法在这种不一致的状态上计算出的方案可能导致同一个 Partition 被两个 Consumer 同时消费（违反 Kafka 的核心语义）或某些 Partition 没有任何 Consumer 消费（消息丢失）。所以 Kafka 选择在协议协商阶段就直接拒绝不兼容的成员，宁可暴露问题也不让数据语义被破坏。\n\n## 二、精准深度解答：两步滚动迁移方案\n\n理解了为什么直接切换行不通之后，正确的迁移方案就很清晰了。核心思路是利用 `partition.assignment.strategy` 支持配置多个策略的特性，在过渡期内让所有 Consumer 同时支持 Eager 和 Cooperative 两种协议，等全员统一后再移除 Eager 策略。整个迁移分两步，每步都需要一次完整的滚动重启。\n\n### 2.1 第一步：双策略共存，滚动重启\n\n将所有 Consumer 的 `partition.assignment.strategy` 配置为同时包含一个 Cooperative 策略和一个 Eager 策略：\n\n```yaml\n# application.yml — 第一步配置\nspring:\n  kafka:\n    consumer:\n      properties:\n        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor,org.apache.kafka.clients.consumer.RangeAssignor\n```\n\n对应的 Java Properties 写法是：\n\n```properties\npartition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor,org.apache.kafka.clients.consumer.RangeAssignor\n```\n\n这个配置的含义是：该 Consumer 同时支持 CooperativeStickyAssignor（COOPERATIVE 协议）和 RangeAssignor（EAGER 协议）。当它加入 Group 时，JoinGroup 请求会携带两种协议的信息。Coordinator 在协商 Group 协议时，会选择所有成员都支持的协议——在滚动重启过程中，已重启的实例支持「EAGER + COOPERATIVE」，未重启的实例只支持「EAGER」，两者的交集是 EAGER。所以在第一步滚动重启的整个过程中，Group 仍然运行在 Eager 模式下，不会出现协议不兼容的问题。\n\n第一步滚动重启的具体操作流程：\n\n```\n实例 1: 修改配置 → 重启 → 加入 Group（支持 EAGER+COOPERATIVE）\n   Group 协议协商结果：EAGER（因为实例 2-8 只支持 EAGER）\n   → Rebalance 正常完成，消费继续\n\n实例 2: 修改配置 → 重启 → 加入 Group（支持 EAGER+COOPERATIVE）\n   Group 协议协商结果：EAGER（因为实例 3-8 只支持 EAGER）\n   → Rebalance 正常完成\n\n…… 逐个重启 ……\n\n实例 8: 修改配置 → 重启 → 加入 Group（支持 EAGER+COOPERATIVE）\n   Group 协议协商结果：EAGER（所有成员都支持 EAGER，交集仍为 EAGER）\n   → 注意：此时虽然所有成员都支持 COOPERATIVE，但因为 EAGER 也在交集中，\n     协议协商的优先级规则决定了 Group 仍然使用 EAGER\n```\n\n这里有一个重要的细节：即使第一步全部重启完成后，所有 8 个实例都同时支持 EAGER 和 COOPERATIVE，Group 仍然运行在 EAGER 模式。这是因为 Kafka 的协议协商逻辑是：只要有 EAGER 协议在候选列表中，就优先选择 EAGER。原因是从 EAGER 切换到 COOPERATIVE 需要一次「全员放弃所有 Partition」的过渡 Rebalance，这个动作只有在显式移除 EAGER 策略后才会触发。所以第一步的作用不是切换协议，而是让所有 Consumer 都具备支持 COOPERATIVE 的能力，为第二步做准备。\n\n### 2.2 第二步：移除 Eager 策略，再次滚动重启\n\n确认第一步的滚动重启已全部完成且消费正常后，将配置修改为只保留 CooperativeStickyAssignor：\n\n```yaml\n# application.yml — 第二步配置\nspring:\n  kafka:\n    consumer:\n      properties:\n        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor\n```\n\n然后再次滚动重启所有实例。第二步滚动重启过程中的协议协商逻辑：\n\n```\n实例 1: 修改配置 → 重启 → 加入 Group（只支持 COOPERATIVE）\n   当前 Group 中：实例 1 只支持 COOPERATIVE，实例 2-8 支持 EAGER+COOPERATIVE\n   所有成员的交集：COOPERATIVE（因为实例 1 不再支持 EAGER）\n   → Group 协议从 EAGER 切换到 COOPERATIVE！\n   → 这次 Rebalance 会触发一次「过渡性」的全量 Revoke\n      （从 EAGER 切换到 COOPERATIVE 的代价，只发生这一次）\n   → Rebalance 完成后，Group 正式运行在 Cooperative 模式\n\n实例 2: 修改配置 → 重启 → 加入 Group（只支持 COOPERATIVE）\n   Group 已经在 COOPERATIVE 模式\n   → 增量 Rebalance，只迁移实例 2 释放的 Partition\n   → 其余实例继续消费，几乎无感知\n\n…… 后续实例重启都享受 Cooperative 模式的增量 Rebalance ……\n\n实例 8: 重启 → 增量 Rebalance → 迁移完成\n```\n\n注意第二步中第一个实例重启时会触发一次从 EAGER 到 COOPERATIVE 的「协议切换 Rebalance」，这次 Rebalance 的行为和 Eager 模式一样——所有 Consumer 先 Revoke 全部 Partition，然后以 COOPERATIVE 协议重新加入。这是不可避免的一次性代价，因为 Group 需要从一种协议状态切换到另一种。但从第二个实例开始，所有后续的 Rebalance 都已经运行在 Cooperative 模式下，只做增量迁移。\n\n### 2.3 为什么是 CooperativeStickyAssignor + RangeAssignor 而不是其他组合\n\n第一步中 Cooperative 策略和 Eager 策略的选择有讲究。Cooperative 侧必须使用 CooperativeStickyAssignor，因为它是目前唯一内置的 Cooperative 策略。Eager 侧应该选择和你当前正在使用的策略一致的那个——如果你之前用的是 RangeAssignor，就配 RangeAssignor；如果之前用的是 RoundRobinAssignor，就配 RoundRobinAssignor。这样在过渡期内，Group 仍然使用和之前完全相同的分配逻辑，不会因为换了策略而导致分配方案大幅变化（进而引发大量 Partition 迁移和缓存失效）。\n\n配置中策略的顺序也有意义。当 Coordinator 从所有成员支持的策略交集中选择最终策略时，它会按成员上报的优先级排序。将 CooperativeStickyAssignor 放在第一位（更高优先级），意味着一旦所有成员都支持 Cooperative，Coordinator 会优先选择它。但实际上在第一步中这个优先级不会生效，因为只要有任何成员只支持 EAGER，Group 就必须用 EAGER。\n\n### 2.4 迁移过程中需要注意的关键事项\n\n第一个要注意的是 ConsumerRebalanceListener 的行为变化。如果你的 Consumer 实现了 `ConsumerRebalanceListener`，需要确认 `onPartitionsRevoked` 回调中的逻辑是否依赖「全量 Revoke」的行为。在 Eager 模式下，`onPartitionsRevoked` 的参数包含该 Consumer 当前持有的所有 Partition；在 Cooperative 模式下，它只包含被实际迁移走的 Partition。如果你在 `onPartitionsRevoked` 中做了类似「flush 所有本地缓存到 Redis」的操作，切换到 Cooperative 后这个逻辑可能只 flush 了部分 Partition 的缓存。正确的做法是同时实现 `onPartitionsLost` 回调——Cooperative 模式下，当 Partition 被意外收回（比如 Consumer 被判定为失败）时会触发 `onPartitionsLost` 而不是 `onPartitionsRevoked`。\n\n第二个要注意的是 Spring Kafka 框架的配置方式。如果你使用 Spring Kafka，`partition.assignment.strategy` 需要通过 `spring.kafka.consumer.properties` 传递，而不是 Spring Kafka 自己的一级配置项。在 Spring Kafka 2.8+ 版本中，你也可以通过 Java Config 方式配置：\n\n```java\n@Bean\npublic ConsumerFactory<String, String> consumerFactory() {\n    Map<String, Object> props = new HashMap<>();\n    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, \"broker-1:9092\");\n    props.put(ConsumerConfig.GROUP_ID_CONFIG, \"order-processor-group\");\n    // 第一步：双策略共存\n    props.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,\n        \"org.apache.kafka.clients.consumer.CooperativeStickyAssignor,\" +\n        \"org.apache.kafka.clients.consumer.RangeAssignor\");\n    return new DefaultKafkaConsumerFactory<>(props);\n}\n```\n\n第三个要注意的是两步之间的间隔。第一步的滚动重启完成后，不要立即开始第二步。建议至少观察 30 分钟到 1 小时，确认以下指标正常：`consumer_lag` 稳定、`kafka_consumer_fetch_manager_records_consumed_rate` 正常、没有频繁的 Rebalance 日志。确认第一步没有引入任何问题后，再开始第二步。\n\n## 三、体系化扩展：监控、回滚与未来演进\n\n### 3.1 迁移期间的监控要点\n\n迁移过程中最需要关注的指标是 `kafka_consumer_coordinator_rebalance_total`（Rebalance 次数）和 `kafka_consumer_coordinator_rebalance_latency_avg`（Rebalance 平均耗时）。在第一步滚动重启期间，每重启一个实例会触发一次 Eager Rebalance，这是预期行为。在第二步的第一个实例重启时，会看到一次耗时较长的 Rebalance（协议切换），之后每个实例重启触发的 Rebalance 耗时应该显著缩短。如果在第二步中观察到 Rebalance 耗时没有明显下降，或者出现连续的多轮 Rebalance（`rebalance_total` 在短时间内快速递增），需要排查是否有 Consumer 因为 `max.poll.interval.ms` 超时而反复被踢出。\n\n另外建议在 Grafana 上关注 `kafka_consumer_coordinator_assigned_partitions`（每个 Consumer 被分配的 Partition 数量）。正常情况下这个值在 Rebalance 前后应该保持相对稳定（因为 CooperativeStickyAssignor 的粘性特性）。如果看到某个 Consumer 的 Partition 数从 4 变成 0 再变成 4，说明可能还在 Eager 模式下运行，需要检查配置是否正确生效。\n\n### 3.2 回滚方案\n\n如果迁移过程中出现问题需要回滚，操作取决于你处于哪一步。如果还在第一步（双策略共存），回滚非常简单：把配置改回只有 RangeAssignor，滚动重启即可。因为 Group 在第一步中一直运行在 EAGER 模式，回滚不会导致任何协议兼容性问题。\n\n如果已经进入第二步并且部分实例已经改为只有 CooperativeStickyAssignor，回滚稍微复杂一些。此时 Group 可能已经切换到了 COOPERATIVE 协议，如果直接把某个实例改回只有 RangeAssignor，又会出现 `InconsistentGroupProtocolException`。正确的回滚方式是：先把所有实例都改回双策略共存（CooperativeStickyAssignor + RangeAssignor），滚动重启让 Group 回到 EAGER 模式，然后再根据需要决定是否移除 CooperativeStickyAssignor。简而言之，回滚也要走「双策略过渡」这一步，不能直接跳。\n\n### 3.3 Kafka 4.0 的默认策略变化与 KIP-848\n\n从 Kafka 3.1 开始，Kafka 官方文档已经建议新项目直接使用 CooperativeStickyAssignor。到了 Kafka 4.0（正式版预计 2025 年发布），CooperativeStickyAssignor 已经成为新版 Consumer（通过 `group.protocol=consumer` 启用的 KIP-848 新协议）的默认行为。KIP-848 将分区分配的计算从 Client 端的 Leader Consumer 移到了 Server 端的 Group Coordinator，彻底消除了 Leader 选举和 SyncGroup 的开销。在 KIP-848 的新协议下，`partition.assignment.strategy` 这个 Client 端配置不再生效，取而代之的是 Broker 端的 `group.consumer.assignors` 配置。但 KIP-848 是一个全新的协议，和现有的「经典」Consumer Group 协议是并行存在的——你需要显式通过 `group.protocol=consumer` 来启用它，默认仍然使用经典协议（`group.protocol=classic`）。\n\n对于仍在使用经典协议的存量项目来说，从 Eager 迁移到 Cooperative 仍然需要走本文描述的两步滚动升级方案。这个方案在 Kafka 2.4 到 4.x 的所有版本中都适用。\n\n### 3.4 面试回答要点\n\n面试中被问到这道题时，回答的核心框架是「为什么不行 → 怎么做 → 注意什么」。首先一句话说清楚直接切换失败的原因：Eager 和 Cooperative 是两种不兼容的 Rebalance 协议，Group 内所有 Consumer 必须使用同一种协议，混合会导致 `InconsistentGroupProtocolException`。然后描述两步迁移方案：第一步在配置中同时列出 CooperativeStickyAssignor 和 RangeAssignor 让双协议共存，滚动重启所有 Consumer，此时 Group 仍运行在 Eager 模式；第二步移除 RangeAssignor 只保留 CooperativeStickyAssignor，再次滚动重启，第一个实例重启时 Group 协议切换到 Cooperative，后续实例都享受增量 Rebalance。最后补充注意事项：两步之间要观察指标、回滚也需要经过双策略过渡、ConsumerRebalanceListener 的行为会变化。如果面试官追问更深层的问题，可以提到 Kafka 4.0 的 KIP-848 新版 Group 协议将分配计算移到了 Server 端，以及 `group.protocol=consumer` 的新配置方式。",
+      "keyPoints": [
+        "Eager 和 Cooperative 是两种互不兼容的 Rebalance 协议，Group Coordinator 要求所有成员使用同一种协议，混合部署会导致 InconsistentGroupProtocolException 错误使新成员无法加入 Group",
+        "迁移第一步：将 partition.assignment.strategy 同时配置 CooperativeStickyAssignor 和 RangeAssignor（双策略共存），滚动重启所有 Consumer，此阶段 Group 仍运行在 Eager 模式因为 EAGER 协议仍在所有成员的交集中",
+        "迁移第二步：移除 RangeAssignor 只保留 CooperativeStickyAssignor，再次滚动重启，第一个实例重启时 Group 协议从 EAGER 切换到 COOPERATIVE，会触发一次性的全量 Revoke 过渡，之后所有 Rebalance 都是增量模式",
+        "第一步中 Eager 侧策略应与当前使用的策略一致（如之前用 RangeAssignor 就配 RangeAssignor），避免过渡期内分配算法变化引发额外的 Partition 迁移",
+        "切换到 Cooperative 后 ConsumerRebalanceListener 的 onPartitionsRevoked 回调只包含被实际迁移走的 Partition 而非全量，依赖全量 Revoke 行为的清理逻辑需要适配",
+        "回滚也必须经过双策略过渡阶段，不能从只有 CooperativeStickyAssignor 直接跳回只有 RangeAssignor，否则同样会触发协议不兼容错误",
+        "从 Kafka 4.0 起 KIP-848 新版 Consumer Group 协议将分配计算移到 Server 端，CooperativeStickyAssignor 成为默认行为，但需通过 group.protocol=consumer 显式启用新协议"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz1",
+          "question": "当 Consumer Group 中同时存在只支持 Eager 协议的成员和只支持 Cooperative 协议的成员时，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Coordinator 自动选择 Eager 协议作为降级方案，所有成员正常运行"},
+            {"id": "B", "text": "只支持 Cooperative 的成员会被 Coordinator 拒绝加入 Group，抛出 InconsistentGroupProtocolException"},
+            {"id": "C", "text": "Coordinator 按多数投票原则选择协议，少数派成员被踢出"},
+            {"id": "D", "text": "两种协议的成员各自独立运行，形成两个子 Group 分别消费不同的 Partition"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka Group Coordinator 要求所有成员支持至少一种共同的 Rebalance 协议。当已有成员只支持 EAGER 而新加入的成员只支持 COOPERATIVE 时，两者没有协议交集，Coordinator 无法为 Group 选定统一协议。此时 Coordinator 不会降级也不会投票，而是直接拒绝新成员加入并返回 InconsistentGroupProtocolException。A 选项的「自动降级」不存在，因为 Cooperative 成员没有声明支持 EAGER；C 选项的「多数投票」不是 Kafka 的协议协商机制；D 选项中 Kafka 不会自动拆分 Group。"
+        },
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz2",
+          "question": "两步迁移方案的第一步中，将配置设为 CooperativeStickyAssignor + RangeAssignor 后滚动重启所有 Consumer，此时 Group 实际运行在哪种协议下？",
+          "choices": [
+            {"id": "A", "text": "COOPERATIVE 协议，因为 CooperativeStickyAssignor 排在配置列表的第一位优先级更高"},
+            {"id": "B", "text": "EAGER 协议，因为只要 EAGER 在所有成员的协议交集中就会被优先选择"},
+            {"id": "C", "text": "混合模式，部分 Partition 使用 COOPERATIVE，部分使用 EAGER"},
+            {"id": "D", "text": "取决于 Group Leader 的配置，Leader 用什么协议全组就用什么"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在第一步的滚动重启过程中，已重启的实例支持 EAGER + COOPERATIVE，未重启的实例只支持 EAGER，所有成员的协议交集是 EAGER。即使第一步全部重启完成后所有成员都同时支持两种协议，Kafka 的协议协商逻辑仍然优先选择 EAGER——因为从 EAGER 切换到 COOPERATIVE 需要一次全量 Revoke 的过渡 Rebalance，这只有在显式移除 EAGER 策略后才会触发。A 选项忽略了协议协商的优先级规则；C 选项不存在，Kafka Group 只能使用一种统一协议；D 选项中协议由 Coordinator 根据所有成员的交集决定，不是 Leader 单方面决定的。"
+        },
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz3",
+          "question": "在第二步滚动重启中，第一个实例重启（配置改为只有 CooperativeStickyAssignor）时会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Group 协议从 EAGER 切换到 COOPERATIVE，触发一次全量 Revoke 的过渡 Rebalance，之后运行在 Cooperative 模式"},
+            {"id": "B", "text": "该实例无法加入 Group，出现 InconsistentGroupProtocolException，因为其余实例还支持 EAGER"},
+            {"id": "C", "text": "Group 继续运行在 EAGER 模式，直到所有实例都只配置了 CooperativeStickyAssignor"},
+            {"id": "D", "text": "Group 立即切换到 COOPERATIVE 模式且不需要任何过渡 Rebalance，直接增量分配"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "第二步的关键在于：第一个实例改为只支持 COOPERATIVE 后，其余 7 个实例仍然支持 EAGER + COOPERATIVE。此时所有成员的协议交集变成了只有 COOPERATIVE（因为第一个实例不再支持 EAGER），所以 Group 协议从 EAGER 切换到 COOPERATIVE。这次切换会触发一次过渡性的全量 Revoke Rebalance，这是从 EAGER 到 COOPERATIVE 的一次性代价。B 选项是错的，因为其余 7 个实例配置了双策略，它们支持 COOPERATIVE，所以交集存在。C 选项不正确，协议切换在交集变化时立即发生。D 选项忽略了协议切换必须经历一次全量 Revoke 的过渡。"
+        },
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz4",
+          "question": "为什么迁移第一步中 Eager 侧应该选择与当前一致的分配策略（如之前用 RangeAssignor 就配 RangeAssignor），而不是随意选择一个 Eager 策略？",
+          "choices": [
+            {"id": "A", "text": "不同的 Eager 策略使用不同版本的 JoinGroup 协议，混用会导致网络层报错"},
+            {"id": "B", "text": "保持相同的分配算法可以避免过渡期内分配方案变化引发额外的 Partition 迁移和状态重建"},
+            {"id": "C", "text": "Kafka 不允许在同一 Group 中使用不同名称的 Eager 策略，会抛出 ConfigException"},
+            {"id": "D", "text": "只有 RangeAssignor 可以和 CooperativeStickyAssignor 共存，其他 Eager 策略都不兼容"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "过渡期内 Group 仍运行在 EAGER 模式并使用 Eager 侧配置的分配策略来计算 Partition 分配方案。如果之前用的是 RangeAssignor，过渡期改成 RoundRobinAssignor，两种算法的分配逻辑完全不同——Range 是按 Topic 连续分段，RoundRobin 是全局轮询。仅仅换策略就可能导致大量 Partition 在 Consumer 之间迁移，对于有本地状态的消费应用来说代价很大。A 选项不正确，所有 Eager 策略都使用相同版本的 JoinGroup 协议；C 选项不正确，Kafka 不限制策略名称组合；D 选项不正确，RoundRobinAssignor 和 StickyAssignor 同样可以和 CooperativeStickyAssignor 共存。"
+        },
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz5",
+          "question": "迁移到 Cooperative 后，观察到某个 Consumer 的 kafka_consumer_coordinator_assigned_partitions 指标在每次 Rebalance 时从 4 变成 0 再变回 4，这说明什么？",
+          "choices": [
+            {"id": "A", "text": "Cooperative 模式正常运行，多轮 Rebalance 的中间状态就是先清零再恢复"},
+            {"id": "B", "text": "该 Consumer 可能仍在使用 Eager 协议，配置没有正确生效"},
+            {"id": "C", "text": "该 Consumer 的 max.poll.interval.ms 超时导致被踢出后重新加入"},
+            {"id": "D", "text": "CooperativeStickyAssignor 的粘性算法失效，退化为 RangeAssignor 行为"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Cooperative 模式的核心特征是增量 Rebalance——不需要迁移的 Partition 始终保持在原 Consumer 上，assigned_partitions 指标应该保持相对稳定（最多短暂减少需要迁移走的个别 Partition）。如果看到 assigned_partitions 从 4 变成 0 再恢复，说明该 Consumer 经历了全量 Revoke，这是 Eager 协议的典型行为。最可能的原因是配置没有正确生效——比如 Spring Kafka 的配置项写错了路径、环境变量覆盖了配置文件、或者该实例还没有完成第二步的重启。C 选项描述的情况也会导致 Partition 数清零，但那属于 Consumer 被踢出再重新加入，不是协议问题，需要结合日志中是否有 `member fenced` 或 `timeout` 错误来判断。"
+        },
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz6",
+          "question": "已经完成第二步迁移（所有实例只配置了 CooperativeStickyAssignor），此时需要紧急回滚到 Eager 模式，正确的做法是？",
+          "choices": [
+            {"id": "A", "text": "直接将所有实例的配置改为只有 RangeAssignor，然后滚动重启"},
+            {"id": "B", "text": "先改回双策略共存（CooperativeStickyAssignor + RangeAssignor）滚动重启，再改为只有 RangeAssignor 滚动重启"},
+            {"id": "C", "text": "先停止所有 Consumer，修改配置后同时启动所有实例"},
+            {"id": "D", "text": "通过 Broker 端配置 group.consumer.assignors 强制覆盖 Client 端策略"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "回滚和迁移一样需要经过双策略过渡阶段。如果直接把某个实例从只有 CooperativeStickyAssignor 改为只有 RangeAssignor，该实例只支持 EAGER，而其余实例只支持 COOPERATIVE，两者没有协议交集，会出现 InconsistentGroupProtocolException。正确做法是先改回双策略共存让所有成员都同时支持两种协议，然后再移除 Cooperative 策略。A 选项会导致滚动重启过程中新旧实例协议不兼容；C 选项虽然技术上可行（全停全起避免了混合状态），但对业务中断太大，不是推荐做法；D 选项中 group.consumer.assignors 是 KIP-848 新协议的配置，不适用于经典协议。"
+        },
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz7",
+          "question": "以下哪种场景下，从 Eager 迁移到 Cooperative 的收益最大？",
+          "choices": [
+            {"id": "A", "text": "Consumer Group 只有 2 个实例，消费 2 个 Partition，每天发版一次"},
+            {"id": "B", "text": "Consumer Group 有 20 个实例，消费 200 个 Partition，每天发版多次且实例做滚动重启"},
+            {"id": "C", "text": "Consumer Group 有 3 个实例但从不做滚动重启，只在维护窗口全量重启"},
+            {"id": "D", "text": "Consumer Group 有 5 个实例但每个实例消费的消息量很低，lag 始终为 0"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Cooperative 模式的核心价值是减少 Rebalance 期间的消费中断。收益大小取决于两个因素：Rebalance 的频率和每次 Rebalance 影响的 Partition 数量。B 选项同时具备高频率（每天多次滚动发布，每次 20 个实例逐个重启意味着 20 次 Rebalance）和大影响面（200 个 Partition 在 Eager 模式下每次 Rebalance 全部停消费）。A 选项规模太小，Eager 的 STW 影响有限；C 选项不做滚动重启就不会频繁触发 Rebalance，全量重启时 Eager 和 Cooperative 的效果差别不大；D 选项消息量低意味着 Rebalance 期间的积压也很少，收益不明显。"
+        },
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz8",
+          "question": "迁移到 Cooperative 后，团队发现 ConsumerRebalanceListener 的 onPartitionsRevoked 回调中原本的「全量缓存刷盘」逻辑只 flush 了部分 Partition 的缓存，原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Cooperative 模式下 onPartitionsRevoked 只传入被实际迁移走的 Partition 列表，不再是全量"},
+            {"id": "B", "text": "CooperativeStickyAssignor 的 bug，已在 Kafka 3.5 修复"},
+            {"id": "C", "text": "Spring Kafka 的 listener 适配层过滤了未变更的 Partition"},
+            {"id": "D", "text": "Cooperative 模式下 onPartitionsRevoked 不再被调用，应改用 onPartitionsLost"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是从 Eager 迁移到 Cooperative 时最常见的「行为变更」坑点。在 Eager 模式下，每次 Rebalance 触发时所有 Consumer 先 Revoke 全部 Partition，所以 onPartitionsRevoked 的参数是该 Consumer 当前持有的全部 Partition 列表。在 Cooperative 模式下，只有需要迁移走的 Partition 才会被 Revoke，所以 onPartitionsRevoked 的参数只包含被迁移的那些 Partition。如果你在 onPartitionsRevoked 中做「遍历参数列表 flush 缓存」的逻辑，Cooperative 模式下就只会 flush 被迁移走的 Partition 的缓存，保留的 Partition 不会被 flush。B 选项不正确，这是设计行为不是 bug；D 选项不正确，onPartitionsRevoked 在 Cooperative 模式下仍然会被调用，只是参数范围变小了。"
+        },
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz9",
+          "question": "在 Kafka 4.0 中，通过 group.protocol=consumer 启用 KIP-848 新版 Consumer Group 协议后，partition.assignment.strategy 配置会怎样？",
+          "choices": [
+            {"id": "A", "text": "仍然生效，CooperativeStickyAssignor 是唯一可选值"},
+            {"id": "B", "text": "被忽略，分区分配由 Broker 端的 Group Coordinator 根据 group.consumer.assignors 配置执行"},
+            {"id": "C", "text": "需要设置为特殊值 server-side 来启用服务端分配"},
+            {"id": "D", "text": "变为只读参数，Client 端可以查询但不能修改"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "KIP-848 将分区分配的计算从 Client 端的 Leader Consumer 移到了 Server 端的 Group Coordinator。在新协议下，Consumer Client 不再负责执行分配算法，因此 partition.assignment.strategy 这个 Client 端配置不再生效。取而代之的是 Broker 端的 group.consumer.assignors 配置，由 Coordinator 使用服务端的 Assignor 来计算分配方案。这种架构变化消除了 Leader 选举、SyncGroup 环节的开销，也意味着分配策略的管理从分散的 Client 端集中到了 Broker 端。A 选项不正确，该配置在新协议下被忽略而非限制为某个值；C 选项中不存在 server-side 这个特殊值；D 选项不正确，它不是变为只读而是直接不参与新协议的逻辑。"
+        },
+        {
+          "id": "kafka-consumer-adv-migrate-to-cooperative-q1-quiz10",
+          "question": "你的团队在迁移第二步的过程中（已有 3 个实例完成了第二步只配置 CooperativeStickyAssignor，还有 5 个实例处于第一步的双策略配置），这时线上突然出现故障需要紧急扩容 Consumer 实例。新实例的 partition.assignment.strategy 应该怎么配置？",
+          "choices": [
+            {"id": "A", "text": "配置为只有 CooperativeStickyAssignor，因为 Group 已经在 Cooperative 模式下运行"},
+            {"id": "B", "text": "配置为只有 RangeAssignor，与「还没完成迁移的 5 个实例」保持一致"},
+            {"id": "C", "text": "配置为 CooperativeStickyAssignor + RangeAssignor 双策略，兼容当前 Group 的任何协议状态"},
+            {"id": "D", "text": "先不加入现有 Group，创建一个临时 Group 消费同一 Topic"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "在迁移第二步进行到一半时，Group 中已经有 3 个实例只支持 COOPERATIVE，5 个实例支持 EAGER + COOPERATIVE，此时 Group 的协议交集是 COOPERATIVE（因为那 3 个实例不再支持 EAGER），Group 正在 Cooperative 模式下运行。新实例配置为双策略（支持 EAGER + COOPERATIVE）是最安全的选择——它能加入任何协议状态的 Group。如果配置为只有 CooperativeStickyAssignor（A 选项），也能正常加入当前的 COOPERATIVE Group，但如果之后需要回滚到 Eager 就又多了一个需要经过过渡阶段的实例。B 选项会直接失败——只支持 EAGER 的新实例无法加入已经运行在 COOPERATIVE 模式的 Group。D 选项的临时 Group 会导致重复消费等一系列问题。"
+        }
+      ],
+      "references": [
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol",
+        "https://kafka.apache.org/documentation/#consumerconfigs_partition.assignment.strategy",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol"
+      ]
+    }
+  ]
+}
