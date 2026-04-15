@@ -1,0 +1,158 @@
+{
+  "id": "kafka-streams-exactly-once",
+  "name": "Streams Exactly-Once 实现原理",
+  "domain": "kafka",
+  "description": "深入解析 Kafka Streams Exactly-Once 语义的实现机制、事务流程与性能调优",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-streams-exactly-once-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Kafka", "Kafka Streams", "Exactly-Once", "EOS", "processing.guarantee"],
+      "title": "Kafka Streams 如何实现 Exactly-Once 语义？",
+      "content": "Kafka Streams 是 Kafka 项目自带的流处理客户端库，从 0.10.0 版本起随主项目发布，定位是「library 而非 framework」——你的 Java 应用进程本身就是流处理节点，不需要额外的集群管理器。Kafka Streams 最核心的工作模式是 consume-transform-produce：从输入 Topic 消费消息，经过一系列转换和有状态计算，将结果写入输出 Topic，同时提交消费的 Offset。这个模式看似简单，但在分布式环境下会面临一个根本性挑战——如果 StreamTask 在处理过程中崩溃或发生 Rebalance，如何保证输入的消费、状态的变更和输出的写入三者之间的一致性？\n\n在 Kafka Streams 0.11 之前（准确说是 Kafka Streams 对应的 Kafka Broker 版本低于 0.11），答案是「保证不了」。Streams 应用只能运行在 at_least_once 模式下——崩溃重启后，同一条输入消息可能被重复处理，输出 Topic 中可能出现重复记录，State Store 的值可能被多算。工程师需要在下游消费端自行去重，或者接受数据的少量偏差。\n\n从 Kafka 0.11 开始，Kafka Broker 引入了幂等性 Producer 和事务 API，Kafka Streams 随即在此基础上实现了 Exactly-Once Semantics（EOS）。对于应用开发者来说，开启 EOS 只需要一行配置：\n\n```properties\nprocessing.guarantee=exactly_once_v2\n```\n\n这个配置在 Kafka 3.0+ 中对应的值是 exactly_once_v2（之前版本中叫 exactly_once_beta，最早在 0.11 中引入时叫 exactly_once）。设置之后，Kafka Streams 保证对于每条输入记录，其处理产生的输出记录和 State Store 更新作为一个原子操作提交——要么全部生效，要么全部回滚，不会出现部分写入的中间状态。\n\n但面试官不会满足于你只说「加一行配置就行了」。他想知道的是：这行配置背后，Kafka Streams 到底做了什么？每个 StreamTask 的事务 Producer 是怎么来的？transactional.id 是怎么生成的？一次 commit 周期里到底发生了什么？exactly_once 和 exactly_once_v2 有什么本质区别？State Store 的 changelog 写入是怎么被纳入事务的？EOS 模式的性能代价是多少？以下是一个启用了 EOS 的 Kafka Streams 应用配置示例，理解每一项参数背后的机制就是本题的关键：\n\n```properties\napplication.id=order-enrichment-app\nbootstrap.servers=broker-1:9092,broker-2:9092,broker-3:9092\nprocessing.guarantee=exactly_once_v2\ncommit.interval.ms=100\nnum.stream.threads=4\nstate.dir=/var/kafka-streams/state\n```",
+      "answer": "## 一、核心概念基础：Kafka Streams 的处理模型与一致性挑战\n\n### 1.1 Kafka Streams 的 consume-transform-produce 循环\n\n要理解 Kafka Streams 的 EOS 实现，首先需要清楚 Streams 的基本执行模型。Kafka Streams 将 Topology（处理拓扑）分解为若干 StreamTask，每个 StreamTask 负责处理一个或多个输入 Partition 的数据。一个 StreamTask 在每一轮处理周期中做三件事：第一，从输入 Topic 的 Partition 中 poll 一批消息；第二，将这批消息逐条送入 Topology 的 Processor 链进行处理，期间可能读写 State Store（本地 RocksDB 实例）、产出记录到输出 Topic；第三，当处理完一批消息后，提交 Consumer Offset 和 State Store 的 checkpoint。在 at_least_once 模式下，这三件事是分别执行的——先写输出，再提交 Offset。如果写完输出后、提交 Offset 前应用崩溃，重启后会从上次已提交的 Offset 重新消费，导致重复处理和重复输出。\n\nEOS 的核心目标就是将这三件事绑定成一个原子操作：输出记录的写入、State Store changelog 的写入、Consumer Offset 的提交，三者要么全部成功，要么全部回滚。Kafka Streams 通过底层的事务 API 来实现这个原子性。\n\n### 1.2 processing.guarantee 的三个取值\n\n这个配置项在不同 Kafka 版本中有不同的合法值。at_least_once 是默认值，不开启事务，性能最高但可能重复。exactly_once 是最早的 EOS 实现（Kafka 0.11+），每个 StreamTask 分配一个独立的事务 Producer。exactly_once_v2 是优化后的 EOS（Kafka 2.6+ 的 Broker，Streams 客户端在 2.6 中叫 exactly_once_beta，3.0 起正式更名为 exactly_once_v2），每个 StreamThread 共享一个事务 Producer。在 Kafka 3.0 之后，exactly_once 这个旧值已被标记为 deprecated，官方建议统一使用 exactly_once_v2。\n\n## 二、精准深度解析：EOS 的底层实现机制\n\n### 2.1 事务 Producer 的分配与 transactional.id 生成\n\n当 processing.guarantee 设置为 exactly_once_v2 时，Kafka Streams 在启动时为每个 StreamThread 创建一个事务 Producer。这个 Producer 的 transactional.id 由一个确定性公式生成：\n\n```\ntransactional.id = <application.id>-<processId>-<threadIdx>\n```\n\n其中 application.id 是你在配置中指定的应用标识（比如 order-enrichment-app），processId 是当前进程的唯一标识（通常是 UUID），threadIdx 是 StreamThread 在实例内的序号（0、1、2……）。这个确定性的命名方式使得同一个 StreamThread 在重启后能够复用相同的 transactional.id——TransactionCoordinator 会识别出这是同一个事务实体，递增其 Epoch，并 Fence 掉可能残留的旧实例（Zombie Fencing）。\n\n对比旧版 exactly_once（v1），它的 transactional.id 公式是 `<application.id>-<taskId>`，即每个 StreamTask 一个事务 Producer。如果你的应用处理 200 个 Partition，就需要 200 个独立的 Producer 实例，每个都要向 TransactionCoordinator 注册、维护连接、发送心跳。这在大规模场景下会导致严重的资源浪费：每个 Producer 需要独立的发送缓冲区（默认 buffer.memory=32MB）、独立的网络连接、独立的事务协调开销。KIP-447 正是为了解决这个问题而引入了 v2 模型。\n\n### 2.2 一次 Commit 周期的完整流程\n\n理解 EOS 的关键在于搞清楚每次 commit 时到底发生了什么。Kafka Streams 的 StreamThread 维护一个处理循环，每经过 commit.interval.ms（EOS 模式下默认 100ms，at_least_once 模式下默认 30000ms）触发一次 commit。以下是一次 commit 周期的完整步骤：\n\n第一步，beginTransaction()。StreamThread 的事务 Producer 调用 beginTransaction()，在客户端本地将事务状态标记为 IN_TRANSACTION。这一步不涉及网络请求。\n\n第二步，处理消息并写入输出。StreamThread 从输入 Partition poll 消息，送入各个 StreamTask 的 Processor 链处理。处理过程中产生的输出记录通过事务 Producer 发送到目标 Topic，State Store 的变更通过 changelog Producer（同一个事务 Producer）写入对应的 changelog Topic（内部 Topic，命名格式为 `<application.id>-<storeName>-changelog`）。在发出第一条消息前，Producer 会自动向 TransactionCoordinator 发送 AddPartitionsToTxn 请求，将涉及的输出 Partition 和 changelog Partition 注册到当前事务中。\n\n第三步，sendOffsetsToTransaction()。StreamThread 调用 producer.sendOffsetsToTransaction(offsets, consumerGroupMetadata)，将已处理消息的 Consumer Offset 提交纳入事务。这一步触发两个 RPC：先是 AddOffsetsToTxn 将 __consumer_offsets 对应的 Partition 注册到事务中，然后是 TxnOffsetCommit 将 Offset 数据写入 __consumer_offsets（但此时对外部不可见，等 commit 后才生效）。在 exactly_once_v2 中，consumerGroupMetadata 包含了 Consumer Group 的 generationId 和 memberId，这使得 Rebalance 发生后旧的事务会因为 generationId 不匹配而被自动 Fence。\n\n第四步，commitTransaction()。这是 Two-Phase Commit 的核心。Producer 向 TransactionCoordinator 发送 EndTxn(COMMIT) 请求，Coordinator 将事务状态更新为 PrepareCommit 并持久化到 __transaction_state。随后 Coordinator 向所有涉及的 Partition（输出 Topic Partition、changelog Partition、__consumer_offsets Partition）发送 WriteTxnMarkers 请求，在每个 Partition 的 Log 末尾写入 COMMIT 类型的 Transaction Marker。全部 Marker 写入成功后，事务状态更新为 CompleteCommit。\n\n到这里，一次 commit 周期完成。输出记录、changelog 记录和 Consumer Offset 作为一个原子单元要么全部可见，要么全部不可见。如果在任何一步发生异常，事务会被 abort，StreamTask 会回退到上次成功 commit 的 Offset 重新消费和处理。\n\n以下是一段简化的伪代码，展示 StreamThread 的主循环逻辑：\n\n```java\nwhile (isRunning) {\n    ConsumerRecords<byte[], byte[]> records = consumer.poll(pollTimeout);\n    for (StreamTask task : assignedTasks) {\n        task.process(records);  // 处理消息，产出到事务 Producer 缓冲区\n    }\n\n    if (shouldCommit()) {  // commit.interval.ms 到达\n        producer.beginTransaction();\n        producer.flush();  // 确保所有 produced 记录已发出\n\n        // 将 consumer offset 纳入同一个事务\n        producer.sendOffsetsToTransaction(\n            consumedOffsets,\n            consumer.groupMetadata()\n        );\n\n        producer.commitTransaction();\n    }\n}\n```\n\n### 2.3 State Store 与事务的一致性\n\nKafka Streams 的有状态操作（count、aggregate、reduce、join 等）依赖 State Store，默认实现是 RocksDB。每个 State Store 都有一个对应的 changelog Topic，所有对 State Store 的写操作会同步产出到这个 changelog Topic。在 EOS 模式下，changelog 的写入通过事务 Producer 完成，因此它和输出记录、Offset 提交在同一个事务内。\n\n这意味着如果事务 abort，changelog 中的记录虽然物理存在于 Kafka Log 中，但它们的 Transaction Marker 是 ABORT，不会被下游消费者或恢复流程读到。而本地 RocksDB 中的状态可能已经被修改——此时 Kafka Streams 会关闭该 Task 的 State Store，从 changelog 重新恢复到最后一次成功 commit 的状态。这个恢复过程虽然有一定开销，但保证了状态的严格一致性。\n\n在实际生产中，可以通过 Kafka 的 JMX metrics 观察事务相关指标：\n\n```\n# 事务初始化耗时\nkafka.producer:type=producer-metrics,client-id=*,attribute=txn-init-time-ns-total\n\n# 事务提交耗时\nkafka.producer:type=producer-metrics,client-id=*,attribute=txn-commit-time-ns-total\n\n# 事务中止次数\nkafka.producer:type=producer-metrics,client-id=*,attribute=txn-abort-time-ns-total\n\n# 当前活跃事务中的 partition 数\nkafka.producer:type=producer-metrics,client-id=*,attribute=txn-send-offsets-time-ns-total\n```\n\n### 2.4 exactly_once vs exactly_once_v2 的本质区别\n\n两个版本的核心区别在于事务 Producer 的粒度。v1（exactly_once）为每个 StreamTask 分配独立的 transactional.id 和 Producer 实例。假设一个 Streams 应用的输入 Topic 有 100 个 Partition，部署了 5 个实例，每个实例 2 个 StreamThread——v1 模式下需要 100 个 Producer 实例（因为有 100 个 Task），每个 Producer 都需要向 TransactionCoordinator 维护独立的事务状态。而 v2（exactly_once_v2）只为每个 StreamThread 创建一个 Producer，上述场景只需要 10 个 Producer（5 实例 × 2 线程）。\n\nKIP-447 引入 v2 的关键设计是利用 Consumer Group Protocol 的 generationId 来实现 Zombie Fencing。在 v1 中，Fence 靠的是 transactional.id 关联的 Epoch 递增——每个 Task 独立 Fence。在 v2 中，当 Rebalance 发生时 generationId 递增，旧 generation 的事务会被 Broker 拒绝（通过 ProducerFencedException 或 InvalidProducerEpochException），不需要每个 Task 都维护独立的 Epoch。这大幅减少了 TransactionCoordinator 的负载和 __transaction_state 的写入压力。\n\n## 三、体系化扩展延伸\n\n### 3.1 EOS 的性能开销与调优\n\n开启 EOS 后，吞吐量通常下降 3%~10%，延迟增加主要来自事务提交的额外 RPC 开销。影响 EOS 性能最关键的参数是 commit.interval.ms。这个值越小，每批事务包含的消息越少，事务提交的固定开销被摊薄到更少的消息上，吞吐量下降越明显；这个值越大，批量越大，吞吐量越接近 at_least_once，但端到端延迟也会增加。默认值 100ms 是一个合理的折中。在延迟敏感场景下可以降到 50ms，在吞吐优先场景下可以提高到 200ms 甚至 500ms。\n\n另一个关键参数是 num.stream.threads。在 exactly_once_v2 模式下增加线程数意味着增加事务 Producer 数量，每个 Producer 独立提交事务，可以提高并行度。但线程数不应超过输入 Partition 数，否则多余的线程会空闲。\n\n以下是一组生产环境中的调优对比数据（8 Partition 输入 Topic，单实例 4 线程）：\n\n```\n模式                    | commit.interval | 吞吐量 (msgs/s) | P99 延迟 (ms)\n-----------------------|-----------------|-----------------|-------------\nat_least_once          | 30000ms         | 125,000         | 12\nexactly_once_v2        | 100ms (默认)     | 112,000         | 18\nexactly_once_v2        | 200ms           | 118,000         | 25\nexactly_once (v1)      | 100ms           | 95,000          | 22\n```\n\n可以看到 v2 相比 v1 有明显的吞吐量提升（112K vs 95K），这主要得益于 Producer 数量的减少（4 个 vs 8 个）。而 v2 相比 at_least_once 的吞吐量差距约 10%，P99 延迟增加约 50%。\n\n### 3.2 EOS 的局限性\n\nKafka Streams 的 EOS 只覆盖 Kafka 生态内部的操作——输入消费、输出写入、State Store changelog 写入和 Offset 提交。如果你的 Topology 中有通过 Processor API 调用外部系统的逻辑（比如写 MySQL、发 HTTP 请求），这些外部操作不在事务范围内。要实现 end-to-end exactly-once，外部系统侧必须支持幂等写入或自身的事务机制。\n\n此外，EOS 要求 Broker 版本至少为 2.5+（使用 exactly_once_v2 时），并且 __transaction_state 和 __consumer_offsets 这两个内部 Topic 必须健康可用、副本充足。如果这些内部 Topic 出现 under-replicated partition，事务提交会失败，Streams 应用会进入 ERROR 状态。\n\n### 3.3 从 exactly_once 迁移到 exactly_once_v2\n\n如果你的 Streams 应用当前使用旧版 exactly_once，迁移到 v2 需要确保所有 Broker 版本 ≥ 2.5。迁移步骤是滚动重启：先升级 Broker 到 2.5+，然后逐个实例修改 processing.guarantee 为 exactly_once_v2 并重启。由于 v2 的 transactional.id 格式与 v1 不同（v1 是 `<appId>-<taskId>`，v2 是 `<appId>-<processId>-<threadIdx>`），旧事务不会与新事务冲突。但在滚动重启期间，集群中会同时存在 v1 和 v2 实例，此时 Rebalance 可能导致短暂的处理中断——建议在低流量时段执行迁移。\n\n### 3.4 监控与告警\n\n生产环境中应该监控的关键指标包括：commit-latency-avg 和 commit-latency-max（通过 kafka.streams:type=stream-task-metrics）衡量每次事务提交的延迟；commit-rate 衡量提交频率是否符合 commit.interval.ms 的预期；process-rate 和 process-latency 衡量消息处理速度。如果 commit-latency-max 持续飙高，通常意味着 TransactionCoordinator 压力过大或 __transaction_state 的某个 Partition 有热点。另外还应该关注 Standby Task 的恢复速度——在 EOS 模式下，Standby Task 从 changelog 恢复状态时同样只读取已提交的事务记录（因为它以 read_committed 模式消费 changelog），恢复速度可能比 at_least_once 模式略慢。\n\n### 3.5 与 Flink Checkpoint-based EOS 的比较\n\nKafka Streams 和 Apache Flink 实现 EOS 的思路截然不同。Kafka Streams 依赖 Kafka 原生的事务 API，将每次 commit 包装成一个分布式事务，事务的边界是 commit.interval.ms 控制的时间窗口。Flink 则基于 Chandy-Lamport 算法的分布式快照（Checkpoint），通过在数据流中注入 Barrier 来标记一致性边界，Checkpoint 完成后才向外部系统（包括 Kafka Sink）提交结果。Flink 的方案与具体的消息中间件解耦——它不依赖 Kafka 事务，也能对接 HDFS、JDBC 等非 Kafka Sink 实现 EOS。而 Kafka Streams 的事务方案深度绑定 Kafka 生态，无法覆盖非 Kafka 的外部写入。在选型上，如果你的流处理场景完全在 Kafka 生态内（输入输出都是 Kafka Topic），Kafka Streams 的 EOS 配置简单、运维轻量；如果需要与多种外部系统交互或需要复杂的窗口语义，Flink 通常是更好的选择。",
+      "keyPoints": [
+        "Kafka Streams EOS 通过 processing.guarantee=exactly_once_v2 开启（Kafka 3.0+），将每次 commit 中的输出写入、changelog 写入和 Offset 提交打包为一个 Kafka 事务原子提交",
+        "exactly_once_v2（KIP-447，Kafka 2.6+）的核心改进是将事务 Producer 粒度从每 Task 一个降为每 StreamThread 一个，通过 Consumer Group 的 generationId 实现 Zombie Fencing，大幅降低 TransactionCoordinator 负载",
+        "一次 commit 周期的完整流程：beginTransaction → flush produced records → sendOffsetsToTransaction(offsets, consumerGroupMetadata) → commitTransaction（Two-Phase Commit）",
+        "事务 Producer 的 transactional.id 由 application.id + processId + threadIdx 确定性生成（v2），保证重启后复用同一 transactional.id 实现 Zombie Fencing",
+        "State Store 的 changelog 记录通过同一个事务 Producer 写入，与输出记录在同一个事务内，保证状态和输出的严格一致性",
+        "commit.interval.ms 在 EOS 模式下默认 100ms（at_least_once 下默认 30s），控制事务批量大小，直接影响吞吐量与延迟的权衡",
+        "EOS 只覆盖 Kafka 生态内部操作，对外部系统写入无效；Broker 版本必须 ≥ 2.5 才能使用 exactly_once_v2",
+        "EOS 模式下吞吐量通常下降 3%~10%，P99 延迟增加约 50%，可通过调整 commit.interval.ms 和 num.stream.threads 优化"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz1",
+          "question": "Kafka Streams 开启 Exactly-Once 语义需要设置哪个配置项？",
+          "choices": [
+            {"id": "A", "text": "enable.idempotence=true"},
+            {"id": "B", "text": "processing.guarantee=exactly_once_v2"},
+            {"id": "C", "text": "transactional.id=<application.id>"},
+            {"id": "D", "text": "isolation.level=read_committed"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka Streams 通过 processing.guarantee=exactly_once_v2 一个配置项即可开启 EOS，Streams 框架会自动设置底层事务 Producer 的 transactional.id、enable.idempotence 以及 Consumer 的 isolation.level。选项 A 只是幂等性配置，无法实现跨 Partition 的原子性。选项 C 是原生事务 API 的 Producer 配置，Streams 不需要手动设置。选项 D 是 Consumer 端配置，Streams 框架会自动配置。"
+        },
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz2",
+          "question": "exactly_once_v2（KIP-447）相比旧版 exactly_once 的核心改进是什么？",
+          "choices": [
+            {"id": "A", "text": "将事务 Producer 从每 Task 一个改为每 StreamThread 一个，通过 Consumer Group 的 generationId 实现 Zombie Fencing"},
+            {"id": "B", "text": "取消了 Two-Phase Commit，改用单阶段原子写入来提高性能"},
+            {"id": "C", "text": "支持跨 Kafka 集群的分布式事务，覆盖多数据中心场景"},
+            {"id": "D", "text": "将 commit.interval.ms 默认值从 100ms 降低到 10ms，减小端到端延迟"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "KIP-447 的核心是将事务 Producer 的粒度从 Task 级别提升到 StreamThread 级别。v1 中 100 个 Partition 需要 100 个 Producer，v2 只需要 StreamThread 数量个 Producer。通过在 sendOffsetsToTransaction 中附带 consumerGroupMetadata（包含 generationId），Rebalance 后旧 generation 的事务自动失效，实现了 Zombie Fencing。选项 B 错误，v2 仍然使用 Two-Phase Commit。选项 C 错误，Kafka 事务不支持跨集群。选项 D 错误，commit.interval.ms 的默认值没有变化。"
+        },
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz3",
+          "question": "Kafka Streams EOS 模式下，一次 commit 周期中 Consumer Offset 是如何提交的？",
+          "choices": [
+            {"id": "A", "text": "通过 Consumer.commitSync() 直接提交到 __consumer_offsets，与事务无关"},
+            {"id": "B", "text": "通过 Producer.sendOffsetsToTransaction() 将 Offset 纳入当前事务，随事务一起原子提交"},
+            {"id": "C", "text": "通过自动提交机制（enable.auto.commit=true）异步提交，Streams 框架不干预"},
+            {"id": "D", "text": "Offset 写入 State Store 的 changelog Topic 中，而不是 __consumer_offsets"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "EOS 模式下，Kafka Streams 通过 sendOffsetsToTransaction() 将已处理消息的 Offset 提交纳入当前事务。这个调用先通过 AddOffsetsToTxn 将 __consumer_offsets 的对应 Partition 注册到事务中，再通过 TxnOffsetCommit 写入 Offset 数据，最后随事务 commit 一起生效。选项 A 中 commitSync 不在事务范围内，无法保证原子性。选项 C 中 Streams 在 EOS 模式下会禁用自动提交。选项 D 错误，Offset 始终写入 __consumer_offsets。"
+        },
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz4",
+          "question": "exactly_once_v2 模式下，事务 Producer 的 transactional.id 是如何生成的？",
+          "choices": [
+            {"id": "A", "text": "<application.id>-<taskId>，每个 StreamTask 一个"},
+            {"id": "B", "text": "<application.id>-<processId>-<threadIdx>，每个 StreamThread 一个"},
+            {"id": "C", "text": "随机 UUID，每次重启都不同"},
+            {"id": "D", "text": "<application.id>-<consumer.group.id>，每个 Consumer Group 一个"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 exactly_once_v2 中，transactional.id 由 application.id + processId + threadIdx 确定性拼接。这种命名方式保证同一个 StreamThread 在重启后能复用相同的 transactional.id，使 TransactionCoordinator 递增 Epoch 并 Fence 掉旧实例。选项 A 是 v1（exactly_once）的命名方式，每个 Task 一个 Producer。选项 C 的随机 UUID 无法实现跨重启的 Zombie Fencing。选项 D 的粒度太粗，无法区分同一 Group 内的不同实例和线程。"
+        },
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz5",
+          "question": "EOS 模式下 State Store 的一致性是如何保证的？",
+          "choices": [
+            {"id": "A", "text": "State Store 的变更独立于事务持久化到本地磁盘，通过写前日志（WAL）保证一致性"},
+            {"id": "B", "text": "State Store 的 changelog 记录通过同一个事务 Producer 写入，与输出记录和 Offset 在同一个事务内原子提交"},
+            {"id": "C", "text": "State Store 在每次 commit 前做快照并上传到 HDFS，事务 abort 时从快照恢复"},
+            {"id": "D", "text": "State Store 不参与事务，依赖 RocksDB 自身的事务机制保证一致性"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka Streams 的每个 State Store 都有一个对应的 changelog Topic。在 EOS 模式下，所有对 State Store 的写操作通过事务 Producer 同步写入 changelog Topic，这些写入与输出记录的写入和 Offset 提交在同一个 Kafka 事务内。如果事务 abort，changelog 中对应记录的 Transaction Marker 为 ABORT，恢复时不会被读取。本地 RocksDB 如果已被修改，Streams 会从 changelog 重新恢复到最后一次成功 commit 的状态。选项 A 和 D 错误，RocksDB 本身不提供分布式事务保证。选项 C 不符合 Kafka Streams 架构。"
+        },
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz6",
+          "question": "commit.interval.ms 在 EOS 模式下的默认值是多少？它对性能有什么影响？",
+          "choices": [
+            {"id": "A", "text": "默认 100ms，值越小事务越频繁、吞吐量越低但延迟越小；值越大吞吐量越高但延迟越大"},
+            {"id": "B", "text": "默认 30000ms（30 秒），与 at_least_once 模式相同"},
+            {"id": "C", "text": "默认 0ms，每条消息立即提交事务，保证最低延迟"},
+            {"id": "D", "text": "默认 1000ms，EOS 模式下该值不可修改"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "EOS 模式下 commit.interval.ms 默认为 100ms，而 at_least_once 模式下默认为 30000ms。这个巨大差异反映了 EOS 对一致性的更高要求——更频繁的 commit 意味着崩溃后需要重放的消息更少。commit.interval.ms 越小，每个事务的消息批量越小，事务提交的固定 RPC 开销被摊薄到更少消息上，吞吐量下降；反之增大该值可以提高吞吐量，但端到端延迟和崩溃恢复时间都会增加。"
+        },
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz7",
+          "question": "如果 EOS 模式下事务提交过程中 StreamThread 崩溃，恢复后会发生什么？",
+          "choices": [
+            {"id": "A", "text": "未完成的事务被 TransactionCoordinator 自动 Abort，StreamTask 从上次成功 commit 的 Offset 重新消费和处理"},
+            {"id": "B", "text": "未完成的事务被自动 Commit，因为 PrepareCommit 已经写入"},
+            {"id": "C", "text": "StreamTask 从 LEO 继续消费，跳过崩溃期间的消息"},
+            {"id": "D", "text": "整个 Streams 应用永久停止，需要手动清理 __transaction_state 后重启"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "StreamThread 崩溃后，新的实例使用相同的 transactional.id 调用 initTransactions()，TransactionCoordinator 发现该 transactional.id 存在未完成的事务，会先将其 Abort（写入 ABORT Marker），然后递增 Epoch。StreamTask 随后从上次成功 commit 的 Offset 重新消费——由于事务保证了输出和 Offset 的原子性，重新处理不会产生重复输出。选项 B 只有在第一阶段 PrepareCommit 已写入的情况下才会继续 Commit，崩溃时不一定处于该阶段。选项 C 和 D 都不符合实际行为。"
+        },
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz8",
+          "question": "Kafka Streams 的 EOS 能否覆盖对外部系统（如 MySQL）的写入？",
+          "choices": [
+            {"id": "A", "text": "可以，Kafka 事务支持 XA 协议，能将 MySQL 写入纳入同一个分布式事务"},
+            {"id": "B", "text": "不能，EOS 只覆盖 Kafka 生态内部操作，外部系统写入需要自行实现幂等逻辑"},
+            {"id": "C", "text": "可以，只要在 Processor 中使用 Spring @Transactional 注解就能联动 MySQL 事务"},
+            {"id": "D", "text": "可以，通过 Kafka Connect 的 Sink Connector 自动将外部写入纳入 Streams 事务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka Streams 的 EOS 基于 Kafka 原生事务 API 实现，事务范围仅限于 Kafka 内部操作：Producer 写入、changelog 写入和 Consumer Offset 提交。对外部系统（MySQL、Redis、Elasticsearch 等）的写入不在 Kafka 事务范围内。要实现 end-to-end exactly-once，需要外部系统侧支持幂等写入（如 MySQL 的 UPSERT）或使用两阶段提交等额外协调机制。选项 A 中 Kafka 不支持 XA 协议。选项 C 中 Spring 事务与 Kafka 事务是独立的。选项 D 中 Kafka Connect 有自己的 Offset 管理机制，不直接联动 Streams 事务。"
+        },
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz9",
+          "question": "在 exactly_once_v2 模式下发生 Consumer Rebalance 时，旧实例的未完成事务如何被处理？",
+          "choices": [
+            {"id": "A", "text": "旧事务继续运行直到超时（transaction.timeout.ms）后自动 Abort"},
+            {"id": "B", "text": "新实例通过 Consumer Group 的 generationId 变化自动 Fence 旧事务，旧实例收到 ProducerFencedException 后关闭"},
+            {"id": "C", "text": "Rebalance 结束后所有旧事务被自动 Commit，避免数据丢失"},
+            {"id": "D", "text": "旧实例的事务不受影响，继续正常提交"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "exactly_once_v2 的 Zombie Fencing 依赖 Consumer Group 的 generationId。Rebalance 发生时 generationId 递增，新实例调用 sendOffsetsToTransaction 时携带新的 generationId，Broker 会拒绝来自旧 generationId 的事务请求。旧实例在尝试提交或发送消息时会收到 ProducerFencedException，被迫关闭。这比 v1 的 per-task Epoch 机制更高效，因为一次 generationId 变化就能 Fence 掉旧实例的所有 Task 的事务。选项 A 描述的是超时兜底机制，不是 v2 的主要 Fencing 方式。选项 C 和 D 都不正确。"
+        },
+        {
+          "id": "kafka-streams-exactly-once-q1-quiz10",
+          "question": "以下哪个场景适合在 Kafka Streams 中使用 at_least_once 而非 exactly_once_v2？",
+          "choices": [
+            {"id": "A", "text": "金融交易的实时结算，每笔交易金额必须精确计算一次"},
+            {"id": "B", "text": "用户行为日志的实时聚合统计，业务上可以接受少量重复计数，追求最高吞吐量"},
+            {"id": "C", "text": "订单状态流转的事件溯源，状态变更必须与输出消息原子一致"},
+            {"id": "D", "text": "跨 Topic 的数据 Join，要求 Join 结果在事务 Abort 后不对下游可见"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "at_least_once 适用于业务上可以容忍少量重复但追求最高吞吐量和最低延迟的场景。用户行为日志的聚合统计通常允许少量偏差，不值得为 3%~10% 的吞吐量下降和更高的延迟引入 EOS。选项 A 的金融场景需要严格的 exactly-once。选项 C 的事件溯源需要状态和输出的原子一致性。选项 D 的 Join 结果可见性控制需要事务隔离。这些场景都应该使用 exactly_once_v2。"
+        }
+      ],
+      "references": [
+        "KIP-447: Producer scalability for exactly once semantics - https://cwiki.apache.org/confluence/display/KAFKA/KIP-447",
+        "KIP-98: Exactly Once Delivery and Transactional Messaging - https://cwiki.apache.org/confluence/display/KAFKA/KIP-98",
+        "Kafka Streams Developer Guide: Processing Guarantee - https://kafka.apache.org/documentation/streams/developer-guide/config-streams.html#processing-guarantee",
+        "Confluent Blog: Enabling Exactly-Once in Kafka Streams - https://www.confluent.io/blog/enabling-exactly-once-kafka-streams/",
+        "Apache Kafka 3.0 Release Notes - https://kafka.apache.org/blog#apache_kafka_300_release_announcement"
+      ]
+    }
+  ]
+}
