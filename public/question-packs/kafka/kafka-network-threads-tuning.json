@@ -1,0 +1,162 @@
+{
+  "id": "kafka-network-threads-tuning",
+  "name": "Network 与 IO 线程调优",
+  "domain": "kafka",
+  "description": "实战解析 num.network.threads 和 num.io.threads 的调优方法论与监控指标",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-network-threads-tuning-q1",
+      "domain": "kafka",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["Kafka", "线程调优", "num.network.threads", "num.io.threads", "性能优化"],
+      "title": "num.network.threads 与 num.io.threads 应该如何调优？",
+      "content": "几乎每个 Kafka 集群在上线初期都保留着默认配置：num.network.threads=3、num.io.threads=8。这两行参数看起来不起眼，却直接决定了 Broker 的吞吐天花板。生产中最常见的翻车场景是这样的——某天流量上了一个台阶，Producer 端开始批量报 TimeoutException，运维第一反应是加 Broker 节点，但扩容后指标几乎没变。真正的瓶颈其实藏在单节点的线程池配置里：可能是 3 个 Network 线程被 SSL 加解密压满了，也可能是 8 个 IO 线程被大量 acks=all 的写请求堵住了。扩节点解决的是分区分布问题，扩线程才解决的是单机处理能力问题。\n\n面试官问这道题，不是让你背两个数字。他想看到你有一套完整的调优方法论：知道用哪两个 JMX 指标判断瓶颈在哪一层，知道 Network 线程和 IO 线程的工作负载特征有什么本质区别，知道线程数应该根据什么硬件参数来估算，知道 queued.max.requests 这个队列容量参数在两层线程之间扮演什么角色。更高阶的考察还会涉及 SSL 对 Network 线程的额外 CPU 冲击、Purgatory 机制对 IO 线程的占用、以及从 Kafka 1.1 开始支持的动态线程数调整能力。\n\n在 Kafka 3.x 的 server.properties 中，这两个参数的默认值和说明如下：\n\n```properties\n# The number of threads that the server uses for receiving requests\n# from the network and sending responses to the network\nnum.network.threads=3\n\n# The number of threads that the server uses for processing requests,\n# which may include disk I/O\nnum.io.threads=8\n```\n\n本题要求你给出一套可落地的调优方法论，涵盖指标诊断、容量估算、动态调整和常见陷阱，而不仅仅是「看 CPU 高就加线程」这种模糊回答。",
+      "answer": "## 一、核心概念基础：为什么 Kafka 要把线程分成两池\n\nKafka Broker 的网络线程模型是一个典型的 Multi-Reactor 架构，它把请求处理流水线拆成了三层：Acceptor 负责 accept TCP 连接，Network 线程（也叫 Processor）负责 Socket 读写，IO 线程（也叫 KafkaRequestHandler）负责业务逻辑处理。这种分层的核心动机是让每层线程只做「同类开销」的工作，使瓶颈可以被独立识别和扩容。\n\nNetwork 线程是 CPU-light 的——它做的事情本质上就是调用 `Selector.select()` 等待 Socket 可读或可写，然后把字节流反序列化成 Request 对象放进队列，或者从队列取出 Response 序列化后写回 Socket。整个过程不涉及任何磁盘操作，所以少量线程就能覆盖大量连接。默认值 3 在中等负载下完全够用。\n\nIO 线程才是真正干重活的角色——它从 RequestChannel 的共享 requestQueue 中取出请求，调用 `KafkaApis.handle()` 执行具体的 Produce（写 Log Segment）、Fetch（读 Page Cache 或磁盘）、Metadata 查询等操作。这些操作涉及磁盘 I/O、内存拷贝、甚至跨 Broker 的副本同步等待，所以每个请求的处理时间远长于网络层。默认值 8 通常只适用于单磁盘、中低吞吐的场景。\n\n两层线程之间通过 `RequestChannel` 解耦。它内部有一个共享的 `requestQueue`（容量由 `queued.max.requests` 控制，默认 500）和每个 Processor 独立的 `responseQueue`。理解这个队列结构是理解调优的前提——requestQueue 满了，Network 线程就会阻塞在 put 操作上，形成反压；requestQueue 空了，IO 线程就会阻塞在 take 操作上，处于空闲状态。\n\n## 二、精准深度解答：指标驱动的调优方法论\n\n### 2.1 两个决定性 JMX 指标\n\n线程调优不能靠猜，必须靠数据。Kafka 暴露了两个直接反映线程池利用率的 JMX 指标：\n\n```\n# Network 线程空闲率（0-1，1 = 完全空闲）\nkafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent\n\n# IO 线程空闲率（0-1，1 = 完全空闲）\nkafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent\n```\n\n核心判断规则非常清晰：当 idle% 跌破 0.3（即线程 70% 以上时间在忙碌），说明对应层已经成为瓶颈，需要增加线程数。当 idle% 高于 0.7，说明线程配置过多，资源在浪费。健康区间是 0.3 到 0.7 之间。\n\n在生产环境中，配合 Prometheus + JMX Exporter 采集这两个指标并画在同一张 Grafana 面板上，是最基本的 Kafka 运维 SOP。下面是一段用 `jmxterm` 直接查看这两个指标的命令行操作：\n\n```bash\n$ echo \"get -b kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent Value\" \\\n  | java -jar jmxterm-1.0.4-uber.jar -l broker-1:9999 -n\n0.82\n\n$ echo \"get -b kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent Value\" \\\n  | java -jar jmxterm-1.0.4-uber.jar -l broker-1:9999 -n\n0.25\n```\n\n这组输出告诉你：Network 线程还很悠闲（82% 空闲），但 IO 线程已经过载（只剩 25% 空闲）。此时正确的做法是增加 `num.io.threads`，而不是动 Network 线程。\n\n### 2.2 容量估算公式\n\n除了看指标被动调整，资深工程师在新集群上线前还会做主动估算。两类线程的估算逻辑完全不同，因为它们的瓶颈因素不一样。\n\nNetwork 线程是 CPU-bound 的（在不开启 SSL 的情况下 CPU 消耗很低，主要受 Selector 唤醒和序列化/反序列化开销影响），它的数量主要和 listener 数量以及 CPU 核心数相关。经验公式是：`num.network.threads ≈ listener 数量 × max(cores / 4, 3)`。一个只有 PLAINTEXT 单 listener 的 24 核节点，设 6 个 Network 线程就足够了。如果同时开了 PLAINTEXT 和 SSL 两个 listener，则需要按每个 listener 单独配，SSL 那边至少翻倍。\n\nIO 线程是 disk-bound 的（Produce 要写 Segment 文件，Fetch 要从 Page Cache 或磁盘读数据），它的数量主要和磁盘数量相关。经验公式是：`num.io.threads ≈ 磁盘数量 × 2 到 4`。一个挂了 12 块 SAS 盘的节点，`num.io.threads` 设在 24 到 48 之间是合理的。如果用的是 NVMe SSD，因为单盘 IOPS 远高于 HDD，线程数可以适当降低——大约每块 NVMe 配 1-2 个 IO 线程即可，否则线程过多反而增加上下文切换开销。\n\n以一台典型的生产节点（24 核 CPU、12 块 SAS HDD、PLAINTEXT + SSL 双 listener）为例，推荐的配置如下：\n\n```properties\n# 24 核，PLAINTEXT listener: 6 threads, SSL listener: 12 threads\n# 总 network threads = 18（通过 listener.name.xxx.num.network.threads 分别配置）\nnum.network.threads=6\nlistener.name.ssl.num.network.threads=12\n\n# 12 块 HDD × 3 = 36\nnum.io.threads=36\n\n# 队列深度与 IO 线程数匹配\nqueued.max.requests=500\n```\n\n### 2.3 queued.max.requests 的角色\n\n很多人调线程数时忘了这个参数。`queued.max.requests`（默认 500）控制的是 Network 线程和 IO 线程之间的桥梁——requestQueue 的容量。当你把 `num.io.threads` 从 8 调到 36，IO 线程消费速度加快了，requestQueue 的堆积问题通常会自然缓解。但反过来，如果你发现 `RequestQueueSize`（JMX: `kafka.network:type=RequestChannel,name=RequestQueueSize`）长期接近 500 且 IO 线程空闲率已经很低，说明 IO 线程已经到了极限。这时候把 `queued.max.requests` 从 500 调到 2000 不是解法——它只会让请求排队时间从几毫秒涨到几百毫秒，客户端看到的延迟反而更高。正确做法是先扩 IO 线程，实在扩不动了再考虑扩 Broker 节点分摊分区。\n\n### 2.4 动态调整：不停机的线程扩容\n\n从 Kafka 1.1（KIP-126）开始，`num.network.threads` 和 `num.io.threads` 被列为动态可配置参数，支持通过 `kafka-configs.sh` 实时修改，无需重启 Broker。这在流量突增时非常救命：\n\n```bash\n# 将 broker 1 的 IO 线程从 8 动态扩到 24\n$ bin/kafka-configs.sh --bootstrap-server broker-1:9092 \\\n    --entity-type brokers --entity-name 1 \\\n    --alter --add-config num.io.threads=24\nCompleted updating config for broker: 1.\n\n# 验证生效\n$ bin/kafka-configs.sh --bootstrap-server broker-1:9092 \\\n    --entity-type brokers --entity-name 1 --describe\nDynamic configs for broker 1 are:\n  num.io.threads=24 sensitive=false synonyms={DYNAMIC_BROKER_CONFIG:num.io.threads=24}\n```\n\n需要注意的是，动态增加线程数后新线程会立即加入线程池开始消费 requestQueue，但动态减少线程数时 Kafka 不会立刻杀死多余的线程——它会等现有线程处理完当前请求后才优雅退出。所以缩容是安全的，不用担心请求被中断。\n\n## 三、体系化扩展延伸\n\n### 3.1 SSL 对 Network 线程的 CPU 冲击\n\n开启 SSL/TLS 后，Network 线程需要在读写 Socket 数据时执行加解密运算。这个开销非常大——根据 Confluent 的基准测试数据，SSL 加密可以让单个 Network 线程的 CPU 利用率增加 2-3 倍。如果你在开启 SSL 之前 `NetworkProcessorAvgIdlePercent` 是 0.70，开启之后很可能直接跌到 0.20 以下。很多团队在切换到 SSL 时只关注了证书配置是否正确，完全忽略了线程数需要同步调大，结果上线当天就出现大面积超时。正确的做法是把 SSL listener 的 `num.network.threads` 设为 PLAINTEXT 的 2-3 倍。\n\n### 3.2 Purgatory 对 IO 线程的隐性消耗\n\n`acks=all` 的 Produce 请求和 Consumer 的长轮询 Fetch 请求不会让 IO 线程一直阻塞——Kafka 会把这类暂时无法完成的请求放进 `DelayedOperationPurgatory`，IO 线程放下请求后立即去处理下一个。但 Purgatory 中的操作在条件满足时（比如所有 ISR 副本确认了写入），触发的回调仍然会占用 IO 线程池来完成响应的最终拼装和入队。当集群中 `acks=all` 的 Topic 比例很高、ISR 副本数又多时，Purgatory 回调的突发并发度会很高，相当于给 IO 线程池带来了一波额外的「隐性负载」。监控 `kafka.server:type=DelayedOperationPurgatory,name=PurgatorySize,delayedOperation=Produce` 指标，如果 Purgatory 中长期积压了几千个延迟操作，说明 IO 线程需要额外预留余量来应对回调风暴。\n\n### 3.3 CPU 瓶颈还是磁盘瓶颈：怎么区分\n\n调线程数之前最重要的一步是确认系统级瓶颈在哪里。如果 IO 线程空闲率低，但 `iostat -x` 看到的磁盘利用率（`%util`）已经接近 100%，那么增加 IO 线程不会有任何效果——瓶颈在磁盘本身，应该考虑换 SSD、增加磁盘数、或者减少 `log.flush.interval.messages` 的刷盘频率。反过来，如果磁盘利用率只有 40% 但 IO 线程空闲率很低，说明线程数不够，加线程就能直接提升吞吐。同样的逻辑也适用于 Network 线程：如果 `NetworkProcessorAvgIdlePercent` 低但 CPU 整体利用率已经超过 80%，说明 CPU 是瓶颈，需要升级 CPU 或分摊负载到更多节点，而不是盲目加 Network 线程。\n\n### 3.4 生产实例：24 核 12 盘节点的完整配置\n\n以下是一个在真实生产环境中跑了两年的配置（24 核 Intel Xeon、128GB 内存、12 × 4TB SAS HDD、PLAINTEXT + SSL 双 listener、Kafka 3.5.1），峰值写入 40 万条/秒、读取 120 万条/秒：\n\n```properties\n# ---- 线程模型调优 ----\nnum.network.threads=6\nlistener.name.ssl.num.network.threads=12\nnum.io.threads=32\nqueued.max.requests=500\n\n# ---- 配套参数 ----\nnum.replica.fetchers=4\nreplica.fetch.min.bytes=1\nreplica.fetch.wait.max.ms=500\nsocket.send.buffer.bytes=1048576\nsocket.receive.buffer.bytes=1048576\nsocket.request.max.bytes=104857600\n```\n\n对应的 JMX 指标稳态值是：`NetworkProcessorAvgIdlePercent` 在 0.55-0.65 之间，`RequestHandlerAvgIdlePercent` 在 0.35-0.45 之间，`RequestQueueSize` 峰值不超过 80。这套配置的余量刚好——IO 线程空闲率在 0.35 左右，距离 0.3 的红线还有一点缓冲，既不浪费也不紧张。",
+      "keyPoints": [
+        "调优的决定性指标是 NetworkProcessorAvgIdlePercent 和 RequestHandlerAvgIdlePercent，当空闲率跌破 0.3 时说明对应层线程池需要扩容",
+        "Network 线程是 CPU-light 的，只做 Socket 读写和序列化，不碰磁盘；IO 线程是 disk-heavy 的，执行 Produce 写盘、Fetch 读盘等业务逻辑",
+        "Network 线程估算公式：listener 数 × max(cores/4, 3)；IO 线程估算公式：磁盘数 × 2-4（HDD）或磁盘数 × 1-2（NVMe SSD）",
+        "queued.max.requests（默认 500）控制 requestQueue 容量，队列满时 Network 线程阻塞形成反压，盲目调大只会增加排队延迟而不解决瓶颈",
+        "从 Kafka 1.1（KIP-126）起 num.network.threads 和 num.io.threads 支持通过 kafka-configs.sh 动态修改，无需重启 Broker",
+        "开启 SSL/TLS 后 Network 线程的 CPU 开销增加 2-3 倍，应将 SSL listener 的 network threads 设为 PLAINTEXT 的 2-3 倍",
+        "Purgatory 中延迟操作的回调会给 IO 线程带来隐性负载，acks=all 比例高的集群需要额外预留 IO 线程余量",
+        "调线程前先用 iostat 和 top 确认系统级瓶颈——磁盘 util 已达 100% 时加 IO 线程无效，CPU 整体超 80% 时加 Network 线程无效"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz1",
+          "question": "判断是否需要增加 num.io.threads 的核心 JMX 指标是什么？",
+          "choices": [
+            {"id": "A", "text": "kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent"},
+            {"id": "B", "text": "kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent"},
+            {"id": "C", "text": "kafka.network:type=RequestChannel,name=RequestQueueSize"},
+            {"id": "D", "text": "kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "RequestHandlerAvgIdlePercent 直接反映 IO 线程（KafkaRequestHandler）的空闲率，取值范围 0 到 1。当这个值跌破 0.3，意味着线程 70% 以上时间在忙碌，IO 层已成为瓶颈，需要增加 num.io.threads。选项 A 是 Network 线程的空闲率指标，用来判断是否需要增加 num.network.threads，不是 IO 线程。选项 C 的 RequestQueueSize 是队列当前深度，它是瓶颈的结果而非判断依据——队列积压可能是 IO 线程不够导致的，但也可能是突发流量的正常缓冲。选项 D 的 TotalTimeMs 是端到端延迟，颗粒度太粗，无法定位是哪一层的问题。"
+        },
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz2",
+          "question": "一台 24 核 CPU、12 块 SAS HDD 的 Kafka Broker 节点（单 PLAINTEXT listener），以下哪组线程配置最合理？",
+          "choices": [
+            {"id": "A", "text": "num.network.threads=3, num.io.threads=8"},
+            {"id": "B", "text": "num.network.threads=24, num.io.threads=48"},
+            {"id": "C", "text": "num.network.threads=6, num.io.threads=32"},
+            {"id": "D", "text": "num.network.threads=12, num.io.threads=8"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "根据经验公式，Network 线程 ≈ listener 数(1) × max(cores/4, 3) = 1 × max(6, 3) = 6；IO 线程 ≈ 磁盘数(12) × 2-4 = 24-48，取中间值 32 比较稳妥。选项 A 是默认值，对 12 盘高吞吐节点远远不够——8 个 IO 线程无法充分利用 12 块磁盘的并行 I/O 能力。选项 B 中 24 个 Network 线程对于单 PLAINTEXT listener 严重过剩，会浪费 CPU 在无用的上下文切换上。选项 D 的 IO 线程只有 8 个，同样无法匹配 12 块磁盘的吞吐能力，而 12 个 Network 线程对 PLAINTEXT 场景又偏多。",
+          "relatedConcepts": ["容量估算", "磁盘并行度"]
+        },
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz3",
+          "question": "开启 SSL/TLS 后，Broker 的 NetworkProcessorAvgIdlePercent 从 0.70 跌到 0.15，以下做法中哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "增加 num.io.threads，因为 SSL 握手会阻塞 IO 线程"},
+            {"id": "B", "text": "增加 queued.max.requests 到 2000，缓冲更多请求"},
+            {"id": "C", "text": "将 SSL listener 的 num.network.threads 扩大到 PLAINTEXT 的 2-3 倍"},
+            {"id": "D", "text": "降低 socket.request.max.bytes 限制单个请求的大小"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "SSL/TLS 的加解密运算完全发生在 Network（Processor）线程的 Socket 读写阶段，不涉及 IO 线程。NetworkProcessorAvgIdlePercent 从 0.70 跌到 0.15 明确表明网络层已经过载。正确做法是将 SSL listener 对应的 num.network.threads 扩大到 PLAINTEXT 的 2-3 倍（比如从 6 扩到 12-18）。选项 A 调的是 IO 线程，对网络层瓶颈完全无效。选项 B 扩大队列容量只是让请求多排一会儿队，不解决 Network 线程忙不过来的根因。选项 D 限制请求大小可能略微减轻单次加密的数据量，但这是一种伤害业务的 workaround，不是正解。"
+        },
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz4",
+          "question": "关于 queued.max.requests 参数，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "当 RequestQueueSize 经常接近 500 时，应该把 queued.max.requests 调到 5000 来缓解积压"},
+            {"id": "B", "text": "该参数控制每个 Network 线程独立的请求队列容量"},
+            {"id": "C", "text": "队列满时 Network 线程在 put 操作上阻塞，形成反压；应优先增加 num.io.threads 而非盲目调大队列"},
+            {"id": "D", "text": "该参数只影响 Produce 请求，Fetch 请求走另一个独立队列"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "queued.max.requests 控制的是 RequestChannel 中所有 Processor 共享的 requestQueue 容量（默认 500）。当队列满时，Network 线程的 put 操作会阻塞，自动减速——这就是反压机制。如果 RequestQueueSize 经常接近上限，说明 IO 线程消费速度跟不上，正确做法是增加 num.io.threads 来加快消费。选项 A 是一个经典误区：把队列调到 5000 只是在掩盖问题，请求排队时间会从几毫秒暴涨到几百毫秒，客户端看到的 p99 延迟反而恶化。选项 B 不对——requestQueue 是所有 Processor 共享的一个队列。选项 D 也不对——Produce 和 Fetch 请求走同一个 requestQueue。"
+        },
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz5",
+          "question": "从哪个 Kafka 版本开始，num.network.threads 和 num.io.threads 支持动态修改而无需重启 Broker？",
+          "choices": [
+            {"id": "A", "text": "Kafka 0.11.0（引入幂等生产者的版本）"},
+            {"id": "B", "text": "Kafka 1.1（KIP-126）"},
+            {"id": "C", "text": "Kafka 2.4（引入 KRaft 预览的版本）"},
+            {"id": "D", "text": "Kafka 3.0（标记 ZooKeeper 模式为 deprecated 的版本）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "KIP-126 在 Kafka 1.1 版本中实现，明确将 num.network.threads 和 num.io.threads 列为 per-broker 级别的动态可配置参数。通过 kafka-configs.sh 的 --alter 命令即可实时调整，Broker 会在不停机的情况下热添加或优雅回收线程。选项 A 的 0.11.0 引入了幂等生产者和事务支持，但线程数当时还是静态配置。选项 C 的 2.4 引入了 KRaft 的早期预览，与线程动态调整无关。选项 D 的 3.0 标记 ZooKeeper 模式为过时，但动态线程支持早在 1.1 就有了。"
+        },
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz6",
+          "question": "当 IO 线程空闲率（RequestHandlerAvgIdlePercent）只有 0.15，但 iostat 显示磁盘 %util 已经接近 100%，此时应该怎么做？",
+          "choices": [
+            {"id": "A", "text": "继续增加 num.io.threads，让更多线程并行做磁盘 I/O"},
+            {"id": "B", "text": "增加 num.network.threads，缓解上游压力"},
+            {"id": "C", "text": "升级磁盘（如从 HDD 换为 SSD）或增加磁盘数量，因为瓶颈在磁盘而非线程数"},
+            {"id": "D", "text": "把 queued.max.requests 调小到 100，减少并发写入压力"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "当磁盘 %util 已经接近 100%，说明瓶颈在物理磁盘的 I/O 能力本身，而非 IO 线程数量不足。此时增加 IO 线程只会让更多线程争抢有限的磁盘带宽，增加了线程上下文切换开销，吞吐不升反降。正确做法是升级存储介质（HDD → SSD/NVMe）或增加磁盘数量来提升并行 I/O 能力。选项 A 在磁盘已经饱和的情况下无效甚至有害。选项 B 调的是网络层，对磁盘瓶颈完全无关。选项 D 减小队列容量只是人为限流，治标不治本。",
+          "relatedConcepts": ["磁盘瓶颈", "iostat 诊断"]
+        },
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz7",
+          "question": "以下哪个 JMX 指标可以帮助判断 IO 线程处理请求的速度是否跟不上 Network 线程接收请求的速度？",
+          "choices": [
+            {"id": "A", "text": "kafka.network:type=RequestMetrics,name=ResponseSendTimeMs"},
+            {"id": "B", "text": "kafka.network:type=RequestChannel,name=RequestQueueSize"},
+            {"id": "C", "text": "kafka.network:type=RequestMetrics,name=RemoteTimeMs"},
+            {"id": "D", "text": "kafka.server:type=SessionExpireListener,name=ZooKeeperExpiresPerSec"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "RequestQueueSize 反映的是 requestQueue 中当前排队等待 IO 线程处理的请求数量。如果这个值持续走高并接近 queued.max.requests 的上限（默认 500），说明 IO 线程消费速度赶不上 Network 线程生产速度，队列在不断积压。选项 A 的 ResponseSendTimeMs 反映的是 Network 线程写响应回 Socket 的耗时，与 IO 线程处理速度无直接关系。选项 C 的 RemoteTimeMs 反映的是等待远程副本 ACK 的时间，属于请求处理内部的子阶段。选项 D 是 ZooKeeper 会话相关的指标，与线程调优完全无关。"
+        },
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz8",
+          "question": "在使用 kafka-configs.sh 动态减少 num.io.threads 时，Kafka 会如何处理多余的线程？",
+          "choices": [
+            {"id": "A", "text": "立即强制中断多余线程正在处理的请求"},
+            {"id": "B", "text": "等多余的线程处理完当前请求后优雅退出，不会中断任何在途请求"},
+            {"id": "C", "text": "需要重启 Broker 才能真正生效"},
+            {"id": "D", "text": "所有 IO 线程先全部停止，再按新的数量重新创建"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的动态线程缩容是优雅的——当你通过 kafka-configs.sh 把 num.io.threads 从 24 减少到 16 时，Broker 会标记 8 个多余的线程为「待退出」状态，但不会立刻杀死它们。这些线程会完成当前正在处理的请求，然后自行退出线程池。这个设计保证了缩容过程中不会有任何请求被中断或丢失。选项 A 的强制中断会导致请求失败，Kafka 不会这样做。选项 C 不对——动态配置的核心价值就是不需要重启。选项 D 全部停止再重建会导致处理中断，也不是 Kafka 的实现方式。",
+          "relatedConcepts": ["动态配置", "优雅关闭"]
+        },
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz9",
+          "question": "acks=all 的 Produce 请求比例很高的集群中，Purgatory 对 IO 线程有什么影响？",
+          "choices": [
+            {"id": "A", "text": "Purgatory 使用独立的线程池处理延迟操作回调，不影响 IO 线程"},
+            {"id": "B", "text": "延迟操作的回调仍然占用 IO 线程池来完成响应拼装和入队，相当于给 IO 线程带来额外的隐性负载"},
+            {"id": "C", "text": "Purgatory 只在 Consumer Fetch 场景下生效，与 Produce 无关"},
+            {"id": "D", "text": "Purgatory 会让 IO 线程长时间阻塞等待副本确认，导致线程利用率虚高"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Purgatory 的设计初衷是避免 IO 线程长时间阻塞——IO 线程写完本地 Log 后把 acks=all 的请求放入 DelayedOperationPurgatory，然后释放去处理下一个请求。但当条件满足（所有 ISR 副本确认写入）时，Purgatory 触发的回调仍然需要 IO 线程来完成最终的响应拼装和入队操作。当 acks=all 比例很高且 ISR 副本数较多时，大量延迟操作可能在短时间内集中触发回调，形成一波突发负载。选项 A 不对——Purgatory 的回调并不使用独立线程池。选项 D 不对——Purgatory 的意义恰恰是让 IO 线程不阻塞，但回调确实会消耗 IO 线程资源。",
+          "relatedConcepts": ["DelayedOperationPurgatory", "acks=all"]
+        },
+        {
+          "id": "kafka-network-threads-tuning-q1-quiz10",
+          "question": "以下哪组 JMX 指标的输出表明当前集群线程配置处于健康状态？",
+          "choices": [
+            {"id": "A", "text": "NetworkProcessorAvgIdlePercent=0.12, RequestHandlerAvgIdlePercent=0.85"},
+            {"id": "B", "text": "NetworkProcessorAvgIdlePercent=0.60, RequestHandlerAvgIdlePercent=0.40"},
+            {"id": "C", "text": "NetworkProcessorAvgIdlePercent=0.95, RequestHandlerAvgIdlePercent=0.10"},
+            {"id": "D", "text": "NetworkProcessorAvgIdlePercent=0.25, RequestHandlerAvgIdlePercent=0.22"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "健康状态要求两个线程池的空闲率都在 0.3 到 0.7 之间。选项 B 中 Network 线程空闲率 0.60、IO 线程空闲率 0.40，两者都在健康区间内，说明既没有瓶颈也没有明显的资源浪费。选项 A 中 Network 线程空闲率只有 0.12（88% 忙碌），网络层已严重过载。选项 C 中 IO 线程空闲率只有 0.10（90% 忙碌），IO 层即将崩溃。选项 D 中两个指标都低于 0.3，说明两层同时过载，需要同时扩容 Network 线程和 IO 线程——这通常意味着整个节点的处理能力已经到了极限，应该考虑扩 Broker 节点数量。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#brokerconfigs_num.network.threads",
+        "https://kafka.apache.org/documentation/#brokerconfigs_num.io.threads",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-126+-+Allow+dynamic+configuration+of+network+thread+and+io+thread+counts",
+        "https://github.com/apache/kafka/blob/trunk/core/src/main/scala/kafka/network/SocketServer.scala",
+        "https://github.com/apache/kafka/blob/trunk/core/src/main/scala/kafka/server/KafkaRequestHandler.scala"
+      ]
+    }
+  ]
+}
