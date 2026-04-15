@@ -1,0 +1,158 @@
+{
+  "id": "kafka-replica-leader-election-flow",
+  "name": "分区 Leader 选举流程",
+  "domain": "kafka",
+  "description": "详解 Kafka 分区 Leader 选举的完整流程、触发条件与四种选举类型的差异",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-replica-leader-election-flow-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Kafka", "Leader Election", "Controller", "ISR", "故障恢复"],
+      "title": "分区 Leader 选举的具体流程是什么？",
+      "content": "凌晨两点，你的 Kafka 3.6 集群告警了。监控显示 Broker 2 的进程不见了——可能是 OOM、可能是磁盘坏了，总之它从 ZooKeeper 的 /brokers/ids 列表中消失了。Broker 2 不是一台普通的 Broker：它是集群里最繁忙的节点之一，承载着 `orders`、`payments`、`inventory` 三个核心 Topic 共计 50 个 Partition 的 Leader 角色。这意味着这 50 个 Partition 的写入请求和绝大部分读取请求瞬间全部失败，Producer 收到 `NOT_LEADER_OR_FOLLOWER` 错误，Consumer 的 Fetch 也中断了。\n\n但奇怪的是，大概过了 5-8 秒，告警自动恢复了——Producer 和 Consumer 重新建立了连接，流量恢复正常。你查看 Controller 所在的 Broker 1 的日志，发现了这样一段输出：\n\n```\n[2024-03-15 02:00:03,412] INFO [Controller id=1] Broker 2 has been removed from ISR of partition orders-3 (kafka.controller.KafkaController)\n[2024-03-15 02:00:03,415] INFO [Controller id=1] Partition orders-3 offline. Leader was 2 (kafka.controller.KafkaController)\n[2024-03-15 02:00:03,418] INFO [Controller id=1] New leader elected for partition orders-3: 3 from ISR [3,1] (kafka.controller.KafkaController)\n[2024-03-15 02:00:03,425] INFO [Controller id=1] Sending LeaderAndIsr request to broker 3 for partition orders-3 with leader=3, isr=[3,1], epoch=15 (kafka.controller.KafkaController)\n[2024-03-15 02:00:03,428] INFO [Controller id=1] Sending UpdateMetadata request to brokers [1,3] for partition orders-3 (kafka.controller.KafkaController)\n```\n\n类似的日志重复了 50 次——Controller 为 Broker 2 上的每一个 Leader Partition 都执行了一次选举。整个过程在 3 秒内完成，集群恢复正常。\n\n这背后发生了什么？Controller 是怎么感知到 Broker 2 宕机的？它是怎么决定把 Leader 交给谁的？为什么选了 Broker 3 而不是 Broker 1？发给其他 Broker 的那些 `LeaderAndIsrRequest` 和 `UpdateMetadataRequest` 分别做了什么？如果 ISR 为空——也就是所有副本都宕机了——Controller 又会怎么处理？\n\nKafka 的分区 Leader 选举远不止「从 ISR 里挑一个」这么简单。它有四种不同类型的选举策略，每种策略的触发条件、选举逻辑和适用场景都不同。理解这个完整流程，不仅是面试高频考点，更是生产环境排查 Leader 切换延迟、处理 Partition 离线故障的基础能力。",
+      "answer": "## 一、Leader 选举核心概念基础详解\n\n### 1.1 基础定义与核心定位\n\n在 Kafka 的分区副本模型中，每个 Partition 有且只有一个 Leader 副本负责处理所有的 Produce 和 Fetch 请求，其余副本作为 Follower 从 Leader 拉取数据保持同步。Leader 选举就是在 Leader 副本不可用时（或需要切换时），从副本集合中选出一个新 Leader 的过程。这个过程由集群中唯一的 Controller 角色统一协调——Controller 本身也是一个普通 Broker，通过在 ZooKeeper 上抢注 `/controller` 临时节点（ZK 模式）或通过 KRaft Raft 协议选举产生（KRaft 模式）获得 Controller 身份。\n\nController 在 Kafka 集群中的地位类似于 Kubernetes 中的 kube-controller-manager：它不直接处理业务流量，但负责整个集群的元数据管理和状态协调。具体到 Leader 选举，Controller 管理着两个核心状态机——`PartitionStateMachine` 和 `ReplicaStateMachine`。`PartitionStateMachine` 追踪每个 Partition 的状态（NewPartition → OnlinePartition → OfflinePartition），`ReplicaStateMachine` 追踪每个副本的状态（NewReplica → OnlineReplica → OfflineReplica）。Leader 选举实际上就是 `PartitionStateMachine` 把一个 Partition 从 OfflinePartition 状态转换回 OnlinePartition 状态的过程。\n\n### 1.2 触发 Leader 选举的四种场景\n\n并非只有 Broker 宕机才会触发 Leader 选举。Kafka 中有四种明确的触发场景，每种场景对应一种选举策略（这些策略定义在源码的 `Election` 枚举类和 `PartitionLeaderElectionAlgorithms` 中）：\n\n第一种是 **Broker 故障导致的离线选举**（OfflinePartitionLeaderElection）。当 Broker 宕机或网络隔离，它上面所有 Leader Partition 变成 Offline 状态，Controller 需要为这些 Partition 选出新 Leader。这是最常见也是最紧急的选举场景。\n\n第二种是 **受控关机触发的选举**（ControlledShutdownPartitionLeaderElection）。Broker 优雅关机时（`kafka-server-stop.sh` 或 `kill -15`），会向 Controller 发送 ControlledShutdownRequest，Controller 在 Broker 真正下线前就为其上的 Leader Partition 提前完成选举。这个过程是平滑的，Producer 几乎感知不到中断。\n\n第三种是 **分区重分配触发的选举**（ReassignPartitionLeaderElection）。当使用 `kafka-reassign-partitions.sh` 迁移分区副本时，如果当前 Leader 不在新的副本分配列表中，Controller 需要在新副本集合中选举一个 Leader。\n\n第四种是 **优先副本选举**（PreferredReplicaPartitionLeaderElection）。为了恢复 Leader 分布均衡，Controller 将 Leader 切换到 AR 列表中的第一个副本（Preferred Replica）。这不是故障恢复，而是负载均衡操作。\n\n## 二、Leader 选举完整流程精准深度解答\n\n### 2.1 Controller 感知 Broker 故障\n\n以 Broker 2 宕机为例，在 ZooKeeper 模式下，整个流程从 ZK 的 Session 超时开始。\n\nBroker 2 启动时在 ZooKeeper 上创建了一个临时节点 `/brokers/ids/2`。当 Broker 2 进程崩溃，它与 ZooKeeper 的 TCP 连接断开。ZooKeeper 不会立刻删除这个临时节点——它会等待 Session 超时（由 `zookeeper.session.timeout.ms` 控制，默认 18000ms，即 18 秒）。Session 超时后，ZooKeeper 删除 `/brokers/ids/2` 节点，并触发 Controller 之前注册的 Watch 回调。\n\n这个 18 秒的等待时间是 Broker 故障检测的主要延迟来源。在 KRaft 模式下，这个延迟显著缩短——Controller 通过心跳机制（`broker.heartbeat.interval.ms`，默认 2000ms）和超时检测（`broker.session.timeout.ms`，默认 9000ms）直接感知 Broker 存活状态，不再经过 ZooKeeper 中转。\n\nController 收到 ZK Watch 通知后，会调用 `KafkaController.onBrokerFailure()` 方法。这个方法做三件事：第一，从内存中的 metadata cache 获取 Broker 2 上所有 Partition 的信息；第二，过滤出 Broker 2 作为 Leader 的那些 Partition；第三，批量触发这些 Partition 的 Leader 选举。\n\n### 2.2 选举算法：从 ISR 中挑选新 Leader\n\nController 拿到需要选举的 Partition 列表后，对每个 Partition 调用 `PartitionStateMachine` 的状态转换逻辑。核心选举算法在 `PartitionLeaderElectionAlgorithms.offlinePartitionLeaderElection()` 方法中。\n\n算法逻辑如下：Controller 读取该 Partition 的 ISR 列表和 AR（Assigned Replicas）列表，然后遍历 ISR 列表中的每个副本 ID，找到第一个存活的 Broker。这里有一个关键细节——选出的不是 ISR 中「数据最多」的副本，而是 ISR 列表中的第一个存活副本。ISR 的顺序在不同版本中可能有差异，但 ISR 中的所有副本的数据差距都在 `replica.lag.time.max.ms`（默认 30 秒）范围内，所以选谁都不会有显著的数据丢失风险。\n\n用伪代码表示这个算法：\n\n```scala\n// 源码位置: kafka/controller/PartitionLeaderElectionAlgorithms.scala\ndef offlinePartitionLeaderElection(\n    assignment: Seq[Int],   // AR 列表，如 [2, 3, 1]\n    isr: Seq[Int],          // ISR 列表，如 [2, 3, 1]\n    liveReplicas: Set[Int], // 存活 Broker 集合，如 {1, 3}\n    uncleanLeaderElectionEnabled: Boolean\n): Option[Int] = {\n  // 第一优先级：从 ISR 中找第一个存活的副本\n  val leaderOpt = isr.find(replica => liveReplicas.contains(replica))\n  if (leaderOpt.isDefined) return leaderOpt\n\n  // ISR 中没有存活副本 → 检查是否允许 Unclean 选举\n  if (uncleanLeaderElectionEnabled) {\n    // 从 AR（完整副本列表）中找第一个存活的副本\n    val uncleanLeaderOpt = assignment.find(replica => liveReplicas.contains(replica))\n    return uncleanLeaderOpt\n  }\n  None // 没有可用 Leader，Partition 保持 Offline\n}\n```\n\n回到我们的场景：`orders-3` 的 AR 列表是 `[2, 3, 1]`，ISR 是 `[2, 3, 1]`，Broker 2 宕机后存活 Broker 集合是 `{1, 3}`。算法遍历 ISR `[2, 3, 1]`——Broker 2 不在存活集合中，跳过；Broker 3 在存活集合中，命中。所以新 Leader 是 Broker 3。这就是为什么 Controller 日志中显示 `New leader elected for partition orders-3: 3`。\n\n### 2.3 四种选举类型的差异\n\n四种选举类型的核心差异在于「从哪个列表中选 Leader」和「选择的优先级规则」。\n\n**OfflinePartitionLeaderElection** 的选择范围是 ISR 列表。如果 ISR 中没有存活副本，且 `unclean.leader.election.enable=true`（默认 false），则退化到从 AR 列表中选择——这就是所谓的 Unclean Leader Election，可能导致数据丢失。\n\n**ControlledShutdownPartitionLeaderElection** 同样从 ISR 中选择，但它会排除即将关机的那个 Broker。因为关机是提前通知的，Controller 有时间在 Broker 真正下线前完成选举，所以不存在 ISR 为空的问题（除非 ISR 中只有即将关机的那一个副本）。受控关机的选举过程对客户端几乎透明——Controller 先选出新 Leader 并通知相关 Broker，然后才让旧 Broker 关机。整个 Leader 不可用窗口可以压缩到毫秒级。\n\n**ReassignPartitionLeaderElection** 发生在分区重分配期间。Controller 会从重分配后的目标副本列表（Target Assignment）与 ISR 的交集中选出新 Leader。如果交集为空（新副本还没追上数据），选举会被推迟，直到至少有一个新副本加入 ISR。\n\n**PreferredReplicaPartitionLeaderElection** 是最简单的一种——如果 AR 列表的第一个副本（Preferred Replica）在 ISR 中且存活，就直接把 Leader 切给它。它不涉及故障恢复，纯粹是负载均衡操作。\n\n### 2.4 选举完成后的广播流程\n\n新 Leader 选出后，Controller 需要通知集群中的所有相关 Broker。这个广播分两步：\n\n第一步，Controller 向新 Leader 所在的 Broker 发送 **LeaderAndIsrRequest**。这个请求包含 Partition 的新 Leader ID、新 ISR 列表和递增后的 Leader Epoch（每次选举 epoch 加 1）。新 Leader 收到后，更新本地元数据，开始接受 Produce 请求。同时，其他 ISR 成员也会收到 LeaderAndIsrRequest，让它们知道自己现在是 Follower，应该从新 Leader 开始 Fetch 数据。\n\n第二步，Controller 向集群中所有存活的 Broker 广播 **UpdateMetadataRequest**。这个请求包含了所有受影响 Partition 的最新元数据（Leader 是谁、ISR 有哪些）。每个 Broker 收到后更新本地的 metadata cache。当 Producer 或 Consumer 下次请求元数据时，任意 Broker 都能返回最新的路由信息。\n\n这两步的顺序很重要——必须先让新 Leader 准备好，再广播元数据。否则客户端可能拿到了新 Leader 地址，但新 Leader 还不知道自己已经是 Leader，会返回 `NOT_LEADER_OR_FOLLOWER` 错误。\n\n在 Broker 2 宕机影响 50 个 Partition 的场景中，Controller 会把这 50 个 Partition 的 LeaderAndIsrRequest 按目标 Broker 分组，对每个 Broker 只发送一次包含所有相关 Partition 信息的批量请求，而不是每个 Partition 发一次。UpdateMetadataRequest 也是类似的批量处理。这种批量化是 Controller 处理大规模选举的性能关键——在 Kafka 2.0 之前，Controller 是逐个 Partition 发送请求的，大规模 Broker 宕机时 Controller 可能需要几十秒才能处理完所有选举。\n\n### 2.5 用 kafka-leader-election.sh 手动触发选举\n\n除了 Controller 自动触发选举之外，运维人员也可以手动触发。Kafka 2.4+ 提供了 `kafka-leader-election.sh` 工具：\n\n```bash\n# 触发全集群的 Preferred Replica 选举（负载均衡）\n$ bin/kafka-leader-election.sh --bootstrap-server broker-1:9092 \\\n    --election-type PREFERRED --all-topic-partitions\n\n# 对特定 Partition 触发 Unclean 选举（紧急恢复，可能丢数据）\n$ bin/kafka-leader-election.sh --bootstrap-server broker-1:9092 \\\n    --election-type UNCLEAN --topic orders --partition 3\n\n# 通过 JSON 文件批量指定\n$ cat partitions.json\n{\"partitions\": [{\"topic\": \"orders\", \"partition\": 3}, {\"topic\": \"payments\", \"partition\": 0}]}\n$ bin/kafka-leader-election.sh --bootstrap-server broker-1:9092 \\\n    --election-type PREFERRED --path-to-json-file partitions.json\n```\n\n`--election-type` 只支持两个值：`PREFERRED` 和 `UNCLEAN`。前者把 Leader 切回 Preferred Replica（前提是它在 ISR 中），后者从非 ISR 副本中选 Leader（紧急恢复手段，可能丢消息）。OfflinePartitionLeaderElection 和 ControlledShutdownPartitionLeaderElection 不能手动触发——它们只在 Broker 真正发生故障或关机时由 Controller 自动执行。\n\n## 三、体系化扩展延伸\n\n### 3.1 Unclean Leader Election 的权衡\n\n当 ISR 中所有副本都不可用时，Partition 会变成 OfflinePartition 状态——没有 Leader，所有读写请求失败。这时你面临一个经典的 CAP 权衡：是等待 ISR 中的副本恢复（保证一致性，牺牲可用性），还是从 OSR 中选一个数据可能落后的副本做 Leader（保证可用性，牺牲一致性）？\n\n`unclean.leader.election.enable` 参数（默认 false）控制这个行为。设置为 true 时，Controller 会从 AR 列表中找第一个存活副本做 Leader，即使它不在 ISR 中。这意味着该副本可能缺少一些已提交的消息——对于 `payments` 这种金融 Topic 来说是不可接受的，但对于 `click-events` 这种日志 Topic 来说可能是合理的。Kafka 2.0 之后支持 Topic 级别的配置覆盖，可以精细化地控制哪些 Topic 允许 Unclean 选举：\n\n```bash\n# 对 click-events Topic 允许 Unclean 选举\n$ bin/kafka-configs.sh --bootstrap-server broker-1:9092 \\\n    --entity-type topics --entity-name click-events \\\n    --alter --add-config unclean.leader.election.enable=true\n```\n\n### 3.2 KRaft 模式对选举速度的改进\n\n在 ZK 模式下，Leader 选举延迟的大头是 Broker 故障检测时间（ZK Session 超时，默认 18 秒）。选举本身很快（通常毫秒级），但从 Broker 宕机到 Controller 感知并完成选举，端到端延迟可能长达 20 秒以上。\n\nKRaft 模式（Kafka 3.3+ Production Ready）带来了两个关键改进。第一，Controller 直接通过心跳检测 Broker 存活状态，`broker.session.timeout.ms` 默认 9 秒，比 ZK 的 18 秒快了一半，而且可以根据网络质量调低。第二，元数据变更不需要写 ZooKeeper——Controller 直接将选举结果写入 `__cluster_metadata` 内部 Topic 的 Raft log，消除了 ZK 写入的 round-trip 延迟。在大规模 Broker 宕机场景下，KRaft 模式的端到端选举延迟可以从 ZK 模式的 20+ 秒降低到 10 秒以内。\n\n### 3.3 Leader Epoch 与选举的防护机制\n\n每次 Leader 选举完成后，Partition 的 Leader Epoch 都会加 1。这个递增的 epoch 起到了「fencing」（防护）作用——旧 Leader 在收到新 epoch 的 LeaderAndIsrRequest 后会发现自己的 epoch 已经过期，立刻停止接受写入请求。即使在网络分区场景下，旧 Leader 暂时没有收到新 epoch 通知，Producer 在获取到新的 Metadata 后也会携带新的 epoch 发送 Produce 请求，旧 Leader 会拒绝 epoch 不匹配的请求并返回 `FENCED_LEADER_EPOCH` 错误。\n\nFollower 恢复后，会向新 Leader 发送 `OffsetsForLeaderEpochRequest`，携带自己本地最新的 epoch。新 Leader 根据 epoch 历史返回该 epoch 的有效数据边界，Follower 据此截断多余的日志。这套机制确保了选举前后数据的一致性不被破坏。\n\n### 3.4 生产监控与选举延迟指标\n\n在生产环境中，Leader 选举的频率和延迟是核心监控指标。通过 JMX 可以获取以下关键 Metrics：\n\n```\n# Controller 级别 — Leader 选举速率\nkafka.controller:type=ControllerStats,name=LeaderElectionRateAndTimeMs\n\n# Controller 级别 — 当前离线 Partition 数（选举未完成或无法选举）\nkafka.controller:type=KafkaController,name=OfflinePartitionsCount\n\n# Controller 级别 — 当前活跃 Controller 数（应该始终为 1）\nkafka.controller:type=KafkaController,name=ActiveControllerCount\n\n# Broker 级别 — ISR 收缩速率（ISR 频繁收缩说明 Follower 频繁掉队）\nkafka.server:type=ReplicaManager,name=IsrShrinksPerSec\n```\n\n`OfflinePartitionsCount` 是最关键的告警指标——它持续大于 0 意味着有 Partition 没有 Leader，客户端的读写请求在失败。正常运行的集群这个值应该始终为 0。`LeaderElectionRateAndTimeMs` 则告诉你选举发生的频率和每次选举的耗时。如果选举频繁发生（比如每分钟都有），通常说明有 Broker 在反复宕机重启（flapping），或者网络抖动导致 ZK Session 频繁超时，需要排查根因而不是仅仅关注选举本身。",
+      "keyPoints": [
+        "Controller 是 Leader 选举的唯一协调者，通过 PartitionStateMachine 管理 Partition 状态转换，在 ZK 模式下通过 Watch /brokers/ids 节点感知 Broker 故障，在 KRaft 模式下通过心跳直接检测",
+        "选举算法遍历 ISR 列表找第一个存活副本作为新 Leader，不是选「数据最多」的副本，而是 ISR 中第一个活着的——因为 ISR 内所有副本的数据差距在 replica.lag.time.max.ms 范围内",
+        "四种选举类型各有适用场景：OfflinePartitionLeaderElection 处理 Broker 故障、ControlledShutdownPartitionLeaderElection 处理优雅关机、ReassignPartitionLeaderElection 处理分区迁移、PreferredReplicaPartitionLeaderElection 处理负载均衡",
+        "选举完成后 Controller 先向新 Leader 发送 LeaderAndIsrRequest（携带递增的 Leader Epoch），再向所有存活 Broker 广播 UpdateMetadataRequest，两步顺序不可颠倒",
+        "受控关机（ControlledShutdown）是最平滑的选举场景：Broker 先通知 Controller，Controller 提前完成选举后再让 Broker 下线，客户端几乎无感知",
+        "当 ISR 为空时，unclean.leader.election.enable 决定是否从 OSR 中选 Leader——可用性和一致性的权衡，支持 Topic 级别的精细化配置",
+        "KRaft 模式将 Broker 故障检测从 ZK Session 超时（默认 18s）缩短到心跳超时（默认 9s），元数据变更写入 __cluster_metadata Raft log 而非 ZK，端到端选举延迟显著降低",
+        "OfflinePartitionsCount 是最关键的生产监控指标，持续大于 0 表示有 Partition 无 Leader；LeaderElectionRateAndTimeMs 监控选举频率和耗时，频繁选举通常指向 Broker flapping 或网络抖动"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz1",
+          "question": "当 Broker 2 宕机时，Controller 是通过什么机制感知到的（ZooKeeper 模式）？",
+          "choices": [
+            {"id": "A", "text": "Controller 定期轮询所有 Broker 的健康状态接口，发现 Broker 2 无响应"},
+            {"id": "B", "text": "Broker 2 的 ZooKeeper 临时节点 /brokers/ids/2 在 Session 超时后被删除，触发 Controller 注册的 Watch 回调"},
+            {"id": "C", "text": "其他 Broker 检测到与 Broker 2 的连接断开后主动通知 Controller"},
+            {"id": "D", "text": "Producer 发送消息到 Broker 2 失败后向 Controller 报告"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 ZooKeeper 模式下，每个 Broker 启动时都会在 ZK 上创建临时节点 /brokers/ids/<id>。Broker 宕机后 TCP 连接断开，ZK 等待 Session 超时（默认 18 秒）后删除该临时节点，触发 Controller 预先注册的 Watch。Controller 在 Watch 回调中获取最新的 Broker 列表并计算哪些 Broker 下线了。选项 A 描述的是主动探测模式，ZK 模式下不是这样工作的。选项 C 和 D 也不对，Broker 之间和客户端都不负责向 Controller 报告 Broker 故障。"
+        },
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz2",
+          "question": "Partition orders-3 的 ISR 列表是 [2, 3, 1]，Broker 2 宕机后存活 Broker 为 {1, 3}，Controller 会选谁做新 Leader？",
+          "choices": [
+            {"id": "A", "text": "Broker 1，因为它的 Broker ID 最小"},
+            {"id": "B", "text": "Broker 3，因为选举算法遍历 ISR 列表 [2, 3, 1]，跳过不存活的 Broker 2，命中第一个存活副本 Broker 3"},
+            {"id": "C", "text": "Broker 1，因为它的 LEO（Log End Offset）最大"},
+            {"id": "D", "text": "随机选择 Broker 1 或 Broker 3，具体结果不确定"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "OfflinePartitionLeaderElection 的算法是遍历 ISR 列表，找第一个存活的副本。ISR 列表是 [2, 3, 1]，Broker 2 不在存活集合中被跳过，Broker 3 在存活集合中被命中，所以新 Leader 是 Broker 3。注意选择标准不是 Broker ID 大小，也不是 LEO 大小，而是 ISR 列表中的顺序。ISR 内所有副本数据差距在 replica.lag.time.max.ms 范围内，所以选哪个都不会有显著数据风险。"
+        },
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz3",
+          "question": "Controller 选出新 Leader 后，向集群发送了两种请求。以下关于这两种请求的描述，哪一项是正确的？",
+          "choices": [
+            {"id": "A", "text": "先发 UpdateMetadataRequest 通知所有 Broker 更新路由，再发 LeaderAndIsrRequest 通知新 Leader 就位"},
+            {"id": "B", "text": "先发 LeaderAndIsrRequest 给新 Leader 和 Follower，让新 Leader 准备好接受请求，再发 UpdateMetadataRequest 给所有存活 Broker 更新元数据缓存"},
+            {"id": "C", "text": "只发 LeaderAndIsrRequest，不需要发 UpdateMetadataRequest，因为客户端会自动发现新 Leader"},
+            {"id": "D", "text": "两种请求同时发送，没有先后顺序要求"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "顺序很重要：必须先发 LeaderAndIsrRequest 让新 Leader 准备好接受请求（更新本地元数据、开始接受 Produce 和 Fetch），然后再发 UpdateMetadataRequest 让所有 Broker 更新 metadata cache。如果顺序颠倒，客户端可能已经拿到了新 Leader 地址，但新 Leader 还不知道自己是 Leader，会返回 NOT_LEADER_OR_FOLLOWER 错误。选项 C 不对，没有 UpdateMetadataRequest 的话其他 Broker 的 metadata cache 不会更新，客户端从这些 Broker 获取的路由信息仍然指向旧 Leader。"
+        },
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz4",
+          "question": "以下四种选举类型中，哪一种在执行时 Leader 不可用窗口最短？",
+          "choices": [
+            {"id": "A", "text": "OfflinePartitionLeaderElection，因为 Controller 立刻检测到故障并选举"},
+            {"id": "B", "text": "ControlledShutdownPartitionLeaderElection，因为 Controller 在旧 Leader 真正下线前就完成了选举"},
+            {"id": "C", "text": "ReassignPartitionLeaderElection，因为分区重分配是提前规划好的"},
+            {"id": "D", "text": "PreferredReplicaPartitionLeaderElection，因为只是切换到 Preferred Replica 非常简单"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ControlledShutdown 是唯一一种在旧 Leader 下线前就完成选举的场景。Broker 发送 ControlledShutdownRequest 给 Controller，Controller 为该 Broker 上的所有 Leader Partition 提前选好新 Leader 并通知相关 Broker，然后才允许旧 Broker 关机。整个 Leader 不可用窗口可以压缩到毫秒级。OfflinePartitionLeaderElection 需要等 ZK Session 超时（默认 18 秒）才能感知故障，不可用窗口最长。ReassignPartitionLeaderElection 和 PreferredReplicaPartitionLeaderElection 虽然也是计划内操作，但执行时还是存在短暂的 Leader 切换窗口。"
+        },
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz5",
+          "question": "当一个 Partition 的 ISR 为空且 unclean.leader.election.enable=false 时，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Controller 从 AR 列表中选一个存活副本做 Leader，但会在日志中记录警告"},
+            {"id": "B", "text": "Partition 保持 OfflinePartition 状态，没有 Leader，所有读写请求失败，直到 ISR 中有副本恢复"},
+            {"id": "C", "text": "Controller 将该 Partition 标记为已删除，需要手动重建"},
+            {"id": "D", "text": "Controller 自动将 unclean.leader.election.enable 临时改为 true 来恢复服务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 ISR 为空且不允许 Unclean 选举时，Controller 找不到合格的 Leader 候选人，Partition 保持 OfflinePartition 状态。此时 OfflinePartitionsCount JMX 指标会大于 0，所有发往该 Partition 的 Produce 请求返回 NOT_LEADER_OR_FOLLOWER，Consumer 的 Fetch 也失败。这种状态会一直持续到 ISR 中有副本恢复上线。如果需要紧急恢复，运维人员可以手动执行 kafka-leader-election.sh --election-type UNCLEAN，但这是有意识的操作决策，Controller 不会自动做这件事。"
+        },
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz6",
+          "question": "以下关于 kafka-leader-election.sh 工具的描述，哪一项是错误的？",
+          "choices": [
+            {"id": "A", "text": "支持 --election-type PREFERRED 和 --election-type UNCLEAN 两种选举类型"},
+            {"id": "B", "text": "从 Kafka 2.4 开始引入，替代已废弃的 kafka-preferred-replica-election.sh"},
+            {"id": "C", "text": "可以通过 --election-type OFFLINE 手动触发 OfflinePartitionLeaderElection"},
+            {"id": "D", "text": "通过 --bootstrap-server 连接集群，同时支持 ZK 模式和 KRaft 模式"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "kafka-leader-election.sh 只支持两种 election-type：PREFERRED（优先副本选举）和 UNCLEAN（不安全选举）。OfflinePartitionLeaderElection 只能由 Controller 在检测到 Broker 故障时自动触发，不能通过命令行手动触发——因为它的前提是 Broker 真的宕机了，这不是运维人员可以「请求」的事件。选项 A、B、D 的描述都是正确的。"
+        },
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz7",
+          "question": "在 KRaft 模式下，Broker 故障检测时间相比 ZK 模式有什么变化？",
+          "choices": [
+            {"id": "A", "text": "没有变化，仍然依赖 ZooKeeper Session 超时来检测故障"},
+            {"id": "B", "text": "Controller 通过心跳机制直接检测 Broker 存活，broker.session.timeout.ms 默认 9 秒，比 ZK 的 18 秒更快"},
+            {"id": "C", "text": "KRaft 模式下 Broker 故障检测是即时的（毫秒级），因为使用了 Raft 协议"},
+            {"id": "D", "text": "KRaft 模式不需要检测 Broker 故障，因为所有 Broker 都运行 Raft 协议可以自动接管"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "KRaft 模式消除了对 ZooKeeper 的依赖。Controller 直接通过心跳机制（broker.heartbeat.interval.ms 默认 2000ms）检测 Broker 存活状态，Session 超时时间由 broker.session.timeout.ms 控制（默认 9 秒），比 ZK 模式的 zookeeper.session.timeout.ms（默认 18 秒）快了一半。选项 C 过于乐观，故障检测仍然需要等待超时期，不是即时的。选项 D 不对，并非所有 Broker 都运行 Raft，只有 Controller 节点参与 Raft 选举。"
+        },
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz8",
+          "question": "每次 Leader 选举完成后，Partition 的 Leader Epoch 会发生什么变化？这个变化的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "Leader Epoch 重置为 0，用于标记这是一个全新的 Leader 任期"},
+            {"id": "B", "text": "Leader Epoch 加 1，起到 fencing 作用——旧 Leader 和客户端通过 epoch 比较识别出过期的 Leader，防止脑裂和数据不一致"},
+            {"id": "C", "text": "Leader Epoch 不变，只有 ISR 列表发生更新"},
+            {"id": "D", "text": "Leader Epoch 设置为当前时间戳，用于排序不同时间发生的选举事件"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Leader Epoch 是单调递增的整数，每次选举加 1。它的核心作用是 fencing：旧 Leader 收到新 epoch 的 LeaderAndIsrRequest 后会停止接受写入；Producer 携带新 epoch 发送 Produce 请求时旧 Leader 会拒绝并返回 FENCED_LEADER_EPOCH 错误；Follower 恢复后通过 OffsetsForLeaderEpochRequest 向新 Leader 校验数据边界，确保截断到正确位置。选项 A 不对，epoch 不会重置，否则无法区分新旧 Leader。选项 D 也不对，epoch 是整数而非时间戳。"
+        },
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz9",
+          "question": "以下哪个 JMX 指标持续大于 0 时表示集群中存在无 Leader 的 Partition，需要立即排查？",
+          "choices": [
+            {"id": "A", "text": "kafka.server:type=ReplicaManager,name=PreferredReplicaImbalanceCount"},
+            {"id": "B", "text": "kafka.controller:type=ControllerStats,name=LeaderElectionRateAndTimeMs"},
+            {"id": "C", "text": "kafka.controller:type=KafkaController,name=OfflinePartitionsCount"},
+            {"id": "D", "text": "kafka.server:type=ReplicaManager,name=IsrShrinksPerSec"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "OfflinePartitionsCount 表示当前集群中没有 Leader 的 Partition 数量。这个值持续大于 0 意味着有 Partition 完全不可用——客户端的读写请求全部失败，是最紧急的告警指标。选项 A 的 PreferredReplicaImbalanceCount 表示 Leader 不在 Preferred Replica 上的 Partition 数，说明 Leader 分布不均衡但 Partition 仍可用。选项 B 是选举速率和耗时指标，用于监控选举是否频繁。选项 D 是 ISR 收缩速率，说明有 Follower 掉出 ISR 但不一定影响可用性。"
+        },
+        {
+          "id": "kafka-replica-leader-election-flow-q1-quiz10",
+          "question": "Broker 执行受控关机（Controlled Shutdown）时，Leader 选举的流程与 Broker 宕机有什么关键区别？",
+          "choices": [
+            {"id": "A", "text": "没有区别，Controller 都是等 ZK Session 超时后才感知到 Broker 下线并触发选举"},
+            {"id": "B", "text": "受控关机时 Broker 主动发送 ControlledShutdownRequest，Controller 在 Broker 真正下线前就完成选举，不需要等 ZK 超时，Leader 不可用窗口极短"},
+            {"id": "C", "text": "受控关机时 Broker 会自行将 Leader 角色转交给 ISR 中的下一个副本，不需要 Controller 参与"},
+            {"id": "D", "text": "受控关机不触发 Leader 选举，Broker 关机后 Partition 直接进入 Offline 状态等待恢复"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "受控关机的核心优势是「预通知」。Broker 在关机前向 Controller 发送 ControlledShutdownRequest，Controller 收到后为该 Broker 上所有 Leader Partition 执行 ControlledShutdownPartitionLeaderElection，选出新 Leader 并通知相关 Broker。只有当所有选举完成后（或 `controlled.shutdown.max.retries` 达到上限），Controller 才允许 Broker 关机。这样客户端几乎感知不到 Leader 切换。而 Broker 宕机场景中，Controller 必须等 ZK Session 超时（默认 18 秒）才能感知故障，不可用窗口更长。选项 C 不对，Broker 不能自行转交 Leader，必须由 Controller 协调。"
+        }
+      ],
+      "references": [
+        "Apache Kafka Documentation — 6.6 Balancing Leadership: https://kafka.apache.org/documentation/#basic_ops_leader_balancing",
+        "KIP-183: Change PreferredReplicaLeaderElection to use AdminClient: https://cwiki.apache.org/confluence/display/KAFKA/KIP-183",
+        "Kafka Source: kafka.controller.PartitionStateMachine — Partition 状态机实现",
+        "Kafka Source: kafka.controller.Election / PartitionLeaderElectionAlgorithms — 四种选举算法实现",
+        "KIP-500: Replace ZooKeeper with a Self-Managed Metadata Quorum (KRaft): https://cwiki.apache.org/confluence/display/KAFKA/KIP-500"
+      ]
+    }
+  ]
+}
