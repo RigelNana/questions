@@ -1,0 +1,157 @@
+{
+  "id": "kafka-storage-compaction-cleaner-thread",
+  "name": "Log Compaction Cleaner 线程工作原理",
+  "domain": "kafka",
+  "description": "深入解析 LogCleaner 线程在 Log Compaction 过程中的完整工作流程与关键数据结构",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-storage-compaction-cleaner-thread-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Kafka", "Log Compaction", "Cleaner Thread", "日志清理", "LogCleaner"],
+      "title": "Log Compaction 过程中 Cleaner 线程做了什么？",
+      "content": "## 场景\n\n你维护着一个 Kafka 3.6 集群，其中有一个 `user-profile` Topic 被配置为 `cleanup.policy=compact`。业务方把它当作一张「全量快照表」来用——每当用户修改个人信息时，Producer 以 userId 为 key 发送最新的 profile JSON。下游的新 Consumer 加入后，从 earliest 开始消费，期望能拿到每个 userId 的最新状态，而不是几十亿条历史变更记录。\n\n这套方案上线三个月一直正常，但最近你发现一个问题：磁盘用量远超预期。这个 Topic 只有 200 万个活跃 key，按理说 compaction 之后每个 Partition 应该只保留 200 万条消息的最新版本，但实际上每个 Partition 的磁盘占用已经膨胀到了 80GB。你登录 Broker 查看 Kafka 的日志，发现了一行让你不安的警告：\n\n```\n[2024-03-15 04:12:33,891] WARN [Log partition=user-profile-5, dir=/data/kafka/logs]\n  Found no dirty offset for cleaning (kafka.log.LogCleaner)\n```\n\n更让你困惑的是，通过 JMX 查看 LogCleaner 的指标时，`max-dirty-percent` 一直维持在 0.85 以上，而 `cleaner-recopy-percent` 显示为 0.0。这说明 85% 的日志都是「脏」的、Cleaner 几乎没有做过任何实质性的清理工作。\n\n```bash\n# 通过 kafka-run-class.sh 查看 LogCleaner JMX 指标\n$ bin/kafka-run-class.sh kafka.tools.JmxTool \\\n    --jmx-url service:jmx:rmi:///jndi/rmi://localhost:9999/jmxrmi \\\n    --object-name 'kafka.log:type=LogCleaner,name=max-dirty-percent' \\\n    --one-time true\n1710475953891,0.8534\n\n$ bin/kafka-run-class.sh kafka.tools.JmxTool \\\n    --jmx-url service:jmx:rmi:///jndi/rmi://localhost:9999/jmxrmi \\\n    --object-name 'kafka.log:type=LogCleaner,name=cleaner-recopy-percent' \\\n    --one-time true\n1710475960234,0.0\n```\n\n### 思考\n\n要排查这个问题，你必须理解 LogCleaner 线程在 Log Compaction 过程中的完整工作流程：它是怎么选择要清理的 Partition 的、用什么数据结构记录「哪些 key 需要保留」、如何在不阻塞正常读写的情况下完成日志的压缩清理。只有搞清楚这条链路中的每个环节，才能定位到底是 dirty ratio 阈值没达到、OffsetMap 内存不够、还是 Cleaner 线程本身挂掉了。",
+      "answer": "## 第一步：Log Compaction 的基础认知\n\n### Kafka 的两种日志清理策略\n\n在深入 Cleaner 线程之前，先搞清楚 Kafka 日志清理的全貌。Kafka 对日志数据的清理有两种完全不同的策略，由 Topic 级别的 `cleanup.policy` 参数控制。第一种是 `delete`（默认值），它按时间或大小删除整个 Segment 文件——超过 `retention.ms`（默认 7 天）或超过 `retention.bytes` 的 Segment 会被直接删掉，不关心消息的 key 是什么。这种策略适合事件流、日志流这类「消费完就不需要了」的场景。\n\n第二种就是本文的主角 `compact`，也就是 Log Compaction。它的核心语义是：对于相同 key 的多条消息，只保留 offset 最大的那条（即最新版本），历史版本全部删除。这让一个 Kafka Topic 可以充当一张「全量快照表」——无论一个 key 被更新了多少次，Compaction 之后都只剩下最终状态。Kafka 内部的 `__consumer_offsets` Topic 就是用 compact 策略存储消费者组的 offset 信息的，KRaft 模式下的 `__cluster_metadata` 也是 compact 的。\n\n还有第三种组合配置 `cleanup.policy=compact,delete`，它会同时运行 Compaction 和基于时间的删除——先做 key 去重，再删掉过期的 Segment。这在「既要最新快照、又不要无限保留」的场景下很实用。\n\n### 什么是「脏数据」和 dirty ratio\n\nLog Compaction 的触发依赖一个关键概念：dirty ratio（脏比率）。Kafka 把每个 Partition 的日志分成两个区域：clean 区域和 dirty 区域。clean 区域是已经被 Compaction 处理过的部分，其中每个 key 只出现一次；dirty 区域是还没被 Compaction 处理的新数据，可能包含同一 key 的多个版本。两个区域之间的分界点叫做 `cleanerCheckpoint`，也叫 `firstDirtyOffset`。\n\ndirty ratio 的计算公式是 `dirty 区域的字节数 / (clean 区域字节数 + dirty 区域字节数)`。只有当一个 Partition 的 dirty ratio 超过 `min.cleanable.dirty.ratio`（默认 0.5）时，它才会被 Cleaner 线程选中进行清理。这个阈值的设计意图很明确：如果 dirty 区域太小，做一次 Compaction 的收益不大（删不了几条重复消息），但 I/O 成本是固定的，不划算。\n\n### LogCleaner 的架构总览\n\nKafka Broker 启动时会创建一个 `LogCleaner` 实例，它由一个 `CleanerManager`（负责选 Partition、管理 checkpoint）和若干个 `CleanerThread`（真正执行清理工作的线程）组成。`CleanerThread` 的数量由 `log.cleaner.threads` 参数控制，默认值是 1。每个 `CleanerThread` 运行一个无限循环：向 `CleanerManager` 请求下一个需要清理的 Partition，拿到之后执行 Compaction，完成后更新 checkpoint，再请求下一个。如果所有 Partition 都不满足清理条件，线程会 sleep 一段时间（由 `log.cleaner.backoff.ms` 控制，默认 15 秒）后再尝试。\n\n---\n\n## 第二步：Cleaner 线程的完整工作流程\n\n### 第一阶段：选择最脏的 Partition\n\n每当一个 `CleanerThread` 准备开始新一轮工作时，它会调用 `CleanerManager.grabFilthiestCompactableLog()` 方法。这个方法遍历 Broker 上所有 `cleanup.policy` 包含 `compact` 的 Partition，计算每个 Partition 的 dirty ratio，然后选出 dirty ratio 最高的那个。这就是「贪心」策略——优先清理收益最大的 Partition。\n\n选择过程中有几个排除条件：如果一个 Partition 的 dirty ratio 低于 `min.cleanable.dirty.ratio`，跳过；如果一个 Partition 已经被另一个 `CleanerThread` 锁定（正在清理中），跳过；如果一个 Partition 的 active segment（当前正在写入的 Segment）是唯一的脏 Segment，也会跳过——因为 active segment 还在接收新消息，不能被清理。\n\n如果所有 Partition 都不满足条件，`grabFilthiestCompactableLog()` 返回 None，`CleanerThread` 就进入 backoff 等待。这就是 content 中看到那条 `Found no dirty offset for cleaning` 警告的原因之一。\n\n### 第二阶段：构建 OffsetMap\n\nCleanerThread 拿到目标 Partition 后，第一步不是急着删数据，而是先扫描 dirty 区域，构建一个叫 `OffsetMap` 的内存数据结构。OffsetMap 本质上是一个开放寻址（open addressing）的哈希表，key 是消息 key 的 MD5 哈希值（16 字节），value 是该 key 在 dirty 区域中出现的最大 offset（8 字节）。每个条目总共占用 24 字节。\n\n为什么用 MD5 哈希而不是原始 key？因为消息的 key 可以是任意长度的字节数组，直接存储会导致内存占用不可控。用固定 16 字节的 MD5 摘要，可以在固定大小的内存块中容纳尽可能多的 key。当然，MD5 哈希存在碰撞的可能性——两个不同的 key 映射到同一个 hash slot——这会导致其中一个 key 的历史版本被错误保留（不会丢数据，只是少删了一些）。在实践中，当 OffsetMap 的装载因子（load factor）低于 0.75 时，碰撞概率极低，Kafka 默认的装载因子上限正是 0.75。\n\nOffsetMap 的总内存大小由 `log.cleaner.dedupe.buffer.size` 参数控制，默认 128MB（134217728 字节）。这块内存在所有 `CleanerThread` 之间平均分配。比如你配了 `log.cleaner.threads=2`，那每个线程的 OffsetMap 容量就是 64MB，能容纳大约 64MB / 24 bytes ≈ 279 万个不同的 key。如果一个 Partition 的 dirty 区域包含的 unique key 数量超过了 OffsetMap 的容量，Cleaner 不会失败，而是只扫描 dirty 区域中能填满 OffsetMap 的那部分 Segment——也就是说一次 Compaction 可能只处理 dirty 区域的一部分，剩余部分等下一轮再来。\n\n构建 OffsetMap 的具体过程是：从 dirty 区域的第一个 Segment 开始，逐条读取消息，对每条消息的 key 计算 MD5，然后在 OffsetMap 中更新 `hash(key) → max(offset)`。如果遇到 key 为 null 的消息（tombstone 除外的无 key 消息），直接跳过，因为没有 key 的消息无法做去重。扫描完所有脏 Segment（或 OffsetMap 填满），这个阶段就结束了。\n\n### 第三阶段：清理日志——逐 Segment 重写\n\n这是 Compaction 的核心步骤。CleanerThread 从 clean 区域和 dirty 区域的每个 Segment 依次读取消息，对每条消息做一个判断：这条消息的 key 对应的最新 offset 是不是就是当前这条消息的 offset？判断的方法就是查 OffsetMap——如果 `offsetMap.get(hash(key)) == currentOffset`，说明这是该 key 的最新版本，保留；如果 `offsetMap.get(hash(key)) > currentOffset`，说明 dirty 区域有更新的版本，当前这条是过时的，丢弃。\n\n对于 key 为 null 的消息，Cleaner 无条件保留（因为它没有 key，无法去重）。对于 value 为 null 的消息，这是 Kafka 的 tombstone（删除标记）。tombstone 不会被立即删除，而是会保留一段时间（由 `delete.retention.ms` 控制，默认 24 小时），确保正在消费的下游 Consumer 能看到这个删除事件。超过保留期的 tombstone 才会在后续的 Compaction 轮次中被真正清除。\n\n被保留的消息会被写入一个新的临时 Segment 文件（文件名带 `.cleaned` 后缀）。CleanerThread 为新 Segment 同步构建 `.index` 和 `.timeindex` 索引文件。整个写入过程完全在 Segment 文件粒度上操作，不影响正在被 Consumer 读取的原始 Segment——这是 Compaction 能做到不阻塞读写的关键。\n\n下面用一个具体的例子来说明。假设一个 Partition 有以下消息：\n\n```\nSegment 0 (clean):   offset=0 key=A val=v1 | offset=1 key=B val=v1\nSegment 1 (dirty):   offset=2 key=A val=v2 | offset=3 key=C val=v1 | offset=4 key=A val=v3\nSegment 2 (dirty):   offset=5 key=B val=v2 | offset=6 key=C val=v2\n```\n\n第一步，Cleaner 扫描 dirty 区域（Segment 1 和 2），构建 OffsetMap：`A→4, C→6, B→5`。第二步，从 Segment 0 开始重写。offset=0 的 key=A，查 OffsetMap 得到 A 的最新 offset 是 4，0 < 4，丢弃。offset=1 的 key=B，最新 offset 是 5，1 < 5，丢弃。Segment 0 重写后为空（或跳过不生成文件）。继续处理 Segment 1：offset=2 key=A 最新是 4，丢弃；offset=3 key=C 最新是 6，丢弃；offset=4 key=A 最新是 4，保留。Segment 2：offset=5 key=B 最新是 5，保留；offset=6 key=C 最新是 6，保留。最终 Compaction 后的结果是：\n\n```\nCompacted:  offset=4 key=A val=v3 | offset=5 key=B val=v2 | offset=6 key=C val=v2\n```\n\n每个 key 只剩最新的一条。注意 offset 没有被重编号——Compaction 后的日志中 offset 可以是不连续的（0-3 被删了），但保留的消息的 offset 值与原来完全一致。\n\n### 第四阶段：Segment 替换与 Checkpoint 更新\n\n重写完成后，CleanerThread 执行一个原子性的 Segment 替换操作：把 `.cleaned` 后缀的临时文件重命名为正式的 `.log`、`.index`、`.timeindex` 文件，同时删除被替换的旧 Segment 文件。在 Linux 上这个重命名操作是原子的（同一文件系统内的 `rename()` 系统调用），所以即使 Broker 在替换过程中崩溃，也不会出现数据不一致——要么用旧文件，要么用新文件。\n\n替换完成后，CleanerThread 更新 `cleaner-offset-checkpoint` 文件，把 `cleanerCheckpoint` 推进到本轮 Compaction 处理到的最新 offset。这个 checkpoint 文件存储在每个 `log.dirs` 目录下，格式是纯文本，每行一个 `topic partition offset` 三元组。下次 Compaction 时，clean/dirty 的分界线就从这个 checkpoint 开始。\n\n---\n\n## 第三步：进阶配置、监控与生产实践\n\n### 关键配置参数一览\n\n与 Log Compaction 直接相关的核心配置如下：\n\n```properties\n# Cleaner 线程数，默认 1。多线程可并行清理不同 Partition\nlog.cleaner.threads=1\n\n# OffsetMap 的总内存大小，默认 128MB，在所有 cleaner 线程间平分\nlog.cleaner.dedupe.buffer.size=134217728\n\n# OffsetMap 的装载因子上限，默认 0.5（Kafka 源码实际默认 0.5，不是 0.75）\nlog.cleaner.io.buffer.load.factor=0.5\n\n# 每秒最大 I/O 字节数，用于限制 Compaction 对磁盘 I/O 的影响，默认不限（Double.MaxValue）\nlog.cleaner.io.max.bytes.per.second=1.7976931348623157E308\n\n# 没有可清理 Partition 时的等待间隔，默认 15 秒\nlog.cleaner.backoff.ms=15000\n\n# Topic 级别：dirty ratio 阈值，低于此值不触发 Compaction，默认 0.5\nmin.cleanable.dirty.ratio=0.5\n\n# Topic 级别：脏数据最长存活时间。超过此时间强制 Compaction，无视 dirty ratio\n# 默认 Long.MaxValue（即不强制）。Kafka 2.4+ 引入\nmax.compaction.lag.ms=9223372036854775807\n\n# Topic 级别：tombstone 保留时间，默认 24 小时\ndelete.retention.ms=86400000\n\n# Topic 级别：Compaction 后单条消息的最小保留时间\nmin.compaction.lag.ms=0\n```\n\n其中 `log.cleaner.dedupe.buffer.size` 是最容易出问题的参数。默认 128MB 只能容纳约 128MB / 24 bytes × 0.5 load factor ≈ 267 万个 unique key。如果你的 compact Topic 有上千万个 key，要么增大这个值到 512MB 甚至 1GB，要么接受 Compaction 需要多轮才能清完的现实——多轮的代价是磁盘占用会在较长时间内维持在高位。\n\n### JMX 监控指标\n\n生产环境中监控 Log Compaction 的健康状况，主要依赖以下 JMX 指标（MBean 域 `kafka.log:type=LogCleaner`）：\n\n`max-dirty-percent` 是所有 compact Partition 中 dirty ratio 的最大值。这个值持续偏高（比如 > 0.8）说明 Cleaner 跟不上写入速度，需要排查原因。`cleaner-recopy-percent` 是最近一次 Compaction 中被保留的消息占总消息的比例——越低说明去重效果越好（删掉的重复数据越多），越高说明大部分消息都是 unique key，Compaction 的收益不大。`max-clean-time-secs` 是最近一次 Compaction 的耗时秒数，如果持续增长说明 Segment 越来越大或 I/O 性能退化。`max-buffer-utilization-percent` 反映 OffsetMap 的使用率——如果持续接近 100%，说明 `log.cleaner.dedupe.buffer.size` 太小了。\n\n你可以用 `kafka-run-class.sh` 配合 JmxTool 来抓取这些指标，也可以通过 Prometheus JMX Exporter 接入监控系统：\n\n```yaml\n# prometheus jmx_exporter 配置片段\nrules:\n  - pattern: 'kafka.log<type=LogCleaner, name=(.+)><>Value'\n    name: kafka_log_cleaner_$1\n    type: GAUGE\n```\n\n### Cleaner 线程崩溃与恢复\n\nCleaner 线程在生产环境中崩溃是一个比较隐蔽的问题。常见的崩溃原因有：OffsetMap 内存分配失败（JVM 堆外内存不足）、读取损坏的 Segment 时抛出 `CorruptRecordException`、或者磁盘 I/O 错误。当 CleanerThread 抛出未捕获异常时，Kafka 的默认行为是记录错误日志并停止该线程，不会影响 Broker 的其他功能。这意味着你的 Broker 看起来一切正常——Producer 能写、Consumer 能读——但 Log Compaction 已经完全停了，磁盘占用会持续增长。\n\n排查这种情况最直接的方法是看 `kafka.log:type=LogCleaner,name=DeadThreadCount` 这个 JMX 指标。如果它大于 0，说明有 Cleaner 线程已经死亡。对应的 Broker 日志中会有类似这样的错误：\n\n```\n[2024-03-15 04:12:30,445] ERROR [kafka-log-cleaner-thread-0]:\n  Error due to (kafka.log.LogCleaner)\norg.apache.kafka.common.errors.CorruptRecordException:\n  Record size 2147483647 is less than the minimum record batch size.\n```\n\n遇到这种情况，首先尝试重启 Broker（Cleaner 线程会随 Broker 启动而重建）。如果是特定 Segment 损坏导致的循环崩溃，可以用 `kafka-dump-log.sh --verify-index-only` 检查 Segment 完整性，必要时手动删除损坏的 Segment（Kafka 会自动处理 offset 连续性）。\n\n### I/O 限速与调优\n\nLog Compaction 涉及大量的磁盘读写——读取所有脏 Segment 构建 OffsetMap，再读一遍所有 Segment 做重写，最后写入新 Segment。在 I/O 能力有限的集群（比如使用 SATA HDD 的节点）上，不加限制的 Compaction 会严重影响正常的 Producer 写入和 Consumer 读取。`log.cleaner.io.max.bytes.per.second` 就是用来限速的——把它设成比如 `10485760`（10MB/s），Cleaner 线程的总 I/O 速率就不会超过 10MB/s。代价是 Compaction 速度变慢，dirty ratio 可能会在一段时间内偏高。\n\n在 NVMe SSD 的集群上通常不需要限速，但如果你发现 Compaction 期间 Consumer 的消费延迟出现周期性抖动（和 Compaction 周期吻合），那么适当限速是值得的。关注 `max-clean-time-secs` 指标，如果限速后单次 Compaction 耗时从 10 秒涨到 300 秒，你需要评估这个 tradeoff 是否可接受。\n\n### 回到最初的问题\n\n回顾 content 中的场景：`max-dirty-percent` 高达 0.85，`cleaner-recopy-percent` 为 0.0，`Found no dirty offset for cleaning` 警告。这个组合最可能的原因是 Cleaner 线程已经死亡——`DeadThreadCount > 0`。因为 Cleaner 完全没在工作，dirty ratio 自然越积越高，而 recopy-percent 停留在 0.0 说明根本没有执行过 Compaction。第二种可能是 `log.cleaner.dedupe.buffer.size` 太小，导致 OffsetMap 无法容纳任何 Partition 的 key 集合，Cleaner 反复尝试又反复放弃。排查路径是先看 `DeadThreadCount`，再看 Broker 日志中的 LogCleaner 相关错误，最后检查 `max-buffer-utilization-percent` 是否持续 100%。",
+      "keyPoints": [
+        "Log Compaction（cleanup.policy=compact）的语义是对相同 key 只保留 offset 最大的那条消息，与按时间/大小删除整个 Segment 的 delete 策略完全不同",
+        "Cleaner 线程通过 dirty ratio（脏区域字节数/总日志字节数）选择最脏的 Partition 进行清理，dirty ratio 低于 min.cleanable.dirty.ratio（默认 0.5）时不触发",
+        "OffsetMap 是 Compaction 的核心数据结构，使用 MD5 哈希做 key、最大 offset 做 value 的开放寻址哈希表，每条 24 字节，总大小由 log.cleaner.dedupe.buffer.size（默认 128MB）控制",
+        "Compaction 分四步：选 Partition → 扫描 dirty 区域构建 OffsetMap → 逐 Segment 重写（只保留最新版本） → 原子替换 Segment 文件并更新 cleaner-offset-checkpoint",
+        "Compaction 不会修改消息的 offset 值，清理后的日志中 offset 可能不连续，但保留消息的 offset 与原始值完全一致",
+        "tombstone（value=null）消息不会被立即删除，而是保留 delete.retention.ms（默认 24 小时）后才会在后续轮次中被清除",
+        "Cleaner 线程崩溃后默认静默停止，不影响 Broker 其他功能，必须监控 JMX 指标 DeadThreadCount 来检测这种隐蔽故障",
+        "log.cleaner.io.max.bytes.per.second 用于限制 Compaction 的磁盘 I/O 速率，防止 Compaction 风暴影响正常读写"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz1",
+          "question": "Kafka 的 Log Compaction 对日志数据做了什么操作？",
+          "choices": [
+            {"id": "A", "text": "对相同 key 的多条消息，只保留 offset 最大（最新）的那条，删除所有旧版本"},
+            {"id": "B", "text": "按消息的时间戳删除超过保留期的旧消息，不关心 key 是否重复"},
+            {"id": "C", "text": "对所有消息进行 gzip 压缩以减少磁盘占用"},
+            {"id": "D", "text": "合并多个小 Segment 文件为一个大 Segment，类似 LSM-Tree 的 Compaction"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Log Compaction 的核心语义是 key 级别的去重：对于同一个 key，只保留 offset 最大的消息（即最新版本），历史版本全部删除。选项 B 描述的是 cleanup.policy=delete 的行为，它按时间或大小删除整个 Segment，与 key 无关。选项 C 混淆了 Compaction 和消息压缩（compression）——Kafka 的消息压缩是 Producer 端的 compression.type 配置，与 Log Compaction 是完全不同的概念。选项 D 描述的更像是 RocksDB 或 HBase 中 LSM-Tree 的 Compaction，Kafka 的 Log Compaction 虽然名字类似但机制不同。"
+        },
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz2",
+          "question": "CleanerThread 在选择要清理的 Partition 时，使用什么策略？",
+          "choices": [
+            {"id": "A", "text": "按 Partition 编号顺序轮询，每次清理下一个编号的 Partition"},
+            {"id": "B", "text": "选择 dirty ratio 最高的 Partition，前提是 dirty ratio 超过 min.cleanable.dirty.ratio 阈值"},
+            {"id": "C", "text": "随机选择一个 cleanup.policy=compact 的 Partition 进行清理"},
+            {"id": "D", "text": "选择 Segment 文件数量最多的 Partition，因为文件越多说明越需要合并"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CleanerThread 通过 CleanerManager.grabFilthiestCompactableLog() 方法选择 dirty ratio 最高的 Partition 进行清理，这是一种贪心策略——优先清理收益最大的。选择的前提是 dirty ratio 必须超过 min.cleanable.dirty.ratio（默认 0.5），否则认为清理收益不大。选项 A 的轮询策略无法优先处理最「脏」的 Partition。选项 C 的随机选择同样低效。选项 D 把 Segment 数量当作判断标准是错误的——dirty ratio 才是衡量是否需要 Compaction 的核心指标。"
+        },
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz3",
+          "question": "OffsetMap 的底层数据结构是什么，每条记录占用多少字节？",
+          "choices": [
+            {"id": "A", "text": "开放寻址哈希表，每条记录 24 字节（16 字节 MD5 哈希 + 8 字节 offset）"},
+            {"id": "B", "text": "Java HashMap，每条记录大小取决于 key 的字节长度加 8 字节 offset"},
+            {"id": "C", "text": "B+ 树索引，每条记录 32 字节（key + offset + 左右指针）"},
+            {"id": "D", "text": "布隆过滤器，不存储具体 offset，只判断 key 是否存在"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "OffsetMap 是一个使用开放寻址（open addressing）的哈希表，key 是消息 key 的 MD5 摘要（固定 16 字节），value 是该 key 在 dirty 区域中出现的最大 offset（8 字节），所以每条记录固定 24 字节。之所以不用原始 key 而用 MD5 哈希，是为了在固定大小的内存块中容纳尽可能多的 key 条目。选项 B 的 HashMap 使用堆内存且每条记录有对象头等额外开销，不适合需要紧凑内存布局的场景。选项 C 的 B+ 树引入了不必要的复杂性。选项 D 的布隆过滤器只能判断存在性，无法存储 offset 值。"
+        },
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz4",
+          "question": "当 OffsetMap 的容量不足以容纳一个 Partition 所有 dirty 区域的 unique key 时，Cleaner 会怎么做？",
+          "choices": [
+            {"id": "A", "text": "抛出 OutOfMemoryError，Cleaner 线程崩溃"},
+            {"id": "B", "text": "只处理 dirty 区域中能填满 OffsetMap 的那部分 Segment，剩余部分等下一轮 Compaction"},
+            {"id": "C", "text": "自动将 OffsetMap 扩容到两倍大小，使用 JVM 堆内存作为溢出空间"},
+            {"id": "D", "text": "跳过该 Partition，永远不对其执行 Compaction"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 OffsetMap 容量不足时，Cleaner 不会失败，而是采取分批处理策略：它只扫描 dirty 区域中能填满 OffsetMap 的那部分 Segment，对这部分执行 Compaction，然后更新 checkpoint。剩余的 dirty Segment 在下一轮 Compaction 中处理。这种设计确保了 Compaction 的渐进式推进，但代价是需要更多轮次才能完成全量清理，期间磁盘占用会维持在较高水平。选项 A 不正确，Kafka 做了优雅的容量控制。选项 C 不正确，OffsetMap 的大小是固定分配的。选项 D 不正确，Partition 不会被永远跳过。"
+        },
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz5",
+          "question": "JMX 指标 max-dirty-percent 持续为 0.85，cleaner-recopy-percent 为 0.0，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "min.cleanable.dirty.ratio 被设置为 0.9，所以 0.85 的 dirty ratio 还未达到清理阈值"},
+            {"id": "B", "text": "Cleaner 线程已经崩溃（DeadThreadCount > 0），完全停止了工作"},
+            {"id": "C", "text": "所有消息的 key 都是唯一的，没有重复 key 可以清理"},
+            {"id": "D", "text": "log.cleaner.io.max.bytes.per.second 限速太低，Compaction 非常慢但仍在进行"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "cleaner-recopy-percent 为 0.0 说明 Cleaner 完全没有执行过任何 Compaction 操作（如果执行了，即使所有消息都保留，这个值也会是 1.0 而不是 0.0）。结合 dirty ratio 持续偏高的事实，最可能的原因是 Cleaner 线程已经崩溃死亡。选项 A 有一定合理性，但如果只是阈值未达到，recopy-percent 不会是 0.0——它会保持上一次成功 Compaction 的值。选项 C 不正确，即使 key 都唯一，recopy-percent 也应该是接近 1.0。选项 D 的限速场景下 recopy-percent 也不会是 0.0，只是清理变慢。"
+        },
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz6",
+          "question": "关于 Compaction 对 tombstone 消息的处理，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "tombstone（value=null）在 Compaction 时立即被删除，因为 null value 表示该 key 已被删除"},
+            {"id": "B", "text": "tombstone 会被保留 delete.retention.ms（默认 24 小时）后才在后续 Compaction 轮次中被清除"},
+            {"id": "C", "text": "tombstone 永远不会被删除，会一直保留在 compacted log 中作为删除标记"},
+            {"id": "D", "text": "tombstone 只有在 Consumer 消费过之后才会被标记为可删除"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 对 tombstone 消息采用延迟删除策略：在 Compaction 过程中，tombstone 不会被立即清除，而是会保留至少 delete.retention.ms（默认 86400000 毫秒，即 24 小时）。这样做的目的是让正在消费的下游 Consumer 有足够的时间窗口看到这个删除事件。选项 A 的立即删除会导致 Consumer 可能永远感知不到某个 key 被删除了。选项 C 的永久保留会导致 tombstone 无限积累。选项 D 的说法不正确，Kafka 不跟踪哪些 Consumer 已经消费过特定消息。"
+        },
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz7",
+          "question": "Log Compaction（compact）和基于时间的日志删除（delete）可以同时使用吗？",
+          "choices": [
+            {"id": "A", "text": "不可以，cleanup.policy 只能二选一"},
+            {"id": "B", "text": "可以，设置 cleanup.policy=compact,delete 即可同时启用，先做 key 去重再按时间删除过期 Segment"},
+            {"id": "C", "text": "可以，但需要创建两个 Topic 分别配置不同的 cleanup.policy"},
+            {"id": "D", "text": "可以，Kafka 默认就是两种策略同时生效的"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 支持在同一个 Topic 上同时启用两种清理策略，通过 cleanup.policy=compact,delete 配置。在这种模式下，Kafka 先执行 Log Compaction 对相同 key 做去重，然后基于 retention.ms 或 retention.bytes 删除过期的 Segment。这在「既需要最新快照、又不想无限保留历史数据」的场景下非常实用，比如 __consumer_offsets 和 __transaction_state 这两个内部 Topic 就用了这种组合策略。选项 A 不正确，cleanup.policy 支持逗号分隔的多值。选项 D 不正确，默认只有 delete 策略。"
+        },
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz8",
+          "question": "生产环境中某个 compact Topic 有 5000 万个 unique key，默认的 log.cleaner.dedupe.buffer.size=128MB 够用吗？",
+          "choices": [
+            {"id": "A", "text": "够用，128MB 足以容纳数亿个 key 的哈希条目"},
+            {"id": "B", "text": "不够，默认 128MB 在装载因子 0.5 下只能容纳约 267 万个 key，5000 万 key 需要多轮 Compaction 或增大 buffer"},
+            {"id": "C", "text": "不够，但 Kafka 会自动使用磁盘做溢出存储，不需要手动调整"},
+            {"id": "D", "text": "取决于 key 的平均字节长度，如果 key 短就够用，key 长就不够"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "OffsetMap 每条记录固定 24 字节（16 字节 MD5 + 8 字节 offset），128MB 在装载因子 0.5 下的有效容量是 128MB × 0.5 / 24 ≈ 267 万个 key。5000 万 unique key 远超这个容量，Cleaner 需要大约 19 轮才能完成全量 Compaction。虽然不会失败，但多轮 Compaction 意味着磁盘占用会在较长时间内维持高位。建议将 buffer 增大到 2-4GB，或接受多轮清理的 tradeoff。选项 A 严重高估了容量。选项 C 不正确，Kafka 没有磁盘溢出机制。选项 D 不正确，OffsetMap 存的是固定长度的 MD5 哈希，与原始 key 长度无关。"
+        },
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz9",
+          "question": "Compaction 完成后，被清理的消息的 offset 值会发生什么变化？",
+          "choices": [
+            {"id": "A", "text": "保留的消息 offset 不变，清理后日志中的 offset 可能不连续"},
+            {"id": "B", "text": "所有保留的消息 offset 会被从 0 开始重新编号，保持连续"},
+            {"id": "C", "text": "保留的消息 offset 被压缩到连续区间，但起始值保持不变"},
+            {"id": "D", "text": "offset 会被随机重分配，Consumer 需要重新 seek 到最新位置"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Log Compaction 不会修改任何消息的 offset 值。被保留的消息保持其原始 offset 完全不变，而被删除的消息对应的 offset 就成了「空洞」，导致日志中的 offset 序列变得不连续。比如原来有 offset 0-6 共 7 条消息，Compaction 后可能只剩 offset 4、5、6，中间 0-3 都被删了。Consumer 在消费 compacted log 时，Kafka 会自动跳过这些空洞。选项 B 的重编号会打破 Consumer 已经提交的 offset 语义，是不可接受的。选项 C 和 D 同样不正确。"
+        },
+        {
+          "id": "kafka-storage-compaction-cleaner-thread-q1-quiz10",
+          "question": "Cleaner 线程崩溃后，Broker 的哪些功能会受到影响？",
+          "choices": [
+            {"id": "A", "text": "Producer 写入和 Consumer 消费完全不受影响，只是 Log Compaction 停止，磁盘占用持续增长"},
+            {"id": "B", "text": "Broker 整体宕机，所有 Partition 的读写都停止"},
+            {"id": "C", "text": "Producer 写入正常，但 cleanup.policy=compact 的 Partition 的 Consumer 消费会报错"},
+            {"id": "D", "text": "Broker 会自动重启 Cleaner 线程，最多影响几秒的 Compaction 进度"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Cleaner 线程崩溃是一个非常隐蔽的问题。当 CleanerThread 抛出未捕获异常时，Kafka 的默认行为是记录错误日志并停止该线程，但不会影响 Broker 的其他功能——Producer 照常写入、Consumer 照常消费。唯一的影响是 Log Compaction 完全停止，compact Topic 的磁盘占用会持续增长。这也是为什么必须监控 JMX 指标 DeadThreadCount 的原因。选项 B 严重夸大了影响。选项 C 不正确，Consumer 消费不会报错。选项 D 不正确，Kafka 不会自动重启崩溃的 Cleaner 线程，需要重启 Broker。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#compaction",
+        "https://kafka.apache.org/documentation/#brokerconfigs_log.cleaner.threads",
+        "https://cwiki.apache.org/confluence/display/KAFKA/Log+Compaction",
+        "https://github.com/apache/kafka/blob/trunk/core/src/main/scala/kafka/log/LogCleaner.scala"
+      ]
+    }
+  ]
+}
