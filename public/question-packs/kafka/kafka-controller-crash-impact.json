@@ -1,0 +1,156 @@
+{
+  "id": "kafka-controller-crash-impact",
+  "name": "Controller 宕机影响",
+  "domain": "kafka",
+  "description": "分析 Controller 所在 Broker 宕机的双重影响及集群恢复流程与时间线",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-controller-crash-impact-q1",
+      "domain": "kafka",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["Kafka", "Controller宕机", "故障恢复", "Leader选举", "可用性"],
+      "title": "Controller 所在 Broker 宕机会发生什么？",
+      "content": "你们的 Kafka 2.8 集群有 5 台 Broker，使用 ZooKeeper 做协调。周三凌晨 03:12，Broker 0 所在物理机突然断电，而 Broker 0 恰好是当前的 Controller。运维群里立刻炸了——监控大盘上 `kafka.controller:type=KafkaController,name=ActiveControllerCount` 指标在所有 Broker 上全部归零，持续了大约 22 秒后 Broker 3 上的这个值变为 1。与此同时，多个 Consumer Group 出现了 `LEADER_NOT_AVAILABLE` 错误，部分 Producer 报了短暂的超时。\n\n你登上 Broker 3 查看 controller.log，看到如下日志：\n\n```\n[2024-07-17 03:12:19,402] INFO [Controller id=3] Successfully elected as the controller. Epoch incremented to 73 (kafka.controller.KafkaController)\n[2024-07-17 03:12:19,518] INFO [Controller id=3] Starting become controller state transition (kafka.controller.KafkaController)\n[2024-07-17 03:12:21,834] INFO [Controller id=3] Partitions undergoing preferred replica election: Set() (kafka.controller.KafkaController)\n[2024-07-17 03:12:22,107] INFO [Controller id=3] Partitions that completed preferred replica election: Set() (kafka.controller.KafkaController)\n[2024-07-17 03:12:22,456] INFO [Controller id=3] 127 partitions have leader in [0] (kafka.controller.KafkaController)\n[2024-07-17 03:12:22,891] INFO [Controller id=3] New leader and ISR for partition orders-events-0: Leader=2, ISR=[2,4] (kafka.controller.KafkaController)\n[2024-07-17 03:12:23,102] INFO [Controller id=3] New leader and ISR for partition orders-events-1: Leader=4, ISR=[4,1] (kafka.controller.KafkaController)\n...\n[2024-07-17 03:12:34,567] INFO [Controller id=3] Finished leader election for 127 partitions (kafka.controller.KafkaController)\n```\n\n同时在 Broker 1 的 server.log 中看到：\n\n```\n[2024-07-17 03:12:01,123] WARN [Broker id=1] Connection to node 0 (broker-0.internal:9092) could not be established. Broker may not be available. (org.apache.kafka.clients.NetworkClient)\n[2024-07-17 03:12:19,556] INFO [Broker id=1] Received UpdateMetadata request with controller epoch 73 from controller 3 (kafka.server.KafkaApis)\n```\n\n事后统计发现，从 Broker 0 断电到所有受影响分区完成 Leader 切换，总共经历了大约 33 秒的不可用窗口。业务方投诉说这段时间里发往那 127 个分区的消息全部超时了。\n\n问题是：Controller 所在 Broker 宕机，集群具体会经历哪些阶段？为什么恢复过程需要这么久？如果你们的分区数从 1000 增长到 10 万，这个恢复时间会怎么变化？有什么办法可以缩短这个不可用窗口？",
+      "answer": "## 一、Controller 在 Kafka 集群中的角色\n\n### 1.1 Controller 的双重身份\n\n理解 Controller 宕机的影响，首先要搞清楚 Controller 到底是什么。在 Kafka 的 ZooKeeper 模式下，Controller 并不是一个独立的进程——它只是某一台 Broker 额外承担的协调者角色。也就是说，Controller 所在的 Broker 同时干着两份工：一份是普通 Broker 的工作（接收 Producer 写入、响应 Consumer 拉取、维护本地分区副本），另一份是集群协调者的工作（管理分区状态机、处理 Leader 选举、响应 Topic 创建删除、广播元数据变更）。\n\n当这台 Broker 宕机时，集群要同时处理两个层面的问题。第一个层面是 Controller 角色的交接——集群需要选出新的 Controller 来接管协调工作。第二个层面是 Broker 故障的善后——所有以这台 Broker 为 Leader 的分区需要选出新 Leader，所有以这台 Broker 为 Follower 的分区需要更新 ISR。这两个层面有严格的先后依赖关系：必须先完成 Controller 交接，新 Controller 才能处理 Broker 故障的善后工作。这就是为什么 Controller 宕机比普通 Broker 宕机的影响更大——普通 Broker 宕机时 Controller 可以立刻启动善后，但 Controller 自己宕机时，善后工作要等新 Controller 就位才能开始。\n\n### 1.2 ZooKeeper 在其中的关键角色\n\nController 的身份通过 ZooKeeper 上的临时节点 `/controller` 来维护。这个节点的内容大概长这样：\n\n```json\n{\"version\":1,\"brokerid\":0,\"timestamp\":\"1721174400000\"}\n```\n\n因为是临时节点（ephemeral node），它的生命周期与创建者的 ZooKeeper Session 绑定。当 Broker 0 断电后，它与 ZooKeeper 的 TCP 连接中断，但 ZooKeeper 不会立刻删除这个节点——它要等到 Session 超时之后才会清理。这个超时时间由 `zookeeper.session.timeout.ms` 控制，默认值是 18000ms（18 秒）。这就是题目场景中那段空白期的主要来源。\n\n## 二、宕机后的完整恢复时间线\n\n### 2.1 阶段一：故障检测（约 0-18 秒）\n\n03:12:00 Broker 0 断电，与 ZooKeeper 的 TCP 连接中断。ZooKeeper 此时只知道心跳停了，但它不能确定 Broker 0 是真的死了还是临时网络抖动。于是 ZooKeeper 开始倒计时，等待 Session 超时。在这段时间内，集群处于一种尴尬的状态：旧 Controller 已经死了，但 ZooKeeper 还没宣告它的死亡，其他 Broker 也不知道 Controller 已经不在了。\n\n其他 Broker 会逐渐发现与 Broker 0 的连接断开（题目中 Broker 1 在 03:12:01 就检测到了），但它们只知道「Broker 0 连不上了」，并不会因此触发 Controller 重选——Controller 重选只能由 ZooKeeper 删除 `/controller` 节点来触发。\n\n这是整个恢复过程中最大的时间开销，也是最「浪费」的——大部分时间都花在等待 ZooKeeper Session 过期上。\n\n### 2.2 阶段二：新 Controller 选举（约 18-19 秒）\n\n03:12:18 左右，ZooKeeper 判定 Broker 0 的 Session 过期，删除 `/controller` 临时节点。所有注册了 Watch 的 Broker 收到节点删除通知，开始竞争创建 `/controller` 节点。ZooKeeper 保证只有一个 Broker 能成功创建临时节点——这就是「先到先得」的选举机制。\n\n这个过程非常快，通常在毫秒级别完成。题目中 Broker 3 在 03:12:19 当选成功。当选后，新 Controller 做的第一件事是递增 `/controller_epoch`（从 72 到 73），然后开始初始化。\n\n### 2.3 阶段三：状态重建（约 19-22 秒）\n\n这是很多人不了解的关键阶段。新 Controller 当选后，不能立刻开始工作——它需要从 ZooKeeper 读取整个集群的元数据并在内存中重建状态。具体包括：从 `/brokers/ids` 读取所有存活 Broker 列表、从 `/brokers/topics` 读取所有 Topic 的分区分配方案、从每个分区的 `/state` 节点读取当前的 Leader 和 ISR 信息。\n\n这些数据在 ZooKeeper 中是分散存储的——每个分区的状态是一个独立的 ZNode。对于一个有 1000 个分区的集群，新 Controller 需要读取约 1000 个 ZNode；对于 10 万个分区的集群，这个数字就变成了 10 万次 ZK 读取。即使每次读取只需要 1-2ms，10 万次也要 100-200 秒。这就是为什么 Kafka 官方文档一直强调「分区数量是影响 Controller failover 时间的最关键因素」。\n\n在题目的场景中，集群只有约 1000 个分区，状态重建大约花了 3 秒（19 到 22 秒之间），这是合理的。\n\n### 2.4 阶段四：受影响分区的 Leader 选举（约 22-34 秒）\n\n状态重建完成后，新 Controller 需要处理旧 Broker 宕机的善后工作。首先，它发现 Broker 0 已经不在 `/brokers/ids` 的存活列表中，于是开始处理所有以 Broker 0 为 Leader 的分区——题目中有 127 个这样的分区。\n\n对于每个受影响的分区，Controller 从 ISR 列表中选择一个新的 Leader。选择策略很简单：ISR 列表中第一个存活的 Broker 成为新 Leader。然后 Controller 将新的 Leader 和 ISR 信息写回 ZooKeeper，并向相关 Broker 发送 LeaderAndIsrRequest。\n\n这 127 个分区的 Leader 选举本身并不慢，但 Controller 需要把每个分区的新状态写入 ZooKeeper（又是 127 次 ZK 写操作），再向受影响的 Broker 发送 LeaderAndIsr 和 UpdateMetadata 请求。Controller 在 Kafka 2.x 中是单线程处理这些事件的——所有事件都排队进入 `ControllerEventManager` 的事件队列，由一个线程串行处理。这意味着 127 个分区的 Leader 选举是逐个处理的（虽然实际实现中会做一些批量优化），整个过程花了约 12 秒。\n\n### 2.5 不可用窗口的精确分解\n\n把上面的时间线拼起来：ZooKeeper Session 超时等待约 18 秒 + Controller 选举约 1 秒 + 状态重建约 3 秒 + 分区 Leader 选举约 12 秒 = 总计约 34 秒。在这 34 秒内，那 127 个以 Broker 0 为 Leader 的分区完全不可用——Producer 写入会收到 `LEADER_NOT_AVAILABLE` 或超时，Consumer 拉取也会失败。\n\n用一条命令可以快速查看受影响分区的恢复状态：\n\n```bash\n# 查看当前所有 under-replicated 分区\n$ bin/kafka-topics.sh --bootstrap-server broker-1:9092 \\\n  --describe --under-replicated-partitions\n\nTopic: orders-events    Partition: 0    Leader: 2    Replicas: 0,2,4    Isr: 2,4\nTopic: orders-events    Partition: 1    Leader: 4    Replicas: 0,4,1    Isr: 4,1\nTopic: user-actions     Partition: 3    Leader: 1    Replicas: 0,1,3    Isr: 1,3\n...\n```\n\nReplicas 列表中还包含 Broker 0 但 ISR 中已经没有了——这说明分区已经完成了 Leader 切换，只是少了一个副本。等 Broker 0 恢复上线后，它会自动从新 Leader 拉取缺失的数据，追上 ISR。\n\n## 三、分区规模对恢复时间的影响\n\n### 3.1 10 万分区的噩梦\n\n如果集群分区数从 1000 增长到 100000，恢复时间会急剧恶化。状态重建阶段需要从 ZooKeeper 读取 10 万个分区的状态 ZNode，按照 1-2ms/次计算需要 100-200 秒。假设其中 25000 个分区以宕机 Broker 为 Leader（5 台 Broker 均匀分布），这 25000 个分区的 Leader 选举加上对应的 ZK 写操作和 Broker 通知，可能需要几十秒甚至几分钟。LinkedIn 的工程博客曾披露，他们在早期使用超大规模分区时，Controller failover 的时间可以达到数分钟级别，这直接推动了后来 KIP-291 等优化提案的出现。\n\n这也是 Kafka 社区建议单集群分区数不超过 20 万（Broker 级别不超过 4000）的核心原因之一——不是运行时性能撑不住，而是 Controller failover 的恢复时间会变得不可接受。\n\n### 3.2 可以用来监控 Controller failover 的 JMX 指标\n\n```\n# Controller 切换速率——如果频繁切换说明集群不稳定\nkafka.controller:type=ControllerStats,name=LeaderElectionRateAndTimeMs\n\n# Controller 事件队列长度——积压过多说明 Controller 过载\nkafka.controller:type=ControllerEventManager,name=EventQueueSize\n\n# 当前集群的 Active Controller 数量——正常应该恒为 1\nkafka.controller:type=KafkaController,name=ActiveControllerCount\n```\n\n### 3.3 缩短恢复时间的实战手段\n\n最直接的手段是降低 `zookeeper.session.timeout.ms`。把它从默认的 18 秒降到 6 秒，可以把故障检测时间缩短 12 秒。但代价是增加了误判风险——如果只是短暂的网络抖动，Broker 可能被误判为宕机触发不必要的 Controller 重选和分区 Leader 切换。经验上来说，生产环境设置在 6-12 秒之间比较合理，同时要确保 ZooKeeper 集群与 Kafka Broker 之间的网络延迟足够低且稳定。\n\n另一个重要手段是控制单 Broker 上的 Leader 分区数量。通过合理设置副本分配策略和定期执行 preferred replica election，确保 Leader 分区在所有 Broker 之间均匀分布。如果一台 Broker 承载了不成比例的 Leader 分区数（比如 5 台 Broker 中一台承载了 40% 的 Leader），那它宕机时的影响面会比预期大得多。\n\n### 3.4 KRaft：根治方案\n\nKafka 3.3 引入的 KRaft 模式从架构上解决了 ZooKeeper 模式下 Controller failover 慢的问题。KRaft 中有多个 Controller 节点（通常 3 个），它们通过 Raft 协议复制元数据日志。Active Controller 的所有状态变更都以日志形式同步到 Standby Controller。当 Active Controller 宕机时，Standby Controller 已经持有完整的最新元数据——不需要从 ZooKeeper 重建状态。Raft 的 Leader 选举通常在一个 election timeout（默认 1 秒）内完成，加上 Standby 不需要状态重建，整个 failover 过程可以在亚秒级完成，相比 ZooKeeper 模式的数十秒到数分钟是质的飞跃。\n\n如果你的集群还在使用 ZooKeeper 模式且分区数已经过万，迁移到 KRaft 应该是优先级最高的基础设施改进之一。Kafka 3.3 起 KRaft 进入 production-ready 状态，Kafka 4.0 已经完全移除了 ZooKeeper 支持。",
+      "keyPoints": [
+        "Controller 所在 Broker 具有双重身份：既是普通数据 Broker（承载分区副本）又是集群协调者（管理分区状态机、Leader 选举），宕机时两个层面的问题需要串行恢复",
+        "恢复必须严格按顺序执行：ZK Session 超时检测 → 新 Controller 选举 → 从 ZK 重建集群元数据状态 → 为宕机 Broker 上的 Leader 分区执行新 Leader 选举",
+        "ZooKeeper Session 超时等待（zookeeper.session.timeout.ms 默认 18s）是整个恢复过程中最大的时间开销，因为 ZK 必须等 Session 过期才会删除 /controller 临时节点",
+        "新 Controller 当选后需要从 ZooKeeper 逐个读取所有分区的状态 ZNode 来重建内存状态，分区数越多重建越慢——10 万分区可能需要 100 秒以上",
+        "在 Controller 空窗期内，集群无法执行任何需要 Controller 协调的操作：分区 Leader 选举、Topic 创建删除、ISR 变更广播等全部暂停",
+        "KRaft 模式（Kafka 3.3+）通过 Standby Controller 持有复制的元数据日志，消除了状态重建阶段，failover 可在亚秒级完成",
+        "降低 zookeeper.session.timeout.ms（如从 18s 到 6-12s）可缩短检测时间，但增加了网络抖动导致误判触发不必要 failover 的风险",
+        "均匀分布 Leader 分区到所有 Broker 上可以减小单台 Broker 宕机时的影响面，定期执行 preferred replica election 是关键运维手段"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz1",
+          "question": "Controller 所在 Broker 宕机后，集群恢复的第一个阶段是什么？",
+          "choices": [
+            {"id": "A", "text": "其他 Broker 立刻检测到 Controller 宕机并开始竞选新 Controller"},
+            {"id": "B", "text": "等待 ZooKeeper Session 超时，ZK 删除 /controller 临时节点后才触发新 Controller 选举"},
+            {"id": "C", "text": "ZooKeeper 主动通知所有 Broker 说 Controller 已宕机"},
+            {"id": "D", "text": "宕机 Broker 上的分区立刻开始 Leader 切换，无需等待新 Controller"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Controller 的身份通过 ZooKeeper 上的 /controller 临时节点维护，只有当 ZK 判定 Session 过期并删除该节点后，其他 Broker 才会收到 Watch 通知并开始竞选。这个等待时间由 zookeeper.session.timeout.ms 决定，默认 18 秒。A 选项中其他 Broker 虽然能发现与宕机 Broker 的连接断开，但它们不会因此主动触发 Controller 重选。C 选项也不准确——ZK 是被动等待 Session 过期，不是主动检测通知。D 更是错误的——分区 Leader 选举必须由 Controller 发起，没有 Controller 时无法进行。"
+        },
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz2",
+          "question": "新 Controller 当选后，为什么不能立刻开始处理分区 Leader 选举？",
+          "choices": [
+            {"id": "A", "text": "需要等待旧 Controller 的所有未完成请求超时后才能接管"},
+            {"id": "B", "text": "需要从 ZooKeeper 读取全部分区元数据并在内存中重建集群状态，才有足够信息做出决策"},
+            {"id": "C", "text": "需要等待所有 Broker 确认新 Controller 身份后才能发送指令"},
+            {"id": "D", "text": "需要等待宕机 Broker 的所有副本数据同步到其他 Broker 后才能选 Leader"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "新 Controller 当选时，它的内存中没有任何集群状态信息——哪些 Broker 存活、每个分区的 Leader 是谁、ISR 列表是什么，全部为空。它必须从 ZooKeeper 的各个 ZNode 中读取这些数据并重建内存中的状态。只有状态重建完成后，它才知道哪些分区需要新 Leader、应该选谁。A 描述的等待机制不存在。C 的确认过程并非前置条件——Controller 通过发送 UpdateMetadataRequest 来通知 Broker。D 描述的是副本恢复过程，那是 Leader 选举之后的事情。"
+        },
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz3",
+          "question": "在 ZK 模式下，影响 Controller failover 状态重建时间的最关键因素是什么？",
+          "choices": [
+            {"id": "A", "text": "集群中 Broker 的数量——Broker 越多重建越慢"},
+            {"id": "B", "text": "集群中分区的总数——每个分区对应一次 ZK 读取，分区越多越慢"},
+            {"id": "C", "text": "ZooKeeper 集群的节点数量——ZK 节点越多一致性确认越慢"},
+            {"id": "D", "text": "网络带宽——元数据量大需要高带宽传输"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "新 Controller 需要从 ZooKeeper 逐个读取每个分区的状态 ZNode（包含 Leader、ISR 等信息），分区数量直接决定了 ZK 读取次数。1000 个分区约需 1-3 秒，10 万个分区可能需要 100 秒以上。A 选项中 Broker 数量的影响远小于分区数——读取 /brokers/ids 只需一次，而分区状态是逐个读取的。C 和 D 的影响相比分区数来说可以忽略不计。"
+        },
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz4",
+          "question": "在 Controller 空窗期（旧 Controller 宕机、新 Controller 尚未就绪）内，以下哪个操作不受影响？",
+          "choices": [
+            {"id": "A", "text": "创建新的 Topic"},
+            {"id": "B", "text": "向已有 Leader 正常的分区写入消息"},
+            {"id": "C", "text": "触发分区 Leader 重选"},
+            {"id": "D", "text": "将 Broker 从 ISR 中移除"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Controller 负责的是集群协调工作——Topic 管理、Leader 选举、ISR 变更广播等。但普通的数据读写不需要 Controller 参与：Producer 写入消息是直接发给分区 Leader Broker，Consumer 拉取也是直接找 Leader Broker，这些数据面操作在 Controller 空窗期内完全正常（前提是分区的 Leader 还活着）。A、C、D 都是需要 Controller 协调的控制面操作，在空窗期内无法执行。"
+        },
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz5",
+          "question": "题目场景中，Broker 0 宕机后那 127 个分区在恢复期间的状态是什么？",
+          "choices": [
+            {"id": "A", "text": "分区数据丢失，需要从备份中恢复"},
+            {"id": "B", "text": "分区的 Leader 为 -1（无 Leader），Producer 和 Consumer 请求返回 LEADER_NOT_AVAILABLE 直到新 Controller 选出新 Leader"},
+            {"id": "C", "text": "ISR 中的 Follower 自动提升为 Leader，不需要等待 Controller"},
+            {"id": "D", "text": "分区进入只读模式，Consumer 可以继续消费但 Producer 无法写入"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当分区的 Leader Broker 宕机后，在新 Controller 为该分区选出新 Leader 之前，该分区处于「无 Leader」状态（Leader = -1）。客户端请求会收到 LEADER_NOT_AVAILABLE 错误。A 选项夸大了影响——数据不会丢失，副本还在其他 Broker 上。C 描述的自动提升机制不存在——Leader 选举必须由 Controller 发起和协调。D 描述的只读模式也不存在——没有 Leader 的分区读写都无法进行。"
+        },
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz6",
+          "question": "将 zookeeper.session.timeout.ms 从默认 18 秒降低到 6 秒的主要风险是什么？",
+          "choices": [
+            {"id": "A", "text": "ZooKeeper 集群的负载会增加 3 倍，可能导致 ZK 不稳定"},
+            {"id": "B", "text": "短暂的网络抖动或 GC 停顿就可能触发 Session 过期，导致不必要的 Controller 重选和分区 Leader 切换"},
+            {"id": "C", "text": "Broker 启动时间必须小于 6 秒，否则会在启动过程中被判定为宕机"},
+            {"id": "D", "text": "Consumer 的 session.timeout.ms 也必须同步降低到 6 秒，否则会出现不一致"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Session 超时时间越短，误判的概率越高。一次 JVM Minor GC 停顿 2 秒加上网络延迟 1-2 秒，可能就让心跳丢失超过 6 秒阈值，触发 Session 过期。这会导致不必要的 Controller 重选和大量分区 Leader 切换，造成的抖动比等久一点还严重。A 选项中 Session 超时时间与 ZK 负载没有直接的 3 倍关系。C 描述的约束不准确——Broker 启动时会建立新的 ZK Session，不受之前的超时影响。D 中 Consumer 的 session.timeout.ms 是 Consumer Group 层面的配置，跟 Broker 的 ZK Session 超时完全独立。"
+        },
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz7",
+          "question": "以下哪条命令可以查看当前集群中因 Broker 宕机而副本不足的分区？",
+          "choices": [
+            {"id": "A", "text": "kafka-topics.sh --describe --unavailable-partitions"},
+            {"id": "B", "text": "kafka-topics.sh --describe --under-replicated-partitions"},
+            {"id": "C", "text": "kafka-consumer-groups.sh --describe --state"},
+            {"id": "D", "text": "kafka-metadata.sh --snapshot --cluster-id"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "kafka-topics.sh --describe --under-replicated-partitions 会列出所有 ISR 成员数少于副本数的分区——也就是有副本掉线的分区。当 Broker 宕机后，它上面的所有副本都会从 ISR 中移除，对应的分区就变成 under-replicated。A 选项的 --unavailable-partitions 列出的是完全没有 Leader 的分区，比 under-replicated 更严重。C 是查看 Consumer Group 状态的命令，不是分区状态。D 是 KRaft 模式下查看元数据快照的命令，ZK 模式下不可用。"
+        },
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz8",
+          "question": "KRaft 模式下 Controller failover 为什么能做到亚秒级？",
+          "choices": [
+            {"id": "A", "text": "KRaft 使用 UDP 协议代替 TCP，心跳检测更快"},
+            {"id": "B", "text": "KRaft 的 Standby Controller 通过 Raft 日志复制已持有完整元数据，不需要从外部存储重建状态，Raft 选举也只需一个 election timeout"},
+            {"id": "C", "text": "KRaft 把所有元数据缓存在 Redis 中，读取速度比 ZooKeeper 快几个数量级"},
+            {"id": "D", "text": "KRaft 不需要 Controller 角色，分区 Leader 选举由各 Broker 自行完成"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "KRaft 快的核心原因是消除了「状态重建」这个最耗时的阶段。在 ZK 模式下新 Controller 需要从头读取所有分区状态，而 KRaft 的 Standby Controller 通过 Raft 协议持续接收 Active Controller 的元数据变更日志，始终保持最新状态。Active Controller 宕机后，Raft 选举通常在 1 个 election timeout（默认约 1 秒）内完成，Standby 直接接管，无需重建。A 纯属编造——KRaft 使用 TCP。C 中 Redis 说法也是虚构的。D 不正确——KRaft 仍然有 Controller 角色，只是不再依赖 ZooKeeper。"
+        },
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz9",
+          "question": "如果集群有 5 台 Broker（Broker 0-4），Topic T 有 3 个分区，副本因子为 3，分区分配如下：P0=[0,1,2], P1=[1,2,3], P2=[2,3,4]。Broker 0（Controller）宕机后，哪些分区需要新 Controller 重新选举 Leader？",
+          "choices": [
+            {"id": "A", "text": "P0、P1、P2 三个分区都需要重新选举 Leader"},
+            {"id": "B", "text": "只有 P0 需要重新选举 Leader（假设 P0 的 Leader 是 Broker 0）"},
+            {"id": "C", "text": "没有分区需要选举 Leader，因为 Controller 宕机不影响数据面"},
+            {"id": "D", "text": "取决于哪些分区的 Leader 恰好在 Broker 0 上——只有 Leader 在 Broker 0 上的分区需要选举"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "需要重新选举 Leader 的分区是那些「当前 Leader 为 Broker 0」的分区，而不是所有副本包含 Broker 0 的分区。P0 的副本列表是 [0,1,2]，但 Leader 不一定是 Broker 0——preferred leader 是 0，但实际 Leader 取决于历史选举结果。如果 P0 的 Leader 确实是 0 则需要选举，如果 Leader 是 1 或 2 则只是 ISR 更新。B 选项过于武断地假设了 P0 的 Leader 是 0。A 和 C 都对问题做了错误的泛化。"
+        },
+        {
+          "id": "kafka-controller-crash-impact-q1-quiz10",
+          "question": "Broker 0 宕机恢复上线后，它之前作为 Leader 的分区会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Broker 0 立刻恢复为这些分区的 Leader，因为它是 preferred replica"},
+            {"id": "B", "text": "Broker 0 作为 Follower 从当前 Leader 拉取缺失数据，追上 ISR 后等待 preferred replica election 才可能恢复为 Leader"},
+            {"id": "C", "text": "这些分区的数据会从 Broker 0 上彻底删除，重新从 Leader 全量复制"},
+            {"id": "D", "text": "Controller 会阻止 Broker 0 重新加入集群，需要运维手动批准"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Broker 0 重启后以 Follower 身份加入集群，对每个分区它会检查本地日志的 LEO（Log End Offset）并向当前 Leader 发送 FetchRequest 拉取缺失数据。当它追上 Leader 的 LEO 并保持在 replica.lag.time.max.ms 阈值内时，会被重新加入 ISR。但此时 Leader 仍然是在故障期间选出的新 Leader——要恢复为 Leader，需要触发 preferred replica election（可以自动或手动触发）。A 的「立刻恢复」不对。C 的全量删除重建只在极端情况下发生（比如日志严重损坏）。D 的手动批准机制不存在。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#design_replicamanagment",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-631%3A+The+Quorum-based+Kafka+Controller",
+        "https://kafka.apache.org/documentation/#brokerconfigs_zookeeper.session.timeout.ms"
+      ]
+    }
+  ]
+}
