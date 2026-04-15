@@ -1,0 +1,158 @@
+{
+  "id": "kafka-ops-cross-rack-migration",
+  "name": "跨机架副本迁移实践",
+  "domain": "kafka",
+  "description": "详解 Kafka 跨机架副本迁移的操作方法、Rack Awareness 配置与高可用保障策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-ops-cross-rack-migration-q1",
+      "domain": "kafka",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": ["Kafka", "跨机架", "Rack Awareness", "副本迁移", "高可用"],
+      "title": "如何将 Kafka 分区副本跨机架迁移以实现高可用？",
+      "content": "## 背景\n\n你所在公司的 Kafka 3.6 集群部署在同一个数据中心的 6 台 Broker（ID 0-5）上，日均消息量约 15 亿条，承载订单、支付、物流三条核心业务线。上周运维部门做了一次机房巡检，发现这 6 台 Broker 全部插在同一个机架（Rack A）的两台交换机下面——也就是说，一旦 Rack A 的汇聚交换机故障或者整个机架掉电，整个 Kafka 集群会同时不可用，所有业务线的消息生产和消费全部中断。\n\n这不是一个理论上的风险。2023 年某头部电商就因为单机架交换机固件 bug 导致机架内所有服务器网络中断 47 分钟，当时 Kafka 集群恰好全部在该机架内，造成了订单积压超过 800 万笔。事后复盘的核心结论就是：Kafka 副本的分布必须跨机架（或者在云上跨可用区），不能把所有鸡蛋放在一个篮子里。\n\nKafka 从 0.10.0 版本开始原生支持 Rack Awareness（机架感知）特性。核心思路很直接：给每个 Broker 配置一个 `broker.rack` 属性标识它所在的物理机架（或云上的可用区），Kafka 在分配分区副本时就会尽量把同一分区的不同副本分散到不同的 rack 上。这样即使某个机架整体故障，每个分区至少还有一个副本在其他机架上存活，Controller 可以从存活的副本中选出新 Leader 继续服务。\n\n现在基础架构团队已经在另外两个机架（Rack B 和 Rack C）各上架了 3 台新服务器，分别是 Broker 6、7、8（Rack B）和 Broker 9、10、11（Rack C）。你的任务是：把现有 Topic `order.events`（12 分区、RF=3）和 `payment.transactions`（8 分区、RF=3）的副本从全部集中在 Rack A 的状态，迁移到跨 Rack A、Rack B、Rack C 三个机架均匀分布的状态。迁移过程不能中断线上业务，且完成后每个分区的 3 个副本必须分别落在 3 个不同的机架上。\n\n请详细说明：Rack Awareness 的配置方法、跨机架重分配计划的生成与手动调整策略、限流执行与验证流程、以及迁移完成后如何利用 RackAwareReplicaSelector 优化跨机架消费延迟。",
+      "answer": "## 第一步：Kafka Rack Awareness 核心概念\n\n在分布式系统的高可用设计中，「故障域隔离」是一个基础原则。所谓故障域（Failure Domain），指的是一组会因为同一个故障事件而同时不可用的资源。一个物理机架就是一个典型的故障域——机架内的服务器共享电源、共享 ToR（Top of Rack）交换机，机架掉电或交换机故障会导致整个机架内的所有服务器同时失联。在云环境中，一个可用区（Availability Zone）就是一个更大粒度的故障域。Kafka 的 Rack Awareness 机制就是为了把副本分散到不同的故障域中，确保单个故障域失效时集群仍然可用。\n\nKafka 的 Rack Awareness 通过 Broker 配置中的 `broker.rack` 属性来实现。你在每台 Broker 的 server.properties 中加上一行配置，告诉 Kafka 这台 Broker 属于哪个机架：\n\n```properties\n# Rack A 的 Broker（ID 0-5）\nbroker.rack=rack-a\n\n# Rack B 的 Broker（ID 6-8）\nbroker.rack=rack-b\n\n# Rack C 的 Broker（ID 9-11）\nbroker.rack=rack-c\n```\n\n在云环境中，`broker.rack` 通常设置为可用区名称，比如 `broker.rack=us-east-1a`。Kubernetes 环境中则可以从节点的 `topology.kubernetes.io/zone` 标签中获取，通过 Strimzi Operator 的 `rack` 配置自动注入。\n\n当所有 Broker 都配置了 `broker.rack` 之后，Kafka 在创建新 Topic 时的副本分配算法会自动考虑机架因素。具体来说，Kafka 的 AdminUtils.assignReplicasToBrokers 方法会先把所有 Broker 按机架分组，然后以轮询方式从不同机架中依次挑选 Broker 来放置副本。假设你有 3 个机架各 4 台 Broker（共 12 台），创建一个 RF=3 的 Topic 时，Kafka 会保证每个分区的 3 个副本分别落在 3 个不同的机架上。如果机架数量少于副本因子（比如 2 个机架但 RF=3），Kafka 仍然会尽量分散——至少保证每个机架都有副本，剩余的副本再轮询分配。\n\n但这里有一个关键的前提条件：Rack Awareness 只在 Topic 创建时自动生效。对于已经存在的 Topic，即使你后来给所有 Broker 补上了 `broker.rack` 配置，已有分区的副本分布不会自动调整。这正是我们面临的场景——`order.events` 和 `payment.transactions` 是在没有 Rack Awareness 的时候创建的，所有副本都在 Rack A 的 Broker 0-5 上。要让它们的副本跨机架分布，必须手动执行分区重分配。\n\n## 第二步：跨机架副本迁移操作详解\n\n### 配置 broker.rack 并滚动重启\n\n第一步是给所有 Broker 加上 `broker.rack` 配置。这个配置项不支持动态更新，修改后需要重启 Broker 才能生效。在生产环境中必须采用滚动重启的方式，一次只重启一台 Broker，等它完全恢复到 ISR 之后再重启下一台：\n\n```bash\n# 在每台 Broker 的 server.properties 中添加 broker.rack 后逐台重启\n# 先重启 Broker 0（Rack A）\nsudo systemctl restart kafka\n\n# 等待 Broker 0 上所有分区重新加入 ISR\nbin/kafka-metadata.sh --snapshot /var/kafka-logs/__cluster_metadata-0/00000000000000000000.log \\\n  --cluster-id <cluster-id> | grep \"broker: 0\"\n\n# 确认 UnderReplicatedPartitions 降回 0 后再重启下一台\nbin/kafka-broker-api-versions.sh --bootstrap-server broker0:9092 | head -1\n```\n\n所有 Broker 重启完成后，可以通过 kafka-metadata.sh 或 ZooKeeper（如果还在 ZK 模式）验证每台 Broker 的 rack 信息已经注册：\n\n```bash\n# KRaft 模式下查看 Broker 注册信息\nbin/kafka-broker-api-versions.sh --bootstrap-server broker0:9092\n# 或通过 AdminClient 查看集群描述\nbin/kafka-metadata.sh --snapshot /var/kafka-logs/__cluster_metadata-0/00000000000000000000.log \\\n  | grep -A2 \"RegisterBrokerRecord\"\n```\n\n输出中应该能看到类似 `rack=rack-a` 的字段。\n\n### 生成并手动调整跨机架重分配计划\n\n接下来用 kafka-reassign-partitions.sh --generate 生成初始计划。准备 topics-to-move.json：\n\n```json\n{\n  \"topics\": [\n    {\"topic\": \"order.events\"},\n    {\"topic\": \"payment.transactions\"}\n  ],\n  \"version\": 1\n}\n```\n\n执行 --generate，目标 Broker 列表覆盖全部三个机架的 12 台 Broker：\n\n```bash\nbin/kafka-reassign-partitions.sh --generate \\\n  --topics-to-move-json-file topics-to-move.json \\\n  --broker-list \"0,1,2,3,4,5,6,7,8,9,10,11\" \\\n  --bootstrap-server broker0:9092\n```\n\n因为所有 Broker 都已配置了 `broker.rack`，--generate 的分配算法会自动考虑机架因素，生成的计划中每个分区的 3 个副本会分布在 3 个不同的 rack 上。输出类似：\n\n```\nCurrent partition replica assignment\n{\"version\":1,\"partitions\":[\n  {\"topic\":\"order.events\",\"partition\":0,\"replicas\":[0,1,2],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":1,\"replicas\":[1,2,3],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  ...\n]}\n\nProposed partition reassignment configuration\n{\"version\":1,\"partitions\":[\n  {\"topic\":\"order.events\",\"partition\":0,\"replicas\":[0,6,9],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":1,\"replicas\":[7,1,10],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":2,\"replicas\":[2,8,11],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":3,\"replicas\":[9,3,6],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  ...\n]}\n```\n\n注意看 Proposed 方案中 partition 0 的副本是 [0,6,9]：Broker 0 在 rack-a，Broker 6 在 rack-b，Broker 9 在 rack-c——三个副本分布在三个不同机架上，这正是我们要的结果。\n\n但 --generate 的自动方案并不总是完美的。你需要人工审查每个分区的副本分布，确认以下几点：第一，每个分区的 3 个副本确实落在 3 个不同的 rack 上，可以写一个脚本交叉校验；第二，每个 Broker 上的 Leader 副本数量（replicas 数组中的第一个元素是 Preferred Leader）大致均匀；第三，迁移的数据量尽可能少——如果某个分区当前的某个副本已经在目标机架上了，尽量保留它不动。\n\n下面是一个用于校验计划中机架分布的简单脚本：\n\n```bash\n#!/bin/bash\n# verify-rack-distribution.sh\n# 定义 Broker 到 Rack 的映射\ndeclare -A BROKER_RACK\nfor b in 0 1 2 3 4 5; do BROKER_RACK[$b]=\"rack-a\"; done\nfor b in 6 7 8; do BROKER_RACK[$b]=\"rack-b\"; done\nfor b in 9 10 11; do BROKER_RACK[$b]=\"rack-c\"; done\n\n# 解析 reassignment JSON 并校验每个分区\npython3 -c \"\nimport json, sys\nrack_map = {0:'a',1:'a',2:'a',3:'a',4:'a',5:'a',6:'b',7:'b',8:'b',9:'c',10:'c',11:'c'}\nwith open('reassignment-plan.json') as f:\n    plan = json.load(f)\nfor p in plan['partitions']:\n    racks = [rack_map[r] for r in p['replicas']]\n    if len(set(racks)) < len(racks):\n        print(f'WARNING: {p[\\\"topic\\\"]}-{p[\\\"partition\\\"]} replicas {p[\\\"replicas\\\"]} '\n              f'racks {racks} - same rack detected!')\n    else:\n        print(f'OK: {p[\\\"topic\\\"]}-{p[\\\"partition\\\"]} replicas {p[\\\"replicas\\\"]} racks {racks}')\n\"\n```\n\n如果发现某些分区的副本没有跨满三个机架（在机架数 ≥ RF 的情况下不应该出现，但手动编辑时可能引入错误），就需要调整 reassignment-plan.json 中对应分区的 replicas 列表。\n\n### 执行迁移与限流策略\n\n跨机架迁移比机架内迁移多了一层网络开销——数据需要经过汇聚交换机甚至核心交换机才能到达另一个机架的 Broker。在云上跨可用区的场景更为敏感，因为跨 AZ 流量通常按量计费（AWS 跨 AZ 数据传输费用约 $0.01/GB，一次迁移几 TB 的数据就是几十美元）。所以跨机架迁移的限流策略需要比机架内迁移更保守。\n\n保存好当前分配的回滚计划后，执行迁移：\n\n```bash\n# 保存回滚计划\ncp current-assignment.json rollback.json\n\n# 以 30MB/s 的限流执行跨机架迁移\nbin/kafka-reassign-partitions.sh --execute \\\n  --reassignment-json-file reassignment-plan.json \\\n  --throttle 31457280 \\\n  --bootstrap-server broker0:9092\n```\n\n这里选择 30MB/s 而不是机架内迁移常用的 50-100MB/s，是因为跨机架链路的可用带宽通常低于机架内链路，而且跨机架流量还会影响到其他服务的跨机架通信。如果你的跨机架链路是 10Gbps 专线且利用率较低，可以适当调高。\n\n迁移过程中需要额外关注跨机架链路的带宽利用率。如果你的监控系统能采集到汇聚交换机的端口流量，观察 Rack A 到 Rack B、Rack A 到 Rack C 的出口带宽是否接近瓶颈。同时关注 Kafka 的 `kafka.server:type=FetcherLagMetrics,name=ConsumerLag,clientId=ReplicaFetcherThread-*` 指标，它反映了新 Follower 副本与 Leader 之间的数据差距，这个值应该在持续减小。\n\n用循环脚本监控进度：\n\n```bash\nwhile true; do\n  result=$(bin/kafka-reassign-partitions.sh --verify \\\n    --reassignment-json-file reassignment-plan.json \\\n    --bootstrap-server broker0:9092 2>&1)\n  echo \"$(date '+%Y-%m-%d %H:%M:%S') $result\" | tail -5\n  if echo \"$result\" | grep -q \"is still in progress\"; then\n    sleep 120\n  else\n    echo \"=== All partitions reassigned, throttles cleared ===\"\n    break\n  fi\ndone\n```\n\n### 迁移后验证\n\n所有分区 completed 后，用 kafka-topics.sh --describe 做最终确认：\n\n```bash\nbin/kafka-topics.sh --describe \\\n  --topic order.events \\\n  --bootstrap-server broker0:9092\n```\n\n输出应该类似：\n\n```\nTopic: order.events  TopicId: abc123  PartitionCount: 12  ReplicationFactor: 3\n  Topic: order.events  Partition: 0   Leader: 0   Replicas: 0,6,9    Isr: 0,6,9\n  Topic: order.events  Partition: 1   Leader: 7   Replicas: 7,1,10   Isr: 7,1,10\n  Topic: order.events  Partition: 2   Leader: 2   Replicas: 2,8,11   Isr: 2,8,11\n  Topic: order.events  Partition: 3   Leader: 9   Replicas: 9,3,6    Isr: 9,3,6\n  ...\n```\n\n逐行检查：每个分区的 Replicas 列表中的三个 Broker ID 必须分别属于 rack-a（0-5）、rack-b（6-8）、rack-c（9-11）。Isr 列表应该与 Replicas 完全一致，说明所有副本都已同步完成。\n\n## 第三步：跨机架场景的进阶优化\n\n跨机架部署解决了高可用问题，但也引入了一个新的性能挑战：跨机架读取延迟。在默认配置下，Consumer 只能从 Leader 副本读取数据。如果 Consumer 部署在 Rack B，但某个分区的 Leader 在 Rack A，每条消息的读取都要跨机架走一次网络。在云上跨 AZ 的场景中，这个额外延迟通常在 0.5-2ms，对于延迟敏感的业务来说不可忽视，更别提跨 AZ 的流量费用了。\n\nKafka 2.4 通过 KIP-392 引入了 RackAwareReplicaSelector，允许 Consumer 从同机架的 Follower 副本读取数据，而不是必须从 Leader 读取。配置方法是在 Broker 端添加：\n\n```properties\n# server.properties\nreplica.selector.class=org.apache.kafka.common.replica.RackAwareReplicaSelector\n```\n\n然后在 Consumer 端配置 `client.rack` 属性，告诉 Broker 这个 Consumer 在哪个机架：\n\n```properties\n# consumer.properties\nclient.rack=rack-b\n```\n\n配置生效后，当 Rack B 上的 Consumer 请求某个分区的数据时，Broker 会优先从 Rack B 上的 Follower 副本提供数据，而不是转发到 Leader 所在的 Rack A。这样既减少了跨机架的网络流量，也降低了消费延迟。需要注意的是，从 Follower 读取的数据可能比 Leader 稍有延迟（取决于 Follower 的追赶速度），对于大多数业务场景这个差异完全可以接受，但对于需要强一致性读取的场景（比如读取最新 offset），Consumer 仍然会被路由到 Leader。\n\n在大规模集群中，手动管理跨机架的副本均衡会变得非常繁琐。LinkedIn 开源的 Cruise Control 提供了 RackAwareGoal 和 ReplicaDistributionGoal，能够持续监控集群副本的机架分布，当检测到某个机架承载了过多的 Leader 副本或者某些分区的副本集中在同一机架时，自动生成并执行再均衡计划。Cruise Control 在计算再均衡方案时会综合考虑机架均衡、磁盘容量均衡、网络负载均衡等多个目标，比手动操作 kafka-reassign-partitions.sh 要可靠得多。\n\n关于跨机架 vs 跨区域（Multi-Region）的区别需要明确：跨机架是同一数据中心内不同物理机架之间的副本分散，网络延迟通常在亚毫秒级；跨可用区是同一云区域（Region）内不同 AZ 之间的副本分散，延迟约 1-2ms；跨区域是不同地理区域之间的副本复制，延迟可达几十到上百毫秒。Kafka 原生的 Rack Awareness 和 Replication 适用于前两种场景，跨区域场景通常需要 MirrorMaker 2 或 Confluent Cluster Linking 这样的专用工具来做异步复制。\n\n最后一个容易被忽略的运维细节：执行跨机架迁移后，原来全部在 Rack A 的旧 Broker（0-5）上会有大量分区副本被删除，释放出的磁盘空间不会立即被操作系统回收。如果你使用的是 XFS 文件系统（Kafka 官方推荐），删除大量 segment 文件后可以执行 `fstrim` 通知 SSD 控制器回收空间（TRIM 操作），这对维持 SSD 的写入性能很重要。同时检查 Rack A 上 Broker 的 `log.dirs` 目录大小是否如预期下降，确认旧副本数据确实被清理干净了。",
+      "keyPoints": [
+        "broker.rack 属性在 server.properties 中配置，标识 Broker 所属机架或可用区，修改后需要重启 Broker 生效，不支持动态更新",
+        "Rack Awareness 只在新 Topic 创建时自动分配跨机架副本，已有 Topic 的副本分布不会自动调整，必须通过 kafka-reassign-partitions.sh 手动迁移",
+        "kafka-reassign-partitions.sh --generate 在所有 Broker 都配置了 broker.rack 时会自动生成跨机架分布的重分配计划，但仍需人工审查确认每个分区副本确实跨满不同机架",
+        "跨机架迁移的限流应比机架内迁移更保守，建议不超过跨机架链路带宽的 15-20%，因为跨机架流量还需与其他服务共享链路",
+        "RackAwareReplicaSelector（KIP-392，Kafka 2.4+）允许 Consumer 从同机架 Follower 读取数据，需要 Broker 配置 replica.selector.class 并且 Consumer 配置 client.rack",
+        "云上跨 AZ 部署时 broker.rack 设为可用区名称（如 us-east-1a），需注意跨 AZ 数据传输费用（AWS 约 $0.01/GB），RackAwareReplicaSelector 可显著降低跨 AZ 读取流量",
+        "Cruise Control 的 RackAwareGoal 可以持续监控和自动修正副本的机架分布偏差，适合 10+ Broker 规模的集群",
+        "跨机架和跨可用区（延迟 1-2ms）适合 Kafka 原生副本机制，跨区域（延迟几十 ms）需要用 MirrorMaker 2 或 Cluster Linking 做异步复制"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz1",
+          "question": "Kafka 的 Rack Awareness 特性是从哪个版本开始支持的？",
+          "choices": [
+            {"id": "A", "text": "0.8.0，与副本机制一起引入"},
+            {"id": "B", "text": "0.10.0，通过 broker.rack 配置实现"},
+            {"id": "C", "text": "1.0.0，作为 GA 特性正式发布"},
+            {"id": "D", "text": "2.0.0，与 KIP-36 一起引入"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 在 0.10.0 版本通过 KIP-36 引入了 Rack Awareness 特性，核心实现是 broker.rack 配置项和改进后的副本分配算法。0.8.0 引入的是副本机制本身但不包含机架感知。A 选项把时间线提前了，C 和 D 选项的版本号都不正确。"
+        },
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz2",
+          "question": "给已有的 Broker 新增 broker.rack 配置后，哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "已有 Topic 的分区副本会在下次 Controller 选举时自动重新分配到不同机架"},
+            {"id": "B", "text": "broker.rack 支持动态配置，使用 kafka-configs.sh --alter 即可生效无需重启"},
+            {"id": "C", "text": "已有 Topic 的副本分布不会自动变化，只有新创建的 Topic 会自动跨机架分配"},
+            {"id": "D", "text": "需要先删除所有 Topic 再重新创建才能获得跨机架分布"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "broker.rack 是静态配置，修改后需要重启 Broker 生效，不支持动态更新。更重要的是，Rack Awareness 只影响新 Topic 的副本分配算法，已有 Topic 的副本分布不会因为 broker.rack 配置的变化而自动调整。要改变已有 Topic 的副本分布，必须手动执行 kafka-reassign-partitions.sh。A 选项描述的自动重分配机制不存在，B 选项关于动态配置是错误的，D 选项的方式虽然可行但完全没有必要而且会导致数据丢失。"
+        },
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz3",
+          "question": "集群有 3 个机架各 2 台 Broker（共 6 台），创建一个 RF=3 的 Topic，Kafka 的分配算法会如何放置副本？",
+          "choices": [
+            {"id": "A", "text": "每个分区的 3 个副本随机分配到 6 台 Broker 上，不考虑机架"},
+            {"id": "B", "text": "每个分区的 3 个副本分别放在 3 个不同机架的 Broker 上"},
+            {"id": "C", "text": "每个分区的 3 个副本放在同一个机架的不同 Broker 上，最大化机架内复制性能"},
+            {"id": "D", "text": "因为每个机架只有 2 台 Broker，RF=3 时 Rack Awareness 无法生效，退化为随机分配"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当所有 Broker 都配置了 broker.rack 且机架数量 ≥ 副本因子时，Kafka 的分配算法会保证每个分区的副本分布在不同的机架上。本题中 3 个机架 ≥ RF=3，所以每个分区的 3 个副本会分别落在 3 个不同的机架上。D 选项的说法完全错误——Rack Awareness 不要求每个机架有足够多的 Broker，只要求机架数量 ≥ 副本因子。A 和 C 选项描述的是不启用 Rack Awareness 或故意违背其原则的行为。"
+        },
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz4",
+          "question": "kafka-reassign-partitions.sh --generate 在 Broker 配置了 broker.rack 的情况下生成的计划有什么特点？",
+          "choices": [
+            {"id": "A", "text": "生成的计划完全忽略 broker.rack，只考虑 Broker ID 的顺序轮询"},
+            {"id": "B", "text": "生成的计划会自动将每个分区的副本分散到不同的机架上"},
+            {"id": "C", "text": "生成的计划会把所有副本集中到 Broker 数量最多的机架以最大化吞吐"},
+            {"id": "D", "text": "--generate 不读取 broker.rack 信息，必须手动编辑 JSON 确保跨机架"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "--generate 命令在计算新的副本分配方案时，会从集群元数据中读取每台 Broker 的 broker.rack 信息，并使用机架感知的分配算法（rack-aware assignment）将同一分区的不同副本分散到不同的机架上。当然，生成的方案仍然建议人工审查确认，因为在机架间 Broker 数量不均等的特殊情况下，自动方案可能在 Leader 分布上不够理想。"
+        },
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz5",
+          "question": "跨机架迁移时，为什么限流值应该比机架内迁移更保守？",
+          "choices": [
+            {"id": "A", "text": "因为跨机架的 TCP 连接建立更慢，需要更长的握手时间"},
+            {"id": "B", "text": "因为跨机架链路带宽通常低于机架内链路，且需要与其他服务共享跨机架带宽"},
+            {"id": "C", "text": "因为 Kafka 在跨机架复制时会自动启用压缩，CPU 开销更大需要降速"},
+            {"id": "D", "text": "因为跨机架复制使用的是不同的协议栈，吞吐上限天然更低"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "机架内 Broker 之间的通信走的是 ToR 交换机，带宽通常是服务器网卡的线速（10/25Gbps）。跨机架通信需要经过汇聚或核心交换机，这些链路是多个机架共享的，可用带宽相对更有限。更关键的是，跨机架链路不仅要承载 Kafka 的副本复制流量，还要承载其他所有服务的跨机架通信。如果 Kafka 迁移把跨机架带宽打满，会影响到同一网络路径上的所有其他服务。A、C、D 选项描述的机制都不存在。"
+        },
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz6",
+          "question": "RackAwareReplicaSelector 的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "在创建 Topic 时自动将副本分配到不同机架"},
+            {"id": "B", "text": "允许 Consumer 从同机架的 Follower 副本读取数据，减少跨机架流量"},
+            {"id": "C", "text": "在 Leader 选举时优先选择与大多数 Consumer 同机架的 Broker 作为 Leader"},
+            {"id": "D", "text": "自动将热点分区的 Leader 迁移到负载较低的机架"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "RackAwareReplicaSelector 是 Kafka 2.4 通过 KIP-392 引入的特性，它的作用是让 Broker 在响应 Consumer 的 Fetch 请求时，优先从与 Consumer 同机架（由 Consumer 端的 client.rack 配置指定）的 Follower 副本提供数据。这样 Consumer 不需要每次都跨机架到 Leader 读取数据，大幅减少了跨机架（或跨 AZ）的网络流量和延迟。A 选项描述的是 Rack Awareness 副本分配，不是 ReplicaSelector。C 和 D 选项的功能不存在于该特性中。"
+        },
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz7",
+          "question": "要启用 RackAwareReplicaSelector，需要在哪些地方做配置？",
+          "choices": [
+            {"id": "A", "text": "只需在 Broker 的 server.properties 中设置 replica.selector.class 即可"},
+            {"id": "B", "text": "需要在 Broker 设置 replica.selector.class，同时在 Consumer 设置 client.rack"},
+            {"id": "C", "text": "只需在 Consumer 端设置 client.rack，Broker 端会自动检测并启用"},
+            {"id": "D", "text": "需要在 Broker、Producer 和 Consumer 三端都设置 client.rack"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "启用 RackAwareReplicaSelector 需要两端配合。Broker 端需要在 server.properties 中设置 replica.selector.class=org.apache.kafka.common.replica.RackAwareReplicaSelector，告诉 Broker 使用机架感知的副本选择器。Consumer 端需要设置 client.rack 属性（如 client.rack=rack-b），告诉 Broker 这个 Consumer 在哪个机架。Broker 根据 Consumer 的 rack 信息选择最近的副本返回数据。Producer 端不需要配置 client.rack，因为写入永远走 Leader。"
+        },
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz8",
+          "question": "在 AWS 上运行 Kafka 集群，3 个 AZ 各部署 2 台 Broker，RF=3，如果不启用 RackAwareReplicaSelector，一个 Consumer 消费全部分区的数据，大约有多少比例的 Fetch 流量是跨 AZ 的？",
+          "choices": [
+            {"id": "A", "text": "0%，Consumer 总是从本 AZ 的 Broker 读取"},
+            {"id": "B", "text": "约 33%，因为三分之一的分区 Leader 在 Consumer 所在的 AZ"},
+            {"id": "C", "text": "约 67%，因为三分之二的分区 Leader 不在 Consumer 所在的 AZ"},
+            {"id": "D", "text": "100%，所有 Fetch 请求都必须跨 AZ 路由到 Leader"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "在 3 个 AZ 各 2 台 Broker 的集群中，RF=3 且开启 Rack Awareness 后，每个分区的 Leader 会均匀分布在 3 个 AZ 中。如果 Consumer 部署在其中一个 AZ，大约三分之一的分区 Leader 在本 AZ（本地读取），另外三分之二的分区 Leader 在其他两个 AZ（需要跨 AZ 读取）。所以约 67% 的 Fetch 流量是跨 AZ 的。这正是 RackAwareReplicaSelector 要解决的问题——启用后 Consumer 可以从本 AZ 的 Follower 读取，将跨 AZ 流量比例降到接近 0。"
+        },
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz9",
+          "question": "在 Kubernetes 环境中，如何自动为 Kafka Broker 的 Pod 设置 broker.rack？",
+          "choices": [
+            {"id": "A", "text": "在 Pod 的环境变量中手动硬编码 KAFKA_BROKER_RACK 值"},
+            {"id": "B", "text": "使用 Strimzi Operator 的 rack 配置，从 Kubernetes 节点的 topology.kubernetes.io/zone 标签自动注入"},
+            {"id": "C", "text": "Kubernetes 会自动将 Pod 所在节点的 AZ 信息写入 Kafka 的 server.properties"},
+            {"id": "D", "text": "需要编写 Init Container 调用云厂商 API 查询实例所在 AZ 并写入配置文件"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Strimzi 是 Kubernetes 上最主流的 Kafka Operator。它的 Kafka CRD 中支持 rack 配置项，可以指定一个 Kubernetes 节点标签（默认就是 topology.kubernetes.io/zone），Operator 会在 Broker Pod 启动前自动读取该节点标签的值并注入到 broker.rack 配置中。这种方式完全自动化，不需要手动维护机架映射。A 选项的硬编码方式不够灵活，C 选项描述的自动写入机制不存在，D 选项虽然可行但过于繁琐且 Strimzi 已经提供了现成的解决方案。"
+        },
+        {
+          "id": "kafka-ops-cross-rack-migration-q1-quiz10",
+          "question": "跨机架副本迁移完成后，发现某些分区的 ISR 列表比 Replicas 列表少一个副本，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "迁移过程中限流设置过低，部分新副本还没有追赶上 Leader 的 LEO"},
+            {"id": "B", "text": "broker.rack 配置错误导致 Controller 拒绝将跨机架副本加入 ISR"},
+            {"id": "C", "text": "跨机架的网络延迟导致 Follower 的 Fetch 请求频繁超时，被踢出 ISR"},
+            {"id": "D", "text": "kafka-reassign-partitions.sh --verify 有 bug，显示 completed 但实际未完成"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "跨机架部署后，Follower 到 Leader 的网络延迟会从亚毫秒级增加到几毫秒甚至更高。如果 replica.lag.time.max.ms 配置值偏小（默认 30 秒通常足够），或者跨机架链路质量不稳定导致偶发的网络抖动，Follower 的 Fetch 请求可能超时，触发 ISR 收缩。解决方法是检查跨机架网络质量并适当调大 replica.lag.time.max.ms。A 选项描述的情况在迁移过程中是正常的，但如果 --verify 已经报告 completed 说明所有新副本已经进入 ISR，之后掉出 ISR 更可能是网络问题。B 选项的机制不存在，broker.rack 不影响 ISR 加入逻辑。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#brokerconfigs_broker.rack",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-36+Rack+aware+replica+assignment",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-392%3A+Allow+consumers+to+fetch+from+closest+replica",
+        "https://kafka.apache.org/documentation/#basic_ops_partitionassignment",
+        "https://github.com/linkedin/cruise-control"
+      ]
+    }
+  ]
+}
