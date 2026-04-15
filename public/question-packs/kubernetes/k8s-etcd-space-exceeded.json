@@ -1,0 +1,281 @@
+{
+  "id": "k8s-etcd-space-exceeded",
+  "name": "etcd space exceeded",
+  "domain": "kubernetes",
+  "description": "排查和恢复 etcd mvcc: database space exceeded 故障的完整流程",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-etcd-space-exceeded-q1",
+      "domain": "kubernetes",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": [
+        "etcd",
+        "mvcc: database space exceeded",
+        "Quota",
+        "告警恢复"
+      ],
+      "title": "etcd space exceeded",
+      "content": "周五晚上 8 点，你正准备下班，值班群里突然炸了。多个同事反馈 kubectl 命令全部报错，任何写操作都失败了：\n\n```\n$ kubectl create namespace test-ns\nError from server: etcdserver: mvcc: database space exceeded\n\n$ kubectl scale deployment nginx --replicas=3\nError from server: etcdserver: mvcc: database space exceeded\n\n$ kubectl apply -f service.yaml\nError from server: etcdserver: mvcc: database space exceeded\n```\n\n奇怪的是，读操作还正常——`kubectl get pods` 能返回结果，但所有创建、更新、删除操作都被拒绝了。你赶紧去看 kube-apiserver 的日志，满屏都是同一个错误：\n\n```\nE0712 20:03:15.493829       1 status.go:71] apiserver received an error that is not an metav1.Status: &errors.errorString{s:\"etcdserver: mvcc: database space exceeded\"}\nE0712 20:03:15.812476       1 writers.go:50] apiserver received an error that is not an metav1.Status: &errors.errorString{s:\"etcdserver: mvcc: database space exceeded\"}\nW0712 20:03:16.127893       1 watcher.go:229] watch chan error: etcdserver: mvcc: database space exceeded\n```\n\n你登录到 etcd 节点用 etcdctl 检查告警状态：\n\n```\n$ etcdctl alarm list \\\n    --endpoints=https://10.0.1.10:2379,https://10.0.1.11:2379,https://10.0.1.12:2379\nmemberID:10276657743932975437 alarm:NOSPACE\nmemberID:10604266599906893894 alarm:NOSPACE\nmemberID:12111446655709937441 alarm:NOSPACE\n```\n\n三个节点全部触发了 NOSPACE alarm。再看数据库大小：\n\n```\n$ etcdctl endpoint status --write-out=table \\\n    --endpoints=https://10.0.1.10:2379,https://10.0.1.11:2379,https://10.0.1.12:2379\n+---------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+---------------+\n|         ENDPOINT          |        ID        | VERSION | DB SIZE | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS        |\n+---------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+---------------+\n| https://10.0.1.10:2379    | 8e9e05c52164694d |  3.5.12 |  2.1 GB |     false |      false |        67 |    4285103 |            4285103 | alarm:NOSPACE |\n| https://10.0.1.11:2379    | 933c5a66a0e5b846 |  3.5.12 |  2.1 GB |      true |      false |        67 |    4285103 |            4285103 | alarm:NOSPACE |\n| https://10.0.1.12:2379    | a8db7c9f7184a31  |  3.5.12 |  2.0 GB |     false |      false |        67 |    4285103 |            4285103 | alarm:NOSPACE |\n+---------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+---------------+\n```\n\nDB SIZE 都在 2GB 左右，而这个集群的 etcd 启动参数里没有显式配置 `--quota-backend-bytes`，也就是用的默认值 2GB。集群现在处于「只读」状态——现有的 Pod 还在跑，但任何新的创建、更新、删除操作都被拒绝。更要命的是，kubelet 的 node lease 续约也在失败，如果不尽快恢复，节点会开始变成 NotReady，Pod 被驱逐，那就是真正的生产事故了。\n\n你需要在最短时间内恢复集群的写入能力，并搞清楚为什么 DB SIZE 会涨到 2GB 以及如何避免再次发生。",
+      "answer": "## 第一步：etcd Space Quota 核心概念基础详解\n\n### etcd 的定义与核心定位\n\netcd 是 Kubernetes 集群唯一的持久化状态存储——一个基于 Raft 共识算法的分布式强一致性键值数据库。所有的 Pod、Service、Deployment、ConfigMap、Secret 等资源对象，最终都以键值对的形式存储在 etcd 中。kube-apiserver 本身不持有任何状态，它只是 etcd 的前端读写代理。你通过 `kubectl` 做的每一次操作，创建也好、更新也好、删除也好，最终都会变成对 etcd 的一次写入。\n\netcd 的基本操作非常直观：\n\n```bash\n# 查看 etcd 集群状态（最常用的运维命令）\netcdctl endpoint status --write-out=table\n\n# 查看当前是否存在告警\netcdctl alarm list\n\n# 查看 Kubernetes 在 etcd 中存储的 key 前缀分布\netcdctl get /registry --prefix --keys-only | head -20\n```\n\n### Space Quota：etcd 的磁盘自我保护机制\n\netcd 使用 MVCC（Multi-Version Concurrency Control，多版本并发控制）存储模型，每次写操作都会创建一个新的全局 revision 版本，而不是原地覆盖旧数据。这意味着即使你反复更新同一个 key，etcd 里也会保存每次更新的完整历史版本。这些历史版本是 Kubernetes watch 机制能够工作的前提——controller 断线重连后需要从旧的 revision 接着读后续变更。\n\n但历史版本只增不减，数据库必然持续增长。为了防止磁盘被写满导致更严重的后果（比如 Raft WAL 无法写入引发数据损坏），etcd 设计了 **space quota** 机制作为最后的安全阀。`--quota-backend-bytes` 参数定义了底层 bbolt 数据库文件的最大允许大小，默认值是 **2GB**（准确地说是 2,147,483,648 bytes）。etcd 官方建议这个值最大不超过 8GB，因为更大的数据库会显著拖慢 Raft 快照生成和新节点数据同步的速度。\n\n### NOSPACE Alarm：触发条件与影响范围\n\n当 etcd 检测到 bbolt 数据库的物理大小达到 quota 上限时，会向集群所有成员广播一个 **NOSPACE alarm**。这个 alarm 的效果是立即的，也是全局的——整个集群进入只读模式，所有写入请求（put、delete、txn）都被拒绝，只允许 range 读取和 compaction 操作。\n\n有两个关键细节容易被忽略。第一，NOSPACE alarm 是集群级别的，不是节点级别的。哪怕只有一个节点的 DB SIZE 触及 quota，所有节点都会进入只读状态。因为 Raft 协议要求写入必须被多数节点确认，一个节点写不进去，leader 的 proposal 就无法达成共识。第二，**alarm 不会自动解除**。即使你后来通过 compaction 和 defrag 把 DB SIZE 降到了很小的值，etcd 仍然处于只读状态，你必须手动执行 `etcdctl alarm disarm` 才能恢复写入。这是 etcd 刻意设计的安全机制——它要确保你明确知道集群曾经到达过容量上限，并且已经采取了修复措施。\n\n## 第二步：紧急恢复流程精准深度解答\n\n### 完整恢复步骤：compact → defrag → disarm\n\n回到故障现场。集群处于 NOSPACE 只读状态，kubelet lease 续约正在失败，你需要在几分钟内恢复写入能力。以下是完整的恢复命令序列。\n\n**操作前先做快照备份**，这是铁律。虽然 compact + defrag 是标准操作，但万一 defrag 过程中磁盘空间不足以创建临时文件，可能导致数据损坏：\n\n```bash\netcdctl snapshot save /data/backup/etcd-emergency-$(date +%Y%m%d%H%M).db \\\n  --endpoints=https://10.0.1.11:2379\n# Snapshot saved at /data/backup/etcd-emergency-202407122005.db\n```\n\n**第一步：获取当前 revision 并执行 compaction。** Compaction 会删除指定 revision 之前的所有历史版本数据，在逻辑层面释放空间：\n\n```bash\n# 获取当前最新 revision\nrev=$(etcdctl endpoint status --write-out=\"json\" \\\n  --endpoints=https://10.0.1.11:2379 \\\n  | grep -o '\"revision\":[0-9]*' | head -1 | grep -o '[0-9]*')\necho \"Current revision: $rev\"\n# Current revision: 4285103\n\n# 执行 compaction\netcdctl compact $rev --endpoints=https://10.0.1.11:2379\n# compacted revision 4285103\n```\n\n这里有一个关键的设计细节：etcd 在 NOSPACE 状态下虽然拒绝常规写入，但特意保留了对 compaction 的支持。这是刻意留出的「逃生通道」——如果连 compaction 都不允许，一旦触及 quota 就彻底死锁了，只能靠删除数据目录从备份恢复集群，代价要大得多。\n\n**第二步：逐节点执行 defrag。** Compaction 只是在逻辑层面标记数据为已删除，bbolt 数据库文件的物理大小不会变。defrag 通过重建数据库文件来回收物理磁盘空间：\n\n```bash\n# 先对 Follower 节点执行\netcdctl defrag --endpoints=https://10.0.1.10:2379\n# Finished defragmenting etcd member[https://10.0.1.10:2379]\n\netcdctl defrag --endpoints=https://10.0.1.12:2379\n# Finished defragmenting etcd member[https://10.0.1.12:2379]\n\n# 最后对 Leader 节点执行\netcdctl defrag --endpoints=https://10.0.1.11:2379\n# Finished defragmenting etcd member[https://10.0.1.11:2379]\n\n# 验证 DB SIZE 已缩小\netcdctl endpoint status --write-out=table \\\n  --endpoints=https://10.0.1.10:2379,https://10.0.1.11:2379,https://10.0.1.12:2379\n# DB SIZE 从 2.1 GB 降到了约 48 MB\n```\n\n必须逐节点执行且先 Follower 后 Leader，因为 defrag 期间该节点暂停处理读写请求。如果同时对三个节点执行，整个 etcd 集群完全不可用，kube-apiserver 会报大量连接错误。\n\n**第三步：解除 NOSPACE alarm 恢复写入能力：**\n\n```bash\netcdctl alarm disarm --endpoints=https://10.0.1.11:2379\n# memberID:10276657743932975437 alarm:NOSPACE\n# memberID:10604266599906893894 alarm:NOSPACE\n# memberID:12111446655709937441 alarm:NOSPACE\n\n# 确认 alarm 已清除\netcdctl alarm list --endpoints=https://10.0.1.11:2379\n# （无输出表示没有活跃告警）\n\n# 验证集群写入恢复\nkubectl create namespace recovery-test && kubectl delete namespace recovery-test\n# namespace/recovery-test created\n# namespace \"recovery-test\" deleted\n```\n\n### 根因分析：为什么 DB SIZE 涨到了 2GB\n\n灭完火之后必须查根因，否则过几天又会复发。etcd DB SIZE 异常增长通常有几种典型原因。\n\n**auto-compaction 未启用。** 这是最常见的根因。检查 etcd 启动参数里有没有 `--auto-compaction-mode` 和 `--auto-compaction-retention`。kubeadm 部署的集群默认配置 `--auto-compaction-mode=periodic --auto-compaction-retention=5m`，但手动部署或使用某些自动化工具的集群可能漏掉了这项配置。没有 auto-compaction，MVCC 历史版本无限堆积，DB SIZE 只会越来越大。\n\n**Event 对象高频写入。** Kubernetes Event 是写入 etcd 最频繁的资源类型。每次 Pod 调度、镜像拉取、探针失败都会生成 Event，一个 200 节点的集群每小时可能产生上万条 Event。用以下命令查看 Event 的存储量：\n\n```bash\netcdctl get /registry/events --prefix --keys-only | wc -l\n```\n\n**kubelet node lease 频繁续约。** 每个节点的 kubelet 默认每 10 秒更新一次 `kube-node-lease` namespace 下的 Lease 对象。100 个节点意味着每秒 10 次 lease 更新，一天就是 86 万个新 revision。\n\n查看各 key 前缀的分布可以帮你快速定位哪类资源占了最多空间：\n\n```bash\netcdctl get / --prefix --keys-only | \\\n  awk -F'/' '{print \"/\"$2\"/\"$3}' | sort | uniq -c | sort -rn | head -20\n```\n\n## 第三步：体系化扩展延伸\n\n### 调大 Quota：什么时候该做、上限是多少\n\n如果你的集群规模确实较大（几千个 namespace、上万个 ConfigMap/Secret），默认 2GB 的 quota 可能不够。生产环境常见的配置是 4GB 或 8GB。etcd 官方明确建议 `--quota-backend-bytes` 不超过 8GB（8589934592 bytes），原因有两个：Raft snapshot 生成需要序列化整个数据库，太大会拖慢 leader 选举后新节点的数据同步；defrag 需要在磁盘上创建一个同等大小的临时文件，数据库太大会导致 defrag 耗时过长。修改 quota 需要重启 etcd，kubeadm 集群修改 `/etc/kubernetes/manifests/etcd.yaml` 即可。但调大 quota 只是治标——真正要解决的是 auto-compaction 配置和数据增长源头。\n\n### Event 分离减轻主库压力\n\n在大规模集群中，推荐将 Event 对象存储到独立的 etcd 集群。kube-apiserver 支持 `--etcd-servers-overrides` 参数：\n\n```\n--etcd-servers-overrides=/events#https://10.0.2.10:2379;https://10.0.2.11:2379;https://10.0.2.12:2379\n```\n\n这样主 etcd 只存储核心资源对象，Event 的高频写入不会影响主库的空间增长和性能。Google GKE、AWS EKS 在底层都采用了类似的 Event 分离架构。\n\n### 监控告警：在 NOSPACE 之前预警\n\n恢复之后最重要的事是补齐监控，确保永远不会再走到 NOSPACE 这一步：\n\n```yaml\ngroups:\n- name: etcd-space-alerts\n  rules:\n  - alert: EtcdDatabaseSizeWarning\n    expr: etcd_mvcc_db_total_size_in_bytes / etcd_server_quota_backend_bytes > 0.8\n    for: 5m\n    labels:\n      severity: warning\n    annotations:\n      summary: \"etcd DB size 已达 quota 的 80%，请检查 compaction 配置\"\n  - alert: EtcdDatabaseSizeCritical\n    expr: etcd_mvcc_db_total_size_in_bytes / etcd_server_quota_backend_bytes > 0.95\n    for: 1m\n    labels:\n      severity: critical\n    annotations:\n      summary: \"etcd DB size 即将触及 quota，立即执行 compaction + defrag\"\n```\n\n同时监控 `etcd_mvcc_db_total_size_in_bytes` 的增长速率。如果 db size 在 24 小时内增长超过 500MB，说明要么 auto-compaction 没生效，要么有异常的高频写入需要排查。\n\n### 恢复过程中的常见致命错误\n\n**用错了 compaction revision。** 有人把 revision 和 Raft index 搞混了，或者手动输入了一个远古的 revision 号，导致 compaction 根本没清理多少数据。正确做法是始终取当前最新的 revision。\n\n**同时对所有节点执行 defrag。** 如果你在脚本中并行对三个节点执行 defrag，三个节点同时暂停服务，整个集群不可用。etcdctl 本身在指定多个 endpoint 时是串行执行的所以还好，但自定义脚本的并行执行是真实的生产事故来源。\n\n**defrag 之后忘了 disarm alarm。** 这个错误发生频率极高。compaction 做了、defrag 做了、DB SIZE 降到了 48MB，但集群还是报 space exceeded——因为 alarm 没解除。记住，NOSPACE alarm 永远不会自动解除，必须手动 disarm。\n\n**没有在操作前做 snapshot 备份。** defrag 的底层逻辑是重建 bbolt 数据库文件。如果操作过程中磁盘空间不够创建临时文件、或者发生了意外的进程中断，可能导致数据库文件损坏。操作前一个 `etcdctl snapshot save` 只需要几秒钟，却能在最坏情况下救你一命。",
+      "keyPoints": [
+        "etcd 的 --quota-backend-bytes 参数定义了 bbolt 数据库的最大允许大小，默认值为 2GB，当 DB SIZE 达到该阈值时 etcd 触发 NOSPACE alarm 使整个集群进入只读模式拒绝所有写入操作",
+        "NOSPACE alarm 是集群级别的状态标记且不会自动解除，即使通过 compaction 和 defrag 将 DB SIZE 降到很小的值也必须手动执行 etcdctl alarm disarm 才能恢复集群写入能力",
+        "紧急恢复的正确步骤是三步走：先获取当前 revision 执行 compaction 清理 MVCC 历史版本，再逐节点（先 Follower 后 Leader）执行 defrag 回收物理磁盘空间，最后 etcdctl alarm disarm 解除告警",
+        "etcd 在 NOSPACE 状态下虽然拒绝常规写入但特意保留了对 compaction 操作的支持，这是刻意设计的逃生通道，否则触及 quota 后将彻底死锁无法自救",
+        "DB SIZE 异常增长的常见根因包括 auto-compaction 未启用或配置不当、Event 对象高频写入、kubelet node lease 频繁续约以及大体积 Secret/ConfigMap 的重复更新",
+        "生产环境应配置 Prometheus 告警监控 etcd_mvcc_db_total_size_in_bytes / etcd_server_quota_backend_bytes 的比值，在达到 80% 时预警，避免走到 NOSPACE 这一步",
+        "大规模集群可通过 kube-apiserver 的 --etcd-servers-overrides 参数将 Event 对象分离到独立 etcd 集群，从根本上降低主库的写入压力和空间增长速度"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz1",
+          "question": "etcd 的 --quota-backend-bytes 参数的默认值是多少？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "512MB，适合小规模测试集群"
+            },
+            {
+              "id": "B",
+              "text": "2GB（2,147,483,648 bytes），etcd 官方建议生产环境最大不超过 8GB"
+            },
+            {
+              "id": "C",
+              "text": "8GB，与 etcd 推荐的最大值一致"
+            },
+            {
+              "id": "D",
+              "text": "没有默认限制，数据库可以无限增长直到磁盘写满"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "etcd 的 --quota-backend-bytes 默认值是 2GB（2,147,483,648 bytes）。这个默认值对于中小规模的 Kubernetes 集群通常足够，因为实际有效数据量一般在 100MB-500MB 之间。A 选项不对，512MB 太小不是默认值。C 选项把默认值和推荐最大值搞混了——8GB 是官方建议的上限，不是默认值。D 选项也不正确，etcd 有明确的默认 quota，正是为了防止数据库无限增长导致磁盘写满后出现更严重的数据损坏问题。"
+        },
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz2",
+          "question": "当 etcd 触发 NOSPACE alarm 后，集群处于什么状态？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "集群完全不可用，所有读写操作都被拒绝"
+            },
+            {
+              "id": "B",
+              "text": "集群进入只读模式，拒绝所有写入（put/delete/txn）但允许读取（range）和 compaction 操作"
+            },
+            {
+              "id": "C",
+              "text": "只有触发 alarm 的那个节点进入只读模式，其他节点正常工作"
+            },
+            {
+              "id": "D",
+              "text": "集群自动开始清理历史版本，清理完成后恢复正常"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "NOSPACE alarm 触发后，etcd 进入只读模式：拒绝所有写入操作但仍然允许读取和 compaction。这是一个重要的设计选择——如果连 compaction 都不允许，集群就彻底死锁了，只能靠删除数据目录恢复。A 选项不准确，读操作和 compaction 仍然可以执行。C 选项错误，NOSPACE alarm 是集群级别的，因为 Raft 协议要求写入必须被多数节点确认，一个节点写不进去整个集群的写入都会失败。D 选项也不对，etcd 不会自动清理，alarm 也不会自动解除，需要人工介入。"
+        },
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz3",
+          "question": "为什么 etcd 在 NOSPACE 状态下仍然允许执行 compaction 操作？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "因为 compaction 是读操作，不涉及写入"
+            },
+            {
+              "id": "B",
+              "text": "这是 etcd 刻意设计的逃生通道，如果连 compaction 都禁止，触及 quota 后将彻底死锁，只能通过删除数据目录重建集群来恢复"
+            },
+            {
+              "id": "C",
+              "text": "因为 compaction 操作绕过了 Raft 共识，直接在本地执行"
+            },
+            {
+              "id": "D",
+              "text": "这是 etcd 的一个 bug，按设计所有写入操作都应该被拒绝"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "etcd 在 NOSPACE 状态下允许 compaction 是一个刻意的安全设计。compaction 虽然涉及删除历史版本数据，但它的目的是释放空间而不是增加数据，所以被归类为「维护操作」而非常规写入。如果连这个逃生通道都关掉了，一旦 DB SIZE 触及 quota，管理员就只能删除 etcd 数据目录然后从 snapshot 恢复，代价要大得多。A 选项不对，compaction 确实会修改底层数据。C 选项也不正确，compaction 仍然走 Raft 共识。D 选项把正确的设计说成了 bug。"
+        },
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz4",
+          "question": "恢复 etcd NOSPACE 故障的正确操作顺序是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "disarm alarm → compaction → defrag"
+            },
+            {
+              "id": "B",
+              "text": "defrag → compaction → disarm alarm"
+            },
+            {
+              "id": "C",
+              "text": "compaction → defrag（逐节点，先 Follower 后 Leader）→ disarm alarm"
+            },
+            {
+              "id": "D",
+              "text": "重启所有 etcd 节点 → compaction → defrag"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "正确的恢复顺序是 compaction → defrag → disarm alarm。首先执行 compaction 清理 MVCC 历史版本的逻辑数据，然后逐节点执行 defrag 回收物理磁盘空间（必须先 Follower 后 Leader，避免集群不可用），最后用 etcdctl alarm disarm 解除 NOSPACE 告警恢复写入能力。A 选项顺序错误，在空间还没释放的情况下 disarm alarm 没有意义，而且 alarm 可能会立即重新触发。B 选项也不对，没有先 compaction 清理历史数据就 defrag 效果有限。D 选项中重启 etcd 不会解除 alarm 也不会释放空间，完全无效。"
+        },
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz5",
+          "question": "以下 etcdctl endpoint status 输出中，哪些信息最能确认集群遇到了 space exceeded 问题？\n\n```\nENDPOINT          | DB SIZE | IS LEADER | ERRORS\n10.0.1.10:2379    |  2.1 GB |   false   | alarm:NOSPACE\n10.0.1.11:2379    |  2.1 GB |    true   | alarm:NOSPACE\n10.0.1.12:2379    |  2.0 GB |   false   | alarm:NOSPACE\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "DB SIZE 超过了 1GB 说明数据量过大"
+            },
+            {
+              "id": "B",
+              "text": "ERRORS 列显示 alarm:NOSPACE 且 DB SIZE 约 2GB 说明已触及默认 quota（2GB）上限"
+            },
+            {
+              "id": "C",
+              "text": "三个节点的 DB SIZE 不完全一致说明存在数据不同步"
+            },
+            {
+              "id": "D",
+              "text": "IS LEADER 为 true 的节点 DB SIZE 最大说明 Leader 负载过重"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "最关键的两个信息是 ERRORS 列的 alarm:NOSPACE 和 DB SIZE 约 2GB。alarm:NOSPACE 直接证实了 etcd 已触发空间告警进入只读模式，而 2GB 的 DB SIZE 与默认的 --quota-backend-bytes 值（2GB）吻合，说明这个集群没有调大 quota 就触顶了。A 选项不准确，DB SIZE 超过 1GB 本身不说明问题，关键是是否触及了 quota。C 选项不对，etcd 各节点的 DB SIZE 有微小差异是正常的，因为 bbolt 的空间管理和 compaction 时机略有不同，这不代表数据不同步。D 选项也是误读，Leader 和 Follower 的 DB SIZE 差异与负载无关。"
+        },
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz6",
+          "question": "执行完 compaction 和 defrag 后，DB SIZE 已经从 2.1GB 降到了 48MB，但 kubectl create namespace 仍然报错 space exceeded。最可能的原因是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "compaction 和 defrag 没有真正生效，需要重新执行"
+            },
+            {
+              "id": "B",
+              "text": "kube-apiserver 有缓存，需要重启 kube-apiserver 才能感知到 etcd 的空间变化"
+            },
+            {
+              "id": "C",
+              "text": "忘了执行 etcdctl alarm disarm 解除 NOSPACE 告警，alarm 不会因为空间释放而自动解除"
+            },
+            {
+              "id": "D",
+              "text": "quota-backend-bytes 配置太小，需要先调大 quota 再重启 etcd"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是恢复 NOSPACE 故障时最常犯的错误。etcd 的 NOSPACE alarm 是一个显式的状态标记，设计上就不会自动解除——即使 DB SIZE 已经降到了原来的 2%，只要 alarm 没有被手动 disarm，集群就继续拒绝写入。这是 etcd 的安全机制：它要确保管理员明确知道集群曾经触及过容量上限。执行 etcdctl alarm disarm 后集群会立即恢复写入能力。A 选项不对，DB SIZE 已经降了说明操作确实生效了。B 选项也不对，kube-apiserver 不缓存 etcd 的空间状态，它是实时感知 etcd 的错误响应。D 选项治标不治本且不必要。"
+        },
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz7",
+          "question": "关于调大 etcd 的 --quota-backend-bytes，以下哪个说法是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "可以设置为任意大小，比如 100GB，只要磁盘空间足够即可"
+            },
+            {
+              "id": "B",
+              "text": "官方建议最大不超过 8GB，因为过大的数据库会拖慢 Raft snapshot 生成和节点恢复速度，同时 defrag 的不可用窗口也会变长"
+            },
+            {
+              "id": "C",
+              "text": "修改 quota 不需要重启 etcd，可以通过 API 动态生效"
+            },
+            {
+              "id": "D",
+              "text": "调大 quota 可以从根本上解决 space exceeded 问题，不需要配置 auto-compaction"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "etcd 官方明确建议 --quota-backend-bytes 不超过 8GB（8,589,934,592 bytes）。原因有两个：一是 Raft snapshot 需要序列化整个数据库，8GB 以上的 snapshot 会显著增加 leader 选举后新节点追数据的时间，可能导致集群在成员变更期间长时间不稳定；二是 defrag 需要在磁盘上创建同等大小的临时文件来重建数据库，数据库越大 defrag 耗时越长，节点不可用窗口也越大。A 选项不对，不是磁盘够大就能随意设。C 选项不正确，quota 修改需要重启 etcd 进程。D 选项是典型的治标不治本思维，不配 auto-compaction 的话 DB SIZE 迟早还会涨满。"
+        },
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz8",
+          "question": "生产环境中如何防止 etcd 再次触发 NOSPACE alarm？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "把 quota-backend-bytes 设到最大值 8GB 就足够了"
+            },
+            {
+              "id": "B",
+              "text": "确保 auto-compaction 正确配置、设置 Prometheus 告警在 DB SIZE 达到 quota 80% 时预警、大规模集群考虑 Event 分离到独立 etcd"
+            },
+            {
+              "id": "C",
+              "text": "每天手动执行一次 compaction 和 defrag 即可"
+            },
+            {
+              "id": "D",
+              "text": "减少集群中的资源对象数量，控制在 1000 个以内"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "防止 NOSPACE 需要多层防御。最基础的是确保 auto-compaction 正确配置（--auto-compaction-mode=periodic --auto-compaction-retention=5m），让历史版本自动清理。其次是配置 Prometheus 告警监控 etcd_mvcc_db_total_size_in_bytes / etcd_server_quota_backend_bytes 的比值，在达到 80% 时就触发告警给运维团队预留处理时间。对于大规模集群，还应该将 Event 对象通过 kube-apiserver 的 --etcd-servers-overrides 分离到独立 etcd 集群，从源头降低主库的写入压力。A 选项只是延缓问题不是解决问题。C 选项不可靠，手动操作容易遗忘且 defrag 有服务中断风险。D 选项不现实，生产集群的资源数量是业务决定的。"
+        },
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz9",
+          "question": "kube-apiserver 的 --etcd-servers-overrides 参数的作用是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "配置 etcd 集群的备份地址，当主 etcd 不可用时自动切换"
+            },
+            {
+              "id": "B",
+              "text": "将特定类型的资源（如 Event）存储到独立的 etcd 集群，降低主 etcd 的写入压力和空间增长"
+            },
+            {
+              "id": "C",
+              "text": "覆盖 etcd 的内部配置参数，比如 quota-backend-bytes"
+            },
+            {
+              "id": "D",
+              "text": "在多个 etcd 集群之间做数据同步和复制"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "--etcd-servers-overrides 允许 kube-apiserver 将特定 API 资源路由到不同的 etcd 集群。最典型的用法是 /events#https://etcd-events:2379，将所有 Event 对象存储到独立的 etcd 实例。Event 是 Kubernetes 中写入最频繁的资源类型之一，分离后主 etcd 的写入压力和空间增长都会大幅降低。Google GKE 和 AWS EKS 在底层都采用了这种 Event 分离架构。A 选项描述的是高可用切换而非资源路由。C 选项完全不对，这个参数不控制 etcd 的内部配置。D 选项也是误解，它不做跨集群数据同步。"
+        },
+        {
+          "id": "k8s-etcd-space-exceeded-q1-quiz10",
+          "question": "你在恢复 NOSPACE 故障后检查发现 etcd 启动参数中没有任何 auto-compaction 配置。以下排查结果中，哪个最能证实缺少 auto-compaction 就是 DB SIZE 暴涨的根因？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "etcdctl endpoint status 显示 DB SIZE 为 2.1GB"
+            },
+            {
+              "id": "B",
+              "text": "kubectl get events --all-namespaces 返回上万条 Event"
+            },
+            {
+              "id": "C",
+              "text": "revision 已到 400 万，而 compaction 后 DB SIZE 从 2.1GB 降到 48MB，说明 99% 以上的空间被历史版本占用"
+            },
+            {
+              "id": "D",
+              "text": "etcdctl alarm list 显示三个节点都有 NOSPACE alarm"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "最有力的证据链是：revision 号非常大（400 万意味着 etcd 累积了 400 万次写操作的历史版本），而 compaction 后 DB SIZE 从 2.1GB 暴降到 48MB，说明数据库 99% 以上的空间都被 MVCC 历史版本占据。如果 auto-compaction 正常工作，这些历史版本会被定期清理，不会堆积到这个程度。两个信息结合起来就能确认根因是 auto-compaction 缺失。A 选项只说明了现象不说明原因。B 选项中 Event 多只是写入量大的一个来源，不直接证明是 compaction 缺失。D 选项也只是故障现象的表现。"
+        }
+      ],
+      "references": [
+        "https://etcd.io/docs/v3.5/op-guide/maintenance/#space-quota",
+        "https://etcd.io/docs/v3.5/op-guide/configuration/#--quota-backend-bytes",
+        "https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/",
+        "https://github.com/etcd-io/etcd/blob/main/server/etcdserver/api/quota.go"
+      ]
+    }
+  ]
+}

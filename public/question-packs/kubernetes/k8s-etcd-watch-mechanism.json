@@ -1,0 +1,283 @@
+{
+  "id": "k8s-etcd-watch-mechanism",
+  "name": "etcd Watch 机制",
+  "domain": "kubernetes",
+  "description": "深入理解 etcd Watch 机制的实现原理及其在 Kubernetes 事件驱动模型中的核心作用",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-etcd-watch-mechanism-q1",
+      "domain": "kubernetes",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": [
+        "etcd",
+        "Watch",
+        "事件通知",
+        "gRPC",
+        "MVCC"
+      ],
+      "title": "etcd Watch 机制",
+      "content": "你在排查一个 Kubernetes 集群问题时，执行了一条大家每天都在用的命令：\n\n```bash\n$ kubectl get pods -w\nNAME                     READY   STATUS    RESTARTS   AGE\nnginx-7c5ddbdf54-k2j8x  1/1     Running   0          3h\n```\n\n然后你在另一个终端删掉这个 Pod：\n\n```bash\n$ kubectl delete pod nginx-7c5ddbdf54-k2j8x\n```\n\n几乎同一秒，第一个终端就刷出了新行：\n\n```\nnginx-7c5ddbdf54-k2j8x  1/1     Terminating   0          3h\nnginx-7c5ddbdf54-ab3m9  0/1     Pending       0          0s\nnginx-7c5ddbdf54-ab3m9  0/1     ContainerCreating   0     1s\nnginx-7c5ddbdf54-ab3m9  1/1     Running       0          2s\n```\n\n你很自然地接受了这个行为——`-w` 就是 watch 嘛。但你有没有想过，这背后到底发生了什么？kubectl 是在不停地轮询 API server 吗？显然不是，因为那样太浪费了。实际上，从 etcd 到 kube-apiserver 到 kubectl，每一层都建立了持久的流式连接来推送变更事件。\n\n你可以直接在 etcd 上看到这个机制的底层行为。用 etcdctl 打开一个 watch：\n\n```bash\n$ etcdctl watch /registry/pods/default/ --prefix\nPUT\n/registry/pods/default/nginx-7c5ddbdf54-ab3m9\nk8s\\x06\\n...（protobuf 编码的 Pod 对象）\n\nDELETE\n/registry/pods/default/nginx-7c5ddbdf54-k2j8x\n```\n\n每当有 Pod 被创建、修改或删除，etcd 就会通过这个 watch 流实时推送事件。kube-apiserver 内部维护着对 etcd 的 watch 连接，收到事件后再扇出（fan-out）给所有订阅了这个资源类型的客户端——包括你的 kubectl、各种 controller、scheduler 等等。\n\n这就是 Kubernetes 声明式模型的底层驱动力：所有的 controller 和 operator 都不是在轮询「现在的状态是什么」，而是在监听「状态发生了什么变化」。这个响应式（reactive）架构的基石就是 etcd 的 Watch 机制。\n\n那么问题来了：etcd Watch 在底层是怎么实现的？它是怎么做到在上万个 key 中精确地推送变更事件、还能保证不丢不乱的？kube-apiserver 又是怎么在 etcd Watch 之上构建出支撑整个集群的事件分发体系的？",
+      "answer": "## 第一步：etcd Watch 核心概念基础详解\n\n### etcd 的定义与 Watch 在其中的定位\n\netcd 是一个分布式强一致性键值存储系统，Kubernetes 用它作为唯一的持久化状态后端。etcd 提供的核心能力有三个：键值读写（Put/Get/Delete）、事务（Txn）、以及 **Watch**——对键或键前缀的变更进行实时流式通知。如果把 etcd 类比成一个数据库，Watch 就是它原生内置的 Change Data Capture（CDC，变更数据捕获）能力。\n\nWatch 解决的核心问题是：在一个分布式系统中，多个组件需要感知数据变化时，如何避免低效的轮询。没有 Watch，每个 Kubernetes controller 都得每隔几秒去 API server 拉取全量资源列表做 diff，这在几千个 Pod 的集群上意味着巨量的无效网络和 CPU 开销。有了 Watch，controller 建立一条持久连接，etcd 只在数据真正发生变化时才推送事件——既实时又高效。\n\n用 etcdctl 体验 Watch 最直观。打开两个终端，一个执行 watch，另一个执行写入：\n\n```bash\n# 终端 1：监听 /demo/ 前缀下所有键的变更\n$ etcdctl watch /demo/ --prefix\n\n# 终端 2：写入和删除\n$ etcdctl put /demo/key1 value1\n$ etcdctl put /demo/key2 value2\n$ etcdctl del /demo/key1\n```\n\n终端 1 会实时输出：\n\n```\nPUT\n/demo/key1\nvalue1\nPUT\n/demo/key2\nvalue2\nDELETE\n/demo/key1\n```\n\n每个事件包含操作类型（PUT 或 DELETE）、键名和值。在 API 层面，etcd 的 Watch 返回的每个事件还携带一个 **revision** 号——这是全局单调递增的逻辑时钟，每次对 etcd 的修改操作都会让 revision 加 1。revision 是理解 etcd Watch 整个机制的关键概念。\n\n### etcd v2 vs v3 的 Watch 演进\n\netcd v2 的 Watch 基于 HTTP/1.1 长轮询（long polling），客户端发一个带 `wait=true` 参数的 GET 请求，服务端 hold 住连接直到有事件发生才返回。客户端收到后必须立即发起下一个请求——中间存在一个时间窗口，如果事件发生在两次请求之间就可能丢失。v2 用一个固定大小 1000 的事件队列做缓冲，队列满了旧事件就被丢弃，客户端必须全量重新拉取。\n\netcd v3 彻底重构了 Watch 机制。传输层从 HTTP/1.1 升级为 **gRPC 双向流**（bidirectional streaming），一条 TCP 连接可以同时承载多个 watch 流，客户端和服务端随时可以互相推送消息，不需要反复建立连接。存储层引入了 **MVCC（多版本并发控制）** 引擎，每个键的每次修改都作为一个独立版本保留在 BoltDB 中，通过 revision 索引。这意味着客户端可以从任意历史 revision 开始 Watch——哪怕断线了也能从断点恢复，不会丢事件。\n\n## 第二步：Watch 机制的精准深度解答\n\n### Watch 的内部架构：watchableStore\n\netcd v3 的 Watch 实现核心在 `mvcc/watchable_store.go` 中的 `watchableStore` 结构体。它是 MVCC 存储引擎上的一层包装，维护着两组 watcher：\n\n**synced watchers** 是那些已经追上最新 revision 的 watcher，它们在等待未来的新事件。当 etcd 收到一个写请求并将其应用到状态机后，watchableStore 会遍历所有 synced watcher，检查哪些 watcher 监听的键范围与这次修改匹配，然后将事件推送到对应 watcher 的事件 channel。\n\n**unsynced watchers** 是那些需要追赶历史数据的 watcher——比如客户端指定了 `--rev=100` 但当前 revision 已经到 5000 了，中间的 4900 个变更需要从 BoltDB 的历史版本中读出来逐个推送。etcd 有一个后台 goroutine（`syncWatchersLoop`）专门负责处理 unsynced watcher，它从 BoltDB 按 revision 顺序读取历史事件，推送给客户端，直到追上最新 revision 后将 watcher 移入 synced 组。\n\n这个 synced/unsynced 分组设计非常巧妙：热路径上（新事件到达时）只需要遍历 synced watcher，不受历史追赶任务的影响；而历史追赶走的是独立的后台协程，有自己的速率控制，不会阻塞新事件的分发。\n\n### MVCC revision 机制与 Watch 的可靠性\n\netcd 的 MVCC 引擎为每个键的每次修改都分配一个全局唯一的 revision。实际上 revision 是一个 main revision + sub revision 的复合结构，同一个事务内的多个操作共享 main revision，通过 sub revision 区分顺序。BoltDB 中有一个专门的 `key` bucket 以 revision 为索引存储每次修改的快照，还有一个 `keyIndex` 内存 B 树维护键名到 revision 列表的映射。\n\n这个设计让 Watch 的可靠投递成为可能。客户端创建 watch 时可以指定一个 start revision，etcd 保证从这个 revision 开始的所有变更事件都会按顺序推送，不漏不重。客户端只需要在本地记住收到的最后一个 revision，断线重连时从 last_revision + 1 开始 Watch 即可。用 etcdctl 验证：\n\n```bash\n# 先查看当前 revision\n$ etcdctl get /demo/key1 -w json | python3 -m json.tool\n{\n    \"header\": {\n        \"revision\": 15892\n    }\n}\n\n# 从指定 revision 开始 watch，可以回放历史事件\n$ etcdctl watch /demo/ --prefix --rev=15890\n```\n\n但历史版本不会无限保留。etcd 的 compaction（压缩）操作会清理掉指定 revision 之前的历史数据。如果客户端指定的 start revision 已经被 compact 了，etcd 会返回一个 `ErrCompacted` 错误，客户端必须执行全量 List 然后从最新的 revision 重新 Watch——这就是 Kubernetes 中 `resource version too old` 错误的根源。\n\n### gRPC 双向流的实现细节\n\netcd Watch API 使用 gRPC 的 bidirectional streaming RPC 定义：\n\n```protobuf\nservice Watch {\n  rpc Watch(stream WatchRequest) returns (stream WatchResponse) {}\n}\n```\n\n一条 gRPC 流上可以复用多个 watch——客户端在同一条流上发送多个 `WatchCreateRequest`（各自指定不同的 key range），服务端为每个创建请求分配一个 `watch_id`，后续推送事件时通过 `watch_id` 区分属于哪个 watch。这种复用设计大幅减少了连接数。在 Kubernetes 场景中，kube-apiserver 对每种资源类型只需要建立一条 watch 流，而不是每个资源对象一条。\n\n每个 `WatchResponse` 包含一组 events（同一 revision 的事件会打包在一起）、当前 `compact_revision`（告诉客户端可以 Watch 的最早 revision）、以及一个关键的布尔标志 `created`（表示这个 watch 已经在服务端成功创建）。\n\n### Kubernetes API server 的 Watch 缓存层\n\nkube-apiserver 并不是把每个 kubectl watch 请求都直接转发给 etcd。如果 1000 个客户端同时 watch Pods，直接在 etcd 上创建 1000 个 watch 会把 etcd 压垮。API server 在 etcd 之上构建了一个 **watchCache** 缓存层（代码在 `staging/src/k8s.io/apiserver/pkg/storage/cacher/` 目录下）。\n\n这个 cacher 的工作原理是：对每种资源类型（Pods、Services、Deployments 等），API server 只向 etcd 建立**一个** watch。etcd 推送的事件进入 cacher 内部的一个环形缓冲区（默认容量 100 到 1000 个事件，取决于资源类型），cacher 然后将事件 **fan-out**（扇出）给所有订阅了该资源类型的客户端 watcher。这样无论有多少客户端在 watch Pods，etcd 上只有一个 Pod watch 的开销。\n\ncacher 还维护着资源对象的内存缓存（一份全量快照），处理 List 请求时直接从内存返回，不需要打到 etcd。这就是为什么 `kubectl get pods` 很快——它大部分时候读的是 API server 内存中的缓存而非 etcd。\n\n### 事件顺序保证与一致性\n\netcd Watch 提供严格的顺序保证：同一个 watch 流上的事件按 revision 严格递增，不会出现乱序。跨不同 watch 之间，相同 revision 的事件保证包含相同的内容。这个保证建立在 Raft 的全序日志复制之上——所有修改都通过 Leader 序列化，每个修改获得一个全局唯一的递增 revision。\n\n但有一个容易忽略的细节：etcd Watch 的事件推送是**异步的**。一个写请求被 committed 并返回客户端成功后，watch 事件不一定已经推送到了所有 watcher。在极端情况下，客户端 A 写入一个 key 并收到成功响应，客户端 B 的 watch 可能还没收到这个事件——这不是 bug，而是 Watch 本身就是最终一致的通知机制。不过因为 etcd 的 Watch 基于 Raft 已 commit 的日志推送，延迟通常在毫秒级别。\n\n### Watch 重连与 Bookmark 事件\n\n长时间运行的 Watch 流不可避免会遇到网络抖动、服务端重启等导致的断线。客户端需要从上次收到的最后一个 revision 重新 Watch。但如果在断线期间目标键没有任何变更，客户端手里记录的 revision 可能已经很旧了。当 etcd 执行 compaction 把这个 revision 之前的数据清理掉后，客户端重连时就会收到 `ErrCompacted`，被迫全量 re-list。\n\n为了缓解这个问题，etcd 3.4 引入了 **Bookmark 事件**。Bookmark 是一种特殊的 watch response，它不包含实际的数据变更事件，只携带当前最新的 revision。etcd 会定期发送 Bookmark 给长时间没有收到事件的 watcher，这样客户端就能更新自己记录的 revision 到最新值。即使断线重连，也能用一个较新的 revision 重新 Watch，大幅降低 compaction 冲突的概率。Kubernetes 在 1.17 版本开始默认启用 WatchBookmarks feature gate，API server 会在 watch response 中包含 `type: BOOKMARK` 事件。\n\n## 第三步：体系化扩展延伸\n\n### Watch 的扩展性设计\n\n在大规模 Kubernetes 集群中（几千个节点、几万个 Pod），Watch 的扩展性至关重要。etcd 这边，每种资源类型只有一个来自 API server 的 watch，所以 etcd 的 watcher 数量取决于资源类型数而非集群规模——通常只有几十个。真正的扇出压力在 API server 层面：如果 500 个 Node 上的 kubelet 都在 watch Pods，API server 的 cacher 需要把每个 Pod 事件复制 500 份推送出去。\n\nAPI server 的 watchCache 为此做了多项优化：事件序列化结果会被缓存和复用（同一个事件发给 500 个客户端只需要序列化一次）；watch event 通过 `sendWatchCacheEvent` 非阻塞地写入每个 watcher 的 channel，慢消费者不会阻塞其他 watcher；当某个 watcher 的 channel 满了，API server 会关闭这个 watch 连接强制客户端重连，而不是让一个慢客户端拖慢整个系统。\n\n### Progress Notify 与 Watch 效率\n\netcd 3.4+ 支持 `WithProgressNotify()` 选项。启用后，即使没有实际变更事件，etcd 也会每隔 `--experimental-watch-progress-notify-interval`（默认 10 分钟）发送一个进度通知给 watcher，携带当前 revision。这和 Bookmark 的功能类似但更可控，适合需要定期确认 watch 连接存活状态的场景。\n\n### 生产环境常见问题\n\n第一个高频问题是**watcher 过多导致 etcd 内存膨胀**。每个 watcher 在 etcd 内部占用一个事件 channel 和相关的元数据内存。如果你有多个 API server 实例（HA 部署），每个实例都会对每种资源类型创建 watch，watch 数量 = API server 实例数 × 资源类型数。可以通过 `etcd_debugging_mvcc_watcher_total` 指标监控 watcher 总数。\n\n第二个常见问题是 **watch 流频繁断开重连**。表现为 kube-apiserver 日志中大量 `watch chan error: etcdserver: mvcc: required revision has been compacted` 错误。根因是 etcd 的 compaction 间隔太短或 API server 处理事件太慢导致跟不上。解决方案是调大 `--etcd-compaction-interval`（默认 5 分钟）或增大 API server 的 `--watch-cache-sizes`。\n\n第三个问题是**事件风暴**。比如执行一次大规模 rolling update 时，短时间内产生大量 Pod 事件，API server 的 watchCache 可能被冲刷，导致部分客户端收到 `410 Gone` 错误被迫全量 re-list。Kubernetes 1.27 引入了 Consistent List from Cache（`WatchList` feature gate）来优化这个场景，允许 List 请求直接从 watch cache 返回而不是回源到 etcd。\n\n### 面试高频考点关联\n\netcd Watch 是面试中串联多个知识点的枢纽话题。从 Watch 可以自然延伸到 Informer 机制（client-go 的 ListAndWatch 模式、Reflector、DeltaFIFO、Indexer 的协作关系）、Controller 的 Reconcile Loop（为什么 controller 是事件驱动而非定时轮询）、以及 API server 的整个请求处理链路（authentication → authorization → admission → storage → watch notification）。理解 Watch 机制还能帮你回答「为什么 Kubernetes 能做到秒级的自愈」这类偏宏观的架构问题——答案就是从 etcd Watch 到 Informer 到 Controller 的事件驱动链路，每个环节都是毫秒级延迟的流式推送。",
+      "keyPoints": [
+        "etcd Watch 是 Kubernetes 声明式模型和控制循环的底层驱动力，所有 controller 和 operator 通过 Watch 监听资源变更事件而非轮询，这使得 Kubernetes 能够实现秒级的状态感知和自愈",
+        "etcd v3 的 Watch 基于 gRPC 双向流实现，一条 TCP 连接可以复用多个 watch（通过 watch_id 区分），相比 v2 的 HTTP 长轮询在连接效率和可靠性上有质的提升",
+        "watchableStore 将 watcher 分为 synced（等待新事件）和 unsynced（追赶历史数据）两组，热路径上只遍历 synced watcher 保证新事件分发的低延迟，历史追赶由独立后台协程处理",
+        "MVCC revision 是全局单调递增的逻辑时钟，客户端可以从任意 revision 开始 Watch 实现断点续传，但被 compaction 清理的 revision 会触发 ErrCompacted 错误迫使客户端全量 re-list",
+        "kube-apiserver 通过 watchCache/cacher 层实现了 Watch 的扇出：对每种资源类型只向 etcd 建立一个 watch，收到事件后扇出给所有订阅客户端，避免了大量客户端直接 watch etcd 的性能问题",
+        "Bookmark 事件是 etcd 3.4 引入的优化机制，它定期向没有收到事件的 watcher 推送当前最新 revision，让客户端保持 revision 新鲜度，降低断线重连时因 compaction 导致全量 re-list 的概率",
+        "Watch 事件推送是异步的——写请求 committed 并返回成功后 watch 事件不一定已到达所有 watcher，Watch 本质上是最终一致的通知机制而非同步回调",
+        "etcd 上的 watcher 数量取决于资源类型数而非集群规模（因为 API server 做了聚合），真正的扇出压力在 API server 的 cacher 层，通过序列化结果复用和非阻塞 channel 写入来优化性能"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz1",
+          "question": "etcd Watch 机制在 Kubernetes 架构中解决的核心问题是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "避免 controller 和 operator 通过轮询感知资源变化，改为事件驱动的流式推送，大幅降低无效网络和 CPU 开销"
+            },
+            {
+              "id": "B",
+              "text": "替代 Raft 共识协议实现节点间的数据同步"
+            },
+            {
+              "id": "C",
+              "text": "提供键值存储的事务能力，保证多个写操作的原子性"
+            },
+            {
+              "id": "D",
+              "text": "实现跨集群的数据复制和灾备恢复"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd Watch 的核心价值是将轮询模型转变为事件驱动的推送模型。在没有 Watch 的情况下，Kubernetes 的每个 controller 都需要定期向 API server 拉取全量资源列表再做 diff，这在大规模集群中意味着巨量的无效网络开销和 CPU 浪费。有了 Watch，controller 建立一条持久的流式连接，只在数据真正发生变化时才收到事件推送——既实时又高效。B 选项描述的是 Raft 的职责。C 选项描述的是 etcd 事务（Txn）的能力而非 Watch。D 选项描述的是跨集群复制，etcd Watch 只在单集群内工作。"
+        },
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz2",
+          "question": "etcd MVCC 中的 revision 是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "每个键独立维护的版本号，不同键的 revision 互不相关"
+            },
+            {
+              "id": "B",
+              "text": "全局单调递增的逻辑时钟，每次对 etcd 的修改操作都让 revision 加 1，所有键共享同一个 revision 序列"
+            },
+            {
+              "id": "C",
+              "text": "Raft 日志的 Index，与 MVCC 存储引擎无关"
+            },
+            {
+              "id": "D",
+              "text": "客户端连接 etcd 时分配的会话 ID，用于标识不同的客户端"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "revision 是 etcd MVCC 引擎的全局逻辑时钟，它是一个跨所有键共享的单调递增整数。每当任何键发生 Put 或 Delete 操作，全局 revision 就加 1。这意味着 revision 不仅标识了某个键的版本，还确定了这个修改在所有修改中的全局顺序。Watch 正是利用 revision 来实现可靠的事件投递——客户端指定一个 start revision，etcd 保证从该 revision 开始的所有变更事件按顺序推送。A 选项描述的是 etcd 中另一个概念 version（每个键独立的修改次数），与全局 revision 不同。C 选项中 Raft Index 和 MVCC revision 是两个不同层面的概念。D 选项描述的是 lease 或 session 机制。"
+        },
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz3",
+          "question": "etcd v3 watchableStore 中 synced watcher 和 unsynced watcher 的区别是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "synced watcher 监听单个键，unsynced watcher 监听键前缀"
+            },
+            {
+              "id": "B",
+              "text": "synced watcher 已追上最新 revision 在等待新事件，unsynced watcher 需要从历史 revision 追赶数据；新事件到达时只遍历 synced watcher，历史追赶由独立后台协程处理"
+            },
+            {
+              "id": "C",
+              "text": "synced watcher 使用 gRPC 流传输，unsynced watcher 使用 HTTP 长轮询作为降级方案"
+            },
+            {
+              "id": "D",
+              "text": "synced watcher 是 Leader 节点上的 watcher，unsynced watcher 是 Follower 节点上的 watcher"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "watchableStore 将 watcher 按照是否追上最新 revision 分为两组。synced watcher 已经追上了 etcd 当前最新的 revision，它们挂在内存中等待新的写入事件；当新事件到达时，watchableStore 只需遍历 synced watcher 组来分发事件，这是热路径。unsynced watcher 指定了一个历史 start revision，需要先从 BoltDB 中读取历史变更逐个推送，直到追上最新 revision 后才移入 synced 组。历史追赶由后台的 syncWatchersLoop 协程负责，有独立的速率控制，不会阻塞新事件的实时分发。这个分组设计保证了 Watch 在高写入吞吐下仍能保持低延迟。A 选项的区分维度不对。C 选项中 v3 所有 watcher 都用 gRPC。D 选项混淆了 Raft 节点角色和 watcher 分类。"
+        },
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz4",
+          "question": "kube-apiserver 的 watchCache/cacher 层的核心设计是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "为每个客户端的 watch 请求在 etcd 上创建一个独立的 watch，保证端到端的事件隔离"
+            },
+            {
+              "id": "B",
+              "text": "对每种资源类型只向 etcd 建立一个 watch，收到事件后通过内部环形缓冲区扇出（fan-out）给所有订阅该资源类型的客户端 watcher"
+            },
+            {
+              "id": "C",
+              "text": "定期从 etcd 拉取全量数据并与内存缓存做 diff，将差异推送给客户端"
+            },
+            {
+              "id": "D",
+              "text": "将所有资源类型的 watch 合并为一个全局 watch 流，在客户端侧按资源类型过滤"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "kube-apiserver 的 cacher（代码在 staging/src/k8s.io/apiserver/pkg/storage/cacher/ 目录）是 etcd Watch 和客户端之间的关键中间层。它对每种资源类型（Pods、Services、Deployments 等）只向 etcd 建立一个 watch 连接。etcd 推送的事件进入 cacher 内部的环形缓冲区，然后被 fan-out 给所有订阅了该资源类型的客户端 watcher。这样无论有 10 个还是 1000 个客户端在 watch Pods，etcd 上都只有一个 Pod watch 的开销。cacher 还维护了资源对象的内存全量快照，kubectl get pods 这类 List 请求大部分时候直接从内存返回而不打到 etcd。A 选项的做法在大规模集群中会压垮 etcd。C 选项描述的是轮询而非 Watch。D 选项不对，不同资源类型使用独立的 watch。"
+        },
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz5",
+          "question": "以下 etcdctl watch 输出中，哪个分析是正确的？\n\n```\n$ etcdctl watch /registry/pods/default/ --prefix --rev=15000\nError: etcdserver: mvcc: required revision has been compacted\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "revision 15000 之前的数据已被 compaction 清理，需要使用一个更新的 revision 来 Watch；在 Kubernetes 中客户端会收到 410 Gone 错误并执行全量 re-list"
+            },
+            {
+              "id": "B",
+              "text": "etcd 集群磁盘空间不足，需要扩容磁盘后重试"
+            },
+            {
+              "id": "C",
+              "text": "revision 15000 不存在，可能是客户端传了一个无效的 revision 值"
+            },
+            {
+              "id": "D",
+              "text": "etcd 的 MVCC 引擎损坏了，需要从备份恢复数据"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "ErrCompacted 是 etcd Watch 中最常见的错误之一。etcd 的 compaction 操作会清理指定 revision 之前的所有历史版本数据来释放存储空间。一旦 revision 15000 之前的数据被 compact 了，从 revision 15000 开始的 Watch 就无法执行——因为 etcd 不确定 15000 到 compact 点之间是否有遗漏的事件。在 Kubernetes 中，这个错误会传递为 HTTP 410 Gone 响应，client-go 的 Reflector 收到后会触发全量 re-list（重新拉取全量资源列表）再从最新的 resourceVersion 开始 Watch。这就是为什么 Kubernetes 引入了 Bookmark 事件来让客户端保持 revision 新鲜度。B 选项中磁盘空间问题会产生 no space 错误。C 选项不对，revision 15000 确实存在过只是被清理了。D 选项过于严重，compaction 是正常运维操作。"
+        },
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz6",
+          "question": "关于 etcd Watch 事件的推送时机，以下哪个说法是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Watch 事件是同步推送的——写请求返回成功之前，所有 watcher 都已经收到了对应的事件"
+            },
+            {
+              "id": "B",
+              "text": "Watch 事件推送是异步的——写请求 committed 并返回成功后，watch 事件不一定已经到达所有 watcher，Watch 本质上是最终一致的通知机制"
+            },
+            {
+              "id": "C",
+              "text": "Watch 事件在 Raft 日志 committed 之前就会推送给 watcher，以降低延迟"
+            },
+            {
+              "id": "D",
+              "text": "Watch 事件推送遵循严格的两阶段提交协议，先 prepare 再 commit"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个常见的认知误区。很多人以为客户端 A 写入成功后，客户端 B 的 watch 一定能立即收到事件。实际上 Watch 事件推送是异步的：写请求在 Raft 层 committed 并被 apply 到状态机后就返回给客户端成功，而 watch 事件的分发是另一个异步流程。watchableStore 在 apply 完成后遍历 synced watcher 并写入各自的 event channel，但从 channel 到 gRPC 流再到客户端网络传输还需要时间。在极端情况下（比如 watcher 消费慢或网络抖动），这个延迟可能达到秒级。不过因为 Watch 基于 Raft 已 committed 日志推送，正常情况下延迟在毫秒级。A 选项描述的同步推送会严重影响写入性能。C 选项中推送未 committed 的事件可能导致事件回滚。D 选项中的两阶段提交在 Watch 中不存在。"
+        },
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz7",
+          "question": "etcd v2 和 v3 的 Watch 实现有什么本质区别？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "v2 基于 HTTP/1.1 长轮询，固定 1000 事件缓冲区，断线可能丢事件；v3 基于 gRPC 双向流，结合 MVCC revision 支持从任意历史点断点续传"
+            },
+            {
+              "id": "B",
+              "text": "v2 使用 TCP 长连接，v3 使用 UDP 以降低延迟"
+            },
+            {
+              "id": "C",
+              "text": "功能完全相同，v3 只是性能优化和代码重构"
+            },
+            {
+              "id": "D",
+              "text": "v2 支持 Watch 键前缀，v3 只支持 Watch 单个精确键"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd v2 到 v3 的 Watch 是一次彻底的架构重构。v2 的 Watch 基于 HTTP/1.1 长轮询：客户端发送一个带 wait=true 的 GET 请求，服务端 hold 住连接直到有事件才返回，客户端收到后必须立即发起下一个请求。这两次请求之间存在时间窗口，如果事件刚好在窗口内发生就可能丢失。v2 用固定大小 1000 的事件队列做缓冲，溢出后客户端只能全量重拉。v3 完全不同：传输层改为 gRPC bidirectional streaming，一条 TCP 连接上持续双向推送；存储层引入 MVCC，每次修改都有全局 revision，客户端可以从任意 revision 开始 Watch 实现可靠的断点续传。B 选项中 etcd 不使用 UDP。C 选项严重低估了变化程度。D 选项反了，v2 和 v3 都支持前缀 Watch。"
+        },
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz8",
+          "question": "生产环境中 kube-apiserver 日志频繁出现 watch chan error: etcdserver: mvcc: required revision has been compacted 错误，最可能的原因和解决方案是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "etcd 版本太旧不支持 Watch，需要升级到 v3"
+            },
+            {
+              "id": "B",
+              "text": "etcd compaction 间隔太短或 API server 处理事件太慢导致 watch 的 revision 被 compact 了，应调大 --etcd-compaction-interval 或增大 API server 的 watch-cache-sizes"
+            },
+            {
+              "id": "C",
+              "text": "etcd 集群节点数太少导致 Watch 性能不足，应该增加到 7 个节点"
+            },
+            {
+              "id": "D",
+              "text": "客户端 kubectl 版本与服务端不兼容，需要升级 kubectl"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这个错误意味着 API server 试图用一个已经被 compaction 清理掉的 revision 来 Watch etcd。最常见的原因有两个：第一，etcd 的 auto-compaction 间隔太短（默认 5 分钟），在高写入负载下历史 revision 被快速清理；第二，API server 的 watchCache 处理事件速度跟不上 etcd 的推送速度，导致 cacher 记录的 revision 落后于 compaction 点。每次发生这个错误，API server 都必须对该资源类型执行一次全量 re-list，这会产生大量 etcd 读请求形成恶性循环。解决方案是适当调大 compaction 间隔（比如从 5 分钟改为 10 分钟），或增大 watch-cache-sizes 让 cacher 有更大的缓冲区。A 选项中 API server 不会连接 v2 etcd。C 选项中增加节点数不解决 compaction 问题。D 选项与服务端 Watch 实现无关。"
+        },
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz9",
+          "question": "关于 etcd Watch 中的 Bookmark 事件，以下哪个描述是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Bookmark 事件包含实际的键值变更数据，用于补发客户端可能错过的事件"
+            },
+            {
+              "id": "B",
+              "text": "Bookmark 是一种不包含实际数据变更的特殊事件，只携带当前最新 revision，定期发送给长时间没收到事件的 watcher，让客户端保持 revision 新鲜度以降低断线重连时 compaction 冲突的概率"
+            },
+            {
+              "id": "C",
+              "text": "Bookmark 是 etcd 集群间数据同步的标记点，用于跨集群复制"
+            },
+            {
+              "id": "D",
+              "text": "Bookmark 是 etcd 内部 compaction 的执行标记，表示该 revision 之前的数据已被安全清理"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Bookmark 事件是 etcd 3.4 引入的重要优化机制，专门解决一个实际问题：如果某个 watcher 监听的键长时间没有变更，客户端记录的 last revision 会变得越来越旧。一旦 watch 连接断开需要重连，客户端只能用这个旧 revision 去 Watch，但这个 revision 可能已经被 compaction 清理了，导致 ErrCompacted 和全量 re-list。Bookmark 事件不包含任何实际的数据变更，它只是 etcd 定期告诉 watcher「目前最新的 revision 是多少」。客户端收到后更新本地记录的 revision，这样即使断线重连也能用一个较新的 revision。Kubernetes 在 1.17 版本默认启用了 WatchBookmarks，API server 会在 Watch response 中包含 type: BOOKMARK 事件。A 选项不对，Bookmark 不含数据。C 和 D 选项的描述与 Bookmark 的实际用途无关。"
+        },
+        {
+          "id": "k8s-etcd-watch-mechanism-q1-quiz10",
+          "question": "你发现集群中部分 controller 的 Reconcile 延迟从毫秒级突然飙到 30 秒以上，etcd 指标 etcd_debugging_mvcc_watcher_total 显示 watcher 数量正常，但 API server 的 watch cache 命中率下降到 40%。最可能的排查方向是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "etcd Raft 选举异常导致写入阻塞，应检查 RAFT TERM 是否快速增长"
+            },
+            {
+              "id": "B",
+              "text": "API server 的 watchCache 环形缓冲区被大量事件冲刷导致频繁 re-list，可能是某种资源（如 Events 或 Pods）短时间内产生了事件风暴，应检查是否有大规模 rolling update 或频繁的 Event 创建"
+            },
+            {
+              "id": "C",
+              "text": "controller 代码存在 bug 导致 Reconcile 函数执行时间过长，与 Watch 机制无关"
+            },
+            {
+              "id": "D",
+              "text": "网络带宽不足导致 gRPC 流传输延迟，应升级网络设备"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "watch cache 命中率下降是关键线索。API server 的 watchCache 使用环形缓冲区存储最近的事件，List 和 Watch 请求优先从缓存服务。当短时间内某种资源产生大量变更事件时（典型场景：大规模 Deployment rolling update 导致成百上千个 Pod 同时变更，或应用疯狂创建 Event 对象），环形缓冲区会被快速冲刷，旧事件被覆盖。此时 watch 的客户端如果消费速度跟不上，就会发现自己记录的 resourceVersion 已经不在缓冲区中了，API server 返回 410 Gone 迫使客户端全量 re-list。re-list 会回源到 etcd 产生大量读请求，进一步加重负载。排查方向是先确认哪种资源在短时间内产生了大量事件（kubectl get events --sort-by=.lastTimestamp），然后针对性地解决：限制 Event 创建频率、调整 rolling update 的 maxSurge/maxUnavailable 降低并发度、或增大 --watch-cache-sizes。"
+        }
+      ],
+      "references": [
+        "https://etcd.io/docs/v3.5/learning/api/#watch-api",
+        "https://etcd.io/docs/v3.5/learning/data_model/",
+        "https://github.com/etcd-io/etcd/blob/main/server/mvcc/watchable_store.go",
+        "https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes"
+      ]
+    }
+  ]
+}
