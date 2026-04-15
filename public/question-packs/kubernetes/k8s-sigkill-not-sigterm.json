@@ -1,0 +1,156 @@
+{
+  "id": "k8s-sigkill-not-sigterm",
+  "name": "SIGKILL 与 SIGTERM 排查",
+  "domain": "kubernetes",
+  "description": "深入理解容器进程收到 SIGKILL 而非 SIGTERM 的各种原因及排查方法",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-sigkill-not-sigterm-q1",
+      "domain": "kubernetes",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["SIGKILL", "SIGTERM", "优雅停机", "Pod终止", "PID1", "信号处理", "滚动更新"],
+      "title": "容器内进程收到 SIGKILL 而非 SIGTERM 是什么原因？",
+      "content": "你负责的 Go 订单处理服务跑在 Kubernetes 1.29 集群上，服务内部实现了标准的优雅关闭逻辑——通过 `signal.NotifyContext` 监听 SIGTERM，收到信号后调用 `server.Shutdown(ctx)` 停止接收新请求、等待活跃连接处理完毕、关闭数据库连接池。这段代码在本地用 `docker stop` 测试时表现完美，日志中清晰打印出「Received SIGTERM, graceful shutdown started...」和「Server stopped, all connections drained」。\n\n但是每次执行 `kubectl rollout restart deployment order-service` 进行滚动更新时，Grafana 上都会出现持续约 30 秒的 502 错误尖峰，Jaeger 链路追踪显示若干请求的 span 直接断开没有正常 response。更严重的是，有用户投诉支付成功但订单状态没更新——排查发现订单写入数据库的事务被中途打断了。\n\n你去看 Pod 的退出日志：\n\n```\n$ kubectl logs order-service-7b8c9d6f5-4xm2k -n production --previous | tail -5\n2024/11/15 14:32:07 [INFO] Handling POST /api/v1/orders - order #882741\n2024/11/15 14:32:08 [INFO] Handling POST /api/v1/orders - order #882742\n2024/11/15 14:32:08 [INFO] Writing order #882742 to database...\n```\n\n日志到这里戛然而止。你精心编写的「Received SIGTERM, graceful shutdown started...」一行从未出现——优雅关闭逻辑根本没有触发。再看 Pod 描述：\n\n```\n$ kubectl describe pod order-service-7b8c9d6f5-4xm2k -n production\n...\n    Last State:     Terminated\n      Reason:       Error\n      Exit Code:    137\n      Started:      Fri, 15 Nov 2024 14:30:12 +0800\n      Finished:     Fri, 15 Nov 2024 14:32:08 +0800\n...\nEvents:\n  Normal   Killing  2m   kubelet  Stopping container order-service\n```\n\nExit Code 137 = 128 + 9，进程是被 SIGKILL（信号 9）强制终止的。SIGKILL 无法被捕获，你的 signal handler 当然不会执行。但 Kubernetes 的 Pod 终止流程明明是先发 SIGTERM 再发 SIGKILL——为什么你的进程直接收到了 SIGKILL？你翻出 Deployment YAML 检查配置：\n\n```yaml\nspec:\n  terminationGracePeriodSeconds: 30\n  containers:\n  - name: order-service\n    image: company/order-service:v2.3.1\n    command: [\"/bin/sh\", \"-c\", \"/app/order-service --config /etc/config/app.yaml\"]\n    resources:\n      limits:\n        memory: \"512Mi\"\n        cpu: \"500m\"\n```\n\nterminationGracePeriodSeconds 设的 30 秒看起来够用。但仔细看 command 字段——`/bin/sh -c` 包裹了实际的应用进程。这个配置下容器内的进程树会长什么样？进程收到 SIGKILL 而非 SIGTERM 的所有可能原因有哪些，应该怎么逐一排查和修复？",
+      "answer": "## 第一步：Linux 信号与 Kubernetes Pod 终止流程基础\n\n### Linux 信号机制：SIGTERM 与 SIGKILL\n\n要理解这个问题，首先要搞清楚 Linux 信号（Signal）的本质。信号是 Linux 内核提供的一种进程间通信机制，本质上是一个软件中断——内核或另一个进程向目标进程发送一个编号，目标进程根据编号执行对应的处理逻辑。Linux 定义了 64 种信号，在容器终止这个场景中最关键的两个是 SIGTERM（编号 15）和 SIGKILL（编号 9）。\n\nSIGTERM 是「请你退出」的礼貌请求。进程收到 SIGTERM 后可以捕获它、执行清理逻辑（关闭连接、刷新缓冲区、保存状态），然后主动调用 `exit()` 退出。用 `kill <pid>` 命令不带 `-9` 参数默认就是发送 SIGTERM。Go 语言中通过 `signal.Notify(ch, syscall.SIGTERM)` 或 `signal.NotifyContext` 注册处理函数，Java 中通过 `Runtime.getRuntime().addShutdownHook()` 实现。\n\nSIGKILL 则是「立刻终止」的最后通牒。进程无法捕获、阻塞或忽略 SIGKILL——内核直接终止进程，不给任何清理的机会。这就是为什么收到 SIGKILL 时你的 graceful shutdown 代码永远不会执行。用一个现实类比来理解：SIGTERM 相当于房东提前 30 天通知你搬家，你可以有序收拾东西；SIGKILL 相当于房东叫来推土机直接把房子推了，你什么都来不及拿。在终端中 `kill -9 <pid>` 就是发送 SIGKILL。\n\n还有几个经常在排查中碰到的信号值得一提：SIGSEGV（编号 11）表示段错误，通常是访问了非法内存地址，在 CGo 或 C 扩展中容易遇到。SIGABRT（编号 6）表示进程调用了 `abort()`，通常是断言失败。SIGHUP（编号 1）最早表示终端挂断，现在常被用来通知进程重新加载配置。对应到退出码上有一个通用规则：如果进程被信号杀死，退出码 = 128 + 信号编号。所以 Exit Code 137 = 128 + 9（SIGKILL），143 = 128 + 15（SIGTERM），139 = 128 + 11（SIGSEGV）。记住这个公式，看到退出码就能立刻反推出是哪个信号。\n\n### Kubernetes Pod 的完整终止流程\n\n理解了信号基础之后，来看 Kubernetes 是怎么编排容器终止的。当你执行 `kubectl delete pod` 或触发滚动更新时，一个 Pod 的终止流程按严格顺序执行。\n\n首先，API Server 将 Pod 的 `metadata.deletionTimestamp` 标记为当前时间，Pod 状态变为 Terminating。与此同时，Endpoint Controller 将该 Pod 从 Service 的 Endpoints 列表中移除，新的请求不再被路由过来——但这个 Endpoints 变更需要时间传播到所有 kube-proxy 和 Ingress Controller 节点，传播期间可能仍有流量发到这个 Pod。\n\n然后 kubelet 在该节点上开始容器终止序列。如果 Pod 定义了 preStop Hook，kubelet 先执行它。preStop Hook 是一个在发送 SIGTERM 之前运行的钩子，通常用来做准备工作——比如从服务注册中心注销实例、调用负载均衡器 API 主动摘流量、或者简单地 `sleep 5` 等待 Endpoints 变更传播完成。\n\npreStop Hook 执行完成后（或者没有配置 preStop Hook），kubelet 向容器中的 PID 1 进程发送 SIGTERM 信号。注意这里的关键词「PID 1」——信号只发给容器 PID namespace 中的 1 号进程，不是广播给所有进程。\n\n从 preStop Hook 开始执行时就开始计时（注意不是从 SIGTERM 发出时开始），kubelet 最多等待 `terminationGracePeriodSeconds`（默认 30 秒）。如果到了这个时限容器仍在运行，kubelet 发送 SIGKILL 强制终止容器内的所有进程。整个时间线可以用一张图理解：\n\n```\n[Pod Terminating] → [preStop Hook 执行] → [SIGTERM → PID 1] → 等待中... → [SIGKILL]\n|<-------------- terminationGracePeriodSeconds (默认 30s) ---------------------->|\n```\n\n关键细节在于：preStop Hook 的执行时间和 SIGTERM 后的等待时间共享同一个 terminationGracePeriodSeconds。如果 preStop Hook 跑了 25 秒，留给应用响应 SIGTERM 做优雅关闭的时间就只剩 5 秒。很多人以为 preStop 有独立的超时，结果在生产环境栽了跟头。\n\n### 容器中 PID 1 的信号处理特殊性\n\n在 Linux 中，PID 1 进程（也就是 init 进程）有一个很特殊的信号处理行为：内核不会为 PID 1 安装默认的信号处理器（default signal disposition）。对普通进程来说，如果没有注册 SIGTERM handler，收到 SIGTERM 的默认行为是终止进程。但对 PID 1 来说，如果它没有显式注册 SIGTERM handler，这个信号会被直接丢弃——进程继续运行，就像什么都没发生过。\n\n在容器中，每个容器有自己独立的 PID namespace，容器的入口进程就是这个 namespace 里的 PID 1。这意味着：如果你的应用进程恰好是容器的 PID 1，而且代码里没有注册 SIGTERM handler（比如一个简单的 C 程序没调用 `signal(SIGTERM, handler)`），SIGTERM 会被静默忽略，kubelet 等 30 秒后直接 SIGKILL。\n\n不过在实际工程中，Go 和 Java 的运行时默认都对 SIGTERM 有响应。Go runtime 收到 SIGTERM 的默认行为是终止进程（除非你通过 `signal.Notify` 拦截了它）；Java 的 JVM 收到 SIGTERM 会触发 Shutdown Hook。所以如果你的 Go/Java 应用直接作为 PID 1 运行，通常不需要担心信号被忽略的问题。\n\n真正的陷阱出在：当你的应用不是 PID 1 的时候。\n\n## 第二步：进程收到 SIGKILL 而非 SIGTERM 的所有原因\n\n回到题目中的场景。进程明明应该在 Pod 终止时收到 SIGTERM，最终却被 SIGKILL 直接杀死。根据我在生产环境中排查过的案例，可能的原因有以下五种，从最常见到最隐蔽依次排列。\n\n### 原因一（最常见）：Shell Form 包裹导致应用不是 PID 1\n\n这正是题目场景的根因。Deployment YAML 中写了：\n\n```yaml\ncommand: [\"/bin/sh\", \"-c\", \"/app/order-service --config /etc/config/app.yaml\"]\n```\n\n这种写法让 `/bin/sh` 成为容器的 PID 1，你的应用进程 `/app/order-service` 是 shell 的子进程。在容器内用 `ps` 验证：\n\n```\n$ kubectl exec -it order-service-xxx -- ps aux\nPID   USER     TIME  COMMAND\n  1   root      0:00 /bin/sh -c /app/order-service --config /etc/config/app.yaml\n  7   root      0:05 /app/order-service --config /etc/config/app.yaml\n 23   root      0:00 ps aux\n```\n\nkubelet 发送 SIGTERM 到 PID 1（即 `/bin/sh`），但 `/bin/sh`（在大多数 Linux 发行版中是 dash 或 bash）有一个行为：当前台子进程正在运行时，shell 收到 SIGTERM 后不会将信号转发给子进程，而是等待子进程自行退出。于是 `/app/order-service` 对即将到来的终止毫不知情，继续愉快地处理请求。30 秒后 kubelet 耐心耗尽发送 SIGKILL，容器中所有进程被内核瞬间终止——正在进行的数据库事务被打断，客户端收到连接重置，完美复现了题目中描述的故障现象。\n\n同样的问题也会出现在 Dockerfile 中。以下两种 CMD 写法在信号处理上有天壤之别：\n\n```dockerfile\n# 错误：shell form —— Docker 自动转为 /bin/sh -c ... 执行\n# PID 1 是 /bin/sh，应用收不到 SIGTERM\nCMD /app/order-service --config app.yaml\n\n# 正确：exec form —— 直接 execve 应用二进制\n# 应用就是 PID 1，直接接收 SIGTERM\nCMD [\"/app/order-service\", \"--config\", \"app.yaml\"]\n```\n\n修复方法很简单——在 K8s YAML 中使用 exec form：\n\n```yaml\ncommand: [\"/app/order-service\"]\nargs: [\"--config\", \"/etc/config/app.yaml\"]\n```\n\n或者用 `cat /proc/1/cmdline | tr '\\0' ' '` 快速验证 PID 1 到底是谁。如果输出是 `/bin/sh -c ...` 就说明踩了这个坑。\n\n### 原因二：terminationGracePeriodSeconds 超时\n\n即使应用正确作为 PID 1 收到了 SIGTERM 并开始优雅关闭，如果关闭过程耗时超过 terminationGracePeriodSeconds，kubelet 还是会发 SIGKILL。默认值 30 秒对大多数 HTTP 服务够用，但以下场景可能不够：应用维护着大量长连接（WebSocket、gRPC 双向流）需要逐个断开、消息消费者需要处理完积压的消息才能提交 offset、或者需要将内存中的大量数据 flush 到磁盘。\n\n排查方法是检查 Pod 的终止时间戳。如果 `Finished - Started` 的差值恰好等于 terminationGracePeriodSeconds，基本可以确定是宽限期超时：\n\n```bash\n# Started: 14:30:12, Finished: 14:30:42\n# 差值恰好 30 秒 = terminationGracePeriodSeconds → 超时被 SIGKILL\n```\n\n修复方案是根据业务需要调大 terminationGracePeriodSeconds，同时在应用内部给优雅关闭逻辑设一个略短于宽限期的超时，确保在 SIGKILL 到来之前主动退出。\n\n### 原因三：OOM Killer 直接发送 SIGKILL\n\n当容器的内存使用超过 `resources.limits.memory` 时，Linux 内核的 OOM Killer 直接向进程发送 SIGKILL。这里的「直接」是关键——完全绕过了 Kubernetes 的终止流程，没有 preStop Hook、没有 SIGTERM、没有宽限期。进程被内核瞬间杀死，任何优雅关闭逻辑都不会执行。\n\n这种情况在 `kubectl describe pod` 中有明确的特征——Reason 字段显示 `OOMKilled`：\n\n```\n    Last State:     Terminated\n      Reason:       OOMKilled\n      Exit Code:    137\n```\n\n虽然 Exit Code 同样是 137，但 OOMKilled 和正常终止流程中的超时 SIGKILL 区别在于 Reason 字段：前者是 `OOMKilled`，后者通常是 `Error`。在节点上用 `dmesg` 也能看到内核日志：\n\n```bash\n$ dmesg | grep -i oom\n[11234.567890] Memory cgroup out of memory: Killed process 23456 (order-service)\n               total-vm:1048576kB, anon-rss:524288kB, file-rss:4096kB\n```\n\n这种情况在 Java 应用中尤其常见。JVM 默认堆内存加上 Metaspace、线程栈、DirectBuffer 等堆外内存，总量很容易超过 container limit。修复方法是用 `-XX:MaxRAMPercentage=75` 限制 JVM 堆内存占比，给堆外内存留出余量。\n\n### 原因四：Liveness Probe 失败触发容器重启\n\n当 Liveness Probe 连续失败达到 `failureThreshold` 次后，kubelet 会杀掉容器并重启。这个重启过程中 kubelet 也是先发 SIGTERM、等待宽限期、再发 SIGKILL。但如果结合了前面的 shell form 问题——SIGTERM 发给了 `/bin/sh` 但没转发给应用——最终就表现为进程被 SIGKILL 杀死。\n\n一个常见的坑是 Liveness Probe 检查了外部依赖。比如探针路径 `/healthz` 内部去 ping 了 Redis，Redis 短暂不可用导致探针失败，kubelet 认为容器不健康开始杀容器。应用本身其实运行得好好的，但因为探针设计不合理而被反复强杀。表现出来就是 Pod 频繁 Restart，Exit Code 全是 137。\n\n排查时看 `kubectl describe pod` 的 Events，如果有 `Unhealthy` 和 `Killing` 交替出现的事件，八成就是 Liveness Probe 的锅：\n\n```\nEvents:\n  Warning  Unhealthy  45s (x3 over 65s)  kubelet  Liveness probe failed: HTTP probe failed with statuscode: 503\n  Normal   Killing    45s                kubelet  Container order-service failed liveness probe, will be restarted\n```\n\n### 原因五：preStop Hook 耗时过长挤压终止宽限期\n\n前面已经提到，preStop Hook 和 SIGTERM 后的等待共享同一个 terminationGracePeriodSeconds。如果你配了一个耗时较长的 preStop Hook——比如 `sleep 25` 用来等负载均衡器摘流量——那么发完 SIGTERM 后留给应用优雅关闭的时间就只剩 5 秒。如果应用需要超过 5 秒来完成关闭（等待活跃请求完成、关闭连接池），还是会被 SIGKILL。\n\n修复方法是把 preStop Hook 的执行时间和应用的最长关闭时间加在一起，确保总和小于 terminationGracePeriodSeconds，并预留 5-10 秒的安全余量：\n\n```yaml\n# preStop sleep 5s + 应用关闭最长 15s = 20s\n# terminationGracePeriodSeconds 设为 30s，留 10s 余量\nspec:\n  terminationGracePeriodSeconds: 30\n  containers:\n  - name: order-service\n    lifecycle:\n      preStop:\n        exec:\n          command: [\"/bin/sh\", \"-c\", \"sleep 5\"]\n```\n\n## 第三步：exec form、init 进程与生产环境最佳实践\n\n### exec form vs shell form 的底层区别\n\nDockerfile 中 CMD 和 ENTRYPOINT 有两种写法。shell form（`CMD /app/server`）Docker 在构建时自动转换为 `CMD [\"/bin/sh\", \"-c\", \"/app/server\"]`，容器启动后 `/bin/sh` 作为 PID 1，实际应用是子进程。exec form（`CMD [\"/app/server\"]`）Docker 直接调用 `execve()` 系统调用运行应用二进制，应用自身就是 PID 1。\n\n同样的规则适用于 Kubernetes YAML。`command` 字段使用数组形式 `[\"/app/server\"]` 是 exec form，不经过 shell。如果你写成 `command: [\"/bin/sh\", \"-c\", \"...\"]` 就等于手动用了 shell form。一个快速验证方式：\n\n```bash\n$ kubectl exec <pod> -- cat /proc/1/cmdline | tr '\\0' ' '\n# 如果输出 /bin/sh -c ... → shell form，有信号问题\n# 如果输出 /app/server --config ... → exec form，信号正常\n```\n\n### tini 和 dumb-init：轻量级 init 进程\n\n有些场景确实需要 shell 来做环境变量展开或命令串联（比如 `exec /app/server --db=$DB_HOST`），这时可以使用 tini 或 dumb-init 作为容器的 PID 1。这两个工具都只有几十 KB 大小，核心解决两个问题：第一，收到 SIGTERM 后正确转发给子进程组，确保应用能收到终止信号；第二，作为 init 进程回收僵尸进程（zombie reaping），避免容器中出现大量 defunct 进程占用 PID 资源。\n\n```dockerfile\n# 安装 tini 并设为 ENTRYPOINT\nRUN apk add --no-cache tini\nENTRYPOINT [\"/sbin/tini\", \"--\"]\nCMD [\"/app/order-service\", \"--config\", \"app.yaml\"]\n```\n\n容器启动后 tini 作为 PID 1，`/app/order-service` 作为 PID 2。kubelet 发 SIGTERM 给 PID 1（tini），tini 立刻将 SIGTERM 转发给子进程组，应用收到信号开始优雅关闭。Docker 本身有内置 tini 支持（`docker run --init`），但 Kubernetes 不支持这个标志，需要在镜像中自行安装。\n\n### 生产环境优雅停机清单\n\n确保容器优雅停机需要从四个层面配合。镜像层面：Dockerfile 使用 exec form，或安装 tini 作为 PID 1。Kubernetes 层面：根据「preStop 耗时 + 应用最长关闭时间 + 10 秒余量」设置 terminationGracePeriodSeconds；配置 preStop Hook 中 sleep 3-5 秒等待 Endpoints 变更传播完成，避免摘流量前应用就停了。应用层面：注册 SIGTERM handler 后立即停止接收新请求（listener.Close 或 health endpoint 返回 503）、等待活跃请求完成（给一个合理的内部超时）、关闭数据库连接池和消息消费者、flush 日志和 metrics buffer。监控层面：在滚动更新期间观察 5xx 错误率和 Pod 终止 Exit Code，持续出现 137 就说明还有 SIGKILL 问题。\n\n一条经验法则：如果你在 `kubectl describe pod` 中看到 Exit Code 143（128 + 15 = SIGTERM），说明应用正确收到了 SIGTERM 并以该信号退出——这是正常的。如果看到 Exit Code 137（128 + 9 = SIGKILL），就需要按本文的五个原因逐一排查。如果看到 Exit Code 0，说明应用捕获了 SIGTERM 并通过 `os.Exit(0)` 主动退出——这是最理想的情况。",
+      "keyPoints": [
+        "kubelet 终止 Pod 时先向容器 PID 1 发送 SIGTERM，等待 terminationGracePeriodSeconds（默认 30 秒）后发送不可捕获的 SIGKILL 强杀，preStop Hook 和 SIGTERM 等待共享同一个宽限期",
+        "最常见的原因是 Dockerfile 或 K8s YAML 使用 shell form（如 /bin/sh -c ...），导致 shell 成为 PID 1 而不转发 SIGTERM 给实际应用进程，应用对终止毫不知情",
+        "容器内存使用超过 resources.limits.memory 时，OOM Killer 直接发送 SIGKILL 绕过整个 K8s 终止流程，describe pod 的 Reason 字段会明确显示 OOMKilled",
+        "Dockerfile 的 CMD/ENTRYPOINT 必须使用 exec form（JSON 数组语法），确保应用进程直接成为容器 PID 1 以接收信号，shell form 会被自动转为 /bin/sh -c 包裹",
+        "如果必须使用 shell 包裹命令做环境变量展开，应在镜像中安装 tini 或 dumb-init 作为 PID 1，它会正确转发 SIGTERM 给子进程并回收僵尸进程",
+        "排查时先看 describe pod 的 Reason 字段区分 OOMKilled 和超时强杀，再在容器内用 cat /proc/1/cmdline 确认 PID 1 是否是应用本身",
+        "terminationGracePeriodSeconds 应设为 preStop Hook 执行时间加上应用最长关闭时间之和再多留 10 秒余量，避免宽限期不够导致 SIGKILL"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz1",
+          "question": "Kubernetes 终止一个 Pod 时，kubelet 向容器 PID 1 进程发送信号的顺序是什么？",
+          "choices": [
+            {"id": "A", "text": "先发 SIGKILL 立即终止，如果进程仍在运行再发 SIGTERM"},
+            {"id": "B", "text": "先发 SIGTERM，等待 terminationGracePeriodSeconds 后若进程未退出再发 SIGKILL 强制终止"},
+            {"id": "C", "text": "同时发送 SIGTERM 和 SIGKILL，由进程自己决定响应哪个"},
+            {"id": "D", "text": "只发 SIGTERM，如果进程不退出就一直等待，永远不会发 SIGKILL"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kubernetes 的 Pod 终止流程是先礼后兵：kubelet 先向容器 PID 1 发送 SIGTERM 信号，给进程机会执行优雅关闭（保存状态、关闭连接、完成处理中的请求）。如果在 terminationGracePeriodSeconds（默认 30 秒）内进程没有退出，kubelet 再发送 SIGKILL 强制终止。选项 A 把顺序搞反了——如果先发 SIGKILL，进程被内核直接杀死，再发 SIGTERM 毫无意义。选项 C 同时发送也没有意义，SIGKILL 不可被捕获会立刻杀死进程。选项 D 忽略了超时后的强杀机制，如果没有 SIGKILL 兜底，一个永不退出的进程会让 Pod 永远处于 Terminating 状态。"
+        },
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz2",
+          "question": "terminationGracePeriodSeconds 的默认值是多少？它的计时起点是什么？",
+          "choices": [
+            {"id": "A", "text": "默认 60 秒，从 SIGTERM 发出时开始计时"},
+            {"id": "B", "text": "默认 30 秒，从 SIGTERM 发出时开始计时"},
+            {"id": "C", "text": "默认 30 秒，从 preStop Hook 开始执行时开始计时，preStop 和 SIGTERM 等待共享这个时间窗口"},
+            {"id": "D", "text": "默认 10 秒，从 Pod 状态变为 Terminating 时开始计时"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "terminationGracePeriodSeconds 默认值是 30 秒，这个大多数人都知道。但一个非常关键的细节是它的计时起点——不是从 SIGTERM 发出时开始，而是从 preStop Hook 开始执行时就开始倒计时了。这意味着 preStop Hook 的执行时间会挤占留给 SIGTERM 优雅关闭的时间。比如 preStop sleep 25 秒，那 SIGTERM 后应用只有 5 秒可以做关闭。选项 A 的 60 秒和选项 D 的 10 秒都是错误的数值。选项 B 虽然数值正确但计时起点错误——如果你以为从 SIGTERM 开始计时，在配了耗时较长的 preStop Hook 时就会被意外 SIGKILL。"
+        },
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz3",
+          "question": "以下 Dockerfile 中，容器启动后 PID 1 进程是什么？\n\n```dockerfile\nCMD /app/server --port 8080\n```",
+          "choices": [
+            {"id": "A", "text": "/app/server 进程直接作为 PID 1 运行"},
+            {"id": "B", "text": "/bin/sh 进程作为 PID 1，/app/server 是 shell 的子进程"},
+            {"id": "C", "text": "dockerd 进程作为 PID 1，由 Docker daemon 直接管理"},
+            {"id": "D", "text": "containerd-shim 进程作为 PID 1，负责容器生命周期管理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Dockerfile CMD 的 shell form 写法（没有使用 JSON 数组语法）。Docker 在构建镜像时会自动将其转换为 `CMD [\"/bin/sh\", \"-c\", \"/app/server --port 8080\"]`，即用 /bin/sh 包裹执行。容器启动后 PID 1 是 /bin/sh，/app/server 作为 shell 的子进程运行（PID 通常是 7 或 8）。这正是导致 SIGTERM 无法到达应用进程的根源——kubelet 发 SIGTERM 给 PID 1（/bin/sh），shell 不转发信号给子进程。正确写法是 exec form：`CMD [\"/app/server\", \"--port\", \"8080\"]`。选项 C 和 D 混淆了容器外部的管理进程和容器内部 PID namespace 的关系。"
+        },
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz4",
+          "question": "当容器内存使用超过 resources.limits.memory 时，进程被终止的机制是什么？",
+          "choices": [
+            {"id": "A", "text": "kubelet 检测到内存超限后发送 SIGTERM，等待 30 秒再发 SIGKILL"},
+            {"id": "B", "text": "Linux 内核的 OOM Killer 直接发送 SIGKILL，完全绕过 Kubernetes 的终止流程，没有 SIGTERM"},
+            {"id": "C", "text": "cgroup 控制器暂停进程的内存分配，等待进程主动释放内存后恢复"},
+            {"id": "D", "text": "kubelet 将 Pod 调度到内存更多的节点上重新运行"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个容易和正常 Pod 终止流程混淆的场景。当容器内存使用超过 cgroup 限制（即 resources.limits.memory）时，Linux 内核的 OOM Killer 直接向进程发送 SIGKILL——注意关键词「直接」，完全绕过了 Kubernetes 的终止流程，没有 preStop Hook、没有 SIGTERM、没有宽限期。在 kubectl describe pod 中 Reason 会显示 OOMKilled。选项 A 描述的是正常 Pod 终止流程，不是 OOM 场景。选项 C 描述的暂停机制不存在于 cgroup v1/v2 的内存限制中（cgroup 的行为就是直接 OOM Kill）。选项 D 不对，OOM 是节点内核级别的行为，不涉及重新调度。"
+        },
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz5",
+          "question": "一个 Pod 执行滚动更新后，kubectl describe pod 显示容器 Exit Code 为 143。这个退出码说明了什么？",
+          "choices": [
+            {"id": "A", "text": "进程收到了 SIGTERM（信号 15）后被终止，143 = 128 + 15，说明 kubelet 成功发送了 SIGTERM"},
+            {"id": "B", "text": "进程被 OOM Killer 杀死，143 是内存超限的标准退出码"},
+            {"id": "C", "text": "进程收到了 SIGKILL（信号 9）后被强制终止"},
+            {"id": "D", "text": "进程代码中调用了 os.Exit(143) 主动退出，通常表示配置错误"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Linux 中当进程被信号终止（未被捕获处理）时，退出码按 128 + 信号编号 的规则计算。SIGTERM 的编号是 15，所以 128 + 15 = 143。Exit Code 143 表明进程收到了 SIGTERM 信号并被该信号终止——这是 Kubernetes 正常 Pod 终止流程的预期结果，说明 kubelet 成功发送了 SIGTERM 且信号到达了 PID 1。相比之下，Exit Code 137 = 128 + 9（SIGKILL）才是需要排查的异常信号。选项 B 不对，OOM Kill 的退出码是 137（SIGKILL），不是 143。选项 C 混淆了信号编号，SIGKILL 对应 137。选项 D 虽然理论上应用可以 exit(143)，但这是极不常见的做法。"
+        },
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz6",
+          "question": "一个 Go 服务用 signal.NotifyContext 监听 SIGTERM 实现优雅关闭，在本地 docker stop 测试时正常工作，但在 K8s 滚动更新时优雅关闭未触发。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Kubernetes 使用了不同于 Docker 的信号协议，默认不发送 SIGTERM"},
+            {"id": "B", "text": "Deployment YAML 中 command 使用了 shell form（/bin/sh -c ...），导致 Go 进程不是 PID 1，shell 不转发 SIGTERM"},
+            {"id": "C", "text": "Go 的 signal.NotifyContext 在 Linux amd64 平台上存在已知 bug"},
+            {"id": "D", "text": "需要在 Pod spec 中显式配置 terminationSignal: SIGTERM 字段才会发 SIGTERM"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个非常典型的「本地正常线上异常」的场景。docker stop 直接向容器 PID 1 发送 SIGTERM。如果本地 Docker 镜像使用 exec form（CMD [\"/app/server\"]），应用就是 PID 1，直接收到 SIGTERM。但在 K8s YAML 中如果 command 改成了 shell form（/bin/sh -c /app/server），/bin/sh 成为 PID 1，SIGTERM 被 shell 吃掉，Go 进程永远收不到。这解释了为什么「本地 docker stop 正常但 K8s 滚动更新失败」。选项 A 不对，K8s kubelet 标准终止流程就是发 SIGTERM。选项 C 不存在这样的 bug。选项 D 不对，K8s 不需要额外配置信号类型。"
+        },
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz7",
+          "question": "以下 Kubernetes 配置中，如果 preStop Hook 执行需要 20 秒、应用优雅关闭需要 15 秒，会发生什么？\n\n```yaml\nspec:\n  terminationGracePeriodSeconds: 30\n```",
+          "choices": [
+            {"id": "A", "text": "preStop 20 秒 + 关闭 15 秒 = 35 秒，超过 30 秒宽限期，应用会在关闭过程中被 SIGKILL"},
+            {"id": "B", "text": "preStop 有独立的超时控制，不影响 terminationGracePeriodSeconds，应用有完整 30 秒做关闭"},
+            {"id": "C", "text": "Kubernetes 会自动将 terminationGracePeriodSeconds 延长到 35 秒以容纳两者"},
+            {"id": "D", "text": "preStop Hook 执行完后 terminationGracePeriodSeconds 才开始计时"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "preStop Hook 和 SIGTERM 后的等待共享同一个 terminationGracePeriodSeconds。总计 30 秒的宽限期从 preStop 开始执行时就开始倒计时。preStop 花了 20 秒，发完 SIGTERM 后只剩 10 秒给应用做关闭，但应用需要 15 秒——超出 5 秒后 kubelet 发 SIGKILL 强杀。选项 B 是最常见的误解，很多人以为 preStop 有独立超时，实际上两者是共享时间窗口。选项 C 不对，Kubernetes 不会自动延长宽限期。选项 D 也是错误的，计时从 preStop 执行开始而非结束。修复方法是把 terminationGracePeriodSeconds 调到 20 + 15 + 10（余量） = 45 秒。"
+        },
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz8",
+          "question": "在生产环境滚动更新中，以下哪种做法可以有效避免终止 Pod 时的请求丢失？",
+          "choices": [
+            {"id": "A", "text": "将 terminationGracePeriodSeconds 设为 0，让 Pod 立即终止以缩短更新时间"},
+            {"id": "B", "text": "配置 preStop Hook sleep 几秒等待 Endpoints 更新传播到所有节点，确保负载均衡器摘除流量后再停止应用"},
+            {"id": "C", "text": "在 Liveness Probe 中检查 Pod 是否处于 Terminating 状态，提前返回失败"},
+            {"id": "D", "text": "将 restartPolicy 设为 Never，避免 Pod 被重启干扰滚动更新"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是生产环境中优雅停机的关键实践。Pod 状态变为 Terminating 时，Endpoint Controller 将 Pod 从 Service Endpoints 中移除，但这个变更需要时间传播到所有 kube-proxy 和 Ingress Controller。如果 kubelet 在传播完成前就发了 SIGTERM 导致应用停止接受请求，那些还没更新的负载均衡器仍然会把流量发过来，造成 502 或 Connection Refused 错误。preStop Hook 中 sleep 3-5 秒可以等待传播完成。选项 A 的 0 秒意味着跳过 SIGTERM 直接 SIGKILL，完全没有优雅关闭。选项 C 不对，Liveness Probe 不该检查终止状态。选项 D 不适用于长期运行的 Deployment 服务。"
+        },
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz9",
+          "question": "tini 和 dumb-init 作为容器 PID 1 时，解决了容器环境中的哪些问题？",
+          "choices": [
+            {"id": "A", "text": "加速容器启动速度，预加载应用依赖库减少初始化时间"},
+            {"id": "B", "text": "正确转发信号给子进程（如将 SIGTERM 转发给应用），以及回收容器内的僵尸进程（zombie reaping）"},
+            {"id": "C", "text": "提供完整的 systemd init 功能，包括服务管理、日志收集和 cgroup 控制"},
+            {"id": "D", "text": "限制容器的 CPU 和内存使用量，替代 Kubernetes 的 resources.limits 配置"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "tini 和 dumb-init 是极其轻量的 init 进程（只有几十 KB），专门为容器环境设计，解决两个核心问题。第一是信号转发：收到 SIGTERM 后将其转发给整个子进程组（kill -TERM -<pgid>），确保应用进程能收到终止信号执行优雅关闭。如果没有它们，shell form 下 /bin/sh 作为 PID 1 不会转发信号。第二是僵尸进程回收：在 Linux 中 PID 1 负责 wait() 回收孤儿进程，如果应用自身作为 PID 1 但没有调用 wait()，子进程退出后会变成 zombie 占用 PID。选项 A 不对，它们不影响启动速度。选项 C 不对，tini 是极简 init。选项 D 不对，资源限制由 cgroup 负责。"
+        },
+        {
+          "id": "k8s-sigkill-not-sigterm-q1-quiz10",
+          "question": "你怀疑容器中应用进程不是 PID 1 导致收不到 SIGTERM。以下哪个命令可以直接验证容器中 PID 1 是什么进程？",
+          "choices": [
+            {"id": "A", "text": "kubectl top pod <pod-name> 查看进程资源使用量"},
+            {"id": "B", "text": "kubectl exec <pod-name> -- cat /proc/1/cmdline | tr '\\0' ' ' 查看 PID 1 的完整命令行"},
+            {"id": "C", "text": "kubectl describe pod <pod-name> | grep PID 从 Pod 描述中查找 PID 信息"},
+            {"id": "D", "text": "kubectl logs <pod-name> | head -1 从日志第一行推断启动进程"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`/proc/1/cmdline` 是 Linux procfs 提供的文件，包含 PID 1 进程的完整命令行参数，各参数间用空字节（\\0）分隔，通过 `tr '\\0' ' '` 转换为可读格式。如果输出是 `/bin/sh -c /app/server ...`，说明 shell 是 PID 1，应用没有直接接收信号。如果输出是 `/app/server --config app.yaml`，说明应用自身就是 PID 1，信号可以正确送达。也可以用 `kubectl exec -- ps aux` 查看完整进程树。选项 A 的 kubectl top 只显示 Pod 级别的 CPU 和内存使用量。选项 C 的 describe pod 输出中没有容器内部的 PID 信息。选项 D 的日志内容和进程 PID 没有直接关系。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination",
+        "https://docs.docker.com/reference/dockerfile/#cmd",
+        "https://github.com/krallin/tini",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/attach-handler-lifecycle-event/"
+      ]
+    }
+  ]
+}
