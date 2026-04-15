@@ -1,0 +1,196 @@
+{
+  "id": "kafka-capacity-partitions-per-broker",
+  "name": "单 Broker Partition 承载上限",
+  "domain": "kafka",
+  "description": "深入分析单台 Kafka Broker 的 Partition 承载上限、资源瓶颈与 ZK/KRaft 模式差异",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-capacity-partitions-per-broker-q1",
+      "domain": "kafka",
+      "type": "real-data",
+      "difficulty": 3,
+      "tags": ["Kafka", "Partition上限", "Broker容量", "文件描述符", "元数据开销"],
+      "title": "单台 Broker 能承载多少 Partition？上限在哪里？",
+      "content": "你所在的团队运维着一个 Kafka 集群，随着业务线不断接入，Topic 数量从最初的几十个增长到了上千个，每个 Topic 又配了 6-12 个 Partition。某天凌晨你被告警电话叫醒：一台 Broker 重启后卡在 Log Recovery 阶段长达 15 分钟，集群元数据传播缓慢导致多个 Consumer Group 频繁 Rebalance。你登上机器一查，单台 Broker 上堆积了将近 14000 个 Partition（含副本）。\n\n你执行了一些基础排查命令：\n\n```bash\n$ cat /proc/sys/fs/file-nr\n38672  0  65536\n\n$ ulimit -n\n65536\n\n$ ls /data/kafka-logs/ | wc -l\n14218\n\n$ ls /data/kafka-logs/order-events-3/*.log | wc -l\n847\n\n$ kafka-log-dirs.sh --bootstrap-server localhost:9092 --broker-list 2 --describe \\\n    | python3 -c \"\nimport json, sys\ndata = json.load(sys.stdin)\nfor d in data['brokers'][0]['logDirs']:\n    parts = len(d['partitions'])\n    print(f\\\"{d['logDir']}: {parts} partitions\\\")\n\"\n/data/kafka-logs: 14218 partitions\n\n$ jcmd $(pgrep -f kafka.Kafka) GC.heap_info\n...\nMetaspace used 198432K, committed 201728K\nHeap: PSYoungGen total 2097152K, used 1048576K\n      PSOldGen total 4194304K, used 3221440K\n```\n\n架构师问了你一个直接的问题：「单台 Broker 到底能承载多少 Partition？上限在哪里？ZooKeeper 模式和 KRaft 模式下有什么区别？」这道题考的是你对 Partition 在 Broker 上的资源消耗模型有没有清晰的认知——不是一个简单的「官方推荐 4000」就能交差的，你需要说清楚这 4000 背后的每一项资源瓶颈是什么。",
+      "answer": "## 一、核心概念基础：Partition 在 Broker 上消耗了什么\n\n### 1.1 Partition 的资源消耗模型\n\n很多人对「单 Broker 能承载多少 Partition」的认知停留在一个笼统的数字——LinkedIn 早年在 ZooKeeper 模式下给出的建议是每台 Broker 不超过 4000 个 Partition，整个集群不超过 200,000 个。但这个数字背后的含义是：在 ZooKeeper 模式的 Controller 元数据传播机制下，超过这个规模会导致 Controller 故障切换时间不可接受地长。到了 KRaft 模式（KIP-500，Kafka 3.3 正式 GA），架构上的根本变化使得集群可以承载数百万 Partition，单 Broker 的上限也从 4000 推到了 10,000 到 20,000 甚至更高。\n\n理解上限需要先拆解每个 Partition 在 Broker 上到底占用了哪些资源。一个 Partition 至少有一个活跃 Segment，每个 Segment 由三个文件组成：`.log`（消息数据）、`.index`（offset 到物理位置的稀疏索引）、`.timeindex`（时间戳到 offset 的稀疏索引）。这三个文件各需要一个文件描述符（file descriptor），所以每个活跃 Segment 消耗 3 个 FD。如果 Partition 有多个未清理的旧 Segment 仍然被 Consumer fetch 或 Follower replica fetch 打开，实际 FD 消耗会更多。\n\n除了文件描述符，还有内存层面的成本。`.index` 和 `.timeindex` 文件通过 mmap 映射到进程地址空间，默认每个文件预分配 10MB（由 `log.index.size.max.bytes` 控制）。10,000 个 Partition 意味着至少 20,000 个 mmap 区域，合计 200GB 的虚拟地址空间映射——虽然不是全部 resident 在物理内存中，但内核的 vm.max_map_count 参数（默认 65530）会成为瓶颈，每个 mmap 区域需要一个 VMA（Virtual Memory Area），两倍 Partition 数量的 VMA 很容易耗尽默认限制。\n\n最后是 Controller 层面的元数据开销，这也是 ZooKeeper 模式和 KRaft 模式差异最大的地方。\n\n### 1.2 ZooKeeper 模式 vs KRaft 模式的本质差异\n\n在 ZooKeeper 模式下，Controller 是集群中的单个 Broker，它把所有 Partition 的元数据（Leader 是谁、ISR 列表、Epoch 等）缓存在 JVM 堆内存中，并且通过 ZooKeeper Watch 机制监听变化。当 Controller 需要通知其他 Broker 元数据变更时——比如某台 Broker 宕机触发 Leader 选举——Controller 必须向集群中每台 Broker 发送 LeaderAndIsr 请求和 UpdateMetadata 请求。问题在于 UpdateMetadata 请求包含集群中所有 Partition 的完整元数据快照。如果集群有 100,000 个 Partition，每次 Controller 故障切换（controller failover）都需要将这 100K 条 Partition 元数据完整推送给每台 Broker，这个过程可能持续数分钟，期间集群处于部分不可用状态。\n\n```\nZK 模式 Controller 切换耗时（经验数据）：\n50,000 partitions → ~30 秒\n100,000 partitions → ~2-3 分钟\n200,000 partitions → ~5-10 分钟（基本不可接受）\n```\n\nKRaft 模式从根本上改变了这个架构。元数据不再存储在 ZooKeeper 中，而是写入一个内部 Topic `__cluster_metadata`，由独立的 Controller Quorum（基于 Raft 协议）管理。关键的变化是元数据传播从「全量推送」变成了「增量日志复制」——Broker 只需要从 `__cluster_metadata` 的 log tail 拉取增量变更，而不是每次都接收全量快照。这意味着 Controller 切换时，新 Controller 从 Raft log 中回放元数据恢复状态，Broker 继续从 log 中读取增量更新，整个过程的时间与 Partition 总数几乎无关，通常在几秒钟内完成。\n\nConfluent 在 2022 年的基准测试中验证了 KRaft 模式可以支撑单集群超过 200 万 Partition，Controller 切换时间稳定在 10 秒以内。Apache Kafka 3.3 将 KRaft 标记为 Production Ready，3.5 开始提供 ZK 到 KRaft 的在线迁移工具，4.0 计划完全移除 ZooKeeper 依赖。\n\n## 二、精准深度解答：五大资源瓶颈逐一拆解\n\n### 2.1 文件描述符（File Descriptor）\n\n每个活跃 Segment 需要 3 个 FD（.log + .index + .timeindex）。如果开启了事务日志还有 `.txnindex`，开启了 Tiered Storage 还有 `.remote` 相关文件。但最基本的模型就是 3 个 FD per active segment per partition。单个 Partition 在稳态下通常只有 1 个活跃 Segment，但 Log Cleaner 线程在做 Compaction 时可能同时打开多个旧 Segment，Consumer 的 fetch 请求也可能触发 Broker 打开非活跃 Segment 文件。保守估计每个 Partition 消耗 5-10 个 FD。\n\n```bash\n# 查看当前 Kafka 进程打开的 FD 数量\n$ ls /proc/$(pgrep -f kafka.Kafka)/fd | wc -l\n42631\n\n# 查看系统级 FD 限制\n$ cat /proc/sys/fs/file-max\n1048576\n\n# 查看进程级 FD 限制\n$ ulimit -n\n65536\n\n# 推荐配置：/etc/security/limits.conf\nkafka soft nofile 128000\nkafka hard nofile 128000\n\n# 或者 systemd unit 中\n[Service]\nLimitNOFILE=128000\n```\n\n10,000 个 Partition × 5 FD = 50,000 FD，再加上网络连接（每个 Client 连接消耗 1 个 FD）、JVM 自身的 FD（jar 文件、日志文件等），ulimit -n 设为 65536 就会逼近上限。生产环境建议将 nofile 设为 128,000 或更高。系统级的 `fs.file-max` 通常默认 1048576，基本不会成为瓶颈，但 `ulimit -n` 的默认值 1024 是一个非常常见的踩坑点——很多「Broker 启动后过一段时间就报 Too many open files 崩溃」的故障根因就是忘了调这个参数。\n\n### 2.2 内存映射区域（mmap / VMA）\n\nKafka 使用 mmap 将 `.index` 和 `.timeindex` 文件映射到内存，这样读取索引时可以避免系统调用的开销，直接访问映射的虚拟地址。每个 mmap 调用会在进程的虚拟内存空间中创建一个 VMA（Virtual Memory Area），Linux 内核通过 `vm.max_map_count` 参数限制单个进程能拥有的 VMA 数量，默认值是 65530。\n\n每个 Partition 的活跃 Segment 至少有 2 个 mmap 区域（.index + .timeindex），所以 Partition 数量的上限粗略估算为 `vm.max_map_count / 2 ≈ 32765`。但实际上 JVM 自身（代码段、堆、线程栈等）也会占用 VMA，加上 Kafka 的 Log Cleaner 可能同时 mmap 多个旧 Segment 的索引，实际可用给 Kafka 索引的 VMA 数量大约只有 60,000 左右。\n\n```bash\n# 查看当前进程的 VMA 数量\n$ cat /proc/$(pgrep -f kafka.Kafka)/maps | wc -l\n58743\n\n# 查看 vm.max_map_count 限制\n$ sysctl vm.max_map_count\nvm.max_map_count = 65530\n\n# 推荐调大到 262144 或更高\n$ sysctl -w vm.max_map_count=262144\n# 持久化\n$ echo 'vm.max_map_count=262144' >> /etc/sysctl.d/99-kafka.conf\n```\n\n如果 Partition 数超过 30,000 且没有调大 `vm.max_map_count`，Broker 会因为 mmap 失败而抛出 `java.lang.OutOfMemoryError: Map failed` 异常。这个错误信息非常有迷惑性——它看起来像是 JVM 堆内存不足，但实际上是操作系统层面的 VMA 数量限制，加大 -Xmx 完全没有用，必须调 sysctl。\n\n### 2.3 JVM 堆内存中的元数据对象\n\nKafka Broker 在 JVM 堆内存中为每个 Partition 维护了大量的 Java 对象：Partition 对象本身、Log 对象、LogSegment 对象、ISR 列表、OffsetIndex、TimeIndex 等。LinkedIn 的工程师在 2018 年的分析中估算，每个 Partition 在 Broker 堆内存中大约占用 10-20KB 的对象空间（取决于 Segment 数量和 ISR 大小）。\n\n```\n10,000 partitions × 15 KB ≈ 150 MB 堆内存用于 Partition 元数据\n20,000 partitions × 15 KB ≈ 300 MB\n50,000 partitions × 15 KB ≈ 750 MB\n```\n\n看起来不多，但问题在于这些对象是长生命周期的——它们会晋升到 Old Generation，增加 Full GC 的压力。如果 Broker 的 -Xmx 设为 6GB（Kafka 官方推荐），750MB 的 Partition 元数据意味着 Old Gen 中有 12.5% 的空间被「不可回收的元数据对象」占据，留给 PageCache 管理、网络缓冲区和请求处理的堆内存就更紧张了。当 Partition 数量超过 30,000，建议将 -Xmx 从 6GB 增加到 8-12GB，并且务必使用 G1GC（Kafka 2.8+ 默认就是 G1GC），通过 `-XX:MaxGCPauseMillis=20` 控制 GC 停顿时间。\n\n### 2.4 Leader 选举风暴\n\n当一台 Broker 宕机时，所有以该 Broker 为 Leader 的 Partition 都需要进行 Leader 选举。选举过程本身很快（每个 Partition 只是从 ISR 列表中选下一个 Broker），但 Controller 需要串行处理这些选举请求，并将结果通知所有相关 Broker。\n\n在 ZooKeeper 模式下，如果一台 Broker 上有 5,000 个 Leader Partition 同时需要选举，Controller 需要逐一处理并发送 LeaderAndIsr RPC。实测数据显示，ZK 模式下每秒大约能完成 200-500 次 Leader 选举（取决于 Controller 的 CPU 和网络），5,000 个选举需要 10-25 秒。在这段时间内，这些 Partition 对外完全不可用——Producer 收到 NOT_LEADER_FOR_PARTITION 错误，Consumer 无法 fetch 数据。\n\nKRaft 模式的改进在于 Controller Quorum 的处理能力更强，且元数据更新是批量写入 `__cluster_metadata` 日志后由各 Broker 异步拉取，避免了 Controller 逐一发送 RPC 的串行瓶颈。实测 KRaft 模式下同样 5,000 个 Leader 选举可以在 2-5 秒内完成。\n\n### 2.5 Log Recovery 启动时间\n\n这是很多人在规划时容易忽略的隐性成本。Broker 重启时，需要对每个 Partition 的最后一个 Segment 执行完整性校验（验证消息 CRC、重建索引）。这个过程叫做 Log Recovery，耗时与 Partition 数量和未 flush 的数据量成正比。\n\n```\nLog Recovery 耗时经验数据（HDD, unclean shutdown）：\n1,000 partitions → ~10-30 秒\n5,000 partitions → ~1-3 分钟\n10,000 partitions → ~3-8 分钟\n20,000 partitions → ~10-20 分钟\n50,000 partitions → ~30-60 分钟（几乎不可接受）\n```\n\n如果是 clean shutdown（通过 `kafka-server-stop.sh` 正常停止），Kafka 会在停止前 flush 所有脏数据并写入 `.kafka_cleanshutdown` 标记文件，重启时跳过大部分 Recovery，启动时间可以缩短到几十秒。但 unclean shutdown（OOM Kill、硬件故障、kill -9）就没有这个优化，每个 Partition 的最后一个 Segment 都必须完整校验。这就是为什么高 Partition 数量的 Broker 一旦发生非预期宕机，恢复时间会长到影响 SLA。\n\nKafka 2.8 引入了 `log.recovery.threads.per.data.dir` 参数（默认值 1），可以通过增大这个值来并行化 Recovery 过程。设为 CPU 核数的一半通常是一个合理的起点，比如 16 核机器设为 8，可以将 Recovery 时间缩短到原来的 1/4 到 1/6。但注意 Recovery 是 I/O 密集型的，如果使用 HDD，过多的并行线程反而会因为随机 I/O 导致性能退化，SSD 上才能充分利用并行化的收益。\n\n### 综合上限评估\n\n```\n┌──────────────────────────────────────────────────────────────────┐\n│          单 Broker Partition 上限综合评估                         │\n├──────────────────┬──────────────────┬────────────────────────────┤\n│ 瓶颈维度          │ ZK 模式上限       │ KRaft 模式上限             │\n├──────────────────┼──────────────────┼────────────────────────────┤\n│ 文件描述符(FD)    │ ulimit -n / 5    │ 同左（OS层面相同）          │\n│ mmap VMA          │ max_map_count/2  │ 同左                       │\n│ JVM 堆元数据      │ ~30K (6GB heap)  │ ~50K (6GB heap, 更高效)    │\n│ Controller 元数据 │ ~4K/broker       │ ~10-20K/broker             │\n│ Leader 选举风暴   │ ~5K leaders      │ ~15K leaders               │\n│ Log Recovery      │ ~10K (SSD)       │ 同左（与模式无关）          │\n├──────────────────┼──────────────────┼────────────────────────────┤\n│ 综合建议上限       │ 2,000-4,000      │ 10,000-20,000              │\n│ 集群总上限        │ ~200,000         │ 2,000,000+                 │\n└──────────────────┴──────────────────┴────────────────────────────┘\n```\n\n需要强调的是，这些数字不是硬性限制，而是「在典型硬件配置和可接受的故障恢复时间下的经验建议值」。如果你的 SLA 允许 Broker 故障后 30 分钟恢复，那单 Broker 跑 50,000 个 Partition 技术上也不是不行；但如果你的 SLA 要求 30 秒内恢复服务，那 ZK 模式下 2,000 可能就是实际上限。上限在哪里取决于你对「不可接受」的定义。\n\n## 三、体系化扩展延伸\n\n### 3.1 KIP-500 与 Partition 可扩展性路线图\n\nKIP-500 是 KRaft 模式的奠基性 KIP，它提出的核心目标之一就是突破 ZooKeeper 模式的 Partition 可扩展性天花板。在后续的演进中，KIP-631（Controller Quorum 实现细节）、KIP-
+
+
+595（metadata topic 的日志格式）、KIP-
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+778（KRaft snapshot）共同构成了新架构的完整图景。其中 KIP-
+
+
+778 引入了 Controller 快照机制——当 `__cluster_metadata` 日志增长到一定大小后，Controller 会生成一个 snapshot 文件，新加入的 Broker 可以直接加载 snapshot 而非回放全量日志，这进一步降低了大规模 Partition 场景下的 Broker 启动时间。\n\nConfluent 在 KRaft GA 前的内部测试中，用 100 台 Broker 组成的集群成功创建了 200 万个 Partition（平均每台 20,000），Controller Quorum 处理元数据更新的吞吐稳定在每秒 10,000 条以上，Controller 切换时间稳定在 5-10 秒。这个数字相比 ZK 模式的 200,000 集群上限提升了一个数量级。\n\n### 3.2 操作系统与 JVM 调优要点\n\n高 Partition 数量的 Broker 需要一套针对性的 OS 和 JVM 调优配置。文件系统层面，XFS 在处理大量小文件时的性能优于 ext4——Kafka 的每个 Partition 目录下会有大量的 .log / .index / .timeindex 文件，ext4 在目录内文件数超过 10,000 时目录查找性能会显著下降（因为 ext4 的 htree 索引在这个规模下开始增加查找层数），而 XFS 的 B+ 树目录索引在百万文件级别仍然保持稳定的查找性能。生产环境中高 Partition Broker 强烈建议使用 XFS 而非 ext4。\n\nJVM 方面，除了前面提到的堆内存和 G1GC 配置，还有一个容易遗漏的参数：`-XX:MetaspaceSize` 和 `-XX:MaxMetaspaceSize`。当 Partition 数量极高时，Kafka 动态加载的类数量也会增加（比如每种压缩算法的 Codec 类），Metaspace 不足会导致 Full GC 甚至 OOM。建议显式设置 `-XX:MaxMetaspaceSize=512m`（默认是无限制，但在某些 JVM 版本上行为不一致）。\n\n```bash\n# 推荐的高 Partition 场景 JVM 参数\nexport KAFKA_HEAP_OPTS=\"-Xms8g -Xmx8g\"\nexport KAFKA_JVM_PERFORMANCE_OPTS=\"\n  -XX:+UseG1GC\n  -XX:MaxGCPauseMillis=20\n  -XX:InitiatingHeapOccupancyPercent=35\n  -XX:G1HeapRegionSize=16m\n  -XX:MaxMetaspaceSize=512m\n  -XX:+ExplicitGCInvokesConcurrent\n\"\n\n# 推荐的 OS sysctl 参数\nvm.max_map_count=262144\nfs.file-max=1048576\nvm.swappiness=1\nnet.core.wmem_max=2097152\nnet.core.rmem_max=2097152\n```\n\n### 3.3 监控与告警策略\n\n高 Partition 场景下需要额外关注几个 JMX 指标。`kafka.server:type=ReplicaManager,name=PartitionCount` 直接反映当前 Broker 承载的 Partition 数量（含 Leader 和 Follower），这是最核心的容量指标，建议设置告警阈值为你评估上限的 80%。`kafka.controller:type=KafkaController,name=ActiveControllerCount` 在所有 Broker 上监控，正常情况下整个集群只有一台 Broker 的值为 1，其余为 0，如果出现多个 1 或全部为 0 说明 Controller 出了问题。`kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions` 在 Broker 重启或故障恢复期间会飙升，高 Partition Broker 的 UnderReplicated 恢复时间更长，如果这个指标长时间不归零说明 Recovery 卡住了。\n\n### 3.4 什么时候该减少 Partition 而非加 Broker\n\n当集群已经有足够的 Broker 但 Partition 总数过多时，正确的做法往往不是继续加 Broker 而是重新审视 Partition 数量是否合理。一个常见的反模式是为每个微服务的每种事件类型都创建独立的 Topic 且每个 Topic 配 12-24 个 Partition——如果有 200 个微服务 × 5 种事件 × 12 Partition = 12,000 个 Partition（单副本），RF=3 后变成 36,000。更合理的做法是按领域聚合 Topic（比如所有订单相关事件共用一个 Topic，通过消息 Header 中的 eventType 字段区分），Partition 数量按实际吞吐需求计算而非按 Topic 数量堆砌。Kafka 的 Partition 数量可以增加但不能减少，所以建 Topic 时「宁少勿多」是一个重要原则——先从 6 个 Partition 开始，根据实际吞吐需要再用 `kafka-topics.sh --alter --partitions` 扩容。",
+      "keyPoints": [
+        "每个 Partition 的活跃 Segment 消耗 3 个文件描述符（.log / .index / .timeindex），10K Partition 保守需要 50K+ FD，ulimit -n 默认 1024 是最常见的踩坑点",
+        "索引文件通过 mmap 映射，每个 Partition 至少占 2 个 VMA，受 vm.max_map_count 限制（默认 65530），超限会导致 Map failed 异常而非 OOM",
+        "ZK 模式下 Controller 通过全量推送 UpdateMetadata 传播元数据，100K Partition 的 Controller 切换需要数分钟；KRaft 模式改为增量日志复制，切换时间降到秒级",
+        "LinkedIn 经验值：ZK 模式 2000-4000 Partition/Broker、200K/集群；KRaft 模式 10K-20K/Broker、200 万+/集群",
+        "Broker 故障后的 Leader 选举风暴耗时与 Partition 数成正比——ZK 模式下 5K Leader 选举需 10-25 秒，KRaft 模式缩短到 2-5 秒",
+        "Log Recovery 是隐性成本，unclean shutdown 后每个 Partition 需完整校验最后一个 Segment，10K Partition 恢复需 3-8 分钟，可通过 log.recovery.threads.per.data.dir 并行化",
+        "JVM 堆内存中每个 Partition 元数据约占 10-20KB，50K Partition 需 ~750MB 堆空间，高 Partition 场景建议 -Xmx 8-12GB 并使用 G1GC",
+        "实际上限取决于 SLA 定义——如果允许 30 分钟恢复可以撑到 50K，如果要求 30 秒恢复则 ZK 模式下 2K 就是实际天花板"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz1",
+          "question": "每个 Kafka Partition 的活跃 Segment 至少消耗多少个文件描述符？",
+          "choices": [
+            {"id": "A", "text": "1 个，只有 .log 文件需要 FD"},
+            {"id": "B", "text": "2 个，.log 和 .index 各一个"},
+            {"id": "C", "text": "3 个，.log、.index 和 .timeindex 各一个"},
+            {"id": "D", "text": "5 个，还包括 .txnindex 和 .snapshot"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "每个活跃 Segment 由三个核心文件组成：.log 存储消息数据、.index 存储 offset 到物理位置的稀疏索引、.timeindex 存储时间戳到 offset 的稀疏索引，各需要一个文件描述符。所以最基本的消耗是 3 个 FD per active segment per partition。如果开启了事务还有 .txnindex，但那不是每个 Partition 都有的。A 和 B 选项都遗漏了索引文件。D 选项虽然在特殊场景下可能成立（事务 + 快照），但不是「至少」的数量。"
+        },
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz2",
+          "question": "当 Broker 上 Partition 数量极高时，mmap 映射可能触发什么错误？",
+          "choices": [
+            {"id": "A", "text": "java.lang.OutOfMemoryError: Java heap space，因为 mmap 占用了 JVM 堆内存"},
+            {"id": "B", "text": "java.lang.OutOfMemoryError: Map failed，因为超出了 vm.max_map_count 的 VMA 数量限制"},
+            {"id": "C", "text": "java.io.IOException: Too many open files，因为 mmap 消耗文件描述符"},
+            {"id": "D", "text": "java.lang.StackOverflowError，因为递归映射索引文件"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的 .index 和 .timeindex 通过 mmap 映射到进程虚拟地址空间，每次 mmap 调用创建一个 VMA（Virtual Memory Area），受 Linux 内核参数 vm.max_map_count 限制（默认 65530）。当 VMA 数量耗尽时，mmap 系统调用返回 ENOMEM，JVM 包装为 OutOfMemoryError: Map failed。这个错误非常有迷惑性——它看起来像内存不足，但增加 -Xmx 完全无效，正确的解决方法是 sysctl -w vm.max_map_count=262144。A 选项错误因为 mmap 不占用 JVM 堆。C 选项描述的是 FD 耗尽的错误。"
+        },
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz3",
+          "question": "ZooKeeper 模式下，Controller 故障切换时的主要瓶颈是什么？",
+          "choices": [
+            {"id": "A", "text": "Controller 需要向每台 Broker 发送包含所有 Partition 完整元数据的 UpdateMetadata 请求，耗时与 Partition 总数成正比"},
+            {"id": "B", "text": "ZooKeeper 的 Zab 协议需要对每个 Partition 单独做一次共识投票"},
+            {"id": "C", "text": "新 Controller 需要从磁盘重新读取所有 .log 文件来重建元数据"},
+            {"id": "D", "text": "所有 Consumer Group 需要同时重新加入 Group Coordinator"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在 ZK 模式下，Controller 将所有 Partition 的元数据（Leader、ISR、Epoch 等）缓存在 JVM 堆内存中。当 Controller 故障切换时，新 Controller 需要从 ZooKeeper 读取完整的元数据，然后向集群中每台 Broker 发送 UpdateMetadata 请求，这个请求包含所有 Partition 的完整快照。100K Partition 的完整元数据传播可能持续数分钟。B 选项不正确，ZK 的共识是在 Controller 写入 ZooKeeper 时完成的，不是 per-partition。C 选项完全错误，Controller 不读 .log 文件。D 选项描述的是 Consumer Rebalance，与 Controller 切换无直接关系。"
+        },
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz4",
+          "question": "KRaft 模式相比 ZK 模式，在 Partition 可扩展性方面的核心架构改进是什么？",
+          "choices": [
+            {"id": "A", "text": "元数据存储在 __cluster_metadata 内部 Topic 中，传播方式从全量推送变为增量日志复制，切换时间与 Partition 总数几乎无关"},
+            {"id": "B", "text": "KRaft 使用了更快的网络协议（gRPC 替代自定义协议），提升了 RPC 吞吐"},
+            {"id": "C", "text": "KRaft 将 Partition 元数据存储在 RocksDB 而非内存中，降低了内存消耗"},
+            {"id": "D", "text": "KRaft 取消了 Controller 角色，每台 Broker 自行管理本地 Partition 元数据"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "KRaft 模式（KIP-500）的核心创新是用一个内部 Topic __cluster_metadata 替代 ZooKeeper 存储集群元数据，由 Controller Quorum（基于 Raft 协议的多节点共识）管理。关键变化是元数据传播从 ZK 模式的「Controller 向每台 Broker 推送全量快照」变为「Broker 从 __cluster_metadata 日志拉取增量更新」。Controller 切换时，新 Controller 从 Raft log 回放状态，Broker 继续读取增量日志，耗时几乎不受 Partition 总数影响。B 选项错误，Kafka 仍使用自定义协议。C 选项不正确。D 选项错误，KRaft 仍有 Controller 角色。"
+        },
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz5",
+          "question": "LinkedIn 给出的 ZK 模式下单台 Broker Partition 承载上限建议值是多少？",
+          "choices": [
+            {"id": "A", "text": "约 500 个，超过就会严重影响性能"},
+            {"id": "B", "text": "约 2,000-4,000 个，集群总上限约 200,000 个"},
+            {"id": "C", "text": "约 50,000 个，与 KRaft 模式接近"},
+            {"id": "D", "text": "无上限，只要硬件资源充足就行"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "LinkedIn 作为 Kafka 的诞生地和最大规模用户之一，基于多年生产运维经验给出的建议是：ZooKeeper 模式下单台 Broker 不超过 4,000 个 Partition，整个集群不超过 200,000 个。这个建议的核心约束是 Controller 故障切换时间——超过这个规模后，Controller 切换需要的元数据传播时间会长到影响集群可用性 SLA。A 选项过于保守。C 选项混淆了 ZK 模式和 KRaft 模式的能力。D 选项忽略了 Controller 元数据传播的系统性瓶颈。"
+        },
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz6",
+          "question": "Broker 非预期宕机后 Log Recovery 耗时长的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "每个 Partition 的最后一个 Segment 需要完整的 CRC 校验和索引重建，耗时与 Partition 数成正比"},
+            {"id": "B", "text": "Broker 需要从其他 Broker 重新拉取所有 Partition 的全量数据"},
+            {"id": "C", "text": "JVM 的 Full GC 在启动时需要扫描所有 Partition 文件"},
+            {"id": "D", "text": "ZooKeeper 需要逐个确认每个 Partition 的元数据一致性"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Broker 非预期宕机（unclean shutdown）时，最后写入的数据可能不完整——PageCache 中的脏数据还没有 flush 到磁盘。重启时 Kafka 需要对每个 Partition 的最后一个 Segment（active segment）执行完整性校验：验证每条消息的 CRC 是否正确、重建可能损坏的 .index 和 .timeindex 文件。这个过程是 I/O 密集型的，耗时与 Partition 数量（以及最后一个 Segment 的数据量）成正比。如果是 clean shutdown，Kafka 会在停止前 flush 并写入 .kafka_cleanshutdown 标记，跳过大部分校验。B 选项描述的是全量副本同步，不是 Log Recovery。"
+        },
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz7",
+          "question": "以下哪个 Linux 内核参数需要调大才能支持高 Partition 数量的 Broker？",
+          "choices": [
+            {"id": "A", "text": "vm.max_map_count，从默认 65530 调到 262144 以支持更多 mmap 映射"},
+            {"id": "B", "text": "vm.swappiness，从默认 60 调到 100 以增加交换空间"},
+            {"id": "C", "text": "kernel.shmmax，增大共享内存段上限"},
+            {"id": "D", "text": "net.core.somaxconn，增大 TCP 连接队列"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "每个 Partition 的 .index 和 .timeindex 文件通过 mmap 映射，每次映射占用一个 VMA（Virtual Memory Area），受 vm.max_map_count 限制。默认 65530 只够约 30,000 个 Partition（每个 Partition 2 个 mmap 区域 + JVM 自身 VMA），必须调大到 262144 或更高。B 选项恰好相反——Kafka 生产环境建议将 swappiness 设为 1 来尽量避免使用 swap。C 选项的 shmmax 与 Kafka 的 mmap 机制无关。D 选项的 somaxconn 是网络参数，与 Partition 数量无直接关系。"
+        },
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz8",
+          "question": "高 Partition 场景下 JVM 堆内存需要加大的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "每个 Partition 在堆中维护 10-20KB 的元数据对象（Partition、Log、LogSegment、ISR 等），50K Partition 需要约 750MB 堆空间且全部晋升到 Old Gen"},
+            {"id": "B", "text": "Kafka 将消息数据缓存在 JVM 堆中，Partition 越多缓存越大"},
+            {"id": "C", "text": "mmap 映射的索引文件占用的是 JVM 堆内存"},
+            {"id": "D", "text": "每个 Partition 需要一个独立的线程，线程栈空间占用堆内存"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka Broker 在 JVM 堆中为每个 Partition 维护了一系列 Java 对象：Partition 对象、Log 对象、LogSegment 对象、ISR 列表、OffsetIndex、TimeIndex 等。LinkedIn 的估算是每个 Partition 大约 10-20KB。这些对象是长生命周期的，会晋升到 Old Generation 永远不被 GC 回收，占据固定的堆空间。50,000 个 Partition × 15KB ≈ 750MB，在默认 6GB 堆中占比 12.5%，压缩了其他功能的可用堆空间。B 选项错误，Kafka 消息数据不在堆中缓存而是依赖 OS PageCache。C 选项错误，mmap 映射在堆外。"
+        },
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz9",
+          "question": "为什么建议高 Partition 的 Kafka Broker 使用 XFS 而非 ext4 文件系统？",
+          "choices": [
+            {"id": "A", "text": "XFS 的 B+ 树目录索引在大量文件时查找性能稳定，ext4 的 htree 在目录内文件数超过 10,000 时性能显著下降"},
+            {"id": "B", "text": "XFS 支持更大的单文件，ext4 单文件最大只有 16GB"},
+            {"id": "C", "text": "XFS 的 journaling 速度比 ext4 快 10 倍"},
+            {"id": "D", "text": "ext4 不支持 mmap，只有 XFS 支持"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka 的每个 Partition 是一个目录，目录下有大量的 Segment 文件（.log / .index / .timeindex）。当 Partition 多且 Segment 多时，单个 log.dirs 目录下可能有数万到数十万个子目录和文件。ext4 使用 htree（基于 hash 的 B-tree）做目录索引，当目录内文件数超过约 10,000 时，htree 的层数增加导致查找性能下降。XFS 使用 B+ 树做目录索引，即使在百万文件级别仍保持 O(log n) 的稳定查找性能。B 选项不正确，ext4 单文件上限是 16TB 而非 16GB。D 选项完全错误，ext4 和 XFS 都支持 mmap。"
+        },
+        {
+          "id": "kafka-capacity-partitions-per-broker-q1-quiz10",
+          "question": "当集群 Partition 总数过多时，以下哪种策略比「继续加 Broker」更有效？",
+          "choices": [
+            {"id": "A", "text": "按领域聚合 Topic（多种事件共用一个 Topic 通过 Header 区分），减少 Topic 和 Partition 总数"},
+            {"id": "B", "text": "将所有 Topic 的副本因子从 3 降到 1 以减少 Partition 副本数"},
+            {"id": "C", "text": "缩短 Retention 时间来减少每个 Partition 的 Segment 数量"},
+            {"id": "D", "text": "关闭所有 Topic 的索引文件以减少文件数量"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Partition 数量过多的根因往往是 Topic 设计过于碎片化——每个微服务的每种事件类型都创建独立 Topic 且每个配 12+ Partition。更合理的做法是按业务领域聚合 Topic，比如所有订单相关事件（创建、支付、物流）共用 order-events Topic，通过消息 Header 中的 eventType 字段在消费端路由。这样 200 微服务 × 5 事件 × 12 Partition 的 12,000 可以压缩到几十个 Topic × 合理 Partition 数的几百个。B 选项会严重损害数据可用性。C 选项改变的是 Segment 数量而非 Partition 数量。D 选项不可行，索引是 Kafka 正常运行的必要组成。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#brokerconfigs_log.index.size.max.bytes",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum",
+        "https://www.confluent.io/blog/apache-kafka-supports-200k-partitions-per-cluster/",
+        "https://www.confluent.io/blog/kafka-without-zookeeper-a-sneak-peek/"
+      ]
+    }
+  ]
+}
