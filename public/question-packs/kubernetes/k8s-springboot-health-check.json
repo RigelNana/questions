@@ -1,0 +1,157 @@
+{
+  "id": "k8s-springboot-health-check",
+  "name": "Spring Boot 应用的 Kubernetes 健康检查方案设计",
+  "domain": "kubernetes",
+  "description": "围绕 Spring Boot Actuator 与 Kubernetes 三种探针的集成，设计生产级健康检查方案并规避级联重启等常见陷阱",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-springboot-health-check-q1",
+      "domain": "kubernetes",
+      "type": "open-ended",
+      "difficulty": 3,
+      "tags": ["Spring Boot", "Actuator", "健康检查", "Liveness", "Readiness", "Startup", "Java"],
+      "title": "为一个 Java Spring Boot 应用设计合理的健康检查方案",
+      "content": "你所在团队维护一个基于 Spring Boot 3.2.4 的订单服务（order-service），运行在 Kubernetes v1.29 集群上。这个服务有以下技术特征：使用 HikariCP 连接池连接 MySQL 8.0（最大连接数 20），通过 Lettuce 客户端连接 Redis 7.2 集群做订单缓存，并调用一个外部支付网关的 REST API 做支付状态查询。服务启动时需要完成以下初始化工作——JVM 的 JIT 编译预热、Spring Context 扫描和 Bean 初始化、Flyway 数据库迁移检查、从 Redis 预加载热点商品的库存快照（约 50 万条 key）。整个启动过程在生产环境中通常需要 35-55 秒，极端情况下（冷节点首次拉取镜像后）可能达到 70 秒。\n\n当前的 Deployment 配置是前任工程师写的，只配了一个 livenessProbe 指向 `/actuator/health`，`initialDelaySeconds` 设为 90 秒。最近你发现了两个问题：第一，每次滚动更新（Rolling Update）时，新 Pod 启动后要等 90 秒才开始第一次存活检查，这期间旧 Pod 已经被终止，导致服务短暂不可用；第二，上周 Redis 集群做主从切换的 3 秒内，所有 Pod 的 `/actuator/health` 同时返回 503，三个副本全部被 kubelet 杀掉重启，引发了线上故障——告警截图如下：\n\n```\n$ kubectl get pods -l app=order-service\nNAME                             READY   STATUS    RESTARTS      AGE\norder-service-6f87d4c9b-h2k8p    0/1     Running   4 (28s ago)   3m\norder-service-6f87d4c9b-m9x3q    0/1     Running   5 (15s ago)   3m\norder-service-6f87d4c9b-t7w2n    0/1     Running   3 (42s ago)   3m\n\n$ kubectl describe pod order-service-6f87d4c9b-h2k8p | grep -A5 Events\nEvents:\n  Warning  Unhealthy  45s (x12 over 2m)  kubelet  Liveness probe failed: HTTP probe failed with statuscode: 503\n  Normal   Killing    45s (x4 over 2m)   kubelet  Container order-service failed liveness probe, will be restarted\n```\n\n请你重新设计这个服务的完整健康检查方案，包括：Spring Boot Actuator 的配置（application.yaml）、Kubernetes Deployment 中三种探针的 YAML 配置和参数选择依据、每个探针端点应该检查哪些组件以及为什么。请特别说明 Liveness 探针为什么不应该检查 Redis 和 MySQL 的连通性。",
+      "answer": "## 第一步：Kubernetes 健康探针与 Spring Boot Actuator 基础\n\n### Kubernetes 探针机制回顾\n\nKubernetes 通过三种探针（Probe）实现容器的健康检查：Liveness Probe（存活探针）检测容器是否还在正常运行，失败后 kubelet 杀掉容器并重启；Readiness Probe（就绪探针）检测容器是否可以接收流量，失败后 Pod 从 Service 的 Endpoints 列表中摘除但容器不重启；Startup Probe（启动探针，v1.20 GA）在容器启动阶段保护慢启动应用，它成功之前 Liveness 和 Readiness 都不会执行。三种探针均由节点上的 kubelet 执行，支持 httpGet、tcpSocket、exec 和 gRPC 四种检查方式。\n\n探针的五个核心参数分别是 `initialDelaySeconds`（容器启动后延迟多久开始第一次检查）、`periodSeconds`（两次检查的间隔）、`timeoutSeconds`（单次检查超时时间）、`failureThreshold`（连续失败多少次才判定为不健康）和 `successThreshold`（连续成功多少次才判定为恢复）。探针的最大容忍时间可以用公式计算：`initialDelaySeconds + periodSeconds × failureThreshold`。\n\n### Spring Boot Actuator 的健康端点体系\n\nSpring Boot Actuator 是 Spring Boot 内置的生产就绪功能模块，从 Spring Boot 2.3（2020 年 5 月发布）开始原生支持 Kubernetes 探针集成。在 `pom.xml` 中引入 `spring-boot-starter-actuator` 后，应用会自动暴露一组健康检查端点。核心端点有三个：`/actuator/health` 是聚合端点，汇总所有 HealthIndicator（健康指示器）的结果，任何一个组件 DOWN 都会导致整体状态变为 DOWN 并返回 HTTP 503；`/actuator/health/liveness` 是 Liveness 分组端点，默认只包含 `LivenessStateHealthIndicator`，检查应用的内部存活状态；`/actuator/health/readiness` 是 Readiness 分组端点，默认包含 `ReadinessStateHealthIndicator`，检查应用是否准备好接受流量。\n\n当 Spring Boot 检测到自己运行在 Kubernetes 环境中（通过 `*_SERVICE_HOST` 和 `*_SERVICE_PORT` 环境变量判断），会自动启用这两个分组端点。你也可以在 `application.yaml` 中手动开启：\n\n```yaml\n# Spring Boot 3.2.x application.yaml 基础配置\nmanagement:\n  endpoint:\n    health:\n      probes:\n        enabled: true          # 手动启用探针端点，不依赖自动检测\n      show-details: always     # 显示每个组件的详细健康信息\n  endpoints:\n    web:\n      exposure:\n        include: health,info,metrics   # 暴露必要端点\n  server:\n    port: 8081                # Actuator 使用独立管理端口，与业务端口 8080 分离\n```\n\n将管理端口与业务端口分离是生产最佳实践——业务端口 8080 面向 Service 和 Ingress 处理业务请求，管理端口 8081 只暴露给 kubelet 做健康检查，不会被外部流量访问到。通过 `curl` 可以验证端点的响应格式：\n\n```bash\n# Liveness 端点 —— 只检查内部存活状态，不涉及任何外部依赖\n$ curl -s http://localhost:8081/actuator/health/liveness | jq .\n{\n  \"status\": \"UP\",\n  \"components\": {\n    \"livenessState\": {\n      \"status\": \"UP\"\n    }\n  }\n}\n\n# Readiness 端点 —— 检查外部依赖，这里会包含 DB 和 Redis\n$ curl -s http://localhost:8081/actuator/health/readiness | jq .\n{\n  \"status\": \"UP\",\n  \"components\": {\n    \"db\": {\n      \"status\": \"UP\",\n      \"details\": {\n        \"database\": \"MySQL\",\n        \"validationQuery\": \"isValid()\"\n      }\n    },\n    \"redis\": {\n      \"status\": \"UP\",\n      \"details\": {\n        \"cluster_size\": 6,\n        \"cluster_state\": \"ok\"\n      }\n    },\n    \"readinessState\": {\n      \"status\": \"UP\"\n    }\n  }\n}\n```\n\n## 第二步：完整探针方案设计与参数调优\n\n### 设计思路：三种探针各司其职\n\n理解了 Spring Boot Actuator 的端点分组机制后，这个订单服务的健康检查方案设计思路就清晰了——利用 Actuator 原生的 Liveness/Readiness 分组，将外部依赖检查与内部存活检查彻底隔离，再用 Startup 探针解决 35-70 秒的慢启动问题。\n\n首先是 Spring Boot 侧的完整配置。关键是把 DB、Redis 这些外部依赖的 HealthIndicator 分配到 readiness 组，而 liveness 组保持干净：\n\n```yaml\n# application.yaml —— 订单服务健康检查完整配置\nserver:\n  port: 8080\n  shutdown: graceful               # 启用优雅停机\n\nspring:\n  lifecycle:\n    timeout-per-shutdown-phase: 30s  # 优雅停机等待时间\n  datasource:\n    hikari:\n      maximum-pool-size: 20\n      connection-timeout: 5000       # 获取连接超时 5 秒\n\nmanagement:\n  server:\n    port: 8081                       # 管理端口独立\n  endpoint:\n    health:\n      probes:\n        enabled: true\n      show-details: always\n      group:\n        liveness:\n          include: livenessState     # Liveness 组：只包含内部存活状态\n        readiness:\n          include: readinessState,db,redis  # Readiness 组：包含 DB 和 Redis\n          # 注意：不包含外部支付网关，因为它不影响接单能力\n  endpoints:\n    web:\n      exposure:\n        include: health,info,metrics,prometheus\n  health:\n    redis:\n      enabled: true\n    db:\n      enabled: true\n```\n\n这里有一个重要的设计决策：外部支付网关没有被加入 Readiness 组。原因是支付网关只在订单支付查询时用到，如果它短暂不可用，服务仍然可以接受新订单创建请求、查询订单列表等其他操作。将一个非核心依赖放进 Readiness 检查会导致不必要的摘流量。只有当某个依赖不可用时服务「完全无法提供任何价值」时，才应该将它加入 Readiness 组。\n\n接下来是 Kubernetes Deployment 的探针配置：\n\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: order-service\n  namespace: production\nspec:\n  replicas: 3\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 1\n      maxUnavailable: 0            # 滚动更新期间不允许有 Pod 不可用\n  template:\n    metadata:\n      labels:\n        app: order-service\n    spec:\n      terminationGracePeriodSeconds: 45\n      containers:\n      - name: order-service\n        image: registry.internal/order-service:v2.8.1\n        ports:\n        - name: http\n          containerPort: 8080\n        - name: management\n          containerPort: 8081\n        resources:\n          requests:\n            cpu: 500m\n            memory: 512Mi\n          limits:\n            cpu: \"2\"\n            memory: 1Gi\n\n        # ===== Startup 探针：保护慢启动 =====\n        # 最多容忍 5s × 30 = 150 秒完成启动\n        # 正常 35-55 秒完成，极端 70 秒，150 秒留足余量\n        startupProbe:\n          httpGet:\n            path: /actuator/health/readiness\n            port: 8081\n          periodSeconds: 5\n          failureThreshold: 30\n          timeoutSeconds: 3\n\n        # ===== Liveness 探针：检测内部存活 =====\n        # 只检查应用内部状态，不涉及任何外部依赖\n        # Startup 成功前不会执行，无需设 initialDelaySeconds\n        livenessProbe:\n          httpGet:\n            path: /actuator/health/liveness\n            port: 8081\n          periodSeconds: 10\n          failureThreshold: 3\n          timeoutSeconds: 3\n          # 最大检测延迟：10s × 3 = 30 秒发现内部故障\n\n        # ===== Readiness 探针：检测流量接受能力 =====\n        # 检查 DB 和 Redis 的连通性\n        readinessProbe:\n          httpGet:\n            path: /actuator/health/readiness\n            port: 8081\n          periodSeconds: 5\n          failureThreshold: 3\n          successThreshold: 2\n          timeoutSeconds: 3\n          # 摘流量延迟：5s × 3 = 15 秒\n          # 恢复延迟：5s × 2 = 10 秒（需连续成功 2 次）\n```\n\n### 为什么 Liveness 绝对不能检查外部依赖\n\n这是整个方案中最关键的设计原则，也是题目中那次线上故障的根因。前任工程师让 Liveness 指向了 `/actuator/health`——这个聚合端点会检查所有注册的 HealthIndicator，包括 DB 和 Redis。当 Redis 集群做主从切换的 3 秒内，`/actuator/health` 返回 503（因为 Redis 的 HealthIndicator 报 DOWN），kubelet 的 Liveness 检查连续失败达到 `failureThreshold`，于是三个 Pod 同时被杀掉重启。Pod 重启后需要 35-55 秒初始化，初始化期间又需要连接 Redis 预加载缓存，但此时 Redis 可能刚切换完成正在恢复，连接风暴又给 Redis 施加了额外压力——这就是典型的「级联重启雪崩」。\n\n正确的设计是：Liveness 只关心「这个进程本身是否还活着」——JVM 是否陷入死锁、主事件循环是否还在运转、内存是否溢出到无法分配。这些问题只有重启才能解决，所以 Liveness 失败触发重启是合理的。而 Redis 短暂不可用、MySQL 主从切换这类外部依赖的暂时性故障，重启容器根本解决不了问题——外部系统恢复后应用自然就好了，不需要重启。这类暂时性不可用应该由 Readiness 处理：摘掉流量、等待恢复、自动重新加入，整个过程没有容器重启，恢复时间从分钟级（重启 + 初始化）缩短到秒级。\n\n### 参数选择依据\n\nStartup 探针的 `failureThreshold: 30` 配合 `periodSeconds: 5` 给了应用 150 秒的启动预算。正常启动 35-55 秒，极端 70 秒，150 秒的预算留了超过 2 倍余量。Startup 探针指向 `/actuator/health/readiness` 而不是 `/actuator/health/liveness`，因为启动完成的标准应该是「所有核心依赖都连上了、缓存预热完成了」，而不仅仅是「JVM 还活着」。只有当 Readiness 端点返回 UP，才说明应用真正具备了处理请求的能力。\n\nLiveness 探针 `periodSeconds: 10` 配合 `failureThreshold: 3` 意味着最长 30 秒检测到内部故障。`timeoutSeconds: 3` 比默认的 1 秒宽裕，可以容忍 JVM 的 Minor GC 暂停（G1 在 1Gi 堆上的 Young GC 通常在 10-30ms，但 Full GC 偶尔可以到 200-500ms）。如果连 3 秒都响应不了，说明问题确实严重。\n\nReadiness 探针 `periodSeconds: 5` 比 Liveness 更频繁，因为摘流量的响应速度直接影响用户体验——15 秒检测到 DB 不可用比 30 秒好得多。`successThreshold: 2` 要求连续成功 2 次才重新接收流量，避免了依赖在恢复边缘反复抖动时 Pod 频繁加入/移除 Endpoints 的问题。\n\n## 第三步：进阶扩展与生产实践\n\n### 自定义 HealthIndicator\n\n默认的 HealthIndicator 有时粒度不够。比如你可能想检查 HikariCP 连接池的活跃连接数是否接近上限，或者检查内部任务队列的积压量。Spring Boot 允许你实现自定义 HealthIndicator 并分配到指定分组：\n\n```java\n@Component\npublic class OrderQueueHealthIndicator implements HealthIndicator {\n    private final OrderProcessingQueue queue;\n\n    public OrderQueueHealthIndicator(OrderProcessingQueue queue) {\n        this.queue = queue;\n    }\n\n    @Override\n    public Health health() {\n        int pending = queue.pendingCount();\n        // 积压超过 5000 单说明处理能力跟不上，应摘流量\n        if (pending > 5000) {\n            return Health.down()\n                .withDetail(\"pendingOrders\", pending)\n                .withDetail(\"threshold\", 5000)\n                .build();\n        }\n        return Health.up()\n            .withDetail(\"pendingOrders\", pending)\n            .build();\n    }\n}\n```\n\n然后在 `application.yaml` 中将它加入 Readiness 组：\n\n```yaml\nmanagement:\n  endpoint:\n    health:\n      group:\n        readiness:\n          include: readinessState,db,redis,orderQueue\n```\n\n注意，这个自定义指标放在 Readiness 组而不是 Liveness 组。因为队列积压不代表进程死了，只是当前处理不过来，摘掉流量让它消化积压才是正确的做法，重启反而会丢失内存中正在处理的订单。\n\n### 与优雅停机的配合\n\n健康检查方案必须和优雅停机（Graceful Shutdown）配合使用，否则 Pod 终止时正在处理的请求会被强制中断。Spring Boot 3.x 的 `server.shutdown=graceful` 配合 Kubernetes 的 terminationGracePeriodSeconds 形成完整的停机流程：kubelet 发送 SIGTERM 信号的同时将 Pod 从 Endpoints 摘除（Readiness 不再重要），Spring Boot 收到 SIGTERM 后停止接受新请求，等待正在处理的请求完成（最多等 `spring.lifecycle.timeout-per-shutdown-phase` 指定的 30 秒），然后关闭连接池和 Spring Context。`terminationGracePeriodSeconds: 45` 给了 Spring Boot 足够的时间完成停机，同时留了 15 秒余量应对 preStop Hook 的执行。\n\n一个容易被忽视的细节是：kubelet 发送 SIGTERM 和从 Endpoints 摘除是并行发生的，不是先摘再停。这意味着在 Endpoints 更新传播到所有 kube-proxy 之前（通常 1-3 秒），仍然有流量被路由到正在停机的 Pod。解决办法是加一个 `preStop` 生命周期钩子，在收到 SIGTERM 后先 sleep 几秒：\n\n```yaml\nlifecycle:\n  preStop:\n    exec:\n      command: [\"sh\", \"-c\", \"sleep 5\"]\n```\n\n这 5 秒给了 kube-proxy 足够的时间完成 iptables/ipvs 规则更新，之后流量自然不再路由过来。\n\n### 常见坑点总结\n\n第一个坑是 Actuator 管理端口防火墙未放行。当你把管理端口设为 8081，但 Kubernetes 的容器端口声明（`containerPort`）中没有包含 8081，或者 NetworkPolicy 阻止了 kubelet 到 8081 的访问，所有探针都会超时失败。排查方法是用 `kubectl exec` 进入 Pod 手动 curl 管理端口来确认端点是否可达。\n\n第二个坑是 Spring Boot 的 Actuator 端点安全配置。如果项目引入了 Spring Security 并配置了全局认证，`/actuator/health` 也会被拦截要求登录，kubelet 的匿名 HTTP 请求会收到 401 或 302 重定向到登录页，探针判定为失败。解决方案是在 `SecurityFilterChain` 中对管理端口或 `/actuator/health/**` 路径放行。\n\n第三个坑是 Readiness 探针过于严格导致所有 Pod 同时不就绪。如果你把「支付网关可达」也放进了 Readiness 检查，当支付网关出现短暂故障时，所有 Pod 的 Readiness 都会失败，Service 后面没有任何健康的 Endpoints，所有请求都返回 503——即使订单创建、查询等不依赖支付网关的接口本来是可以正常工作的。设计 Readiness 检查时要问自己一个问题：「如果这个依赖挂了，我的服务是否完全无法提供任何有价值的响应？」只有答案是肯定的，才应该将它加入 Readiness 组。\n\n第四个坑是忽略了 HealthIndicator 本身的超时。默认情况下 Spring Boot 的数据库 HealthIndicator 会执行一次 `SELECT 1` 验证连接，如果 DB 响应慢（比如正在执行大事务），这个检查可能消耗好几秒。如果 kubelet 的 `timeoutSeconds` 设为 3 秒，而 HealthIndicator 内部查询花了 4 秒，探针就会超时失败。可以通过 `spring.datasource.hikari.validation-timeout` 控制连接验证的超时时间，确保它小于探针的 `timeoutSeconds`。",
+      "keyPoints": [
+        "Spring Boot 2.3+ 原生支持 /actuator/health/liveness 和 /actuator/health/readiness 分组端点，在 Kubernetes 环境中自动启用，也可通过 management.endpoint.health.probes.enabled=true 手动开启",
+        "Liveness 探针必须只检查应用内部存活状态（livenessState），不能包含 DB、Redis 等外部依赖，否则外部短暂故障会触发所有 Pod 同时重启形成级联雪崩",
+        "Readiness 探针适合检查核心外部依赖的可用性，失败后仅从 Endpoints 摘除流量而不重启容器，依赖恢复后 Pod 自动重新加入负载均衡池",
+        "Startup 探针用于保护 30-70 秒的 JVM 慢启动过程，它成功前 Liveness 和 Readiness 都不会执行，消除了 initialDelaySeconds 在启动保护与故障检测速度之间的两难矛盾",
+        "管理端口（如 8081）应与业务端口（8080）分离，避免健康检查请求与业务流量竞争连接资源，同时防止外部直接访问 Actuator 端点",
+        "Readiness 的 successThreshold 建议设为 2 以上，避免依赖在恢复边缘抖动时 Pod 频繁加入/移除 Endpoints 导致 kube-proxy 规则频繁重建",
+        "自定义 HealthIndicator 应根据业务语义分配到正确的探针组——队列积压、连接池耗尽等问题应归入 Readiness 而非 Liveness，因为摘流量比重启更有效",
+        "优雅停机需要 preStop Hook 中 sleep 3-5 秒，给 kube-proxy 时间完成 Endpoints 变更传播，否则 SIGTERM 和 Endpoints 摘除的并行执行会导致终止期间仍有流量进入"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-springboot-health-check-q1-quiz1",
+          "question": "Spring Boot Actuator 的 /actuator/health/liveness 和 /actuator/health/readiness 端点从哪个版本开始原生支持？",
+          "choices": [
+            {"id": "A", "text": "Spring Boot 2.0，随 Actuator 模块首次发布"},
+            {"id": "B", "text": "Spring Boot 2.3，专门为 Kubernetes 探针集成而新增"},
+            {"id": "C", "text": "Spring Boot 3.0，作为 Jakarta EE 迁移的一部分引入"},
+            {"id": "D", "text": "Spring Boot 2.7，作为 2.x 系列的最后一个特性版本加入"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Spring Boot 2.3（2020 年 5 月发布）是第一个原生支持 Kubernetes 探针的版本，新增了 Liveness 和 Readiness 两个健康分组端点。A 选项错在 Spring Boot 2.0 的 Actuator 只有聚合的 /actuator/health，没有按探针类型分组的端点。C 选项错在 3.0 的主要变化是从 javax 迁移到 Jakarta 命名空间，探针支持早在 2.3 就有了。D 选项错在 2.7 是 2.x 最后一个特性版本，但探针功能比它早了三个版本。"
+        },
+        {
+          "id": "k8s-springboot-health-check-q1-quiz2",
+          "question": "在 Kubernetes 中，Readiness 探针失败后 kubelet 会执行什么操作？",
+          "choices": [
+            {"id": "A", "text": "杀掉容器并根据 restartPolicy 决定是否重启"},
+            {"id": "B", "text": "将 Pod 从 Service 的 Endpoints 中移除，但不重启容器"},
+            {"id": "C", "text": "发送 SIGTERM 信号给容器主进程，等待优雅停机"},
+            {"id": "D", "text": "将 Pod 标记为 Failed 状态并触发 ReplicaSet 创建新副本"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Readiness 探针失败后，kubelet 将 Pod 的 Ready condition 设为 False，Endpoints Controller 监听到这个变化后将 Pod IP 从 Service 的 Endpoints（或 EndpointSlice）中摘除，kube-proxy 随后更新 iptables/ipvs 规则停止向该 Pod 路由流量。容器本身不会被杀掉或重启。A 选项描述的是 Liveness 探针失败后的行为。C 选项描述的是 Pod 正常终止的流程。D 选项完全不正确，探针失败不会导致 Pod 进入 Failed 状态。"
+        },
+        {
+          "id": "k8s-springboot-health-check-q1-quiz3",
+          "question": "Startup 探针与 Liveness/Readiness 探针的执行关系是怎样的？",
+          "choices": [
+            {"id": "A", "text": "三种探针从容器启动后同时并行执行，互不影响"},
+            {"id": "B", "text": "Startup 探针成功之前 Liveness 和 Readiness 都不会执行，Startup 成功一次后永久退出"},
+            {"id": "C", "text": "Startup 探针在 Liveness 之前执行，但 Readiness 不受 Startup 控制，会立即开始"},
+            {"id": "D", "text": "Startup 探针在整个 Pod 生命周期中持续运行，与 Liveness 交替执行"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Startup 探针的核心设计就是作为「门卫」保护慢启动应用。容器创建后 kubelet 首先只执行 Startup 探针，Liveness 和 Readiness 都处于挂起状态不会执行。只有当 Startup 探针成功一次后，kubelet 才将控制权移交给 Liveness 和 Readiness，而 Startup 自身则永久退出不再执行。A 选项忽略了 Startup 对其他探针的阻塞作用。C 选项错在 Readiness 同样受 Startup 控制。D 选项错在 Startup 是一次性的，不会持续运行。"
+        },
+        {
+          "id": "k8s-springboot-health-check-q1-quiz4",
+          "question": "Spring Boot 的 /actuator/health 聚合端点与 /actuator/health/liveness 的关键区别是什么？",
+          "choices": [
+            {"id": "A", "text": "两者完全相同，/actuator/health/liveness 只是 /actuator/health 的别名"},
+            {"id": "B", "text": "/actuator/health 检查所有注册的 HealthIndicator，/actuator/health/liveness 只检查 liveness 分组中配置的指标"},
+            {"id": "C", "text": "/actuator/health 返回 JSON 格式，/actuator/health/liveness 返回纯文本"},
+            {"id": "D", "text": "/actuator/health 需要认证才能访问，/actuator/health/liveness 是公开的"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "/actuator/health 是聚合端点，会汇总所有注册的 HealthIndicator 的结果，包括 DB、Redis、磁盘空间等，任何一个组件 DOWN 都会导致整体返回 503。而 /actuator/health/liveness 只检查 liveness 分组中配置的指标，默认仅包含 LivenessStateHealthIndicator，不涉及外部依赖。这正是为什么 Liveness 探针必须指向分组端点而非聚合端点——用聚合端点会把外部依赖的故障误判为容器存活问题。A 选项忽略了分组机制。C 和 D 选项描述的差异不存在。"
+        },
+        {
+          "id": "k8s-springboot-health-check-q1-quiz5",
+          "question": "以下 curl 输出说明了什么情况？\n\n```\n$ curl -s http://localhost:8081/actuator/health/readiness\n{\"status\":\"DOWN\",\"components\":{\"db\":{\"status\":\"DOWN\",\"details\":{\"error\":\"...\"}},\"redis\":{\"status\":\"UP\"},\"readinessState\":{\"status\":\"UP\"}}}\n```",
+          "choices": [
+            {"id": "A", "text": "应用内部崩溃，Liveness 探针也会同时失败，Pod 即将被重启"},
+            {"id": "B", "text": "数据库连接不可用，Readiness 返回 DOWN，Pod 将被从 Endpoints 摘除但不会重启"},
+            {"id": "C", "text": "Redis 和数据库都有问题，应用完全无法工作"},
+            {"id": "D", "text": "readinessState 为 UP 说明 Readiness 检查通过，db 的 DOWN 会被忽略"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "输出显示 readiness 分组的整体 status 为 DOWN，原因是 db 组件状态为 DOWN（数据库连接异常），而 redis 和 readinessState 都是 UP。Spring Boot 的聚合逻辑是「任一组件 DOWN 则整体 DOWN」。Readiness 返回 503（DOWN）后，kubelet 会将 Pod 从 Service Endpoints 摘除，但不会重启容器。A 选项错误，因为 Liveness 端点有独立的分组，不包含 db，所以 Liveness 不受影响。C 选项错误，Redis 状态是 UP。D 选项错误，聚合规则不会忽略任何组件的 DOWN 状态。"
+        },
+        {
+          "id": "k8s-springboot-health-check-q1-quiz6",
+          "question": "如果将 Liveness 探针指向 /actuator/health（聚合端点）而不是 /actuator/health/liveness，当 Redis 短暂不可用时会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Pod 被从 Endpoints 摘除但不重启，等 Redis 恢复后自动重新加入"},
+            {"id": "B", "text": "/actuator/health 返回 503，Liveness 连续失败后 kubelet 杀掉所有 Pod 并重启，可能引发级联雪崩"},
+            {"id": "C", "text": "Liveness 探针会自动忽略外部依赖的状态，只关注内部组件"},
+            {"id": "D", "text": "kubelet 会降级为 TCP 探测模式，只检查端口是否可达"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是本题最核心的坑点。/actuator/health 聚合端点会检查所有 HealthIndicator，Redis 不可用时返回 HTTP 503。当 Liveness 指向这个端点时，kubelet 判定容器存活检查失败，连续超过 failureThreshold 次后杀掉容器并重启。如果多个 Pod 同时受影响（Redis 不可用是全局性的），就会出现所有 Pod 同时被重启的级联雪崩。重启后的 Pod 又要重新连 Redis 预加载缓存，进一步加重 Redis 的恢复压力。A 选项描述的是 Readiness 失败的正确行为，不是 Liveness。C 和 D 选项描述的行为不存在。"
+        },
+        {
+          "id": "k8s-springboot-health-check-q1-quiz7",
+          "question": "在没有 Startup 探针的情况下，为了保护 60 秒启动的 Java 应用不被 Liveness 误杀，通常需要设置 initialDelaySeconds 为 90+。这种做法的主要缺点是什么？",
+          "choices": [
+            {"id": "A", "text": "会导致 Pod 的 Phase 一直停留在 Pending 状态直到延迟时间过去"},
+            {"id": "B", "text": "应用在运行阶段发生死锁后，也要等 90+ 秒才能被 Liveness 首次检查到，故障检测严重滞后"},
+            {"id": "C", "text": "initialDelaySeconds 期间 kubelet 会持续消耗 CPU 做空轮询，浪费节点资源"},
+            {"id": "D", "text": "会阻止 Readiness 探针的执行，导致 Pod 启动期间无法被加入 Endpoints"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "initialDelaySeconds 只影响容器启动后第一次探针检查的延迟时间，后续的检查按 periodSeconds 间隔正常执行。但问题在于这个延迟是全局的——不仅在启动阶段生效，每次容器重启后都要等 90+ 秒才开始第一次 Liveness 检查。如果应用在运行阶段第 5 秒就死锁了，但 Liveness 要到第 90 秒之后才开始检查，故障检测窗口被拉到不可接受的长度。A 选项错误，initialDelaySeconds 不影响 Pod Phase。C 选项错误，kubelet 只是跳过检查，不做空轮询。D 选项错误，Liveness 和 Readiness 的 initialDelaySeconds 是独立的。"
+        },
+        {
+          "id": "k8s-springboot-health-check-q1-quiz8",
+          "question": "在生产环境中，为什么建议将 Spring Boot Actuator 的管理端口（management.server.port）设置为与业务端口不同的值？",
+          "choices": [
+            {"id": "A", "text": "管理端口与业务端口分离后，健康检查请求不会与业务流量竞争连接资源，且可以通过 NetworkPolicy 限制管理端口只对 kubelet 开放"},
+            {"id": "B", "text": "Spring Boot 不允许在同一端口上同时暴露业务接口和 Actuator 端点"},
+            {"id": "C", "text": "Kubernetes 的探针只支持检查与 Service 端口不同的端口"},
+            {"id": "D", "text": "分离管理端口可以让 Actuator 端点的响应速度提升 10 倍以上"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "管理端口独立是生产最佳实践，核心原因有两个：一是资源隔离，业务高峰期时业务端口可能已经有大量并发连接，如果健康检查走同一端口，可能因为连接池满或线程繁忙导致探针超时误判；二是安全隔离，管理端口可以通过 NetworkPolicy 或防火墙规则限制只允许 kubelet 所在网段访问，防止外部用户探测 /actuator 端点暴露系统信息。B 选项错误，Spring Boot 完全支持在同一端口暴露二者。C 选项错误，探针可以指定任意端口。D 选项的性能提升幅度完全是编造的。"
+        },
+        {
+          "id": "k8s-springboot-health-check-q1-quiz9",
+          "question": "以下 Startup 探针配置允许应用的最大启动时间是多少？\n\n```yaml\nstartupProbe:\n  httpGet:\n    path: /actuator/health/readiness\n    port: 8081\n  initialDelaySeconds: 10\n  periodSeconds: 5\n  failureThreshold: 24\n  timeoutSeconds: 3\n```",
+          "choices": [
+            {"id": "A", "text": "120 秒（5 × 24）"},
+            {"id": "B", "text": "130 秒（10 + 5 × 24）"},
+            {"id": "C", "text": "72 秒（3 × 24）"},
+            {"id": "D", "text": "82 秒（10 + 3 × 24）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "探针的最大容忍时间公式为 initialDelaySeconds + periodSeconds × failureThreshold。在这个配置中，容器启动后先等 10 秒（initialDelaySeconds），然后每 5 秒（periodSeconds）检查一次，允许连续失败 24 次（failureThreshold），所以最大启动时间 = 10 + 5 × 24 = 130 秒。A 选项漏算了 initialDelaySeconds。C 选项错误地用 timeoutSeconds 代替了 periodSeconds 来计算，timeoutSeconds 是单次检查的超时时间，不是检查间隔。D 选项犯了同样的错误。"
+        },
+        {
+          "id": "k8s-springboot-health-check-q1-quiz10",
+          "question": "Pod 终止时 kubelet 发送 SIGTERM 与从 Endpoints 中移除 Pod 的时序关系是什么？为什么需要在 preStop Hook 中加 sleep？",
+          "choices": [
+            {"id": "A", "text": "先从 Endpoints 移除，等待 30 秒后再发送 SIGTERM，不需要 preStop sleep"},
+            {"id": "B", "text": "先发送 SIGTERM，等容器停止后再从 Endpoints 移除，不需要 preStop sleep"},
+            {"id": "C", "text": "SIGTERM 发送和 Endpoints 移除是并行进行的，preStop sleep 给 kube-proxy 时间完成规则更新避免终止期间仍有流量进入"},
+            {"id": "D", "text": "kubelet 同步执行所有操作，不存在时序问题，preStop sleep 只是为了等待长连接关闭"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "当 Pod 被终止时，kubelet 发送 SIGTERM 和 Endpoints Controller 将 Pod 从 Endpoints 移除是并行发生的。问题在于即使 Endpoints 已经更新，kube-proxy 还需要 1-3 秒时间将变更同步到节点的 iptables/ipvs 规则中。在这个传播窗口内，仍然可能有流量被路由到正在停机的 Pod。preStop Hook 中 sleep 3-5 秒就是为了覆盖这个传播延迟——容器在 sleep 期间不会收到 SIGTERM（preStop 在 SIGTERM 之前执行），等 sleep 结束时规则已经更新完毕，之后再执行优雅停机就不会有新流量进来了。"
+        }
+      ],
+      "references": [
+        "https://docs.spring.io/spring-boot/docs/3.2.x/reference/html/actuator.html#actuator.endpoints.kubernetes-probes",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/",
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-probes",
+        "https://spring.io/blog/2020/03/25/liveness-and-readiness-probes-with-spring-boot"
+      ]
+    }
+  ]
+}
