@@ -1,0 +1,156 @@
+{
+  "id": "kafka-reliability-isolation-level",
+  "name": "read_committed 与 read_uncommitted 对比",
+  "domain": "kafka",
+  "description": "对比分析 Kafka Consumer 两种事务隔离级别的可见性差异、性能影响与生产选型",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-reliability-isolation-level-q1",
+      "domain": "kafka",
+      "type": "comparison",
+      "difficulty": 3,
+      "tags": ["Kafka", "isolation.level", "read_committed", "read_uncommitted", "事务隔离"],
+      "title": "isolation.level 设为 read_committed 与 read_uncommitted 的区别",
+      "content": "很多团队在上线 Kafka 事务 Producer 之后，理所当然地认为 Exactly-Once 已经到位了——Producer 端配好了 `transactional.id`，代码里也规规矩矩地调用 `beginTransaction()` → `send()` → `commitTransaction()`。但下游的消费服务仍然报出了数据重复。排查后发现，Consumer 的 `isolation.level` 用的是默认值 `read_uncommitted`。Producer 端辛苦做的事务原子性，在 Consumer 端被完全忽略了。\n\n`isolation.level` 是 Kafka Consumer 端唯一与事务隔离相关的配置项，自 Kafka 0.11（KIP-98）引入事务机制后一并推出。它只有两个合法取值：`read_uncommitted`（默认值）和 `read_committed`。这两个取值的命名借鉴了关系型数据库的事务隔离级别概念，但在 Kafka 语境下的含义与 RDBMS 有本质区别——Kafka 里没有「脏读」「幻读」的概念，`isolation.level` 控制的核心问题是：Consumer 是否能看到尚未提交（或已被回滚）的事务消息。\n\n表面上看，这只是一个配置开关的区别。但实际上，两种模式在消费可见性边界、Lag 计算方式、消费延迟特征、以及与非事务消息的交互行为上都有显著差异。选错了模式，轻则造成消费端看到脏数据、事务回滚后的幽灵消息，重则在 `read_committed` 模式下因为长事务导致消费完全停滞、Lag 飙升到告警。\n\n以下是两个 Consumer 分别使用两种隔离级别的核心配置对比：\n\n```properties\n# Consumer A — 默认模式，不感知事务\ngroup.id=analytics-consumer\nisolation.level=read_uncommitted\nenable.auto.commit=true\n\n# Consumer B — 事务感知模式，只读已提交\ngroup.id=payment-consumer\nisolation.level=read_committed\nenable.auto.commit=false\n```\n\n同一个 Partition、同一批消息，这两个 Consumer 看到的数据范围、消费进度、Lag 指标可能完全不同。面试官问你这道题，想考察的不只是「一个能看到未提交消息、一个看不到」这种一句话结论，而是你是否理解 LSO 和 HW 的区别、是否知道 `read_committed` 模式下的 Lag 计算基于 LSO 而非 HW、是否了解长事务对 `read_committed` Consumer 的阻塞效应、以及在 Kafka Streams 和生产环境中应该如何选型。",
+      "answer": "## 一、核心概念基础：Kafka Consumer 的事务隔离机制\n\n### 1.1 Kafka Consumer 基础与 isolation.level 的定位\n\nKafka Consumer 通过 `poll()` 方法从 Broker 的 Partition Log 中拉取消息。在 Kafka 0.11 之前，Consumer 能读到的消息范围由一个边界决定——HW（High Watermark），即所有 ISR 副本都已同步到的最高 Offset。Consumer 的 Fetch 请求最多只能读到 HW 位置的消息，这个机制保证 Consumer 不会读到只存在于 Leader 但尚未同步到 Follower 的消息（避免 Leader 宕机后数据不一致）。\n\nKafka 0.11 引入事务机制后，Partition Log 中开始出现事务消息——这些消息在写入 Log 时与普通消息在物理存储上完全一样（Kafka 的 Log 是 append-only 的），但它们「逻辑上」属于某个事务，需要等待 Transaction Marker（COMMIT 或 ABORT）写入后才能确定最终状态。这就产生了一个新问题：Consumer 应不应该读到那些「已经写入 Log 但所属事务尚未提交」的消息？\n\n`isolation.level` 就是用来回答这个问题的配置项。它在 Consumer 端配置，告诉 Broker 在响应 Fetch 请求时应该使用哪种可见性边界。默认值 `read_uncommitted` 保持了 0.11 之前的行为——Consumer 可以读到 HW 范围内的所有消息，完全不关心事务状态。而 `read_committed` 则引入了一个新的边界——LSO（Last Stable Offset），Consumer 只能读到 LSO 范围内的消息，且会过滤掉已回滚事务的消息。\n\n这里需要强调一点：`isolation.level` 仅影响 Consumer 的读取行为，对 Producer 的写入和 Broker 的存储没有任何影响。同一个 Partition 可以同时被 `read_uncommitted` 和 `read_committed` 的 Consumer 消费，它们各自看到不同范围的数据。\n\n### 1.2 HW 与 LSO：两个消费边界\n\n理解两种隔离级别的核心在于理解 HW 和 LSO 这两个 Offset 的区别。\n\nHW（High Watermark）的定义是：所有 ISR 副本都已同步到的最高 Offset。它与事务无关，纯粹反映副本同步进度。`read_uncommitted` Consumer 使用 HW 作为消费上界。\n\nLSO（Last Stable Offset）的定义是：当前 Partition 上所有「活跃事务」（已开始但未提交/回滚的事务）中，最小的 First Offset。如果当前没有任何活跃事务，LSO 等于 HW。`read_committed` Consumer 使用 LSO 作为消费上界。LSO 永远小于或等于 HW，两者相等当且仅当 Partition 上没有进行中的事务。\n\n## 二、精准深度解答：read_committed 与 read_uncommitted 多维度对比\n\n### 2.1 消费可见性差异：一个具象化的时间线\n\n假设 Partition 0 上有两个事务 A 和 B 并行进行，同时还有一些非事务消息。以下是 Partition Log 的真实状态和两种 Consumer 的可见性差异：\n\n```\nPartition-0 Log 时间线（从左到右 offset 递增）\n\nOffset:   0      1      2      3      4      5      6      7      8\nPayload:  m0     m1     m2     m3     m4     m5     m6     m7     m8\nSource:   txn-A  txn-A  (none) txn-B  txn-B  txn-A  COMMIT (none) txn-B\n                                                     (A)\n          ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ← ←\n\n当前状态：事务 A 已在 offset 6 写入 COMMIT Marker\n         事务 B 仍在进行中（尚未提交或回滚）\n         HW = 9（所有 ISR 副本已同步到 offset 9）\n         LSO = 3（事务 B 的 First Offset，活跃事务中最小的起始位置）\n\n─────────────────────────────────────────────────────────\nread_uncommitted Consumer 看到的消息：\n  offset 0,1,2,3,4,5,6(Marker被跳过),7,8  → 共 8 条业务消息\n  消费上界 = HW = 9\n  它不关心事务状态，事务 B 未提交的 m3、m4、m8 照样消费\n\nread_committed Consumer 看到的消息：\n  offset 0,1,2  → 共 3 条业务消息\n  消费上界 = LSO = 3\n  虽然事务 A 的 m0、m1、m5 已提交，但 m5 在 LSO 之后，暂时不可见\n  offset 2 的非事务消息可以读到（在 LSO 之前）\n  offset 7 的非事务消息暂时也读不到（在 LSO 之后）\n─────────────────────────────────────────────────────────\n\n等到事务 B 提交（COMMIT Marker 写入 offset 9）后：\n  LSO 推进到 = HW = 10\n  read_committed Consumer 一次性看到 offset 3,4,5,7,8 的消息\n  （offset 6 和 9 是 Marker，被 Consumer 客户端过滤掉）\n\n如果事务 B 回滚（ABORT Marker 写入 offset 9）后：\n  LSO 推进到 = HW = 10\n  read_committed Consumer 看到 offset 5,7 的消息\n  offset 3,4,8 属于已回滚的事务 B，被 Consumer 客户端根据\n  Broker 返回的 abortedTransactions 索引过滤掉\n```\n\n这个时间线揭示了 `read_committed` 的一个关键特征：LSO 的推进取决于「最慢的那个活跃事务」。即使事务 A 已经提交，它在 offset 5 处的消息因为在事务 B 的 LSO 阻塞线之后，仍然暂时不可见。这种「连坐」效应在生产环境中是最常见的 `read_committed` 性能陷阱。\n\n### 2.2 Lag 计算方式的差异\n\n`read_uncommitted` Consumer 的 Lag 计算公式是 `HW - consumer_committed_offset`，反映的是 Consumer 落后于副本同步进度的距离。`read_committed` Consumer 的 Lag 计算公式是 `LSO - consumer_committed_offset`，反映的是 Consumer 落后于「已稳定数据」的距离。\n\n在同一个 Consumer Group 内，如果一部分成员使用 `read_committed`，一部分使用 `read_uncommitted`（实际生产中不应该这样做，但理论上可以），你用 `kafka-consumer-groups.sh` 查看时会看到截然不同的 Lag 数值：\n\n```bash\n# 场景：Partition 上有一个长事务（5 分钟未提交），期间持续有新消息写入\n# 两个独立的 Consumer Group 分别以两种模式消费同一个 Topic\n\n$ kafka-consumer-groups.sh --bootstrap-server broker-1:9092 \\\n    --describe --group analytics-group\n\nGROUP            TOPIC       PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG\nanalytics-group  events      0          4582901         4583120         219\nanalytics-group  events      1          3891450         3891460         10\nanalytics-group  events      2          5120380         5120395         15\n\n# analytics-group 使用 read_uncommitted，LOG-END-OFFSET 基于 HW\n# Lag 很小，消费基本跟上\n\n$ kafka-consumer-groups.sh --bootstrap-server broker-1:9092 \\\n    --describe --group payment-group\n\nGROUP            TOPIC       PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG\npayment-group    events      0          4582901         4582901         0\npayment-group    events      1          3891450         3891460         10\npayment-group    events      2          5120380         5102800         0\n\n# payment-group 使用 read_committed，LOG-END-OFFSET 基于 LSO\n# Partition 0 的 LOG-END-OFFSET 远低于实际 HW —— 因为 LSO 被长事务阻塞\n# 注意 Partition 2 看起来 Lag=0 但 LOG-END-OFFSET 比上面小很多\n# 这说明 Partition 2 上也有活跃事务压低了 LSO\n```\n\n这里有一个容易被忽视的细节：`kafka-consumer-groups.sh` 输出的 `LOG-END-OFFSET` 列在 `read_committed` 模式下展示的并不是真正的 LEO（Log End Offset），而是 LSO。Kafka 的 `ListOffsets` API 在收到 `read_committed` Consumer 的请求时，会返回 LSO 而不是 HW。这意味着你不能简单地用这个命令的输出来判断 Broker 端的真实写入进度——你需要额外查看 Broker 的 JMX 指标 `kafka.log:type=Log,name=LogEndOffset` 来获取真实的 LEO。\n\n### 2.3 性能影响\n\n在没有活跃事务的场景下，`read_committed` 和 `read_uncommitted` 的性能几乎没有差异——因为 LSO 等于 HW，两者的消费边界相同。Consumer 客户端的 Aborted Transaction 过滤逻辑只在确实存在回滚事务时才有额外开销，而且这个开销发生在客户端的内存操作中（检查 PID 是否在 Aborted Set 中），相对于网络 I/O 和反序列化来说可以忽略不计。\n\n真正产生性能差异的场景是：Partition 上存在活跃事务时。此时 `read_committed` Consumer 受 LSO 限制，能读到的数据范围变小了，`poll()` 返回的 `ConsumerRecords` 可能为空或数量很少，实际吞吐量下降。而 `read_uncommitted` Consumer 不受影响，继续以 HW 为上界正常消费。\n\n更极端的情况是长事务导致的「消费停滞」。如果一个 Producer 开启了事务后因为 GC 停顿、网络分区或代码 bug 导致事务迟迟不提交，LSO 会停留在该事务的起始 Offset 不动。在这段时间内，即使后续有大量已提交的事务消息和非事务消息写入，`read_committed` Consumer 也看不到任何新数据。生产环境中 `transaction.timeout.ms`（默认 60000ms）是最后的防线——超过这个时间后 TransactionCoordinator 会自动 Abort 该事务，LSO 随即推进。但 60 秒对于高吞吐场景可能已经积压了数百万条消息。\n\n### 2.4 与非事务消息的交互\n\n一个容易被忽略的知识点：`read_committed` Consumer 并不只能消费事务消息。非事务消息（由没有配置 `transactional.id` 的普通 Producer 发送的消息）在 `read_committed` 模式下也能正常消费，但它们的可见性同样受 LSO 的限制。如果一条非事务消息的 Offset 在 LSO 之后，`read_committed` Consumer 暂时也看不到它。\n\n这意味着：即使你的 Consumer 消费的 Topic 里 99% 都是非事务消息，只要有一个事务 Producer 往这个 Topic 写了一条消息并且事务没有及时提交，整个 Partition 上 LSO 之后的所有消息（包括非事务消息）对 `read_committed` Consumer 都不可见。这是一个在混合使用事务和非事务 Producer 的场景中非常危险的特性。\n\n### 2.5 核心差异汇总\n\n```\n维度                    read_uncommitted          read_committed\n───────────────────────────────────────────────────────────────────\n消费上界                 HW (High Watermark)      LSO (Last Stable Offset)\n未提交事务消息            可见                     不可见\n已回滚事务消息            可见（当作普通消息）       不可见（客户端过滤）\n非事务消息可见性          不受事务影响              受 LSO 限制，可能被阻塞\nLag 计算基准             HW                       LSO\n长事务影响               无影响                    LSO 停滞 → 消费停滞\n性能开销                 无额外开销                有 Aborted Txn 过滤开销\nKafka Streams 默认值     —                        read_committed（自动设置）\n是否需要关闭 auto commit  不强制                    强烈建议（配合事务时必须）\n```\n\n## 三、体系化扩展延伸\n\n### 3.1 Consumer Lag 监控的陷阱\n\n在使用 `read_committed` 的生产环境中，Consumer Lag 监控需要特别注意。传统的 Lag 告警阈值（比如 Lag 超过 10000 触发告警）在 `read_committed` 模式下可能产生大量误报——不是 Consumer 处理慢了，而是 LSO 被上游的事务阻塞了。排查这类问题需要同时关注两个 Broker JMX 指标的差值：\n\n```\n# 真正的消息写入进度\nkafka.log:type=Log,name=LogEndOffset,topic=events,partition=0  → 值: 4583120\n\n# 已稳定的消费边界\nkafka.log:type=Log,name=LastStableOffset,topic=events,partition=0  → 值: 4582901\n\n# 差值 = 4583120 - 4582901 = 219\n# 如果这个差值持续增长，说明有活跃事务阻塞了 LSO\n```\n\n建议在监控系统中同时配置两个告警：一个是 Consumer Lag 告警（基于 LSO），用于发现 Consumer 本身的处理瓶颈；另一个是 LEO - LSO 差值告警，用于发现上游事务的阻塞问题。后者的告警阈值可以设为 `transaction.timeout.ms` 对应的消息量（比如 60 秒内的预期写入量）。\n\n### 3.2 长事务对 read_committed 的连锁效应\n\n生产中最常见的 `read_committed` 事故场景是这样的：一个事务 Producer 因为依赖的外部服务响应超慢，导致事务从 `beginTransaction()` 到 `commitTransaction()` 之间经历了 45 秒。在这 45 秒内，这个 Partition 上所有 `read_committed` Consumer 的消费完全停滞，积压了约 200 万条消息。当事务最终提交后，LSO 瞬间跳跃，Consumer 需要消化积压的 200 万条消息，造成下游系统的突发流量尖刺。\n\n应对策略有三个层面。第一，缩短 `transaction.timeout.ms`——核心业务建议从默认的 60 秒缩短到 10~30 秒，让悬挂事务更快被自动 Abort。第二，事务内不要执行耗时的外部调用——事务的生命周期应该尽可能短，只包含 Kafka 的 send 和 offset 提交操作，外部服务调用应该在事务开始之前完成。第三，对 `read_committed` Consumer 的下游系统做限流和背压保护，防止 LSO 跳跃后的突发流量冲垮下游。\n\n### 3.3 Kafka Streams 的默认行为\n\nKafka Streams 在内部自动将 Consumer 的 `isolation.level` 设置为 `read_committed`。当你配置 `processing.guarantee=exactly_once_v2`（Kafka 2.5+）时，Streams 框架会同时开启事务 Producer 和 `read_committed` Consumer，形成端到端的 EOS 保证。这意味着如果你的 Streams 应用消费的 Topic 上有其他事务 Producer 在写入长事务，你的 Streams 应用也会受到 LSO 阻塞的影响——即使这些长事务与你的 Streams 应用完全无关。\n\n即使你没有开启 `exactly_once_v2`，Kafka Streams 默认也会设置 `read_committed`。这是因为 Streams 框架假设输入 Topic 可能包含事务消息，为了保证处理语义的正确性，宁可用 `read_committed` 过滤掉未提交和已回滚的消息，也不让脏数据进入处理管线。如果你确定输入 Topic 不会有事务消息，可以在 Streams 配置中显式覆盖 `default.consumer.isolation.level=read_uncommitted`，但通常不建议这样做。\n\n### 3.4 生产环境选型指南\n\n选型的核心判断标准只有一个：你的 Consumer 消费的 Topic 上是否有事务 Producer 在写入？\n\n如果有事务 Producer，且你的业务逻辑不能容忍读到未提交或已回滚的事务消息（典型场景：支付、订单、库存扣减），那必须使用 `read_committed`，同时关闭 `enable.auto.commit` 并确保 `transaction.timeout.ms` 设置得足够短。\n\n如果没有事务 Producer（所有 Producer 都是普通的非事务模式），那 `read_uncommitted` 和 `read_committed` 的行为完全一样——因为没有活跃事务，LSO 永远等于 HW。此时用哪个都可以，但没有必要用 `read_committed` 引入不必要的 LSO 依赖。\n\n如果 Topic 上混合了事务和非事务 Producer，且你能接受偶尔看到 Aborted 事务的消息（比如纯分析场景，数据少一条多一条不影响结论），那 `read_uncommitted` 更合适——它避免了 LSO 阻塞的风险，让消费延迟更可控。\n\n```properties\n# 生产推荐配置：需要事务隔离的核心业务 Consumer\ngroup.id=payment-consumer\nisolation.level=read_committed\nenable.auto.commit=false\nauto.offset.reset=earliest\nmax.poll.records=500\nmax.poll.interval.ms=300000\n\n# 生产推荐配置：不需要事务隔离的分析/日志 Consumer\ngroup.id=analytics-consumer\nisolation.level=read_uncommitted\nenable.auto.commit=true\nauto.commit.interval.ms=5000\nauto.offset.reset=latest\n```\n\n最后一个常见的认知盲区：Kafka 3.0 起 `enable.idempotence` 的默认值从 `false` 改为了 `true`，但 `isolation.level` 的默认值仍然是 `read_uncommitted`，且社区目前没有计划改变这个默认值。原因很简单——切换到 `read_committed` 会改变消费行为（引入 LSO 限制），可能导致存量 Consumer 出现莫名其妙的消费停滞，不适合作为默认行为静默变更。这意味着 Consumer 端的事务感知永远需要手动开启，这一点在 Code Review 中应该作为必查项。",
+      "keyPoints": [
+        "read_uncommitted 以 HW 为消费上界，读取所有消息包括未提交和已回滚事务的消息；read_committed 以 LSO 为消费上界，只读已提交事务消息和非事务消息，同时在客户端过滤已回滚事务消息",
+        "LSO（Last Stable Offset）等于当前 Partition 上所有活跃事务中最小的 First Offset，一个长事务会阻塞 LSO 之后的所有消息（包括已提交事务消息和非事务消息）对 read_committed Consumer 的可见性",
+        "kafka-consumer-groups.sh 的 LOG-END-OFFSET 列对 read_committed Consumer 展示的是 LSO 而非 LEO，不能用它判断 Broker 端真实的写入进度，需要结合 JMX 的 LogEndOffset 指标",
+        "read_committed 的性能开销主要不在 Aborted Transaction 过滤（客户端内存操作），而在 LSO 限制导致的可消费数据范围缩小，极端情况下长事务会造成消费完全停滞",
+        "Kafka Streams 默认将 Consumer 的 isolation.level 设为 read_committed，即使未开启 exactly_once_v2 也是如此，因此 Streams 应用天然受 LSO 阻塞影响",
+        "非事务消息在 read_committed 模式下同样受 LSO 限制，混合使用事务和非事务 Producer 时需特别警惕单个事务阻塞整个 Partition 消费的风险",
+        "isolation.level 的默认值在 Kafka 所有版本中始终是 read_uncommitted，Consumer 端的事务感知永远需要手动开启，这是与 enable.idempotence（3.0+ 默认 true）的关键区别"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz1",
+          "question": "Kafka Consumer 的 isolation.level 配置的默认值是什么？",
+          "choices": [
+            {"id": "A", "text": "read_committed，与 Kafka 3.0+ 默认开启幂等性保持一致"},
+            {"id": "B", "text": "read_uncommitted，Consumer 读取所有消息不区分事务状态"},
+            {"id": "C", "text": "repeatable_read，借鉴 MySQL 的默认隔离级别"},
+            {"id": "D", "text": "没有默认值，必须显式指定否则 Consumer 启动报错"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "isolation.level 的默认值在所有 Kafka 版本中始终是 read_uncommitted。虽然 Kafka 3.0 将 enable.idempotence 的默认值改为了 true，但 isolation.level 的默认值从未改变，因为切换到 read_committed 会引入 LSO 限制，可能导致存量 Consumer 出现消费停滞。选项 C 的 repeatable_read 是 MySQL 的概念，Kafka 的 isolation.level 只有两个合法取值。"
+        },
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz2",
+          "question": "read_committed Consumer 的消费上界由什么决定？",
+          "choices": [
+            {"id": "A", "text": "HW（High Watermark），即所有 ISR 副本同步到的最高 Offset"},
+            {"id": "B", "text": "LEO（Log End Offset），即 Leader 副本的最新写入位置"},
+            {"id": "C", "text": "LSO（Last Stable Offset），即所有活跃事务中最小的 First Offset"},
+            {"id": "D", "text": "Consumer 自身记录的 committed offset + max.poll.records"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "read_committed Consumer 的消费上界由 LSO 决定，LSO 等于当前 Partition 上所有活跃事务中最小的 First Offset。如果没有活跃事务，LSO 等于 HW。选项 A 是 read_uncommitted Consumer 使用的消费边界。选项 B 的 LEO 包含未同步到 Follower 的消息，连 read_uncommitted Consumer 都读不到 LEO。选项 D 混淆了消费上界和单次 poll 的消息数量控制。"
+        },
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz3",
+          "question": "Partition 上有事务 A（offset 0-2, 已提交）和事务 B（offset 3-5, 进行中），非事务消息在 offset 6。read_committed Consumer 能读到哪些消息？",
+          "choices": [
+            {"id": "A", "text": "offset 0,1,2（事务 A 已提交）和 offset 6（非事务消息）"},
+            {"id": "B", "text": "offset 0,1,2（事务 A 已提交），offset 6 因为在 LSO 之后暂时不可见"},
+            {"id": "C", "text": "所有消息 offset 0-6 都可见，因为事务 A 已提交"},
+            {"id": "D", "text": "没有消息可见，必须等所有事务结束后才能消费"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "LSO 等于活跃事务 B 的 First Offset = 3，因此 read_committed Consumer 只能读到 offset 0,1,2 的消息。虽然 offset 6 是非事务消息，但它在 LSO 之后，同样不可见——这就是 LSO 的「连坐」效应。选项 A 错误地认为非事务消息不受 LSO 限制。选项 D 过于保守，事务 A 的消息在 LSO 之前是可以读到的。"
+        },
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz4",
+          "question": "read_committed Consumer 如何过滤已回滚（Aborted）事务的消息？",
+          "choices": [
+            {"id": "A", "text": "Broker 在 Log 中直接删除 Aborted 事务的消息，Consumer 永远读不到它们"},
+            {"id": "B", "text": "Broker 在 FetchResponse 中携带 abortedTransactions 索引，Consumer 客户端在内存中过滤对应 PID 的消息"},
+            {"id": "C", "text": "Consumer 向 TransactionCoordinator 查询每条消息所属事务的提交状态"},
+            {"id": "D", "text": "Broker 在返回 FetchResponse 之前服务端完成过滤，Consumer 收到的已经是干净数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的 Partition Log 是 append-only 的，Aborted 事务的消息不会被删除（选项 A 错误）。过滤发生在 Consumer 客户端——Broker 在 FetchResponse 中返回 abortedTransactions 字段（来自 Segment 级别的 .txnindex 文件），Consumer 在内存中维护 Aborted PID Set，对每条消息检查其 PID 是否在 Set 中。选项 C 的查询方式每条消息都要 RPC，性能不可接受。选项 D 错误地认为过滤在 Broker 端完成。"
+        },
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz5",
+          "question": "kafka-consumer-groups.sh 对 read_committed Consumer Group 展示的 LOG-END-OFFSET 反映的是什么？",
+          "choices": [
+            {"id": "A", "text": "Partition 的 LEO（Log End Offset），即 Leader 最新写入位置"},
+            {"id": "B", "text": "Partition 的 HW（High Watermark），即 ISR 副本同步进度"},
+            {"id": "C", "text": "Partition 的 LSO（Last Stable Offset），即已稳定的消费边界"},
+            {"id": "D", "text": "Consumer 的 committed offset，即上次提交的消费位置"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "kafka-consumer-groups.sh 通过 ListOffsets API 获取 LOG-END-OFFSET，该 API 对 read_committed Consumer 返回的是 LSO 而非 LEO 或 HW。这意味着你从命令行看到的 LOG-END-OFFSET 可能远小于实际的消息写入进度，容易误判为 Broker 端写入变慢。需要通过 JMX 的 LogEndOffset 指标获取真实的 LEO。"
+        },
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz6",
+          "question": "一个事务 Producer 因为 GC 停顿导致事务 50 秒未提交，对 read_committed Consumer 的影响是什么？",
+          "choices": [
+            {"id": "A", "text": "Consumer 正常消费，只是跳过该事务的消息"},
+            {"id": "B", "text": "Consumer 的消费完全停滞，LSO 无法推进，该 Partition 上所有新消息都不可见"},
+            {"id": "C", "text": "Consumer 收到 TransactionTimeoutException 异常，需要重新初始化"},
+            {"id": "D", "text": "Consumer 自动切换到 read_uncommitted 模式继续消费"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "长事务会导致 LSO 停滞在该事务的 First Offset，此后写入的所有消息（不论是已提交事务消息还是非事务消息）对 read_committed Consumer 都不可见，消费完全停滞。这种停滞直到事务提交/回滚或被 transaction.timeout.ms（默认 60 秒）触发自动 Abort 后才会恢复。Consumer 本身不会收到异常也不会切换模式，它只是 poll() 返回空结果。"
+        },
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz7",
+          "question": "Kafka Streams 默认使用哪种 isolation.level？",
+          "choices": [
+            {"id": "A", "text": "read_uncommitted，与 KafkaConsumer 的默认值保持一致"},
+            {"id": "B", "text": "read_committed，Streams 框架自动设置，即使未开启 exactly_once 也是如此"},
+            {"id": "C", "text": "取决于 processing.guarantee 配置，at_least_once 用 read_uncommitted，exactly_once 用 read_committed"},
+            {"id": "D", "text": "Kafka Streams 不使用 KafkaConsumer，没有 isolation.level 的概念"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka Streams 默认将内部 Consumer 的 isolation.level 设为 read_committed，不管 processing.guarantee 是 at_least_once 还是 exactly_once_v2。这是因为 Streams 框架假设输入 Topic 可能包含事务消息，用 read_committed 可以避免读到脏数据。选项 C 的条件判断逻辑不存在——Streams 统一使用 read_committed。"
+        },
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz8",
+          "question": "在没有任何事务 Producer 写入的 Topic 上，read_committed 和 read_uncommitted Consumer 的行为有何区别？",
+          "choices": [
+            {"id": "A", "text": "read_committed Consumer 的消费延迟显著高于 read_uncommitted，因为需要等待 LSO 计算"},
+            {"id": "B", "text": "两者行为完全一样——没有活跃事务时 LSO 等于 HW，消费边界和 Lag 计算完全相同"},
+            {"id": "C", "text": "read_committed Consumer 会拒绝消费非事务消息，返回 InvalidIsolationLevelException"},
+            {"id": "D", "text": "read_committed Consumer 的吞吐量会下降约 30%，因为 Aborted Transaction 过滤有额外开销"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 Partition 上没有任何活跃事务时，LSO 等于 HW，两种模式的消费边界完全相同。read_committed Consumer 不会对非事务消息做任何额外处理——它能正常消费非事务消息。只有存在活跃事务时，两者的行为才会出现差异。选项 D 夸大了性能开销——Aborted Transaction 过滤只在存在回滚事务时有少量客户端内存操作开销。"
+        },
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz9",
+          "question": "为什么 read_committed Consumer 配合事务使用时必须关闭 enable.auto.commit？",
+          "choices": [
+            {"id": "A", "text": "auto commit 会在事务提交之前就提交 offset，导致事务 Abort 后 Consumer 跳过了本应重新消费的消息"},
+            {"id": "B", "text": "auto commit 与 read_committed 配置冲突，Consumer 启动时会抛出 ConfigException"},
+            {"id": "C", "text": "auto commit 的提交间隔无法与 transaction.timeout.ms 对齐，导致 offset 时间戳混乱"},
+            {"id": "D", "text": "auto commit 会将 offset 提交到 __consumer_offsets 而不是 __transaction_state，格式不兼容"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在 consume-transform-produce 模式中，Consumer offset 的提交应该通过 sendOffsetsToTransaction() 纳入 Producer 的事务中，与输出消息原子提交。如果开启了 auto commit，offset 会在事务之外被自动提交——即使后续事务 Abort，offset 已经提交了，Consumer 重启后会从新 offset 继续消费，跳过了本应重试的消息，破坏了 Exactly-Once 语义。选项 B 错误，两者在技术上不冲突，Consumer 不会报错，只是语义上不正确。"
+        },
+        {
+          "id": "kafka-reliability-isolation-level-q1-quiz10",
+          "question": "如何监控 read_committed Consumer 是否因 LSO 阻塞而消费停滞？",
+          "choices": [
+            {"id": "A", "text": "只看 Consumer Lag 指标即可，Lag 增大说明 Consumer 处理变慢"},
+            {"id": "B", "text": "监控 Broker JMX 的 LogEndOffset 与 LastStableOffset 的差值，差值持续增长说明有活跃事务阻塞 LSO"},
+            {"id": "C", "text": "检查 Consumer 的 poll() 返回是否抛出 LSOBlockedException 异常"},
+            {"id": "D", "text": "查看 __transaction_state Topic 的消息数量，数量增多说明有悬挂事务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确的做法是同时监控 LEO 和 LSO 的差值（JMX 指标 kafka.log:type=Log,name=LogEndOffset 与 kafka.log:type=Log,name=LastStableOffset）。如果差值持续增长，说明有活跃事务阻塞了 LSO 的推进。选项 A 只看 Lag 无法区分「Consumer 本身慢」和「LSO 被阻塞」两种情况。选项 C 不存在这个异常——Consumer 只会 poll() 返回空结果。选项 D 不够精确，__transaction_state 的消息数量变化不能直接反映特定 Partition 的 LSO 状态。"
+        }
+      ],
+      "references": [
+        "KIP-98: Exactly Once Delivery and Transactional Messaging — https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging",
+        "Apache Kafka Documentation: Consumer Configs — https://kafka.apache.org/documentation/#consumerconfigs_isolation.level",
+        "Kafka Source: Fetcher.java — CompletedFetch.parseRecord() 中的 Aborted Transaction 过滤逻辑",
+        "Confluent Blog: Transactions in Apache Kafka — https://www.confluent.io/blog/transactions-apache-kafka/"
+      ]
+    }
+  ]
+}
