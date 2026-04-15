@@ -1,0 +1,158 @@
+{
+  "id": "kafka-reliability-eos-impl",
+  "name": "Kafka EOS 实现原理",
+  "domain": "kafka",
+  "description": "深入解析 Kafka Exactly-Once Semantics 的两层实现机制：幂等性 Producer 与事务 API",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-reliability-eos-impl-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Kafka", "Exactly-Once", "EOS", "幂等性", "事务"],
+      "title": "Kafka 如何实现 Exactly-Once Semantics (EOS)？",
+      "content": "分布式系统里有一句流传很广的话：「Exactly-once 是不可能的。」这个断言在纯粹的分布式理论中确实成立——两个独立进程通过不可靠网络通信，无法在不引入额外协调机制的情况下保证消息恰好被处理一次。但 Kafka 从 0.11 版本开始宣称实现了 Exactly-Once Semantics（EOS），这件事引发了巨大的争议。LinkedIn 的工程师和 Kafka 核心团队的 Jay Kreps 专门写过长文辩论。那么 Kafka 的 EOS 到底做了什么？它真的是「真正的」exactly-once 吗？\n\n要回答这个问题，首先需要界定 Kafka 所说的 EOS 的边界。Kafka 的 EOS 并不是一个泛化的分布式 exactly-once 保证，它的精确含义是：在 Kafka 生态系统内部（Producer → Broker → Consumer），对于一条消息的「写入」操作，保证恰好生效一次。具体来说，Kafka 的 EOS 分为两个层次：\n\n第一层是**幂等性 Producer（Idempotent Producer）**。通过 `enable.idempotence=true` 开启后，Producer 端的每条消息携带 PID（Producer ID）和 Sequence Number，Broker 端通过校验 Sequence 的连续性来过滤重复写入。但幂等性的保障范围仅限于「单个 Producer 实例 → 单个 Partition」这条链路，且仅在 Producer 不重启的单次 Session 内有效。\n\n第二层是**事务 API（Transactional Producer + Consumer）**。这是 EOS 的完整形态。通过配置 `transactional.id`，Producer 可以将跨 Partition、跨 Topic 的多次写入操作包装成一个原子事务——要么全部对 Consumer 可见，要么全部不可见。事务 API 底层依赖一个专门的内部 Topic `__transaction_state` 和一个 Two-Phase Commit 协议来协调。\n\n面试官问你「Kafka 如何实现 EOS」的时候，他期待听到的不只是「开启 `enable.idempotence` 就行了」这种表面答案。他想考察的是：你是否理解 PID + Sequence Number 的去重机制？你是否知道 TransactionCoordinator 的角色和 `__transaction_state` Topic 的结构？你能否完整描述一个事务从 `initTransactions()` 到 `commitTransaction()` 的全生命周期？你是否了解 Transaction Marker（COMMIT/ABORT）是怎么写入 Partition Log 的？你是否知道 Consumer 端的 `isolation.level=read_committed` 是如何配合事务工作的？\n\n以下是一个最小化的事务 Producer 使用示例，理解这段代码的每一行背后发生了什么，就是本题的核心：\n\n```java\nProperties props = new Properties();\nprops.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, \"broker-1:9092\");\nprops.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, \"order-processor-txn-01\");\n// enable.idempotence 在设置 transactional.id 后自动为 true\nKafkaProducer<String, String> producer = new KafkaProducer<>(props);\n\nproducer.initTransactions();  // ① 注册 transactional.id，获取 PID + Epoch\ntry {\n    producer.beginTransaction();  // ② 标记事务开始\n    producer.send(new ProducerRecord<>(\"orders\", \"key1\", \"order-created\"));\n    producer.send(new ProducerRecord<>(\"inventory\", \"sku-1\", \"stock-deducted\"));\n    producer.commitTransaction();  // ③ 两阶段提交\n} catch (ProducerFencedException e) {\n    producer.close();  // 被更新的 Epoch fence 掉，必须关闭\n} catch (KafkaException e) {\n    producer.abortTransaction();  // ④ 回滚\n}\n```\n\n这四个步骤的背后各自触发了怎样的 Broker 端协议交互？Transaction Marker 是什么？`__transaction_state` 里记录了什么？Consumer 怎么知道哪些消息属于已提交的事务？这些问题的答案构成了对 Kafka EOS 实现原理的完整理解。",
+      "answer": "## 一、Exactly-Once Semantics 核心概念基础详解\n\n### 1.1 分布式消息投递的三种语义\n\n在展开 Kafka EOS 实现之前，先厘清分布式消息系统中的三种投递语义。At-most-once 意味着消息最多投递一次，可能丢失但不会重复，典型实现是 Producer 发送后不等确认、不做重试。At-least-once 意味着消息至少投递一次，不会丢失但可能重复，典型实现是 Producer 开启 `retries` 并配合 `acks=all`，网络超时后自动重发。Exactly-once 意味着消息恰好投递一次，既不丢失也不重复——这是最理想的语义，但在分布式环境中实现成本最高。\n\nKafka 在 0.11 之前只支持前两种语义。工程师们要在消费端实现「恰好一次」的效果，通常需要自己维护一套去重逻辑——比如用 Redis 存消息 fingerprint，或者在数据库层面用 UPSERT 做幂等写入。这些方案不是不能用，但它们把复杂度推给了每一个下游消费者，而且去重存储本身的一致性又成了新的问题。\n\nKafka 0.11（KIP-98、KIP-129）的核心设计哲学是：把 exactly-once 的保证下沉到 Kafka Broker 层面，让应用层不需要关心去重。这个设计分两步走：先用幂等性解决单 Partition 的重复写入问题，再用事务解决跨 Partition 的原子性问题。\n\n### 1.2 幂等性：EOS 的第一块基石\n\n幂等性 Producer 的原理在前序章节已经详细讲过，这里只做关键回顾。Producer 初始化时通过 `InitProducerId` RPC 从 Broker 获取一个全局唯一的 PID（64 位整数）和一个 Epoch（16 位整数）。之后 Producer 发送到每个 Partition 的消息 Batch 都会携带 `<PID, Epoch, Sequence Number>`。Broker 端的 `ProducerStateManager` 为每个 `<PID, Partition>` 维护 last sequence，收到新 Batch 时校验其 base sequence 是否等于 last sequence + 1——是则写入，小于等于则判定为重复投递并静默返回成功，跳跃则报错。\n\n幂等性的保障边界是「单 Producer 实例 + 单 Partition + 单 Session」。它解决的核心场景是：Producer 因网络超时触发了 `retries`，同一个 Batch 被发送了两次，Broker 能识别并只写入一次。但它无法解决两个问题——跨 Partition 的原子性（往 `orders` 和 `inventory` 两个 Topic 的写入不是原子的），以及跨 Session 的幂等性（Producer 重启后 PID 变化，之前的去重检查点失效）。这两个问题的解决需要事务 API。\n\n## 二、事务 API 的精准深度解析\n\n### 2.1 TransactionCoordinator 与 __transaction_state\n\n事务的协调者是 TransactionCoordinator，它运行在 Broker 端，每个 Broker 都有一个实例。当 Producer 配置了 `transactional.id` 并调用 `initTransactions()` 时，客户端首先通过 `FindCoordinator` RPC 找到负责管理该 `transactional.id` 的 TransactionCoordinator——定位方式是对 `transactional.id` 做哈希，取模 `__transaction_state` Topic 的 Partition 数量（默认 50），落到哪个 Partition，该 Partition 的 Leader Broker 上的 TransactionCoordinator 就负责管理这个事务。\n\n`__transaction_state` 是一个 Kafka 内部 Topic，默认 50 个 Partition，`replication.factor=3`，`cleanup.policy=compact`。它的 key 是 `transactional.id`，value 是该事务的当前状态（包括 PID、Epoch、事务状态机的当前阶段、涉及的 Partition 列表等）。这个 Topic 使用 Log Compaction 策略，保证同一个 `transactional.id` 只保留最新状态。TransactionCoordinator 在内存中维护事务状态的缓存，宕机恢复时从 `__transaction_state` 重放日志重建状态。\n\n### 2.2 事务的完整生命周期\n\n一个事务从开始到结束经历以下阶段，每一步都对应具体的 RPC 交互：\n\n**第一步：initTransactions()**。Producer 启动后调用此方法，触发两个关键动作。首先是 `FindCoordinator` 请求，定位负责此 `transactional.id` 的 TransactionCoordinator。然后是 `InitProducerId` 请求，Coordinator 检查该 `transactional.id` 是否有之前未完成的事务——如果有，先将其回滚（写入 ABORT 标记）。之后为该 Producer 分配（或恢复）PID 并递增 Epoch。Epoch 的递增是一个关键设计：如果有一个旧的 Producer 实例还在用同一个 `transactional.id` 发送消息（比如网络分区导致的脑裂），新 Epoch 会让 Broker 拒绝旧 Epoch 的所有请求，这就是所谓的「Zombie Fencing」。旧 Producer 的下一次发送会收到 `ProducerFencedException`，被强制关闭。\n\n**第二步：beginTransaction()**。这一步纯粹是客户端本地的状态标记，将 Producer 内部的事务状态从 `READY` 切换到 `IN_TRANSACTION`，不涉及任何网络请求。\n\n**第三步：send() — 消息发送**。Producer 调用 `send()` 将消息投递到目标 Partition。但在第一条消息发出之前，Producer 会先向 TransactionCoordinator 发送 `AddPartitionsToTxn` 请求，将目标 Partition 注册到当前事务中。Coordinator 收到后，在 `__transaction_state` 中记录该事务涉及的 Partition 列表，事务状态变为 `Ongoing`。随后 Producer 正常发送消息到目标 Partition 的 Leader Broker——这些消息会被写入 Partition Log，但此时它们对 `isolation.level=read_committed` 的 Consumer 不可见（稍后解释机制）。\n\n如果事务中还包含 Consumer Offset 的提交（典型的 consume-transform-produce 模式），Producer 会调用 `sendOffsetsToTransaction(offsets, consumerGroupId)`，这会触发 `AddOffsetsToTxn` 请求将 `__consumer_offsets` 对应的 Partition 也注册到事务中，然后通过 `TxnOffsetCommit` 请求将 offset 写入 `__consumer_offsets`（同样暂时对 read_committed Consumer 不可见）。\n\n**第四步：commitTransaction() — 两阶段提交**。这是整个事务协议中最复杂的部分，采用经典的 Two-Phase Commit（2PC）：\n\n第一阶段（Prepare）：Producer 向 TransactionCoordinator 发送 `EndTxn(COMMIT)` 请求。Coordinator 将事务状态更新为 `PrepareCommit`，并将这个状态变更持久化到 `__transaction_state`。一旦写入成功，事务就被视为「逻辑上已提交」——即使此时 Coordinator 宕机，恢复后也会继续完成第二阶段。\n\n第二阶段（Commit）：Coordinator 向事务涉及的每个 Partition 的 Leader Broker 发送 `WriteTxnMarkers` 请求，要求在这些 Partition 的 Log 末尾写入一条 Transaction Marker（也叫 Control Record），类型为 `COMMIT`。Transaction Marker 是一种特殊的 Kafka 消息，它不包含业务数据，只包含 `<PID, Epoch, COMMIT|ABORT>` 信息。当所有涉及的 Partition 都成功写入 COMMIT Marker 后，Coordinator 将事务状态更新为 `CompleteCommit` 并持久化到 `__transaction_state`。至此事务完成。\n\n如果第四步调用的是 `abortTransaction()`，流程类似，只是状态变为 `PrepareAbort`，写入的 Marker 类型为 `ABORT`，最终状态为 `CompleteAbort`。\n\n### 2.3 Consumer 端的 read_committed 隔离级别\n\n事务的写入端靠 Transaction Marker 标记提交或回滚，那读取端怎么配合？答案是 Consumer 的 `isolation.level` 配置。默认值 `read_uncommitted` 表示 Consumer 会读取所有消息，包括未提交事务中的消息——这等同于没有事务隔离。设置为 `read_committed` 后，Consumer 的行为发生关键变化：它只会读取「已提交事务中的消息」和「非事务消息」。\n\n实现机制是 Broker 为每个 Partition 维护一个 LSO（Last Stable Offset），它等于当前所有活跃事务中最小的起始 Offset。`read_committed` Consumer 的 `fetch` 请求只能读到 LSO 之前的消息。当一个事务提交后，其 COMMIT Marker 被写入，Broker 会推进 LSO，之前被「挡住」的消息就变得可读了。如果事务回滚，ABORT Marker 被写入后，Consumer 在读取时会根据 Marker 过滤掉属于该事务的所有消息（Consumer 客户端内部完成过滤）。\n\n这个机制有一个性能含义：如果一个长事务迟迟不提交，LSO 会停留在很低的位置，导致 `read_committed` Consumer 的可见数据大幅滞后。生产环境中 `transaction.timeout.ms`（默认 60000ms）控制事务的最大存活时间，超时后 Coordinator 会自动 Abort 该事务。\n\n### 2.4 关键配置一览\n\n```properties\n# Producer 端\ntransactional.id=order-processor-txn-01   # 事务 ID，跨重启保持不变\nenable.idempotence=true                    # 设置 transactional.id 后自动开启\ntransaction.timeout.ms=60000               # 事务超时，默认 60 秒\nmax.in.flight.requests.per.connection=5    # 幂等模式下上限 5\n\n# Consumer 端\nisolation.level=read_committed             # 只读已提交事务的消息\n\n# Broker 端\ntransactional.id.expiration.ms=604800000   # transactional.id 过期清理，默认 7 天\ntransaction.state.log.replication.factor=3 # __transaction_state 副本数\ntransaction.state.log.num.partitions=50    # __transaction_state 分区数\n```\n\n## 三、体系化扩展延伸\n\n### 3.1 EOS 的性能开销\n\n事务并非免费的午餐。开启事务后的额外开销主要来自三方面。第一，每个事务的 `beginTransaction` → `commitTransaction` 周期内，会额外产生 `AddPartitionsToTxn`、`EndTxn`、`WriteTxnMarkers` 等 RPC 请求，这些请求会增加事务的端到端延迟。根据 Confluent 的基准测试，在 Kafka 2.x 上，事务 Producer 的吞吐量相比非事务模式下降约 3%~5%，延迟增加约 20%~30%（主要来自 2PC 的额外一轮 Broker 写入）。第二，`__transaction_state` 的写入压力——每个事务至少触发 2 次对该 Topic 的写入（`Ongoing` 和 `PrepareCommit/CompleteCommit`），高频短事务会让这个 Topic 成为热点。第三，`read_committed` Consumer 受 LSO 机制影响，在存在大量并发事务时，消费延迟可能增加。\n\n最佳实践是将多条消息打包到一个事务中批量提交，而不是每条消息一个事务。典型的做法是按时间窗口（比如每 100ms）或按消息数量（比如每 200 条）批量提交。\n\n### 3.2 Kafka Streams 中的 EOS\n\nKafka Streams 是 EOS 的最大受益者。Streams 应用的核心模式是 consume-transform-produce：从输入 Topic 读取消息，处理后写入输出 Topic，同时提交 Consumer Offset。EOS 保证这三个操作（读取、处理、写入 + Offset 提交）作为一个原子单元执行。配置方式是设置 `processing.guarantee=exactly_once`（Kafka 2.5 之前）或 `processing.guarantee=exactly_once_v2`（Kafka 2.5+）。\n\n### 3.3 KIP-447：EOS v2（Kafka 2.5+）\n\n初版 EOS（Kafka 0.11~2.4）在 Kafka Streams 中有一个显著的扩展性问题：每个 Stream Task（对应一个输入 Partition）需要一个独立的 `transactional.id`，因此每个 Task 需要一个独立的 Producer 实例。如果一个 Streams 应用处理 1000 个 Partition，就需要 1000 个 Producer——这对内存和连接数是巨大的消耗。\n\nKIP-447（Kafka 2.5 引入）对此做了根本性优化。核心思想是：一个 Consumer Group 内的每个成员（Consumer 实例）共享一个 Producer 和一个 `transactional.id`，通过 Group Coordinator 和 Transaction Coordinator 的协作来保证跨 Rebalance 的事务安全。具体实现上，新增了 `AddPartitionsToTxn` v3 协议，允许在事务中附带 Consumer Group 的 Generation ID，当 Rebalance 发生、Generation ID 变化时，旧事务会被自动 Fence 掉。这使得 Kafka Streams 在 EOS 模式下只需要「实例数」个 Producer 而非「Task 数」个，大幅降低了资源占用。在 Streams 配置中，使用 `processing.guarantee=exactly_once_v2` 即可启用这一优化。\n\n### 3.4 EOS 的局限性与何时不该使用\n\n第一个局限：Kafka 的 EOS 只覆盖 Kafka 生态内部的写入操作。如果你的 Consumer 在消费消息后需要写入外部系统（比如 MySQL、Elasticsearch），Kafka 的事务无法覆盖外部系统的写入——你仍然需要在外部系统侧实现幂等逻辑。所谓的 end-to-end exactly-once 需要 Kafka 事务与外部系统的幂等写入配合才能实现。\n\n第二个局限：事务的超时机制（`transaction.timeout.ms`）意味着不适合长时间运行的事务。如果你的业务逻辑需要等待外部服务响应后才能决定提交还是回滚，而外部服务可能耗时数分钟，事务可能在等待期间被 Coordinator 自动 Abort。\n\n第三个判断标准：如果你的场景只是简单的单 Partition 写入（比如日志收集），幂等性 Producer 已经足够，不需要引入事务的额外复杂度。事务的核心价值在于跨 Partition / 跨 Topic 的原子写入，以及 consume-transform-produce 的端到端 exactly-once。如果你没有这些需求，开启幂等性（Kafka 3.0+ 默认开启）即可。",
+      "keyPoints": [
+        "Kafka EOS 分两层实现：幂等性 Producer（PID + Sequence Number）解决单 Partition 单 Session 内的重复写入，事务 API（TransactionCoordinator + 2PC）解决跨 Partition 跨 Session 的原子性",
+        "事务 Producer 通过 transactional.id 获取稳定的 PID 和递增的 Epoch，实现 Zombie Fencing——旧 Producer 实例收到 ProducerFencedException 后被强制关闭",
+        "事务状态由 __transaction_state 内部 Topic 持久化，使用 Log Compaction 策略，默认 50 个 Partition、3 副本，TransactionCoordinator 基于 transactional.id 的哈希值定位到具体 Partition",
+        "事务提交采用 Two-Phase Commit：第一阶段将状态写入 __transaction_state 为 PrepareCommit，第二阶段向所有涉及的 Partition 写入 COMMIT Transaction Marker（Control Record）",
+        "Consumer 通过 isolation.level=read_committed 配合事务工作，只能读到 LSO（Last Stable Offset）之前的消息，LSO 等于所有活跃事务中最小的起始 Offset",
+        "KIP-447（Kafka 2.5+）引入 EOS v2，将 Kafka Streams 从每 Task 一个 Producer 优化为每实例一个 Producer，通过 Consumer Group 的 Generation ID 实现跨 Rebalance 的事务安全",
+        "Kafka EOS 只覆盖 Kafka 生态内部的写入操作，对外部系统（MySQL、ES 等）的写入仍需在外部侧实现幂等逻辑，end-to-end exactly-once 需要两侧配合",
+        "事务的性能开销主要来自额外的协调 RPC 和 __transaction_state 写入，吞吐量下降约 3%~5%，延迟增加约 20%~30%，生产中应批量提交而非逐条提交"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz1",
+          "question": "Kafka 的 Exactly-Once Semantics (EOS) 的精确含义是什么？",
+          "choices": [
+            {"id": "A", "text": "保证消息从 Producer 到最终外部存储（如 MySQL）的端到端恰好一次投递"},
+            {"id": "B", "text": "保证在 Kafka 生态内部（Producer → Broker → Consumer），消息的写入操作恰好生效一次"},
+            {"id": "C", "text": "保证 Consumer 的业务处理逻辑恰好执行一次，即使 Consumer 重启也不会重复处理"},
+            {"id": "D", "text": "保证网络层面的 TCP 数据包恰好送达一次，从传输层消除重复"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的 EOS 精确定义是在 Kafka 生态系统内部保证消息写入恰好生效一次，覆盖 Producer → Broker 的去重写入以及跨 Partition 的原子性。选项 A 错在「端到端到外部存储」——Kafka 事务无法覆盖外部系统的写入，仍需外部侧实现幂等。选项 C 混淆了 Broker 端写入保证和 Consumer 业务逻辑保证——EOS 保证的是 Broker 上不出现重复消息，不是 Consumer 的业务处理不重复执行。选项 D 完全偏离了应用层语义的讨论。"
+        },
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz2",
+          "question": "Kafka EOS 的两层实现机制分别是什么？",
+          "choices": [
+            {"id": "A", "text": "幂等性 Producer（单 Partition 去重）+ 事务 API（跨 Partition 原子写入）"},
+            {"id": "B", "text": "Consumer 端去重表 + Producer 端消息 UUID"},
+            {"id": "C", "text": "Broker 端 WAL（Write-Ahead Log）+ Consumer 端 Offset 自动提交"},
+            {"id": "D", "text": "ZooKeeper 分布式锁 + Broker 端消息指纹去重"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka EOS 分两层：第一层是幂等性 Producer，通过 PID + Sequence Number 在 Broker 端实现单 Partition 的去重写入；第二层是事务 API，通过 TransactionCoordinator 和 Two-Phase Commit 实现跨 Partition、跨 Topic 的原子写入。选项 B 描述的是应用层的手动去重方案，不是 Kafka 内建的 EOS。选项 C 中 WAL 是 Kafka 本身的存储机制，与 EOS 无直接关系。选项 D 中 ZooKeeper 在 Kafka 事务协议中不参与去重。"
+        },
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz3",
+          "question": "TransactionCoordinator 是如何定位到负责某个 transactional.id 的 Broker 的？",
+          "choices": [
+            {"id": "A", "text": "对 transactional.id 做哈希，取模 __transaction_state Topic 的 Partition 数量，该 Partition 的 Leader Broker 即为 Coordinator"},
+            {"id": "B", "text": "所有事务统一由 Controller Broker 管理，不分区"},
+            {"id": "C", "text": "Producer 随机选择一个 Broker 作为 Coordinator"},
+            {"id": "D", "text": "通过 ZooKeeper 的临时节点选举 Coordinator"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "TransactionCoordinator 的定位方式是对 transactional.id 做哈希取模 __transaction_state Topic 的 Partition 数量（默认 50），落到哪个 Partition，该 Partition 的 Leader Broker 上的 TransactionCoordinator 就负责管理这个事务 ID。这个设计与 GroupCoordinator 的定位方式（对 group.id 哈希取模 __consumer_offsets 的 Partition 数）完全一致。选项 B 错在 Controller 并不负责事务协调。选项 C 的随机选择无法保证同一个 transactional.id 总是由同一个 Coordinator 管理。选项 D 中 ZooKeeper 不参与 TransactionCoordinator 的定位。"
+        },
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz4",
+          "question": "Producer 调用 initTransactions() 时，如果 Coordinator 发现该 transactional.id 存在未完成的旧事务，会怎么处理？",
+          "choices": [
+            {"id": "A", "text": "等待旧事务自然超时后再初始化新事务"},
+            {"id": "B", "text": "先将旧事务回滚（写入 ABORT 标记），然后递增 Epoch 并分配 PID"},
+            {"id": "C", "text": "直接忽略旧事务，为新 Producer 分配新的 PID 和 Epoch"},
+            {"id": "D", "text": "抛出异常要求 Producer 手动调用 abortTransaction() 后重试"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "initTransactions() 是一个带有清理语义的初始化操作。Coordinator 发现该 transactional.id 有未完成的旧事务时，会先将其回滚（向涉及的 Partition 写入 ABORT Marker），然后递增 Epoch——新 Epoch 使得旧 Producer 实例（如果还存活）的后续请求被 Fence 掉。选项 A 错在 initTransactions 不会等待超时，而是主动清理。选项 C 忽略旧事务会导致 Partition 上残留未提交的事务消息，影响 read_committed Consumer。选项 D 错在旧 Producer 可能已经崩溃，无法手动 abort。"
+        },
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz5",
+          "question": "事务提交（commitTransaction）的 Two-Phase Commit 中，第一阶段完成后 Coordinator 宕机，恢复后会怎样？",
+          "choices": [
+            {"id": "A", "text": "事务被自动回滚，因为第二阶段未完成"},
+            {"id": "B", "text": "事务状态丢失，需要 Producer 重新发起整个事务"},
+            {"id": "C", "text": "Coordinator 从 __transaction_state 恢复 PrepareCommit 状态，继续执行第二阶段写入 COMMIT Marker"},
+            {"id": "D", "text": "事务永久挂起，需要运维人员手动介入清理"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这就是两阶段提交的核心价值所在。第一阶段将 PrepareCommit 状态持久化到 __transaction_state 后，事务就被视为「逻辑上已提交」。即使 Coordinator 此时宕机，新的 Coordinator（该 Partition 的新 Leader）从 __transaction_state 重放日志后会恢复到 PrepareCommit 状态，然后继续向各 Partition 写入 COMMIT Marker 完成第二阶段。选项 A 错在第一阶段已经决定了提交方向，不会回滚。选项 B 错在 __transaction_state 是持久化的，状态不会丢失。选项 D 错在 Coordinator 会自动恢复和继续。"
+        },
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz6",
+          "question": "Transaction Marker（Control Record）的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "记录事务涉及的所有消息的 Offset 列表，供 Consumer 端做过滤"},
+            {"id": "B", "text": "写入 Partition Log 末尾的特殊消息，标记其前面属于该 PID 的消息是 COMMIT 还是 ABORT，read_committed Consumer 据此过滤"},
+            {"id": "C", "text": "替换 Partition Log 中属于该事务的所有消息，将它们物理删除或标记为已提交"},
+            {"id": "D", "text": "写入 __transaction_state Topic 中，记录事务的最终状态"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Transaction Marker 是一种特殊的 Control Record，由 Coordinator 通过 WriteTxnMarkers 请求写入到事务涉及的每个 Partition 的 Log 末尾。它不包含业务数据，只包含 <PID, Epoch, COMMIT|ABORT> 信息。read_committed Consumer 在读取 Partition Log 时，遇到 COMMIT Marker 则认为前面属于该 PID 的消息有效，遇到 ABORT Marker 则在客户端侧过滤掉属于该 PID 的消息。选项 A 错在 Marker 不记录 Offset 列表。选项 C 错在不会物理删除消息。选项 D 描述的是事务状态日志，不是 Transaction Marker。"
+        },
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz7",
+          "question": "Consumer 设置 isolation.level=read_committed 后，其可见消息范围受什么控制？",
+          "choices": [
+            {"id": "A", "text": "受 HW（High Watermark）控制，只能读到所有副本都已同步的消息"},
+            {"id": "B", "text": "受 LSO（Last Stable Offset）控制，只能读到所有活跃事务中最小起始 Offset 之前的消息"},
+            {"id": "C", "text": "受 LEO（Log End Offset）控制，可以读到 Leader 上所有已写入的消息"},
+            {"id": "D", "text": "受 Consumer 本地 Offset 缓存控制，与 Broker 端事务状态无关"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "read_committed Consumer 的可见消息范围由 LSO（Last Stable Offset）决定。LSO 等于当前所有活跃（未提交/未回滚）事务中最小的起始 Offset。这意味着只要有一个长事务迟迟不提交，LSO 就会停留在较低位置，阻塞 read_committed Consumer 读取后续消息。选项 A 的 HW 控制的是副本同步边界，不是事务可见性。选项 C 的 LEO 是 Leader 上最新写入位置，read_uncommitted Consumer 也只能读到 HW 而非 LEO。选项 D 完全错误，read_committed 依赖 Broker 端的 LSO 机制。"
+        },
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz8",
+          "question": "KIP-447（EOS v2，Kafka 2.5+）解决的核心问题是什么？",
+          "choices": [
+            {"id": "A", "text": "消除事务 Producer 的性能开销，使事务模式与非事务模式吞吐量一致"},
+            {"id": "B", "text": "将 Kafka Streams EOS 模式从每 Task 一个 Producer 优化为每实例一个 Producer，大幅降低资源占用"},
+            {"id": "C", "text": "支持跨 Kafka 集群的分布式事务"},
+            {"id": "D", "text": "允许 Consumer 端直接参与事务的提交和回滚决策"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "EOS v1 在 Kafka Streams 中要求每个 Stream Task（对应一个输入 Partition）有独立的 transactional.id 和 Producer 实例。如果处理 1000 个 Partition 就需要 1000 个 Producer，对内存和连接数消耗巨大。KIP-447 通过让同一个 Consumer Group 成员共享一个 Producer，并利用 Group 的 Generation ID 实现跨 Rebalance 的事务安全，将 Producer 数量从 Task 级别降为实例级别。选项 A 错在 EOS v2 并未消除事务开销。选项 C 错在 Kafka 事务不支持跨集群。选项 D 错在 Consumer 端只是被动的读取端。"
+        },
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz9",
+          "question": "以下哪种场景仅靠幂等性 Producer 即可满足，不需要使用事务 API？",
+          "choices": [
+            {"id": "A", "text": "订单创建后需要同时写入 orders Topic 和 notifications Topic，保证原子性"},
+            {"id": "B", "text": "日志收集服务将应用日志写入单个 Topic 的固定 Partition，需要去除网络重试导致的重复"},
+            {"id": "C", "text": "Kafka Streams 应用需要 consume-transform-produce 的端到端 exactly-once"},
+            {"id": "D", "text": "Producer 频繁重启，需要保证重启前后不产生重复消息"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "幂等性 Producer 的保障边界是「单 Producer 实例 → 单 Partition → 单 Session」。日志收集写入单个 Partition、只需去除网络重试导致的重复，完全在幂等性的保障范围内。选项 A 涉及跨 Topic 的原子写入，需要事务。选项 C 的 consume-transform-produce 模式需要将消费 Offset 提交和消息产出包装在同一个事务中。选项 D 涉及跨 Session（重启后 PID 变化），幂等性无法覆盖，需要事务的 transactional.id 来保持跨重启的 PID 稳定性。"
+        },
+        {
+          "id": "kafka-reliability-eos-impl-q1-quiz10",
+          "question": "如果一个事务长时间未提交，超过 transaction.timeout.ms（默认 60 秒），会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Coordinator 自动将该事务 Abort，并向涉及的 Partition 写入 ABORT Marker，LSO 向前推进"},
+            {"id": "B", "text": "Coordinator 自动将该事务 Commit，避免长时间阻塞 read_committed Consumer"},
+            {"id": "C", "text": "事务保持 Ongoing 状态直到 Producer 显式提交或回滚，不受超时影响"},
+            {"id": "D", "text": "Broker 将事务涉及的消息物理删除，释放磁盘空间"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "transaction.timeout.ms 是事务的最大存活时间。超时后 TransactionCoordinator 会主动将该事务标记为 Abort，向涉及的所有 Partition 写入 ABORT Marker。这样做的目的是避免长事务阻塞 LSO，导致 read_committed Consumer 长时间无法读取新消息。选项 B 错在超时不会自动提交，自动提交未完成的事务可能导致数据不一致。选项 C 错在 Kafka 有主动的超时回滚机制。选项 D 错在 ABORT 后消息不会被物理删除，只是 Consumer 端会过滤。"
+        }
+      ],
+      "references": [
+        "KIP-98: Exactly Once Delivery and Transactional Messaging - https://cwiki.apache.org/confluence/display/KAFKA/KIP-98",
+        "KIP-129: Streams Exactly-Once Semantics - https://cwiki.apache.org/confluence/display/KAFKA/KIP-129",
+        "KIP-447: Producer scalability for exactly once semantics - https://cwiki.apache.org/confluence/display/KAFKA/KIP-447",
+        "Kafka Documentation: Transactions - https://kafka.apache.org/documentation/#semantics",
+        "Confluent Blog: Exactly-Once Semantics Are Possible - https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/"
+      ]
+    }
+  ]
+}
