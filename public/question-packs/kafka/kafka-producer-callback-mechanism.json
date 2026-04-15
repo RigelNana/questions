@@ -1,0 +1,156 @@
+{
+  "id": "kafka-producer-callback-mechanism",
+  "name": "Producer Callback 机制",
+  "domain": "kafka",
+  "description": "详解 KafkaProducer 异步发送的 Callback 回调机制与执行流程",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-producer-callback-mechanism-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["Producer", "Callback", "异步发送", "RecordMetadata", "异常处理"],
+      "title": "Producer 的 Callback 机制是如何工作的？",
+      "content": "你的团队最近上线了一个订单事件推送服务，使用 KafkaProducer 将订单状态变更消息异步发送到 `order-events` Topic。代码大致是这样写的：\n\n```java\nproducer.send(new ProducerRecord<>(\"order-events\", orderId, payload), (metadata, exception) -> {\n    if (exception != null) {\n        log.error(\"订单消息发送失败: orderId={}\", orderId, exception);\n        failureCounter.increment();\n    } else {\n        log.info(\"发送成功: partition={}, offset={}\", metadata.partition(), metadata.offset());\n    }\n});\n```\n\n上线第一天一切正常，Callback 中的成功日志和 Prometheus 指标都在正常输出。但到了第三天，运维反馈下游消费者出现了明显的消息延迟，你去看 Producer 端的日志，发现一个诡异的现象：最近两个小时内，Callback 里的 `log.info` 和 `log.error` 都完全没有输出——不是发送失败，而是 Callback 根本没有被调用。`failureCounter` 和 `successCounter` 两个指标同时停止增长，但应用进程还活着，send() 方法也没有抛出异常，上游业务系统还在源源不断地调用 send()。\n\n你的第一反应是看 Producer 的 JMX 指标，发现 `record-queue-time-avg`（消息在缓冲区中等待的平均时间）从正常的 5ms 飙到了 58 秒，`request-latency-avg` 也从 3ms 涨到了 45 秒。但 Broker 端的监控显示集群完全健康，其他 Producer 实例发送正常。\n\n进一步排查发现，问题出在 Callback 自身。一位同事在前一天的版本迭代中，在 Callback 内部加了一段「发送失败时同步写入 MySQL 补偿表」的逻辑：\n\n```java\nproducer.send(record, (metadata, exception) -> {\n    if (exception != null) {\n        // 问题代码：在 Callback 中做同步数据库写入\n        compensationDao.insertSync(record.key(), record.value(), exception.getMessage());\n        log.error(\"写入补偿表完成: orderId={}\", record.key());\n    } else {\n        log.info(\"发送成功: partition={}, offset={}\", metadata.partition(), metadata.offset());\n    }\n});\n```\n\n当 Broker 端某个分区的 Leader 发生了短暂切换（约 15 秒），触发了一批消息的发送失败回调。这些回调在 Sender 线程中串行执行，每次同步写入 MySQL 耗时 50-200ms，几百个失败回调堆积起来直接把 Sender 线程阻塞了数分钟。Sender 线程被卡住后，不仅后续的失败回调无法执行，连正常的成功回调也全部排队等待，RecordAccumulator 中的消息无法被发送出去，最终导致缓冲区逐渐填满、send() 开始阻塞上游业务线程。\n\n这个真实案例的核心问题是：KafkaProducer 的 Callback 到底在哪个线程执行？它的执行时机和顺序保证是怎样的？为什么一个阻塞的 Callback 能让整个 Producer 瘫痪？",
+      "answer": "## KafkaProducer 核心概念基础\n\nKafkaProducer 是 Apache Kafka 官方 Java 客户端中负责消息生产的核心组件，定义在 `org.apache.kafka.clients.producer` 包中。它的核心使命是将业务消息高效、可靠地从应用端投递到 Kafka Broker 集群。在 Kafka 3.x 系列版本中，KafkaProducer 的架构设计已经非常成熟，其内部采用经典的双线程模型：应用线程（即调用 `send()` 的业务线程）负责消息的拦截、序列化和分区计算，然后将消息追加到内存缓冲区 RecordAccumulator 中；Sender 线程（也叫 I/O 线程）则在后台持续运转，从缓冲区拉取就绪的 ProducerBatch，通过 NIO 网络通道批量发送给目标 Broker。\n\nCallback（回调）是 KafkaProducer 异步编程模型中最核心的用户扩展点。`org.apache.kafka.clients.producer.Callback` 是一个只有单方法的函数式接口，定义极其简洁：\n\n```java\npublic interface Callback {\n    void onCompletion(RecordMetadata metadata, Exception exception);\n}\n```\n\n这个接口遵循一个明确的契约：`metadata` 和 `exception` 两个参数互斥——消息发送成功时 `metadata` 非空、`exception` 为 null；发送失败时 `exception` 非空、`metadata` 为 null。这个互斥语义在 Kafka 源码 `org.apache.kafka.clients.producer.internals.ProduceRequestResult` 的实现中被严格保证。使用 Callback 的最基础代码如下：\n\n```java\n// 创建 Producer 实例（线程安全，全局复用）\nProperties props = new Properties();\nprops.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, \"kafka01:9092,kafka02:9092,kafka03:9092\");\nprops.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());\nprops.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());\nprops.put(ProducerConfig.ACKS_CONFIG, \"all\");\nKafkaProducer<String, String> producer = new KafkaProducer<>(props);\n\n// 带 Callback 的异步发送\nProducerRecord<String, String> record = new ProducerRecord<>(\"order-events\", \"order-123\", \"{\\\"status\\\":\\\"paid\\\"}\");\nproducer.send(record, (metadata, exception) -> {\n    if (exception == null) {\n        // metadata 包含消息落盘后的精确坐标\n        System.out.printf(\"发送成功 → topic=%s, partition=%d, offset=%d, timestamp=%d%n\",\n            metadata.topic(), metadata.partition(), metadata.offset(), metadata.timestamp());\n    } else {\n        System.err.println(\"发送失败: \" + exception.getMessage());\n    }\n});\n```\n\n调用 `send()` 后消息并不会立即通过网络发出，而是被追加到 RecordAccumulator 对应 TopicPartition 的 ProducerBatch 中，send() 几乎立刻返回一个 `Future<RecordMetadata>`。真正的网络 I/O、Broker 应答接收、以及 Callback 的触发，全部由后台 Sender 线程异步完成。理解这个执行模型，是理解 Callback 机制的前提。\n\n## Callback 机制的精准深度解答\n\n### Callback 的执行时机与线程模型\n\n这是面试中最核心的考点：Callback 在哪个线程中被调用？答案是 **Sender 线程**（I/O 线程），而不是调用 send() 的应用线程。从源码角度看，Sender 线程在每一轮事件循环中通过 `NetworkClient.poll()` 收取 Broker 的 ProduceResponse，然后调用 `ProducerBatch.done()` 方法完成该批次的处理，`done()` 方法内部会遍历这个 Batch 中所有消息的 Callback 并逐一调用 `onCompletion()`。整个调用链是这样的：\n\n```\nSender.run()\n  → Sender.sendProducerData()      // 发送就绪 Batch\n  → Sender.runOnce()\n    → NetworkClient.poll()          // 收取 Broker 响应\n    → handleProduceResponse()       // 处理 ProduceResponse\n      → ProducerBatch.done()        // 完成该 Batch\n        → Thunk.callback.onCompletion()  // 逐条调用用户 Callback\n```\n\nKafka 源码中，每条消息在追加到 ProducerBatch 时会被包装成一个 `Thunk` 对象（定义在 `ProducerBatch` 内部类中），Thunk 持有该消息对应的 Callback 引用和 FutureRecordMetadata。当 Batch 完成时（无论成功还是失败），Sender 线程会串行执行该 Batch 内所有 Thunk 的 Callback。这个「串行」极其关键——一个 Callback 卡住，后面所有 Callback 以及后续 Batch 的处理都会被阻塞，Sender 线程只有一个，它是全局共享的。\n\n### RecordMetadata 包含的信息\n\n当消息发送成功时，Callback 收到的 `RecordMetadata` 对象携带了消息在 Broker 端的精确落盘坐标，包含以下关键字段：`topic()` 返回消息实际写入的 Topic 名称；`partition()` 返回消息落入的分区编号；`offset()` 返回该消息在分区内的唯一偏移量，这是消费者定位消息的核心坐标；`timestamp()` 返回消息的时间戳，根据 Topic 配置 `message.timestamp.type` 的不同，它可能是 Producer 端设置的 CreateTime，也可能是 Broker 端写入时的 LogAppendTime；`serializedKeySize()` 和 `serializedValueSize()` 返回序列化后 Key 和 Value 的字节数，这在监控消息体积时很有用。需要注意的是，如果 Topic 开启了压缩（`compression.type` 不为 none），`offset()` 返回的是压缩批次中最后一条消息的 offset，而不是当前消息的 offset——这是 Kafka 的实现细节，在消息追踪场景下容易踩坑。\n\n### 异常参数的类型体系\n\n当消息发送失败时，Callback 收到的 `exception` 参数是 `org.apache.kafka.common.KafkaException` 的某个子类。Kafka 将异常分为两大类：可重试异常（`RetriableException` 的子类）和不可重试异常。可重试异常包括 `NetworkException`（网络连接中断）、`NotLeaderOrFollowerException`（Leader 切换）、`UnknownTopicOrPartitionException`（元数据尚未同步完成）、`TimeoutException`（请求超时）等，这类异常意味着问题可能是暂时的，Producer 内部的重试机制（由 `retries` 和 `delivery.timeout.ms` 控制）会自动重试。只有当所有内部重试都耗尽后，最终的异常才会传递到 Callback。不可重试异常包括 `RecordTooLargeException`（消息体超过 `max.request.size` 或 Broker 端 `message.max.bytes` 限制）、`SerializationException`（序列化失败，通常是代码 Bug）、`AuthorizationException`（ACL 权限不足）等，这类异常会立即传递到 Callback 而不会重试。\n\n在 Callback 中区分这两类异常非常有工程意义：\n\n```java\nproducer.send(record, (metadata, exception) -> {\n    if (exception == null) {\n        metricsRegistry.counter(\"kafka.send.success\").increment();\n        return;\n    }\n    if (exception instanceof RetriableException) {\n        // 所有内部重试已耗尽，仍然失败\n        // 说明 Broker 可能持续不可用，写入降级队列\n        log.warn(\"消息重试耗尽仍失败: {}\", exception.getMessage());\n        degradedQueue.offer(record);\n    } else {\n        // 不可重试错误，通常需要人工介入\n        log.error(\"不可重试的发送错误\", exception);\n        alertService.fire(\"kafka-producer-fatal\", exception.getMessage());\n    }\n});\n```\n\n### Callback 的执行顺序保证\n\nKafka 官方文档明确给出了一个重要保证：**对于发往同一个 Partition 的消息，Callback 的调用顺序与 send() 的调用顺序一致**。这个保证的实现原理是：发往同一 Partition 的消息会被追加到同一个 ProducerBatch（或相邻的 Batch）中，而 Batch 内部的 Thunk 列表维护了 append 顺序，Sender 线程在调用 Callback 时按 Thunk 列表顺序串行执行。但要注意，**跨 Partition 的 Callback 没有顺序保证**——因为不同 Partition 的 Batch 可能由不同的 ProduceRequest 承载，Broker 的响应到达顺序不确定。\n\n这个顺序保证在某些场景下非常有用。比如你在 Callback 中维护一个「最后成功发送的 offset」用于断点续传，同 Partition 内的顺序保证意味着你看到 offset=100 的成功回调后，可以确定 offset 99 之前的回调一定已经执行过了。\n\n### 阻塞 Callback 的灾难性后果\n\n回到 content 中的故障场景，这是生产环境中最常见的 Callback 使用事故。Sender 线程只有一个，它承担着从 RecordAccumulator 拉取 Batch、通过网络发送到 Broker、接收 Broker 响应、调用 Callback 这一完整链路。一旦某个 Callback 阻塞了 Sender 线程（比如同步写数据库、同步调用 HTTP 接口、做大量计算），整条链路就停滞了。具体表现为：后续所有 Callback 排队等待无法被调用；新的 ProducerBatch 无法被发送出去导致 RecordAccumulator 持续积压；当缓冲区占满 `buffer.memory`（默认 32MB）后，应用线程调用 send() 时会被阻塞最多 `max.block.ms`（默认 60 秒），超时后抛出 `TimeoutException`。也就是说，一个阻塞的 Callback 最终会从 I/O 线程反压到所有业务线程，导致整个应用的吞吐量归零。这就是为什么 Kafka 官方文档中反复强调：**Callback 中不应执行阻塞操作或耗时逻辑**。\n\n排查这类问题的最直接手段是对 Sender 线程做 thread dump。在 JVM 中执行 `jstack <pid>` 或通过 JMX 获取线程栈，找到名为 `kafka-producer-network-thread | producer-1` 的线程（后缀数字是 Producer 的 `client.id`），如果它的栈帧停在你的 Callback 代码中（比如 JDBC 驱动的 `socketRead0`），问题就定位了。\n\n## 体系化扩展\n\n### send().get() 同步模式 vs Callback 异步模式\n\n`send().get()` 通过阻塞调用线程来获取发送结果，编程模型简单但吞吐量低下——每条消息都要等待一次完整的 Broker 往返（RTT 通常 1-5ms），实测在 acks=all 配置下吞吐量约 2000-5000 msg/s。Callback 异步模式下应用线程只负责将消息投入缓冲区后立即返回，Sender 线程通过批量发送和 Pipeline（`max.in.flight.requests.per.connection` 默认 5 个在途请求）实现了 10 万+ msg/s 的吞吐量。两者的本质区别在于：同步模式下网络等待时间由应用线程承担，Sender 线程的批量优势被浪费；异步模式下应用线程和网络 I/O 完全并行，Sender 线程可以充分利用批量和 Pipeline 机制。\n\n但有一个容易忽略的点：即使使用 `send().get()`，消息仍然先进入 RecordAccumulator，只是 `get()` 会阻塞到 Sender 线程完成该消息的发送并收到 Broker 确认。所以 `send().get()` 并不是绕过了 Sender 线程直接发送，它只是用 Future 的阻塞语义模拟了同步行为。\n\n### 生产环境 Callback 最佳实践\n\nCallback 中应该只做三件事：记录指标（counter increment，O(1) 操作）、记录日志（异步 logger 如 Log4j2 AsyncAppender）、投递到内存队列（如 `ConcurrentLinkedQueue` 或 Disruptor RingBuffer）供其他线程异步处理。绝对不要在 Callback 中做同步 I/O 操作。如果你确实需要在发送失败时写补偿表，正确的做法是在 Callback 中将失败消息投入一个 BlockingQueue，然后由专门的补偿线程从队列中消费并写入数据库：\n\n```java\nprivate final BlockingQueue<FailedRecord> compensationQueue = new LinkedBlockingQueue<>(10000);\n\n// Callback 中只做轻量操作\nproducer.send(record, (metadata, exception) -> {\n    if (exception != null) {\n        boolean offered = compensationQueue.offer(\n            new FailedRecord(record.key(), record.value(), exception));\n        if (!offered) {\n            log.error(\"补偿队列已满，丢弃失败消息: key={}\", record.key());\n        }\n    }\n});\n\n// 独立的补偿线程处理持久化\nExecutors.newSingleThreadExecutor().submit(() -> {\n    while (!Thread.currentThread().isInterrupted()) {\n        FailedRecord failed = compensationQueue.take();\n        compensationDao.insertSync(failed.key(), failed.value(), failed.errorMsg());\n    }\n});\n```\n\n### 与 Spring Kafka 的关系\n\n在 Spring Kafka 生态中，`KafkaTemplate.send()` 返回的是 `CompletableFuture<SendResult<K, V>>`（Spring Kafka 3.0+ 版本，对应 Spring Boot 3.x；2.x 版本返回的是 `ListenableFuture`，已在 Spring 6 中废弃）。Spring 在底层仍然使用原生 KafkaProducer 的 Callback 机制，只是将其包装为更符合 Spring 风格的 CompletableFuture API：\n\n```java\n// Spring Kafka 3.x 写法\nkafkaTemplate.send(\"order-events\", orderId, payload)\n    .thenAccept(result -> {\n        RecordMetadata m = result.getRecordMetadata();\n        log.info(\"发送成功: partition={}, offset={}\", m.partition(), m.offset());\n    })\n    .exceptionally(ex -> {\n        log.error(\"发送失败\", ex);\n        return null;\n    });\n```\n\n但这里有一个隐藏陷阱：`thenAccept` 和 `exceptionally` 的执行线程取决于 CompletableFuture 的完成时机。如果 Future 在 `thenAccept` 注册之前就已经完成了（比如发送非常快），回调会在调用 `thenAccept` 的当前线程（通常是业务线程）中执行；如果 Future 在 `thenAccept` 注册之后才完成，回调会在完成 Future 的线程中执行——而这个线程正是 Kafka 的 Sender 线程。所以即使用了 Spring Kafka 的 CompletableFuture 包装，同样不能在回调中做阻塞操作，风险与直接使用原生 Callback 完全一样。\n\n### 面试回答技巧\n\n回答这道题时，建议按「接口定义 → 执行线程 → 顺序保证 → 避坑要点」四段式组织。第一段说清楚 Callback 接口的 `onCompletion(RecordMetadata, Exception)` 签名和参数互斥语义；第二段强调 Callback 在 Sender I/O 线程中执行，而不是应用线程，这是区分背概念和真懂原理的分水岭；第三段提及同 Partition 的顺序保证；第四段以「不能在 Callback 里做阻塞操作」收尾，如果能配合一个真实的阻塞导致 Producer 瘫痪的案例，面试官会非常满意。如果面试官进一步追问异常处理，把 `RetriableException` 和不可重试异常的分类讲清楚，说明 Callback 收到的异常已经是 Producer 内部重试耗尽后的最终结果，展示你对 `delivery.timeout.ms` 和重试机制关系的理解。",
+      "keyPoints": [
+        "Callback 在 Sender（I/O）线程中被调用而非应用线程，整个 Producer 实例共享同一个 Sender 线程，阻塞 Callback 会导致所有分区的消息发送停滞",
+        "RecordMetadata 包含消息落盘的精确坐标：topic、partition、offset、timestamp、serializedKeySize 和 serializedValueSize",
+        "Callback 的 metadata 和 exception 参数互斥——成功时 exception 为 null，失败时 metadata 为 null，这是 Kafka 源码中的硬性契约",
+        "对于发往同一 Partition 的消息，Callback 的调用顺序与 send() 的调用顺序严格一致，但跨 Partition 无顺序保证",
+        "Callback 收到的异常已经是 Producer 内部重试耗尽后的最终结果，分为 RetriableException（如 NetworkException、NotLeaderOrFollowerException）和不可重试异常（如 RecordTooLargeException、SerializationException）",
+        "Callback 中只应做 O(1) 级别的轻量操作（计数器递增、异步日志、内存队列投递），需要做 I/O 的逻辑应委托给独立线程",
+        "Spring Kafka 的 CompletableFuture 底层仍依赖原生 Callback 机制，thenAccept/exceptionally 同样可能在 Sender 线程中执行，阻塞风险与原生 Callback 相同",
+        "排查 Callback 不触发的首选手段是对 kafka-producer-network-thread 线程做 jstack dump，检查 Sender 线程是否阻塞在用户代码中"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz1",
+          "question": "KafkaProducer 的 Callback 接口中 onCompletion 方法的两个参数是什么关系？",
+          "choices": [
+            {"id": "A", "text": "互斥关系：成功时 metadata 非空且 exception 为 null，失败时 exception 非空且 metadata 为 null"},
+            {"id": "B", "text": "两者可以同时非空：失败时 metadata 包含部分信息，exception 包含错误详情"},
+            {"id": "C", "text": "两者可以同时为 null：当消息发送超时但未确认时两个参数都为 null"},
+            {"id": "D", "text": "只有 exception 参数有实际意义，metadata 在任何情况下都可能为 null"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka 官方文档和源码（ProducerBatch.done() 方法）明确保证 metadata 和 exception 互斥：发送成功时 metadata 携带消息在 Broker 端的精确落盘坐标、exception 为 null；发送失败时 exception 携带错误信息、metadata 为 null。选 B 的误区来源于某些消息中间件（如 RocketMQ 的 SendResult）在部分成功时会返回不完整的元数据，但 Kafka 不是这样设计的。选 C 不存在这种情况，即使超时也会以 TimeoutException 传递到 exception 参数。选 D 不正确，成功时 metadata 一定非空。"
+        },
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz2",
+          "question": "KafkaProducer 的 Callback 在哪个线程中被执行？",
+          "choices": [
+            {"id": "A", "text": "调用 send() 的应用业务线程"},
+            {"id": "B", "text": "Producer 内部的 Sender（I/O）线程"},
+            {"id": "C", "text": "JVM 的 ForkJoinPool commonPool 线程"},
+            {"id": "D", "text": "Callback 专用的回调线程池"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Callback 在 Producer 的 Sender 线程（线程名格式为 kafka-producer-network-thread | <client.id>）中被调用。Sender 线程在收到 Broker 的 ProduceResponse 后，通过 ProducerBatch.done() 方法串行调用该 Batch 内所有消息的 Callback。选 A 是最常见的误解，很多开发者以为 Callback 会在自己调用 send() 的线程中异步回调。选 C 是将 Kafka 与 Java CompletableFuture 的默认执行器搞混了。选 D 也不正确，Kafka Producer 没有为 Callback 分配独立的线程池，这也是为什么阻塞 Callback 会导致 Sender 线程卡住。"
+        },
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz3",
+          "question": "发往同一 Partition 的两条消息 M1（先 send）和 M2（后 send），它们的 Callback 调用顺序是怎样的？",
+          "choices": [
+            {"id": "A", "text": "M1 的 Callback 一定先于 M2 的 Callback 被调用"},
+            {"id": "B", "text": "M2 的 Callback 可能先于 M1 被调用，取决于 Broker 的处理速度"},
+            {"id": "C", "text": "两者的 Callback 可能在不同线程中并发执行，无顺序保证"},
+            {"id": "D", "text": "只有当 max.in.flight.requests.per.connection=1 时才保证 M1 先于 M2"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka 官方文档明确保证：对于发往同一 Partition 的消息，Callback 的调用顺序与 send() 的调用顺序一致。这个保证源于同一 Partition 的消息会被追加到相同或相邻的 ProducerBatch 中，Batch 内部的 Thunk 列表维护了 append 顺序，Sender 线程按此顺序串行调用 Callback。选 B 的误区是将 Broker 端的处理顺序与客户端 Callback 顺序混淆了。选 C 不正确，所有 Callback 都在同一个 Sender 线程中串行执行，不存在并发。选 D 把消息发送到 Broker 的顺序保证（需要幂等或 in-flight=1）与 Callback 调用顺序保证搞混了——Callback 的顺序保证不依赖 max.in.flight 配置。"
+        },
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz4",
+          "question": "当 Callback 收到一个 RetriableException 时，说明了什么？",
+          "choices": [
+            {"id": "A", "text": "Producer 内部的重试机制已耗尽（delivery.timeout.ms 超时），最终仍然失败"},
+            {"id": "B", "text": "该异常刚发生，Producer 还没有尝试重试，需要用户在 Callback 中手动重试"},
+            {"id": "C", "text": "Producer 只重试了一次就放弃了，需要增大 retries 参数"},
+            {"id": "D", "text": "该异常是 Broker 端返回的警告，消息实际上已经写入成功"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Callback 收到的异常是 Producer 内部重试机制耗尽后的最终结果。Kafka 2.1+ 中 retries 默认为 Integer.MAX_VALUE（几乎无限重试），真正控制重试上限的是 delivery.timeout.ms（默认 120 秒）。只有在这个时间窗口内所有重试都失败后，异常才会传递到 Callback。选 B 是非常危险的误解，如果开发者基于这个错误认知在 Callback 中再次调用 send() 进行「手动重试」，可能导致消息重复发送和无限重试循环。选 C 不正确，Kafka 的重试次数远不止一次。选 D 混淆了异常和警告的概念，Callback 收到 exception 意味着消息确实没有被成功写入。"
+        },
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz5",
+          "question": "对 Producer 做 jstack，发现 kafka-producer-network-thread 线程长时间停在 java.net.SocketInputStream.socketRead0()，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Callback 中执行了同步的网络 I/O 操作（如 JDBC 查询或 HTTP 调用），阻塞了 Sender 线程"},
+            {"id": "B", "text": "正常现象，Sender 线程在等待 Broker 的 ProduceResponse 返回"},
+            {"id": "C", "text": "Kafka Broker 宕机导致 TCP 连接超时，属于 Broker 端问题"},
+            {"id": "D", "text": "Producer 的 buffer.memory 已满，Sender 线程在等待缓冲区释放"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Sender 线程使用 NIO（Java NIO Selector）与 Broker 通信，正常情况下不会阻塞在传统的 BIO socketRead0 调用上。如果线程栈显示 Sender 线程停在 socketRead0，说明该线程在执行用户代码时触发了传统的阻塞 I/O——最典型的就是 Callback 中做了同步数据库查询或 HTTP 调用。选 B 不正确，Sender 线程等待 Broker 响应时栈帧应在 java.nio.channels.Selector.select() 而非 socketRead0。选 C 虽然 Broker 问题可能导致超时，但 Sender 线程使用 NIO 不会停在 socketRead0。选 D 不正确，缓冲区满时阻塞的是调用 send() 的应用线程，而非 Sender 线程。"
+        },
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz6",
+          "question": "以下哪种写法在生产环境中最危险？",
+          "choices": [
+            {"id": "A", "text": "producer.send(record); // 不处理返回值也不传 Callback"},
+            {"id": "B", "text": "producer.send(record, callback); // 异步 Callback"},
+            {"id": "C", "text": "producer.send(record).get(); // 同步阻塞"},
+            {"id": "D", "text": "producer.send(record).get(5, TimeUnit.SECONDS); // 带超时的同步阻塞"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "选 A 是经典的「fire and forget」反模式——send() 返回的 Future 被丢弃，也没有传入 Callback，这意味着消息发送失败时没有任何通知机制，异常被完全静默吞掉。在 Broker 短暂不可用、网络抖动、缓冲区满等异常场景下，消息会丢失且不留任何痕迹。选 B 是推荐的生产写法，Callback 可以捕获发送失败并做相应处理。选 C 虽然吞吐量低，但至少能通过 ExecutionException 感知到发送失败。选 D 是 C 的改进版，加了超时避免无限阻塞。从消息可靠性角度看，B/C/D 都能感知失败，只有 A 完全不可控。"
+        },
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz7",
+          "question": "关于 send().get() 同步模式和 Callback 异步模式的吞吐量差异，以下描述最准确的是？",
+          "choices": [
+            {"id": "A", "text": "异步模式吞吐量通常是同步模式的 20-50 倍，因为同步模式每条消息都要等待完整网络往返，浪费了 Sender 线程的批量发送能力"},
+            {"id": "B", "text": "两者吞吐量差异不大，因为无论同步还是异步消息都要经过 RecordAccumulator 缓冲"},
+            {"id": "C", "text": "异步模式比同步模式快 2-3 倍，差距主要在序列化和分区计算的并行化上"},
+            {"id": "D", "text": "同步模式吞吐量更高，因为 get() 会强制 Sender 线程立即发送当前 Batch 而非等待 linger.ms"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "实测在 3 节点 Kafka 集群、acks=all、500 字节消息体的配置下，同步模式吞吐量约 2000-5000 msg/s，异步模式可达 10 万+ msg/s，差距在 20-50 倍。根本原因是同步模式下每条消息的发送都被应用线程的阻塞等待串行化了，Sender 线程无法将多条消息合并为一个 Batch 批量发送，Pipeline（max.in.flight.requests.per.connection）也无法发挥作用。选 B 忽略了同步等待导致的串行化开销。选 C 严重低估了差距，序列化和分区计算不是瓶颈所在，网络 RTT 的串行等待才是。选 D 完全错误，get() 不会改变 Sender 线程的发送时机。"
+        },
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz8",
+          "question": "生产环境中发送失败需要写入补偿表，以下哪种做法是正确的？",
+          "choices": [
+            {"id": "A", "text": "在 Callback 中将失败消息投入内存队列（如 ConcurrentLinkedQueue），由独立的补偿线程异步消费并写入数据库"},
+            {"id": "B", "text": "直接在 Callback 中调用 compensationDao.insertSync() 同步写入 MySQL"},
+            {"id": "C", "text": "在 Callback 中再次调用 producer.send() 将失败消息发到另一个 Kafka Topic 作为死信队列"},
+            {"id": "D", "text": "不使用 Callback，改用 send().get() 同步模式，在 catch 块中写入补偿表"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "选 A 是标准的最佳实践——Callback 中只做 O(1) 级别的内存操作（offer 到队列），将真正的 I/O 工作委托给独立线程。这样既不阻塞 Sender 线程，又能实现失败消息的持久化。选 B 是 content 中故障场景的根因，同步数据库写入会阻塞 Sender 线程导致整个 Producer 瘫痪。选 C 虽然看起来巧妙，但在 Callback 中调用 send() 存在递归风险——如果新的 send 也失败了，Callback 又会被触发，可能导致无限循环；而且 Callback 在 Sender 线程中调用 send()，虽然 send() 本身只是放入缓冲区不会阻塞，但增加了 Sender 线程的负担。选 D 虽然可行但牺牲了吞吐量，不是推荐方案。"
+        },
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz9",
+          "question": "在 Spring Kafka 3.x 中使用 KafkaTemplate.send() 返回的 CompletableFuture，thenAccept 回调是否可能在 Kafka Sender 线程中执行？",
+          "choices": [
+            {"id": "A", "text": "可能，如果 Future 在 thenAccept 注册之后才完成，回调会在 Sender 线程中执行"},
+            {"id": "B", "text": "不可能，Spring Kafka 已将回调切换到独立线程池中执行"},
+            {"id": "C", "text": "不可能，CompletableFuture 的回调总是在 ForkJoinPool.commonPool 中执行"},
+            {"id": "D", "text": "不可能，Spring Kafka 使用 @Async 注解确保回调在 Spring 的 TaskExecutor 中执行"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Spring Kafka 底层仍然使用原生 KafkaProducer 的 Callback 机制，在 Callback 中调用 CompletableFuture.complete() 来完成 Future。根据 CompletableFuture 的规范，如果 Future 在 thenAccept 注册之后才完成，回调会在调用 complete() 的线程中同步执行——而 complete() 是在 Kafka Sender 线程中被调用的。选 B 不正确，Spring Kafka 没有为此分配独立线程池。选 C 混淆了 CompletableFuture.supplyAsync()（默认使用 commonPool）和 thenAccept 的执行机制——thenAccept 的执行线程取决于 Future 的完成时机，不一定在 commonPool 中。选 D 不正确，Spring Kafka 的 send() 方法没有使用 @Async 机制。这意味着即使用了 Spring 封装，Callback 中的阻塞风险仍然存在。"
+        },
+        {
+          "id": "kafka-producer-callback-mechanism-q1-quiz10",
+          "question": "Producer 的 Callback 长时间不触发，RecordAccumulator 持续积压，以下哪个 JMX 指标最能直接反映这一问题？",
+          "choices": [
+            {"id": "A", "text": "record-queue-time-avg（消息在缓冲区中的平均等待时间）急剧上升"},
+            {"id": "B", "text": "record-send-rate（消息发送速率）急剧上升"},
+            {"id": "C", "text": "compression-rate-avg（压缩率）急剧下降"},
+            {"id": "D", "text": "connection-count（活跃连接数）急剧下降"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "当 Sender 线程被阻塞时，RecordAccumulator 中的消息无法被拉取发送，最直观的表现是 record-queue-time-avg（消息从追加到缓冲区到被 Sender 线程取出发送的平均等待时间）从正常的个位数毫秒飙升到数十秒甚至数分钟。选 B 不正确，Sender 线程被阻塞时 record-send-rate 应该急剧下降而非上升。选 C 不相关，compression-rate 反映的是压缩效率，与 Sender 线程是否阻塞无关。选 D 也不直接相关，连接数下降通常反映网络层面的问题而非 Sender 线程阻塞——Sender 线程阻塞时连接可能仍然保持着，只是没有新的请求通过连接发出。content 中的故障案例里 record-queue-time-avg 从 5ms 飙到 58 秒就是这个指标的典型表现。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html",
+        "https://kafka.apache.org/javadoc/org/apache/kafka/clients/producer/Callback.html",
+        "https://kafka.apache.org/documentation/#producerconfigs"
+      ]
+    }
+  ]
+}
