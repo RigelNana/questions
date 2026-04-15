@@ -1,0 +1,157 @@
+{
+  "id": "kafka-reliability-consumer-eos",
+  "name": "消费端配合实现 EOS",
+  "domain": "kafka",
+  "description": "深入解析消费端通过 read_committed 隔离级别和 LSO 机制配合 Transactional Producer 实现端到端 Exactly-Once",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-reliability-consumer-eos-q1",
+      "domain": "kafka",
+      "type": "principle",
+      "difficulty": 4,
+      "tags": ["Kafka", "Exactly-Once", "Consumer", "read_committed", "事务消费"],
+      "title": "消费端如何配合 Transactional Producer 实现 EOS？",
+      "content": "一个支付团队在上线 Kafka 事务 Producer 之后，信心满满地认为 Exactly-Once 已经到位了。Producer 端配置了 `transactional.id`，代码里规规矩矩地调用 `beginTransaction()` → `send()` → `commitTransaction()`，从 Broker 的 `__transaction_state` Topic 也能看到事务状态在正常流转。但下游的对账服务还是报出了重复扣款——同一笔订单被处理了两次。\n\n排查了整整一天，最后发现问题出在 Consumer 端。对账服务的 Consumer 配置里，`isolation.level` 是默认值 `read_uncommitted`。这意味着 Consumer 根本不关心消息属于哪个事务、事务是否已经提交——它把 Partition Log 里的所有消息都当成有效数据来消费了，包括那些最终被 Abort 的事务中的消息。Producer 端辛辛苦苦做的事务原子性，在 Consumer 端被完全忽略了。\n\n这个案例暴露了很多工程师对 Kafka EOS 的一个根本性误解：他们认为 EOS 是 Producer 单方面的事情，只要 Producer 配好了事务，下游自然就能享受 Exactly-Once 保证。事实完全相反——Kafka 的 EOS 是一个端到端的协议，Producer 端负责原子写入和 Transaction Marker 的生成，而 Consumer 端必须主动选择「只读已提交事务」的隔离级别才能配合工作。没有 Consumer 端的配合，Producer 的事务就像一扇没有锁的保险柜，机制存在但形同虚设。\n\n要理解 Consumer 端的 EOS 配合机制，需要搞清楚几个核心概念：`isolation.level` 的两个取值（`read_uncommitted` 和 `read_committed`）分别意味着什么？Broker 端的 LSO（Last Stable Offset）和 HW（High Watermark）有什么区别？Consumer 在 `read_committed` 模式下是怎么过滤掉 Aborted 事务中的消息的？在典型的 consume-transform-produce 模式中，`sendOffsetsToTransaction()` 是怎么把 Consumer Offset 提交纳入事务的？为什么 `read_committed` Consumer 的消费延迟可能比 `read_uncommitted` 高出很多？\n\n以下是本题需要你完整理解的核心链路：\n\n```\nProducer (事务写入)          Broker (Partition Log)              Consumer (事务过滤)\n─────────────────          ──────────────────────              ─────────────────────\nbeginTransaction()         │ msg-1 (txn-A)        │           isolation.level=read_committed\nsend(msg-1)          ──►   │ msg-2 (txn-A)        │  ──►      只读 LSO 之前的消息\nsend(msg-2)                │ msg-3 (non-txn)      │           遇到 ABORT Marker → 过滤 txn-B\nsend(msg-3 non-txn)        │ msg-4 (txn-B)        │           遇到 COMMIT Marker → 放行 txn-A\ncommitTransaction()        │ COMMIT Marker (txn-A) │\nabortTransaction(txn-B)    │ ABORT Marker (txn-B)  │\n                           │ ← LSO 在此推进 →      │\n```\n\n理解这条链路上每个环节的机制，就是回答本题的关键。",
+      "answer": "## 一、核心概念基础：为什么 EOS 需要消费端配合\n\n### 1.1 事务消息在 Partition Log 中的真实面貌\n\n要理解 Consumer 端为什么需要主动配合，首先要明白事务消息在 Broker 的 Partition Log 里是怎么存储的。很多人以为事务提交后，Broker 会把事务中的消息「标记为已提交」或者把 Aborted 事务的消息删除——这是完全错误的。Kafka 的 Partition Log 是一个 append-only 的不可变日志，事务消息和非事务消息交错写入，物理上没有任何区别。一条消息写入 Log 之后，不管它所属的事务最终是 Commit 还是 Abort，这条消息永远不会被修改或删除（除非被正常的 Log Retention 或 Compaction 清理掉）。\n\n那 Broker 怎么告诉 Consumer 哪些消息属于已提交的事务、哪些属于已回滚的事务？答案是 Transaction Marker。当 TransactionCoordinator 完成 Two-Phase Commit 的第二阶段时，它向事务涉及的每个 Partition 写入一条 Control Record（Transaction Marker），类型为 `COMMIT` 或 `ABORT`。这条 Marker 本身也是 Partition Log 中的一条消息，只不过它的 `controlType` 标记为 `TRANSACTION_MARKER`，不包含业务数据，只包含 `<PID, ProducerEpoch, COMMIT|ABORT>` 信息。\n\n这意味着在 Partition Log 中，一个事务的消息和它的 Marker 之间可能隔着很多其他消息（包括其他事务的消息和非事务消息）。Consumer 需要自己根据 Marker 来决定哪些消息该要、哪些该丢弃。但这一切的前提是——Consumer 必须主动开启事务感知模式。\n\n### 1.2 isolation.level：Consumer 的事务隔离开关\n\nKafka Consumer 有一个配置项 `isolation.level`，它只有两个合法取值：\n\n```properties\n# 默认值：读取所有消息，包括未提交/已回滚事务中的消息\nisolation.level=read_uncommitted\n\n# 事务感知模式：只读取已提交事务中的消息 + 非事务消息\nisolation.level=read_committed\n```\n\n`read_uncommitted` 是默认值，这也是前面那个支付团队踩坑的根本原因。在这个模式下，Consumer 的行为和 Kafka 0.11 之前完全一样——它把 Partition Log 里的每条消息都当成有效数据，完全忽略 Transaction Marker 的存在。事务消息还是非事务消息？已提交还是已回滚？Consumer 不关心，全部消费。\n\n切换到 `read_committed` 后，Consumer 的行为发生了根本性变化。它不再直接读取到 HW（High Watermark）为止，而是只能读取到 LSO（Last Stable Offset）为止。同时，它会利用 Broker 返回的 Aborted Transaction 索引信息，在客户端侧过滤掉属于已回滚事务的消息。这两个机制的配合，才是 Consumer 端 EOS 的完整实现。\n\n## 二、精准深度解答：read_committed 的底层机制\n\n### 2.1 LSO（Last Stable Offset）与 HW（High Watermark）的区别\n\n这是理解 `read_committed` Consumer 行为的核心。先回顾 HW 的定义：HW 是所有 ISR 副本都已同步到的最高 Offset，`read_uncommitted` Consumer 最多只能读到 HW 的位置。LSO 是 Kafka 0.11 引入的新概念，定义为：当前 Partition 上所有 active（未完成）事务中，最小的 First Offset。如果当前没有任何活跃事务，LSO 等于 HW。\n\n用一个具体的例子来说明：\n\n```\nPartition Log:\nOffset:  0     1     2     3     4     5     6     7     8\n         msg   msg   msg   msg   msg   msg   COMMIT msg   msg\n         (A)   (A)   (-)   (B)   (B)   (A)   (A)    (-)   (B)\n                                                          ↑\n事务 A: offset 0,1,5 → 已 COMMIT（Marker 在 offset 6）    HW=9\n事务 B: offset 3,4,8 → 仍在进行中（尚未提交/回滚）\n非事务: offset 2,7\n\nLSO = min(活跃事务的 First Offset) = 事务B的起始offset = 3\n```\n\n在这个例子中，虽然事务 A 已经提交了，但因为事务 B 从 offset 3 开始且仍在进行中，LSO 停留在 3。`read_committed` Consumer 最多只能读到 offset 2（LSO - 1 的位置）。事务 A 在 offset 0 和 1 的消息可以读到，offset 2 的非事务消息也可以读到，但 offset 5 处事务 A 的消息（虽然已提交）暂时也读不到——因为它在 LSO 之后。\n\n这就揭示了一个关键的性能特征：一个长时间未完成的事务会阻塞同一 Partition 上所有后续消息对 `read_committed` Consumer 的可见性，即使后续消息属于已提交的事务或非事务消息。这就是为什么 `transaction.timeout.ms`（默认 60000ms）在生产环境中非常重要——超时后 Coordinator 会自动 Abort 悬挂的事务，推进 LSO。\n\n### 2.2 Aborted Transaction 过滤机制\n\nLSO 只是第一道防线——它控制 Consumer 能读到多远。但 LSO 之前可能同时包含已提交事务的消息、已回滚事务的消息和非事务消息。Consumer 还需要一种机制来过滤掉已回滚事务的消息。\n\n这个过滤机制的工作方式如下。Broker 在每个 Partition 的 Log Segment 上维护一个 `AbortedTransactionIndex`（`.txnindex` 文件），记录了该 Segment 中所有已回滚事务的 `<PID, FirstOffset, LastOffset>`。当 `read_committed` Consumer 发送 `FetchRequest` 时，Broker 在响应中除了返回消息数据外，还会携带一个 `abortedTransactions` 字段，列出当前 Fetch 范围内所有已回滚事务的 PID 和 Offset 区间。Consumer 客户端收到这些信息后，在内存中维护一个 Aborted PID Set，对于 Fetch 回来的每条消息检查其 PID 是否在 Aborted Set 中——如果在，则丢弃；如果不在或消息是非事务的，则保留。\n\n整个过滤过程发生在 Consumer 客户端内部（`Fetcher` 类），对应用层完全透明。应用代码调用 `consumer.poll()` 时，拿到的 `ConsumerRecords` 已经是过滤后的结果，不需要自己写任何去重逻辑。\n\n### 2.3 consume-transform-produce 模式的完整实现\n\n`read_committed` 解决了「只读已提交」的问题，但在 consume-transform-produce 场景中还需要解决另一个问题：消费 Offset 的提交必须和产出消息的写入绑定为一个原子操作。否则，如果消息写入了输出 Topic 但 Offset 提交失败，Consumer 重启后会重新消费同一批消息，导致输出侧重复。\n\nKafka 事务 API 通过 `sendOffsetsToTransaction()` 解决了这个问题。以下是完整的 Java 代码示例：\n\n```java\nProperties prodProps = new Properties();\nprodProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, \"broker-1:9092\");\nprodProps.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, \"etl-processor-txn-01\");\n// enable.idempotence 在设置 transactional.id 后自动为 true\nKafkaProducer<String, String> producer = new KafkaProducer<>(prodProps);\n\nProperties consProps = new Properties();\nconsProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, \"broker-1:9092\");\nconsProps.put(ConsumerConfig.GROUP_ID_CONFIG, \"etl-consumer-group\");\nconsProps.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, \"read_committed\");\nconsProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, \"false\");\nKafkaConsumer<String, String> consumer = new KafkaConsumer<>(consProps);\nconsumer.subscribe(Collections.singletonList(\"input-topic\"));\n\nproducer.initTransactions();\n\nwhile (true) {\n    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));\n    if (records.isEmpty()) continue;\n\n    producer.beginTransaction();\n    try {\n        // 1. Transform & Produce\n        for (ConsumerRecord<String, String> record : records) {\n            String transformed = transform(record.value());\n            producer.send(new ProducerRecord<>(\"output-topic\", record.key(), transformed));\n        }\n\n        // 2. 将 Consumer Offset 纳入同一个事务\n        Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();\n        for (TopicPartition partition : records.partitions()) {\n            List<ConsumerRecord<String, String>> partRecords = records.records(partition);\n            long lastOffset = partRecords.get(partRecords.size() - 1).offset();\n            offsets.put(partition, new OffsetAndMetadata(lastOffset + 1));\n        }\n        producer.sendOffsetsToTransaction(offsets, \n            new ConsumerGroupMetadata(\"etl-consumer-group\"));\n\n        // 3. 原子提交：输出消息 + 消费 Offset 一起生效\n        producer.commitTransaction();\n    } catch (ProducerFencedException e) {\n        // 被新实例 Fence 掉，必须关闭\n        producer.close();\n        consumer.close();\n        throw e;\n    } catch (KafkaException e) {\n        producer.abortTransaction();\n        // Abort 后消费位点未提交，下次 poll() 会重新消费这批消息\n    }\n}\n```\n\n这段代码的关键在于 `sendOffsetsToTransaction()` 调用。它的内部流程是：Producer 向 TransactionCoordinator 发送 `AddOffsetsToTxn` 请求，将 `__consumer_offsets` Topic 中该 Consumer Group 对应的 Partition 注册到当前事务；然后通过 `TxnOffsetCommit` 请求将 Offset 写入 `__consumer_offsets`。这些 Offset 和输出消息一样，在事务提交前对外部不可见。只有当 `commitTransaction()` 成功后，输出 Topic 的消息和 `__consumer_offsets` 中的 Offset 才同时对外部可见。如果事务 Abort，两者都回滚——Consumer 下次 poll 时会从上一次成功提交的 Offset 继续消费，输出 Topic 的消息会被 `read_committed` Consumer 过滤掉。\n\n注意代码中 `enable.auto.commit` 必须设为 `false`。如果开启了自动提交，Consumer 的 Offset 会在事务之外被提交，破坏原子性保证。\n\n## 三、体系化扩展延伸\n\n### 3.1 read_committed Consumer 的消费延迟问题\n\n生产环境中最常见的 `read_committed` 相关问题是消费延迟突然飙升。监控上表现为 Consumer Lag 急剧增大，但 Broker 端的消息写入速率和 Consumer 的处理速率都没有变化。根源几乎总是某个事务迟迟未提交，导致 LSO 停滞不前。\n\n排查这类问题需要关注两个指标。第一个是 Broker 端暴露的 JMX 指标 `kafka.log:type=Log,name=LastStableOffset,topic=<topic>,partition=<partition>`，将它与 `LogEndOffset` 对比可以看到 LSO 和 LEO 之间的差距。第二个是 Consumer 端的 `records-lag` 指标——对于 `read_committed` Consumer，这个 Lag 是基于 LSO 而非 HW 计算的。如果 Lag 突然增大但 Consumer 的处理速率没有下降，大概率是 LSO 被某个事务阻塞了。\n\n可以用以下命令直接查看 LSO：\n\n```bash\n# 查看某个 Consumer Group 的 Lag（read_committed 模式下基于 LSO）\nkafka-consumer-groups.sh --bootstrap-server broker-1:9092 \\\n  --describe --group etl-consumer-group\n\n# 输出示例（注意 LOG-END-OFFSET 对 read_committed 消费者反映的是 LSO）\nGROUP              TOPIC          PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG\netl-consumer-group input-topic    0          1842350         1842350         0\netl-consumer-group input-topic    1          2105671         2105890         219\netl-consumer-group input-topic    2          1953200         1961487         8287  ← 异常\n```\n\n如果 Partition 2 的 Lag 持续增长，而其他 Partition 正常，说明 Partition 2 上有一个长事务阻塞了 LSO。此时需要检查是否有 Producer 实例因为 GC、网络问题或代码 bug 导致事务长时间不提交。`transaction.timeout.ms` 是最后的防线，但默认 60 秒的超时对于高吞吐场景可能已经太长。核心业务建议缩短到 10~30 秒。\n\n### 3.2 Kafka Streams 的自动 EOS\n\nKafka Streams 是 consume-transform-produce 模式的最大受益者，因为它把上面那段复杂的手动事务代码完全封装了。只需要一行配置即可开启 EOS：\n\n```properties\n# Kafka 2.5 之前\nprocessing.guarantee=exactly_once\n\n# Kafka 2.5+（推荐，性能更优）\nprocessing.guarantee=exactly_once_v2\n```\n\nStreams 框架内部会自动管理 Transactional Producer 的创建、事务的 begin/commit/abort、`sendOffsetsToTransaction()` 的调用，以及异常时的回滚和重试。开发者只需要关注业务逻辑的 `map()`、`filter()`、`aggregate()` 等操作。Kafka 2.5 引入的 `exactly_once_v2`（KIP-447）优化了 Producer 实例数量——从每个 Stream Task 一个 Producer 减少为每个 Consumer 实例一个，对含大量 Partition 的应用可节省数十倍连接和内存开销。\n\n### 3.3 外部系统集成的 EOS 挑战\n\n当 Consumer 需要将消息写入 Kafka 之外的系统（MySQL、Elasticsearch、S3 等），Kafka 的事务就鞭长莫及了。这种场景下实现端到端 EOS 通常有两种策略。\n\n第一种是「幂等写入」策略：Consumer 设置 `read_committed` 读取已提交消息后，在写入外部系统时利用消息自身的唯一标识（如 Kafka 的 `<topic, partition, offset>` 三元组）做幂等判断。比如在 MySQL 中建一张去重表，以 `topic_partition_offset` 为唯一键，写入业务数据和去重记录在同一个数据库事务中完成。这种方式依赖外部系统的事务支持。\n\n第二种是「Offset 外置」策略：不使用 Kafka 的 `__consumer_offsets` 来存储消费位点，而是将 Offset 和业务数据一起写入外部系统的同一个事务。比如在 MySQL 中用一张 `kafka_offsets` 表记录每个 Partition 的消费进度，每次写入业务数据时同步更新 Offset 表。Consumer 启动时从 MySQL 的 `kafka_offsets` 表读取上次消费位点，调用 `consumer.seek()` 定位到该 Offset。这种方式完全不依赖 Kafka 的事务机制，但需要自己管理 Offset 的一致性。\n\n### 3.4 版本兼容性与注意事项\n\n`isolation.level=read_committed` 需要 Kafka 0.11+（Broker 和 Client 均需升级）。如果 Broker 版本低于 0.11，Consumer 设置 `read_committed` 会在启动时报错。Kafka 3.0 起，`enable.idempotence` 默认值从 `false` 改为 `true`，但 `isolation.level` 的默认值仍然是 `read_uncommitted`——这意味着即使在最新版本中，Consumer 端的事务感知仍然需要手动开启。这是一个常见的认知盲区：Producer 端的幂等性已经默认开启了，但 Consumer 端的 `read_committed` 永远不会自动开启，因为它会改变消费行为（引入 LSO 限制），不适合作为默认行为。",
+      "keyPoints": [
+        "Kafka EOS 是端到端协议，Consumer 必须设置 isolation.level=read_committed 才能配合 Transactional Producer 工作，默认的 read_uncommitted 会读取所有消息包括已 Abort 事务的消息",
+        "read_committed Consumer 的可见范围由 LSO（Last Stable Offset）控制，LSO 等于当前所有活跃事务中最小的 First Offset，一个长事务会阻塞同一 Partition 上所有后续消息的可见性",
+        "Consumer 端的 Aborted 事务过滤依赖 Broker 在 FetchResponse 中返回的 abortedTransactions 信息和 Segment 级别的 .txnindex 文件，过滤在 Consumer 客户端内部完成，对应用层透明",
+        "consume-transform-produce 模式通过 sendOffsetsToTransaction() 将 Consumer Offset 提交纳入 Producer 事务，保证输出消息写入和消费位点提交的原子性",
+        "read_committed 模式下必须关闭 enable.auto.commit，否则 Offset 会在事务之外被自动提交，破坏原子性保证",
+        "LSO 停滞导致的消费延迟是生产中最常见的 read_committed 问题，可通过 Broker JMX 的 LastStableOffset 与 LogEndOffset 差值监控，transaction.timeout.ms 是最后防线",
+        "Kafka 的事务无法覆盖外部系统写入，外部系统 EOS 需要依赖幂等写入（基于 topic-partition-offset 去重）或 Offset 外置（将 Offset 和业务数据写入同一个外部事务）"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz1",
+          "question": "Consumer 的 isolation.level 配置默认值是什么？在默认值下 Consumer 对事务消息的处理行为是怎样的？",
+          "choices": [
+            {"id": "A", "text": "默认值是 read_committed，Consumer 只读取已提交事务中的消息"},
+            {"id": "B", "text": "默认值是 read_uncommitted，Consumer 读取所有消息包括未提交和已 Abort 事务的消息，完全忽略事务边界"},
+            {"id": "C", "text": "默认值是 read_committed，但 Consumer 会将 Aborted 事务的消息标记为「待确认」而非直接丢弃"},
+            {"id": "D", "text": "没有默认值，必须显式配置否则 Consumer 启动报错"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "isolation.level 的默认值是 read_uncommitted，这意味着 Consumer 的行为与 Kafka 0.11 之前完全一致——读取 Partition Log 中的所有消息，不区分事务消息和非事务消息，也不关心事务是否已提交或回滚。选项 A 的 read_committed 需要手动配置，即使在 Kafka 3.0+ 中也不会自动开启。选项 C 描述的「待确认」状态不存在，read_committed 直接过滤 Aborted 消息。选项 D 错在该配置有明确的默认值。"
+        },
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz2",
+          "question": "LSO（Last Stable Offset）的定义是什么？",
+          "choices": [
+            {"id": "A", "text": "当前 Partition 上所有 ISR 副本都已同步到的最高 Offset，即 High Watermark 的别名"},
+            {"id": "B", "text": "当前 Partition 上所有活跃（未完成）事务中最小的 First Offset，当无活跃事务时等于 HW"},
+            {"id": "C", "text": "Consumer Group 中所有成员当前消费进度的最小 Offset"},
+            {"id": "D", "text": "Partition Leader 上最后一条写入消息的 Offset + 1，即 LEO"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "LSO 是 Kafka 0.11 引入的概念，定义为当前 Partition 上所有活跃（未提交/未回滚）事务中最小的 First Offset。如果没有任何活跃事务，LSO 等于 HW。read_committed Consumer 的 Fetch 请求只能读到 LSO 之前的消息。选项 A 描述的是 HW（High Watermark），它控制的是副本同步边界，与事务无关。选项 C 描述的是 Consumer Lag 计算中的基线概念。选项 D 描述的是 LEO（Log End Offset）。"
+        },
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz3",
+          "question": "read_committed Consumer 是如何过滤掉已 Abort 事务中的消息的？",
+          "choices": [
+            {"id": "A", "text": "Broker 在 Partition Log 中物理删除已 Abort 事务的消息，Consumer 读到的 Log 已经是干净的"},
+            {"id": "B", "text": "Broker 在 FetchResponse 中返回 abortedTransactions 列表（PID 和 Offset 区间），Consumer 客户端内部根据此信息过滤"},
+            {"id": "C", "text": "Consumer 向 TransactionCoordinator 查询每条消息所属事务的状态，逐条判断是否应该消费"},
+            {"id": "D", "text": "Broker 端的 Fetch 逻辑直接跳过 Aborted 消息，只返回 Committed 和非事务消息给 Consumer"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "过滤机制分两部分协作：Broker 端为每个 Log Segment 维护 .txnindex 文件记录已 Abort 事务的 PID 和 Offset 区间，在处理 read_committed Consumer 的 FetchRequest 时将相关的 abortedTransactions 信息附在响应中返回。Consumer 客户端收到后在内存中维护 Aborted PID Set，对每条消息做客户端侧过滤。选项 A 错在 Kafka Log 是 append-only 的，不会删除消息。选项 C 的逐条查询效率不可接受。选项 D 错在 Broker 确实返回所有消息（包括 Aborted 的），过滤在客户端完成。"
+        },
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz4",
+          "question": "在 consume-transform-produce 模式中，sendOffsetsToTransaction() 的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "将 Consumer Offset 提交到 __consumer_offsets Topic，但在事务之外独立完成，与消息写入无关"},
+            {"id": "B", "text": "将 Consumer Offset 纳入当前 Producer 事务中，使 Offset 提交和输出消息写入成为同一个原子操作"},
+            {"id": "C", "text": "让 Producer 根据 Consumer 的当前 Offset 决定从哪里开始读取消息"},
+            {"id": "D", "text": "将 Producer 发送的消息 Offset 同步给 Consumer，实现 Producer 和 Consumer 的进度同步"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "sendOffsetsToTransaction() 的核心作用是将 Consumer Offset 的提交操作纳入当前 Producer 事务。内部流程是：Producer 向 TransactionCoordinator 发送 AddOffsetsToTxn 请求将 __consumer_offsets 对应的 Partition 注册到事务中，然后通过 TxnOffsetCommit 写入 Offset。这些 Offset 在事务 Commit 前不可见，Abort 时回滚。选项 A 错在事务外独立提交 Offset 会破坏原子性。选项 C 和 D 完全混淆了该 API 的方向和用途。"
+        },
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz5",
+          "question": "如果一个 Partition 上有一个事务已经持续了 50 秒仍未提交（transaction.timeout.ms 为默认的 60 秒），对 read_committed Consumer 有什么影响？",
+          "choices": [
+            {"id": "A", "text": "没有影响，read_committed Consumer 可以正常读取该事务之后的已提交消息"},
+            {"id": "B", "text": "LSO 停留在该事务的 First Offset 位置，导致 read_committed Consumer 无法读取该 Offset 之后的任何消息，包括已提交事务的消息和非事务消息"},
+            {"id": "C", "text": "Consumer 会自动切换到 read_uncommitted 模式以避免消费停滞"},
+            {"id": "D", "text": "只有属于该未完成事务的消息不可读，其他已提交事务的消息和非事务消息正常消费"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "LSO 的定义是所有活跃事务中最小的 First Offset。一个未完成的事务会将 LSO 钉在其起始位置，阻塞同一 Partition 上所有后续消息（包括其他已提交事务的消息和非事务消息）对 read_committed Consumer 的可见性。这是 read_committed 模式的核心性能特征。选项 A 和 D 的错误在于忽略了 LSO 的全局阻塞效应。选项 C 不存在这种自动降级机制。transaction.timeout.ms 超时后 Coordinator 会自动 Abort 该事务来解除阻塞。"
+        },
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz6",
+          "question": "在 consume-transform-produce 模式中，为什么必须将 enable.auto.commit 设为 false？",
+          "choices": [
+            {"id": "A", "text": "因为 read_committed 模式与自动提交冲突，Consumer 启动时会抛出配置冲突异常"},
+            {"id": "B", "text": "因为自动提交会在事务之外独立提交 Offset，如果事务 Abort 而 Offset 已自动提交，Consumer 不会重新消费被回滚的那批消息，导致数据丢失"},
+            {"id": "C", "text": "因为自动提交会导致 Consumer 消费速度变慢，影响事务的吞吐量"},
+            {"id": "D", "text": "因为自动提交使用的 Offset 格式与事务模式不兼容"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "自动提交（enable.auto.commit=true）会在 poll() 调用时自动提交上一次 poll 拉取到的消息的 Offset，这个提交完全在事务之外进行。如果输出消息已经写入但事务还未提交时 Offset 被自动提交了，一旦事务 Abort，输出消息被回滚，但 Consumer 的消费位点已经前进了——下次 poll 不会重新消费这批消息，导致输入端的消息被「吞掉」。选项 A 错在两者不会抛配置冲突。选项 C 和 D 都不是真实原因。"
+        },
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz7",
+          "question": "Kafka Streams 中开启 EOS 需要哪个配置？Kafka 2.5+ 推荐用哪个值？",
+          "choices": [
+            {"id": "A", "text": "配置项是 processing.guarantee，Kafka 2.5+ 推荐使用 exactly_once_v2，它将每 Task 一个 Producer 优化为每实例一个 Producer"},
+            {"id": "B", "text": "配置项是 isolation.level=read_committed，Streams 框架会自动创建事务 Producer"},
+            {"id": "C", "text": "配置项是 enable.exactly.once=true，所有 Kafka 版本通用"},
+            {"id": "D", "text": "不需要额外配置，Kafka Streams 默认启用 EOS"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka Streams 通过 processing.guarantee 配置项控制 EOS。Kafka 2.5 之前使用 exactly_once，每个 Stream Task 需要独立的 transactional.id 和 Producer 实例。Kafka 2.5+（KIP-447）引入 exactly_once_v2，通过 Consumer Group 的 Generation ID 实现跨 Rebalance 的事务安全，将 Producer 数量从 Task 级别降为实例级别。选项 B 的 isolation.level 只是 Consumer 端配置。选项 C 的配置名不存在。选项 D 错在 Streams 默认 processing.guarantee 是 at_least_once。"
+        },
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz8",
+          "question": "Consumer 消费外部系统场景下，以下哪种方式能实现端到端 EOS？",
+          "choices": [
+            {"id": "A", "text": "Consumer 设置 read_committed 就足够了，Kafka 事务会自动覆盖外部系统的写入"},
+            {"id": "B", "text": "在外部系统侧利用 Kafka 消息的 <topic, partition, offset> 三元组做幂等写入，将业务数据写入和去重记录插入放在同一个外部事务中"},
+            {"id": "C", "text": "使用 Kafka Connect 的 Sink Connector，它自动为所有外部系统提供 EOS 保证"},
+            {"id": "D", "text": "将外部系统的写入操作封装为 Kafka Producer 的 send() 调用，利用 Kafka 事务覆盖"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的事务只覆盖 Kafka 生态内部的写入，无法延伸到外部系统。对外部系统实现 EOS 需要在外部侧做幂等处理——典型方式是利用消息的 <topic, partition, offset> 三元组作为唯一标识，在外部数据库中建去重表或使用 UPSERT，确保同一条消息无论消费多少次，外部系统的状态只变更一次。选项 A 错在 Kafka 事务不覆盖外部系统。选项 C 取决于具体 Connector 的实现，不是所有 Sink Connector 都支持 EOS。选项 D 不可行——外部系统写入不能变成 Kafka send()。"
+        },
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz9",
+          "question": "Broker 用什么文件存储已 Abort 事务的索引信息，供 read_committed Consumer 的 Fetch 请求使用？",
+          "choices": [
+            {"id": "A", "text": ".index 文件，即 Offset Index，复用了现有的 Offset 索引结构"},
+            {"id": "B", "text": ".txnindex 文件，每个 Log Segment 对应一个，记录该 Segment 中已 Abort 事务的 PID 和 Offset 区间"},
+            {"id": "C", "text": "__transaction_state Topic 中的 Compacted Log，Consumer 直接消费该 Topic 获取事务状态"},
+            {"id": "D", "text": ".timeindex 文件，复用了时间戳索引来标记事务的起止时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 在每个 Log Segment 旁边维护一个 .txnindex 文件（Aborted Transaction Index），记录该 Segment 中所有已回滚事务的 <PID, FirstOffset, LastOffset>。当 read_committed Consumer 发送 FetchRequest 时，Broker 根据请求的 Offset 范围查询对应 Segment 的 .txnindex，将相关的 abortedTransactions 信息附在 FetchResponse 中返回。选项 A 的 .index 是 Offset 到物理位置的映射，与事务无关。选项 C 的 __transaction_state 由 TransactionCoordinator 使用，Consumer 不直接消费。选项 D 的 .timeindex 是时间戳索引。"
+        },
+        {
+          "id": "kafka-reliability-consumer-eos-q1-quiz10",
+          "question": "以下关于 read_committed 与 Kafka 版本兼容性的说法，哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "Kafka 3.0+ 默认开启 enable.idempotence=true，同时也默认将 isolation.level 切换为 read_committed"},
+            {"id": "B", "text": "isolation.level=read_committed 需要 Kafka 0.11+ 的 Broker 和 Client，Kafka 3.0+ 虽然默认开启幂等性但 isolation.level 默认仍为 read_uncommitted"},
+            {"id": "C", "text": "只需要 Broker 升级到 0.11+，Consumer Client 使用任意版本都支持 read_committed"},
+            {"id": "D", "text": "read_committed 是 Kafka 2.0 引入的功能，0.11 版本只有 Producer 端的事务支持"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "read_committed 和 Transactional Producer 都是 Kafka 0.11（KIP-98）引入的，Broker 和 Client 都需要 0.11+。Kafka 3.0 将 enable.idempotence 的默认值改为 true，但出于兼容性考虑，isolation.level 的默认值始终保持 read_uncommitted——因为 read_committed 会引入 LSO 限制，可能改变现有 Consumer 的消费行为，不适合作为默认值。选项 A 错在 isolation.level 默认值没有改变。选项 C 错在 Client 也必须支持 read_committed 协议。选项 D 错在 read_committed 是 0.11 引入的。"
+        }
+      ],
+      "references": [
+        "KIP-98: Exactly Once Delivery and Transactional Messaging - https://cwiki.apache.org/confluence/display/KAFKA/KIP-98",
+        "KIP-447: Producer scalability for exactly once semantics - https://cwiki.apache.org/confluence/display/KAFKA/KIP-447",
+        "Kafka Documentation: Consumer Configs (isolation.level) - https://kafka.apache.org/documentation/#consumerconfigs_isolation.level",
+        "Kafka Source: AbortedTransactionIndex.java - https://github.com/apache/kafka/blob/trunk/storage/src/main/java/org/apache/kafka/storage/internals/log/AbortedTxn.java",
+        "Confluent Blog: Transactions in Apache Kafka - https://www.confluent.io/blog/transactions-apache-kafka/"
+      ]
+    }
+  ]
+}
