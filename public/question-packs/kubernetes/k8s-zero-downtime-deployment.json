@@ -1,0 +1,157 @@
+{
+  "id": "k8s-zero-downtime-deployment",
+  "name": "零停机应用部署",
+  "domain": "kubernetes",
+  "description": "深入解析 Kubernetes 零停机部署的完整实现方案，覆盖 Rolling Update 配置、Readiness Probe、preStop Hook、PDB 与 Endpoint 更新时序等核心机制",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-zero-downtime-deployment-q1",
+      "domain": "kubernetes",
+      "type": "requirement",
+      "difficulty": 3,
+      "tags": ["零停机", "Rolling Update", "Readiness Probe", "优雅关闭", "preStop"],
+      "title": "如何实现零停机（Zero Downtime）的应用部署？",
+      "content": "你所在的团队负责一个日均交易 300 万笔的支付网关服务，跑在 Kubernetes 1.28 集群上，Deployment 配置了 6 个副本。业务侧要求 7×24 可用性不低于 99.99%，这意味着全年不可用时间不能超过 52 分钟。团队每周三和周五各发一次版，每次发版 CI/CD Pipeline 会自动执行 `kubectl set image` 触发滚动更新。\n\n最近一个月，每次发版后 Grafana 的 HTTP 监控面板上都会出现 10-30 个 502/503 错误。虽然每次持续时间只有 3-8 秒，但按照每次 5 秒、每周两次来算，一个月就是 40 秒的不可用时间，一年下来光发版就要占掉 480 秒——接近 99.99% SLA 允许的年度总预算的 15%。产品经理和运维负责人都很不满意。\n\n你拉取了当前的 Deployment 配置：\n\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: payment-gateway\n  namespace: production\nspec:\n  replicas: 6\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 25%\n      maxUnavailable: 25%\n  selector:\n    matchLabels:\n      app: payment-gateway\n  template:\n    metadata:\n      labels:\n        app: payment-gateway\n    spec:\n      containers:\n      - name: gateway\n        image: registry.internal/payment-gateway:v3.8.1\n        ports:\n        - containerPort: 8443\n        livenessProbe:\n          httpGet:\n            path: /healthz\n            port: 8443\n          initialDelaySeconds: 10\n          periodSeconds: 10\n```\n\n发版期间你用 `kubectl get pods -w` 观察了更新过程：\n\n```\nNAME                               READY   STATUS        RESTARTS   AGE\npayment-gateway-6d9f8b7c4-abc12   1/1     Running       0          2d\npayment-gateway-6d9f8b7c4-def34   1/1     Running       0          2d\npayment-gateway-6d9f8b7c4-ghi56   1/1     Terminating   0          2d\npayment-gateway-8e2a4f1c3-jkl78   0/1     Running       0          3s\npayment-gateway-8e2a4f1c3-mno90   0/1     Running       0          3s\n```\n\n新 Pod 刚刚被创建 3 秒就已经有旧 Pod 在 Terminating 了。再看一下被终止的旧 Pod 的应用日志：\n\n```\n2024-11-20T14:32:05.891Z ERROR gateway connection reset by peer: 10.244.2.18:8443\n2024-11-20T14:32:05.903Z WARN  gateway write tcp 10.244.2.18:8443->10.244.0.12:52340: broken pipe\n2024-11-20T14:32:06.112Z INFO  gateway process exiting with signal: terminated\n```\n\n问题很明显：没有 Readiness Probe 导致新 Pod 未就绪就被当作 Ready，`maxUnavailable: 25%` 允许旧 Pod 在新 Pod 就绪前就被终止，没有 preStop Hook 导致旧 Pod 收到 SIGTERM 后直接退出而正在处理的支付请求被中断。\n\n现在你需要给出完整的零停机部署方案：从 Rolling Update 参数调优、Readiness Probe 配置、preStop Hook + terminationGracePeriodSeconds 优雅关闭、PDB 防护，到 Endpoint 更新时序的竞态问题，给出一份可以直接交付到生产的完整配置和实施方案。",
+      "answer": "## 第一步：零停机部署核心概念基础详解\n\n### 什么是零停机部署\n\n零停机部署（Zero Downtime Deployment）是指在应用版本更新的整个过程中，对外提供服务不发生任何中断——用户的每一个请求都能被正常处理和响应，没有 502、503 或 Connection refused 这样的错误出现。这不仅仅是「部署的时候服务不挂」这么简单，它要求在新旧版本切换的整个窗口期内，每一秒钟都有足够数量的健康 Pod 在接收和处理流量，同时旧 Pod 的退出不能丢失任何正在处理中的请求。\n\n在没有容器编排的传统运维时代，实现零停机部署是一件非常痛苦的事情。典型做法是准备两组服务器（称为 Blue-Green），通过负载均衡器在两组之间切换流量。这种方式需要双倍的服务器资源，而且切换过程依赖手动操作或自定义脚本，容易出错。Kubernetes 的出现从根本上改变了这个局面——它在 Deployment 控制器中内置了 Rolling Update 机制，配合 Readiness Probe、preStop Hook 等原语，可以用声明式配置实现全自动的零停机部署。但「能实现」和「默认就是零停机」是两码事，Kubernetes 的默认配置并不能保证零停机，需要你理解整个流量切换的时序并做针对性配置。\n\n### 为什么传统部署会导致停机\n\n理解零停机部署的前提是搞清楚停机到底是怎么产生的。停机的本质是：用户的请求到达了一个无法处理它的目标。这个「无法处理」有两种情况。第一种是新 Pod 还没准备好就开始接收流量——应用进程刚启动，还在加载配置、建立数据库连接池、预热缓存，此时请求进来要么超时要么报错。第二种是旧 Pod 正在被终止但流量还在往它路由——kube-proxy 的 iptables/IPVS 规则还没来得及更新，新请求仍然被发送到一个正在关闭甚至已经关闭端口的 Pod 上，结果就是 Connection refused 或 502 Bad Gateway。\n\n这两种情况在 Kubernetes 中分别对应两个独立的问题：流量接入的时机控制（靠 Readiness Probe）和流量摘除的时序协调（靠 preStop Hook + Endpoint 更新机制）。零停机部署就是要同时解决这两个问题，让流量的「接入」和「摘除」都精确地与 Pod 的生命周期对齐。\n\n### Kubernetes 中实现零停机的基础机制：Rolling Update\n\nKubernetes Deployment 的默认更新策略就是 RollingUpdate——逐步用新版本 Pod 替换旧版本 Pod，而不是一次性全部替换。这个机制的核心思想很朴素：任何时刻都保证有足够数量的 Pod 在正常服务。Deployment Controller 通过管理两个 ReplicaSet（旧版本 RS 和新版本 RS）来实现这一点，在两个 RS 之间逐步转移副本数——新 RS 扩容一个、旧 RS 缩容一个，反复迭代直到所有 Pod 都是新版本。\n\n一个最基础的 Rolling Update 配置看起来是这样的：\n\n```yaml\nspec:\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 1        # 更新过程中最多多出 1 个 Pod\n      maxUnavailable: 0  # 更新过程中不允许有 Pod 不可用\n```\n\n`maxSurge: 1` 表示同一时刻最多比期望副本数多创建 1 个 Pod，`maxUnavailable: 0` 表示同一时刻不允许有任何 Pod 处于不可用状态。这两个参数的组合决定了更新的「步进节奏」：每次先创建一个新 Pod，等它完全就绪后再终止一个旧 Pod。这是最保守也是最安全的配置，代价是更新速度最慢。但 Rolling Update 本身只是零停机的「框架」，真正让它生效还需要 Readiness Probe、preStop Hook、PDB 等多个机制的协同配合，缺少任何一环都可能导致更新期间出现错误。\n\n## 第二步：零停机部署的精准深度解答\n\n### maxSurge 与 maxUnavailable 的配置策略\n\n回到题目中的支付网关场景。原始配置是 `maxSurge: 25%, maxUnavailable: 25%`，对于 6 个副本的 Deployment，25% 向上取整 maxSurge 为 2，25% 向下取整 maxUnavailable 为 1。这意味着更新过程中最多同时存在 8 个 Pod（6+2），且允许 1 个 Pod 处于不可用状态——也就是说 Controller 可以在新 Pod 还没 Ready 的时候就开始终止旧 Pod。对于支付网关这样的核心服务，这是不可接受的。\n\n正确的配置应该把 `maxUnavailable` 设为 0。这个参数的含义是「更新过程中可用 Pod 数量不能低于 replicas - maxUnavailable」，设为 0 就保证了任何时刻都有 6 个 Ready 的 Pod 在接收流量。`maxSurge` 可以根据集群资源余量设为 1 或 2——值越大更新越快但同时占用的资源越多。对于 6 副本的核心服务，`maxSurge: 2, maxUnavailable: 0` 是一个很好的平衡点：每次可以同时创建 2 个新 Pod，新 Pod Ready 后再终止 2 个旧 Pod，整个更新只需要 3 轮就能完成。\n\n### Readiness Probe：Pod 未 Ready 不接流量\n\n题目中的 Deployment 只配置了 livenessProbe 而没有 readinessProbe，这是最常见的零停机失败原因。在 Kubernetes 中，Readiness Probe 决定的是 Pod 是否被加入 Service 的 Endpoints 列表。如果一个 Pod 没有通过 Readiness Probe，kube-proxy 不会把流量路由到它。反过来说，如果一个 Pod 根本没有配置 Readiness Probe，kubelet 会在容器进程启动后立刻将其标记为 Ready——即使应用内部还在做初始化。\n\n对于支付网关这种启动时需要建立数据库连接池、加载加密证书、初始化风控规则引擎的服务，从容器进程启动到真正能处理请求可能需要 5-15 秒。没有 Readiness Probe 意味着这 5-15 秒内流量就已经被路由过来了，请求必然失败。更糟糕的是，Deployment Controller 看到新 Pod「Ready」了就会开始缩减旧 Pod，导致可用处理能力下降。\n\nReadiness Probe 应该检测的是应用是否真正「能处理业务请求」，而不仅仅是「进程是否存活」。最佳实践是在应用中实现一个专门的 `/ready` 端点，这个端点在应用完成所有初始化（数据库连接建立、缓存预热、依赖服务健康检查）后才返回 200：\n\n```yaml\nreadinessProbe:\n  httpGet:\n    path: /ready\n    port: 8443\n  initialDelaySeconds: 5    # 给应用 5 秒启动时间再开始探测\n  periodSeconds: 5           # 每 5 秒探测一次\n  successThreshold: 1        # 连续 1 次成功即标记为 Ready\n  failureThreshold: 3        # 连续 3 次失败才标记为 NotReady\n```\n\n这里 `initialDelaySeconds` 要根据你的应用实际启动时间来设置。如果应用冷启动需要 10 秒，那设置为 5 秒就能在第 10 秒（5 + periodSeconds=5）时检测到应用就绪。设太短会产生无意义的失败探测日志，设太长会拖慢发版速度。生产环境中建议用 Startup Probe 来处理慢启动的情况——Startup Probe 在应用启动期间代替 Readiness Probe 和 Liveness Probe 工作，启动完成后才交还控制权，这样可以给应用足够的启动时间而不影响正常运行时的探测间隔。\n\n### preStop Hook + terminationGracePeriodSeconds：优雅关闭连接\n\n解决了「新 Pod 何时接入流量」的问题后，还要解决「旧 Pod 何时停止接收流量」。这里的核心挑战是 Kubernetes 内部的一个竞态条件：当 API Server 标记一个 Pod 为「正在删除」（设置 deletionTimestamp）后，两件事会并行发生——Endpoint Controller 开始从 Endpoints 中移除该 Pod 的 IP（路径 A），kubelet 开始执行 preStop Hook 然后发送 SIGTERM（路径 B）。这两条路径是独立的 watch 事件触发的，没有先后顺序保证。\n\n在一个 100+ 节点的集群中，路径 A 的完整链路是：Endpoint Controller watch 到变化 → 更新 Endpoints/EndpointSlice 对象 → kube-proxy watch 到 Endpoints 变化 → 重新生成 iptables/IPVS 规则并应用。这个链路涉及多次 API Server 交互和 watch 传播延迟，通常需要 2-5 秒。如果你的前面还有 Ingress Controller（如 Nginx Ingress），它也需要感知 Endpoints 变化并 reload 配置，又增加 1-3 秒延迟。\n\n如果没有 preStop Hook，kubelet 在感知到 deletionTimestamp 后几乎立刻发送 SIGTERM。假设你的应用收到 SIGTERM 后在 500ms 内就关闭了监听端口——但此时 kube-proxy 的 iptables 规则还没有更新完毕，新请求仍然会被路由到这个已经关闭端口的 Pod IP 上。这就是发版期间那些 502 错误的根本原因。\n\npreStop Hook 的作用就是在 SIGTERM 发送之前插入一段等待时间，让网络层有足够时间完成流量摘除：\n\n```yaml\nlifecycle:\n  preStop:\n    exec:\n      command: [\"sh\", \"-c\", \"sleep 7\"]\n```\n\n这段 `sleep 7` 让容器在收到 SIGTERM 之前多等 7 秒。这 7 秒内容器仍然在正常运行，可以继续处理已经路由过来的请求。同时网络层在并行完成 iptables 规则更新。7 秒后 SIGTERM 到达时，绝大多数情况下 Endpoints 已经更新完毕，不会再有新请求路由过来。应用收到 SIGTERM 后开始 drain（排空正在处理的请求），全部完成后正常退出。\n\n`terminationGracePeriodSeconds` 是整个终止流程的总超时，从 API Server 设置 deletionTimestamp 开始计时，包含 preStop 执行时间 + SIGTERM 后的应用清理时间。默认值是 30 秒。如果 preStop sleep 7 秒，应用 drain 最多需要 20 秒，那 `terminationGracePeriodSeconds` 应该设为至少 30-35 秒。超过这个时间 kubelet 会发送 SIGKILL 强制杀死容器——前面所有的优雅处理全部白费。一个非常常见的配置错误是加了 preStop 但没有相应调大 `terminationGracePeriodSeconds`，导致应用还没 drain 完就被 SIGKILL。\n\n### PodDisruptionBudget 防止驱逐过多\n\nRolling Update 不是 Pod 被终止的唯一场景。节点维护（`kubectl drain`）、集群自动扩缩容（Cluster Autoscaler 缩容节点）、甚至 Pod 优先级抢占，都可能导致 Pod 被驱逐。如果恰好在滚动更新期间有节点需要维护，两个事件叠加可能导致可用 Pod 数量跌破安全线。\n\nPodDisruptionBudget（PDB）就是为了防止这种情况。它定义了在自愿中断（voluntary disruption）场景下，必须保持的最小可用 Pod 数或最大不可用 Pod 数：\n\n```yaml\napiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: payment-gateway-pdb\n  namespace: production\nspec:\n  minAvailable: 4            # 任何时候至少保持 4 个 Pod 可用\n  selector:\n    matchLabels:\n      app: payment-gateway\n```\n\n这个 PDB 告诉 Kubernetes：不管是滚动更新还是节点维护，payment-gateway 的可用 Pod 数不能低于 4（总共 6 个副本）。如果 `kubectl drain` 某个节点上有 2 个 payment-gateway Pod，但此时只剩 4 个 Pod 可用，drain 操作会被阻塞直到有新 Pod 补上来。PDB 只对自愿中断生效，对节点宕机（非自愿中断）不生效——节点挂了 kubelet 都联系不上 API Server，PDB 无从执行。\n\n### Service 的 Endpoint 更新时序\n\n把前面的机制串起来，一个完整的零停机 Pod 替换的时序是这样的：\n\n```\nt=0s   Deployment Controller 决定终止旧 Pod-A，创建新 Pod-B\n       API Server 设置 Pod-A 的 deletionTimestamp\n       ┌─── 路径 A：Endpoint Controller 从 EndpointSlice 移除 Pod-A IP\n       │    kube-proxy 更新 iptables 规则（耗时 2-5s）\n       │    Ingress Controller reload 配置（耗时 1-3s）\n       │\n       ├─── 路径 B：kubelet 执行 Pod-A 的 preStop: sleep 7\n       │    （7 秒内 Pod-A 仍然正常运行，处理剩余请求）\n       │\n       │    同时 Pod-B 正在启动，尚未通过 Readiness Probe\n       │\nt=5s   路径 A 完成：新请求不再路由到 Pod-A\nt=7s   路径 B preStop 结束：kubelet 向 Pod-A 发送 SIGTERM\n       Pod-A 应用开始 graceful shutdown，drain 剩余请求\nt=12s  Pod-B 通过 Readiness Probe，被加入 Endpoints\n       Pod-B 开始接收新流量\nt=15s  Pod-A 应用 drain 完成，进程正常退出\n```\n\n关键点在于：preStop 的 sleep 时间（7 秒）必须大于网络层收敛时间（通常 2-5 秒），这样在 SIGTERM 到达时流量已经被摘除；新 Pod 必须通过 Readiness Probe 后才被加入 Endpoints，这样只有真正就绪的 Pod 才接收流量。两个机制配合就实现了「旧 Pod 已经没有新流量进来了再关闭」+「新 Pod 真正准备好了才接流量」的双重保障。\n\n### 完整的生产级配置\n\n将上述所有机制整合到一份完整的 Deployment 配置中：\n\n```yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: payment-gateway\n  namespace: production\nspec:\n  replicas: 6\n  revisionHistoryLimit: 5\n  strategy:\n    type: RollingUpdate\n    rollingUpdate:\n      maxSurge: 2          # 允许同时多 2 个 Pod 加速更新\n      maxUnavailable: 0    # 绝不减少可用 Pod 数\n  selector:\n    matchLabels:\n      app: payment-gateway\n  template:\n    metadata:\n      labels:\n        app: payment-gateway\n    spec:\n      terminationGracePeriodSeconds: 45   # preStop(7s) + drain(最多30s) + 余量\n      containers:\n      - name: gateway\n        image: registry.internal/payment-gateway:v3.9.0\n        ports:\n        - containerPort: 8443\n        readinessProbe:\n          httpGet:\n            path: /ready\n            port: 8443\n          initialDelaySeconds: 5\n          periodSeconds: 5\n          successThreshold: 1\n          failureThreshold: 3\n        livenessProbe:\n          httpGet:\n            path: /healthz\n            port: 8443\n          initialDelaySeconds: 15\n          periodSeconds: 10\n        lifecycle:\n          preStop:\n            exec:\n              command: [\"sh\", \"-c\", \"sleep 7\"]\n        resources:\n          requests:\n            cpu: 500m\n            memory: 512Mi\n          limits:\n            cpu: \"2\"\n            memory: 1Gi\n---\napiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: payment-gateway-pdb\n  namespace: production\nspec:\n  minAvailable: 4\n  selector:\n    matchLabels:\n      app: payment-gateway\n```\n\n这份配置的每一个参数都有明确的意图：`maxUnavailable: 0` 保证可用数不减少；`readinessProbe` 保证只有真正就绪的 Pod 才接收流量；`preStop: sleep 7` 给网络层足够的收敛时间；`terminationGracePeriodSeconds: 45` 给整个终止流程足够的时间预算；PDB 保证即使叠加节点维护也不会击穿可用性底线。\n\n## 第三步：体系化扩展延伸\n\n### 常见导致零停机失败的坑\n\n在生产环境中，即使配置看起来没问题，仍然有几个隐蔽的坑会导致零停机失效。第一个坑是没有配置 Readiness Probe 或者 Readiness Probe 检测的端点不准确。有些团队把 Readiness Probe 指向 `/healthz`——这个端点通常只检查进程是否存活，不检查依赖服务是否可达。正确的做法是让 `/ready` 端点检查数据库连接池、缓存连接、必要的外部服务健康状态，只有全部正常才返回 200。\n\n第二个坑是长连接中断。如果你的服务使用 WebSocket、gRPC streaming 或 HTTP/2 长连接，客户端可能持有一个连接长达几分钟。Endpoints 更新只影响新连接的路由，已建立的长连接不受影响——这些连接绑定在旧 Pod 上，旧 Pod 被终止时连接直接断开。解决方案是在应用层收到 SIGTERM 后主动通知客户端断开重连。对于 gRPC 服务，调用 `server.GracefulStop()` 会发送 GOAWAY 帧通知客户端；对于 WebSocket，发送 Close 帧让客户端重连。客户端重连后会被路由到新 Pod。\n\n第三个坑是优雅关闭不彻底。应用收到 SIGTERM 后停止了接受新连接，但正在处理的请求中有一个需要调用外部支付渠道接口，这个接口响应时间 P99 是 25 秒。如果 `terminationGracePeriodSeconds` 只有 30 秒而 preStop 又占了 7 秒，留给应用 drain 的时间只有 23 秒，不够这个请求完成。结果是 SIGKILL 到来时这个支付请求被强制中断，可能导致扣款成功但订单状态未更新的不一致问题。解决方案是根据业务最长请求处理时间来设置 grace period，并在应用侧实现带超时的 drain 逻辑。\n\n第四个坑是 PID 1 问题。如果 Dockerfile 使用了 shell 格式的 ENTRYPOINT（如 `ENTRYPOINT java -jar app.jar`），实际的 PID 1 是 `/bin/sh`，它不会将 SIGTERM 转发给子进程。应用根本收不到 SIGTERM，一直跑到 `terminationGracePeriodSeconds` 超时才被 SIGKILL。解决方案是使用 exec 格式 `ENTRYPOINT [\"java\", \"-jar\", \"app.jar\"]`，或者使用 tini/dumb-init 作为 PID 1 init 进程来正确转发信号。\n\n### 进阶：Blue-Green / Canary with Argo Rollouts\n\nRolling Update 是 Kubernetes 内置的更新策略，简单可靠但有局限——它无法实现流量百分比控制（比如先给 5% 的流量跑新版本观察一段时间），也无法做到瞬间全量切换。对于更复杂的发布需求，社区的标准答案是 Argo Rollouts。\n\nArgo Rollouts 是一个 Kubernetes Controller，它用自定义资源 `Rollout` 替代原生 Deployment，支持 Blue-Green 和 Canary 两种高级发布策略。以 Canary 为例，你可以定义「先切 10% 流量到新版本，等 5 分钟后如果 Prometheus 报告的错误率低于 0.1% 再自动推进到 50%，最后全量切换」这样的渐进式发布流程：\n\n```yaml\napiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: payment-gateway\nspec:\n  replicas: 6\n  strategy:\n    canary:\n      steps:\n      - setWeight: 10          # 先切 10% 流量\n      - pause: { duration: 5m } # 观察 5 分钟\n      - setWeight: 50          # 扩大到 50%\n      - pause: { duration: 5m }\n      - setWeight: 100         # 全量切换\n      canaryService: payment-gateway-canary\n      stableService: payment-gateway-stable\n      trafficRouting:\n        nginx:\n          stableIngress: payment-gateway-ingress\n```\n\n这种方式比原生 Rolling Update 更安全——如果新版本有问题，影响范围被控制在 10% 的流量内，而不是像 Rolling Update 那样一旦新 Pod Ready 就开始接收全量流量中的等比例份额。配合 AnalysisRun（Argo Rollouts 的自动分析功能），可以在每个阶段自动查询 Prometheus 指标，如果错误率或延迟超标则自动回滚，完全无需人工介入。\n\n### 数据库 Migration 的零停机策略\n\n零停机部署最容易被忽视的一环是数据库 schema migration。如果新版本的代码依赖一个新的数据库字段或表结构变更，而这个变更和旧版本代码不兼容，那么 Rolling Update 期间新旧版本共存时必然有一方报错。\n\n业界公认的解决方案是「Expand-Contract」模式，也叫两阶段迁移。第一阶段（Expand）：先部署一个中间版本的代码，它同时兼容旧 schema 和新 schema——比如新字段用 `ALTER TABLE ADD COLUMN ... DEFAULT NULL` 添加，旧代码不读不写这个字段所以不受影响，新代码开始写入但也能处理字段为 NULL 的情况。第二阶段（Contract）：等所有 Pod 都更新到新版本后，再部署下一个版本的代码去掉对旧 schema 的兼容，清理不再需要的旧字段。这种方式保证了在任何时刻，正在运行的代码和数据库 schema 都是兼容的。\n\n关键原则是：schema 变更必须向后兼容（backward compatible）。不能 rename column、不能 drop column、不能改 column type——这些破坏性变更必须拆成多个小步骤，每一步都保持兼容性。工具方面，`gh-ost`（MySQL）和 `pgroll`（PostgreSQL）可以实现在线 schema 变更而不锁表。\n\n### 面试高频考点\n\n面试中零停机部署通常从「你们的发布流程是怎样的」这个问题切入，然后层层深入。第一层考你知不知道 Rolling Update 的基本概念和 maxSurge/maxUnavailable 参数。第二层考你理不理解 Readiness Probe 在其中的关键作用。第三层考你知不知道 preStop Hook 解决的竞态问题——这是大多数人的知识盲区，能答出「Endpoint 更新和 Pod 终止是并行的，存在竞态窗口」就已经超过 80% 的候选人了。第四层考你在生产环境中实际踩过什么坑——长连接处理、PID 1 信号转发、数据库 migration 兼容性这些话题，能结合自己的经验讲出来会非常加分。面试官真正想听的不是你背了多少概念，而是你有没有在真实场景中把这些概念串联起来解决过问题。",
+      "keyPoints": [
+        "maxUnavailable 设为 0 是零停机的基础保障，确保更新过程中可用 Pod 数量不低于期望副本数，配合 maxSurge 控制同时创建的新 Pod 数量来平衡更新速度和资源占用",
+        "Readiness Probe 决定 Pod 何时被加入 Service Endpoints 开始接收流量，未配置 Readiness Probe 的 Pod 启动后立即被标记为 Ready，导致未就绪 Pod 收到请求",
+        "Endpoint 更新（网络层摘除）和 kubelet 执行 preStop/SIGTERM（Pod 终止层）是并行发生的独立路径，存在 2-5 秒的竞态窗口，preStop sleep 用于弥补这个时间差",
+        "terminationGracePeriodSeconds 是从 deletionTimestamp 开始计时的总超时，包含 preStop 执行时间，必须设为 preStop 时长 + 应用最大 drain 时间 + 安全余量",
+        "PodDisruptionBudget 保护 Pod 不被自愿中断（节点 drain、集群缩容）过度驱逐，但对非自愿中断（节点宕机）无效",
+        "长连接场景（gRPC/WebSocket）需要应用层主动发送断开通知让客户端重连到新 Pod，仅靠 Endpoints 更新只能影响新连接的路由",
+        "数据库 schema migration 必须遵循 Expand-Contract 模式保持向后兼容，不能在 Rolling Update 期间部署与旧 schema 不兼容的代码",
+        "Dockerfile 的 ENTRYPOINT 必须使用 exec 格式确保应用进程是 PID 1 能直接收到 SIGTERM，shell 格式会导致信号无法转发到应用进程"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz1",
+          "question": "在 Kubernetes Deployment 的 Rolling Update 中，maxSurge 和 maxUnavailable 的核心作用是什么？",
+          "choices": [
+            {"id": "A", "text": "maxSurge 控制更新过程中允许多出的 Pod 数，maxUnavailable 控制允许不可用的 Pod 数，两者共同决定更新的步进节奏和安全性"},
+            {"id": "B", "text": "maxSurge 控制新 Pod 的启动速度，maxUnavailable 控制旧 Pod 的删除速度，两者相互独立互不影响"},
+            {"id": "C", "text": "maxSurge 是新 ReplicaSet 的最大副本数，maxUnavailable 是旧 ReplicaSet 的最小副本数"},
+            {"id": "D", "text": "maxSurge 和 maxUnavailable 只在使用 Recreate 策略时生效，RollingUpdate 策略会忽略这两个参数"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "maxSurge 定义的是更新过程中 Pod 总数可以比 replicas 多出多少（即同时存在的新旧 Pod 总数上限），maxUnavailable 定义的是更新过程中可用 Pod 数可以比 replicas 少多少。两者协同工作决定了 Deployment Controller 在新旧 ReplicaSet 之间调整副本数的步进策略。选项 B 错在两者并不独立——Controller 每一步决策都要同时满足两个约束。选项 C 混淆了参数含义，它们控制的是差值而非绝对值。选项 D 完全错误，这两个参数只在 RollingUpdate 策略下有意义，Recreate 策略没有这两个参数。"
+        },
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz2",
+          "question": "一个 replicas: 6 的 Deployment 配置了 maxSurge: 2, maxUnavailable: 0，更新过程中同一时刻最多存在多少个 Pod？",
+          "choices": [
+            {"id": "A", "text": "6 个"},
+            {"id": "B", "text": "8 个"},
+            {"id": "C", "text": "12 个"},
+            {"id": "D", "text": "2 个"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "maxSurge: 2 表示更新过程中 Pod 总数最多比期望的 replicas（6）多出 2 个，即最多同时存在 6 + 2 = 8 个 Pod。这 8 个 Pod 包括正在运行的旧版本 Pod 和正在启动的新版本 Pod。maxUnavailable: 0 保证这 8 个 Pod 中至少有 6 个处于 Ready 状态。选项 A（6 个）忽略了 maxSurge 允许超额创建 Pod。选项 C（12 个）可能是把 maxSurge 理解成了倍数而非增量。选项 D（2 个）混淆了 maxSurge 和 Pod 总数的关系。"
+        },
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz3",
+          "question": "为什么没有配置 Readiness Probe 的 Deployment 在滚动更新时容易出现 5xx 错误？",
+          "choices": [
+            {"id": "A", "text": "没有 Readiness Probe 时 kubelet 不会启动容器，Pod 永远处于 Pending 状态"},
+            {"id": "B", "text": "没有 Readiness Probe 时容器启动后立即被标记为 Ready，即使应用尚未完成初始化就开始接收流量，同时 Controller 误判新 Pod 已就绪而提前缩减旧 Pod"},
+            {"id": "C", "text": "没有 Readiness Probe 时 Service 不会创建 Endpoints，所有流量都被拒绝"},
+            {"id": "D", "text": "没有 Readiness Probe 时 Deployment Controller 会跳过 Rolling Update 改为 Recreate 策略"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kubernetes 的默认行为是：如果 Pod 没有配置 Readiness Probe，kubelet 在容器进程成功启动后就将 Pod 的 Ready condition 设为 True。这导致两个问题叠加：一是 Service 立即将流量路由到这个还在初始化的 Pod 上，请求失败；二是 Deployment Controller 看到新 Pod 已经「Ready」就开始缩减旧 Pod，减少了可用的健康处理节点。选项 A 完全错误，Readiness Probe 不影响容器启动。选项 C 也不对，没有 Readiness Probe 时 Pod Ready 后照样会被加入 Endpoints。选项 D 编造了不存在的行为。"
+        },
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz4",
+          "question": "preStop Hook 在 Pod 终止流程中解决了什么核心问题？",
+          "choices": [
+            {"id": "A", "text": "防止 kubelet 向容器发送 SIGTERM 信号"},
+            {"id": "B", "text": "在 SIGTERM 发送前插入延迟，给 Endpoint Controller 和 kube-proxy 足够时间完成流量摘除，避免新请求被路由到正在终止的 Pod"},
+            {"id": "C", "text": "替代 Readiness Probe 的功能，在 Pod 终止时将其从 Endpoints 中移除"},
+            {"id": "D", "text": "通知 Deployment Controller 停止创建新 Pod，等旧 Pod 完全终止后再继续"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Pod 被标记为删除后，Endpoint Controller 移除 Pod IP（网络层）和 kubelet 执行 preStop + SIGTERM（Pod 层）是两条并行的路径。如果没有 preStop 延迟，kubelet 可能在 Endpoints 尚未更新完毕时就已经让容器关闭了，导致新请求路由到已关闭的 Pod。preStop: sleep 5-10s 就是为了确保在 SIGTERM 到达之前，网络层已经完成流量摘除。选项 A 错误，preStop 执行完毕后 SIGTERM 仍然会发送。选项 C 混淆了 preStop 和 Readiness Probe 的职责。选项 D 编造了不存在的机制。"
+        },
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz5",
+          "question": "以下 kubectl describe pod 输出片段说明了什么问题？\n\n```\nState:       Terminated\n  Reason:    OOMKilled\n  Exit Code: 137\nLast State:  Running\n```\n\n结合 terminationGracePeriodSeconds 的语境来看：",
+          "choices": [
+            {"id": "A", "text": "Exit Code 137 = SIGKILL(128+9)，可能是 terminationGracePeriodSeconds 超时后被强制终止，也可能是内存超 limit 被 OOM Killer 杀掉"},
+            {"id": "B", "text": "Exit Code 137 表示进程正常退出，graceful shutdown 成功完成"},
+            {"id": "C", "text": "Exit Code 137 表示收到了 SIGTERM 信号，应用主动选择以 137 为退出码退出"},
+            {"id": "D", "text": "Exit Code 137 是 Kubernetes 内部错误码，与信号无关"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在 Unix/Linux 系统中，当进程被信号杀死时退出码为 128 + 信号编号。SIGKILL 的编号是 9，所以 128 + 9 = 137。这个退出码出现在两种场景：一是 OOM Killer 杀进程（Reason 字段已经明确写了 OOMKilled），二是 terminationGracePeriodSeconds 超时后 kubelet 发送 SIGKILL 强制终止容器。在优雅关闭的语境中看到 137 就要检查 grace period 是否设得太短。选项 B 错误，正常退出的退出码应该是 0。选项 C 混淆了 SIGTERM（信号 15，退出码 143）和 SIGKILL（信号 9，退出码 137）。选项 D 编造了解释。"
+        },
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz6",
+          "question": "一个常见的配置错误是 preStop: sleep 15 但 terminationGracePeriodSeconds 保持默认的 30 秒，应用 drain 需要 25 秒。这会导致什么后果？",
+          "choices": [
+            {"id": "A", "text": "没有问题，Kubernetes 会自动延长 terminationGracePeriodSeconds 来等待应用完成 drain"},
+            {"id": "B", "text": "preStop 占了 15 秒后只剩 15 秒给应用 drain，而应用需要 25 秒，超时后被 SIGKILL 强制终止，正在处理的请求被中断"},
+            {"id": "C", "text": "preStop 会被自动跳过以保证应用有足够时间处理 SIGTERM"},
+            {"id": "D", "text": "terminationGracePeriodSeconds 的计时从 SIGTERM 发送后才开始，preStop 不消耗这个时间预算"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "terminationGracePeriodSeconds 的计时从 API Server 设置 deletionTimestamp 那一刻开始，preStop 的执行时间包含在这个总预算内。preStop sleep 15 秒后 kubelet 发送 SIGTERM，此时距离 SIGKILL 只剩 30 - 15 = 15 秒。应用需要 25 秒来 drain，但只有 15 秒可用，超时后被 SIGKILL 强杀——正在处理的请求被直接中断。选项 A 错误，Kubernetes 不会自动延长 grace period。选项 C 也不对，preStop 不会被跳过（除非总超时已到，此时直接 SIGKILL）。选项 D 是很常见的误解，grace period 包含 preStop 时间。"
+        },
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz7",
+          "question": "PodDisruptionBudget（PDB）的 minAvailable 和 maxUnavailable 有什么区别？什么场景下用哪个？",
+          "choices": [
+            {"id": "A", "text": "minAvailable 指定必须保持的最小可用 Pod 数，maxUnavailable 指定允许不可用的最大 Pod 数，两者效果相同只是表达方式不同，副本数不变时可互换"},
+            {"id": "B", "text": "minAvailable 在弹性伸缩场景下更灵活因为它指定绝对数，maxUnavailable 在固定副本数场景下更直观因为它限制百分比"},
+            {"id": "C", "text": "minAvailable 适合副本数固定的场景，maxUnavailable 适合配合 HPA 弹性伸缩的场景——因为 HPA 改变副本数时 maxUnavailable 按比例自动适配"},
+            {"id": "D", "text": "两者只能用绝对数不能用百分比，且同一个 PDB 中必须同时配置"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "minAvailable 指定最少保持多少 Pod 可用，maxUnavailable 指定最多允许多少 Pod 不可用。在固定副本数场景下两者可以互换（比如 replicas=6 时 minAvailable=4 等价于 maxUnavailable=2）。但在使用 HPA 的弹性伸缩场景下差异很大：如果用 minAvailable=4 而 HPA 把副本数从 6 扩到 20，PDB 仍然只保护 4 个——节点 drain 可以一次驱逐 16 个 Pod。用 maxUnavailable=30% 则不管当前副本数多少都保证至少 70% 可用，随伸缩自动适配。选项 A 忽略了弹性伸缩场景下的差异。选项 B 说反了适用场景。选项 D 两者都支持百分比且同一 PDB 中只能配一个。"
+        },
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz8",
+          "question": "你的团队在滚动更新时 gRPC 服务出现了大量 UNAVAILABLE 错误，但 HTTP 服务没有问题。排查发现 preStop 和 Readiness Probe 都配置正确。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "gRPC 使用长连接复用（HTTP/2 多路复用），旧 Pod 被终止时已建立的连接直接断开，而新连接的路由已经被 Endpoints 更新正确处理了"},
+            {"id": "B", "text": "gRPC 不支持 Kubernetes Service 的负载均衡，需要使用 Headless Service"},
+            {"id": "C", "text": "preStop Hook 对 gRPC 服务不生效，只对 HTTP 服务生效"},
+            {"id": "D", "text": "gRPC 服务的 Readiness Probe 必须用 gRPC 健康检查协议，HTTP 探针无法正常工作"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "gRPC 基于 HTTP/2 协议，客户端和服务端之间通常维持长连接并在同一连接上多路复用多个请求。当 Endpoints 更新完毕后，只有新建立的连接会被路由到新 Pod，但客户端已经建立的长连接仍然绑定在旧 Pod 上。旧 Pod 被终止时这些长连接直接断开，正在进行的 RPC 调用报 UNAVAILABLE。正确的做法是在应用层收到 SIGTERM 后调用 `server.GracefulStop()` 发送 GOAWAY 帧，通知客户端关闭连接并重连。选项 B 虽然 gRPC 的负载均衡有特殊考量，但这不是本题描述的错误场景。选项 C 编造了限制。选项 D 虽然 K8s 1.24+ 确实支持 gRPC 探针，但 HTTP 探针检查健康端点也能工作。"
+        },
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz9",
+          "question": "在数据库 schema migration 场景下，以下哪种操作可以在 Rolling Update 期间安全执行（不破坏零停机）？",
+          "choices": [
+            {"id": "A", "text": "ALTER TABLE users RENAME COLUMN name TO full_name"},
+            {"id": "B", "text": "ALTER TABLE users ADD COLUMN phone VARCHAR(20) DEFAULT NULL"},
+            {"id": "C", "text": "ALTER TABLE users DROP COLUMN legacy_field"},
+            {"id": "D", "text": "ALTER TABLE users MODIFY COLUMN age BIGINT（从 INT 改为 BIGINT）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "零停机 migration 的核心原则是 schema 变更必须向后兼容（backward compatible）。ADD COLUMN 加一个允许 NULL 的新字段是安全的——旧版本代码不读不写这个字段所以不受影响，新版本代码可以开始使用它。选项 A RENAME COLUMN 会立刻让旧版本代码找不到原字段报错。选项 C DROP COLUMN 会让旧版本代码尝试读取已删除的字段报错。选项 D MODIFY COLUMN 改类型在某些数据库中需要锁表且可能导致数据截断或格式不兼容。这三种操作都应该拆成多步骤的 Expand-Contract 模式来执行。"
+        },
+        {
+          "id": "k8s-zero-downtime-deployment-q1-quiz10",
+          "question": "Argo Rollouts 的 Canary 发布相比 Kubernetes 原生 Rolling Update 最核心的优势是什么？",
+          "choices": [
+            {"id": "A", "text": "Canary 发布不需要创建新 ReplicaSet，直接在原地更新 Pod 的镜像"},
+            {"id": "B", "text": "Canary 发布可以精确控制流量百分比逐步切换到新版本，配合自动分析在异常时自动回滚，将新版本问题的爆炸半径控制在小范围内"},
+            {"id": "C", "text": "Canary 发布比 Rolling Update 更快，因为它一次性替换所有 Pod"},
+            {"id": "D", "text": "Canary 发布不需要 Readiness Probe 和 preStop Hook 就能实现零停机"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "原生 Rolling Update 的流量分配是按 Pod 比例自然分散的——如果 6 个副本中有 1 个是新版本，新版本大约会收到 1/6（约 17%）的流量，无法精确控制。Argo Rollouts 通过与 Ingress Controller 或 Service Mesh 集成，可以实现「新版本只有 2 个 Pod 但只接收 5% 流量」这样的精确控制。配合 AnalysisRun 自动查询 Prometheus 指标，在错误率超标时自动回滚，大幅降低了新版本问题的爆炸半径。选项 A 错误，Canary 发布也需要创建新的 Pod。选项 C 混淆了 Canary 和 Recreate 策略。选项 D 不对，Canary 发布同样需要 Readiness Probe 和 preStop Hook 来保证零停机。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-update-deployment",
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination",
+        "https://kubernetes.io/docs/tasks/run-application/configure-pdb/",
+        "https://argo-rollouts.readthedocs.io/en/stable/"
+      ]
+    }
+  ]
+}
