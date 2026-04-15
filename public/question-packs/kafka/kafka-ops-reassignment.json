@@ -1,0 +1,156 @@
+{
+  "id": "kafka-ops-reassignment",
+  "name": "分区副本重分配实战",
+  "domain": "kafka",
+  "description": "详解 Kafka 分区副本重分配的三步操作流程、限流配置与生产实战经验",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-ops-reassignment-q1",
+      "domain": "kafka",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": ["Kafka", "分区重分配", "kafka-reassign-partitions", "负载均衡", "数据迁移"],
+      "title": "如何进行 Kafka 分区副本的重新分配（Reassignment）？",
+      "content": "## 背景\n\n你所在的团队维护着一套 Kafka 3.6 集群，6 个 Broker（ID 0-5），运行在 KRaft 模式下，承载了公司全部核心业务的事件流，日均消息量约 20 亿条。最近基础架构部门完成了新一批服务器的交付，你需要把 3 台新机器（Broker 6、7、8）加入集群，然后把部分 Topic 的分区副本从老 Broker 迁移到新 Broker 上，让集群负载更均衡。\n\n这个需求在 Kafka 运维中非常常见。除了扩容加 Broker 之外，下线退役一台老 Broker、把热点分区从负载过高的 Broker 上挪走、甚至变更某个 Topic 的副本因子，都需要用到分区副本重分配（Partition Reassignment）这个操作。Kafka 自带的 kafka-reassign-partitions.sh 就是干这件事的官方工具，它从 Kafka 最早的版本就存在，一直是集群运维的核心脚本之一。\n\n这个工具的工作流程分为三步：先用 `--generate` 让 Kafka 根据你指定的目标 Broker 列表自动生成一份重分配计划（JSON 格式），然后用 `--execute` 执行这份计划触发副本数据的跨 Broker 迁移，最后用 `--verify` 检查迁移进度直到所有分区完成。整个过程中最关键的一个参数是 `--throttle`，它控制副本复制的带宽上限——如果不加限流，大规模重分配会把集群的网络带宽吃满，直接影响在线业务的读写延迟。\n\n假设你现在要把 `order.events`（12 分区、3 副本）和 `payment.transactions`（8 分区、3 副本）这两个 Topic 的分区从 Broker 0-5 重新分配到 Broker 3-8 上，请详细说明完整的操作步骤，包括每一步的输入输出、限流策略、以及在这个过程中需要关注的监控指标和风险点。",
+      "answer": "## 第一步：kafka-reassign-partitions.sh 基础概念\n\n在 Kafka 的架构中，每个 Topic 的每个 Partition 都有一组副本（Replica），分布在不同的 Broker 上。其中一个副本是 Leader，负责处理所有的读写请求；其余副本是 Follower，不断从 Leader 拉取数据保持同步，一旦 Leader 所在的 Broker 挂掉，Controller 会从 Follower 中选举新的 Leader。正常情况下，Kafka 在创建 Topic 时会自动把各分区的副本均匀地分散到集群中的 Broker 上，但随着集群的扩缩容、Broker 的上下线、业务流量的变化，这种均匀分布会被打破——某些 Broker 可能承载了过多的 Leader 副本导致 CPU 和网络负载偏高，某些 Broker 的磁盘空间因为堆积了大 Topic 的分区而告急。\n\nkafka-reassign-partitions.sh 就是用来解决这个问题的官方 CLI 工具。它的核心能力是把指定分区的副本从一组 Broker 迁移到另一组 Broker 上，底层调用的是 Kafka Admin API 中的 `AlterPartitionReassignments` 请求（Kafka 2.4+ 引入的新 API，在此之前走的是 ZooKeeper 写入 /admin/reassign_partitions 节点）。它最常见的使用场景有四个：集群扩容后把已有分区的副本扩散到新 Broker 上实现负载均衡；下线退役某台 Broker 之前先把它上面的所有副本迁走；变更某个 Topic 的副本因子（比如从 2 副本升级到 3 副本）；以及把热点分区从负载过高的 Broker 上迁移到空闲 Broker 上。\n\n这个工具的基本语法格式是 `kafka-reassign-partitions.sh --bootstrap-server <broker地址> --<操作> [参数]`，操作类型包括三个：`--generate` 生成重分配计划、`--execute` 执行计划、`--verify` 验证进度。在 Kafka 2.4 之前，连接集群只能用 `--zookeeper`；从 2.4 开始支持 `--bootstrap-server`，这也是目前推荐的方式，特别是在 KRaft 模式集群上 `--zookeeper` 根本不可用。\n\n## 第二步：三步操作流程详解\n\n### 第一步：--generate 生成重分配计划\n\n在执行重分配之前，首先要告诉 Kafka 你想把哪些 Topic 迁移到哪些 Broker 上。这需要准备一个 JSON 文件来指定要迁移的 Topic 列表。按照背景中的需求，我们要迁移 `order.events` 和 `payment.transactions`，先创建一个 topics-to-move.json 文件：\n\n```json\n{\n  \"topics\": [\n    {\"topic\": \"order.events\"},\n    {\"topic\": \"payment.transactions\"}\n  ],\n  \"version\": 1\n}\n```\n\n然后执行 --generate 命令，指定目标 Broker 列表：\n\n```bash\nbin/kafka-reassign-partitions.sh --generate \\\n  --topics-to-move-json-file topics-to-move.json \\\n  --broker-list \"3,4,5,6,7,8\" \\\n  --bootstrap-server broker1:9092\n```\n\n这条命令会输出两段 JSON。第一段是「Current partition replica assignment」，记录了当前各分区的副本分布情况，务必保存下来作为回滚方案；第二段是「Proposed partition reassignment configuration」，是 Kafka 根据目标 Broker 列表自动生成的新分配方案：\n\n```\nCurrent partition replica assignment\n{\"version\":1,\"partitions\":[\n  {\"topic\":\"order.events\",\"partition\":0,\"replicas\":[0,1,2],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":1,\"replicas\":[1,2,3],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":2,\"replicas\":[2,3,4],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":3,\"replicas\":[3,4,5],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  ...\n]}\n\nProposed partition reassignment configuration\n{\"version\":1,\"partitions\":[\n  {\"topic\":\"order.events\",\"partition\":0,\"replicas\":[3,6,7],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":1,\"replicas\":[4,7,8],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":2,\"replicas\":[5,8,3],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":3,\"replicas\":[6,3,4],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  ...\n]}\n```\n\n注意 --generate 只是生成计划，并不会真正执行任何数据迁移。你需要把「Current partition replica assignment」那段 JSON 保存到 rollback.json，把「Proposed partition reassignment configuration」保存到 reassignment-plan.json。保存回滚计划这一步绝对不能省略——一旦新的分配方案出了问题（比如某台新 Broker 硬件故障），你需要用回滚计划把分区迁回原来的 Broker。\n\n--generate 生成的方案是 Kafka 按照「尽量在目标 Broker 间均匀分散副本」的策略自动计算的，大多数场景下可以直接使用。但如果你有特殊需求，比如希望某些分区的 Leader 副本优先落在特定机架的 Broker 上，或者只想移动部分分区而不是整个 Topic，可以跳过 --generate 手动编写 reassignment-plan.json。手动编写时 JSON 格式跟上面的输出完全一样，replicas 数组中的第一个 Broker ID 就是 Preferred Leader（优先副本），Controller 在做 Preferred Leader Election 时会优先选它为 Leader。\n\n### 第二步：--execute 执行重分配\n\n确认计划无误后，用 --execute 触发重分配，同时通过 --throttle 限制副本复制的带宽：\n\n```bash\nbin/kafka-reassign-partitions.sh --execute \\\n  --reassignment-json-file reassignment-plan.json \\\n  --throttle 52428800 \\\n  --bootstrap-server broker1:9092\n```\n\n这里 `--throttle 52428800` 表示限流 50MB/s（52428800 字节）。命令输出如下：\n\n```\nCurrent partition replica assignment\n\n{\"version\":1,\"partitions\":[{\"topic\":\"order.events\",\"partition\":0,\"replicas\":[0,1,2], ...}]}\n\nSave this to use as the --reassignment-json-file option during rollback\nSuccessfully started partition reassignments for order.events-0,order.events-1,...,payment.transactions-7\nThe inter-broker throttle limit was set to 52428800 B/s\nEach broker participating in the reassignment will have a replication throttle applied.\n```\n\n执行 --execute 之后，Kafka 内部发生了什么？这是理解重分配原理的关键。以 order.events 分区 0 为例，假设它的副本要从 [0,1,2] 变成 [3,6,7]，Controller 的处理流程是这样的：首先，Controller 把分区的副本集合临时扩展为 [0,1,2,3,6,7]，也就是新旧副本并存。新的 Follower 副本（Broker 3、6、7）会被创建出来，开始从当前 Leader（Broker 0）拉取数据追赶进度。这个追赶过程跟正常的 Follower 同步机制完全一样——新 Follower 不断发 Fetch 请求给 Leader，Leader 把日志数据返回给它们。当新 Follower 追上 Leader 的 LEO（Log End Offset）之后，它们会被加入 ISR（In-Sync Replicas）列表。一旦所有新副本都进入了 ISR，Controller 就会执行最后的清理工作：把旧副本（Broker 0、1、2 上的）从副本集合中移除并删除，把副本集合更新为最终的 [3,6,7]，最后更新集群元数据通知所有 Broker。\n\n--throttle 参数的作用原理是在涉及重分配的 Broker 上设置两个动态配置：`leader.replication.throttled.rate` 和 `follower.replication.throttled.rate`，限制副本复制的出口和入口带宽。同时还会在相关 Topic 上设置 `leader.replication.throttled.replicas` 和 `follower.replication.throttled.replicas`，指明哪些副本参与限流。限流只作用于重分配的副本复制流量，不影响正常的 ISR 同步和客户端读写。\n\n限流值设多少合适？这取决于你集群的网络容量和业务对延迟的敏感度。一个常见的经验法则是：限流值不超过 Broker 网络带宽的 20-30%。如果你的 Broker 是万兆网卡（10Gbps ≈ 1.25GB/s），50-100MB/s 的限流通常是安全的。如果业务高峰期 Broker 的网络利用率已经到了 60% 以上，就需要把限流值降到更低，或者选择在凌晨低峰期执行。限流值可以在重分配过程中动态调整，不需要停止重分配，再次执行 --execute 加上新的 --throttle 值即可：\n\n```bash\n# 发现业务延迟升高，把限流从 50MB/s 降到 20MB/s\nbin/kafka-reassign-partitions.sh --execute \\\n  --reassignment-json-file reassignment-plan.json \\\n  --throttle 20971520 \\\n  --bootstrap-server broker1:9092\n```\n\n### 第三步：--verify 验证进度\n\n重分配是一个持续过程，取决于要迁移的数据量和限流值，可能持续几分钟到几天。用 --verify 检查进度：\n\n```bash\nbin/kafka-reassign-partitions.sh --verify \\\n  --reassignment-json-file reassignment-plan.json \\\n  --bootstrap-server broker1:9092\n```\n\n输出会逐分区显示状态：\n\n```\nStatus of partition reassignment:\nReassignment of partition order.events-0 is completed.\nReassignment of partition order.events-1 is completed.\nReassignment of partition order.events-2 is still in progress.\nReassignment of partition order.events-3 is still in progress.\n...\nReassignment of partition payment.transactions-6 is completed.\nReassignment of partition payment.transactions-7 is completed.\n\nClearing broker-level throttles on brokers 0,1,2,3,4,5,6,7,8\nClearing topic-level throttles on topic order.events\nClearing topic-level throttles on topic payment.transactions\n```\n\n当所有分区都显示 completed 时，--verify 会自动清除之前设置的限流配置。这一步非常关键——如果你忘记执行 --verify 或者中途中断了验证脚本，限流配置会残留在 Broker 和 Topic 上，导致后续正常的 ISR 同步也被限流，影响副本的追赶速度。所以生产环境中建议写一个循环脚本定期执行 --verify，直到所有分区 completed 为止：\n\n```bash\nwhile true; do\n  output=$(bin/kafka-reassign-partitions.sh --verify \\\n    --reassignment-json-file reassignment-plan.json \\\n    --bootstrap-server broker1:9092 2>&1)\n  echo \"$output\"\n  if echo \"$output\" | grep -q \"is still in progress\"; then\n    echo \"--- Reassignment still in progress, checking again in 60s ---\"\n    sleep 60\n  else\n    echo \"--- All partitions reassigned successfully ---\"\n    break\n  fi\ndone\n```\n\n如何估算重分配需要多长时间？公式很简单：迁移时间 ≈ 需要迁移的数据总量 / 限流速率。假设 order.events 每个分区平均 80GB 数据，12 个分区有 8 个需要迁移至少 1 个副本（假设平均每个分区迁移 1.5 个副本的数据量），那总迁移数据量约为 8 × 80GB × 1.5 = 960GB。以 50MB/s 的限流速率计算，960GB / 50MB/s ≈ 19660 秒 ≈ 5.5 小时。实际时间会比这个估算略长，因为限流是针对单个 Broker 的，多个分区同时迁移时会共享这个带宽上限。\n\n## 第三步：生产环境进阶实践\n\n重分配过程中需要密切关注的监控指标有几个。首先是 `UnderReplicatedPartitions`，重分配期间这个值会出现短暂升高，因为新副本刚创建时还没追上 Leader，会被临时标记为 under-replicated，这是正常的预期行为。但如果这个值在重分配完成后仍然居高不下，就说明有副本没能成功追上 Leader，可能是网络瓶颈或目标 Broker 的磁盘 I/O 跟不上。其次是 `BytesInPerSec` 和 `BytesOutPerSec`，观察参与迁移的 Broker 的网络吞吐量是否在限流范围内。还有各 Broker 的 CPU 使用率和磁盘 I/O，如果目标 Broker 的磁盘写入延迟显著升高，说明迁移压力过大需要降低限流值。\n\n不加 --throttle 直接执行重分配是生产环境中最危险的操作之一。新 Follower 会以 Broker 网络和磁盘能承受的最大速率拉取数据，在万兆网卡上这可能意味着每个 Broker 同时以 500MB/s 以上的速率进行副本复制。这会瞬间打满网络带宽和磁盘 I/O，导致正常的客户端请求超时、Producer 写入失败、Consumer 消费延迟飙升。在一个承载生产流量的集群上不加限流做重分配，基本等于一次自找的线上事故。\n\n关于通过重分配变更副本因子，这是一个很多人不知道的用法。假设 order.events 当前是 2 副本，你想升级到 3 副本，只需要手动编写一个 reassignment-plan.json，在每个分区的 replicas 列表中多加一个 Broker ID：\n\n```json\n{\"version\":1,\"partitions\":[\n  {\"topic\":\"order.events\",\"partition\":0,\"replicas\":[3,6,7],\"log_dirs\":[\"any\",\"any\",\"any\"]},\n  {\"topic\":\"order.events\",\"partition\":1,\"replicas\":[4,7,8],\"log_dirs\":[\"any\",\"any\",\"any\"]}\n]}\n```\n\n原来 replicas 是 [3,6]（2 副本），现在改成 [3,6,7]（3 副本），执行 --execute 后 Broker 7 上会创建新的 Follower 副本并追赶数据，完成后副本因子就从 2 变成了 3。反过来减少副本因子也是同样的操作，减少 replicas 中的 Broker ID 即可。\n\n在大规模集群中（50+ Broker），手动使用 kafka-reassign-partitions.sh 管理分区分布变得不现实——你不可能手动为几千个分区计算最优的副本分布。LinkedIn 开源的 Cruise Control 就是为了解决这个问题而生的。它持续监控集群中每个 Broker 的负载指标（CPU、网络、磁盘、Leader 数量），当检测到负载不均衡时自动生成并执行重分配计划。Cruise Control 的 rebalance 算法考虑了机架感知、磁盘容量均衡、Leader 均衡等多个维度，比 kafka-reassign-partitions.sh --generate 的简单轮询策略要智能得多。如果你的集群规模超过 10 台 Broker，强烈建议部署 Cruise Control 来做自动化再均衡。\n\n最后一个需要注意的点是 KRaft 模式下的重分配。在 Kafka 3.0+ 的 KRaft 集群中，kafka-reassign-partitions.sh 的用法跟 ZooKeeper 模式完全一样，只是必须使用 `--bootstrap-server` 而不是 `--zookeeper`。底层实现上，KRaft 模式不再通过 ZooKeeper 的 /admin/reassign_partitions 节点触发重分配，而是通过 Controller Quorum 直接处理 AlterPartitionReassignments API 请求，响应速度更快，也避免了 ZooKeeper 节点 Watch 机制的延迟问题。从 Kafka 3.7 开始，还可以通过 Admin API 直接取消正在进行中的重分配（`--cancel` 参数），这在 ZooKeeper 模式下是不支持的。",
+      "keyPoints": [
+        "kafka-reassign-partitions.sh 的三步工作流是 --generate（生成计划）→ --execute（执行迁移）→ --verify（验证完成并清除限流），--generate 只生成 JSON 计划不会触发实际数据迁移",
+        "执行重分配时 Controller 先将副本集合扩展为新旧并存，新 Follower 追赶 Leader 数据进入 ISR 后，旧副本才会被移除并删除，整个过程对客户端透明",
+        "--throttle 参数通过设置 Broker 级别的 leader/follower.replication.throttled.rate 限制副本复制带宽，建议不超过 Broker 网络容量的 20-30%",
+        "--verify 完成时会自动清除限流配置，如果忘记执行 --verify 会导致限流残留影响正常 ISR 同步，生产环境应写循环脚本定期执行 --verify",
+        "迁移时间估算公式为「需要迁移的数据总量 / 限流速率」，实际时间会因多分区共享带宽上限而略长于理论值",
+        "重分配期间 UnderReplicatedPartitions 指标短暂升高是正常现象，但完成后仍居高不下则说明有副本未成功追赶需要排查",
+        "不加 --throttle 执行重分配会导致副本复制以最大速率运行打满网络带宽，等同于生产环境自找事故",
+        "通过在 reassignment-plan.json 中增减 replicas 列表的 Broker ID 可以变更 Topic 的副本因子，这是 kafka-topics.sh --alter 无法完成的操作"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-ops-reassignment-q1-quiz1",
+          "question": "kafka-reassign-partitions.sh --generate 命令执行后，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "立即开始将分区副本迁移到目标 Broker，同时输出迁移计划"},
+            {"id": "B", "text": "仅输出当前分配方案和建议的新分配方案两段 JSON，不触发任何数据迁移"},
+            {"id": "C", "text": "在 ZooKeeper 或 Controller 中注册迁移任务，等待管理员手动确认后开始执行"},
+            {"id": "D", "text": "生成计划并自动备份当前分配到集群元数据中，后续可通过 --rollback 回滚"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "--generate 是一个纯粹的计算和输出操作，它读取当前集群的分区分配信息，根据你指定的 --broker-list 计算出一份新的分配方案，然后把当前方案和新方案以 JSON 格式打印到标准输出。它既不会在 ZooKeeper 或 Controller 中注册任何任务，也不会触发任何数据迁移。A 选项描述的是 --execute 的行为。C 选项的「注册等待确认」机制并不存在。D 选项的自动备份和 --rollback 参数也不存在——保存回滚计划是操作人员手动完成的，这也是为什么文档和最佳实践反复强调要保存 --generate 输出的 Current 部分。"
+        },
+        {
+          "id": "kafka-ops-reassignment-q1-quiz2",
+          "question": "执行重分配时，Controller 处理分区副本从 [0,1,2] 变更到 [3,6,7] 的内部流程是怎样的？",
+          "choices": [
+            {"id": "A", "text": "先删除 Broker 0、1、2 上的旧副本，再在 Broker 3、6、7 上创建新副本并从头拉取全量数据"},
+            {"id": "B", "text": "先将副本集合扩展为 [0,1,2,3,6,7]，新 Follower 追赶进入 ISR 后再移除旧副本"},
+            {"id": "C", "text": "直接将 Broker 0 上的数据文件通过 SCP 复制到 Broker 3，然后更新元数据指向新位置"},
+            {"id": "D", "text": "Controller 通知 Leader 停止接收写入，等数据同步完成后切换到新 Broker 再恢复写入"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 重分配采用的是「先扩后缩」策略，整个过程不会中断客户端的读写。Controller 首先将分区的副本集合临时扩展为新旧副本并存（[0,1,2,3,6,7]），新的 Follower 副本开始从 Leader 拉取数据追赶进度，追上 LEO 后加入 ISR。当所有新副本都进入 ISR 后，Controller 才将旧副本从副本集合中移除并物理删除数据文件。A 选项的「先删后建」会导致数据丢失和服务中断。C 选项的 SCP 文件复制不是 Kafka 的机制，Kafka 的副本同步走的是 Fetch 协议。D 选项描述的停写行为也不存在——重分配全程 Leader 正常接收读写请求。"
+        },
+        {
+          "id": "kafka-ops-reassignment-q1-quiz3",
+          "question": "--throttle 52428800 参数的限流原理是什么？",
+          "choices": [
+            {"id": "A", "text": "在 Broker 端设置 leader/follower.replication.throttled.rate 动态配置，限制参与重分配的副本复制带宽"},
+            {"id": "B", "text": "在网络层对所有 Broker 间的流量做 QoS 限速，包括客户端读写和副本复制"},
+            {"id": "C", "text": "通过降低 Follower 的 Fetch 请求频率实现限流，每次 Fetch 之间插入固定的等待时间"},
+            {"id": "D", "text": "限制 Controller 每秒派发的重分配任务数量，间接控制整体迁移速度"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "--throttle 参数的实现机制是在涉及重分配的 Broker 上动态设置两个配置项：leader.replication.throttled.rate 控制 Leader 向 Follower 发送副本数据的出口带宽上限，follower.replication.throttled.rate 控制 Follower 接收副本数据的入口带宽上限。同时在相关 Topic 上设置 leader/follower.replication.throttled.replicas 指定哪些副本参与限流。关键点在于，限流只作用于重分配涉及的副本复制流量，不会影响正常的 ISR 同步和客户端读写。B 选项描述的全局 QoS 不是 Kafka 的限流方式。C 和 D 选项的限流机制也不存在。"
+        },
+        {
+          "id": "kafka-ops-reassignment-q1-quiz4",
+          "question": "重分配过程中想把限流从 50MB/s 调整为 20MB/s，应该怎么操作？",
+          "choices": [
+            {"id": "A", "text": "必须先用 --cancel 取消当前重分配，修改限流值后重新执行 --execute"},
+            {"id": "B", "text": "用 kafka-configs.sh 手动修改每个 Broker 的 replication.throttled.rate 配置"},
+            {"id": "C", "text": "直接再次执行 --execute 并带上新的 --throttle 20971520 参数即可，无需停止重分配"},
+            {"id": "D", "text": "Kafka 不支持在重分配过程中动态调整限流值，只能等本次完成后在下次重分配时使用新值"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Kafka 支持在重分配进行中动态调整限流值，方法非常简单：用同一个 reassignment-plan.json 再次执行 --execute 命令，带上新的 --throttle 值即可。Kafka 会检测到重分配已经在进行中，不会重新启动迁移任务，只会更新限流配置。这个特性在生产环境中非常实用——当你发现限流值设得太高导致业务延迟升高时，可以立即降低限流值缓解压力，不需要取消和重启整个重分配过程。A 选项的「先取消再重启」虽然也能达到目的但完全没有必要，而且会浪费已经迁移的进度。B 选项手动修改 Broker 配置虽然在技术上可行但不推荐，因为 --execute 会自动管理这些配置。"
+        },
+        {
+          "id": "kafka-ops-reassignment-q1-quiz5",
+          "question": "执行 --verify 时输出显示所有分区都是 completed，同时显示了「Clearing broker-level throttles」和「Clearing topic-level throttles」，这意味着什么？",
+          "choices": [
+            {"id": "A", "text": "所有分区迁移完成，限流配置已自动清除，可以安全地认为重分配全部结束"},
+            {"id": "B", "text": "所有分区迁移完成，但限流配置需要手动通过 kafka-configs.sh 删除才会真正清除"},
+            {"id": "C", "text": "分区迁移完成但还需要执行 Preferred Leader Election 让新的优先副本成为 Leader"},
+            {"id": "D", "text": "数据迁移完成但旧副本还没有被删除，需要等下一次 log segment 清理周期才会释放磁盘空间"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "当 --verify 显示所有分区都是 completed 状态时，它会自动清除之前通过 --throttle 设置的所有限流配置，包括 Broker 级别的 leader/follower.replication.throttled.rate 和 Topic 级别的 leader/follower.replication.throttled.replicas。输出中的「Clearing broker-level throttles」和「Clearing topic-level throttles」就是在执行这个清理操作。清理完成后，整个重分配过程就真正结束了。旧副本在重分配过程中就已经被 Controller 删除了，不需要等 log segment 清理。Leader 选举也在重分配过程中由 Controller 自动处理——replicas 列表中的第一个 Broker 就是 Preferred Leader。"
+        },
+        {
+          "id": "kafka-ops-reassignment-q1-quiz6",
+          "question": "重分配完成后忘记执行 --verify，会导致什么后果？",
+          "choices": [
+            {"id": "A", "text": "没有任何影响，限流配置会在重分配完成后自动过期失效"},
+            {"id": "B", "text": "限流配置残留在 Broker 和 Topic 上，导致正常的 ISR 同步也被限速，影响副本追赶效率"},
+            {"id": "C", "text": "重分配不会被标记为完成，旧副本会一直保留不会被删除，占用额外的磁盘空间"},
+            {"id": "D", "text": "集群元数据不会更新，客户端仍然会连接旧 Broker 读写数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个非常容易踩的坑。--throttle 设置的限流配置是 Broker 和 Topic 级别的动态配置，它们不会自动过期或自动清除——只有 --verify 在检测到所有分区迁移完成时才会主动删除这些配置。如果你忘了执行 --verify，这些限流配置会一直残留。虽然重分配本身的数据迁移已经完成了（旧副本已被删除、元数据已更新），但限流配置会影响到后续的正常 ISR 同步流量——比如某个 Broker 短暂下线后重新上线需要追赶数据，追赶速度也会被之前残留的限流值限制。所以生产环境必须确保 --verify 被执行并成功清除了限流配置。"
+        },
+        {
+          "id": "kafka-ops-reassignment-q1-quiz7",
+          "question": "以下哪种场景不能通过 kafka-reassign-partitions.sh 实现？",
+          "choices": [
+            {"id": "A", "text": "将 Topic 的副本因子从 2 提升到 3"},
+            {"id": "B", "text": "将特定分区的副本从 Broker 1 迁移到 Broker 5"},
+            {"id": "C", "text": "增加 Topic 的分区数量（比如从 12 个扩到 24 个）"},
+            {"id": "D", "text": "将即将下线的 Broker 上的所有副本迁移到其他 Broker"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "kafka-reassign-partitions.sh 的能力范围是移动已有分区的副本在不同 Broker 之间的分布，以及通过增减 replicas 列表中的 Broker ID 来变更副本因子。增加 Topic 的分区数量是完全不同的操作——新分区需要被创建（而非迁移已有分区），这需要通过 kafka-topics.sh --alter --partitions 来完成。A 选项可以实现：在 reassignment-plan.json 中把每个分区的 replicas 列表从 2 个 Broker ID 扩展到 3 个。B 选项是最基本的重分配操作。D 选项是重分配的经典场景——Broker 下线前先把它的副本都迁走。"
+        },
+        {
+          "id": "kafka-ops-reassignment-q1-quiz8",
+          "question": "集群有 6 个 Broker（万兆网卡），需要迁移总计 500GB 的分区数据。业务高峰期 Broker 网络利用率约 50%，要求重分配在 8 小时内完成且不影响业务。以下哪个限流值最合理？",
+          "choices": [
+            {"id": "A", "text": "--throttle 209715200（200MB/s），迁移速度快可以 40 分钟内完成"},
+            {"id": "B", "text": "--throttle 20971520（20MB/s），完全安全但需要约 7 小时"},
+            {"id": "C", "text": "不加 --throttle，让 Kafka 全速迁移尽快完成"},
+            {"id": "D", "text": "--throttle 5242880（5MB/s），最保守的策略确保零影响"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题需要综合考虑迁移时间和业务影响。万兆网卡的理论带宽约 1.25GB/s，业务高峰期已经占用 50%（约 625MB/s），剩余带宽约 625MB/s。经验法则建议限流值不超过 Broker 网络容量的 20-30%，也就是 250-375MB/s，但还要考虑业务高峰期的额外余量。200MB/s（A 选项）虽然在绝对值上不超过 20%，但在高峰期叠加业务流量后总利用率会达到 65-70%，对延迟敏感的业务来说风险较高。20MB/s（B 选项）比较保守但能在约 7 小时内完成，在 8 小时的窗口内是可行的。不加限流（C 选项）是生产大忌。5MB/s（D 选项）太保守，500GB / 5MB/s ≈ 28 小时，远超 8 小时的时间窗口。"
+        },
+        {
+          "id": "kafka-ops-reassignment-q1-quiz9",
+          "question": "在 Kafka 3.6 KRaft 模式集群上执行分区重分配，与 ZooKeeper 模式相比有什么不同？",
+          "choices": [
+            {"id": "A", "text": "KRaft 模式不支持 kafka-reassign-partitions.sh，必须使用 Admin API 编程实现"},
+            {"id": "B", "text": "命令行用法完全相同只是必须用 --bootstrap-server，底层通过 Controller Quorum 处理而非 ZooKeeper 节点"},
+            {"id": "C", "text": "KRaft 模式下重分配不需要限流，Controller 会自动进行带宽管理"},
+            {"id": "D", "text": "KRaft 模式下重分配只能迁移 Leader 副本，Follower 副本的位置由 Controller 自动决定"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "从使用者的角度来看，KRaft 模式下 kafka-reassign-partitions.sh 的用法和 ZooKeeper 模式几乎完全一样，--generate、--execute、--verify 三步流程不变，--throttle 限流机制不变，JSON 格式不变。唯一的区别是连接参数必须使用 --bootstrap-server 而非 --zookeeper。底层实现上的变化是：ZooKeeper 模式通过写入 /admin/reassign_partitions ZNode 触发 Controller 的 Watch 回调来启动重分配，而 KRaft 模式通过 Controller Quorum 直接处理 AlterPartitionReassignments API 请求，响应更快也更可靠。A 选项错误，KRaft 完全支持这个工具。C 选项的「自动带宽管理」不存在。D 选项的限制也不存在。"
+        },
+        {
+          "id": "kafka-ops-reassignment-q1-quiz10",
+          "question": "重分配执行到一半时发现目标 Broker 7 出现硬件故障需要紧急回滚，正确的操作步骤是什么？",
+          "choices": [
+            {"id": "A", "text": "用 --generate 生成的 Current partition replica assignment JSON 作为新的 reassignment-plan.json，执行 --execute 做反向迁移"},
+            {"id": "B", "text": "直接重启集群，Kafka 会自动检测异常并回滚到重分配前的副本分布"},
+            {"id": "C", "text": "删除 ZooKeeper 中的 /admin/reassign_partitions 节点即可取消正在进行的重分配"},
+            {"id": "D", "text": "使用 kafka-reassign-partitions.sh --rollback 参数加上之前保存的原始分配 JSON 自动回滚"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这就是为什么 --generate 输出的「Current partition replica assignment」必须保存下来。回滚的方法是把这段保存的 JSON 作为新的 reassignment-plan.json，然后执行 --execute 触发一次反向的重分配，把副本迁回原来的 Broker。这本质上是另一次重分配操作，同样需要 --throttle 限流并用 --verify 验证完成。B 选项的「重启自动回滚」不存在——重启集群只会恢复到重分配中断时的状态，已经迁移成功的分区不会回退。C 选项只在 ZooKeeper 模式下技术上可行但不推荐，且在 KRaft 模式下不适用。D 选项的 --rollback 参数不存在，Kafka 没有提供自动回滚功能。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#basic_ops_cluster_expansion",
+        "https://kafka.apache.org/documentation/#basic_ops_partitionassignment",
+        "https://docs.confluent.io/platform/current/kafka/post-deployment.html#increasing-replication-factor"
+      ]
+    }
+  ]
+}
