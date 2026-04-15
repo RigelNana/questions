@@ -1,0 +1,156 @@
+{
+  "id": "k8s-vcluster-concept",
+  "name": "Virtual Cluster（vCluster）概念",
+  "domain": "kubernetes",
+  "description": "深入理解 vCluster 的设计背景、虚拟控制平面 + syncer 架构、资源同步策略、隔离边界，以及与多集群和 Namespace 方案的选型对比",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-vcluster-concept-q1",
+      "domain": "kubernetes",
+      "type": "concept",
+      "difficulty": 3,
+      "tags": ["vCluster", "虚拟集群", "多租户", "隔离", "平台工程"],
+      "title": "什么是 Virtual Cluster（vCluster）？它解决了什么问题？",
+      "content": "你在一家 SaaS 公司做平台工程，团队大约 120 人，分成 15 个业务小组。目前所有团队共用一个 Kubernetes 集群，通过 Namespace + RBAC + ResourceQuota 做隔离。随着团队规模增长，问题越来越多。\n\n首先是 CRD 冲突。团队 A 装了 cert-manager v1.12，团队 B 的项目依赖 v1.14 的新字段，但 CRD 是集群级资源，你不可能在同一个集群里装两个版本的 cert-manager CRD。其次是权限边界模糊——团队 C 想自己定义 ClusterRole 给他们的 Operator 用，但 ClusterRole 也是集群级资源，你不敢把 `rbac.authorization.k8s.io` 的权限放开给租户。第三是 Admission Webhook 的干扰——安全团队部署的 OPA Gatekeeper 策略对所有 Namespace 生效，但 ML 团队的训练 Pod 需要特权容器挂载 GPU，每次都要找平台团队加豁免。\n\n你考虑过给每个团队独立的 Kubernetes 集群。但 15 个集群意味着 15 套控制平面（每套至少 3 个 etcd 节点），光控制平面的计算开销就要 45+ 台机器，加上每个集群的监控、日志、Ingress Controller 等基础设施，运维团队 5 个人根本管不过来。云厂商的托管集群倒是省了控制平面运维，但每个集群每月的管理费加起来也不便宜，而且跨集群的网络策略和服务发现又是新的复杂度。\n\n有同事提到了 vCluster 这个方案——在现有宿主集群的一个 Namespace 里跑一个「虚拟 Kubernetes 集群」，每个虚拟集群有独立的 API Server、独立的 RBAC、独立的 CRD 注册表，但工作负载的 Pod 实际还是跑在宿主集群的节点上。听起来很理想，但你有一堆问题：这个「虚拟集群」到底虚拟了什么、同步了什么？租户在虚拟集群里 `kubectl get nodes` 看到的是什么？Pod 的网络和存储怎么处理？性能开销有多大？\n\n这道题考的就是你对 Virtual Cluster 这个多租户方案的理解深度。",
+      "answer": "## Virtual Cluster（vCluster）基础定义\n\nvCluster 是由 Loft Labs 开发的开源项目，核心思想用一句话概括就是：**在一个 Kubernetes 集群（宿主集群）的 Namespace 内运行一个完整但轻量的 Kubernetes 控制平面，形成一个逻辑上完全独立的「虚拟集群」**。对虚拟集群的使用者来说，他拿到的是一个完整的 kubeconfig，可以自由地创建 Namespace、安装 CRD、配置 RBAC、部署 Admission Webhook，就像在操作一个真实集群一样。但从宿主集群管理员的视角看，这个虚拟集群的所有资源其实都运行在宿主集群的某一个 Namespace 内，工作负载（Pod）直接调度到宿主集群的节点上，共享宿主集群的计算、网络和存储资源。\n\nvCluster 从 0.x 版本发展至今，截止 0.19+ 版本已经相当成熟。它的 CLI 工具 `vcluster` 提供了从创建到连接到管理的全套命令。最简单的创建方式只需要一条命令：\n\n```bash\n# 安装 vcluster CLI（macOS 示例）\nbrew install loft-sh/tap/vcluster\n\n# 在当前 kubeconfig 指向的宿主集群中创建虚拟集群\n# 默认在当前 Namespace 下创建，虚拟集群名叫 team-a\nvcluster create team-a --namespace vcluster-team-a\n\n# 创建完成后自动切换 kubeconfig context\n# 此时 kubectl 命令已经指向虚拟集群\nkubectl get namespaces\n# NAME              STATUS   AGE\n# default           Active   30s\n# kube-system       Active   30s\n# kube-public       Active   30s\n```\n\n注意看输出——这个虚拟集群有自己独立的 `default`、`kube-system`、`kube-public` Namespace，跟宿主集群完全隔离。你在虚拟集群里创建的 Namespace 不会出现在宿主集群的 Namespace 列表里，宿主集群里其他团队的资源你也完全看不到。\n\n要断开连接回到宿主集群，用 `vcluster disconnect` 即可；要删除虚拟集群，用 `vcluster delete team-a --namespace vcluster-team-a`。\n\n## vCluster 的内部架构：虚拟控制平面 + syncer\n\n理解 vCluster 的关键在于搞清楚它的两个核心组件：**虚拟控制平面**和 **syncer（同步器）**。\n\n### 虚拟控制平面\n\nvCluster 会在宿主集群的目标 Namespace 中创建一个 Pod（或一组 Pod，取决于 HA 配置），这个 Pod 内运行一个轻量的 Kubernetes 发行版作为虚拟集群的控制平面。默认使用 **k3s**（Rancher 的轻量 K8s 发行版），也支持切换为 k0s 或原生 Kubernetes（EKS/vanilla k8s API Server + etcd）。选择 k3s 的好处是它把 API Server、Controller Manager、Scheduler 和一个嵌入式 SQLite/etcd 都打包在一个二进制文件里，内存占用通常在 200-500MB 之间，启动速度在 30 秒左右。\n\n虚拟控制平面有自己独立的数据存储（k3s 默认用嵌入式 SQLite，生产环境可以配外部 etcd 或 PostgreSQL）。这意味着虚拟集群的所有资源对象——Namespace、ConfigMap、Secret、CRD、RBAC 规则——都存储在虚拟控制平面的数据库中，完全不会写入宿主集群的 etcd。这是 vCluster 实现 CRD 隔离和 RBAC 隔离的根基。\n\n### syncer（同步器）\n\nsyncer 是 vCluster 的核心引擎。虚拟集群的使用者在虚拟 API Server 上创建了一个 Deployment，这个 Deployment 最终要变成 Pod 跑在宿主集群的真实节点上。syncer 的职责就是**把虚拟集群中需要实际执行的资源「翻译」并同步到宿主集群**，同时把宿主集群的运行状态反向同步回虚拟集群。\n\n资源同步遵循一个清晰的分类策略。**纯虚拟资源**（只存在于虚拟集群内部，不同步到宿主集群）包括：Namespace、CRD、ClusterRole/ClusterRoleBinding、Admission Webhook 配置、ServiceAccount（虚拟集群内部的）、ResourceQuota、LimitRange。这些资源只在虚拟控制平面的存储中存在，宿主集群完全无感知。\n\n**向下同步资源**（从虚拟集群同步到宿主集群）包括：Pod、Service、ConfigMap、Secret、Ingress、PersistentVolumeClaim。syncer 把虚拟集群中的 Pod spec 取出来，做名称改写（加上虚拟集群前缀避免冲突），然后在宿主集群的目标 Namespace 中创建真实 Pod。比如虚拟集群 `team-a` 的 `default` Namespace 中有个 Pod 叫 `web-server`，syncer 会在宿主集群的 `vcluster-team-a` Namespace 中创建一个名为 `web-server-x-default-x-team-a` 的 Pod。ConfigMap 和 Secret 也做同样的名称改写后同步到宿主集群，因为 Pod 挂载时需要真实存在这些资源。\n\n**向上同步资源**（从宿主集群反向同步到虚拟集群）主要是 Node 信息和 Pod 状态。虚拟集群的用户执行 `kubectl get nodes` 时，看到的节点信息是 syncer 从宿主集群同步过来的（默认做了过滤和脱敏）。Pod 的 status、events、logs 也从宿主集群反向同步，这样用户在虚拟集群内 `kubectl logs` 和 `kubectl describe pod` 都能正常工作。\n\n下面这个 `vcluster.yaml` 配置文件展示了 0.19+ 版本的关键同步选项：\n\n```yaml\n# vcluster.yaml — vCluster 0.19+ 配置\nsync:\n  toHost:\n    pods:\n      enabled: true\n    services:\n      enabled: true\n    configmaps:\n      enabled: true\n    secrets:\n      enabled: true\n    ingresses:\n      enabled: true\n    persistentvolumeclaims:\n      enabled: true\n  fromHost:\n    nodes:\n      enabled: true\n      # 可选：只同步特定标签的节点给虚拟集群\n      selector:\n        labels:\n          team: ml-gpu\n    storageClasses:\n      enabled: true\n    ingressClasses:\n      enabled: true\n\ncontrolPlane:\n  distro:\n    k3s:\n      enabled: true\n      # 生产环境建议用外部数据库\n  backingStore:\n    etcd:\n      deploy:\n        enabled: true       # 部署独立 etcd 而非 SQLite\n        statefulSet:\n          resources:\n            requests:\n              memory: 256Mi\n              cpu: 100m\n```\n\n用这个配置创建虚拟集群的命令是：\n\n```bash\nvcluster create team-a \\\n  --namespace vcluster-team-a \\\n  --values vcluster.yaml\n```\n\n## vCluster 真正解决的问题\n\n理解了架构之后，回到最初的问题：vCluster 到底解决了什么？\n\n**第一，CRD 隔离**。每个虚拟集群有自己的 API Server 和独立存储，CRD 注册在虚拟控制平面中，互不干扰。团队 A 装 cert-manager v1.12，团队 B 装 v1.14，各自独立。这是 Namespace 级隔离完全做不到的——CRD 是 Cluster-scoped 资源。\n\n**第二，租户自主权**。租户在虚拟集群内拥有 cluster-admin 权限，可以自由创建 ClusterRole、部署 Operator、配置 Admission Webhook、管理 Namespace。宿主集群管理员不再是所有权限变更的瓶颈。从运维效率来说，这把平台团队从「所有团队的 RBAC 审批人」变成了「集群基础设施提供者」。\n\n**第三，Admission/Policy 隔离**。虚拟集群内部可以有自己的 Admission Webhook 和 Policy Engine（比如 Kyverno），不受宿主集群策略影响。ML 团队的虚拟集群可以允许特权容器，而其他团队的虚拟集群维持严格策略。\n\n**第四，成本效率**。相比独立集群方案，vCluster 复用宿主集群的 Node 资源和网络基础设施。一个虚拟控制平面的开销大约是 200-500MB 内存加 0.5 核 CPU，远低于一套独立 etcd 集群 + API Server 的成本。15 个团队用 15 个 vCluster，额外开销大约 3-8GB 内存，而 15 个独立集群的控制平面至少需要 45 台机器。\n\n## vCluster vs 多集群 vs Namespace：选型思路\n\n选择哪种隔离方案，核心看两个维度：**隔离需求强度**和**运维预算**。\n\nNamespace + RBAC + ResourceQuota 是最轻量的方案，适合团队间信任度高、不需要 CRD 隔离、运维人力有限的场景。它的上限是 Namespace 级别的资源配额和网络策略隔离，做不到 CRD、ClusterRole、Admission Webhook 的隔离。\n\nvCluster 是中间路线，提供接近独立集群的隔离体验，同时复用宿主集群的计算资源和基础设施。适合需要 CRD 隔离、需要给租户 cluster-admin 权限、但又不想承担多集群运维成本的场景。典型用例包括多租户 SaaS 平台、CI/CD 的临时测试环境（跑完就删）、开发者自助环境。\n\n独立集群适合隔离要求最高的场景——不同安全域（PCI DSS 合规要求生产环境物理隔离）、不同地理区域（数据主权要求）、或者规模已经大到需要独立控制平面和节点池。代价是运维复杂度和成本最高。\n\n## vCluster 的局限性\n\nvCluster 不是银弹。第一个局限是**网络不是完全隔离的**——虚拟集群的 Pod 跑在宿主集群的节点上，共享宿主集群的 CNI 网络。虽然可以通过 NetworkPolicy 限制跨虚拟集群流量，但这不是默认行为，需要额外配置。如果你需要网络层的硬隔离，vCluster 做不到。\n\n第二个局限是**排查链路变长**。出了问题你需要同时看虚拟集群和宿主集群两个层面。一个 Pod 在虚拟集群里显示 Pending，你得去宿主集群看对应的真实 Pod 状态才能定位原因。syncer 的名称改写（`pod-name-x-namespace-x-vcluster-name`）也增加了 debug 的认知负担。\n\n第三个局限是**某些高级功能需要商业版**。vCluster 开源版已经覆盖了大部分功能，但像 HA 控制平面、集中管理面板（vCluster Platform）、审计日志等企业级特性在商业版中。\n\n## 面试高频考点\n\n面试中关于 vCluster 的考察通常围绕几个方向。第一是能不能清楚说出 vCluster 的核心架构——虚拟控制平面加 syncer 的双组件模型。第二是资源同步策略——哪些资源纯虚拟、哪些向下同步、哪些向上同步，能具体举例说 Pod 和 ConfigMap 怎么同步的。第三是跟 Namespace 隔离方案的对比——vCluster 多解决了哪些 Namespace 做不到的问题（CRD 隔离、ClusterRole 隔离、Admission 隔离）。第四是局限性——能指出网络共享和排查复杂度的问题，说明你不是只看了官网首页。如果你能提到 syncer 的名称改写规则（`resource-x-namespace-x-vcluster`），或者提到 k3s 作为默认控制平面发行版的选择理由，会给面试官留下更深的印象。",
+      "keyPoints": [
+        "vCluster 在宿主集群的一个 Namespace 内运行轻量的虚拟 Kubernetes 控制平面（默认 k3s），虚拟集群有独立的 API Server、etcd/SQLite 存储、RBAC 和 CRD 注册表，但工作负载 Pod 实际运行在宿主集群节点上",
+        "syncer 是 vCluster 的核心引擎，负责将 Pod、Service、ConfigMap、Secret 等资源从虚拟集群「翻译」并同步到宿主集群执行，同时将 Node 信息和 Pod 状态反向同步回虚拟集群，采用名称改写规则（resource-x-namespace-x-vcluster）避免冲突",
+        "CRD、ClusterRole、Namespace、Admission Webhook 等集群级资源只存在于虚拟控制平面的存储中，不会同步到宿主集群，这是实现 CRD 隔离和权限隔离的根基，也是 Namespace 方案无法做到的",
+        "vCluster 解决了 Namespace 隔离方案的三个核心缺陷：CRD 版本冲突（集群级资源无法按 Namespace 隔离）、租户无法获得 cluster-admin 自主权、Admission Webhook/Policy 全局生效无法按租户定制",
+        "相比独立多集群方案，vCluster 的虚拟控制平面开销约 200-500MB 内存和 0.5 核 CPU，远低于独立 etcd + API Server 的成本，同时复用宿主集群的计算节点和网络基础设施",
+        "vCluster 的主要局限包括：网络不是完全隔离的（Pod 共享宿主集群 CNI 需要额外 NetworkPolicy 配置）、排查链路变长（需同时排查虚拟集群和宿主集群两个层面）、syncer 名称改写增加 debug 认知负担",
+        "选型判断标准：Namespace + RBAC 适合团队互信且无 CRD 隔离需求的场景，vCluster 适合需要 CRD 和权限完全隔离但不想承担多集群运维成本的场景，独立集群适合安全合规要求硬隔离或跨地域部署的场景"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-vcluster-concept-q1-quiz1",
+          "question": "vCluster 的核心概念是什么？",
+          "choices": [
+            {"id": "A", "text": "在宿主 Kubernetes 集群的 Namespace 内运行一个轻量虚拟控制平面，形成逻辑独立的虚拟集群，Pod 仍运行在宿主节点上"},
+            {"id": "B", "text": "通过 KVM/QEMU 在物理节点上创建虚拟机，每个虚拟机运行独立的 Kubernetes 集群"},
+            {"id": "C", "text": "用 Docker-in-Docker 技术在容器内运行完整的 Kubernetes 集群，包括 kubelet 和容器运行时"},
+            {"id": "D", "text": "通过增强的 Namespace + NetworkPolicy 实现多租户隔离，不需要额外的控制平面"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "vCluster 的核心是在宿主集群的一个 Namespace 中部署虚拟控制平面（默认 k3s），通过 syncer 把需要实际执行的资源同步到宿主集群。B 选项描述的是虚拟机级别的隔离，不是 vCluster 的实现方式。C 选项描述的是 kind（Kubernetes IN Docker）的做法，虽然也能创建集群但 Pod 运行在容器内而非宿主节点上。D 选项描述的是传统 Namespace 多租户方案，正是 vCluster 要替代的场景——因为 Namespace 无法隔离 CRD 和 ClusterRole 等集群级资源。"
+        },
+        {
+          "id": "k8s-vcluster-concept-q1-quiz2",
+          "question": "vCluster 默认使用哪个 Kubernetes 发行版作为虚拟控制平面？",
+          "choices": [
+            {"id": "A", "text": "原生 Kubernetes（kube-apiserver + etcd + controller-manager + scheduler 全套组件独立部署）"},
+            {"id": "B", "text": "k3s——Rancher 的轻量发行版，把核心组件打包在单一二进制文件中"},
+            {"id": "C", "text": "MicroK8s——Canonical 维护的 snap 包形式的 Kubernetes 发行版"},
+            {"id": "D", "text": "minikube——本地开发用的单节点 Kubernetes 环境"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "vCluster 默认使用 k3s 作为虚拟控制平面的 Kubernetes 发行版。k3s 的优势是把 API Server、Controller Manager、Scheduler 和嵌入式数据存储打包在一个二进制文件中，内存占用低（通常 200-500MB），启动快。vCluster 也支持 k0s 和原生 Kubernetes 作为替代选项。A 选项的原生 Kubernetes 是可选项但不是默认值，且资源开销更大。C 的 MicroK8s 和 D 的 minikube 都不是 vCluster 支持的控制平面发行版。"
+        },
+        {
+          "id": "k8s-vcluster-concept-q1-quiz3",
+          "question": "syncer 在 vCluster 架构中的核心职责是什么？",
+          "choices": [
+            {"id": "A", "text": "在虚拟集群和宿主集群之间双向同步资源——将 Pod 等资源向下同步到宿主集群执行，将 Node 信息和 Pod 状态向上同步回虚拟集群"},
+            {"id": "B", "text": "负责虚拟集群的 etcd 数据备份，定期将虚拟控制平面的数据快照同步到宿主集群的 PV 中"},
+            {"id": "C", "text": "充当虚拟集群的 API Server 代理，将所有 kubectl 请求转发到宿主集群的 kube-apiserver"},
+            {"id": "D", "text": "负责虚拟集群节点的心跳维护，模拟 kubelet 向虚拟 API Server 报告节点健康状态"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "syncer 是 vCluster 的核心引擎，负责双向资源同步。向下方向，它将虚拟集群中的 Pod、Service、ConfigMap、Secret 等资源翻译并同步到宿主集群的目标 Namespace，使 Pod 能真正运行在宿主节点上。向上方向，它从宿主集群同步 Node 信息和 Pod 运行状态回虚拟集群，让用户能正常使用 kubectl get nodes、kubectl logs 等命令。B 选项错误，syncer 不负责数据备份。C 选项错误，虚拟集群有自己独立的 API Server，不是简单代理到宿主集群。D 选项描述的更像 virtual-kubelet 的行为而非 syncer。"
+        },
+        {
+          "id": "k8s-vcluster-concept-q1-quiz4",
+          "question": "以下哪类资源在 vCluster 中是「纯虚拟」的，只存在于虚拟控制平面存储中而不同步到宿主集群？",
+          "choices": [
+            {"id": "A", "text": "Pod 和 Deployment"},
+            {"id": "B", "text": "CRD、ClusterRole、Namespace 和 Admission Webhook 配置"},
+            {"id": "C", "text": "ConfigMap 和 Secret"},
+            {"id": "D", "text": "PersistentVolumeClaim 和 Service"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CRD、ClusterRole/ClusterRoleBinding、Namespace、Admission Webhook 这些资源只存在于虚拟控制平面的数据存储中，不会同步到宿主集群。这正是 vCluster 实现隔离的核心——虚拟集群可以自由注册 CRD 和定义 RBAC 规则而不影响宿主集群。A 选项的 Pod 需要同步到宿主集群才能真正运行（Deployment 通过 Controller 创建的 Pod 也是同步下去的）。C 选项的 ConfigMap 和 Secret 需要同步到宿主集群，因为 Pod 挂载时需要真实存在这些资源。D 选项的 PVC 和 Service 也需要同步到宿主集群以便实际绑定存储和暴露网络。"
+        },
+        {
+          "id": "k8s-vcluster-concept-q1-quiz5",
+          "question": "在虚拟集群 team-a 的 default Namespace 中创建了一个名为 web-server 的 Pod。syncer 同步到宿主集群后，这个 Pod 在宿主集群中的名称是什么？",
+          "choices": [
+            {"id": "A", "text": "web-server（保持原名不变，通过 label 区分来源）"},
+            {"id": "B", "text": "web-server-x-default-x-team-a（按照 resource-x-namespace-x-vcluster 规则改写）"},
+            {"id": "C", "text": "team-a-web-server（在原名前加虚拟集群名前缀）"},
+            {"id": "D", "text": "vcluster-team-a-default-web-server（按 vcluster-集群名-namespace-pod名 格式拼接）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "vCluster 的 syncer 使用 `resource-x-namespace-x-vcluster` 的名称改写规则来避免宿主集群中的命名冲突。所以虚拟集群 team-a 的 default Namespace 中的 web-server Pod，同步到宿主集群后会变成 web-server-x-default-x-team-a，并且这个 Pod 创建在宿主集群的 vcluster-team-a Namespace 中。A 选项错误，保持原名会导致多个虚拟集群的同名 Pod 冲突。C 和 D 选项的命名格式都不符合 vCluster 的实际规则。理解这个命名规则对日常 debug 非常重要，因为排查问题时你需要能快速在宿主集群中找到虚拟集群 Pod 对应的真实 Pod。"
+        },
+        {
+          "id": "k8s-vcluster-concept-q1-quiz6",
+          "question": "以下关于 vCluster 的说法，哪一个是常见误解？",
+          "choices": [
+            {"id": "A", "text": "vCluster 的 Pod 共享宿主集群的 CNI 网络，默认情况下不同虚拟集群的 Pod 之间网络可达"},
+            {"id": "B", "text": "vCluster 可以实现 CRD 级别的隔离，不同虚拟集群可以安装不同版本的同一个 CRD"},
+            {"id": "C", "text": "vCluster 自动为不同虚拟集群提供完全的网络隔离，跨虚拟集群流量默认被阻断"},
+            {"id": "D", "text": "vCluster 的虚拟控制平面开销通常在 200-500MB 内存左右，远低于独立集群控制平面"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个非常常见的误解。vCluster 的 Pod 运行在宿主集群的真实节点上，共享宿主集群的 CNI 网络。默认情况下，不同虚拟集群的 Pod 之间是网络可达的，就像同一个集群中不同 Namespace 的 Pod 一样。如果需要网络隔离，必须额外配置 NetworkPolicy。A 选项正确描述了这个事实。B 选项正确，CRD 隔离是 vCluster 的核心价值之一。D 选项正确描述了 vCluster 的资源开销。很多人在第一次接触 vCluster 时会假设「虚拟集群 = 完全隔离」，但网络层的隔离需要额外手段。"
+        },
+        {
+          "id": "k8s-vcluster-concept-q1-quiz7",
+          "question": "在 Namespace 隔离、vCluster 和独立多集群三种方案中，以下哪个场景最适合使用 vCluster？",
+          "choices": [
+            {"id": "A", "text": "小团队（3-5 个服务）共用集群，只需要资源配额和基础 RBAC 隔离"},
+            {"id": "B", "text": "PCI DSS 合规要求生产环境与开发环境之间有物理级别的隔离"},
+            {"id": "C", "text": "多个团队需要独立安装不同版本的 CRD 和 Operator，但希望共享底层计算资源以控制成本"},
+            {"id": "D", "text": "不同业务线部署在不同地理区域，需要满足数据主权法规要求"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "vCluster 最适合的场景是：隔离需求超出 Namespace 能力（需要 CRD 隔离、独立 RBAC、独立 Admission 策略），但又不想承担多集群的运维成本和资源浪费。C 选项完美契合这个定位。A 选项的场景用 Namespace + RBAC + ResourceQuota 就够了，引入 vCluster 属于过度设计。B 和 D 选项需要真正的物理隔离或地理隔离，vCluster 的 Pod 仍然跑在宿主集群节点上，无法满足这些合规要求，必须使用独立集群。"
+        },
+        {
+          "id": "k8s-vcluster-concept-q1-quiz8",
+          "question": "你的 CI/CD 系统需要为每个 PR 创建一个临时的 Kubernetes 环境跑集成测试，测试完成后销毁。以下哪种方案最合适？",
+          "choices": [
+            {"id": "A", "text": "为每个 PR 创建一个独立的 EKS/GKE 集群，测试完销毁"},
+            {"id": "B", "text": "用 vCluster 在共享宿主集群中为每个 PR 创建虚拟集群，测试完用 vcluster delete 销毁"},
+            {"id": "C", "text": "所有 PR 共用同一个 Namespace，通过 label 区分不同 PR 的资源"},
+            {"id": "D", "text": "使用 kind（Kubernetes IN Docker）在 CI runner 上创建本地集群"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 vCluster 最经典的使用场景之一——CI/CD 临时环境。vCluster 创建速度快（约 30 秒），控制平面资源开销低，支持完整的 Kubernetes API（包括 CRD 安装），销毁也是秒级操作。A 选项的独立集群创建时间通常在 10-15 分钟，成本也高得多。C 选项在同一 Namespace 中不同 PR 的资源可能互相干扰（比如 Service 名称冲突），也无法测试需要集群级资源（CRD、ClusterRole）的场景。D 选项的 kind 适合单元测试级别的场景，但它运行在 Docker 容器内，网络和存储行为与真实集群有差异，不适合生产环境兼容性测试。"
+        },
+        {
+          "id": "k8s-vcluster-concept-q1-quiz9",
+          "question": "如果虚拟集群中的一个 Pod 持续处于 Pending 状态，以下哪个排查步骤是正确的？",
+          "choices": [
+            {"id": "A", "text": "只需在虚拟集群内执行 kubectl describe pod 查看 Events，所有信息都在虚拟集群层面"},
+            {"id": "B", "text": "先在虚拟集群内 describe pod 看初步信息，再切换到宿主集群查看对应的真实 Pod（名称改写后的）的 Events 和 Node 资源状况"},
+            {"id": "C", "text": "直接在宿主集群层面排查即可，虚拟集群内的信息都是冗余的"},
+            {"id": "D", "text": "检查虚拟集群的 k3s 进程日志，Pending 一定是虚拟控制平面调度器的问题"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考的是 vCluster 排查的一个核心要点：你需要同时看两个层面。虚拟集群内 describe pod 可以看到 syncer 反向同步的状态和部分 Events，但如果 Pending 原因是宿主集群节点资源不足、调度约束不满足或 PVC 绑定失败，这些信息往往只有在宿主集群的真实 Pod 上才能看到完整细节。你需要根据名称改写规则（web-server-x-default-x-team-a）找到宿主集群中对应的 Pod 来排查。A 选项不完整，虚拟集群层面的信息可能不够。C 选项忽略了虚拟集群层面可能有的额外信息（比如 Admission Webhook 拒绝）。D 选项不正确，vCluster 的 Pod 调度是由宿主集群的调度器完成的，不是虚拟控制平面的调度器。"
+        },
+        {
+          "id": "k8s-vcluster-concept-q1-quiz10",
+          "question": "vCluster 虚拟集群中用户执行 kubectl get nodes 时看到的节点信息来源是什么？",
+          "choices": [
+            {"id": "A", "text": "虚拟集群有自己的 kubelet 进程注册的虚拟节点，与宿主集群节点无关"},
+            {"id": "B", "text": "syncer 从宿主集群同步真实节点信息到虚拟集群（可配置过滤和 label selector）"},
+            {"id": "C", "text": "虚拟集群无法执行 kubectl get nodes，该命令会返回空结果"},
+            {"id": "D", "text": "虚拟控制平面模拟了一个单节点环境，永远只显示一个名为 vcluster 的虚拟节点"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "虚拟集群中的 Node 信息是 syncer 从宿主集群「向上同步」过来的。syncer 从宿主集群读取真实节点的信息，做一定的过滤和脱敏后同步到虚拟集群的 API Server 中。在 vcluster.yaml 配置中可以通过 sync.fromHost.nodes.selector.labels 指定只同步特定标签的节点，比如只让 ML 团队的虚拟集群看到带 GPU 标签的节点。A 选项错误，vCluster 不运行 kubelet 进程。C 选项错误，kubectl get nodes 是可以正常执行的。D 选项描述的行为类似 virtual-kubelet 的做法，不是 vCluster 的默认行为。"
+        }
+      ],
+      "references": [
+        "https://www.vcluster.com/docs",
+        "https://www.vcluster.com/docs/vcluster/deploy/topologies",
+        "https://www.vcluster.com/docs/vcluster/configure/vcluster-yaml/sync",
+        "https://loft.sh/blog/virtual-clusters-for-kubernetes-benefits-use-cases"
+      ]
+    }
+  ]
+}

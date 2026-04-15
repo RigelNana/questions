@@ -1,0 +1,157 @@
+{
+  "id": "k8s-http-request-full-path",
+  "name": "HTTP 请求在 K8s 中的完整路径",
+  "domain": "kubernetes",
+  "description": "从外部客户端发出 HTTP 请求到最终到达 Pod 容器端口的全链路拆解，涵盖 DNS、LB、Ingress、Service、kube-proxy、CNI 每一跳的数据包变化",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-http-request-full-path-q1",
+      "domain": "kubernetes",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["网络", "Service", "kube-proxy", "iptables", "Ingress", "CNI"],
+      "title": "一个 HTTP 请求从客户端到达 Pod 的完整路径是怎样的？",
+      "content": "面试官让你「从客户端发出请求开始，一跳一跳讲清楚 HTTP 请求是怎么最终到达 Pod 的」时候，他考察的不是你能不能背出 Service、Ingress、kube-proxy 这几个名词，而是你对 Kubernetes 网络模型有没有一个端到端的、可操作的理解。能把每一跳的 src/dst IP:port 变化、涉及的组件和配置、可能出问题的点都讲清楚的人，和只能说「请求经过 Ingress 到 Service 再到 Pod」的人，面试评价会差两个档次。\n\n这道题之所以重要，是因为线上网络排查几乎都是沿着这条链路走的。我在生产环境里遇到过一个典型问题：用户报告服务偶尔返回 502，你在 Pod 日志里完全看不到对应的请求——请求根本没到 Pod。如果你不清楚请求的完整路径，你都不知道应该从哪里开始抓包。是 LB 层丢的？Ingress Controller 返回的 502？还是 kube-proxy 的 iptables 规则把请求转发到了一个已经不存在的 Pod IP？\n\n我们用一个具体场景来展开。假设你的团队有一个电商 API 服务跑在 Kubernetes 1.28 集群上（3 个 master + 10 个 worker 节点，AWS EKS，CNI 用 VPC-CNI），部署情况如下：\n\n```yaml\n# Deployment: 3 个 Pod 副本\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: order-api\n  namespace: production\nspec:\n  replicas: 3\n  template:\n    spec:\n      containers:\n      - name: order-api\n        image: order-api:v2.1.3\n        ports:\n        - containerPort: 8080\n---\n# Service: ClusterIP 类型\napiVersion: v1\nkind: Service\nmetadata:\n  name: order-svc\n  namespace: production\nspec:\n  selector:\n    app: order-api\n  ports:\n  - port: 80\n    targetPort: 8080\n  type: ClusterIP\n---\n# Ingress: 对外暴露\napiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: order-ingress\n  namespace: production\n  annotations:\n    nginx.ingress.kubernetes.io/ssl-redirect: \"true\"\nspec:\n  ingressClassName: nginx\n  tls:\n  - hosts:\n    - api.shop.com\n    secretName: shop-tls\n  rules:\n  - host: api.shop.com\n    http:\n      paths:\n      - path: /orders\n        pathType: Prefix\n        backend:\n          service:\n            name: order-svc\n            port:\n              number: 80\n```\n\n现在一个用户在浏览器里访问 `https://api.shop.com/orders/12345`。请你从这个 HTTP 请求离开用户浏览器的那一刻开始，逐跳讲清楚数据包的完整路径，包括每一跳的源/目标 IP:port 变化、涉及的组件和配置，以及每一跳可能出问题时的排查思路。",
+      "answer": "## Kubernetes 网络模型基础\n\n在逐跳拆解请求路径之前，必须先理解 Kubernetes 网络模型的三条基本原则，因为所有的网络行为都建立在这三条原则之上。第一，每个 Pod 拥有独立的 IP 地址，Pod 内的所有容器共享同一个网络命名空间（network namespace），也就是共享同一个 IP 和端口空间。第二，任意两个 Pod 之间可以直接通过各自的 IP 通信，不需要 NAT——不管这两个 Pod 在不在同一个节点上。第三，节点上的 agent（如 kubelet）可以直接与该节点上的所有 Pod 通信。这三条原则是 CNI 插件（如 Calico、Flannel、AWS VPC-CNI、Cilium）必须实现的契约。至于每个 CNI 怎么实现的（VXLAN 隧道、BGP 路由、AWS ENI 直连），是各家的事情，但效果必须满足这三条。\n\n搞清楚了这个基础，我们就可以开始画完整的链路图了。下面这张 ASCII 图是整个请求路径的全景视图，后面会逐跳详细拆解：\n\n```\n用户浏览器 (58.210.35.100)\n     │\n     │ ① DNS 解析: api.shop.com → 52.83.120.50 (ELB IP)\n     ▼\nAWS NLB / ALB (52.83.120.50:443)\n     │\n     │ ② TLS 透传 / 终止, 转发到 NodePort\n     ▼\nWorker Node (192.168.1.101:32480)   ← NodePort 端口\n     │\n     │ ③ iptables DNAT → Ingress Controller Pod IP\n     ▼\nIngress Controller Pod (10.244.0.15:443)\n     │\n     │ ④ TLS 终止, 读取 Host+Path, 匹配 Ingress 规则\n     │    选择后端 Pod (绕过 ClusterIP, 直接用 Endpoints)\n     ▼\nOrder API Pod (10.244.2.38:8080)    ← 目标容器端口\n     │\n     │ ⑤ 应用处理请求, 原路返回响应\n     ▼\n用户浏览器收到 HTTP 200\n```\n\n## 第一跳：客户端 DNS 解析\n\n一切从 DNS 开始。用户浏览器拿到 `api.shop.com` 这个域名后，首先需要解析出 IP 地址。这个 DNS 查询走的是公网 DNS 链路，跟 Kubernetes 集群内部的 CoreDNS 没有任何关系。通常的配置是：`api.shop.com` 的 DNS A 记录（或 CNAME）指向云厂商 Load Balancer 的外部 IP。在 AWS 上，如果你的 Ingress Controller 的 Service 类型是 LoadBalancer，AWS Load Balancer Controller 会自动创建一个 NLB/ALB 并分配一个 DNS 名称（如 `a]b1c2d3-1234567890.us-east-1.elb.amazonaws.com`），你需要把 `api.shop.com` CNAME 到这个地址，或者用 Route 53 Alias 记录直接关联。\n\n解析完成后，浏览器拿到的目标 IP 是 `52.83.120.50`（ELB 的外部 IP）。此时数据包的头部信息是：\n\n```\nsrc: 58.210.35.100:随机高端口 (用户公网 IP)\ndst: 52.83.120.50:443 (ELB 外部 IP)\n```\n\n这一步可能出的问题：DNS 解析失败（域名没配或 TTL 过长导致解析到旧 IP）、DNS 解析到了错误的 LB 地址。排查工具：`dig api.shop.com` 或 `nslookup api.shop.com`，确认解析出的 IP 是否是当前 LB 的地址。\n\n## 第二跳：云厂商 Load Balancer → 节点\n\nLoad Balancer 收到请求后，需要选择一个后端节点把流量转发过去。Kubernetes 中 LoadBalancer 类型的 Service 背后的机制是：kube-controller-manager 中的 cloud-controller-manager 调用云厂商 API，创建一个外部负载均衡器，并把集群所有（或部分）Worker 节点注册为 LB 的后端 target，端口是 Service 的 NodePort。\n\n以 Ingress Controller 的 LoadBalancer Service 为例，假设 NodePort 被分配为 32480：\n\n```bash\n$ kubectl get svc -n ingress-nginx ingress-nginx-controller\nNAME                       TYPE           CLUSTER-IP     EXTERNAL-IP    PORT(S)\ningress-nginx-controller   LoadBalancer   10.96.15.200   52.83.120.50   80:31920/TCP,443:32480/TCP\n```\n\nLB 选中了节点 192.168.1.101，把流量转发到该节点的 32480 端口。此时数据包变为：\n\n```\nsrc: 58.210.35.100:随机高端口 (用户公网 IP, 如果 LB 支持透传)\n     或 LB 内部 IP (如果 LB 做了 SNAT)\ndst: 192.168.1.101:32480 (Worker 节点 IP + NodePort)\n```\n\n这里有一个重要的细节：`externalTrafficPolicy`。如果 Service 设置了 `externalTrafficPolicy: Cluster`（默认值），LB 可以把流量发到任意节点，即使该节点上没有运行 Ingress Controller Pod——因为 kube-proxy 的 iptables 规则会二次转发。但如果设置为 `externalTrafficPolicy: Local`，LB 只会把流量发到确实运行了 Ingress Controller Pod 的节点上，避免了多余的一跳网络转发，同时保留了客户端真实源 IP（因为不需要额外 SNAT）。生产环境中 Ingress Controller 通常推荐设置 `externalTrafficPolicy: Local`。\n\n这一步可能出的问题：LB 健康检查失败导致所有节点被摘除（常见于 NodePort 端口上没有进程监听的情况）、Security Group / 防火墙规则阻断了 LB 到节点的流量。排查方式：在云控制台查看 LB 的 target health 状态，在节点上用 `ss -tlnp | grep 32480` 确认 NodePort 是否在监听。\n\n## 第三跳：节点 kube-proxy 规则转发\n\n流量到达节点的 32480 端口后，由 kube-proxy 在内核中维护的 iptables/IPVS 规则接管。这是整条链路中最「隐蔽」的一环——没有任何用户态进程在 32480 端口上监听，所有转发都发生在内核的 netfilter 框架中。\n\n在 iptables 模式下，我们可以看到类似这样的规则链：\n\n```bash\n$ iptables -t nat -L KUBE-NODEPORTS -n | grep 32480\nKUBE-EXT-XXXXX  tcp  --  0.0.0.0/0  0.0.0.0/0  tcp dpt:32480\n\n$ iptables -t nat -L KUBE-EXT-XXXXX -n\nChain KUBE-EXT-XXXXX (1 references)\ntarget     prot opt source    destination\nKUBE-SVC-XXXXX  all  --  0.0.0.0/0  0.0.0.0/0\n\n$ iptables -t nat -L KUBE-SVC-XXXXX -n\nChain KUBE-SVC-XXXXX (2 references)\ntarget     prot opt source       destination\nKUBE-SEP-AAAA  all  --  0.0.0.0/0  0.0.0.0/0  statistic mode random probability 0.50000\nKUBE-SEP-BBBB  all  --  0.0.0.0/0  0.0.0.0/0\n\n$ iptables -t nat -L KUBE-SEP-AAAA -n\nChain KUBE-SEP-AAAA (1 references)\ntarget  prot opt source       destination\nDNAT    tcp  --  0.0.0.0/0    0.0.0.0/0  tcp to:10.244.0.15:443\n```\n\n注意看最后一行的 DNAT 规则——目标地址被改写为 `10.244.0.15:443`，这是 Ingress Controller Pod 的 IP 和端口。iptables 通过概率分发在多个 Ingress Controller Pod 之间做负载均衡（如果有 2 个副本，第一条概率 0.5，第二条兜底）。同时内核的 conntrack（连接跟踪）模块会记录这次 DNAT 映射，确保同一个 TCP 连接的后续包和返回包都能正确路由。\n\n数据包经过 DNAT 后变为：\n\n```\nsrc: 58.210.35.100:随机高端口 (或 LB IP, 取决于 externalTrafficPolicy)\ndst: 10.244.0.15:443 (Ingress Controller Pod IP)\n```\n\n如果 Ingress Controller Pod 不在当前节点上，数据包还需要跨节点传输——这就进入了 CNI 的领地。不同 CNI 方案的实现方式不同：Flannel 用 VXLAN 隧道封装，Calico 可以用 BGP 直接路由或 IPIP 隧道，AWS VPC-CNI 直接利用 VPC 路由表实现 Pod IP 在 VPC 内直接可达（因为每个 Pod 都绑了一个 ENI 的辅助 IP）。无论哪种方式，最终效果是数据包到达了运行 Ingress Controller Pod 的节点，并被投递到 Pod 的网络命名空间中。\n\n排查要点：`iptables -t nat -L -n -v | grep KUBE-SVC` 看规则是否存在、是否有流量命中（pkts 计数器）；`conntrack -L | grep <Pod IP>` 查看连接跟踪表是否有对应条目；如果怀疑跨节点通信有问题，在源节点和目标节点上同时 `tcpdump -i any host 10.244.0.15` 抓包对比。\n\n## 第四跳：Ingress Controller 路由转发\n\n请求到达 Ingress Controller Pod 之后，进入七层处理。以 ingress-nginx 为例，Nginx 进程在 443 端口上接收 TLS 连接，用 Ingress 资源中引用的 TLS Secret 完成 TLS 握手和解密（TLS Termination），然后读取明文 HTTP 请求的 Host 头（`api.shop.com`）和 URI 路径（`/orders/12345`），在内存中的路由表里匹配到对应的 Ingress 规则——`host: api.shop.com, path: /orders, pathType: Prefix` → backend `order-svc:80`。\n\n关键细节来了：ingress-nginx 在转发流量时，并不是把请求发给 order-svc 的 ClusterIP（10.96.xx.xx），而是直接从 Kubernetes API 获取 order-svc 对应的 EndpointSlice，拿到后端 Pod 的真实 IP 列表，然后在 Nginx 的 upstream 中直接配置这些 Pod IP。这意味着这一跳完全绕过了 kube-proxy 的 iptables/IPVS 规则。你可以 exec 进 Ingress Controller Pod 验证：\n\n```bash\n$ kubectl exec -it ingress-nginx-controller-xxx -n ingress-nginx -- \\\n  cat /etc/nginx/nginx.conf | grep -A 5 \"upstream.*order-svc\"\n\nupstream upstream-production-order-svc-80 {\n    server 10.244.2.38:8080;   # Pod 1\n    server 10.244.1.52:8080;   # Pod 2\n    server 10.244.3.17:8080;   # Pod 3\n}\n```\n\n看到了吗？upstream 里直接是三个 Pod IP:8080，不是 ClusterIP。Nginx 选中 `10.244.2.38:8080` 后，建立新的 HTTP 连接将请求转发过去。此时数据包变为：\n\n```\nsrc: 10.244.0.15:随机高端口 (Ingress Controller Pod IP)\ndst: 10.244.2.38:8080 (目标 Order API Pod IP + 容器端口)\n```\n\n如果 Ingress Controller Pod 和目标 Pod 不在同一个节点上，这里又是一次 CNI 跨节点通信。\n\n排查要点：`kubectl logs -n ingress-nginx ingress-nginx-controller-xxx` 看 Nginx 的 access/error log；`kubectl exec` 进去后 `curl -v http://10.244.2.38:8080/orders/12345` 手动测试后端 Pod 连通性；确认 Ingress Controller 是否拿到了最新的 Endpoints（`kubectl get endpointslice -n production -l kubernetes.io/service-name=order-svc`）。\n\n## 第五跳：请求到达目标 Pod\n\n数据包最终到达 `10.244.2.38:8080`，这个地址是 order-api 容器内 Go/Java/Node 应用监听的端口。在 Pod 的网络命名空间内，应用进程通过标准的 socket accept 接收连接，处理业务逻辑，构造 HTTP 响应。响应沿着来时的路径原路返回：Pod → CNI 网络 → Ingress Controller（重新加密如果需要）→ kube-proxy conntrack 做反向 NAT → 节点 → LB → 用户浏览器。\n\n整个链路中，conntrack 是返回路径的关键。内核在做 DNAT 时会在 conntrack 表中记录映射关系，返回的数据包经过 conntrack 时会被自动做反向 SNAT，把 src 从 Pod IP 改回 Service 的 ClusterIP 或 NodePort 地址，确保客户端收到的响应源地址与它当初发出请求时的目标地址一致。你可以用 `conntrack -L -d 10.244.2.38` 查看这些映射记录。\n\n## 体系化扩展\n\n### iptables 与 IPVS 模式下路径的差异\n\n上面描述的第三跳是基于 iptables 模式的。如果 kube-proxy 运行在 IPVS 模式下，NodePort 流量的处理方式略有不同。IPVS 模式下，Service 的 ClusterIP 会被绑定到节点的 `kube-ipvs0` dummy 网卡上，IPVS 内核模块使用哈希表而非链式 iptables 规则做 DNAT。你可以用 `ipvsadm -Ln` 查看 virtual server 及其 real server 列表。两个关键差异：第一，IPVS 支持多种负载均衡算法（rr、lc、wrr 等），而 iptables 只能做随机概率分发；第二，IPVS 规则的查找复杂度是 O(1)（哈希表），而 iptables 是 O(n)（链式线性遍历），在 Service 数量超过 1000 时性能差距明显。但需要注意，IPVS 模式仍然依赖少量 iptables 规则处理 SNAT 和 MASQUERADE。\n\n### Service Mesh 插入后的路径变化\n\n如果集群部署了 Istio Service Mesh，请求路径会增加两个 sidecar 代理的环节。Istio 的 `istio-init` init container 在 Pod 启动时通过 iptables 规则劫持 Pod 内所有出入流量到 Envoy sidecar（127.0.0.6:15001 / 127.0.0.6:15006）。完整路径变成：Ingress Controller → 目标 Pod 的 Envoy sidecar inbound（15006 端口）→ 应用容器（8080 端口）。如果 Ingress Controller 本身也在 mesh 中，出方向流量也会经过 Ingress Controller Pod 的 Envoy sidecar outbound。每多一个 sidecar 就多了一次用户态代理和一次 iptables 劫持，典型地增加 2-5ms 的延迟。你可以通过 `istioctl proxy-config listener <pod>` 和 `istioctl proxy-config route <pod>` 查看 sidecar 的监听和路由配置。\n\n### 常见网络排查工具和方法\n\n沿着这条链路排查问题，工具链大致是：`dig/nslookup`（第一跳 DNS）→ 云控制台看 LB target health（第二跳）→ `iptables -t nat -L -n -v`（第三跳规则和命中计数）→ `conntrack -L`（连接跟踪映射）→ `tcpdump -i any -n host <target-pod-ip>`（任意节点抓包）→ `kubectl logs`（Ingress Controller 和应用日志）→ `kubectl exec + curl`（手动测试 Pod 连通性）。面试中如果你能在白板上画出这个全链路图，然后对着每一跳说出具体的排查命令，基本就是高分了。\n\n### 面试中怎么讲这道题\n\n建议用这个结构回答：先画一张从上到下的 5 层链路图（DNS → LB → Node/kube-proxy → Ingress Controller → Pod），然后从外到内逐层讲，每层说三件事——这一层做了什么、数据包的 IP:port 怎么变的、出问题了怎么查。不要试图一口气讲完所有细节，先讲主干路径，面试官感兴趣的点他会追问。如果面试官问「你线上遇到过什么网络问题」，就是最好的加分机会——把某一跳出问题的真实排查经历讲出来，比背诵全链路有说服力得多。",
+      "keyPoints": [
+        "Kubernetes 网络模型的核心原则是每个 Pod 有独立 IP、Pod 间直接可达不需要 NAT，CNI 插件（Calico/Flannel/VPC-CNI）负责实现这一契约",
+        "完整请求路径是：外部 DNS 解析 → 云 LB → NodePort（kube-proxy iptables/IPVS DNAT）→ Ingress Controller Pod（七层路由、TLS 终止）→ 目标 Pod 容器端口",
+        "kube-proxy 在内核 netfilter 中维护 iptables 规则实现 DNAT，通过 statistic 模块的概率匹配做负载均衡，conntrack 记录映射关系保证返回包正确路由",
+        "Ingress Controller（如 ingress-nginx）转发流量时直接从 EndpointSlice 获取 Pod IP，绕过 Service ClusterIP 和 kube-proxy，自行实现七层负载均衡",
+        "externalTrafficPolicy: Local 避免 LB → Node 后的二次转发跳跃，同时保留客户端真实源 IP，生产环境 Ingress Controller 推荐启用",
+        "IPVS 模式用哈希表替代 iptables 链表实现 O(1) 查找和增量更新，Service 数量超过千级时性能优势明显，但仍依赖少量 iptables 处理 SNAT",
+        "Istio Service Mesh 通过 init container 注入 iptables 规则将 Pod 出入流量劫持到 Envoy sidecar，每个 sidecar 增加一次用户态代理和约 2-5ms 延迟",
+        "全链路排查工具链：dig（DNS）→ LB target health（云控制台）→ iptables -t nat -L -n -v（规则命中）→ conntrack -L（连接跟踪）→ tcpdump（抓包）→ kubectl logs/exec（应用层）"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-http-request-full-path-q1-quiz1",
+          "question": "外部用户访问 api.shop.com 时，DNS 解析返回的 IP 地址通常属于以下哪个组件？",
+          "choices": [
+            {"id": "A", "text": "集群内 CoreDNS 的 ClusterIP"},
+            {"id": "B", "text": "Ingress Controller Pod 的 Pod IP"},
+            {"id": "C", "text": "云厂商 Load Balancer 的外部 IP（或 CNAME 指向 LB 的 DNS 名称）"},
+            {"id": "D", "text": "order-svc Service 的 ClusterIP"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "外部用户的 DNS 查询走的是公网 DNS 链路，跟集群内部的 CoreDNS 完全无关。api.shop.com 的 DNS 记录应该指向云厂商 Load Balancer 的外部 IP 或 DNS 名称（如 AWS ELB 的 xxx.elb.amazonaws.com）。A 错误，CoreDNS 的 ClusterIP 只在集群内部可达，外部根本无法访问。B 错误，Pod IP 是集群内部私有地址，外部不可路由。D 同理，ClusterIP 也是集群内部虚拟 IP，不能作为外部 DNS 记录的目标。"
+        },
+        {
+          "id": "k8s-http-request-full-path-q1-quiz2",
+          "question": "云 Load Balancer 将流量转发到 Kubernetes 节点时，目标端口是什么？",
+          "choices": [
+            {"id": "A", "text": "Service 定义中的 port（如 80）"},
+            {"id": "B", "text": "Pod 容器的 containerPort（如 8080）"},
+            {"id": "C", "text": "Service 自动分配的 NodePort（如 32480）"},
+            {"id": "D", "text": "Ingress Controller 监听的 443 端口"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "LoadBalancer 类型的 Service 在每个节点上开放 NodePort 端口（范围 30000-32767），云厂商 LB 将流量转发到节点的这个 NodePort 上。A 的 port 80 是 Service 在集群内部的端口，外部 LB 不会直接访问。B 的 containerPort 是 Pod 内部应用的监听端口，LB 不直接与 Pod 通信。D 的 443 端口虽然是 Ingress Controller 进程实际监听的端口，但 LB 不直接连 Pod，而是通过 NodePort 间接到达。流量链路是：LB → NodePort → kube-proxy DNAT → Ingress Controller Pod:443。"
+        },
+        {
+          "id": "k8s-http-request-full-path-q1-quiz3",
+          "question": "在 kube-proxy 的 iptables 模式下，NodePort 流量到达节点后，内核通过什么机制将数据包转发到目标 Pod？",
+          "choices": [
+            {"id": "A", "text": "kube-proxy 进程在用户态接收数据包，选择后端 Pod 后转发"},
+            {"id": "B", "text": "内核 netfilter 框架中的 DNAT 规则直接在内核态改写目标地址并转发"},
+            {"id": "C", "text": "kubelet 通过 gRPC 调用 CNI 插件完成数据包路由"},
+            {"id": "D", "text": "CoreDNS 将 Service 名解析为 Pod IP，数据包直接发往 Pod"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 iptables 模式下，kube-proxy 的角色只是维护 iptables 规则——它通过 Watch API Server 上 Service/EndpointSlice 的变化来增删改 iptables nat 表中的规则。实际的流量转发完全由内核 netfilter 框架处理，通过 DNAT 规则将目标地址从 NodeIP:NodePort 改写为 PodIP:PodPort，全程不经过任何用户态进程。A 描述的是已经废弃的 userspace 模式。C 不对，CNI 负责的是 Pod 网络接口的创建和 IP 分配，不参与运行时的包转发决策。D 也不对，DNS 只在应用层做名称解析，不参与内核层的数据包路由。"
+        },
+        {
+          "id": "k8s-http-request-full-path-q1-quiz4",
+          "question": "ingress-nginx Controller 在将请求转发到后端 Pod 时，通常使用的目标地址是什么？",
+          "choices": [
+            {"id": "A", "text": "后端 Service 的 ClusterIP（如 10.96.xx.xx:80），由 kube-proxy 再做一次 DNAT"},
+            {"id": "B", "text": "后端 Pod 的真实 IP（如 10.244.2.38:8080），直接从 EndpointSlice 获取，绕过 kube-proxy"},
+            {"id": "C", "text": "后端 Service 的 NodePort，通过节点转发到 Pod"},
+            {"id": "D", "text": "后端 Service 的 ExternalName，通过 DNS CNAME 跳转"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ingress-nginx Controller 的设计是直接从 Kubernetes API 获取 Service 对应的 EndpointSlice（或 Endpoints），把后端 Pod 的真实 IP:Port 配置到 Nginx 的 upstream 中，转发时直接连 Pod。这样做绕过了 kube-proxy 的 iptables/IPVS 规则，让 Nginx 自己掌控负载均衡策略（如会话保持、加权轮询）。你可以 exec 进 Controller Pod 查看 nginx.conf 中的 upstream 配置来验证。A 描述的方式会导致多一层 kube-proxy 转发，ingress-nginx 不这样做。C 和 D 都不是 Ingress Controller 的标准转发方式。"
+        },
+        {
+          "id": "k8s-http-request-full-path-q1-quiz5",
+          "question": "在节点上执行 `iptables -t nat -L KUBE-SVC-XXXXX -n` 看到两条规则，第一条概率是 0.33333，第二条概率是 0.50000，第三条没有概率限定直接跳转。这代表什么？",
+          "choices": [
+            {"id": "A", "text": "三个后端 Pod 被选中的概率分别是 33%、50%、17%，负载不均衡"},
+            {"id": "B", "text": "三个后端 Pod 被选中的概率都是 33.3%，通过条件概率实现均匀分发"},
+            {"id": "C", "text": "第三个 Pod 永远会被选中，因为它是兜底规则"},
+            {"id": "D", "text": "只有前两个 Pod 参与负载均衡，第三个 Pod 是 backup"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 iptables 模式下实现均匀负载均衡的经典概率设计。第一条规则概率 1/3，命中就选 Pod1；没命中（概率 2/3）进入第二条，此时概率 1/2，对应全局概率 2/3 × 1/2 = 1/3，命中选 Pod2；还没命中（概率 2/3 × 1/2 = 1/3）进入第三条兜底规则，直接选 Pod3。三个 Pod 各自被选中的概率都是 1/3。A 选项的错误在于把条件概率当成了全局概率——50% 不是 Pod2 的全局被选中率，而是「在 Pod1 没被选中的前提下」Pod2 被选中的条件概率。C 和 D 都忽略了概率链的工作方式。"
+        },
+        {
+          "id": "k8s-http-request-full-path-q1-quiz6",
+          "question": "将 Ingress Controller 的 Service 设置为 `externalTrafficPolicy: Local` 后，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "LB 会把流量转发到所有节点，节点上的 kube-proxy 负责二次转发到有 Pod 的节点"},
+            {"id": "B", "text": "LB 只把流量发到运行了 Ingress Controller Pod 的节点，避免二次跳转并保留客户端源 IP"},
+            {"id": "C", "text": "所有流量都会被路由到 master 节点上的 kube-apiserver 进行调度"},
+            {"id": "D", "text": "kube-proxy 会在每个节点上启动一个本地代理进程来处理流量"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "externalTrafficPolicy: Local 的核心效果是：节点上如果没有对应 Service 的后端 Pod，kube-proxy 就不会在该节点上创建 NodePort 的监听规则，LB 对该节点的健康检查会失败，从而自动将其从 target 列表中摘除。结果是流量只会被发到确实运行了 Pod 的节点上，省去了跨节点二次转发（减少一跳延迟），同时因为不需要在中间节点做 SNAT，客户端的真实源 IP 得以保留。A 描述的是默认的 externalTrafficPolicy: Cluster 行为。C 完全错误，流量不经过 kube-apiserver。D 也不对，Local 模式下 kube-proxy 不启动额外进程。"
+        },
+        {
+          "id": "k8s-http-request-full-path-q1-quiz7",
+          "question": "相比 iptables 模式，IPVS 模式在处理 Service 转发时的核心优势是什么？",
+          "choices": [
+            {"id": "A", "text": "IPVS 完全不需要 iptables，所有网络功能都由 IPVS 内核模块独立实现"},
+            {"id": "B", "text": "IPVS 使用哈希表实现 O(1) 查找，支持增量更新和多种负载均衡算法，大规模集群下性能远优于 iptables 的线性遍历"},
+            {"id": "C", "text": "IPVS 在用户态运行，可以实现更灵活的七层路由策略"},
+            {"id": "D", "text": "IPVS 模式下 kube-proxy 不需要 Watch API Server，规则由 kubelet 直接写入"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "IPVS 的核心优势在数据结构和更新方式上。iptables 规则是链表结构，匹配时需要线性遍历，复杂度 O(n)；IPVS 用哈希表索引 virtual server，查找复杂度 O(1)。在规则更新方面，iptables 需要通过 iptables-restore 全量刷新所有规则，而 IPVS 支持通过 netlink 接口增量添加/删除单个 real server。此外 IPVS 原生支持 rr、wrr、lc、wlc、sh 等多种调度算法。A 是错误的——IPVS 模式仍然依赖少量 iptables/ipset 处理 SNAT 和 MASQUERADE。C 不对，IPVS 工作在内核空间，是四层负载均衡器。D 也不对，kube-proxy 在 IPVS 模式下仍然通过 Watch 机制获取 Service/EndpointSlice 变化。"
+        },
+        {
+          "id": "k8s-http-request-full-path-q1-quiz8",
+          "question": "生产环境中用户报告服务间歇性 502 错误，Pod 日志中没有对应请求记录。你应该优先在哪一层排查？",
+          "choices": [
+            {"id": "A", "text": "直接重启所有 Pod，大概率能修复"},
+            {"id": "B", "text": "检查 Ingress Controller 的 access/error log，确认 502 是由 Ingress Controller 返回的还是透传自后端"},
+            {"id": "C", "text": "重新部署 kube-proxy DaemonSet 以刷新 iptables 规则"},
+            {"id": "D", "text": "修改 CoreDNS 配置增加 DNS 缓存时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "502 Bad Gateway 意味着反向代理（这里是 Ingress Controller 的 Nginx）尝试连接后端但失败了。Pod 日志没有记录说明请求没到 Pod，问题出在 Ingress Controller 到 Pod 之间。优先排查 Ingress Controller 的日志是最高效的切入点——Nginx 的 error log 会记录具体是 upstream timeout、connection refused 还是 upstream prematurely closed。常见原因包括：Ingress Controller 缓存了已被销毁的 Pod IP（EndpointSlice 更新延迟）、Pod 的 readinessProbe 配置不当导致 Pod 还没就绪就接收流量、或者 Pod 的 graceful shutdown 没实现好导致滚动更新时连接被断开。A 的盲目重启不解决根因。C 和 D 与 502 错误的排查方向不相关。"
+        },
+        {
+          "id": "k8s-http-request-full-path-q1-quiz9",
+          "question": "部署了 Istio Service Mesh 后，从 Ingress Controller 到目标 Pod 的请求路径会发生什么变化？",
+          "choices": [
+            {"id": "A", "text": "没有变化，Istio 只影响 Pod 之间的东西向流量，不影响 Ingress 到 Pod 的流量"},
+            {"id": "B", "text": "请求会先到 Istio 的 Ingress Gateway，完全替代 Nginx Ingress Controller"},
+            {"id": "C", "text": "请求到达目标 Pod 后，先被 Pod 内的 Envoy sidecar 的 iptables 规则劫持到 sidecar 的 inbound 端口（15006），再转发给应用容器"},
+            {"id": "D", "text": "Istio 会在内核态注入 eBPF 程序替代 iptables，实现零拷贝转发"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Istio 的 sidecar 注入机制会在每个 Pod 中添加一个 Envoy 代理容器，并通过 istio-init init container 配置 iptables 规则劫持 Pod 内所有入站流量到 Envoy 的 inbound 监听端口 15006。所以即使 Ingress Controller 直接把请求发到 Pod IP:8080，数据包进入 Pod 的网络命名空间后也会先被 iptables 劫持到 Envoy sidecar，由 sidecar 执行 mTLS 验证、流量策略、遥测采集等操作后再转给应用容器。A 不对，Istio 对所有进入 Pod 的流量都有效果。B 不准确，Istio 有自己的 Ingress Gateway 但并不强制替代 Nginx。D 描述的是 Cilium 的方案，不是 Istio 的默认行为。"
+        },
+        {
+          "id": "k8s-http-request-full-path-q1-quiz10",
+          "question": "在排查跨节点 Pod 通信问题时，以下哪组命令组合最能帮助你定位问题？",
+          "choices": [
+            {"id": "A", "text": "kubectl describe pod + kubectl get events"},
+            {"id": "B", "text": "在源节点和目标节点上同时执行 tcpdump -i any host <Pod IP> 抓包对比，配合 conntrack -L 查看连接跟踪表"},
+            {"id": "C", "text": "kubectl top nodes + kubectl top pods 查看资源使用率"},
+            {"id": "D", "text": "helm list + helm status 查看 Helm release 状态"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "跨节点 Pod 通信问题的排查核心是确定数据包在哪一跳丢失或被改写了。在源节点和目标节点上同时 tcpdump 抓包，可以明确判断：包是否从源节点发出了（看源节点有没有 outgoing 包）、包是否到达了目标节点（看目标节点有没有 incoming 包）、包的 IP/端口是否被正确改写。配合 conntrack -L 查看 NAT 映射关系，可以确认 DNAT/SNAT 是否正确。A 的 describe/events 主要看调度和容器生命周期事件，对网络层的包级问题帮助有限。C 看的是资源使用率，跟网络连通性无关。D 跟网络排查完全不沾边。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/services-networking/service/",
+        "https://kubernetes.io/docs/concepts/services-networking/ingress/",
+        "https://kubernetes.io/docs/concepts/cluster-administration/networking/",
+        "https://kubernetes.io/docs/reference/networking/virtual-ips/"
+      ]
+    }
+  ]
+}
