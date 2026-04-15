@@ -1,0 +1,157 @@
+{
+  "id": "k8s-mysql-operator-design",
+  "name": "MySQL Operator 设计",
+  "domain": "kubernetes",
+  "description": "设计一个生产级 MySQL Operator，涵盖主从复制、自动故障转移和备份恢复",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-mysql-operator-design-q1",
+      "domain": "kubernetes",
+      "type": "project",
+      "difficulty": 4,
+      "tags": ["Operator", "MySQL", "StatefulSet", "主从复制", "项目设计"],
+      "title": "MySQL Operator 设计",
+      "content": "面试官问你「如果让你在 Kubernetes 上跑 MySQL 集群，你会怎么设计」的时候，他考察的不是你会不会写 StatefulSet YAML。他真正想知道的是：你理不理解有状态服务在 Kubernetes 上的核心挑战，你能不能设计一个 Operator 来自动化数据库的全生命周期管理，以及你对主从复制、故障转移、备份恢复这些数据库运维操作有没有实操经验。\n\n先说场景。你的团队负责一个电商平台的后端基础设施，业务方需要在 Kubernetes 1.29 集群中运行多套 MySQL 8.0 集群。具体需求是这样的：每套集群 3 个节点（1 主 2 从），支持自动故障转移且 RTO（Recovery Time Objective，恢复时间目标）小于 30 秒，每天自动备份到 S3 并保留 7 天，支持在线扩缩容从节点数量。业务方不想关心 MySQL 运维细节，他们希望像创建一个 Deployment 一样简单——写一段 YAML apply 一下，集群就自动拉起来了。\n\n这就是 Operator 模式要解决的问题。你需要设计一个 MySQL Operator，让业务方写出这样的 CR（Custom Resource，自定义资源）就能完成所有事情：\n\n```yaml\napiVersion: mysql.example.com/v1alpha1\nkind: MySQLCluster\nmetadata:\n  name: order-db\n  namespace: production\nspec:\n  version: \"8.0.36\"\n  replicas: 3                    # 1 primary + 2 replicas\n  primaryIndex: 0                # mysql-0 为初始 primary\n  storage:\n    size: 100Gi\n    storageClassName: gp3-encrypted\n  resources:\n    requests:\n      cpu: \"2\"\n      memory: 4Gi\n    limits:\n      cpu: \"4\"\n      memory: 8Gi\n  backup:\n    schedule: \"0 2 * * *\"        # 每天凌晨 2 点\n    s3:\n      bucket: mycompany-mysql-backups\n      prefix: order-db/\n      secretName: s3-credentials\n    retentionDays: 7\n  replication:\n    mode: semi-sync              # 半同步复制\n    gtid: true                   # 启用 GTID\n  monitoring:\n    enabled: true                # 自动创建 ServiceMonitor\n    exporterImage: prom/mysqld-exporter:0.15.1\n```\n\n`kubectl apply -f order-db.yaml` 之后，30 秒内你应该看到这样的输出：\n\n```bash\nkubectl get mysqlcluster -n production\n# NAME       REPLICAS   PRIMARY    STATUS   AGE\n# order-db   3/3        mysql-0    Ready    45s\n\nkubectl get pods -n production -l mysql.example.com/cluster=order-db\n# NAME             READY   STATUS    RESTARTS   AGE\n# order-db-0       3/3     Running   0          42s   ← primary\n# order-db-1       3/3     Running   0          35s   ← replica\n# order-db-2       3/3     Running   0          28s   ← replica\n\nkubectl get svc -n production -l mysql.example.com/cluster=order-db\n# NAME                TYPE        CLUSTER-IP      PORT(S)\n# order-db-primary    ClusterIP   10.96.45.12     3306/TCP  ← 读写，指向 primary\n# order-db-readonly   ClusterIP   10.96.45.13     3306/TCP  ← 只读，负载均衡到 replicas\n# order-db-headless   ClusterIP   None            3306/TCP  ← StatefulSet headless\n```\n\n每个 Pod 里跑 3 个容器：mysqld 主进程、mysqld-exporter 指标采集、以及一个 sidecar agent 负责健康检查和复制状态上报。当 primary 节点故障时，Operator 需要在 30 秒内完成：检测故障、选择数据最新的 replica 提升为新 primary、重新配置其他 replica 指向新 primary、更新 primary Service 的 endpoints。\n\n如何设计这个 Operator 的 CRD、Controller reconcile 逻辑、复制拓扑管理和备份控制器？",
+      "answer": "## 第一步：Kubernetes Operator 与有状态服务的核心挑战\n\n### Operator 模式的本质\n\nKubernetes Operator 模式的核心思想是将人类运维工程师的领域知识编码为软件。在 Kubernetes 的世界里，内置的 Controller（如 Deployment Controller、StatefulSet Controller）已经能自动管理无状态应用的生命周期——创建 Pod、滚动更新、扩缩容。但数据库这类有状态服务的运维远比无状态服务复杂：你不能随便杀掉一个 MySQL 主节点然后重新拉一个，你需要先确保数据同步完成、需要选举新主、需要重新配置复制拓扑、需要更新路由——这些操作 StatefulSet 一个都不会帮你做。\n\nOperator 通过 CRD（Custom Resource Definition，自定义资源定义）扩展 Kubernetes API，定义出类似 `MySQLCluster` 这样的自定义资源类型，然后用一个运行在集群中的 Controller 来 watch 这些资源的变化并执行相应的运维操作。核心理念是声明式管理：用户只需要描述「我要一个 3 节点的 MySQL 集群」，Operator 负责搞清楚如何从当前状态到达目标状态——这就是所谓的 reconcile（调和）循环。一个基于 kubebuilder 或 operator-sdk 搭建的 Operator 项目，最核心的代码就是这个 reconcile 函数。\n\n### 为什么 StatefulSet 不够\n\nStatefulSet 确实解决了有状态服务的三个基础问题：稳定的网络标识（每个 Pod 有固定的 DNS 名如 `order-db-0.order-db-headless.production.svc.cluster.local`）、有序的部署和删除（Pod 按序号 0、1、2 依次启动，反序删除）、以及稳定的持久化存储（每个 Pod 通过 volumeClaimTemplates 绑定一个 PVC，Pod 重建后还能挂载回来）。但对于数据库来说，这只是万里长征的第一步。\n\nStatefulSet 不知道哪个 Pod 是 primary、哪个是 replica。它不会帮你配置 MySQL 的主从复制。它不知道什么时候该做 failover，更不知道怎么做。当你把 replicas 从 3 扩到 5 时，新加的两个 Pod 拉起来后只是空的 MySQL 实例，StatefulSet 不会帮你把它们加入复制拓扑。备份、恢复、版本升级这些操作更不在 StatefulSet 的能力范围内。所以 MySQL Operator 要做的，本质上就是在 StatefulSet 之上叠加数据库领域的运维逻辑。\n\n一个生产级的 MySQL Operator 至少需要自动化六个环节：集群初始化（从零创建完整的主从集群）、复制拓扑管理（维护主从关系、监控复制延迟）、故障转移（检测主节点故障后自动选主并重建拓扑）、备份与恢复（定时物理备份到 S3，支持 Point-in-Time Recovery）、扩缩容（添加或移除从节点并自动配置复制）、以及版本升级（先升级 replica 再 failover 再升级旧 primary 的滚动策略）。\n\n## 第二步：Operator 核心架构与实现细节\n\n### CRD Status 设计\n\nCRD 的 spec 部分在题目中已经展示了，这里重点讲 status 的设计——它是用户了解集群运行状态的窗口：\n\n```yaml\nstatus:\n  phase: Running           # Pending → Initializing → Running → FailingOver → Failed\n  readyReplicas: 3\n  currentPrimary: order-db-0\n  replication:\n    - pod: order-db-1\n      role: replica\n      gtidExecuted: \"3E11FA47-71CA-11E1-9E33-C80AA9429562:1-1542\"\n      secondsBehindPrimary: 0\n      ioRunning: true\n      sqlRunning: true\n    - pod: order-db-2\n      role: replica\n      gtidExecuted: \"3E11FA47-71CA-11E1-9E33-C80AA9429562:1-1540\"\n      secondsBehindPrimary: 2\n      ioRunning: true\n      sqlRunning: true\n  lastBackup:\n    time: \"2024-01-15T02:05:32Z\"\n    size: \"12.4Gi\"\n    status: Completed\n  conditions:\n    - type: Ready\n      status: \"True\"\n    - type: ReplicationHealthy\n      status: \"True\"\n    - type: BackupReady\n      status: \"True\"\n```\n\n这个 status 结构让用户通过 `kubectl get mysqlcluster` 就能看到集群的健康状态、当前主节点、每个从节点的复制进度和最近一次备份的结果。其中 `phase` 字段是一个状态机，驱动着 Controller 的 reconcile 逻辑。\n\n### Controller Reconcile 逻辑：状态机驱动\n\nController 的 reconcile 函数是 Operator 的大脑。每次 reconcile 被触发时（可能是 CR 被修改、Pod 状态变化、或定时 requeue），Controller 先读取 MySQLCluster CR 的当前状态，然后和期望状态对比，执行必要的操作使两者收敛。核心流程用 Go 伪代码描述如下：\n\n```go\nfunc (r *MySQLClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {\n    cluster := &v1alpha1.MySQLCluster{}\n    if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {\n        return ctrl.Result{}, client.IgnoreNotFound(err)\n    }\n\n    // 1. 确保基础资源存在（幂等操作）\n    if err := r.ensureConfigMap(ctx, cluster); err != nil { return ctrl.Result{}, err }\n    if err := r.ensureStatefulSet(ctx, cluster); err != nil { return ctrl.Result{}, err }\n    if err := r.ensureServices(ctx, cluster); err != nil { return ctrl.Result{}, err }\n\n    // 2. 根据集群 phase 执行不同逻辑\n    pods, _ := r.getClusterPods(ctx, cluster)\n    switch cluster.Status.Phase {\n    case \"Initializing\":\n        if allPodsReady(pods) {\n            r.initReplication(ctx, cluster, pods)\n            cluster.Status.Phase = \"Running\"\n        }\n    case \"Running\":\n        if !r.isPrimaryHealthy(ctx, cluster) {\n            cluster.Status.Phase = \"FailingOver\"\n            return ctrl.Result{Requeue: true}, nil\n        }\n        r.syncReplicationStatus(ctx, cluster, pods)\n        r.handleScaling(ctx, cluster, pods)\n    case \"FailingOver\":\n        r.executeFailover(ctx, cluster, pods)\n    }\n\n    r.Status().Update(ctx, cluster)\n    return ctrl.Result{RequeueAfter: 10 * time.Second}, nil\n}\n```\n\n这里最关键的设计原则是幂等性——同一个 reconcile 逻辑执行多次的结果和执行一次完全相同。这非常重要，因为 Kubernetes 的 informer 机制可能因为 Pod 状态频繁变化而在短时间内多次触发 reconcile。比如 `ensureStatefulSet` 在 StatefulSet 已经存在时应该只做 diff 和必要的 patch，而不是尝试重新创建。\n\n### GTID 复制与半同步配置\n\n复制拓扑的建立是 MySQL Operator 最核心的功能。选择 GTID（Global Transaction Identifier，全局事务标识符）模式而非传统的 binlog position 模式，原因很实际：GTID 模式下每个事务有全局唯一的 ID（格式为 `source_id:transaction_id`），replica 可以自动找到它需要从 primary 获取的下一个事务，不需要手动指定 binlog 文件名和位置。这在 failover 场景下尤其关键——当一个 replica 被提升为新 primary 后，其他 replica 可以直接通过 `CHANGE REPLICATION SOURCE TO SOURCE_AUTO_POSITION=1` 切换到新 primary，不需要计算 binlog 偏移量。\n\nOperator 在初始化复制时执行的 SQL 序列大致如下：\n\n```sql\n-- 在 primary (order-db-0) 上执行\nCREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${REPL_PASSWORD}';\nGRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';\n-- 启用半同步复制 primary 端\nINSTALL PLUGIN rpl_semi_sync_source SONAME 'semisync_source.so';\nSET GLOBAL rpl_semi_sync_source_enabled = 1;\nSET GLOBAL rpl_semi_sync_source_timeout = 5000;  -- 5s 超时降级为异步\n\n-- 在 replica (order-db-1, order-db-2) 上执行\nCHANGE REPLICATION SOURCE TO\n  SOURCE_HOST = 'order-db-0.order-db-headless.production.svc.cluster.local',\n  SOURCE_PORT = 3306,\n  SOURCE_USER = 'repl',\n  SOURCE_PASSWORD = '${REPL_PASSWORD}',\n  SOURCE_AUTO_POSITION = 1,\n  GET_SOURCE_PUBLIC_KEY = 1;\nINSTALL PLUGIN rpl_semi_sync_replica SONAME 'semisync_replica.so';\nSET GLOBAL rpl_semi_sync_replica_enabled = 1;\nSTART REPLICA;\n```\n\n半同步复制（Semi-Synchronous Replication）的含义是：primary 在提交一个事务后，至少等一个 replica 确认收到了该事务的 binlog 事件才返回客户端成功。这意味着在 primary 挂掉的瞬间，至少有一个 replica 拥有 primary 最后提交的事务数据，从而保证 failover 后不丢数据。`rpl_semi_sync_source_timeout = 5000` 表示如果 5 秒内没有 replica 确认，自动降级为异步复制——这是一个重要的权衡，防止所有 replica 都挂了时 primary 被完全阻塞无法写入。\n\n### 故障转移自动化\n\n故障转移是 MySQL Operator 中最复杂也最关键的逻辑。当 Operator 检测到 primary 不可用时（通过 sidecar agent 上报心跳中断或直接连接 3306 端口超时），需要在 30 秒内完成五个步骤。\n\n第一步是确认 primary 真的挂了，避免网络抖动导致的误判。Operator 连续三次探测，间隔 3 秒，只有连续三次都失败才判定为故障，这消耗大约 9 秒。第二步是选举新 primary——Operator 查看所有 replica 的 `SHOW REPLICA STATUS` 输出，比较 `Executed_Gtid_Set`，拥有最多已执行事务的 replica 数据最完整，应该被提升。如果 order-db-1 的 GTID 到了 `1-1542`，order-db-2 只到 `1-1540`，那么 order-db-1 会被选中。第三步是执行提升——在选中的 replica 上执行 `STOP REPLICA; RESET REPLICA ALL;` 断开旧复制关系，再 `SET GLOBAL read_only = OFF` 开放写入。第四步是重建拓扑——其他 replica 先等中继日志（relay log）全部回放完毕，再执行 `CHANGE REPLICATION SOURCE TO` 指向新 primary 并 `START REPLICA`。第五步是更新 Kubernetes 资源——Operator 修改 `order-db-primary` Service 的 selector 指向新 primary Pod，更新 CR 的 `status.currentPrimary` 字段。整个流程大约 15-25 秒，满足 RTO < 30 秒的要求。\n\n### 备份控制器设计\n\n备份控制器独立于集群 reconcile 逻辑运行。根据 CR 中的 `backup.schedule`，Operator 创建一个 Kubernetes CronJob，在指定时间触发备份 Pod。备份使用 Percona XtraBackup 8.0 执行物理备份——XtraBackup 通过拷贝 InnoDB 数据文件并跟踪 redo log 实现热备份，不锁表，对线上业务几乎零影响。备份 Pod 连接到一个 replica（而非 primary）执行备份以避免给 primary 增加 IO 压力，完成后流式上传到 S3。\n\n```yaml\n# Operator 自动生成的备份 CronJob\napiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: order-db-backup\n  namespace: production\n  ownerReferences:\n    - apiVersion: mysql.example.com/v1alpha1\n      kind: MySQLCluster\n      name: order-db\nspec:\n  schedule: \"0 2 * * *\"\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          containers:\n            - name: xtrabackup\n              image: percona/percona-xtrabackup:8.0.35\n              command: [\"/scripts/backup-and-upload.sh\"]\n              env:\n                - name: MYSQL_HOST\n                  value: order-db-1.order-db-headless  # 从 replica 备份\n                - name: S3_BUCKET\n                  value: mycompany-mysql-backups\n              volumeMounts:\n                - name: backup-scripts\n                  mountPath: /scripts\n          restartPolicy: OnFailure\n```\n\n`ownerReferences` 确保删除 MySQLCluster CR 时 CronJob 会被级联删除。备份保留策略由 Operator 的一个单独协程管理——定期扫描 S3 bucket 中超过 `retentionDays` 的旧备份并清理。\n\n### PVC 管理与存储考量\n\nStatefulSet 的 `volumeClaimTemplates` 为每个 Pod 创建独立的 PVC。几个关键设计点：`storageClassName` 应该使用支持在线扩容的 StorageClass（如 AWS 的 gp3），因为数据库的存储需求会持续增长，你需要能在不停机的情况下扩容 PVC（Kubernetes 1.24+ 支持在线 PVC 扩容，前提是 StorageClass 设置了 `allowVolumeExpansion: true`）。当 StatefulSet 缩容时（比如从 3 缩到 2），Kubernetes 会删除 Pod 但不会删除 PVC——这是安全设计，防止意外缩容丢数据。Operator 需要在 reconcile 中加入保护逻辑：只有确认 PVC 对应的 replica 数据已同步到其他节点后才能安全清理孤儿 PVC。\n\n## 第三步：生产落地与面试策略\n\n### 现有方案对比\n\n业界已有几个成熟的 MySQL Operator。Oracle 官方的 MySQL Operator for Kubernetes 基于 MySQL InnoDB Cluster（Group Replication，底层是 Paxos 协议）实现，原生支持多主模式但配置复杂、社区活跃度一般。Percona Operator for MySQL 基于 Percona XtraDB Cluster（PXC，底层使用 Galera 的 wsrep 同步复制协议）实现多主集群，数据一致性最强但写性能受限于最慢节点的确认速度，适合金融等对一致性要求极高的场景。Vitess 是另一个方向——不是传统 MySQL Operator，而是分布式数据库中间件，在 MySQL 之上增加分片层，适合 YouTube 这种超大规模场景，但架构复杂度远超一般 Operator。面试中如果被问到「自研还是用开源」，推荐回答：先评估开源方案，Percona Operator 是目前最成熟的选择，能满足就不要重复造轮子；但即便用开源方案，也需要理解 Operator 内部原理，因为生产中一定会遇到需要调试 Operator 行为的场景。\n\n### 生产中的关键挑战\n\n脑裂防护（Split-Brain Prevention）是数据库 Operator 的头号挑战。假设 primary 和 Operator 之间的网络断了，但 primary 本身还在正常运行。如果 Operator 此时发起 failover 并提升了一个 replica 为新 primary，集群中就会同时存在两个可写节点——这就是脑裂，两边各写各的数据无法自动合并。解决方案是 fencing 机制：Operator 在提升新 primary 之前先尝试在旧 primary 上执行 `SET GLOBAL super_read_only = ON` 强制其变为只读，同时创建 NetworkPolicy 禁止任何业务 Pod 连接旧 primary 的 3306 端口。只有确认旧 primary 被隔离后，才提升新 primary。\n\n备份验证同样关键——「备份不测试等于没备份」是 DBA 的铁律。Operator 应该每周自动从 S3 下载最近一次备份，在临时 Pod 中恢复并执行 `CHECK TABLE` 验证数据完整性，然后清理临时资源。滚动升级策略也需要精心设计：MySQL 版本升级必须先逐一升级 replica（停止 → 升级镜像版本 → 重启 → 确认复制正常），所有 replica 升级完成后做一次计划内 failover 将 primary 切到已升级的节点，最后升级旧 primary。这种「先从后主」的策略确保整个升级过程中集群始终可用。\n\n### 监控集成\n\n每个 MySQL Pod 的 sidecar 中运行 mysqld_exporter（Prometheus 社区维护的 MySQL 指标采集器），暴露 `mysql_global_status_threads_connected`、`mysql_slave_status_seconds_behind_master`、`mysql_global_status_innodb_buffer_pool_reads` 等关键指标。Operator 在创建集群时自动创建 ServiceMonitor 资源让 Prometheus 自动发现并采集这些指标。核心告警规则包括：复制延迟超过 10 秒（`mysql_slave_status_seconds_behind_master > 10`）、复制线程中断（`mysql_slave_status_slave_io_running == 0`）、磁盘使用率超过 85%、连接数接近 `max_connections`。\n\n### 面试中如何用 15 分钟讲清楚\n\n面试时不要一上来就讲 reconcile 循环的代码细节。推荐的表达顺序是：先花 2 分钟讲清楚数据库在 Kubernetes 上的挑战和 Operator 模式的价值——让面试官理解你为什么要做这件事。然后花 3 分钟展示 CRD 设计和 CR YAML——让面试官感受到终端用户的体验。接着花 5 分钟讲核心流程中最难的两个：failover 自动化和 backup 控制器——这是最能体现你技术深度的部分。最后花 3 分钟讲生产踩坑经验（脑裂防护、备份验证、升级策略）——这些说出来就知道你真做过，而不是背的理论。留 2 分钟给面试官提问。如果面试官追问 reconcile 的实现细节或 GTID 复制原理，你再按需展开。",
+      "keyPoints": [
+        "Operator 模式的核心价值是将人类运维知识编码为软件，通过 CRD 扩展 Kubernetes API 让用户声明式地管理 MySQL 集群，Controller 的 reconcile 循环负责将实际状态持续收敛到期望状态",
+        "StatefulSet 只提供稳定网络标识、有序部署和持久存储三个基础能力，MySQL Operator 需要在其之上实现复制拓扑管理、故障转移、备份恢复、扩缩容和版本升级等数据库领域特定的运维逻辑",
+        "GTID 复制模式的核心优势在于 failover 后 replica 可以通过 CHANGE REPLICATION SOURCE TO SOURCE_AUTO_POSITION=1 自动定位同步起始点，无需手动计算 binlog 文件名和偏移量",
+        "半同步复制要求 primary 提交事务后至少等一个 replica 确认收到 binlog 事件才返回客户端，保证 failover 后至少一个 replica 拥有 primary 的全部数据，rpl_semi_sync_source_timeout 控制超时降级为异步的阈值",
+        "故障转移的五步流程（三次探测确认 → 比较 GTID 选主 → 提升并开放写入 → 重建复制拓扑 → 更新 Service endpoints）总耗时约 15-25 秒，满足 RTO < 30 秒的要求",
+        "脑裂防护是数据库 Operator 的头号挑战，必须在提升新 primary 之前通过 fencing 机制（super_read_only + NetworkPolicy）确认旧 primary 被隔离，否则两个 primary 同时接受写入会导致数据分叉",
+        "备份控制器应使用 Percona XtraBackup 执行物理热备份（不锁表），从 replica 而非 primary 执行以避免影响写入性能，并通过定期恢复验证确保备份可用"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz1",
+          "question": "Kubernetes 原生的 StatefulSet 能为 MySQL 提供哪些能力，不能提供哪些？",
+          "choices": [
+            {"id": "A", "text": "StatefulSet 提供稳定网络标识、有序部署和持久存储，但不能管理复制拓扑、自动故障转移、备份恢复和版本升级，这些需要 Operator 在其之上实现"},
+            {"id": "B", "text": "StatefulSet 可以自动管理 MySQL 主从复制和故障检测，但不能处理备份到 S3，所以只需要 Operator 补充备份功能"},
+            {"id": "C", "text": "StatefulSet 和 Deployment 的唯一区别是前者有持久存储，其他能力完全相同，所以数据库也可以用 Deployment 部署"},
+            {"id": "D", "text": "StatefulSet 已经能完成数据库的所有运维操作，Operator 只是在 StatefulSet 之上提供了更友好的 YAML 声明接口"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "StatefulSet 解决了有状态应用的三个基础问题：稳定的 DNS 名（如 order-db-0.order-db-headless）、Pod 按序号顺序启停、以及通过 volumeClaimTemplates 让每个 Pod 绑定独立的 PVC。但它对 Pod 内运行的是什么应用完全无感知——它不知道哪个 Pod 是 MySQL primary、不会配置主从复制、不会检测故障并自动 failover、更不会执行备份和版本升级。B 选项错误地声称 StatefulSet 能管理复制和故障检测，StatefulSet 只管 Pod 的创建和删除顺序，完全不理解 MySQL 协议。C 选项忽略了 StatefulSet 的网络标识和存储绑定能力对有状态服务的重要性。D 选项严重高估了 StatefulSet 的能力。"
+        },
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz2",
+          "question": "MySQL Operator 的 Controller reconcile 函数为什么必须是幂等的？",
+          "choices": [
+            {"id": "A", "text": "因为 reconcile 只在集群首次创建时执行一次，幂等性确保这唯一一次执行的成功率"},
+            {"id": "B", "text": "幂等性是 Go 语言的编程范式要求，与 Kubernetes 的事件触发机制无关"},
+            {"id": "C", "text": "因为 Kubernetes 的 informer 机制可能重复触发 reconcile（如 Pod 状态频繁变化、网络重传），幂等性保证多次执行和一次执行结果相同，不会因重复调用导致集群状态异常"},
+            {"id": "D", "text": "幂等性是指 reconcile 函数只能读取 Kubernetes 资源状态，不能修改任何资源"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Kubernetes Controller 的 reconcile 函数会被各种事件频繁触发——CR 被修改、Pod 状态变化（如容器重启）、定时 requeue、以及 informer 的 resync 都会触发 reconcile。在高频场景下（比如 failover 期间多个 Pod 状态快速变化），reconcile 可能在短时间内被调用十几次。如果 reconcile 不是幂等的，比如每次调用都尝试 CREATE StatefulSet 而不先检查是否已存在，就会报 AlreadyExists 错误导致流程中断。幂等的 reconcile 应该先读取当前状态，只在需要时做 diff 和 patch。B 选项完全错误，reconcile 会被反复调用而非只调用一次。C 选项混淆了语言特性和架构设计。D 选项描述的是只读操作，reconcile 必须能修改资源才能工作。"
+        },
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz3",
+          "question": "为什么 MySQL Operator 选择 GTID 复制模式而非传统的 binlog position 复制？",
+          "choices": [
+            {"id": "A", "text": "GTID 模式下每个事务有全局唯一 ID，failover 后新 replica 可以通过 SOURCE_AUTO_POSITION=1 自动定位同步起始点，不需要手动计算 binlog 文件名和偏移量"},
+            {"id": "B", "text": "GTID 模式的复制速度比 binlog position 模式快 10 倍，因为跳过了 binlog 解析步骤"},
+            {"id": "C", "text": "binlog position 模式已在 MySQL 8.0 中被完全移除，GTID 是唯一的复制方式"},
+            {"id": "D", "text": "GTID 模式不需要 binlog 文件，直接通过 redo log 复制数据，减少了磁盘 IO 开销"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "GTID 的核心价值在于简化 failover 后的拓扑重建。传统 binlog position 模式下，每个 replica 通过「binlog 文件名 + 偏移量」标记自己同步到了哪里。当 primary 挂掉后，你需要手动计算新 primary 上对应的 binlog 位置——这在 relay log 存在延迟的情况下非常容易出错。GTID 模式下每个事务有唯一 ID（如 3E11FA47:1-1542），replica 执行 CHANGE REPLICATION SOURCE TO SOURCE_AUTO_POSITION=1 后会自动告诉新 primary「我已经有了 1-1540 的事务，请从 1541 开始发」。B 选项是编造的，GTID 不影响复制速度。C 选项错误，MySQL 8.0 仍然支持 binlog position 模式。D 选项也是错误的，GTID 仍然需要 binlog，GTID 只是事务的标识方式，底层仍然通过 binlog 传输事务数据。"
+        },
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz4",
+          "question": "当半同步复制的 rpl_semi_sync_source_timeout 超时后会发生什么？",
+          "choices": [
+            {"id": "A", "text": "primary 立即停止所有写操作并进入只读模式，直到至少一个 replica 恢复连接才解除"},
+            {"id": "B", "text": "primary 自动降级为异步复制模式继续处理写请求，不阻塞业务，当有 replica 重新确认收到 binlog 后自动恢复为半同步模式"},
+            {"id": "C", "text": "primary 将超时的事务回滚并向客户端返回错误，事务不会被提交"},
+            {"id": "D", "text": "MySQL 主进程因超时异常而崩溃退出，需要人工介入重启"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "半同步复制的超时降级机制是一个关键的可用性设计。当 rpl_semi_sync_source_timeout（默认 10000ms，我们设为 5000ms）到期后如果没有任何 replica 确认收到 binlog 事件，primary 会自动降级为异步复制模式——事务照常提交，客户端照常收到成功响应，只是此时的数据还没有被任何 replica 确认接收。当 replica 恢复连接后，半同步模式会自动恢复。这个设计的权衡很清晰：在所有 replica 都不可用的极端情况下，可用性优先于数据一致性。B 选项描述的行为会直接导致业务中断，MySQL 不会这样做。C 选项描述的是事务回滚，但实际上事务已经在引擎层提交了，超时只影响是否等待 replica 确认。D 选项纯属编造。"
+        },
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz5",
+          "question": "以下 kubectl 输出说明集群处于什么状态？\n\n```\nkubectl get mysqlcluster order-db -n production -o jsonpath='{.status.replication}'\n[{\"pod\":\"order-db-1\",\"secondsBehindPrimary\":0,\"ioRunning\":true,\"sqlRunning\":true},\n {\"pod\":\"order-db-2\",\"secondsBehindPrimary\":45,\"ioRunning\":true,\"sqlRunning\":true}]\n```",
+          "choices": [
+            {"id": "A", "text": "order-db-1 复制完全同步（延迟 0 秒），order-db-2 有 45 秒复制延迟但 IO 和 SQL 线程正常，可能是 order-db-2 上正在回放一个大事务或存在 IO 瓶颈"},
+            {"id": "B", "text": "两个 replica 延迟分别为 0 和 45，说明集群刚完成初始化，45 秒是正常的首次同步开销"},
+            {"id": "C", "text": "secondsBehindPrimary 为 45 表示 order-db-2 已断开复制 45 秒，需要手动重新配置复制关系"},
+            {"id": "D", "text": "集群的总延迟为 0+45=45 秒，需要增加更多 replica 来分担复制负载"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`secondsBehindPrimary` 表示 replica 当前回放的事务时间戳与 primary 最新事务时间戳之间的差值。0 表示完全同步，45 秒表示 order-db-2 正在回放的事务比 primary 最新的事务落后 45 秒。关键信息是 `ioRunning` 和 `sqlRunning` 都为 true——这说明复制连接本身是正常的，IO 线程在正常接收 binlog，SQL 线程在正常回放 relay log，只是回放速度跟不上。常见原因包括：primary 上有大批量写入（如大表 ALTER TABLE 或批量 INSERT），order-db-2 的磁盘 IO 性能不足，或 order-db-2 的 CPU 被其他进程占用。B 选项的判断不合理，首次同步的延迟通常更大且持续时间更长。C 选项混淆了延迟和断开连接，如果复制断开则 ioRunning 或 sqlRunning 会是 false。D 选项完全误解了延迟的含义，增加 replica 不会减少已有 replica 的延迟。"
+        },
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz6",
+          "question": "在 MySQL Operator 的 failover 流程中，如果跳过了 fencing（隔离旧 primary）步骤直接提升新 primary，最严重的后果是什么？",
+          "choices": [
+            {"id": "A", "text": "新 primary 无法启动写入，因为 MySQL 内部有全局写锁机制会检测到另一个 primary 的存在"},
+            {"id": "B", "text": "所有 replica 会同时收到两个 primary 的 binlog 事件导致 MySQL 进程崩溃"},
+            {"id": "C", "text": "Kubernetes 的 Service 会自动检测到两个 primary 并拒绝路由流量到任何一个"},
+            {"id": "D", "text": "可能导致脑裂——旧 primary 若实际仍在运行，业务会同时向两个 primary 写入不同数据，造成数据分叉且无法自动合并，需要人工介入做数据对账"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "脑裂是分布式有状态系统中最危险的故障模式。假设 primary（order-db-0）和 Operator 之间网络中断，但 order-db-0 本身还在正常运行并接受业务写入。如果 Operator 不做 fencing 就直接提升 order-db-1 为新 primary，那么 order-db-primary Service 会被更新指向 order-db-1，新的写请求会发到 order-db-1，但之前已经建立了连接的客户端可能还在向 order-db-0 写入——两边各写各的，数据完全分叉。事后即使发现了脑裂，合并两边的数据也是极其困难的，通常需要人工对账。B 选项描述的全局锁机制不存在，MySQL 无法自动感知另一个实例也在当 primary。C 选项也不成立，replica 通过 CHANGE REPLICATION SOURCE TO 指向特定 primary，不会自动连接到其他实例。D 选项错误，Kubernetes Service 只根据 selector 路由，不理解 MySQL 协议。"
+        },
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz7",
+          "question": "Oracle MySQL Operator（基于 Group Replication）和 Percona Operator for MySQL（基于 Galera/PXC）在复制机制上的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "Oracle 方案使用 MySQL Group Replication 基于 Paxos 协议实现组内共识，Percona 方案使用 Galera 的 wsrep 协议实现同步复制多主集群，Galera 一致性更强但写入性能受限于最慢节点"},
+            {"id": "B", "text": "两者使用完全相同的底层复制机制，区别仅在于 Oracle 是商业版而 Percona 是社区开源版"},
+            {"id": "C", "text": "Oracle 方案只支持单主模式不支持多主，Percona 方案只支持多主模式不支持单主，两者的应用场景完全不重叠"},
+            {"id": "D", "text": "Percona 方案在所有指标上都优于 Oracle 方案，业界已达成共识推荐使用 Percona"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Oracle MySQL Operator 基于 MySQL InnoDB Cluster 方案，核心是 Group Replication（GR），它使用 Paxos 变体协议在组成员之间达成事务提交共识，支持单主和多主两种模式，但多主模式下冲突事务会被回滚。Percona Operator 基于 Percona XtraDB Cluster（PXC），底层使用 Galera 库的 wsrep API 实现真正的同步复制——每个事务在所有节点 certify 通过后才算提交，一致性最强但写入延迟取决于最慢节点的确认速度，在跨可用区部署时网络延迟会直接影响写入性能。B 选项完全错误，GR 和 Galera 是两套独立的复制技术。C 选项不准确，GR 支持多主模式，PXC 默认就是多主但也可以配置为单写。D 选项过于绝对，选型需要根据具体场景权衡。"
+        },
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz8",
+          "question": "MySQL Operator 的备份为什么应该从 replica 而非 primary 执行？",
+          "choices": [
+            {"id": "A", "text": "primary 上的数据一直在变化所以无法生成一致性备份，只有 replica 的数据是静态不变的才能做备份"},
+            {"id": "B", "text": "XtraBackup 执行物理备份时虽然不锁表，但会产生额外的磁盘读 IO 和 CPU 开销来拷贝数据文件并跟踪 redo log，在 replica 上执行可以避免这些负载影响 primary 的写入延迟"},
+            {"id": "C", "text": "MySQL 的权限模型不允许持有 REPLICATION SLAVE 权限的 primary 节点执行备份命令"},
+            {"id": "D", "text": "从 replica 备份的数据传输速度比从 primary 快 5-10 倍，因为 replica 的网络带宽更空闲"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "XtraBackup 执行物理备份时需要拷贝 InnoDB 的 .ibd 数据文件和系统表空间文件，同时持续读取 redo log 以记录备份过程中发生的变更。对于一个 100GB 的数据库，备份可能持续 20-40 分钟，期间会产生持续的磁盘读取 IO。如果在 primary 上执行，这些额外的 IO 会和业务写入竞争磁盘带宽，可能导致写入延迟抖动。在 replica 上执行则不影响 primary——即使 replica 在备份期间复制延迟暂时增大，也不会影响业务的读写体验。B 选项错误，XtraBackup 的设计核心就是在数据持续变化的实例上做一致性热备份，它通过 redo log 来保证一致性。C 选项完全编造，MySQL 权限和备份命令没有这种限制。D 选项的 5-10 倍加速也是编造的，备份速度主要取决于磁盘 IO 而非网络。"
+        },
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz9",
+          "question": "MySQL Operator 的 Controller 为什么需要 leader election 机制？",
+          "choices": [
+            {"id": "A", "text": "leader election 用于在 MySQL 集群内部选择哪个 Pod 作为 primary 节点"},
+            {"id": "B", "text": "Kubernetes 强制要求所有 Controller 必须配置 leader election，否则 Controller Pod 无法通过 admission webhook 创建"},
+            {"id": "C", "text": "Operator 通常部署为 Deployment 多副本以保证高可用，但 reconcile 逻辑（如 failover）不能被多个实例同时执行，leader election 通过 Lease 对象确保同一时刻只有一个 Controller 实例在处理 reconcile"},
+            {"id": "D", "text": "leader election 用于在多个 Kubernetes 集群之间协调，确保 Operator 不会在多个集群中同时操作同一个 MySQL 集群"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Operator 本身也是一个 Deployment，为了高可用通常部署 2-3 个副本。但 MySQL 的运维操作（尤其是 failover）不能被多个 Controller 实例同时执行——想象两个 Controller 同时检测到 primary 故障，一个尝试提升 order-db-1，另一个尝试提升 order-db-2，结果就是灾难。leader election 机制通过 Kubernetes 的 Lease 对象（一种分布式锁）确保同一时刻只有一个 Controller 实例是 leader 在执行 reconcile，其他实例处于 standby 状态。当 leader 挂掉后，其他实例通过 Lease 的超时机制竞争成为新 leader。kubebuilder 和 operator-sdk 生成的脚手架代码中默认启用 leader election。B 选项混淆了 Operator 的 leader election 和 MySQL 的主从选择——前者是 Controller 层面的，后者是数据库层面的。C 选项是编造的，Kubernetes 没有这个强制要求。D 选项描述的是多集群场景，leader election 只在单集群内生效。"
+        },
+        {
+          "id": "k8s-mysql-operator-design-q1-quiz10",
+          "question": "MySQL Operator 的日志显示 failover 流程卡在「Waiting for relay log replay on order-db-2」超过 60 秒，最可能的原因和解决方案是什么？",
+          "choices": [
+            {"id": "A", "text": "order-db-2 的磁盘已满导致无法写入任何数据，需要先扩容 PVC 然后重启 failover 流程"},
+            {"id": "B", "text": "order-db-2 正在回放一个大事务（如大批量 DELETE 或 ALTER TABLE）的中继日志，回放完成前无法安全切换复制源；应在 Operator 中设置 relay log 回放超时阈值，超时后选择跳过（接受少量数据不一致）或选其他 replica 完成 failover"},
+            {"id": "C", "text": "Operator 自身因为内存不足（OOM）被 kill 了，无法继续推进 failover 流程"},
+            {"id": "D", "text": "Kubernetes API server 不可用导致 Operator 无法读取 Pod 状态和更新 CR status"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 failover 流程中，Operator 需要等待每个 replica 把已接收但尚未回放完的 relay log 全部应用完毕，才能安全地将其 CHANGE REPLICATION SOURCE TO 指向新 primary。如果 primary 故障前刚好执行了一个耗时很长的大事务（比如 `DELETE FROM orders WHERE created_at < '2023-01-01'` 删除千万行数据），这个事务的 binlog 已经被 replica 的 IO 线程接收到 relay log 中，但 SQL 线程还在回放——回放一个删除千万行的事务可能需要几分钟。Operator 必须等它回放完，因为如果此时强制切换到新 primary，这部分未回放的数据变更就会丢失。解决方案是设置一个合理的超时阈值（比如 120 秒），超时后 Operator 可以选择跳过这个 replica（标记为需要重建），用其他已完成回放的 replica 继续 failover。B 选项虽然也可能导致卡住，但日志中显示的是「等待 relay log 回放」而不是「磁盘写入失败」。C 和 D 选项描述的问题不会产生这个特定的日志信息。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/extend-kubernetes/operator/",
+        "https://dev.mysql.com/doc/refman/8.0/en/replication-gtids.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/replication-semisync.html",
+        "https://docs.percona.com/percona-operator-for-mysql/pxc/index.html",
+        "https://github.com/percona/percona-xtrabackup"
+      ]
+    }
+  ]
+}
