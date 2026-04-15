@@ -1,0 +1,156 @@
+{
+  "id": "kafka-consumer-graceful-shutdown",
+  "name": "Consumer 优雅关闭实践",
+  "domain": "kafka",
+  "description": "详解 Kafka Consumer 优雅关闭的实现方式、代码模板与生产最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-consumer-graceful-shutdown-q1",
+      "domain": "kafka",
+      "type": "practice",
+      "difficulty": 2,
+      "tags": ["Consumer", "优雅关闭", "wakeup()", "ShutdownHook", "最佳实践"],
+      "title": "如何实现 Consumer 的优雅关闭？",
+      "content": "你所在的团队负责维护一套用户行为事件消费服务，技术栈是 Java 17 + Kafka Client 3.4，集群版本 Kafka 3.5。服务部署了 4 个实例组成一个 Consumer Group，订阅一个 16 分区的 Topic，每个实例消费 4 个分区，整体消费吞吐稳定在 3 万条/秒左右。\n\n最近你的团队要给消费服务上线一个新版本，修复了一个消息处理逻辑的 bug。运维同事按照滚动发布的流程，先停掉第一个实例然后部署新版本。然而停实例的方式是直接 `kill -9`，因为「反正 K8s 会自动拉起新的 Pod」。发布完成后，你在 Grafana 上观察到一个非常明显的消费中断窗口：\n\n```\n14:20:03  Consumer Lag: 1,200（正常水位）\n14:20:15  实例 consumer-2 被 kill -9\n14:20:15  consumer-2 的 4 个分区停止消费\n14:20:15  其余 3 个实例继续正常消费各自的分区\n...\n（漫长的等待，consumer-2 的分区无人消费，Lag 持续攀升）\n...\n14:21:00  Consumer Lag: 48,000（consumer-2 的分区积压 45 秒的数据）\n14:21:00  Coordinator 日志: Member consumer-2 in group user-event-group has failed, removing it from the group\n14:21:00  Rebalance 开始，所有实例 STW\n14:21:28  Rebalance 完成，3 个实例重新分配 16 个分区\n14:21:28  Consumer Lag: 82,000\n```\n\n从 consumer-2 被杀死到 Coordinator 发现它死亡，中间过去了整整 45 秒——这恰好是 `session.timeout.ms` 的默认值。在这 45 秒内，consumer-2 原本负责的 4 个分区完全没有被消费，积压了超过 8 万条消息。更糟糕的是，Rebalance 触发后所有实例还要经历一段 STW 停顿。\n\n你的同事问：「有没有办法让 Consumer 停止的时候，Coordinator 立刻知道它走了，而不是傻等 45 秒？」你意识到问题的根源在于进程没有优雅关闭。那么，Kafka Consumer 的优雅关闭应该怎么实现？为什么 `consumer.close()` 如此重要？生产环境中完整的关闭代码模板是什么样的？",
+      "answer": "## 核心概念基础：为什么 Consumer 需要优雅关闭\n\nKafka Consumer 不是一个无状态的 HTTP 客户端，你不能随意杀掉它然后期望一切正常。每个 Consumer 实例在运行期间至少维护着三层状态：第一层是它与 Group Coordinator 之间的成员关系——Coordinator 知道这个 Consumer 活着、知道它负责哪些 Partition；第二层是它本地的消费位移（Offset）进度——哪些消息已经处理完毕但还没来得及提交；第三层是它持有的 TCP 连接和内存缓冲区等系统资源。优雅关闭的核心目标，就是在进程退出前有序地清理这三层状态。\n\n如果你直接 `kill -9` 一个 Consumer 进程，操作系统会立即终止进程，JVM 没有机会执行任何清理逻辑。从 Coordinator 的视角来看，这个 Consumer「突然消失了」——它不知道 Consumer 是主动退出还是网络故障还是宕机，只能被动等待心跳超时。在 Kafka 3.0+ 中，`session.timeout.ms` 默认值是 45 秒，这意味着 Coordinator 要等整整 45 秒才能确认这个 Consumer 已死，然后才触发 Rebalance 将它的 Partition 分给其他成员。在这 45 秒的真空期内，被杀掉的 Consumer 原本负责的 Partition 完全无人消费，消息持续积压。\n\n除了 Rebalance 延迟，`kill -9` 还会导致 Offset 丢失。如果你使用的是手动提交模式（`enable.auto.commit=false`），那些已经处理完但还没调用 `commitSync()` 的消息 Offset 就丢了。当 Rebalance 完成后新的 Consumer 接管这些 Partition 时，会从上一次成功提交的 Offset 开始消费，导致这部分消息被重复处理。即使你用的是自动提交模式，`auto.commit.interval.ms` 默认是 5 秒，也就是说最多可能丢失最近 5 秒内处理过的 Offset。\n\n`consumer.close()` 方法正是用来解决这些问题的。当你调用 `close()` 时，Consumer 客户端会做三件关键的事情：首先，它会提交当前已处理的 Offset（如果启用了自动提交）；然后，它会向 Coordinator 发送一个 LeaveGroup 请求，明确告诉 Coordinator「我要主动退出了」；最后，它会关闭底层的网络连接、释放内存缓冲区等资源。LeaveGroup 请求是关键中的关键——Coordinator 收到这个请求后会立即将该 Consumer 从 Group 成员列表中移除，并立即触发 Rebalance，而不需要等待 `session.timeout.ms` 超时。这就是开头场景中 45 秒等待的根本解法。\n\n一个最基础的 Consumer 消费循环长这样：\n\n```java\nKafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);\nconsumer.subscribe(List.of(\"user-events\"));\ntry {\n    while (true) {\n        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));\n        for (ConsumerRecord<String, String> record : records) {\n            processEvent(record);\n        }\n        consumer.commitSync();\n    }\n} finally {\n    consumer.close(); // 这一行决定了是优雅退出还是暴力退出\n}\n```\n\n问题在于：这个 `while(true)` 循环怎么才能优雅地跳出来？你不能从外部直接中断 `poll()` 调用——`poll()` 内部持有锁并且在做网络 I/O，强行中断可能导致状态不一致。Kafka 为此提供了一个专门的机制：`wakeup()`。\n\n## 精准深度解答：wakeup() + ShutdownHook 的标准实现模式\n\n`consumer.wakeup()` 是 KafkaConsumer 中唯一一个被设计为线程安全的方法。Kafka 官方文档对此有明确说明：除了 `wakeup()` 之外，KafkaConsumer 的所有方法都不是线程安全的，必须在同一个线程中调用。`wakeup()` 的作用很简单——它设置一个内部标志位，让当前正在执行或下一次执行的 `poll()`（以及 `commitSync()`、`committed()` 等阻塞方法）抛出 `WakeupException`。这个异常不代表错误，而是一个「请优雅退出」的信号。\n\n标准的优雅关闭模式由三个部分组成：一个 `AtomicBoolean` 标志位控制循环退出、一个 ShutdownHook 线程触发 wakeup、以及主循环中的 try-catch-finally 结构处理 WakeupException 并在 finally 中执行 close。完整的生产级代码模板如下：\n\n```java\npublic class GracefulConsumer implements Runnable {\n    private final KafkaConsumer<String, String> consumer;\n    private final AtomicBoolean shutdownRequested = new AtomicBoolean(false);\n\n    public GracefulConsumer(Properties props) {\n        this.consumer = new KafkaConsumer<>(props);\n    }\n\n    @Override\n    public void run() {\n        consumer.subscribe(List.of(\"user-events\"));\n        try {\n            while (!shutdownRequested.get()) {\n                ConsumerRecords<String, String> records =\n                    consumer.poll(Duration.ofMillis(1000));\n                for (ConsumerRecord<String, String> record : records) {\n                    processEvent(record);\n                }\n                consumer.commitSync();\n            }\n        } catch (WakeupException e) {\n            // wakeup() 触发的异常，仅在确认是关闭信号时忽略\n            if (!shutdownRequested.get()) {\n                throw e; // 不是我们触发的 wakeup，向上抛出\n            }\n        } finally {\n            try {\n                consumer.commitSync(); // 最后一次提交未提交的 Offset\n            } catch (Exception e) {\n                log.error(\"最终 Offset 提交失败\", e);\n            } finally {\n                consumer.close(Duration.ofSeconds(10)); // 带超时的关闭\n                log.info(\"Consumer 已优雅关闭\");\n            }\n        }\n    }\n\n    // 线程安全的关闭入口\n    public void shutdown() {\n        shutdownRequested.set(true);\n        consumer.wakeup(); // 唯一可以跨线程调用的方法\n    }\n}\n```\n\n然后在 main 方法中注册 ShutdownHook：\n\n```java\npublic static void main(String[] args) {\n    Properties props = buildConsumerProps();\n    GracefulConsumer consumer = new GracefulConsumer(props);\n    Thread consumerThread = new Thread(consumer, \"consumer-main\");\n\n    // JVM 关闭时触发 wakeup\n    Runtime.getRuntime().addShutdownHook(new Thread(() -> {\n        log.info(\"收到关闭信号，触发 Consumer 优雅关闭...\");\n        consumer.shutdown();\n        try {\n            consumerThread.join(15000); // 最多等 15 秒\n        } catch (InterruptedException e) {\n            Thread.currentThread().interrupt();\n        }\n    }, \"shutdown-hook\"));\n\n    consumerThread.start();\n}\n```\n\n这段代码的执行流程值得仔细拆解。当 JVM 收到 SIGTERM 信号（`kill -15` 或 K8s 发送的终止信号）时，ShutdownHook 线程启动，调用 `consumer.shutdown()`。`shutdown()` 先将 `shutdownRequested` 设为 true，然后调用 `consumer.wakeup()`。此时如果主线程正阻塞在 `poll()` 中，`poll()` 会立即抛出 `WakeupException`；如果主线程正在处理消息，那么下次进入 `poll()` 时才会抛出。主线程捕获 `WakeupException` 后检查 `shutdownRequested` 标志——确认是关闭信号后不再重新抛出，而是进入 finally 块。finally 块中先做最后一次 `commitSync()` 确保已处理的 Offset 不丢，然后调用 `consumer.close(Duration.ofSeconds(10))` 执行真正的关闭操作。\n\n`close(Duration timeout)` 方法的超时参数非常重要。这个超时限制了 close 操作的最大耗时——包括提交 Offset、发送 LeaveGroup 请求、等待 Coordinator 响应和关闭网络连接的全部时间。如果 Coordinator 所在的 Broker 响应缓慢或者网络有延迟，没有超时参数的 `close()` 可能会阻塞很长时间（默认内部超时是 30 秒）。在 K8s 环境中，Pod 的 `terminationGracePeriodSeconds` 默认是 30 秒，如果 close 操作本身花了 25 秒，加上其他清理逻辑的时间，很可能超过这个宽限期，导致 K8s 最终还是发送 SIGKILL 强杀进程——前功尽弃。因此建议将 close 的超时设置为 terminationGracePeriodSeconds 的一半以下，比如 10 秒。\n\n关于 LeaveGroup 请求触发即时 Rebalance 这一点，可以通过 Broker 端日志直观地验证。当 Consumer 调用 `close()` 时，Broker 端会立即出现如下日志：\n\n```\n[2024-03-15 14:20:16,012] INFO [GroupCoordinator 1]: Member consumer-2 sending LeaveGroup\n  request to coordinator for group user-event-group (kafka.coordinator.group.GroupCoordinator)\n[2024-03-15 14:20:16,015] INFO [GroupCoordinator 1]: Preparing to rebalance group\n  user-event-group in state PreparingRebalance (kafka.coordinator.group.GroupCoordinator)\n```\n\n注意时间戳——从 Consumer 关闭到 Rebalance 启动只有 3 毫秒，完全不需要等待 45 秒的 `session.timeout.ms` 超时。这就是优雅关闭与暴力关闭在生产环境中的本质差异。\n\n还有一个细节容易被忽略：`WakeupException` 的判断逻辑。在 catch 块中检查 `shutdownRequested` 标志是必要的，因为 `wakeup()` 也可能被其他地方意外调用（比如你实现了一个动态调整订阅列表的功能，需要用 wakeup 打断当前 poll）。如果不检查标志就直接吞掉所有 `WakeupException`，可能会掩盖非关闭场景下的 wakeup 信号，导致难以排查的 bug。\n\n## 体系化扩展：框架集成、容器化部署与常见错误\n\n在实际项目中，很少有人直接用原生 KafkaConsumer 编写消费逻辑。Spring Kafka 是 Java 生态中最常用的 Kafka 封装框架，它通过 `@KafkaListener` 注解和 `KafkaMessageListenerContainer` 组件封装了 Consumer 的整个生命周期管理，包括优雅关闭。\n\n当 Spring 应用收到关闭信号时（SIGTERM 或 `context.close()`），Spring 容器会按照 Bean 的销毁顺序执行清理。`KafkaMessageListenerContainer` 实现了 `SmartLifecycle` 接口，它的 `stop()` 方法内部会调用 `consumer.wakeup()` 打断 poll 循环，等待消费线程退出，然后提交 Offset 并调用 `consumer.close()`——也就是我们前面手写的那套逻辑，Spring Kafka 帮你做了。关键配置在 `ContainerProperties` 中：\n\n```yaml\nspring:\n  kafka:\n    consumer:\n      group-id: user-event-group\n      enable-auto-commit: false\n    listener:\n      ack-mode: MANUAL_IMMEDIATE\n      # 容器关闭时等待消费线程结束的超时时间\n      shutdown-timeout: 10000\n```\n\n`shutdown-timeout`（对应 `ContainerProperties.setShutdownTimeout()`）控制的是 `KafkaMessageListenerContainer.stop()` 等待消费线程退出的最大时间。如果消费线程在这个时间内没有退出（比如正在处理一条耗时很长的消息），容器会强制中断线程。默认值是 10 秒，在大多数场景下是够用的。但如果你的单条消息处理时间可能超过 10 秒（比如涉及大文件处理或批量数据库写入），需要相应调大这个值，同时确保 K8s 的 `terminationGracePeriodSeconds` 也留出足够的余量。\n\n说到 K8s 环境，容器化部署中的 Consumer 优雅关闭需要额外注意信号传递链路。K8s 停止一个 Pod 时，先向容器内 PID 1 的进程发送 SIGTERM，等待 `terminationGracePeriodSeconds`（默认 30 秒）后如果进程还没退出，再发送 SIGKILL 强杀。关键在于你的 Java 进程必须是容器的 PID 1 进程，才能直接收到 SIGTERM。如果你的 Dockerfile 用的是 shell form 的 ENTRYPOINT（如 `ENTRYPOINT java -jar app.jar`），实际的 PID 1 是 `/bin/sh`，Java 进程是它的子进程，SIGTERM 会发给 shell 而不是 Java——shell 收到 SIGTERM 后直接退出，Java 进程变成孤儿进程，ShutdownHook 根本不会执行。正确的做法是使用 exec form：`ENTRYPOINT [\"java\", \"-jar\", \"app.jar\"]`，或者在 shell form 前加 `exec`：`ENTRYPOINT exec java -jar app.jar`。\n\n对于更精细的控制，可以利用 K8s 的 `preStop` hook 在 SIGTERM 之前执行一段自定义逻辑。比如你想在 Consumer 关闭前先将实例从服务发现中摘除，或者等待当前消息批次处理完毕后再触发关闭，可以这样配置：\n\n```yaml\nlifecycle:\n  preStop:\n    exec:\n      command: [\"/bin/sh\", \"-c\", \"sleep 5 && kill -TERM 1\"]\n```\n\n这个 preStop hook 会先 sleep 5 秒（给其他系统感知到 Pod 即将下线的时间），然后向 PID 1 发送 SIGTERM。注意 preStop 的执行时间计入 `terminationGracePeriodSeconds` 的总预算，所以如果 preStop sleep 了 5 秒，留给 Consumer 优雅关闭的时间就只剩 25 秒了。\n\n最后聊聊生产环境中最常见的三个错误。第一个错误是根本不调用 `close()`，直接 `System.exit(0)` 或者 `kill -9`。后果就是开头场景描述的——Coordinator 要等整个 `session.timeout.ms` 才能发现 Consumer 死亡，造成分钟级别的消费中断。第二个错误是在 close 之前没有做最后一次 Offset 提交。`consumer.close()` 在启用了 `enable.auto.commit=true` 时会自动提交一次 Offset，但如果你用的是手动提交模式，close 本身不会帮你提交——你必须在 finally 块中显式调用 `commitSync()`，否则最后一批已处理的消息 Offset 会丢失，重启后被重复消费。第三个错误是把 `consumer.close()` 放在 try 块而不是 finally 块中。如果 try 块中的任何代码抛出异常（包括 WakeupException），close 就不会执行，进程退出时又回到了暴力关闭的老路。\n\n面试中回答这道题，建议按照「为什么需要 → 怎么实现 → 代码模板 → 框架和容器集成」的顺序展开。先用 LeaveGroup 请求 vs session.timeout.ms 等待这个对比说明优雅关闭的价值，然后讲 wakeup + WakeupException 的标准模式并给出完整代码，再提一下 Spring Kafka 的 shutdown-timeout 配置和 K8s 中 SIGTERM 信号传递的注意事项。如果面试官追问，可以进一步聊 Static Membership（`group.instance.id`）在滚动发布场景下避免 Rebalance 的做法——设置了 `group.instance.id` 的 Consumer 即使短暂离线，只要在 `session.timeout.ms` 内重新上线，就能跳过 Rebalance 直接恢复之前的 Partition 分配，配合优雅关闭可以实现几乎零中断的滚动部署。",
+      "keyPoints": [
+        "直接 kill -9 Consumer 进程会导致 Coordinator 等待整个 session.timeout.ms（默认 45 秒）才发现成员死亡，期间对应 Partition 无人消费",
+        "consumer.close() 会向 Coordinator 发送 LeaveGroup 请求，触发即时 Rebalance，将关闭感知时间从数十秒缩短到毫秒级",
+        "wakeup() 是 KafkaConsumer 中唯一线程安全的方法，用于从外部线程安全地打断 poll() 阻塞，触发 WakeupException 作为退出信号",
+        "标准模式由三部分组成：AtomicBoolean 标志位控制循环、ShutdownHook 调用 wakeup()、finally 块中先 commitSync 再 close(Duration)",
+        "close(Duration timeout) 的超时参数必须设置，且应小于 K8s terminationGracePeriodSeconds 的一半，避免超时后被 SIGKILL 强杀",
+        "finally 块中必须显式调用 commitSync() 提交最后一批 Offset（手动提交模式下 close 不会自动提交），否则会导致消息重复消费",
+        "K8s 环境下 Dockerfile 必须使用 exec form 的 ENTRYPOINT 确保 Java 进程是 PID 1，否则 SIGTERM 信号无法传递到 JVM 的 ShutdownHook",
+        "Spring Kafka 的 KafkaMessageListenerContainer 已内置 wakeup + close 逻辑，通过 shutdown-timeout 参数控制关闭等待时间"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz1",
+          "question": "当 Consumer 进程被 kill -9 强制终止后，Coordinator 需要多长时间才能感知到该 Consumer 已下线？",
+          "choices": [
+            {"id": "A", "text": "立即感知，因为 TCP 连接断开后 Broker 会收到 RST 包"},
+            {"id": "B", "text": "等待 heartbeat.interval.ms 超时后感知"},
+            {"id": "C", "text": "等待 session.timeout.ms 超时后感知，Kafka 3.0+ 默认 45 秒"},
+            {"id": "D", "text": "等待 max.poll.interval.ms 超时后感知，默认 5 分钟"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "kill -9 导致进程立即终止，没有机会发送 LeaveGroup 请求。虽然 TCP 连接确实会断开，但 Coordinator 判定 Consumer 死亡依据的是心跳超时而非 TCP 状态——Coordinator 在 session.timeout.ms 时间内没收到心跳才会将其移除。A 的说法忽略了 Kafka 的心跳超时机制，TCP RST 不会触发 Coordinator 的成员移除逻辑。B 混淆了 heartbeat.interval.ms（心跳发送频率）和 session.timeout.ms（心跳超时判定阈值），前者只是客户端发送心跳的间隔，不是超时判定标准。D 描述的 max.poll.interval.ms 是 poll 超时检测，由客户端本地判定并主动发送 LeaveGroup，而 kill -9 后客户端已经不存在了。"
+        },
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz2",
+          "question": "consumer.close() 方法执行时会做哪些关键操作？",
+          "choices": [
+            {"id": "A", "text": "只关闭网络连接和释放内存资源，不涉及与 Coordinator 的交互"},
+            {"id": "B", "text": "提交 Offset（若启用自动提交）、发送 LeaveGroup 请求给 Coordinator、关闭网络连接和释放资源"},
+            {"id": "C", "text": "发送 LeaveGroup 请求给 Coordinator、关闭网络连接，但不会自动提交 Offset"},
+            {"id": "D", "text": "将持有的 Partition 数据刷盘后发送 LeaveGroup 请求"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "consumer.close() 的核心操作包括三步：如果启用了 enable.auto.commit=true，会先执行一次自动提交；然后向 Coordinator 发送 LeaveGroup 请求以触发即时 Rebalance；最后关闭底层 NetworkClient、释放缓冲区等资源。A 遗漏了 LeaveGroup 请求这个最关键的步骤。C 的说法在自动提交模式下是错的，close 时确实会触发一次自动提交。D 的「数据刷盘」完全不是 Consumer 端的概念——Consumer 只消费消息，不负责数据持久化，刷盘是 Broker 端的 log.flush 操作。"
+        },
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz3",
+          "question": "关于 KafkaConsumer 的 wakeup() 方法，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "wakeup() 与 poll()、commitSync() 一样，必须在消费线程中调用，否则会抛出 ConcurrentModificationException"},
+            {"id": "B", "text": "wakeup() 是 KafkaConsumer 中唯一线程安全的方法，可以从任意线程调用，会使当前或下一次 poll() 抛出 WakeupException"},
+            {"id": "C", "text": "wakeup() 会立即中断消费线程（类似 Thread.interrupt()），消费线程会收到 InterruptedException"},
+            {"id": "D", "text": "wakeup() 会通知 Coordinator 该 Consumer 即将关闭，Coordinator 主动发起 Rebalance"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 官方文档明确指出 wakeup() 是 KafkaConsumer 唯一的线程安全方法。它通过设置一个内部 AtomicBoolean 标志位来工作，当 poll()、commitSync() 等阻塞方法检测到该标志位为 true 时，抛出 WakeupException。A 的 ConcurrentModificationException 是其他非线程安全方法被跨线程调用时的行为，不适用于 wakeup()。C 混淆了 wakeup 机制和 Java 线程中断机制——wakeup 不是 Thread.interrupt()，它不会设置线程的 interrupted 状态，也不会抛出 InterruptedException。D 完全错误，wakeup() 只是客户端内部的一个信号机制，不涉及任何网络通信。"
+        },
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz4",
+          "question": "在标准的优雅关闭代码模板中，为什么 catch(WakeupException) 块中需要检查 shutdownRequested 标志？",
+          "choices": [
+            {"id": "A", "text": "因为 WakeupException 可能是 Coordinator 主动发送的 Rebalance 通知，需要区分关闭信号和 Rebalance 信号"},
+            {"id": "B", "text": "因为 wakeup() 可能被其他业务逻辑调用（如动态调整订阅），不检查标志会吞掉非关闭场景的 wakeup 信号"},
+            {"id": "C", "text": "因为 WakeupException 也可能由网络超时引起，需要判断是否是真正的关闭请求"},
+            {"id": "D", "text": "因为 poll() 在正常消费时也会偶尔抛出 WakeupException，需要过滤掉正常情况"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "wakeup() 是一个通用的「打断 poll() 阻塞」机制，不仅仅用于关闭场景。在复杂的应用中，你可能在动态调整 Topic 订阅列表、重置 Offset 位置等场景下也需要调用 wakeup() 来打断当前的 poll()。如果 catch 块中不检查 shutdownRequested 标志就直接吞掉 WakeupException，那些非关闭场景下的 wakeup 信号也会被静默吞掉，导致逻辑错误且极难排查。A 错误——WakeupException 纯粹是客户端内部机制，Coordinator 不会发送这个异常。C 错误——网络超时不会导致 WakeupException，它只由 wakeup() 方法触发。D 错误——poll() 在正常消费时绝不会自行抛出 WakeupException。"
+        },
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz5",
+          "question": "观察以下 Broker 端日志，Consumer 的关闭方式最可能是什么？\n\n```\n14:20:16.012 INFO Member consumer-2 sending LeaveGroup request\n14:20:16.015 INFO Preparing to rebalance group user-event-group\n14:20:16.890 INFO Stabilized group generation 348 with 3 members\n```",
+          "choices": [
+            {"id": "A", "text": "consumer-2 被 kill -9 强杀，Coordinator 检测到心跳超时后触发 Rebalance"},
+            {"id": "B", "text": "consumer-2 调用了 consumer.close() 发送 LeaveGroup 请求，Coordinator 在 3 毫秒内触发 Rebalance"},
+            {"id": "C", "text": "consumer-2 的 poll 超时被 Coordinator 踢出，自动发送 LeaveGroup"},
+            {"id": "D", "text": "consumer-2 的网络分区导致连接断开，Broker 检测到 TCP 异常后触发 Rebalance"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "日志明确显示「Member consumer-2 sending LeaveGroup request」，说明 Consumer 主动发送了 LeaveGroup 请求，这只有在调用 consumer.close() 时才会发生。从时间戳可以看到 LeaveGroup 请求到 Rebalance 启动只间隔 3 毫秒，这是优雅关闭的典型表现。如果是 kill -9（A），不会出现 LeaveGroup 请求日志，而是会在 session.timeout.ms 超时后看到「Member has failed, removing it」的日志。C 描述的 poll 超时确实会发送 LeaveGroup，但日志特征不同——会有「Member consumer-2 has exceeded max.poll.interval.ms」的记录。D 的网络分区不会产生 LeaveGroup 请求日志。"
+        },
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz6",
+          "question": "以下代码在手动提交模式下有什么问题？\n\n```java\ntry {\n    while (!shutdown.get()) {\n        var records = consumer.poll(Duration.ofMillis(1000));\n        process(records);\n        consumer.commitSync();\n    }\n} catch (WakeupException e) {\n    // 关闭信号，忽略\n} finally {\n    consumer.close(Duration.ofSeconds(10));\n}\n```",
+          "choices": [
+            {"id": "A", "text": "close() 不应该带超时参数，应该调用无参的 close() 让它自然完成"},
+            {"id": "B", "text": "catch 块中应该调用 consumer.commitSync() 而不是忽略 WakeupException"},
+            {"id": "C", "text": "finally 块中缺少最后一次 commitSync() 调用，WakeupException 可能在 commitSync 之前的 poll 阶段抛出，导致最后一批已处理的 Offset 未提交"},
+            {"id": "D", "text": "WakeupException 不应该被 catch，应该让它自然传播到 finally 块"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这段代码的问题在于 WakeupException 的抛出时机。wakeup() 可能在 poll() 正在执行时被触发，此时 poll() 立即抛出 WakeupException，后续的 process() 和 commitSync() 都不会执行。但上一次循环中 process() 已经处理完的消息也已经通过 commitSync() 提交了，问题出在当前正在处理的批次——如果 WakeupException 在 poll 获取到新记录但还没处理和提交时抛出，虽然不会丢失处理结果，但更常见的情况是：poll 返回了记录、process 处理了记录，然后下一次循环的 poll 抛出 WakeupException，导致刚处理的那批 Offset 没有提交。正确做法是在 finally 块中、consumer.close() 之前加一次 commitSync()。"
+        },
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz7",
+          "question": "对比 consumer.close() 和 consumer.close(Duration.ofSeconds(10))，以下哪个说法正确？",
+          "choices": [
+            {"id": "A", "text": "无参 close() 不会发送 LeaveGroup 请求，带超时的 close(Duration) 才会发送"},
+            {"id": "B", "text": "无参 close() 内部默认超时 30 秒，close(Duration) 允许自定义超时；在 K8s 环境下应使用 close(Duration) 并确保超时小于 terminationGracePeriodSeconds"},
+            {"id": "C", "text": "两者行为完全相同，Duration 参数仅用于兼容新版 API，无实际作用"},
+            {"id": "D", "text": "close(Duration.ZERO) 会跳过 LeaveGroup 请求直接断开连接，等同于 kill -9 的效果"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "无参 close() 在 Kafka 3.x 客户端中内部使用 30 秒的默认超时（KafkaConsumer.DEFAULT_CLOSE_TIMEOUT_MS），而 close(Duration) 允许你指定超时时间。在 K8s 环境中这个差异非常关键：如果 terminationGracePeriodSeconds 是 30 秒而 close 也用了 30 秒超时，加上 ShutdownHook 中其他逻辑的耗时，总时间很可能超过宽限期，触发 SIGKILL。A 错误——两者都会发送 LeaveGroup 请求。C 错误——超时参数有实际作用。D 的说法不准确——close(Duration.ZERO) 会尝试发送 LeaveGroup 但不等待响应，不完全等同于 kill -9。"
+        },
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz8",
+          "question": "在 K8s 滚动发布场景中，Consumer Pod 的 Dockerfile 使用了 `ENTRYPOINT java -jar app.jar`（shell form），你发现每次滚动部署时 Consumer 的 ShutdownHook 都没有执行，优雅关闭失败。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "K8s 滚动部署不会发送 SIGTERM 信号，只会直接发送 SIGKILL"},
+            {"id": "B", "text": "shell form 的 ENTRYPOINT 会以 /bin/sh -c 启动，Java 进程不是 PID 1，SIGTERM 发给了 shell 进程而非 JVM"},
+            {"id": "C", "text": "Java 17 不支持在容器环境中注册 ShutdownHook，需要使用专门的容器信号处理库"},
+            {"id": "D", "text": "Spring Kafka 的 ShutdownHook 优先级比 JVM 的 ShutdownHook 高，覆盖了自定义的关闭逻辑"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Dockerfile 的 shell form ENTRYPOINT（不带方括号）会被解释为 /bin/sh -c \"java -jar app.jar\"，此时 PID 1 是 /bin/sh 进程，Java 进程是 shell 的子进程。K8s 停止 Pod 时向 PID 1 发送 SIGTERM，shell 收到信号后直接退出，不会将信号转发给子进程——Java 进程变成孤儿进程后被内核清理，ShutdownHook 没有机会执行。解决方案是使用 exec form：ENTRYPOINT [\"java\", \"-jar\", \"app.jar\"]，让 Java 直接作为 PID 1 接收 SIGTERM。A 错误——K8s 会先发 SIGTERM 等待 terminationGracePeriodSeconds 后才发 SIGKILL。C 错误——Java 在容器中完全支持 ShutdownHook。D 的说法没有依据。"
+        },
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz9",
+          "question": "如果 Consumer 设置了 group.instance.id（Static Membership），调用 consumer.close() 时的行为与普通 Consumer 有什么不同？",
+          "choices": [
+            {"id": "A", "text": "Static Member 调用 close() 时不会发送 LeaveGroup 请求，Coordinator 不会触发 Rebalance，直到 session.timeout.ms 超时"},
+            {"id": "B", "text": "Static Member 调用 close() 时仍然会发送 LeaveGroup 请求并触发即时 Rebalance，与普通 Consumer 行为完全相同"},
+            {"id": "C", "text": "Static Member 不支持调用 close()，必须通过 kill -15 信号关闭"},
+            {"id": "D", "text": "Static Member 调用 close() 时会将 Partition 分配信息持久化到本地磁盘，下次启动时恢复"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个容易混淆的知识点。Static Membership 的核心特性是：当 Consumer 异常断连（心跳超时）或通过 close(Duration.ZERO) 方式退出时，Coordinator 不会立即移除成员和触发 Rebalance，而是保留其 Partition 分配直到 session.timeout.ms 超时，以便它快速重新加入。但当 Consumer 显式调用 close() 方法时，close() 内部会发送包含 group.instance.id 的 LeaveGroup 请求，Coordinator 收到后仍然会将该成员移除并触发 Rebalance。换句话说，Static Membership 对「意外断连」做了优化（不急着 Rebalance），但对「主动退出」仍然保持即时 Rebalance 的行为。A 的描述对应的是 Static Member 意外断连的场景，而非主动 close 的场景。"
+        },
+        {
+          "id": "kafka-consumer-graceful-shutdown-q1-quiz10",
+          "question": "生产环境中，你发现 Consumer 的 ShutdownHook 执行了 close() 但 Broker 日志中没有看到 LeaveGroup 请求，Rebalance 仍然延迟到 session.timeout.ms 超时后才触发。最可能的排查方向是什么？",
+          "choices": [
+            {"id": "A", "text": "Consumer 与 Coordinator 所在 Broker 之间存在网络问题，LeaveGroup 请求在超时时间内未能送达"},
+            {"id": "B", "text": "Kafka Client 版本太旧（0.9 之前），不支持 LeaveGroup 请求"},
+            {"id": "C", "text": "close() 方法的超时参数设置过大，超过了 session.timeout.ms"},
+            {"id": "D", "text": "Consumer 使用的是 assign() 手动分配分区模式，不通过 Group Coordinator 管理成员关系"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "当 close() 执行了但 Broker 没收到 LeaveGroup 请求时，最可能的原因是网络层面的问题——LeaveGroup 请求在传输过程中丢失或因网络超时未能到达 Coordinator。这在跨机房部署或网络抖动场景下并不罕见。排查时可以在 Consumer 端开启 DEBUG 日志查看 LeaveGroup 请求是否真的发出，以及 NetworkClient 是否报告了连接异常。B 不太可能——现代生产环境几乎不会用 0.9 之前的版本。C 的逻辑不成立——close 超时大于 session.timeout.ms 只会让 close 阻塞更久，不会阻止 LeaveGroup 请求的发送。D 是一个值得注意的场景——如果使用 assign() 而非 subscribe()，Consumer 不参与 Group 协议，确实不会发送 LeaveGroup，但题目已说明 ShutdownHook 执行了 close()，且 Rebalance 最终仍然触发了（只是延迟），说明 Consumer 确实在 Group 中。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html#close--",
+        "https://kafka.apache.org/javadoc/org/apache/kafka/clients/consumer/KafkaConsumer.html#wakeup--",
+        "https://docs.spring.io/spring-kafka/reference/kafka/receiving-messages/listener-container.html"
+      ]
+    }
+  ]
+}

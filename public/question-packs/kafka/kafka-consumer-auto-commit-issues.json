@@ -1,0 +1,154 @@
+{
+  "id": "kafka-consumer-auto-commit-issues",
+  "name": "自动提交 Offset 的问题",
+  "domain": "kafka",
+  "description": "分析 enable.auto.commit=true 可能导致的重复消费和消息丢失问题",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-consumer-auto-commit-issues-q1",
+      "domain": "kafka",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["Consumer", "自动提交", "重复消费", "消息丢失", "Offset"],
+      "title": "enable.auto.commit 设为 true 可能带来什么问题？",
+      "content": "你所在团队负责一个电商平台的订单支付回调服务，Consumer 从 `payment-callback` Topic 消费银行回调消息，每条消息触发一次订单状态更新和库存扣减。某天下午 14:32，运营同学报告有 37 笔订单被重复扣款，客诉电话已经打到客服中心。\n\n你拉出这 37 笔订单的支付流水，发现它们的支付时间集中在 14:17 到 14:22 这 5 分钟内。再查 Consumer 的运行日志，发现 14:22:03 有一条 OOM Kill 记录：\n\n```\n2024-03-15 14:22:03.841 [main] ERROR - Consumer process killed by OOM killer\nkafka_consumer_payment_callback_1 exited with code 137 (SIGKILL)\n```\n\nConsumer 在 14:22:18 被 Kubernetes 自动拉起，随后日志显示它从一个比预期更早的 Offset 开始消费：\n\n```\n2024-03-15 14:22:18.502 [main] INFO  o.a.k.c.c.internals.ConsumerCoordinator\n  - [Consumer clientId=payment-consumer-1, groupId=payment-callback-group]\n    Setting offset for partition payment-callback-3 to the committed offset FetchPosition{offset=108724, ...}\n2024-03-15 14:22:18.510 [main] INFO  - Resuming from offset 108724,\n    but last processed offset before crash was approximately 108891\n```\n\n也就是说，Consumer 在 crash 前实际已经消费并处理到了 Offset 108891 附近，但重启后却从 108724 开始消费——中间差了大约 167 条消息被重新消费和处理。这些消息中就包含了那 37 笔被重复扣款的订单。\n\n你查看 Consumer 的配置，发现问题的根源：\n\n```properties\n# consumer.properties — 问题配置\nbootstrap.servers=broker-1:9092,broker-2:9092,broker-3:9092\ngroup.id=payment-callback-group\nenable.auto.commit=true\nauto.commit.interval.ms=5000\nmax.poll.records=500\nmax.poll.interval.ms=300000\nsession.timeout.ms=45000\nauto.offset.reset=latest\n```\n\n`enable.auto.commit=true` 加上默认的 `auto.commit.interval.ms=5000`，意味着 Consumer 每 5 秒才自动提交一次 Offset。OOM crash 发生在两次自动提交之间，导致最近 5 秒内已消费但未提交的 167 条消息在重启后被重新消费。\n\n更让你不安的是，你的同事提到上个月还出现过一次相反的问题：有几条回调消息在日志里显示已经被 poll 到了，但业务处理抛了异常，最终这些消息「消失」了——既没有被成功处理，也没有被重新消费。当时没有深究，现在回想起来，这很可能也跟自动提交有关。\n\n面试官问你：`enable.auto.commit` 设为 `true` 到底可能带来什么问题？请结合具体场景分析重复消费和消息丢失的机制，并说明与 Rebalance 的交互。",
+      "answer": "## 一、Kafka Consumer Offset 提交机制基础\n\n### 1.1 什么是 Offset 提交\n\nKafka 的消费模型和传统消息队列有一个本质区别：Broker 不会主动追踪每条消息是否被消费，而是由 Consumer 自己维护消费进度。这个进度信息就是 Offset——每个 Partition 内消息的唯一递增序号。Consumer 通过「提交 Offset」这个动作告诉 Kafka：「我已经消费到这个位置了，下次从这里之后继续。」提交的目标是 Kafka 内部的 `__consumer_offsets` Topic，本质上是一条 key 为 `(group, topic, partition)`、value 为 Offset 值的消息。\n\n为什么提交时机如此关键？因为 Consumer 随时可能崩溃、重启或触发 Rebalance。一旦发生这些事件，Consumer 需要从上一次成功提交的 Offset 位置恢复消费。提交得太晚，已处理的消息会被重新消费（重复消费）；提交得太早，未处理完的消息会被跳过（消息丢失）。整个 Offset 提交策略的核心，就是在这两种风险之间找到平衡。\n\n### 1.2 enable.auto.commit 的工作机制\n\n当 `enable.auto.commit=true`（这是 Kafka Consumer 的默认配置）时，Offset 提交完全由客户端库自动管理，应用代码不需要也无法干预提交时机。具体机制是这样运作的：Consumer 内部维护一个时间戳，记录上一次自动提交的时刻。每次调用 `poll()` 方法时，Consumer 在真正向 Broker 发起 Fetch 请求之前，会先检查当前时间与上次提交时间的差值是否超过了 `auto.commit.interval.ms`（默认 5000ms，即 5 秒）。如果超过了，Consumer 会在 `poll()` 内部触发一次异步提交，提交的内容是当前 Consumer 持有的所有 Partition 的最新消费位置。\n\n用伪代码表示这个过程：\n\n```java\n// KafkaConsumer.poll() 内部简化逻辑\npublic ConsumerRecords<K, V> poll(Duration timeout) {\n    // 第一步：检查是否需要自动提交\n    if (autoCommitEnabled && now() - lastAutoCommitTime >= autoCommitIntervalMs) {\n        // 异步提交上一次 poll() 消费到的所有 Partition 的最新 Offset\n        commitAsync(subscriptions.allConsumed());\n        lastAutoCommitTime = now();\n    }\n    // 第二步：发起 Fetch 请求，拉取新消息\n    return fetchRecords(timeout);\n}\n```\n\n这里有三个容易忽略的细节。第一，自动提交是在 `poll()` 方法内部触发的，不是由独立的后台定时器线程驱动。如果你的消费循环中两次 `poll()` 之间隔了很长时间（比如单条消息处理耗时很大），自动提交的实际间隔会远大于 `auto.commit.interval.ms`。第二，自动提交是异步的（内部调用的是 `commitAsync`），提交请求发出后不等待 Broker 确认就继续执行，这意味着提交可能悄悄失败而 Consumer 完全不知道。第三，自动提交提交的是「当前所有已分配 Partition 的最新 Offset」，不管这些消息是否已经被业务代码处理完毕——这正是问题的根源。\n\n## 二、两大核心问题的精准剖析\n\n### 2.1 问题一：重复消费\n\n重复消费是 `enable.auto.commit=true` 最常见也最容易理解的问题。场景很简单：Consumer 在两次自动提交之间崩溃，已消费但未提交的消息在重启后会被重新消费。\n\n用题目中的生产事故还原一条完整的时间线：\n\n```\n时间线（Partition payment-callback-3）：\n\n14:17:00.000  自动提交触发，提交 Offset = 108724 到 __consumer_offsets\n             |                                                    |\n14:17:00~14:22:03  Consumer 持续消费，处理了 Offset 108724 ~ 108891\n             |    共 167 条消息，包括 37 笔支付回调                  |\n             |    这些消息已被业务代码处理（订单状态更新+库存扣减）      |\n             |    但下一次自动提交还没到来                           |\n             |                                                    |\n14:22:03.841  Consumer 进程被 OOM Kill (SIGKILL)                  |\n             |    SIGKILL 无法被捕获，没有优雅关闭的机会               |\n             |    最后一次成功提交的 Offset 仍然是 108724             |\n             |                                                    |\n14:22:18.502  Consumer 被 K8s 重新拉起                            |\n             |    向 __consumer_offsets 查询上次提交的 Offset        |\n             |    得到 108724，从这个位置开始消费                     |\n             |    → Offset 108724~108891 的 167 条消息被重新消费    |\n             |    → 37 笔订单被重复扣款                             |\n```\n\n重复消费窗口的大小直接取决于 `auto.commit.interval.ms` 和 Consumer 的消费速率。假设 Consumer 的消费速率是 200 条/秒，`auto.commit.interval.ms=5000`，那么理论上最大重复消费窗口是 5 × 200 = 1000 条消息。在题目的场景中，Consumer 在 5 分多钟内只消费了 167 条消息（速率约 0.5 条/秒），说明单条消息处理耗时较长（支付回调涉及数据库事务），而 5 秒的提交间隔已经足够覆盖这 167 条消息的处理时间。\n\n这里有一个关键的认知纠偏：很多人以为把 `auto.commit.interval.ms` 调小就能「解决」重复消费问题。调到 1000ms 确实能把重复窗口从 5 秒缩小到 1 秒，但无论你调到多小，只要自动提交是异步且周期性的，就永远存在「提交间隔内 crash」的可能。把间隔从 5000ms 调到 100ms 只是把重复消费的条数从 1000 条降到 20 条，问题的本质没有改变。而且提交频率太高还会给 `__consumer_offsets` Topic 带来额外的写入压力，在大规模消费组场景下可能成为性能瓶颈。\n\n### 2.2 问题二：消息丢失（业务视角）\n\n消息丢失这个问题比重复消费更隐蔽，也更危险。它发生在这样一个场景中：Consumer 调用 `poll()` 拿到一批消息后开始处理，但在所有消息处理完成之前，下一次 `poll()` 调用触发了自动提交，把整批消息的最大 Offset 都提交了。如果此时 Consumer 崩溃，那些已提交 Offset 但尚未处理完的消息就「丢」了。\n\n时间线如下：\n\n```\n时间线（消息丢失场景）：\n\npoll() 返回 Offset 200~249 共 50 条消息\n  |\n  |  处理 Offset 200~219（20 条成功）\n  |  处理 Offset 220 时抛出异常（比如下游服务超时）\n  |  异常被 catch 但没有中断消费循环，继续处理 221~249\n  |\n下一次 poll() 调用\n  |  检查发现距离上次提交已超过 5s\n  |  自动提交 Offset = 250（整批消息的 max offset + 1）\n  |  此时 Offset 220 的消息实际处理失败了\n  |\nConsumer 崩溃或正常重启\n  |  从 Offset 250 开始消费\n  |  → Offset 220 的消息永远不会被重新消费\n  |  → 对应的那笔支付回调「消失」了\n```\n\n在多线程消费模式下，这个问题更为严重。有些团队为了提高吞吐，会把 `poll()` 到的消息扔给线程池并行处理，主线程立即进入下一轮 `poll()`。这种写法下，线程池里的消息还在处理中，但 `poll()` 已经触发了自动提交：\n\n```java\n// 危险的多线程消费模式 + 自动提交\nwhile (true) {\n    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));\n    // 把消息扔给线程池，主线程立即回到 poll()\n    for (ConsumerRecord<String, String> record : records) {\n        executor.submit(() -> processPaymentCallback(record));\n    }\n    // 下一轮 poll() 可能触发自动提交，但线程池里的消息可能还没处理完！\n}\n```\n\n这段代码在正常运行时看起来一切正常，但一旦 Consumer 重启，线程池中尚未处理完的消息就会因为 Offset 已被提交而被跳过。这种 bug 在测试环境很难复现（因为测试环境消息量小、处理快），往往在生产环境的高峰期才暴露。\n\n### 2.3 与 Rebalance 的交互\n\n自动提交与 Rebalance 的交互是很多人忽略的第三个问题维度。当消费组发生 Rebalance（比如新 Consumer 加入、旧 Consumer 心跳超时、Topic 分区数变更）时，Consumer 会在 Rebalance 开始前尝试做一次自动提交。但这个「Rebalance 前的最后一次提交」遵循的仍然是异步提交机制——如果这次提交因为网络抖动而失败了，Consumer 不会重试，Rebalance 照常进行。\n\n结果是什么？假设 Consumer A 在 Rebalance 前已经消费到了 Offset 500，但最后一次自动提交失败了，`__consumer_offsets` 中记录的仍然是 Offset 400。Rebalance 之后这个 Partition 被分配给了 Consumer B，Consumer B 从 Offset 400 开始消费，Offset 400 到 500 之间的 100 条消息被重复消费。\n\n```\nRebalance 交互时间线：\n\nConsumer A 消费 Partition-0，当前进度 Offset=500\n  |\n  |  Rebalance 触发（新 Consumer 加入 Group）\n  |  Consumer A 在 onPartitionsRevoked 回调前尝试自动提交\n  |  提交 Offset=500 的请求发出（异步）\n  |  但网络抖动导致这次提交失败\n  |  __consumer_offsets 中仍然记录 Offset=400\n  |\nRebalance 完成，Partition-0 分配给 Consumer B\n  |  Consumer B 查询 committed offset = 400\n  |  从 Offset 400 开始消费\n  |  → Offset 400~500 的消息被重复消费\n```\n\n在 Kafka 2.4 之前使用的 Eager Rebalance 协议中，这个问题尤为突出，因为每次 Rebalance 都会导致所有 Partition 被先撤销再重新分配。Kafka 2.4 引入的 Cooperative Rebalance（增量式再平衡）缓解了这个问题——它只撤销需要迁移的 Partition，减少了不必要的 Offset 提交窗口。但即便使用 Cooperative Rebalance，被迁移的那些 Partition 仍然存在同样的风险。\n\n## 三、体系化扩展\n\n### 3.1 什么场景下可以接受自动提交\n\n并不是所有场景都需要关闭自动提交。如果你的消费端天然具备幂等性——比如消费消息后写入的是一个以消息 key 为主键的 Elasticsearch 索引，重复写入只是覆盖相同文档；或者消费消息后执行的是一个带 `INSERT ... ON DUPLICATE KEY UPDATE` 的 MySQL 语句——那么重复消费本身不会造成业务影响。在这类场景下，自动提交的简单性（零代码侵入）反而是优势，配合把 `auto.commit.interval.ms` 调到 1000ms 左右，是一个完全合理的选择。\n\n类似地，日志采集、监控指标收集、数据分析 ETL 等场景，少量的重复或丢失对业务影响极小，自动提交足够用。\n\n### 3.2 手动提交的替代方案\n\n对于支付、订单这类核心业务链路，关闭自动提交、使用手动提交是标准做法。生产环境推荐 `commitAsync()` + `commitSync()` 的组合模式：\n\n```java\nprops.put(\"enable.auto.commit\", \"false\");\nKafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);\nconsumer.subscribe(Collections.singletonList(\"payment-callback\"));\n\ntry {\n    while (running) {\n        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));\n        for (ConsumerRecord<String, String> record : records) {\n            processPaymentCallback(record);\n        }\n        // 正常循环中用异步提交，不阻塞消费吞吐\n        consumer.commitAsync((offsets, ex) -> {\n            if (ex != null) log.warn(\"Async commit failed: {}\", offsets, ex);\n        });\n    }\n} finally {\n    try {\n        // 关闭前用同步提交兜底，确保最后一批 Offset 落地\n        consumer.commitSync(Duration.ofSeconds(10));\n    } finally {\n        consumer.close();\n    }\n}\n```\n\n对于需要更精细控制的场景（比如每处理 N 条消息提交一次），可以使用带参数的 `commitSync(Map<TopicPartition, OffsetAndMetadata>)` 做指定 Partition 和 Offset 的精确提交。\n\n### 3.3 调小 auto.commit.interval.ms 能解决问题吗\n\n这是面试中经常被追问的点。答案是：能缓解，但不能根治。把 `auto.commit.interval.ms` 从 5000ms 调到 500ms，重复消费窗口从最多 5 秒缩小到最多 0.5 秒——在消费速率为 200 条/秒的场景下，最大重复条数从 1000 条降到 100 条。但只要存在「提交和消费之间的时间差」，重复消费的可能性就永远存在。而且更频繁的提交意味着更多的网络请求和 `__consumer_offsets` 写入负载。在一个有 500 个 Consumer 实例的大规模消费组中，把提交间隔从 5s 调到 500ms 会让 `__consumer_offsets` 的写入 QPS 增加 10 倍，这可能引发 Coordinator Broker 的性能问题。\n\n更关键的是，调小提交间隔完全无法解决消息丢失问题——自动提交的时机与业务处理进度脱钩，这个本质矛盾只有手动提交才能解决。\n\n### 3.4 面试回答技巧\n\n面试官问这道题时，建议按三层递进回答。第一层讲机制：`enable.auto.commit=true` 时，Consumer 在每次 `poll()` 调用中检查是否超过 `auto.commit.interval.ms`，超过则异步提交当前所有 Partition 的最新 Offset，这个过程与业务处理进度无关。第二层讲两大问题，用具体数字和时间线：重复消费发生在提交间隔内 crash 的场景，窗口大小 = 提交间隔 × 消费速率；消息丢失发生在 poll 触发提交但消息尚未处理完的场景，尤其在多线程消费模式下。第三层讲解决方案和权衡：核心业务用手动提交 + 幂等性兜底，非核心业务可以接受自动提交但调小间隔，并且要提到与 Rebalance 的交互——Rebalance 前的自动提交如果失败不会重试，可能导致额外的重复消费。能讲到 Rebalance 这一层，面试官会认为你对 Consumer 的内部机制有深入理解，而不仅仅是背了一个「自动提交不安全」的结论。",
+      "keyPoints": [
+        "自动提交在 poll() 内部触发而非独立线程，提交间隔由 auto.commit.interval.ms 控制（默认 5000ms），提交方式是异步的，失败时 Consumer 无感知",
+        "重复消费发生在两次自动提交之间 Consumer 崩溃的场景，重复窗口大小 = auto.commit.interval.ms × 消费速率，SIGKILL 等不可捕获信号会跳过优雅关闭",
+        "消息丢失（业务视角）发生在 poll() 触发自动提交但当前批次消息尚未全部处理完成的场景，多线程消费模式下尤为危险",
+        "Rebalance 前的自动提交是异步的且不重试，如果提交失败会导致 Partition 迁移后新 Consumer 从更早的 Offset 消费，产生额外重复",
+        "调小 auto.commit.interval.ms 只能缩小重复消费窗口但无法根治问题，且高频提交会增加 __consumer_offsets 的写入压力",
+        "幂等消费场景（ES 覆盖写入、数据库 UPSERT）可以接受自动提交，核心支付/订单链路必须使用手动提交 + commitAsync/commitSync 组合模式",
+        "自动提交提交的是当前所有已分配 Partition 的最新 Offset，与业务处理进度完全脱钩——这是所有问题的根本原因"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz1",
+          "question": "enable.auto.commit=true 时，自动提交 Offset 的触发时机是什么？",
+          "choices": [
+            {"id": "A", "text": "Consumer 内部有一个独立的后台定时器线程，每隔 auto.commit.interval.ms 执行一次提交"},
+            {"id": "B", "text": "每次调用 poll() 时检查距离上次提交是否超过 auto.commit.interval.ms，超过则在 poll() 内部触发异步提交"},
+            {"id": "C", "text": "每条消息被 poll() 返回给应用代码后立即自动提交该条消息的 Offset"},
+            {"id": "D", "text": "每次消费循环结束（即 while 循环的一次迭代结束）时自动提交"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka Consumer 是单线程模型，自动提交并非由独立的后台定时器线程触发，而是嵌套在 poll() 方法内部的逻辑。每次调用 poll() 时，Consumer 检查当前时间与上次提交时间的差值是否超过 auto.commit.interval.ms，超过则先异步提交再拉取新消息。A 选项的「独立后台线程」是非常常见的误解。C 选项描述的是逐条提交，自动提交从不这样做。D 选项将提交绑定到应用层循环迭代，实际上提交发生在 poll() 内部，与应用的循环结构无关。"
+        },
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz2",
+          "question": "自动提交模式下，Consumer 提交到 __consumer_offsets 的 Offset 值代表什么含义？",
+          "choices": [
+            {"id": "A", "text": "最后一条已被业务代码成功处理的消息的 Offset"},
+            {"id": "B", "text": "当前已分配 Partition 中最后一条被 poll() 返回的消息的 Offset + 1，即下一条要消费的位置"},
+            {"id": "C", "text": "Partition 中最新一条消息的 Offset（即 Log End Offset）"},
+            {"id": "D", "text": "Consumer 启动时从 auto.offset.reset 策略确定的初始 Offset"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "自动提交提交的是 Consumer 当前持有的所有已分配 Partition 的 position，即最后一条被 poll() 返回的消息的 Offset + 1。这个值表示「下一条要消费的位置」。关键在于这个值与业务处理进度完全无关——只要消息被 poll() 返回了，不管业务代码有没有处理完，下一次自动提交都会把这个 Offset 提交上去。A 选项混淆了「poll 返回」和「业务处理完成」两个概念，这正是自动提交导致消息丢失的根源。C 选项描述的是 LEO，跟消费进度无关。D 选项描述的是初始偏移策略。"
+        },
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz3",
+          "question": "在题目的生产事故中，Consumer 在 crash 前消费到了 Offset 108891，但重启后从 108724 开始。中间 167 条消息被重复消费的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Consumer 被 SIGKILL 杀死无法执行 ShutdownHook，最后一次自动提交在 5 秒前的 108724，108724~108891 之间的 Offset 未被提交"},
+            {"id": "B", "text": "Kafka Broker 端发生了数据丢失，导致 __consumer_offsets 中记录的 Offset 被回退"},
+            {"id": "C", "text": "auto.offset.reset=latest 配置导致 Consumer 重启后从最新位置消费，跳过了部分消息"},
+            {"id": "D", "text": "Consumer Group 的 session.timeout.ms 设置过短导致 Rebalance，Partition 被重新分配后 Offset 被回退"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "OOM Kill 发送的是 SIGKILL（信号 9），这是不可被进程捕获的信号，JVM 的 ShutdownHook 不会执行，Consumer 的 close() 方法也不会被调用，因此没有机会做最后一次 Offset 提交。上一次自动提交发生在约 5 秒前，提交的 Offset 是 108724，之后消费到 108891 的进度全部丢失。B 选项中 __consumer_offsets 有 3 副本，不太可能恰好在这个时间点丢数据。C 选项中 auto.offset.reset 仅在没有已提交 Offset 时生效，这里 108724 已经存在。D 选项中 session.timeout.ms=45s 对比 OOM 时间线不构成超时。"
+        },
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz4",
+          "question": "以下哪种场景下，enable.auto.commit=true 最可能导致消息丢失（而非重复消费）？",
+          "choices": [
+            {"id": "A", "text": "Consumer 在两次自动提交之间被 kill -9 杀死"},
+            {"id": "B", "text": "Consumer 将 poll() 到的消息提交给线程池异步处理，主线程立即进入下一轮 poll()，线程池处理未完成时 Consumer 崩溃"},
+            {"id": "C", "text": "Kafka Broker 返回 LEADER_NOT_AVAILABLE 错误导致 Consumer 暂时无法拉取消息"},
+            {"id": "D", "text": "Consumer 的 max.poll.interval.ms 超时导致 Rebalance 发生"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "消息丢失的核心场景是「Offset 已提交但消息未处理完」。在多线程消费模式下，主线程把消息扔给线程池后立即进入下一轮 poll()，poll() 内部可能触发自动提交，把包括尚在线程池中处理的消息的 Offset 都提交了。如果此时 Consumer 崩溃，线程池中未处理完的消息的 Offset 已经被提交，重启后不会再被消费——这些消息从业务角度就「丢」了。A 选项导致的是重复消费而非丢失。C 选项只是暂时无法拉取，不涉及 Offset 提交。D 选项触发 Rebalance 可能导致重复消费，但不直接导致丢失。"
+        },
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz5",
+          "question": "Consumer 日志中出现以下内容，说明发生了什么？\n\n```\n[Consumer clientId=c1, groupId=g1] Asynchronous auto-commit of offsets\n{payment-callback-3=OffsetAndMetadata{offset=108724}} failed due to\norg.apache.kafka.clients.consumer.RetriableCommitFailedException:\nOffset commit failed with a retriable exception.\n```",
+          "choices": [
+            {"id": "A", "text": "自动提交因可重试错误（如网络抖动）失败，但自动提交不会重试这次失败，Offset 108724 可能未被成功持久化"},
+            {"id": "B", "text": "自动提交失败后会立即自动重试，最终 Offset 108724 一定会被成功提交"},
+            {"id": "C", "text": "Consumer 因为这个错误被踢出消费组，触发了 Rebalance"},
+            {"id": "D", "text": "这是 commitSync() 的错误日志，同步提交遇到可重试异常后放弃了提交"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这条日志来自自动提交（Asynchronous auto-commit），说明一次自动提交因为可重试的异常（如短暂网络抖动）而失败了。关键点在于，自动提交使用的是 commitAsync，而 commitAsync 在设计上不做自动重试——原因是重试可能导致旧的 Offset 值覆盖后续更新的提交。所以这次提交就这样悄悄失败了，下一次 poll() 触发的自动提交会提交一个更新的 Offset。但如果 Consumer 在下一次自动提交之前崩溃，就会产生更大的重复消费窗口。B 选项错误，自动提交不重试。C 选项中单次提交失败不会导致被踢出消费组。D 选项中日志明确标注了 Asynchronous auto-commit。"
+        },
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz6",
+          "question": "有人建议将 auto.commit.interval.ms 从 5000 调到 200 来「解决」重复消费问题。以下哪个说法最准确？",
+          "choices": [
+            {"id": "A", "text": "能完全解决重复消费问题，200ms 的窗口足够小，生产环境不可能在 200ms 内崩溃并产生有意义的重复"},
+            {"id": "B", "text": "能缩小重复消费窗口但无法根治，且高频提交会增加 __consumer_offsets 的写入压力，在大规模消费组中可能成为瓶颈"},
+            {"id": "C", "text": "会导致 Consumer 的消费吞吐下降 25 倍，因为每次提交都要等待 Broker 响应"},
+            {"id": "D", "text": "没有任何效果，因为自动提交的实际间隔由 poll() 调用频率决定，跟配置值无关"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "调小 auto.commit.interval.ms 确实能缩小重复消费的窗口——从最多 5 秒缩到最多 200ms，在消费速率 200 条/秒的场景下最多重复 40 条而非 1000 条。但无论调到多小，只要是周期性的异步提交，就永远存在「提交间隔内 crash」的可能，问题本质未变。同时，500 个 Consumer 实例每 200ms 提交一次意味着每秒 2500 次提交请求打到 Coordinator Broker，可能导致 __consumer_offsets Partition 的 Leader 成为热点。A 选项错误，200ms 内完全可能处理多条消息。C 选项混淆了异步提交和同步提交——自动提交是异步的，不等响应。D 选项错误，poll() 频率和配置值共同决定实际间隔。"
+        },
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz7",
+          "question": "对比自动提交的重复消费问题和手动 commitAsync() 的重复消费问题，核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "自动提交的重复消费由提交时机不可控导致，手动 commitAsync 的重复消费由不重试+Offset 回退风险导致，后者可以通过 commitSync 兜底解决"},
+            {"id": "B", "text": "两者没有区别，都是异步提交失败导致的重复消费，解决方案完全相同"},
+            {"id": "C", "text": "自动提交不存在重复消费问题，只有手动 commitAsync 才有"},
+            {"id": "D", "text": "手动 commitAsync 不存在重复消费问题，只有自动提交才有"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "两者都可能导致重复消费，但原因和解决方式不同。自动提交的重复消费源于提交时机完全由 poll() 的调用间隔控制，业务代码无法干预——你无法在「关键业务处理完成后」立即触发一次提交。手动 commitAsync 的重复消费通常发生在提交失败且未重试的情况下，但应用代码可以通过在 finally 块中调用 commitSync() 做兜底，确保 Consumer 关闭前最后一批 Offset 被可靠提交。这种组合模式让重复消费窗口缩小到「最后一轮 poll 到的消息」而非「一整个 auto.commit.interval.ms」。B 选项忽略了可控性的差异。C 和 D 都是片面的。"
+        },
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz8",
+          "question": "一个 Consumer Group 有 6 个 Consumer 实例消费 12 个 Partition。其中一个实例因 Full GC 超过 session.timeout.ms 被踢出组，触发 Rebalance。在自动提交模式下，该实例负责的 2 个 Partition 最可能出现什么问题？",
+          "choices": [
+            {"id": "A", "text": "这 2 个 Partition 在 Rebalance 期间无法消费，但不会有重复消费问题"},
+            {"id": "B", "text": "Rebalance 前该实例尝试自动提交这 2 个 Partition 的 Offset，如果提交失败（异步不重试），新接管的 Consumer 会从更早的 Offset 消费，导致重复"},
+            {"id": "C", "text": "新接管这 2 个 Partition 的 Consumer 会自动从 Partition 末尾（latest）开始消费，跳过未消费的消息"},
+            {"id": "D", "text": "Full GC 结束后该实例会自动回到消费组并恢复消费进度，不影响其他 Consumer"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 Consumer 因心跳超时被踢出组时，Kafka 客户端在 Rebalance 流程中会调用 onPartitionsRevoked 回调，并在此之前尝试一次自动提交。但自动提交是异步的且不重试，如果 Full GC 导致网络延迟，这次提交很可能失败。Rebalance 完成后，新接管这 2 个 Partition 的 Consumer 会从 __consumer_offsets 中记录的上一次成功提交的 Offset 开始消费，如果那个 Offset 落后于实际消费进度，就会产生重复消费。A 选项忽略了 Offset 提交失败的风险。C 选项中 auto.offset.reset=latest 仅在没有已提交 Offset 时生效。D 选项中被踢出后该实例会重新加入组触发又一次 Rebalance，不会静默恢复。"
+        },
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz9",
+          "question": "在 Kafka 2.4+ 的 Cooperative Rebalance（增量式再平衡）机制下，自动提交的重复消费问题是否被彻底解决？",
+          "choices": [
+            {"id": "A", "text": "是，Cooperative Rebalance 确保 Offset 在 Partition 迁移前被同步提交成功，不再有重复消费风险"},
+            {"id": "B", "text": "否，Cooperative Rebalance 只减少了需要迁移的 Partition 数量，被迁移的 Partition 仍然面临异步提交失败导致的重复消费风险"},
+            {"id": "C", "text": "是，Cooperative Rebalance 不需要提交 Offset，因为 Partition 不会被撤销"},
+            {"id": "D", "text": "否，Cooperative Rebalance 反而加剧了重复消费问题，因为它引入了两阶段 Rebalance"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Cooperative Rebalance（CooperativeStickyAssignor）的核心改进是：Rebalance 时不再撤销所有 Partition 再重新分配，而是只迁移需要变更归属的 Partition，其余 Partition 不受影响。这确实大幅减少了 Rebalance 影响范围。但对于那些确实需要迁移的 Partition，迁移前的 Offset 提交仍然是异步的。如果提交失败，新 Consumer 从旧 Offset 开始消费的问题依然存在。A 选项错误，Cooperative Rebalance 没有改变自动提交的异步特性。C 选项错误，被迁移的 Partition 仍然要经历 revoke 和 assign。D 选项的「两阶段」描述了协议过程，但不是重复消费加剧的原因。"
+        },
+        {
+          "id": "kafka-consumer-auto-commit-issues-q1-quiz10",
+          "question": "生产环境中排查到自动提交导致重复消费后，以下哪个修复方案最合理？",
+          "choices": [
+            {"id": "A", "text": "将 auto.commit.interval.ms 调到 100ms，重复消费窗口足够小"},
+            {"id": "B", "text": "关闭自动提交，改用手动 commitAsync + commitSync 组合模式，同时在下游支付接口增加幂等校验（如唯一流水号去重）"},
+            {"id": "C", "text": "保持自动提交不变，在 Consumer 端加一个本地去重缓存（如 HashMap），消费前检查消息是否已处理过"},
+            {"id": "D", "text": "关闭自动提交，在每条消息处理完后调用 commitSync()，确保逐条提交"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 方案是生产环境的标准做法，包含两层防御：第一层通过手动提交（commitAsync 保吞吐 + commitSync 做关闭兜底）最大限度缩小重复消费窗口；第二层通过下游幂等性（唯一流水号、数据库唯一键约束等）兜底即使少量重复也不产生业务影响。A 方案治标不治本，且高频提交有性能隐患。C 方案的本地 HashMap 在 Consumer 重启后会丢失，无法跨重启去重，而且内存开销不可控。D 方案虽然最安全但性能极差——每条消息都要等一次网络往返（通常 2-10ms），消费吞吐会从数千条/秒降到一两百条/秒，对于支付回调这类高时效性场景不可接受。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#consumerconfigs_enable.auto.commit",
+        "https://kafka.apache.org/documentation/#consumerconfigs_auto.commit.interval.ms"
+      ]
+    }
+  ]
+}
