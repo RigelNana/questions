@@ -1,0 +1,158 @@
+{
+  "id": "kafka-capacity-too-many-partitions",
+  "name": "Partition 过多的问题与治理",
+  "domain": "kafka",
+  "description": "深入分析 Kafka Partition 过多引发的六大问题及生产环境中的治理策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-capacity-too-many-partitions-q1",
+      "domain": "kafka",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["Kafka", "Partition过多", "元数据膨胀", "选举风暴", "治理"],
+      "title": "Partition 数量过多会带来哪些问题？如何治理？",
+      "content": "你所在的团队运维着一个 30 节点的 Kafka 2.8 集群（ZooKeeper 模式），支撑着公司 200 多个微服务的消息通信。三年来每个团队自行创建 Topic，没有统一的 Partition 数量规范。某天凌晨 03:17，一台 Broker（broker.id=5）因内核 OOM Killer 被杀掉，你被告警拉起后开始排查。\n\n你登上集群执行了一组基础摸底命令：\n\n```bash\n$ kafka-topics.sh --bootstrap-server kafka-01:9092 --list | wc -l\n3847\n\n$ kafka-topics.sh --bootstrap-server kafka-01:9092 --describe \\\n    | grep 'PartitionCount' | awk '{sum+=$2} END{print sum}'\n126540\n\n$ kafka-metadata.sh --snapshot /data/kafka/__cluster_metadata-0/00000000000000000000.log \\\n    --cluster-id lkc-12345 2>/dev/null\nERROR: Not a KRaft cluster\n\n$ kafka-log-dirs.sh --bootstrap-server kafka-01:9092 --broker-list 5 --describe \\\n    | python3 -c \"import json,sys; d=json.load(sys.stdin); \\\n      print(len(d['brokers'][0]['logDirs'][0]['partitions']))\"\n8416\n\n$ cat /proc/sys/fs/file-nr\n156231  0  200000\n\n$ dmesg | tail -5\n[86423.112] Out of memory: Killed process 4371 (java) total-vm:14325280kB\n              anon-rss:6291456kB file-rss:0kB shmem-rss:0kB\n\n$ kafka-consumer-groups.sh --bootstrap-server kafka-01:9092 --list | wc -l\n412\n```\n\nbroke.id=5 重启后，你观察到 Controller 日志中持续刷新 Leader 选举消息，耗时长达 47 秒才完成该 Broker 上所有 Partition 的 Leader 重选。同时多个 Consumer Group 触发了 Rebalance，业务侧报告消息消费中断超过一分钟。\n\n架构评审会上，平台负责人问你：「我们集群 12 万 Partition 是不是太多了？到底会带来哪些问题？怎么治理？」你需要系统地回答这个问题——不只是列问题，还要给出可落地的治理路线图。",
+      "answer": "## 一、核心概念基础：为什么 Partition 多了反而是毒药\n\nKafka 的并行度模型建立在 Partition 之上——Consumer Group 中每个消费者实例绑定一个或多个 Partition，Partition 越多意味着可以挂载的消费者越多，理论吞吐天花板越高。但这个「越多越好」的直觉在生产环境中有一个明显的拐点。当集群 Partition 总数超过一定规模后，元数据管理开销、故障恢复延迟、资源消耗等问题会急剧恶化，Partition 从并行度的助推器变成集群稳定性的定时炸弹。\n\nLinkedIn 在 ZooKeeper 模式下给出的经验值是整个集群不超过 200,000 个 Partition、单 Broker 不超过 4,000 个。案例中的集群有 126,540 个 Partition 分布在 30 台 Broker 上，平均每台 4,218 个（含副本），已经逼近甚至超过了推荐上限。问题的严重程度取决于六个维度：Controller 元数据开销、Leader 选举风暴、文件描述符耗尽、端到端延迟上升、Producer 批处理效率下降、以及 Broker 启动恢复时间过长。这六个维度并非孤立存在，它们相互耦合，在故障场景下形成连锁反应——就像案例中 broker.id=5 被 OOM Kill 后，选举风暴 + Consumer Rebalance + 业务中断的多米诺效应。\n\n## 二、精准深度解答：六大问题与治理策略\n\n### 2.1 Controller 元数据膨胀\n\n在 ZooKeeper 模式下，Controller 是整个集群元数据的唯一管理者。它把每个 Partition 的 Leader、ISR 列表、LeaderEpoch 等信息缓存在 JVM 堆中，并通过 UpdateMetadata 请求向所有 Broker 推送完整的元数据快照。这里的关键词是「完整快照」——每当 Controller 发生切换或有重大拓扑变更时，Controller 需要把集群中所有 Partition 的元数据打包成一个巨大的 RPC payload 发送给每台 Broker。\n\n126,540 个 Partition 的元数据大约有多大？每个 Partition 的元数据条目包含 topic name（平均 30 字节）、partition id（4 字节）、leader（4 字节）、ISR 列表（RF=3 时约 12 字节）、replica 列表（12 字节）等，加上协议开销大约 100-150 字节。126K × 130 字节 ≈ 16MB 的序列化 payload。这个数据需要发送给 30 台 Broker，Controller 的网络出口带宽在切换瞬间承受 30 × 16MB = 480MB 的突发流量。如果 Controller 节点的网卡是 1Gbps，光发这些元数据就需要约 4 秒，加上 ZooKeeper 读取和 JVM 序列化开销，整个 Controller 切换过程可能持续 30 秒到数分钟。在此期间集群的元数据视图不一致，Producer 和 Consumer 都会遇到 NOT_LEADER_FOR_PARTITION 或 UNKNOWN_TOPIC_OR_PARTITION 错误。\n\n```bash\n# 通过 JMX 监控 Controller 元数据推送延迟\n$ kafka-run-class.sh kafka.tools.JmxTool \\\n    --jmx-url service:jmx:rmi:///jndi/rmi://kafka-01:9999/jmxrmi \\\n    --object-name kafka.controller:type=ControllerStats,name=LeaderElectionRateAndTimeMs \\\n    --reporting-interval 5000\ntime,kafka.controller:type=ControllerStats,name=LeaderElectionRateAndTimeMs:Count,Mean\n1700000000,1247,23.45\n\n# 查看 Controller 日志中的元数据推送耗时\n$ grep 'UpdateMetadata' /data/kafka/logs/controller.log | tail -3\n[2024-01-15 03:17:52,341] INFO Sending UpdateMetadata request\n  with 126540 partition states to 30 brokers (kafka.controller.KafkaController)\n[2024-01-15 03:18:31,007] INFO Finished UpdateMetadata propagation\n  in 38666 ms (kafka.controller.KafkaController)\n```\n\n上面的日志清晰地显示了 UpdateMetadata 传播耗时 38.6 秒——将近 40 秒的元数据不一致窗口。\n\n### 2.2 Leader 选举风暴\n\n当 broker.id=5 宕机时，所有以它为 Leader 的 Partition 都需要重新选举。假设 8,416 个 Partition 中有约三分之一是 Leader（RF=3 时均匀分布），大约 2,800 个 Partition 需要 Leader 选举。ZooKeeper 模式下 Controller 串行处理每个选举请求：从 ISR 列表中选出新 Leader → 将结果写入 ZooKeeper → 向相关 Broker 发送 LeaderAndIsr 请求。每个选举大约消耗 5-20ms（取决于 ZooKeeper 延迟），2,800 个选举需要 14-56 秒。案例中观测到的 47 秒选举耗时完全吻合这个计算。\n\n在这 47 秒内，这 2,800 个 Partition 的 Leader 位置是空的——Producer 发往这些 Partition 的消息全部返回错误，Consumer 无法拉取数据。对于延迟敏感的业务（如订单支付、实时风控），47 秒的不可用是完全不可接受的。更糟糕的是选举风暴会级联触发 Consumer Group Rebalance：Consumer 发现多个 Partition 的 Leader 变化后，Coordinator 会触发 Group Rebalance，412 个 Consumer Group 同时 Rebalance 又会给 Broker 带来额外的协调开销，形成正反馈的恶性循环。\n\n### 2.3 文件描述符耗尽\n\n每个 Partition 的活跃 Segment 至少消耗 3 个文件描述符（.log、.index、.timeindex），加上旧 Segment 被 Consumer fetch 或 Log Cleaner 打开的情况，保守按每个 Partition 5 个 FD 估算。broker.id=5 上 8,416 个 Partition × 5 = 42,080 FD，再加上网络连接（每个 Client 一个 FD）、JVM 自身的 FD，总消耗量轻松超过 150K。案例中 `file-nr` 显示已用 156,231、上限 200,000，使用率 78%，在高负载峰值时极易触及上限导致 `Too many open files` 崩溃。而 OOM Kill 的发生说明 Broker 的 JVM 堆内存中堆积了大量 Partition 元数据对象（每个 Partition 约 10-20KB），8,416 × 15KB ≈ 126MB 的不可回收对象压在 Old Gen 中，加上正常的请求处理内存开销，最终触发了内核 OOM Killer。\n\n### 2.4 端到端延迟上升与 Producer 批处理效率下降\n\n这两个问题紧密相关。当一个 Producer 实例向多个 Partition 写入数据时，RecordAccumulator 为每个 Partition 维护独立的 batch buffer。如果 Producer 写入 500 个 Partition，默认的 `linger.ms=0`（或设了一个很小的值比如 5ms）意味着大多数 batch 在还没填满 `batch.size`（默认 16KB）之前就因为 linger 超时被发送出去了。结果是每个 batch 只有几百字节到几 KB 的有效数据，但每个 batch 都需要一次完整的 Produce 请求。500 个小 batch 比 50 个满载 batch 多消耗 10 倍的请求开销，Broker 端 request handler 线程的 CPU 被大量低效请求占满。\n\n同时 Consumer 侧也受影响：更多 Partition 意味着 Consumer 在每次 `poll()` 中需要向更多 Broker 发送 Fetch 请求。假设一个 Consumer 被分配了 60 个 Partition 分布在 20 台 Broker 上，每次 poll 需要并行发送 20 个 Fetch RPC，网络往返和请求排队的延迟叠加，端到端延迟从 Partition 少时的个位数毫秒涨到数十甚至上百毫秒。在 Partition 极多的集群中还会观察到 Page Cache 抖动——Broker 的 OS Page Cache 需要缓存所有活跃 Partition 的尾部数据（tail read），Partition 越多 working set 越大，一旦超过物理内存容量就会频繁产生磁盘 I/O，吞吐量断崖式下跌。\n\n### 2.5 Broker 启动恢复时间\n\nBroker 重启时需要对每个 Partition 的最后一个 Segment 执行 Log Recovery——校验 CRC、重建损坏的索引。非正常关机（如 OOM Kill、kill -9）时所有 Partition 都需要完整校验。broker.id=5 上 8,416 个 Partition，使用 HDD 存储时 Recovery 耗时经验如下：\n\n```\nPartition 数量    HDD Recovery 时间      SSD Recovery 时间\n1,000             10-30 秒               5-10 秒\n5,000             2-5 分钟               30-60 秒\n8,416             4-10 分钟              1-3 分钟\n20,000            15-30 分钟             5-8 分钟\n```\n\n`log.recovery.threads.per.data.dir` 参数（默认 1）控制 Recovery 并行度。在 SSD 上将其设为 CPU 核数的一半可以显著缩短恢复时间，但 HDD 上由于随机 I/O 瓶颈效果有限。\n\n### 2.6 治理策略：落地路线图\n\n治理的核心思路是「减少 Partition 总数 + 提升单 Partition 利用率 + 迁移到 KRaft 架构」。\n\n第一步是审计现有 Topic。写一个脚本扫描所有 Topic 的 Partition 数量、7 天消息吞吐、Consumer Group 绑定情况，识别出三类治理对象：僵尸 Topic（无生产无消费）、过度分区 Topic（吞吐 100 msg/s 却配了 64 个 Partition）、碎片化 Topic（同一业务域拆了几十个 Topic）。\n\n```bash\n# 审计脚本：找出 7 天内无写入的 Topic\nfor topic in $(kafka-topics.sh --bootstrap-server kafka-01:9092 --list); do\n  offsets=$(kafka-run-class.sh kafka.tools.GetOffsetShell \\\n    --broker-list kafka-01:9092 --topic \"$topic\" --time -1 \\\n    | awk -F: '{sum+=$3} END{print sum}')\n  offsets_7d=$(kafka-run-class.sh kafka.tools.GetOffsetShell \\\n    --broker-list kafka-01:9092 --topic \"$topic\" --time $(date -d '7 days ago' +%s000) \\\n    | awk -F: '{sum+=$3} END{print sum}')\n  delta=$((offsets - offsets_7d))\n  if [ \"$delta\" -eq 0 ]; then\n    echo \"ZOMBIE: $topic (partitions: $(kafka-topics.sh --describe --topic $topic \\\n      --bootstrap-server kafka-01:9092 | head -1 | awk '{print $4}'))\"\n  fi\ndone\n```\n\n第二步是清理僵尸 Topic。在生产环境中不要直接删除——先将 Topic 的 `retention.ms` 设为 1 小时让数据自然过期，观察 7 天确认无 Consumer 报错后再执行删除。这样即使有遗漏的消费方也不会直接丢数据。\n\n第三步是 Topic 合并。Kafka 不支持直接减少 Partition 数量（只能增不能减），对于过度分区的 Topic，只能创建新 Topic（合理 Partition 数）→ 用 MirrorMaker 2 或自定义 Consumer-Producer 管道将数据从旧 Topic 迁移到新 Topic → 切换 Producer 和 Consumer 到新 Topic → 下线旧 Topic。对于碎片化 Topic（如 order-created、order-paid、order-shipped 三个 Topic 各 12 Partition），合并为 order-events 单个 Topic 16 Partition，通过消息 Header 中的 eventType 字段路由。这样 36 个 Partition 变成 16 个，减少 55%。\n\n第四步是建立制度。在 Topic 创建流程中加入审批环节：每个新 Topic 必须提交预期吞吐量和消费者并发数，Partition 数按公式 `max(throughput_MB_s / partition_throughput_MB_s, consumer_count)` 计算，不允许随意设定。同时配置 `auto.create.topics.enable=false` 禁止自动创建 Topic。\n\n第五步是迁移到 KRaft。Apache Kafka 3.3 标记 KRaft 为 Production Ready，3.5 提供了 ZK-to-KRaft 在线迁移工具（`kafka-metadata.sh`），4.0 计划完全移除 ZooKeeper 依赖。KRaft 模式下元数据通过 `__cluster_metadata` 内部 Topic 以增量日志复制方式传播，Controller 切换时间从分钟级降到秒级，集群 Partition 上限从 200K 提升到 200 万以上。这是从根本上解决元数据膨胀和选举风暴的架构级方案。\n\n## 三、体系化扩展延伸\n\n### 3.1 KRaft 对 Partition 可扩展性的根本改进\n\nKRaft（KIP-500）将元数据从 ZooKeeper 迁移到基于 Raft 的内部 Controller Quorum。核心变化有两个：一是元数据传播从「Controller 全量推送」变为「Broker 从 __cluster_metadata 日志增量拉取」，消除了 UpdateMetadata 的 O(N×P) 开销（N 为 Broker 数，P 为 Partition 数）；二是 Controller Quorum 可以批量处理 Leader 选举，5,000 个选举在 KRaft 下 2-5 秒即可完成，相比 ZK 模式的 47 秒提升了一个数量级。Confluent 的基准测试验证了 KRaft 集群可稳定支撑 200 万 Partition，Controller 切换时间保持在 10 秒以内。KIP-778 引入的 Controller 快照机制进一步优化了新 Broker 加入时的元数据同步——直接加载快照文件而非回放全量日志。\n\n### 3.2 Cruise Control 自动化治理\n\nLinkedIn 开源的 Cruise Control 是 Partition 治理的利器。它持续监控每台 Broker 的 CPU、网络、磁盘利用率，当发现 Partition 分布不均（某些 Broker 负载远高于平均值）时自动生成 Partition 迁移计划并执行。在高 Partition 集群中 Cruise Control 的价值尤为突出：它可以自动将 Partition 从过载 Broker 迁移到空闲 Broker，避免手动执行 `kafka-reassign-partitions.sh` 时的人为失误。建议配置 `anomaly.detection.goals` 包含 `RackAwareGoal`、`ReplicaCapacityGoal` 和 `DiskCapacityGoal`，设定 `partition.count.per.broker` 上限告警。\n\n### 3.3 Consumer Rebalance 与 Partition 数量的关系\n\n这是一个容易被忽视的维度。Consumer Group 的 Rebalance 耗时与 Group 订阅的 Partition 总数正相关。在 Eager Rebalance（Kafka 2.3 之前的默认行为）下，每次 Rebalance 都会 revoke 全部 Partition 再重新分配，Partition 越多分配计算越耗时、JoinGroup 请求的 payload 越大。即使升级到 Cooperative Sticky Assignor（Kafka 2.4+），Rebalance 的元数据交换量仍然与 Partition 数成正比。建议将 `group.max.session.timeout.ms` 和 `session.timeout.ms` 合理调大，同时启用 Static Group Membership（`group.instance.id`）来减少不必要的 Rebalance 触发。\n\n### 3.4 监控与持续治理\n\n建立 Partition 数量的持续监控体系：通过 Prometheus 采集 `kafka_server_replicamanager_partitioncount` 指标，按 Broker 维度绘制时间序列图，设置增长率告警——如果单周 Partition 增长超过 5% 就触发审计流程。同时监控 `kafka_controller_controllerstats_leaderelectionrateandtimems` 来追踪选举耗时趋势，以及 `kafka_server_replicamanager_underreplicatedpartitions` 来发现恢复缓慢的 Partition。这些指标组合起来构成了 Partition 健康度的完整画像。",
+      "keyPoints": [
+        "ZK 模式下 Controller 通过 UpdateMetadata 全量推送元数据，126K Partition 的 payload 约 16MB、传播至 30 台 Broker 耗时 38 秒，期间集群元数据视图不一致",
+        "Broker 宕机触发 Leader 选举风暴——ZK 模式串行处理每个选举约 5-20ms，2800 个 Leader 选举耗时 47 秒，受影响 Partition 在此期间完全不可用",
+        "每个 Partition 消耗约 5 个 FD（3 个活跃 Segment 文件 + Consumer/Cleaner 打开的旧 Segment），8K Partition 已消耗 156K FD 逼近 200K 上限",
+        "Producer 向大量 Partition 写入时 batch 在 linger.ms 超时前无法填满 batch.size，产生大量低效小请求，Broker request handler CPU 被浪费",
+        "Partition 过多导致 OS Page Cache working set 膨胀，一旦超过物理内存容量就会频繁磁盘 I/O，吞吐量断崖下跌",
+        "Kafka 不支持直接减少 Partition 数量，治理只能通过新建 Topic + 数据迁移 + 切换流量的方式完成，需要完整的迁移管道",
+        "治理四步法：审计僵尸与过度分区 Topic → 清理与合并 → 建立创建审批制度 → 迁移 KRaft 架构从根本上突破元数据瓶颈",
+        "KRaft 模式将元数据传播从全量推送改为增量日志复制，Controller 切换从分钟级降到秒级，集群 Partition 上限从 200K 提升到 200 万+"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz1",
+          "question": "ZooKeeper 模式下 Controller 故障切换时，元数据传播耗时长的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Controller 需要向每台 Broker 发送包含所有 Partition 完整元数据的 UpdateMetadata 请求，payload 大小和 Broker 数量共同决定了传播耗时"},
+            {"id": "B", "text": "ZooKeeper 的 Zab 协议需要对每个 Partition 执行一次独立的共识投票"},
+            {"id": "C", "text": "新 Controller 需要从每台 Broker 逐一拉取 Partition 元数据再合并"},
+            {"id": "D", "text": "所有 Producer 和 Consumer 需要同时向新 Controller 重新注册"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "ZK 模式下 Controller 将所有 Partition 的元数据（Leader、ISR、Epoch 等）缓存在 JVM 堆中。Controller 切换时新 Controller 从 ZooKeeper 读取全量元数据后，必须向集群中每台 Broker 发送 UpdateMetadata 请求，该请求包含所有 Partition 的完整快照。126K Partition × ~130 字节 ≈ 16MB payload，发送给 30 台 Broker 就是 480MB 突发流量，这个 O(N×P) 的开销是传播耗时的根本瓶颈。B 选项不正确，ZK 的共识发生在 Controller 写入时而非 per-partition。C 选项颠倒了方向，是 Controller 向 Broker 推送而非拉取。"
+        },
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz2",
+          "question": "一台 Broker 宕机后 Leader 选举风暴的持续时间主要取决于什么？",
+          "choices": [
+            {"id": "A", "text": "集群中 Broker 的总数量"},
+            {"id": "B", "text": "该 Broker 上 Leader Partition 的数量乘以单次选举的 ZooKeeper 写入延迟"},
+            {"id": "C", "text": "ISR 列表中 Follower 的 fetch 速度"},
+            {"id": "D", "text": "Topic 的副本因子大小"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ZK 模式下 Controller 串行处理 Leader 选举——对每个需要选举的 Partition，Controller 从 ISR 中选出新 Leader 并将结果写入 ZooKeeper。单次选举耗时主要由 ZK 写入延迟决定（约 5-20ms）。因此总耗时 ≈ Leader Partition 数 × 单次 ZK 写入延迟。案例中约 2,800 个 Leader × ~17ms ≈ 47 秒。A 选项不是决定因素。C 选项描述的是副本同步而非选举过程。D 选项影响的是 ISR 候选列表大小，不直接决定选举速度。"
+        },
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz3",
+          "question": "为什么 Partition 过多会导致 Producer 批处理效率下降？",
+          "choices": [
+            {"id": "A", "text": "RecordAccumulator 为每个 Partition 维护独立 batch buffer，Partition 过多时 linger.ms 超时前 batch 无法填满，产生大量低效小请求"},
+            {"id": "B", "text": "Producer 会为每个 Partition 创建一个独立的网络连接，连接数过多导致 TCP 握手开销增大"},
+            {"id": "C", "text": "Producer 的 acks=all 需要等待所有 Partition 的 ISR 确认，Partition 越多等待越久"},
+            {"id": "D", "text": "Partition 过多导致 Producer 的 metadata.max.age.ms 频繁刷新，元数据请求占满网络带宽"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka Producer 的 RecordAccumulator 按 TopicPartition 维度管理 batch。如果一个 Producer 实例向 500 个 Partition 写入，就有 500 个独立的 batch buffer。在 linger.ms 较小（如 5ms）的配置下，大多数 batch 在等待期间只积累了几百字节的数据就被发送，远未达到 batch.size（默认 16KB）上限。结果是大量的低效小 batch 导致更多的 Produce 请求，Broker 端 request handler 线程被低效请求占满。B 选项不正确，Producer 按 Broker 维度复用连接而非按 Partition。C 选项混淆了 acks 机制，acks=all 是单个 Partition 维度的 ISR 确认。"
+        },
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz4",
+          "question": "案例中 dmesg 日志显示 Broker 被 OOM Killer 杀掉，最可能的内存压力来源是什么？",
+          "choices": [
+            {"id": "A", "text": "8,416 个 Partition 的元数据对象（每个约 10-20KB）占据大量 Old Gen 不可回收空间，叠加请求处理的临时对象分配，触发堆内存耗尽"},
+            {"id": "B", "text": "消息数据被缓存在 JVM 堆中，Partition 越多消息缓存越大"},
+            {"id": "C", "text": "每个 Partition 创建了独立的线程池，线程栈空间耗尽了进程内存"},
+            {"id": "D", "text": "ZooKeeper 客户端为每个 Partition 创建了独立的 Watch，Watch 回调消耗了大量堆内存"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka Broker 在 JVM 堆中为每个 Partition 维护 Partition 对象、Log 对象、LogSegment 对象、ISR 列表、OffsetIndex、TimeIndex 等长生命周期对象，每个 Partition 约占 10-20KB。8,416 × 15KB ≈ 126MB 的不可回收对象驻留在 Old Generation 中。dmesg 显示 anon-rss 为 6GB，与典型的 Kafka JVM 堆配置（-Xmx 6G）吻合。这些固定对象加上正常请求处理的临时对象分配，导致 Old Gen 接近满载，最终触发内核 OOM Killer。B 选项错误，Kafka 依赖 OS Page Cache 而非堆内存缓存消息。"
+        },
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz5",
+          "question": "Kafka 不支持直接减少 Topic 的 Partition 数量，原因是什么？",
+          "choices": [
+            {"id": "A", "text": "减少 Partition 意味着需要合并已有数据，但 Partition 间的消息没有全局排序，无法确定合并后的消息顺序，会破坏 offset 连续性和消费语义"},
+            {"id": "B", "text": "这只是一个尚未实现的功能，Kafka 4.0 将会支持"},
+            {"id": "C", "text": "减少 Partition 会导致 Consumer Group 的 offset 丢失"},
+            {"id": "D", "text": "ZooKeeper 不支持删除 Partition 的 znode"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Partition 减少的根本困难在于数据语义。每个 Partition 有独立的 offset 空间，消息的 key 经过 hash 路由到特定 Partition。如果从 12 个 Partition 减少到 6 个，被删除 Partition 中的数据需要重新分配到剩余 Partition，但这会改变消息的 offset、打乱 key-based ordering guarantee、并使所有 Consumer 的已提交 offset 失效。这不是简单的工程问题而是语义上的不可逆操作。B 选项不正确，Kafka 社区明确表示没有计划支持此功能。C 选项只描述了部分影响而非根本原因。"
+        },
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz6",
+          "question": "治理 Partition 过多时，识别僵尸 Topic 的正确方法是什么？",
+          "choices": [
+            {"id": "A", "text": "用 GetOffsetShell 对比 7 天前和当前的 offset 差值，差值为 0 的 Topic 即无写入的僵尸 Topic"},
+            {"id": "B", "text": "直接删除所有名称包含 test 或 dev 前缀的 Topic"},
+            {"id": "C", "text": "查看 Topic 的 retention.ms 配置，过期时间短的就是僵尸 Topic"},
+            {"id": "D", "text": "检查 Topic 的 Partition 数量，Partition 少于 3 个的就是不重要的 Topic 可以删除"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "僵尸 Topic 的定义是一段时间内无生产也无消费的 Topic。通过 kafka.tools.GetOffsetShell 获取 Topic 各 Partition 当前的 latest offset 和 7 天前的 offset，两者之差为 0 说明该时间段内无消息写入。同时应结合 Consumer Group 的 lag 检查确认也无活跃消费者。B 选项过于粗暴，名称不能代表使用状态。C 选项混淆了 retention 配置和实际使用情况。D 选项完全不合理，Partition 数量与 Topic 重要性无关。"
+        },
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz7",
+          "question": "将碎片化 Topic 合并为领域聚合 Topic 时，应通过什么方式区分不同事件类型？",
+          "choices": [
+            {"id": "A", "text": "通过消息 Header 中的 eventType 字段在消费端路由，所有同一业务域的事件共用 Topic 和 Partition"},
+            {"id": "B", "text": "为每种事件类型创建不同的 Consumer Group，通过 Group 名称区分"},
+            {"id": "C", "text": "使用不同的 message key 前缀，在 Consumer 端通过 key 过滤"},
+            {"id": "D", "text": "在 Topic 名称中编码事件类型，如 order.created、order.paid"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Topic 合并的目标是减少 Topic 和 Partition 总数，所以不能再按事件类型拆分 Topic（D 选项正是要解决的问题）。正确做法是将 order-created、order-paid、order-shipped 等事件合并到 order-events 单个 Topic，在消息 Header 中设置 eventType 字段（如 ORDER_CREATED、ORDER_PAID）。Consumer 端在 poll 到消息后根据 Header 路由到不同的处理逻辑。这样 36 个 Partition（3 Topic × 12）压缩为 16 个，减少 55%。B 选项不能区分事件类型。C 选项修改 key 会影响 Partition 路由语义。"
+        },
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz8",
+          "question": "KRaft 模式相比 ZK 模式在 Partition 可扩展性方面最关键的架构改进是什么？",
+          "choices": [
+            {"id": "A", "text": "元数据存储在 __cluster_metadata 内部 Topic 中，传播方式从全量推送变为增量日志复制，Controller 切换耗时与 Partition 总数几乎无关"},
+            {"id": "B", "text": "KRaft 使用 gRPC 替换了自定义协议，网络吞吐提升 10 倍"},
+            {"id": "C", "text": "KRaft 将 Partition 数据从 Broker 本地磁盘迁移到分布式存储"},
+            {"id": "D", "text": "KRaft 允许 Partition 在 Broker 之间自动迁移，无需手动执行 reassignment"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "KRaft（KIP-500）的核心创新是用内部 Topic __cluster_metadata 替代 ZooKeeper 存储元数据，由 Controller Quorum（基于 Raft 共识）管理。关键变化是 Broker 从 __cluster_metadata 日志增量拉取元数据更新，而非被 Controller 全量推送。Controller 切换时新 Controller 从 Raft log 回放状态，Broker 继续读增量日志，耗时与 Partition 总数几乎无关。Confluent 基准测试验证 KRaft 支持 200 万 Partition、Controller 切换保持 10 秒内。B 选项不正确，Kafka 仍使用自定义协议。D 选项描述的是 Cruise Control 功能，不是 KRaft 的改进。"
+        },
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz9",
+          "question": "在 Partition 过多的集群中，Consumer Group Rebalance 耗时增加的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Rebalance 的元数据交换量与 Group 订阅的 Partition 总数成正比——JoinGroup 请求需要携带所有 Partition 的分配信息，分配计算复杂度也随之增长"},
+            {"id": "B", "text": "Rebalance 需要暂停所有 Broker 的请求处理"},
+            {"id": "C", "text": "每个 Partition 需要单独向 Group Coordinator 注册"},
+            {"id": "D", "text": "Rebalance 会触发所有 Partition 的 Leader 重选"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Consumer Group Rebalance 时，每个 Consumer 在 JoinGroup 请求中上报自己的订阅信息和当前分配的 Partition 列表，Group Leader 收到所有成员信息后执行分配算法。Partition 总数越多，JoinGroup/SyncGroup 请求的 payload 越大，分配算法（如 Range、RoundRobin、Sticky）的计算量也越大。即使使用 Cooperative Sticky Assignor，元数据交换量仍然与 Partition 数成正比。B 选项不正确，Rebalance 不会暂停 Broker 请求处理。D 选项错误，Rebalance 和 Leader 选举是完全不同的机制。"
+        },
+        {
+          "id": "kafka-capacity-too-many-partitions-q1-quiz10",
+          "question": "以下哪项措施对防止 Partition 过度增长最有效？",
+          "choices": [
+            {"id": "A", "text": "设置 auto.create.topics.enable=false 并建立 Topic 创建审批流程，Partition 数按预期吞吐量公式计算"},
+            {"id": "B", "text": "增加 Broker 数量来稀释每台 Broker 的 Partition 密度"},
+            {"id": "C", "text": "将所有 Topic 的副本因子从 3 降到 1 来减少 Partition 副本总数"},
+            {"id": "D", "text": "缩短 retention.ms 让数据更快过期以减少 Segment 数量"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Partition 过多的根因是缺乏管控的 Topic 创建——每个团队随意创建 Topic 且给出过大的 Partition 数。最有效的治理措施是从源头管控：关闭 auto.create.topics.enable 禁止自动创建，建立审批流程要求申请方提供预期吞吐和消费者并发数，按 max(throughput / partition_throughput, consumer_count) 公式计算合理 Partition 数。B 选项治标不治本，Partition 总数不变只是分散了。C 选项会严重损害数据可用性。D 选项减少的是 Segment 数而非 Partition 数。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#brokerconfigs_auto.create.topics.enable",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum",
+        "https://www.confluent.io/blog/apache-kafka-supports-200k-partitions-per-cluster/",
+        "https://www.confluent.io/blog/kafka-without-zookeeper-a-sneak-peek/",
+        "https://github.com/linkedin/cruise-control"
+      ]
+    }
+  ]
+}
