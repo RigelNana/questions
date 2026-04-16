@@ -1,0 +1,158 @@
+{
+  "id": "mon-prom-adv-wal",
+  "name": "Prometheus WAL 机制详解",
+  "domain": "monitoring",
+  "description": "深入理解 Prometheus TSDB 的 Write-Ahead Log 机制及其在崩溃恢复中的作用",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "mon-prom-adv-wal-q1",
+      "domain": "monitoring",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Prometheus", "WAL", "TSDB", "持久化", "崩溃恢复"],
+      "title": "Prometheus 的 WAL（Write-Ahead Log）机制有什么作用？",
+      "content": "## WAL：Prometheus 不丢数据的最后一道防线\n\n假设你是一个电商平台的 SRE，公司的核心监控跑在 Prometheus 2.45 上，采集了大约 300 万条活跃时间序列。某天凌晨 3 点，监控告警把你叫醒——Prometheus 所在的 Node 因为内核 OOM Killer 把 Prometheus 进程杀掉了。你赶紧 SSH 上去看，发现 Prometheus 进程确实不在了，赶紧 `systemctl restart prometheus` 把它拉起来。\n\n重启之后你打开 Grafana，心里已经做好了丢数据的准备。按照你对 TSDB 的理解，Prometheus 每隔 2 小时才会把内存中的 head block 通过 compaction 写成磁盘上的 persistent block。如果进程在两次 compaction 之间崩溃了，head block 里那些还没落盘的数据不就全丢了吗？结果你在 Grafana 上一看——数据居然是连续的，从崩溃前几秒到重启后的新数据，中间只有不到 1 分钟的空白（大约等于你重启服务的时间）。\n\n这不太对劲。head block 是纯内存结构，进程死了内存就没了，数据凭什么还在？你翻了一下 Prometheus 的数据目录，发现除了熟悉的 `chunks_head/` 和那些以 01 开头的 block 目录之外，还有一个 `wal/` 目录，里面躺着一堆编号递增的文件：\n\n```\n/var/lib/prometheus/data/\n├── wal/\n│   ├── 00000147\n│   ├── 00000148\n│   ├── 00000149\n│   ├── 00000150    # 最新的 segment\n│   └── checkpoint.00000146/\n│       └── 00000000\n├── chunks_head/\n│   ├── 000001\n│   └── 000002\n├── 01HQRS...(block 目录)\n└── 01HQRT...(block 目录)\n```\n\n你用 `ls -lh` 看了一下，每个文件大约 128MB。这就是 Prometheus 的 WAL（Write-Ahead Log，预写日志）。它是 TSDB 在设计上用来对抗进程崩溃的核心机制——所有写入操作在进入内存之前，必须先追加写入到 WAL 文件里。进程崩溃后重启时，Prometheus 通过重放这些 WAL 文件，就能把 head block 的内存状态恢复到崩溃前的样子。\n\n但 WAL 的作用远不止「崩溃恢复」这一点。从 Prometheus 2.32 开始引入的 Agent Mode 把 WAL 变成了唯一的存储后端，只写 WAL 不建 head block，配合 Remote Write 把数据转发到远端存储。WAL 的设计直接影响了 Prometheus 的启动时间、内存占用和数据安全性。\n\n理解 WAL 的内部机制，你需要回答这几个问题：WAL 的 segment 文件里到底记录了什么？三种记录类型（Series、Samples、Tombstones）各自的作用是什么？重启时 WAL 重放的具体流程是怎样的？WAL 什么时候会被清理，checkpoint 又是什么？",
+      "answer": "## 一、Prometheus TSDB 的整体架构与 WAL 的定位\n\nPrometheus 从 2.0 版本开始内置了自研的 TSDB（Time Series Database），替代了 1.x 时代基于 LevelDB 的存储引擎。要理解 WAL 的作用，必须先搞清楚 TSDB 的数据生命周期。\n\nTSDB 的存储分为两个大层：内存层和磁盘层。内存层的核心是 head block，它是一个内存中的数据结构，负责接收所有最新写入的样本数据。Prometheus 每次 scrape 到的指标值（sample）首先会被写入 head block。head block 默认覆盖最近 2 小时的数据（由 `--storage.tsdb.min-block-duration` 控制，默认 `2h`）。当 head block 中最老的数据超过 2 小时后，TSDB 会触发一次 compaction，把 head block 中已经「成熟」的那部分数据序列化为磁盘上的 persistent block——也就是你在数据目录中看到的那些以 ULID 命名的目录（如 `01HQRS...`）。每个 persistent block 是一个不可变的、自包含的数据单元，包含 `chunks/`（压缩后的时序数据）、`index`（倒排索引）和 `meta.json`（元数据）。\n\n这个架构有一个显而易见的问题：head block 是纯内存结构，如果进程在两次 compaction 之间崩溃了，内存中还没来得及持久化的数据就会丢失。对于一个 scrape interval 为 15 秒的监控系统来说，2 小时的 head block 意味着最多可能丢失 2 小时 × 300 万序列的数据，这在任何生产环境中都是不可接受的。\n\nWAL 就是为了解决这个问题而存在的。WAL 的全称是 Write-Ahead Log，中文叫「预写日志」，这个名字精准描述了它的工作方式：所有写入操作在进入 head block 之前，必须先（Ahead）写入（Write）到 WAL 日志文件（Log）中。WAL 是一种顺序追加写入的磁盘文件，写入性能极高（顺序写 SSD 可以轻松达到数百 MB/s），不会成为写入路径上的性能瓶颈。一旦数据被写入 WAL 并且操作系统确认落盘，即使进程崩溃，重启后也能通过重放 WAL 文件恢复 head block 的完整状态。\n\n这种「先写日志再写内存」的模式并非 Prometheus 独创。MySQL 的 InnoDB 引擎有 redo log，PostgreSQL 有 WAL，etcd 有 WAL，Kafka 的 partition log 本质上也是 WAL。这是数据库领域用了几十年的经典持久化模式，核心思想是：顺序写磁盘比随机写磁盘快得多，用一次廉价的顺序写来保障数据安全性，再在后台慢慢做复杂的数据组织（compaction）。\n\n## 二、WAL 的物理结构与 Segment 文件\n\nWAL 数据存储在 Prometheus 数据目录下的 `wal/` 子目录中。WAL 被切分为多个 segment 文件，每个 segment 文件大小固定为 128MB。文件名是从 `00000000` 开始的 8 位十进制递增编号。当当前 segment 写满 128MB 后，TSDB 会创建一个新的 segment 文件继续写入。在一个采集 300 万序列、scrape interval 为 15 秒的 Prometheus 实例上，WAL 的总大小通常在 2-4GB 左右，对应 16-32 个 segment 文件。\n\n```\nwal/\n├── 00000147          # 128MB，已写满\n├── 00000148          # 128MB，已写满\n├── 00000149          # 128MB，已写满\n├── 00000150          # 当前正在写入的 segment\n└── checkpoint.00000146/\n    └── 00000000      # checkpoint 文件\n```\n\n每个 segment 文件内部由连续的 record（记录）组成。每条 record 包含一个类型标识、长度字段、CRC32 校验和以及实际的数据载荷。TSDB 的 WAL 定义了三种 record 类型，这三种类型各自承担不同的职责。\n\n第一种是 Series Record（类型值 1）。当 Prometheus 首次遇到一个新的时间序列时（比如第一次 scrape 到 `http_requests_total{method=\"GET\", handler=\"/api/v1/query\"}`），它会在 head block 中为这个序列分配一个唯一的内部引用 ID（ref ID，一个自增的 uint64），然后把「ref ID → 标签集合」这个映射关系作为一条 Series Record 写入 WAL。这条记录的作用是在重放时重建 symbol table（符号表），让 TSDB 知道每个 ref ID 对应的是哪组标签。\n\n第二种是 Samples Record（类型值 2）。这是 WAL 中数量最多的记录类型。每次 scrape 完成后，Prometheus 会把本次采集到的所有样本数据批量编码为一条或多条 Samples Record。每条 Samples Record 包含一组 `(ref ID, timestamp, value)` 三元组——ref ID 引用 Series Record 中定义的序列，timestamp 是毫秒级 Unix 时间戳，value 是 float64 类型的指标值。批量编码的好处是减少磁盘 I/O 次数，Prometheus 会把同一次 scrape 的所有样本打包到同一条 record 中。\n\n第三种是 Tombstones Record（类型值 3）。当你通过 Prometheus 的 Admin API 调用 `POST /api/v1/admin/tsdb/delete_series` 删除某些时间序列时，TSDB 不会真正从 WAL 或 head block 中移除数据，而是写入一条 Tombstone Record 标记这些序列在某个时间范围内的数据为「已删除」。查询时 TSDB 会跳过被 tombstone 标记的数据。这种设计避免了在 append-only 的 WAL 中做随机删除，保持了 WAL 的顺序写特性。\n\n## 三、完整的写入流程\n\n理解了 WAL 的记录类型后，来看一次完整的样本写入是怎么发生的。假设 Prometheus 刚刚完成一次对某个 Target 的 scrape，拿到了 1000 个 sample。\n\n首先，Prometheus 的 scrape manager 会调用 TSDB 的 `Appender` 接口。Appender 是一个事务性的写入接口，它提供 `Append(ref, labels, timestamp, value)` 方法来添加单个样本，以及 `Commit()` 方法来提交整个批次。在 `Append` 阶段，TSDB 会检查每个样本的序列是否已经存在于 head block 的 series map 中。如果是一个全新的序列（ref 为 0），TSDB 会分配一个新的 ref ID，将 labels → ref ID 的映射存入内存中的 series map，并在提交时生成一条 Series Record。如果序列已经存在，直接使用已有的 ref ID。\n\n关键步骤发生在 `Commit()` 调用时。Commit 做了两件事，而且顺序不能反：第一步，把这批操作中的所有新 Series Record 和 Samples Record 序列化后追加写入当前的 WAL segment 文件，并调用一次 `fsync`（或者依赖操作系统的 page cache flush）确保数据落盘。第二步，把样本数据写入 head block 的内存结构（head chunk）。这个「先 WAL 后内存」的顺序是 WAL 作为预写日志的核心保证：如果进程在第一步之后、第二步之前崩溃了，重启后通过重放 WAL 仍然可以恢复数据；如果在第一步之前就崩溃了，这批数据确实会丢失，但这只是最后一次还没提交的 scrape 数据（最多 15 秒），损失可以接受。\n\n在实际实现中，Prometheus 默认并不对每次 Commit 都执行 `fsync`，而是依赖操作系统的 page cache 机制——数据先写入内核的 page cache，由操作系统在后台异步刷盘。这意味着如果是操作系统级别的崩溃（比如断电），可能会丢失 page cache 中还没刷到磁盘的最后几秒数据。如果你需要更强的持久化保证，可以把 Prometheus 部署在带 BBU（Battery-Backed Unit，电池保护单元）的 RAID 卡上，或者使用带 fsync 保证的云盘（如 AWS EBS 的 `io2` 类型）。\n\n## 四、崩溃恢复：WAL 重放的完整流程\n\nPrometheus 启动时的 WAL 重放是理解 WAL 价值的关键。当 TSDB 初始化 head block 时，它会执行以下恢复流程。\n\n第一阶段是加载 checkpoint。TSDB 会在 `wal/` 目录中查找最新的 `checkpoint.NNNNN` 子目录。checkpoint 本质上是一个压缩过的 WAL 快照——它包含了截止到某个时间点仍然有效的所有 Series Record 和最后一个样本值，但去掉了已经被 compaction 写入 persistent block 的旧样本。加载 checkpoint 的目的是快速重建 series map，而不需要从最早的 WAL segment 开始重放。\n\n第二阶段是重放 checkpoint 之后的所有 WAL segment。TSDB 按照 segment 编号从小到大的顺序，逐个打开 segment 文件，逐条读取 record。对于 Series Record，TSDB 重建 ref ID → labels 的映射关系，恢复 symbol table。对于 Samples Record，TSDB 把每个样本写入对应序列的 head chunk，恢复内存中的时序数据。对于 Tombstones Record，TSDB 重建删除标记。如果某条 record 的 CRC32 校验失败，TSDB 会认为这条记录以及该 segment 中后续的所有记录都已损坏（因为 WAL 是顺序追加的，一条记录损坏意味着后面的数据偏移量也不可信了），跳过这些记录并打印一条 warning 日志。\n\n重放完成后，head block 的内存状态就恢复到了崩溃前的样子（除了最后可能因 page cache 未刷盘而丢失的几秒数据）。整个恢复过程的耗时取决于需要重放的 WAL 数据量。在一个 300 万序列的实例上，如果有 3GB 的 WAL 数据需要重放，启动时间大约在 30-60 秒。这也是为什么 Prometheus 的文档建议不要让 WAL 积累太多——WAL 越大，启动越慢。\n\n你可以在 Prometheus 的启动日志中看到 WAL 重放的详细信息：\n\n```\nts=2024-01-15T03:02:15.332Z caller=head.go:535 level=info component=tsdb msg=\"Replaying on-disk memory mappable chunks if any\"\nts=2024-01-15T03:02:16.108Z caller=head.go:579 level=info component=tsdb msg=\"On-disk memory mappable chunks replay completed\" duration=776.234ms\nts=2024-01-15T03:02:16.108Z caller=head.go:587 level=info component=tsdb msg=\"Replaying WAL, this may take a while\"\nts=2024-01-15T03:02:38.445Z caller=head.go:658 level=info component=tsdb msg=\"WAL segment loaded\" segment=147 maxSegment=150\nts=2024-01-15T03:02:49.891Z caller=head.go:658 level=info component=tsdb msg=\"WAL segment loaded\" segment=148 maxSegment=150\nts=2024-01-15T03:02:58.220Z caller=head.go:658 level=info component=tsdb msg=\"WAL segment loaded\" segment=149 maxSegment=150\nts=2024-01-15T03:03:04.673Z caller=head.go:658 level=info component=tsdb msg=\"WAL segment loaded\" segment=150 maxSegment=150\nts=2024-01-15T03:03:04.673Z caller=head.go:665 level=info component=tsdb msg=\"WAL replay completed\" checkpoint_replay_duration=1.204s wal_replay_duration=48.565s total_replay_duration=49.769s\n```\n\n从这段日志可以看到，checkpoint 重放用了 1.2 秒，WAL 重放用了 48.5 秒，总恢复时间约 50 秒。这个时间就是 Prometheus 从启动到开始接收新数据之间的空白窗口。\n\n## 五、WAL Truncation 与 Checkpoint\n\n如果 WAL 只追加不清理，文件会无限增长。TSDB 通过 truncation（截断）机制定期清理过期的 WAL segment。truncation 的触发时机与 head compaction 同步：每当 head block 中最老的数据被 compacted 成 persistent block 后，那些只包含已被 compacted 的旧数据的 WAL segment 就不再需要了，可以安全删除。\n\n但直接删除旧 segment 有一个问题：Series Record 可能在很早的 segment 中定义，但对应的序列在最新的 segment 中仍然有新样本。如果删除了包含 Series Record 的旧 segment，重启时就无法重建这些序列的 ref ID → labels 映射。为了解决这个问题，TSDB 在 truncation 时会创建一个 checkpoint。\n\ncheckpoint 的创建过程是这样的：TSDB 扫描所有即将被删除的旧 WAL segment，从中提取出仍然「活跃」的 Series Record（即这些序列在 head block 中仍有数据）以及每个活跃序列的最后一个样本，把它们写入一个新的 checkpoint 目录（如 `checkpoint.00000146/`）。这样，即使旧 segment 被删除，重启时通过加载 checkpoint 就能恢复这些序列的元数据。checkpoint 完成后，编号小于等于 146 的所有旧 segment 就可以安全删除了。\n\n在 Prometheus 的指标中，你可以通过 `prometheus_tsdb_wal_truncate_duration_seconds` 观察每次 truncation 的耗时，通过 `prometheus_tsdb_checkpoint_creations_total` 和 `prometheus_tsdb_checkpoint_deletions_total` 监控 checkpoint 的创建和清理情况。如果你发现 WAL 目录占用空间持续增长且 truncation 不触发，通常是因为 head compaction 被阻塞了——可能是磁盘 I/O 太慢或者 TSDB 内部出了 bug。\n\n## 六、Agent Mode 下的 WAL-Only 模式\n\n从 Prometheus 2.32 开始，Prometheus 引入了 Agent Mode（通过 `--enable-feature=agent` 启动参数开启）。Agent Mode 从根本上改变了 WAL 的角色：在这个模式下，Prometheus 不再构建 head block，不做 compaction，不创建 persistent block，也不支持本地查询——它只做两件事：scrape 指标写入 WAL，然后通过 Remote Write 协议把 WAL 中的数据发送到远端存储（如 Thanos、Cortex、Mimir、VictoriaMetrics）。\n\n这种模式的设计动机是：在大规模部署中，很多边缘位置的 Prometheus 实例只负责采集数据，所有查询都在中心化的远端存储上完成。这些采集实例不需要本地查询能力，也不需要长期存储，保留一个完整的 TSDB 引擎会浪费大量内存和磁盘。Agent Mode 把 Prometheus 精简成一个高效的指标采集和转发代理，内存占用可以降低 20-40%。\n\nAgent Mode 下的 WAL 与普通模式的 WAL 有一些关键差异。首先，Agent Mode 的 WAL 不记录 Tombstones（因为没有本地存储可以删除）。其次，WAL 的 truncation 不再与 head compaction 同步，而是与 Remote Write 的进度同步——当 WAL 中的数据成功发送到远端存储后，对应的 segment 才可以被截断。Remote Write 的发送进度通过 WAL 中的一个特殊标记来跟踪。\n\n## 七、生产环境中的 WAL 问题诊断与最佳实践\n\nWAL 损坏是生产中偶尔会遇到的问题。常见的原因包括磁盘扇区损坏、文件系统 corruption、以及极端情况下的内核 bug。当 WAL 损坏时，Prometheus 启动日志会出现类似以下的错误：\n\n```\nts=2024-01-15T03:02:40.112Z caller=head.go:621 level=error component=tsdb msg=\"WAL segment is corrupted\" err=\"unexpected CRC32 checksum\" segment=149\n```\n\nPrometheus 自带的诊断工具 `promtool` 可以检查和修复 WAL。运行 `promtool tsdb analyze /var/lib/prometheus/data` 可以分析整个 TSDB 的健康状态。如果确认 WAL 损坏且无法自动恢复，可以用 `promtool tsdb clean-tombstones` 清理无效标记，或者在最坏的情况下删除损坏的 segment 文件让 Prometheus 跳过它启动（代价是丢失该 segment 中的数据）。\n\nWAL 对启动时间的影响是另一个需要关注的生产问题。WAL 越大，重放时间越长，Prometheus 启动越慢。影响 WAL 大小的因素包括：活跃时间序列的数量（序列越多，Series Record 和 Samples Record 越多）、scrape interval（interval 越短，单位时间产生的 Samples Record 越多）、以及 head block 的时间跨度（`--storage.tsdb.min-block-duration` 越大，两次 compaction 之间积累的 WAL 越多）。在一个 500 万序列、scrape interval 15 秒的实例上，WAL 可能达到 6-8GB，重放时间超过 2 分钟。如果启动时间是你的痛点，可以考虑减小 `--storage.tsdb.min-block-duration`（比如改成 `1h`），但这会增加 compaction 的频率和 I/O 开销，是一个需要权衡的取舍。\n\n最后，WAL 与 Remote Write 之间有一个重要的协作关系。即使在非 Agent Mode 下，Prometheus 的 Remote Write 也是从 WAL 中读取数据进行发送的。Remote Write 组件维护了一个独立的读取位置（read cursor），它从 WAL 中按顺序读取 record，编码为 Remote Write 协议格式后发送到远端。如果远端存储短暂不可用（比如网络抖动），Remote Write 会暂停发送，WAL 中的数据会持续积累作为缓冲。当远端恢复后，Remote Write 会从上次中断的位置继续发送，补齐缺失的数据。但如果远端长时间不可用导致 WAL 堆积过多，Prometheus 可能因为磁盘空间不足而出问题。你可以通过 `prometheus_remote_storage_bytes_total` 和 `prometheus_remote_storage_highest_timestamp_in_seconds` 这两个指标来监控 Remote Write 的发送进度和 WAL 积压情况。",
+      "keyPoints": [
+        "WAL（Write-Ahead Log）是 Prometheus TSDB 的预写日志机制，所有写入操作先追加写入 WAL 再写入内存中的 head block，通过「先日志后内存」的顺序保证进程崩溃后数据可恢复",
+        "WAL 由 128MB 大小的 segment 文件组成，存储在数据目录的 wal/ 子目录中，文件名按 8 位十进制递增编号，写满一个 segment 后自动创建下一个",
+        "WAL 定义了三种 record 类型：Series Record 记录 ref ID 到标签集的映射用于重建符号表，Samples Record 批量记录 (ref ID, timestamp, value) 三元组，Tombstones Record 记录删除标记",
+        "崩溃恢复时 TSDB 先加载最新的 checkpoint 快速重建 series map，再按编号顺序重放 checkpoint 之后的所有 WAL segment，逐条恢复 Series 映射、Samples 数据和 Tombstone 标记",
+        "WAL truncation 与 head compaction 同步触发，在删除旧 segment 之前会创建 checkpoint 保存仍然活跃的 Series Record，确保重启时不会丢失序列元数据",
+        "Agent Mode（Prometheus 2.32+）将 WAL 变为唯一存储后端，不建 head block 不做 compaction，只通过 WAL + Remote Write 实现采集转发，内存占用降低 20-40%",
+        "WAL 大小直接影响 Prometheus 启动时间，300 万序列约 3GB WAL 重放需要 30-60 秒，可通过减小 --storage.tsdb.min-block-duration 来控制 WAL 积累量但会增加 compaction 频率",
+        "Remote Write 从 WAL 中按顺序读取数据发送到远端存储，远端不可用时 WAL 作为缓冲持续积累，恢复后从中断位置继续发送，可通过 prometheus_remote_storage_* 指标监控积压情况"
+      ],
+      "quiz": [
+        {
+          "id": "mon-prom-adv-wal-quiz1",
+          "question": "Prometheus 的 WAL（Write-Ahead Log）在 TSDB 中的核心作用是什么？",
+          "choices": [
+            {"id": "A", "text": "作为预写日志，确保所有写入操作先落盘到 WAL 再写入内存中的 head block，使进程崩溃后可通过重放 WAL 恢复未持久化的数据"},
+            {"id": "B", "text": "作为查询加速索引，在磁盘上维护一份有序的时间序列索引以加速 PromQL 范围查询"},
+            {"id": "C", "text": "作为 Prometheus 实例间的数据同步通道，多个 Prometheus 通过共享 WAL 目录实现高可用"},
+            {"id": "D", "text": "作为 persistent block 的压缩缓冲区，数据先在 WAL 中完成 Gorilla 编码压缩后再写入 block"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "WAL 的核心定位是预写日志（Write-Ahead Log），它的设计目标是数据持久化安全性而非查询性能。所有样本数据在写入内存中的 head block 之前，必须先以顺序追加的方式写入 WAL 的 segment 文件。如果 Prometheus 进程崩溃，重启时 TSDB 会重放 WAL 中的 record 来恢复 head block 的内存状态。选 B 错误，WAL 是顺序写入的日志文件而非索引结构，查询并不经过 WAL。选 C 错误，WAL 是单实例的本地文件，Prometheus 不支持通过共享 WAL 做集群同步。选 D 错误，数据压缩发生在 head chunk 和 compaction 阶段，WAL 中的记录是未压缩的原始格式。"
+        },
+        {
+          "id": "mon-prom-adv-wal-quiz2",
+          "question": "Prometheus TSDB 的 WAL 定义了哪三种 record 类型？",
+          "choices": [
+            {"id": "A", "text": "Series Record（序列定义）、Samples Record（样本数据）、Tombstones Record（删除标记）"},
+            {"id": "B", "text": "Header Record（文件头）、Data Record（数据载荷）、Footer Record（文件尾校验）"},
+            {"id": "C", "text": "Index Record（索引条目）、Chunk Record（压缩数据块）、Meta Record（元数据）"},
+            {"id": "D", "text": "Create Record（序列创建）、Append Record（样本追加）、Compact Record（压缩完成标记）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Prometheus TSDB 的 WAL 严格定义了三种 record 类型。Series Record（类型值 1）记录 ref ID 到标签集合的映射关系，用于在重放时重建 symbol table。Samples Record（类型值 2）批量记录 (ref ID, timestamp, value) 三元组，是 WAL 中数量最多的记录类型。Tombstones Record（类型值 3）在通过 Admin API 删除序列时写入，标记特定时间范围的数据为已删除。选 B 描述的是通用文件格式的概念，不是 TSDB WAL 的实际实现。选 C 描述的更像 persistent block 的内部结构（index、chunks、meta.json），与 WAL 无关。选 D 中的 Compact Record 不存在于 WAL 中，compaction 是 TSDB 的独立后台流程。"
+        },
+        {
+          "id": "mon-prom-adv-wal-quiz3",
+          "question": "在 Prometheus 的一次样本写入流程中，WAL 写入和 head block 写入的顺序是怎样的？",
+          "choices": [
+            {"id": "A", "text": "先写入 head block 内存结构，成功后再异步写入 WAL 作为备份"},
+            {"id": "B", "text": "WAL 写入和 head block 写入并行执行，哪个先完成都可以"},
+            {"id": "C", "text": "先将 record 追加写入 WAL segment 文件并确认落盘，然后再将样本写入 head block 的内存结构"},
+            {"id": "D", "text": "只写入 head block，WAL 由后台 goroutine 定期从 head block 中导出生成"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 WAL 作为「预写日志」的核心语义：Write-Ahead 意味着必须「先写日志」。在 Appender 的 Commit() 调用中，TSDB 第一步将所有新的 Series Record 和 Samples Record 序列化后追加写入当前 WAL segment 文件，第二步才将样本数据写入 head block 的内存结构（head chunk）。这个顺序不能反转，因为如果先写内存后写 WAL，当进程在两步之间崩溃时内存数据丢失且 WAL 中没有对应记录，数据就永久丢失了。选 A 颠倒了顺序，违背了 WAL 的预写语义。选 B 的并行写入无法保证崩溃一致性。选 D 完全错误，WAL 不是从内存导出的备份。"
+        },
+        {
+          "id": "mon-prom-adv-wal-quiz4",
+          "question": "Prometheus TSDB 的 WAL segment 文件默认大小和存储位置分别是什么？",
+          "choices": [
+            {"id": "A", "text": "每个 segment 128MB，存储在数据目录的 wal/ 子目录中，文件名为 8 位十进制递增编号"},
+            {"id": "B", "text": "每个 segment 64MB，存储在数据目录的 log/ 子目录中，文件名为 Unix 时间戳"},
+            {"id": "C", "text": "每个 segment 256MB，存储在数据目录根目录下，文件名以 wal_ 为前缀"},
+            {"id": "D", "text": "segment 大小动态调整（1MB-1GB），存储在数据目录的 journal/ 子目录中"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Prometheus TSDB 的 WAL segment 文件大小固定为 128MB，这个值是硬编码在源码中的常量而非可配置参数。segment 文件存储在 Prometheus 数据目录（默认 /var/lib/prometheus/data 或通过 --storage.tsdb.path 指定）下的 wal/ 子目录中。文件名采用从 00000000 开始的 8 位十进制递增编号格式（如 00000147、00000148）。当当前 segment 写满 128MB 后，TSDB 自动创建下一个编号的 segment 继续写入。选 B 的 64MB 和 log/ 目录都不正确。选 C 的 256MB 和根目录也不对。选 D 所描述的动态大小和 journal/ 目录名不属于 Prometheus 的实现。"
+        },
+        {
+          "id": "mon-prom-adv-wal-quiz5",
+          "question": "以下是 Prometheus 启动日志的一段摘录，从中可以得出什么结论？\n\n```\nts=... msg=\"WAL segment loaded\" segment=147 maxSegment=150\nts=... msg=\"WAL segment loaded\" segment=148 maxSegment=150\nts=... msg=\"WAL segment loaded\" segment=149 maxSegment=150\nts=... msg=\"WAL segment loaded\" segment=150 maxSegment=150\nts=... msg=\"WAL replay completed\" checkpoint_replay_duration=1.204s wal_replay_duration=48.565s total_replay_duration=49.769s\n```",
+          "choices": [
+            {"id": "A", "text": "需要重放 4 个 WAL segment（147-150），总恢复时间约 50 秒，其中 checkpoint 恢复仅 1.2 秒说明 checkpoint 机制有效减少了需要重放的数据量"},
+            {"id": "B", "text": "WAL 总共只有 4 个 segment 文件，说明这个 Prometheus 实例的数据量很小，启动慢是因为磁盘 I/O 太差"},
+            {"id": "C", "text": "segment 147-150 都是损坏的文件，Prometheus 花了 50 秒尝试修复后放弃了"},
+            {"id": "D", "text": "50 秒的重放时间说明 WAL 机制有严重的性能问题，应该考虑禁用 WAL 以加快启动"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这段日志清楚地展示了 WAL 重放流程。首先 checkpoint 重放用了 1.204 秒（checkpoint_replay_duration），这一步快速恢复了所有活跃序列的元数据。然后重放了 segment 147 到 150 共 4 个 segment 文件，用了 48.565 秒（wal_replay_duration）。4 个 segment 意味着需要重放约 512MB 的 WAL 数据（4 × 128MB）。checkpoint 编号是 146（因为重放从 147 开始），说明 146 及之前的 segment 已经被 checkpoint 覆盖并删除了——这正是 checkpoint 减少重放量的效果。选 B 判断错误，4 个 segment 是 checkpoint 之后剩余的数量，不代表总量小。选 C 错误，这是正常的重放日志不是错误修复。选 D 错误，WAL 是不可禁用的核心组件，没有 WAL 崩溃后数据就真丢了。"
+        },
+        {
+          "id": "mon-prom-adv-wal-quiz6",
+          "question": "关于 Prometheus WAL 的持久化保证，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "WAL 对每次 Commit 都执行 fsync，确保数据一定写入物理磁盘，即使断电也不会丢任何数据"},
+            {"id": "B", "text": "WAL 默认依赖操作系统 page cache 异步刷盘，进程崩溃不丢数据，但操作系统崩溃或断电可能丢失最后几秒在 page cache 中未刷盘的数据"},
+            {"id": "C", "text": "WAL 每隔 5 分钟做一次批量刷盘，两次刷盘之间的数据如果进程崩溃就会丢失"},
+            {"id": "D", "text": "WAL 数据先写入 SHM（共享内存）再由守护进程异步写入磁盘，进程崩溃后守护进程会补写未落盘的数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个容易被忽略的生产细节。Prometheus 的 WAL 在默认配置下并不对每次 Commit 执行 fsync 系统调用，而是将数据写入操作系统的 page cache 后就返回成功。page cache 中的数据由内核的 pdflush/writeback 线程在后台异步刷到物理磁盘。这意味着如果是 Prometheus 进程自身崩溃（被 OOM Killer 杀死、段错误等），page cache 中的数据仍然会被内核刷到磁盘，所以不会丢数据。但如果是操作系统级别的崩溃（内核 panic、物理断电），page cache 中尚未刷盘的数据会丢失，通常是最后几秒的样本。选 A 说每次都 fsync 是错误的，那样会严重影响写入性能。选 C 的 5 分钟间隔不是 Prometheus 的实际行为。选 D 描述的 SHM 加守护进程模式完全不是 Prometheus 的实现方式。"
+        },
+        {
+          "id": "mon-prom-adv-wal-quiz7",
+          "question": "WAL 的 checkpoint 机制解决了什么问题？",
+          "choices": [
+            {"id": "A", "text": "解决 WAL segment 删除后活跃序列的 Series Record 丢失问题——checkpoint 保存所有仍活跃序列的元数据，使旧 segment 可以安全删除而不影响重启恢复"},
+            {"id": "B", "text": "解决 WAL 文件损坏问题——checkpoint 是 WAL 的完整镜像备份，损坏时可以从 checkpoint 恢复"},
+            {"id": "C", "text": "解决 Prometheus 多实例数据同步问题——checkpoint 作为共享的数据快照在实例间传递"},
+            {"id": "D", "text": "解决查询性能问题——checkpoint 是 WAL 数据的索引，查询时先查 checkpoint 再定位到具体的 WAL segment"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "checkpoint 解决的核心问题是：WAL truncation 需要删除旧 segment 以释放磁盘空间，但旧 segment 中可能包含仍然活跃的序列的 Series Record（ref ID → labels 映射）。如果直接删除这些 segment，重启时就无法重建这些序列的元数据，导致 Samples Record 中的 ref ID 无法映射到对应的标签集合。checkpoint 通过提前扫描待删除的 segment，将所有仍活跃序列的 Series Record 提取到一个紧凑的 checkpoint 目录中，使旧 segment 可以安全删除。同时 checkpoint 只保留必要的数据，体积远小于原始 segment 总和，加快了重启时的恢复速度。选 B 错误，checkpoint 不是 WAL 的完整备份，它只包含活跃序列的元数据。选 C 错误，checkpoint 是单实例的本地机制。选 D 错误，WAL 不参与查询路径。"
+        },
+        {
+          "id": "mon-prom-adv-wal-quiz8",
+          "question": "你负责的 Prometheus 实例每次重启需要 3 分钟才能完成 WAL 重放，导致监控有较长的空白窗口。以下哪个措施最能有效缩短 WAL 重放时间？",
+          "choices": [
+            {"id": "A", "text": "将 --storage.tsdb.min-block-duration 从默认的 2h 减小到 1h，使 head compaction 更频繁，减少 WAL 积累量"},
+            {"id": "B", "text": "增加 --storage.tsdb.retention.time 的值，让更多数据保留在 persistent block 中"},
+            {"id": "C", "text": "将 scrape_interval 从 15s 增大到 60s 以减少 Samples Record 数量——但这会降低监控精度"},
+            {"id": "D", "text": "删除 wal/ 目录下的所有文件让 Prometheus 从零开始——启动最快但会丢失 head block 数据"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "WAL 重放时间直接取决于需要重放的 WAL 数据量，而 WAL 的积累量与 head compaction 的频率密切相关。--storage.tsdb.min-block-duration 控制 head block 的最小时间跨度，默认 2h 意味着至少要累积 2 小时的数据才触发一次 compaction 和 WAL truncation。减小到 1h 后，compaction 和 truncation 频率加倍，WAL 中积累的未被清理的数据量大约减半，重放时间相应缩短。但这个改动的代价是 compaction 频率增加导致更多的磁盘 I/O。选 B 完全无关，retention 影响的是 persistent block 的保留时间，不影响 WAL 大小。选 C 虽然有效但代价太大，监控精度下降通常不可接受。选 D 能让启动变快但会丢失所有未持久化的数据，是破坏性操作而非优化。"
+        },
+        {
+          "id": "mon-prom-adv-wal-quiz9",
+          "question": "Prometheus 2.32+ 的 Agent Mode 对 WAL 的使用方式与普通模式有什么核心区别？",
+          "choices": [
+            {"id": "A", "text": "Agent Mode 将 WAL 作为唯一存储后端，不建 head block 不做 compaction，WAL truncation 与 Remote Write 发送进度同步而非与 head compaction 同步"},
+            {"id": "B", "text": "Agent Mode 完全不使用 WAL，所有采集到的数据直接通过 Remote Write 发送到远端，不做任何本地持久化"},
+            {"id": "C", "text": "Agent Mode 使用双倍大小的 WAL segment（256MB）和更频繁的 checkpoint 来支持更高的吞吐量"},
+            {"id": "D", "text": "Agent Mode 将 WAL 替换为 SQLite 数据库，以支持更灵活的本地查询和数据管理"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Agent Mode 从根本上改变了 WAL 的角色和生命周期管理。在普通模式下，WAL 是 head block 的持久化保障，truncation 与 head compaction 同步。在 Agent Mode 下，Prometheus 不构建 head block，不做 compaction，不创建 persistent block，也不支持本地 PromQL 查询。WAL 成为唯一的本地存储：scrape 到的数据写入 WAL，Remote Write 组件从 WAL 中读取数据发送到远端存储，当数据成功发送后对应的 WAL segment 才被截断。此外 Agent Mode 的 WAL 不记录 Tombstones Record，因为没有本地存储可以执行删除操作。选 B 错误，Agent Mode 仍然使用 WAL 作为 Remote Write 的缓冲，而非直接发送。选 C 的 256MB segment 不正确。选 D 的 SQLite 完全不是 Prometheus 的实现。"
+        },
+        {
+          "id": "mon-prom-adv-wal-quiz10",
+          "question": "Prometheus 启动时日志显示 WAL segment 149 的 CRC32 校验失败，以下哪种处理方式最合适？",
+          "choices": [
+            {"id": "A", "text": "Prometheus 会自动跳过 segment 149 中损坏的 record 及其后续 record，继续重放 segment 150，启动完成后打印 warning 日志。损坏的 segment 中部分数据会丢失但服务可用"},
+            {"id": "B", "text": "Prometheus 会自动回滚到上一个 checkpoint 的状态，放弃所有 checkpoint 之后的 WAL 数据，然后正常启动"},
+            {"id": "C", "text": "Prometheus 会拒绝启动并进入维护模式，等待管理员手动运行 promtool tsdb repair-wal 修复后才能启动"},
+            {"id": "D", "text": "Prometheus 会自动从其他 Prometheus 副本拉取缺失的数据来填补损坏 segment 导致的数据空洞"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Prometheus 对 WAL 损坏采用的是「尽力恢复」策略。当重放过程中某条 record 的 CRC32 校验失败时，TSDB 会认为这条记录以及该 segment 文件中后续的所有记录都不可信（因为 WAL 是顺序追加的，一条记录损坏意味着后续数据的偏移量可能也不正确），跳过这些记录并打印 warning 日志。但 TSDB 会继续重放下一个 segment 文件（如 150），因为每个 segment 是独立的文件，150 的起始位置是可以确定的。最终的结果是丢失了 segment 149 中从损坏点到文件末尾的数据，但 Prometheus 仍能正常启动和服务。选 B 描述的全量回滚不是实际行为，Prometheus 会尽量恢复更多数据。选 C 错误，Prometheus 不会因为 WAL 部分损坏就拒绝启动。选 D 错误，Prometheus 原生不支持实例间的数据同步修复。"
+        }
+      ],
+      "references": [
+        "https://prometheus.io/docs/prometheus/latest/storage/",
+        "https://ganeshvernekar.com/blog/prometheus-tsdb-wal-and-checkpoint/",
+        "https://ganeshvernekar.com/blog/prometheus-tsdb-the-head-block/",
+        "https://prometheus.io/docs/prometheus/latest/feature_flags/#prometheus-agent",
+        "https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write"
+      ]
+    }
+  ]
+}
