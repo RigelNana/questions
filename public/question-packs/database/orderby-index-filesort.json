@@ -1,0 +1,156 @@
+{
+  "id": "db-orderby-index-filesort",
+  "name": "ORDER BY 与索引避免 filesort",
+  "domain": "database",
+  "description": "ORDER BY 如何利用索引避免 filesort 及排序优化的完整策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q036",
+      "domain": "database",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["MySQL", "ORDER BY", "filesort", "索引", "排序优化"],
+      "title": "ORDER BY 与索引的关系：如何避免 filesort？",
+      "content": "你负责的一个订单系统上线两个月后，运营反馈「最新订单列表页」越来越慢。这是核心业务页面，每天被访问超过 8 万次。你拿到慢查询日志发现罪魁祸首是这条 SQL，在 500 万行的 orders 表上平均耗时 1.8 秒：\n\n```sql\nSELECT id, user_id, product_name, amount, status, created_at\nFROM orders\nWHERE status = 1\nORDER BY created_at DESC\nLIMIT 20;\n```\n\n表结构如下：\n\n```sql\nCREATE TABLE orders (\n  id BIGINT AUTO_INCREMENT PRIMARY KEY,\n  user_id BIGINT NOT NULL,\n  product_name VARCHAR(200) NOT NULL,\n  amount DECIMAL(10,2) NOT NULL,\n  status TINYINT NOT NULL DEFAULT 1 COMMENT '1=待支付 2=已支付 3=已取消',\n  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  INDEX idx_status (status),\n  INDEX idx_created_at (created_at)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n```\n\n你跑了 EXPLAIN，结果让你皱眉：\n\n```\n+----+------+------------+------+---------+------+--------+-----------------------------+\n| id | type | key        | len  | ref     | rows | filt   | Extra                       |\n+----+------+------------+------+---------+------+--------+-----------------------------+\n|  1 | ref  | idx_status | 1    | const   | 2.4M | 100.00 | Using filesort              |\n+----+------+------------+------+---------+------+--------+-----------------------------+\n```\n\nMySQL 选择了 idx_status 索引定位 status=1 的记录，但 Extra 列赫然写着「Using filesort」。这意味着 MySQL 从索引中找到约 240 万条 status=1 的记录后，必须把它们全部拉出来做一次内存或磁盘排序，才能拿到按 created_at 降序的前 20 条。240 万行数据的排序，耗时 1.8 秒就不奇怪了。\n\n你可能会想：表上已经有 idx_created_at 索引了，MySQL 为什么不直接用它？你把 idx_status 删掉再跑 EXPLAIN，发现 MySQL 改走了 idx_created_at 的全索引扫描，虽然不需要 filesort 了，但要反向遍历整棵索引找 status=1 的记录，遇到 status≠1 的就跳过，效率同样很差。似乎两个单列索引都解决不了问题。\n\n问题来了：为什么 ORDER BY 有时候能利用索引的有序性直接返回结果，有时候又必须 filesort？到底什么条件下 ORDER BY 才能「免排序」？如何设计索引让这条慢查询从 1.8 秒降到 1 毫秒以内？请从 MySQL 排序的底层机制出发，系统地讲解 ORDER BY 与索引的关系、filesort 的工作原理、以及生产环境中避免 filesort 的完整策略。",
+      "answer": "## ORDER BY 排序与索引：从基础到生产级排序优化\n\n### ORDER BY 是什么，MySQL 怎么执行排序\n\nORDER BY 是 SQL 中用于控制结果集排列顺序的子句，几乎所有面向用户的查询都会用到它——最新的订单、最热的文章、最近的消息，背后都是 ORDER BY。在 MySQL（本文以 InnoDB 存储引擎为讨论基础）中，执行一条带 ORDER BY 的查询时，优化器面临两条路径：第一条路径是利用索引的有序性（Index Ordering），如果恰好有一棵 B+ 树索引的叶子节点排列顺序和 ORDER BY 要求的顺序一致，MySQL 直接按顺序读取索引即可，不需要任何额外的排序操作；第二条路径就是 filesort，优化器判断没有任何索引能满足排序需求时，就会把符合 WHERE 条件的所有记录取出来，在内存中（或临时磁盘文件中）执行排序算法，再返回排好序的结果。EXPLAIN 输出中 Extra 列出现「Using filesort」就是走了第二条路径。\n\n这里有一个非常常见的误解需要纠正：filesort 中的「file」不是说一定要写磁盘文件。MySQL 会优先在内存的 sort buffer（大小由 sort_buffer_size 参数控制，默认 256KB）中完成排序。只有当需要排序的数据量超过 sort buffer 容量时，MySQL 才会把数据切分成多个有序的临时块写到磁盘，最终做一次多路归并排序。所以 filesort 的真正含义是「MySQL 自己做的排序」，跟是否真正涉及文件 IO 无关。但不管是内存排序还是磁盘排序，filesort 相比直接利用索引有序性都有额外的 CPU 和内存开销，在数据量大的场景下这个开销非常可观——这就是为什么我们要尽力避免它。\n\n一个最基本的利用索引避免 filesort 的例子是：如果表上有 `INDEX idx_created_at (created_at)`，执行 `SELECT * FROM orders ORDER BY created_at DESC LIMIT 20` 时，MySQL 可以直接从 idx_created_at 的叶子节点最右端开始反向扫描 20 条记录，利用 B+ 树叶子节点的双向链表直接获得有序结果，Extra 列会显示「Using index」或者什么都不显示（表示自然有序，无需额外操作），而不是「Using filesort」。\n\n### 深入排查：为什么你的 ORDER BY 会 filesort\n\n回到开头的问题。那条慢查询 `WHERE status = 1 ORDER BY created_at DESC` 在 500 万行表上出现 filesort，核心原因是 WHERE 和 ORDER BY 分别用到了不同的列，而两个单列索引谁也无法同时满足筛选和排序两个需求。MySQL 优化器的决策逻辑是这样的：如果走 idx_status，可以精准定位 status=1 的记录（约 240 万行），但这些记录在 idx_status 这棵 B+ 树上是按 status 排序的，不是按 created_at 排序的，所以必须 filesort；如果走 idx_created_at，记录确实按 created_at 排好了序，但 MySQL 不知道哪些记录的 status=1，只能一条一条扫描判断，遇到 status≠1 的就跳过，最坏情况下可能要扫完整棵索引才能凑够 20 条。优化器综合评估后选择了 idx_status + filesort 这条路径，因为它至少能把数据范围缩小到 240 万行。\n\n这就引出了一条核心规则：ORDER BY 想要利用索引的有序性，WHERE 中的等值条件列和 ORDER BY 的排序列必须共同构成某个索引的最左前缀。具体来说，如果你有一个联合索引 `(a, b, c)`，那么以下模式都能利用这个索引直接有序输出而避免 filesort：\n\n```sql\n-- 模式 1：ORDER BY 列就是索引的最左前缀\nORDER BY a\nORDER BY a, b\nORDER BY a, b, c\n\n-- 模式 2：WHERE 的等值条件「补齐」了前缀，ORDER BY 接上后续列\nWHERE a = 1 ORDER BY b\nWHERE a = 1 AND b = 2 ORDER BY c\nWHERE a = 1 ORDER BY b, c\n```\n\n原理是 B+ 树的叶子节点按 (a, b, c) 的字典序排列。当 a=1 固定时，所有 a=1 的记录在索引中天然按 b 排序；当 a=1 且 b=2 时，这些记录天然按 c 排序。等值条件相当于在索引有序性的基础上「固定了前缀」，让后续列的有序性得以延续。\n\n所以，解决开头那条慢查询的方案就清晰了——创建联合索引 `(status, created_at)`：\n\n```sql\nALTER TABLE orders ADD INDEX idx_status_created (status, created_at);\n```\n\n加完索引后重新跑 EXPLAIN：\n\n```\n+----+------+--------------------+------+---------+------+------+---------------------+\n| id | type | key                | len  | ref     | rows | filt | Extra               |\n+----+------+--------------------+------+---------+------+------+---------------------+\n|  1 | ref  | idx_status_created | 1    | const   |   20 |  100 | Backward index scan |\n+----+------+--------------------+------+---------+------+------+---------------------+\n```\n\n「Using filesort」消失了。MySQL 在 idx_status_created 这棵 B+ 树上定位到 status=1 的最后一条记录（created_at 最大的那条），然后反向扫描 20 条就够了。rows 从 240 万降到 20，执行时间从 1.8 秒降到 0.3 毫秒。这就是联合索引的等值前缀加排序后缀模式——面试中最高频的索引设计考点之一。\n\n### filesort 的内部实现：单次排序与双次排序\n\n当 filesort 不可避免时（比如 ORDER BY 包含计算表达式），了解 MySQL 的排序算法有助于做针对性优化。MySQL 内部有两种 filesort 算法。\n\n第一种是双次排序（Two-Pass / Original Algorithm），也叫回表排序。MySQL 只把排序键（ORDER BY 的列值）和行指针（主键或 rowid）放进 sort buffer，排序完成后再根据行指针回表取出完整的行数据。这种方式 sort buffer 能容纳更多记录（因为每条记录只占排序键 + 8 字节指针），但排序后需要大量随机 IO 回表读数据。\n\n第二种是单次排序（Single-Pass / Modified Algorithm），也叫全列排序。MySQL 把查询需要的所有列都放进 sort buffer 一起排序，排序完成后直接输出结果，不需要回表。这种方式省掉了回表的随机 IO，但每条记录在 sort buffer 中占用的空间更大，sort buffer 能容纳的记录数更少。\n\nMySQL 通过 max_sort_length（默认 1024 字节，MySQL 8.0 中改名为 max_length_for_sort_data 已在 8.0.20 废弃）来决定用哪种算法：如果查询所有列的总长度不超过这个阈值，就用单次排序；超过了就退化为双次排序。在 MySQL 8.0.20+ 中，优化器会自动根据实际行大小和 sort_buffer_size 动态选择算法。\n\nsort_buffer_size 的调优也有讲究。这个参数是每个连接独享的，不是全局共享的。如果你有 500 个并发连接，把 sort_buffer_size 从 256KB 调到 8MB，最坏情况下仅排序缓冲区就要消耗 500 × 8MB = 4GB 内存。生产环境中建议保持默认 256KB 或适度调到 1-2MB，对于确实需要大排序的特定 SQL 可以在会话级别单独设置 `SET SESSION sort_buffer_size = 4 * 1024 * 1024`。\n\n### filesort 不可避免的典型场景\n\n有几种情况下，无论怎么设计索引都无法消除 filesort，必须了然于胸。\n\n第一种是 ORDER BY 表达式而非列。比如 `ORDER BY price * discount` 或 `ORDER BY YEAR(created_at)`，索引存储的是列的原始值而非计算结果，无法直接提供表达式的有序性。MySQL 8.0.13 引入了函数索引（Functional Index），可以针对表达式创建索引：`ALTER TABLE products ADD INDEX idx_final_price ((price * discount))`，但仅限于确定性表达式。\n\n第二种是混合 ASC/DESC 排序。在 MySQL 8.0.1 之前，B+ 树索引只支持单一方向的排序。`ORDER BY a ASC, b DESC` 即使有联合索引 (a, b)，也必须 filesort，因为索引中 a 和 b 的排列方向都是升序。MySQL 8.0.1 引入了降序索引（Descending Index），允许你在建索引时指定方向：`CREATE INDEX idx_a_b ON t(a ASC, b DESC)`，从而让 `ORDER BY a ASC, b DESC` 也能直接利用索引有序性。\n\n第三种是 WHERE 范围条件加 ORDER BY 不同列。比如 `WHERE created_at > '2024-01-01' ORDER BY amount DESC`，假设有索引 (created_at, amount)，created_at 的范围条件破坏了 amount 在索引中的有序性——因为不同 created_at 值下的 amount 是各自有序的，合在一起就不是全局有序的了。这种查询只能在范围过滤后对结果做 filesort。\n\n第四种是 ORDER BY 的列来自不同表。在 JOIN 查询中，如果 ORDER BY 混合了来自多张表的列，比如 `ORDER BY t1.name, t2.score`，没有任何单表索引能满足跨表排序需求。\n\n### MySQL 8.0 降序索引：彻底解决混合排序\n\n降序索引是 MySQL 8.0 最重要的索引增强之一。在 8.0 之前，`CREATE INDEX idx ON t(a DESC)` 虽然语法上不报错，但 MySQL 内部会默默忽略 DESC 关键字，实际创建的还是升序索引。从 MySQL 8.0.1 开始，DESC 真正生效了。来看一个实际例子：\n\n```sql\nCREATE TABLE leaderboard (\n  id BIGINT AUTO_INCREMENT PRIMARY KEY,\n  game_id INT NOT NULL,\n  score INT NOT NULL,\n  play_time DATETIME NOT NULL\n);\n\n-- 需求：同一个游戏内，按分数从高到低排，分数相同按时间从早到晚排\n-- ORDER BY game_id ASC, score DESC, play_time ASC\n\n-- MySQL 5.7: 这个索引无法避免 filesort\nCREATE INDEX idx_old ON leaderboard(game_id, score, play_time);\n\n-- MySQL 8.0.1+: 降序索引完美匹配\nCREATE INDEX idx_new ON leaderboard(game_id ASC, score DESC, play_time ASC);\n```\n\n在 MySQL 8.0.33 上验证：\n\n```sql\nEXPLAIN SELECT * FROM leaderboard\nWHERE game_id = 100\nORDER BY score DESC, play_time ASC\nLIMIT 50;\n\n-- 使用 idx_new 时:\n-- type: ref | key: idx_new | Extra: NULL（无 filesort）\n-- 使用 idx_old 时:\n-- type: ref | key: idx_old | Extra: Using filesort\n```\n\n### LIMIT 与排序的协同优化\n\n当 ORDER BY 配合 LIMIT 使用时，MySQL 有一个重要的优化：即使需要 filesort，如果有 LIMIT N，MySQL 不会对全部数据做完整排序，而是使用优先队列（Priority Queue / Heap Sort）只维护 TOP N 条记录。这在 MySQL 5.6+ 中引入，EXPLAIN 的 Extra 列有时会显示「Using filesort; Using priority queue」。但这个优化的前提是 N 足够小且排序所需内存不超过 sort_buffer_size。\n\n更值得关注的是，当索引能同时覆盖 WHERE 和 ORDER BY 时，LIMIT 的优化效果是质变级别的。回到我们最初的例子，联合索引 idx_status_created 让 MySQL 只需要扫描 20 条索引记录就能返回结果，而不需要读取 240 万行再排序取前 20。这种「索引有序 + LIMIT 截断」的组合是分页查询性能的基石。\n\n### 生产环境中的排序监控与调优\n\n在生产环境中，你需要知道系统里有多少 filesort 操作以及它们的开销。MySQL 提供了两个状态变量来跟踪：`Sort_merge_passes` 表示 filesort 期间因为 sort buffer 不够用而做的磁盘归并次数——如果这个值持续增长，说明有大量数据排序溢出到磁盘了；`Sort_rows` 表示被排序的总行数。你可以通过 `SHOW GLOBAL STATUS LIKE 'Sort%'` 查看这些指标。\n\n如果你需要深入了解优化器为什么选择 filesort 而不是利用索引，MySQL 的 OPTIMIZER_TRACE 是最强的诊断工具：\n\n```sql\nSET optimizer_trace = 'enabled=on';\nSELECT id, created_at FROM orders WHERE status = 1 ORDER BY created_at DESC LIMIT 20;\nSELECT * FROM information_schema.OPTIMIZER_TRACE\\G\nSET optimizer_trace = 'enabled=off';\n```\n\n在 trace 输出的 `reconsidering_access_paths_for_index_ordering` 部分，你能看到优化器评估过哪些索引用于排序、每个索引的预估代价是多少、最终为什么选择了当前方案。这比盲猜 EXPLAIN 的结果要精准得多。\n\n在 MySQL 8.0 的 performance_schema 中，`events_statements_summary_by_digest` 表记录了每类 SQL 的 `SUM_SORT_MERGE_PASSES`、`SUM_SORT_ROWS`、`SUM_SORT_SCAN`、`SUM_SORT_RANGE` 等排序统计指标，可以精确到具体 SQL 语句级别来定位排序开销最大的查询。\n\n### 面试高频追问与应答要点\n\n面试中「给你一条 SQL，设计索引来避免 filesort」是经典题型。核心应答思路是：先看 WHERE 中有没有等值条件，等值条件列放在联合索引的最前面；然后看 ORDER BY 的列，紧接在等值列后面放；如果还需要覆盖索引，把 SELECT 中的其他列追加在最后面。这就是经典的 ESA 原则——Equality 等值列在前，Sort 排序列在中，Access 访问列（覆盖）在后。\n\n例如 `WHERE user_id = ? AND status = 1 ORDER BY created_at DESC` 的最优索引是 `(user_id, status, created_at)`。user_id 和 status 是等值条件固定前缀，created_at 接在后面利用有序性避免 filesort。如果查询只需要 id 和 created_at，还可以进一步设计成覆盖索引 `(user_id, status, created_at, id)`——虽然 InnoDB 二级索引的叶子节点本身就包含主键 id，但显式写出来更清晰。\n\n最后一个加分点：B+ 树索引天然支持反向扫描（Backward Index Scan）。`ORDER BY created_at DESC` 用升序索引 (created_at ASC) 依然可以避免 filesort，MySQL 会从叶子节点的最右端开始反向遍历。在 MySQL 8.0 的 EXPLAIN 中你会看到 Extra 列显示「Backward index scan」。但反向扫描在某些边界场景下性能略低于正向扫描（约 5-15%），如果业务上绝大多数查询都是 DESC 排序，直接创建 DESC 索引是更优的选择。",
+      "keyPoints": [
+        "filesort 不等于磁盘排序，它是 MySQL 在 sort buffer 中执行的排序操作，只有数据超过 sort_buffer_size 时才溢出到磁盘做多路归并",
+        "ORDER BY 利用索引有序性的核心条件是：WHERE 等值条件列 + ORDER BY 列共同构成某个联合索引的最左前缀，等值条件固定前缀后排序列延续有序性",
+        "联合索引设计遵循 ESA 原则：Equality 等值列在前、Sort 排序列在中、Access 覆盖列在后，这是避免 filesort 的索引设计黄金法则",
+        "MySQL 8.0.1 引入真正的降序索引（Descending Index），之前版本 CREATE INDEX 中的 DESC 会被静默忽略，混合 ASC/DESC 的 ORDER BY 在 8.0 之前必定 filesort",
+        "WHERE 范围条件会破坏后续列在索引中的有序性，因此 WHERE col_a > X ORDER BY col_b 无法利用联合索引 (col_a, col_b) 避免 filesort",
+        "MySQL 有两种 filesort 算法：单次排序把所有列放入 sort buffer 一次完成，双次排序只放排序键和 rowid 排完后再回表取数据，由行宽度自动选择",
+        "OPTIMIZER_TRACE 的 reconsidering_access_paths_for_index_ordering 部分能精确展示优化器评估排序路径的决策过程，是排查 filesort 问题的终极工具",
+        "B+ 树索引天然支持反向扫描（Backward Index Scan），ORDER BY col DESC 用 ASC 索引也能避免 filesort，但性能比正向扫描低约 5-15%"
+      ],
+      "quiz": [
+        {
+          "id": "db-q036-quiz-1",
+          "question": "关于 MySQL 中的 filesort，以下哪个说法是正确的？",
+          "choices": [
+            { "id": "A", "text": "filesort 一定会把数据写到磁盘临时文件中进行排序" },
+            { "id": "B", "text": "filesort 是 MySQL 在 sort buffer 中执行的排序操作，仅在数据超出 sort buffer 容量时才溢出到磁盘" },
+            { "id": "C", "text": "filesort 只在没有任何索引的表上才会出现" },
+            { "id": "D", "text": "filesort 是 InnoDB 存储引擎层面的排序机制，MyISAM 不会出现 filesort" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "filesort 中的「file」极具误导性，让很多人以为它一定涉及磁盘 IO。实际上 MySQL 会优先在内存的 sort buffer（由 sort_buffer_size 控制，默认 256KB）中完成排序，只有当需要排序的数据量超过 sort buffer 容量时，才会分批写到磁盘临时文件再做归并排序。A 选项误以为 filesort 必定写磁盘。C 选项不对，即使表上有索引，如果索引的有序性无法满足 ORDER BY 的需求，MySQL 照样会 filesort。D 选项也不对，filesort 是 MySQL Server 层的排序机制，与存储引擎无关，MyISAM 同样会出现。"
+        },
+        {
+          "id": "db-q036-quiz-2",
+          "question": "有联合索引 (a, b, c)，以下哪条 SQL 能利用这个索引避免 filesort？",
+          "choices": [
+            { "id": "A", "text": "WHERE a = 1 ORDER BY c" },
+            { "id": "B", "text": "WHERE a = 1 ORDER BY b, c" },
+            { "id": "C", "text": "WHERE b = 1 ORDER BY a" },
+            { "id": "D", "text": "WHERE a = 1 ORDER BY c, b" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "联合索引 (a, b, c) 的叶子节点按 a → b → c 的字典序排列。当 a=1 固定后，所有 a=1 的记录在索引中天然按 (b, c) 排序，因此 `WHERE a = 1 ORDER BY b, c` 完美匹配索引有序性，无需 filesort。A 选项中 a=1 固定后记录按 b 排序，但 ORDER BY c 跳过了 b 列，不符合最左前缀原则，必须 filesort。C 选项的 WHERE 条件在 b 列上而不是 a 列上，无法利用联合索引的最左前缀。D 选项的 ORDER BY c, b 顺序与索引列的顺序 (b, c) 相反，索引无法直接提供这种排列顺序。"
+        },
+        {
+          "id": "db-q036-quiz-3",
+          "question": "MySQL 的 filesort 有两种内部算法，关于单次排序（Single-Pass）和双次排序（Two-Pass）的区别，以下说法正确的是哪个？",
+          "choices": [
+            { "id": "A", "text": "单次排序把所有查询列放入 sort buffer 一起排序，排序后直接返回结果无需回表；双次排序只放排序键和 rowid，排完后再回表取完整数据" },
+            { "id": "B", "text": "单次排序只对主键排序，双次排序对主键和二级索引同时排序" },
+            { "id": "C", "text": "单次排序意味着只做一轮比较就完成排序，双次排序需要做两轮比较" },
+            { "id": "D", "text": "单次排序适用于 InnoDB，双次排序专用于 MyISAM" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "MySQL filesort 的两种算法区别在于放入 sort buffer 的数据内容不同。单次排序（也叫 Modified Algorithm）把查询需要的所有列值都放进 sort buffer，排完序直接输出，优点是不需要回表，缺点是每条记录占用空间大，sort buffer 能容纳的记录数少。双次排序（也叫 Original Algorithm）只把排序键和行指针放进去，排完后再根据行指针回表取完整数据，优点是 sort buffer 能装更多记录，缺点是多了一轮回表的随机 IO。B 选项混淆了排序内容，C 选项误解了「单次/双次」的含义（指的是访问数据的次数而非比较轮次），D 选项错误地把算法和存储引擎绑定。"
+        },
+        {
+          "id": "db-q036-quiz-4",
+          "question": "关于 WHERE 范围条件对 ORDER BY 索引有序性的影响，以下哪种说法是正确的？",
+          "choices": [
+            { "id": "A", "text": "WHERE a > 10 ORDER BY b 可以利用联合索引 (a, b) 避免 filesort，因为 a 和 b 都在索引中" },
+            { "id": "B", "text": "WHERE a > 10 ORDER BY b 即使有联合索引 (a, b) 也必须 filesort，因为 a 的范围条件破坏了 b 在索引中的全局有序性" },
+            { "id": "C", "text": "WHERE a > 10 ORDER BY a, b 会导致 filesort，因为 WHERE 和 ORDER BY 都包含了 a 列产生冲突" },
+            { "id": "D", "text": "范围条件和 ORDER BY 之间没有关系，只要列都在索引中就不会 filesort" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个高频考点。联合索引 (a, b) 的叶子节点按 a → b 字典序排列：a=10 的记录内部按 b 排序，a=11 的记录内部也按 b 排序，但 a=10 的最后一条 b 值可能是 999，而 a=11 的第一条 b 值可能是 1。因此当 a 是范围条件（a > 10）时，不同 a 值对应的 b 值各自有序但整体无序，ORDER BY b 无法利用索引有序性，必须 filesort。A 选项犯了「列在索引中就一定能避免 filesort」的常见错误。C 选项说反了，ORDER BY a, b 与索引顺序一致，范围条件 a > 10 实际上可以利用索引有序性。D 选项忽略了范围条件对后续列有序性的破坏。"
+        },
+        {
+          "id": "db-q036-quiz-5",
+          "question": "以下 EXPLAIN 输出的 Extra 列信息中，哪一条说明查询成功利用了索引有序性避免了 filesort？\n\n```\nA: Extra: Using filesort\nB: Extra: Using index; Using filesort\nC: Extra: Backward index scan\nD: Extra: Using index condition\n```",
+          "choices": [
+            { "id": "A", "text": "A — Using filesort 说明 MySQL 做了额外排序但仍然利用了索引" },
+            { "id": "B", "text": "B — Using index 和 Using filesort 同时出现说明覆盖索引排序" },
+            { "id": "C", "text": "C — Backward index scan 说明 MySQL 利用索引的反向扫描获取有序结果，没有 filesort" },
+            { "id": "D", "text": "D — Using index condition 说明排序条件下推到索引层面执行了" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "「Backward index scan」是 MySQL 8.0 新增的 EXPLAIN 输出信息，表示 MySQL 利用 B+ 树索引的反向扫描来获取降序结果，这说明排序完全由索引有序性提供，没有发生 filesort。A 选项中「Using filesort」明确表示需要额外排序，恰恰是没有利用索引有序性的标志。B 选项中「Using index」表示覆盖索引，但同时出现「Using filesort」说明虽然不需要回表但仍然需要排序——索引覆盖了查询列并不代表索引提供了排序。D 选项的「Using index condition」是索引条件下推（ICP）的标志，表示 WHERE 条件的一部分在索引层面提前过滤，与排序无关。"
+        },
+        {
+          "id": "db-q036-quiz-6",
+          "question": "在 MySQL 5.7 中执行 CREATE INDEX idx ON t(a ASC, b DESC)，关于 DESC 关键字的效果，以下哪个说法正确？",
+          "choices": [
+            { "id": "A", "text": "MySQL 5.7 会正确创建降序索引，b 列按降序存储在 B+ 树中" },
+            { "id": "B", "text": "MySQL 5.7 会报语法错误，因为 DESC 索引在 5.7 中不受支持" },
+            { "id": "C", "text": "MySQL 5.7 语法上接受 DESC 但会静默忽略它，实际创建的仍然是 (a ASC, b ASC) 索引" },
+            { "id": "D", "text": "MySQL 5.7 会创建两棵索引树，一棵升序一棵降序" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个非常经典的坑。在 MySQL 8.0.1 之前（包括 5.7 的所有版本），CREATE INDEX 语法上接受 ASC 和 DESC 关键字不会报错，但 MySQL 内部会静默忽略 DESC，实际创建的索引所有列都是升序排列。这意味着在 5.7 上 ORDER BY a ASC, b DESC 即使有联合索引 (a, b) 也必定 filesort，因为索引的 b 列实际上是升序存储的。MySQL 8.0.1 才真正实现了降序索引，DESC 关键字开始生效。A 选项的错误正是这个坑的核心——很多人以为写了 DESC 就是降序索引。B 选项不对，语法上不会报错。D 选项完全是杜撰的。"
+        },
+        {
+          "id": "db-q036-quiz-7",
+          "question": "关于 sort_buffer_size 参数的调优，以下哪种做法是推荐的？",
+          "choices": [
+            { "id": "A", "text": "全局设置为尽可能大的值（如 128MB），让所有排序都在内存中完成" },
+            { "id": "B", "text": "保持全局默认值（256KB 或适度调到 1-2MB），对特定需要大排序的 SQL 在会话级别单独设置较大值" },
+            { "id": "C", "text": "设为 0 以禁用内存排序，强制所有排序走磁盘以节省内存" },
+            { "id": "D", "text": "在 MySQL 8.0 中 sort_buffer_size 已废弃，排序自动使用自适应内存管理" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "sort_buffer_size 是每个连接独享的内存分配，而不是全局共享池。如果全局设为 128MB，当有 200 个并发连接同时做排序操作时，仅排序缓冲区就可能消耗 200 × 128MB = 25.6GB 内存，极有可能导致 OOM。A 选项的做法在生产环境中非常危险。正确的策略是全局保持保守的默认值（256KB 到 1-2MB），对已知需要处理大数据量排序的特定 SQL，通过 SET SESSION sort_buffer_size = N 在会话级别临时调大。C 选项不合理，设为 0 不会禁用排序而是会报错。D 选项不正确，sort_buffer_size 在 MySQL 8.0 中仍然有效且被使用。"
+        },
+        {
+          "id": "db-q036-quiz-8",
+          "question": "生产环境中一条分页查询 SELECT ... WHERE user_id = ? ORDER BY created_at DESC LIMIT 20 OFFSET 10000 非常慢，你已经有联合索引 (user_id, created_at)，EXPLAIN 没有 filesort，但查询仍需 800ms。最可能的原因和优化方向是什么？",
+          "choices": [
+            { "id": "A", "text": "索引失效了需要重建索引" },
+            { "id": "B", "text": "OFFSET 10000 导致 MySQL 实际扫描了 10020 行索引记录并回表 10020 次，然后丢弃前 10000 行；应改用延迟关联或游标分页避免深度翻页" },
+            { "id": "C", "text": "LIMIT 和 ORDER BY 配合时 MySQL 一定会做全表扫描" },
+            { "id": "D", "text": "DESC 排序比 ASC 慢很多，改为 ASC 就能解决" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是典型的深度分页（Deep Pagination）问题，与 filesort 无关。即使索引完美匹配了 WHERE 和 ORDER BY，LIMIT 20 OFFSET 10000 意味着 MySQL 要先读取 10020 条记录，每条都可能触发回表取完整行数据，然后丢弃前 10000 条只返回最后 20 条。解决方案有两种：一是延迟关联，先用子查询只取主键 `SELECT id FROM ... LIMIT 20 OFFSET 10000`（覆盖索引无需回表），再 JOIN 回主表取完整数据；二是游标分页，让前端传上一页最后一条记录的 created_at 值，改写为 `WHERE user_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT 20`，彻底消除 OFFSET。A 选项的索引重建无法解决深度分页问题，C 和 D 选项都是错误的。"
+        },
+        {
+          "id": "db-q036-quiz-9",
+          "question": "以下哪种场景中 ORDER BY 即使设计了联合索引也无法避免 filesort？",
+          "choices": [
+            { "id": "A", "text": "WHERE a = 1 AND b = 2 ORDER BY c DESC，有索引 (a, b, c)" },
+            { "id": "B", "text": "WHERE a = 1 ORDER BY b LIMIT 10，有索引 (a, b)" },
+            { "id": "C", "text": "SELECT t1.id FROM t1 JOIN t2 ON t1.id = t2.fk ORDER BY t1.score, t2.rank，有 t1 上的索引 (score) 和 t2 上的索引 (rank)" },
+            { "id": "D", "text": "WHERE a = 1 ORDER BY b, c，有索引 (a, b, c)" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "当 ORDER BY 的列来自 JOIN 查询中的不同表时，没有任何单表索引能提供跨表的排序有序性。MySQL 必须先完成 JOIN 操作得到中间结果集，然后对中间结果集做 filesort。这是 filesort 不可避免的经典场景之一。A 选项中 a=1, b=2 固定了索引前两列，记录按 c 排序，DESC 方向可以通过反向扫描（Backward Index Scan）实现，无需 filesort。B 选项中 a=1 固定后记录按 b 排序，LIMIT 10 只需读 10 条，完美利用索引。D 选项中 a=1 固定后记录按 (b, c) 排序，与 ORDER BY b, c 完全匹配。只有 C 选项的跨表排序是必定需要 filesort 的。"
+        },
+        {
+          "id": "db-q036-quiz-10",
+          "question": "你想深入了解 MySQL 优化器为什么对某条 SQL 选择了 filesort 而不是利用索引排序，最精准的诊断工具是什么？",
+          "choices": [
+            { "id": "A", "text": "EXPLAIN ANALYZE，它会显示排序的精确耗时" },
+            { "id": "B", "text": "SHOW PROFILE，它能分解出 filesort 阶段的 CPU 和 IO 消耗" },
+            { "id": "C", "text": "OPTIMIZER_TRACE，它能展示优化器评估每个索引用于排序时的代价对比和最终决策原因" },
+            { "id": "D", "text": "慢查询日志的 Rows_examined 字段，它能直接看出是否做了 filesort" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "OPTIMIZER_TRACE 是 MySQL 提供的优化器决策追踪工具，开启后执行目标 SQL，再查询 information_schema.OPTIMIZER_TRACE 就能看到优化器的完整决策过程。在 trace 输出的 reconsidering_access_paths_for_index_ordering 部分，你能看到优化器评估了哪些索引可用于排序、每个方案的预估代价是多少、最终为什么选择了 filesort 或索引排序。A 选项的 EXPLAIN ANALYZE（MySQL 8.0.18+）确实能显示实际执行时间，但无法展示优化器的决策理由。B 选项的 SHOW PROFILE 已在 MySQL 5.7 中标记为废弃。D 选项的慢查询日志可以看到 Rows_examined 和是否有 filesort 标志，但无法解释优化器为什么选了 filesort。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/order-by-optimization.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/descending-indexes.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/optimizer-trace.html"
+      ]
+    }
+  ]
+}

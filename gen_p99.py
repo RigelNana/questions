@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Generate mon-prom-p99-calculation.json question pack."""
+import json
+import os
+
+content = (
+    "## 为什么 P99 延迟是 SRE 最关注的黄金指标\n\n"
+    "你的团队负责一组部署在 Kubernetes 上的 Go 微服务，一共 20 个 Pod 实例，"
+    "监控栈是 Prometheus 2.53 + Grafana 11。SLO 白纸黑字写着「核心接口 P99 延迟不超过 200ms」。"
+    "后端同事在代码里用 `prometheus/client_golang` 埋了一个 Histogram 类型的延迟指标，"
+    "你 curl 了一个实例的 `/metrics` 端点，看到了下面这段输出：\n\n"
+    "```\n"
+    "# HELP http_request_duration_seconds HTTP request latency in seconds\n"
+    "# TYPE http_request_duration_seconds histogram\n"
+    "http_request_duration_seconds_bucket{handler=\"/api/orders\",le=\"0.05\"} 520\n"
+    "http_request_duration_seconds_bucket{handler=\"/api/orders\",le=\"0.1\"} 3840\n"
+    "http_request_duration_seconds_bucket{handler=\"/api/orders\",le=\"0.15\"} 7620\n"
+    "http_request_duration_seconds_bucket{handler=\"/api/orders\",le=\"0.2\"} 9450\n"
+    "http_request_duration_seconds_bucket{handler=\"/api/orders\",le=\"0.25\"} 9920\n"
+    "http_request_duration_seconds_bucket{handler=\"/api/orders\",le=\"0.3\"} 9970\n"
+    "http_request_duration_seconds_bucket{handler=\"/api/orders\",le=\"0.5\"} 9995\n"
+    "http_request_duration_seconds_bucket{handler=\"/api/orders\",le=\"1.0\"} 9999\n"
+    "http_request_duration_seconds_bucket{handler=\"/api/orders\",le=\"+Inf\"} 10000\n"
+    "http_request_duration_seconds_sum{handler=\"/api/orders\"} 1328.74\n"
+    "http_request_duration_seconds_count{handler=\"/api/orders\"} 10000\n"
+    "```\n\n"
+    "你心里有几个问题。第一，怎么写一条 PromQL 把这个实例的 P99 算出来？"
+    "第二，这条 PromQL 背后的 `histogram_quantile()` 函数到底是怎么做数学计算的"
+    "——它说的「线性插值」是什么意思？"
+    "第三，如果要算 20 个实例的全局 P99（不是每个实例各自的 P99），PromQL 该怎么改？"
+    "第四，为什么有些同事反馈 Grafana 上画出的 P99 曲线有明显的「阶梯感」，跳来跳去不平滑？\n\n"
+    "这道题是 SRE 面试中的高频实操题。面试官不会只满足于你写出 "
+    "`histogram_quantile(0.99, rate(xxx_bucket[5m]))`——他还想听你把插值原理讲明白，"
+    "能用上面这组真实数据手算一遍 P99 的值，并且知道桶边界设计不合理时会出什么问题。"
+    "能把这些讲透的人，会被面试官认为「真的在生产环境做过监控」，而不只是照着文档抄了一条查询。"
+)
+
+answer = (
+    "## 一、PromQL 与 Histogram 延迟度量基础\n\n"
+    "PromQL（Prometheus Query Language）是 Prometheus 内置的函数式查询语言，"
+    "专门用于对时间序列数据做实时查询和聚合计算。它的语法既不像 SQL 那样声明式，"
+    "也不像编程语言那样命令式，而是一种独特的「选择器 + 函数嵌套」风格。"
+    "最基本的查询就是一个指标名加上标签过滤器，比如 "
+    "`http_request_duration_seconds_count{handler=\"/api/orders\"}` "
+    "会返回所有匹配的时间序列的当前值。在此基础上，你可以用 `rate()` 计算速率、"
+    "用 `sum()` 做聚合、用 `histogram_quantile()` 算分位数——"
+    "这些函数可以任意嵌套组合，构成强大的查询表达式。PromQL 是 Grafana 面板、"
+    "Alertmanager 告警规则和 Recording Rule 的统一查询接口，掌握它是做好 Prometheus 监控的前提。\n\n"
+    "在延迟监控领域，平均值是最具误导性的指标。假设 10000 次请求中有 9900 次耗时 50ms、"
+    "100 次耗时 5 秒，平均延迟只有 99.5ms——看起来完全达标，但有 1% 的用户等了 5 秒，体验极差。"
+    "P99（第 99 百分位数，即 99th Percentile）的含义是：将所有请求按延迟从小到大排序，"
+    "排在第 99% 位置的那个值。换句话说，99% 的请求延迟低于 P99，只有最慢的 1% 超过它。"
+    "Google 的 SRE 手册明确推荐用 P50（中位数）、P90、P99 作为延迟类 SLI"
+    "（Service Level Indicator，服务级别指标），因为分位数才能真实反映用户体验的分布情况，"
+    "平均值会把长尾延迟淹没掉。\n\n"
+    "Prometheus 用 Histogram 类型指标支撑分位数计算。Histogram 的核心思想是"
+    "「预设一组桶边界（Bucket Boundary），每次观测值进来时，累加所有上边界 >= 该值的桶计数」。"
+    "比如桶边界是 0.1, 0.2, 0.3，一个 0.15 秒的请求会让 le=\"0.2\"、le=\"0.3\"、le=\"+Inf\" "
+    "三个桶的计数都加 1。这就是所谓的「累积直方图」（Cumulative Histogram）"
+    "——le=\"0.2\" 的值不是「0.1 到 0.2 之间的请求数」，而是「所有延迟 <= 0.2 秒的请求总数」。"
+    "除了桶计数，Histogram 还暴露 `_sum`（所有观测值的总和）和 `_count`（观测次数），"
+    "前者除以后者就是平均值。理解了累积桶这个核心概念，后面 `histogram_quantile()` "
+    "的插值逻辑就很自然了。\n\n"
+    "## 二、histogram_quantile() 函数深度解析\n\n"
+    "### 基本语法与标准 P99 查询\n\n"
+    "`histogram_quantile()` 的函数签名是：\n\n"
+    "```\n"
+    "histogram_quantile(phi float, b instant-vector) -> instant-vector\n"
+    "```\n\n"
+    "第一个参数 phi 是目标分位数，取值 0 到 1 之间（0.99 代表 P99，0.5 代表 P50）。"
+    "第二个参数 b 是一组带有 `le` 标签的 Histogram bucket 时间序列。"
+    "计算单个实例过去 5 分钟的 P99 延迟，标准写法是：\n\n"
+    "```promql\n"
+    "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))\n"
+    "```\n\n"
+    "这里有一个关键点：为什么要套 `rate()`？因为 Histogram 的桶计数是一个只增不减的 Counter"
+    "（累积计数器），从服务启动以来一直在累加。如果不用 `rate()` 转换，"
+    "`histogram_quantile()` 算出来的是从启动到现在的全量 P99，而不是「最近 5 分钟」的 P99。"
+    "`rate(xxx[5m])` 的作用是取过去 5 分钟的增量除以 300 秒，得到每秒的变化速率，"
+    "同时自动处理 Counter 重置（比如服务重启后计数器归零）的情况。对 `histogram_quantile()` 来说，"
+    "它只关心各个桶之间的比例关系，所以用速率值和用增量值的计算结果在数学上是等价的。\n\n"
+    "### 线性插值原理——用真实数据手算 P99\n\n"
+    "我们用题目中 `/metrics` 输出的数据来手动走一遍 `histogram_quantile()` 的计算过程。"
+    "一共 10000 次请求，P99 对应的排名位置是 10000 × 0.99 = 9900，"
+    "也就是「从小到大排第 9900 个请求的延迟值」。\n\n"
+    "逐个检查桶：le=\"0.2\" 的累积计数是 9450（表示有 9450 个请求延迟 <= 200ms），"
+    "le=\"0.25\" 的累积计数是 9920（有 9920 个请求延迟 <= 250ms）。"
+    "9450 < 9900 < 9920，所以 P99 落在 200ms 到 250ms 这个区间内。"
+    "`histogram_quantile()` 在这个区间内做线性插值，公式为：\n\n"
+    "```\n"
+    "P99 = bucket_lower + (bucket_upper - bucket_lower) × (rank - count_lower) / (count_upper - count_lower)\n"
+    "```\n\n"
+    "代入数据：\n\n"
+    "```\n"
+    "P99 = 0.2 + (0.25 - 0.2) × (9900 - 9450) / (9920 - 9450)\n"
+    "    = 0.2 + 0.05 × 450 / 470\n"
+    "    = 0.2 + 0.05 × 0.9574\n"
+    "    = 0.2 + 0.04787\n"
+    "    ≈ 0.248 秒 = 248ms\n"
+    "```\n\n"
+    "这个结果告诉你：P99 延迟约 248ms，超过了 200ms 的 SLO 阈值。"
+    "注意这个值是「估算」而非精确值——线性插值假设 200ms 到 250ms 这个区间内的请求延迟是均匀分布的。"
+    "如果实际分布不均匀（比如大部分集中在 245ms 附近），真实 P99 可能比 248ms 更高或更低。"
+    "桶间距越小，均匀分布假设的偏差越小，精度就越高。这就是为什么桶边界设计对精度至关重要。\n\n"
+    "### 多实例全局 P99\n\n"
+    "20 个实例各自暴露 Histogram，计算全局 P99 时需要先把所有实例的桶计数按 `le` 标签聚合，"
+    "再调用 `histogram_quantile()`：\n\n"
+    "```promql\n"
+    "histogram_quantile(\n"
+    "  0.99,\n"
+    "  sum by (le) (rate(http_request_duration_seconds_bucket[5m]))\n"
+    ")\n"
+    "```\n\n"
+    "`sum by (le)` 把 20 个实例同一个 `le` 值的速率加在一起。这在数学上是正确的——"
+    "「实例 A 每秒有 30 个请求 <= 200ms」加上「实例 B 每秒有 45 个请求 <= 200ms」"
+    "就是「全局每秒有 75 个请求 <= 200ms」。桶计数的可加性是 Histogram 能做跨实例聚合的根本原因。"
+    "如果还需要按接口维度区分，在 `by` 子句中保留 handler 标签即可：\n\n"
+    "```promql\n"
+    "histogram_quantile(\n"
+    "  0.99,\n"
+    "  sum by (handler, le) (rate(http_request_duration_seconds_bucket[5m]))\n"
+    ")\n"
+    "```\n\n"
+    "### 桶边界设计决定精度\n\n"
+    "桶边界直接决定了 `histogram_quantile()` 的精度。上面的例子中，"
+    "200ms 到 250ms 之间只有 50ms 的间距，精度大约是 ±25ms。如果你的 SLO 阈值恰好是 200ms，"
+    "你需要在 150ms 到 300ms 区间内设足够密的桶。一个针对「SLO 200ms」场景的推荐配置：\n\n"
+    "```go\n"
+    "Buckets: []float64{0.01, 0.025, 0.05, 0.075, 0.1, 0.13, 0.16, 0.2, 0.22, 0.25, 0.3, 0.4, 0.5, 1.0, 2.5}\n"
+    "```\n\n"
+    "这个配置在 SLO 关注的 100ms-300ms 区间内设了 8 个桶，间距 20-50ms，"
+    "精度足以准确判断是否触达 SLO。也可以用 `prometheus.ExponentialBuckets(0.01, 2, 12)` "
+    "生成指数增长桶，适合延迟跨越多个数量级的场景——指数桶在低延迟区间自然更密，高延迟区间更稀疏。\n\n"
+    "## 三、生产环境最佳实践与常见陷阱\n\n"
+    "### Recording Rule 预计算\n\n"
+    "在有 20+ 实例且多个 Grafana 面板同时查询的场景下，每次刷新都执行 "
+    "`sum by (le) (rate(...))` 会给 Prometheus 带来显著的查询压力。"
+    "标准做法是用 Recording Rule 预计算中间结果：\n\n"
+    "```yaml\n"
+    "groups:\n"
+    "  - name: http_latency_rules\n"
+    "    interval: 30s\n"
+    "    rules:\n"
+    "      - record: job_handler:http_request_duration_seconds_bucket:rate5m\n"
+    "        expr: sum by (job, handler, le) (rate(http_request_duration_seconds_bucket[5m]))\n"
+    "      - record: job_handler:http_request_duration_seconds:p99\n"
+    "        expr: histogram_quantile(0.99, job_handler:http_request_duration_seconds_bucket:rate5m)\n"
+    "      - record: job_handler:http_request_duration_seconds:p50\n"
+    "        expr: histogram_quantile(0.5, job_handler:http_request_duration_seconds_bucket:rate5m)\n"
+    "```\n\n"
+    "Recording Rule 的命名遵循 Prometheus 推荐规范：`level:metric:operations`。"
+    "第一条规则预计算聚合后的桶速率，P99 和 P50 两条规则直接复用这个中间结果，"
+    "查询性能提升数倍。在 Grafana 中建 Time Series 面板时，直接引用预计算指标："
+    "Query A 填 `job_handler:http_request_duration_seconds:p99{handler=\"/api/orders\"}`、"
+    "Query B 填对应的 p50 指标、再加一条 Query C 设为常量 0.2 画 SLO 基准线。"
+    "Y 轴单位选 seconds，Grafana 会自动转换为 ms 或 s 显示。\n\n"
+    "### 常见精度陷阱\n\n"
+    "第一个高频踩坑点是 `sum` 聚合时忘记 `by (le)`。如果你写成 "
+    "`histogram_quantile(0.99, sum(rate(..._bucket[5m])))`（没有 `by (le)`），"
+    "`sum()` 会把所有 `le` 标签的时间序列加在一起变成一条，"
+    "`histogram_quantile()` 找不到多个桶来做插值，直接返回 NaN。"
+    "这个错误在 Grafana 上的表现就是面板一片空白，初次使用者几乎人人踩过。\n\n"
+    "第二个坑是桶边界上限设置过低。如果你最大的有限桶是 `le=\"1.0\"`，"
+    "但有少量请求延迟超过 1 秒，`histogram_quantile(0.99, ...)` 可能返回 `+Inf`。"
+    "原因是第 99 百分位的排名落在了 le=\"1.0\" 和 le=\"+Inf\" 之间，"
+    "而 +Inf 没有有限上界，无法做有意义的插值。"
+    "解决方法是把最大有限桶设到足够大的值（比如 10 秒或 30 秒），确保极端长尾也能被有限桶覆盖。\n\n"
+    "第三个坑是默认的 `DefBuckets`（.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10）"
+    "跟业务延迟分布不匹配。如果接口延迟集中在 80ms-250ms，默认桶在这个范围内只有 0.1 和 0.25 两个边界，"
+    "间隔 150ms。Grafana 上画出来的 P99 会在 100ms 和 250ms 之间来回「跳变」，"
+    "形成难看的阶梯状曲线。根本原因就是桶密度不足导致插值精度太低。\n\n"
+    "### Native Histograms：Prometheus 2.40+ 的突破\n\n"
+    "传统 Histogram 的最大痛点是「桶越多精度越高，但时间序列也越多」。"
+    "20 个自定义桶产生 23 条时间序列，乘以 Label 组合数后可以轻松膨胀到百万量级。"
+    "Prometheus 从 2.40 版本（2022 年 11 月）开始引入 Native Histograms"
+    "（也叫 Sparse Histograms），将整个直方图编码为单个样本，不再用 `le` 标签展开。"
+    "在 Go 的 `client_golang` v1.17.0+ 中启用只需一行：\n\n"
+    "```go\n"
+    "requestDuration := prometheus.NewHistogram(prometheus.HistogramOpts{\n"
+    "    Name:                        \"http_request_duration_seconds\",\n"
+    "    Help:                        \"HTTP request duration\",\n"
+    "    NativeHistogramBucketFactor: 1.1,\n"
+    "})\n"
+    "```\n\n"
+    "`NativeHistogramBucketFactor` 控制桶的分辨率，"
+    "1.1 意味着相邻桶的边界比值为 1.1，等效于传统方式设 100+ 个桶的精度但只占 1 条时间序列。"
+    "Server 端需要启动时添加 `--enable-feature=native-histograms`。"
+    "截至 Prometheus 2.53（2024 年 7 月），这个特性仍是实验性的，"
+    "但已在 Grafana Cloud 等大规模环境中投入生产使用，被认为是 Histogram 的未来方向。\n\n"
+    "### SLO 告警实战\n\n"
+    "有了 P99 的 Recording Rule，设置 SLO 告警就很直接：\n\n"
+    "```yaml\n"
+    "groups:\n"
+    "  - name: slo_alerts\n"
+    "    rules:\n"
+    "      - alert: HighP99Latency\n"
+    "        expr: job_handler:http_request_duration_seconds:p99{handler=\"/api/orders\"} > 0.2\n"
+    "        for: 5m\n"
+    "        labels:\n"
+    "          severity: warning\n"
+    "        annotations:\n"
+    "          summary: \"P99 latency exceeds 200ms SLO\"\n"
+    "          description: \"{{ $labels.handler }} P99 = {{ $value | humanizeDuration }}\"\n"
+    "```\n\n"
+    "更成熟的做法是采用 Google SRE 手册推荐的「多窗口燃烧率」（Multi-Window Burn Rate）模型："
+    "同时检查 5 分钟短窗口和 1 小时长窗口的错误预算消耗速率，短窗口捕捉突发劣化，"
+    "长窗口过滤瞬时抖动，避免误告警的同时也不会漏掉持续性的慢恶化。"
+    "这种模型需要在 Recording Rule 中同时维护多个时间窗口的分位数指标。"
+)
+
+key_points = [
+    "histogram_quantile(0.99, rate(xxx_bucket[5m])) 是计算 P99 延迟的标准 PromQL 写法，rate() 将累积计数器转为每秒速率以获取时间窗口内的分位数，而非从启动至今的全量分位数",
+    "线性插值公式为 bucket_lower + (bucket_upper - bucket_lower) × (rank - count_lower) / (count_upper - count_lower)，精度完全取决于目标分位数所在区间的桶密度",
+    "多实例场景必须用 sum by (le) 先聚合桶计数再调用 histogram_quantile()，因为桶计数是可加的而分位数值不可加",
+    "桶边界设计应围绕 SLO 阈值加密——如果 P99 SLO 是 200ms，在 100ms-300ms 范围内至少设 5-8 个桶边界，桶间距直接决定插值精度",
+    "sum 聚合时漏掉 by (le) 会将所有桶合并为一条时间序列，histogram_quantile() 无法区分桶边界，返回 NaN",
+    "histogram_quantile() 返回 +Inf 意味着目标分位数排名超出了最高有限桶的计数范围，需要扩大桶边界上限以覆盖长尾延迟",
+    "生产环境应使用 Recording Rule 预计算 rate + sum by (le) 的中间结果，避免多个 Grafana 面板每次刷新都触发全量聚合计算",
+    "Prometheus 2.40+ 的 Native Histograms 将直方图编码为单个样本，用 NativeHistogramBucketFactor 控制分辨率，从根本上消除了桶数量与时间序列爆炸的矛盾",
+]
+
+quiz = [
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz1",
+        "question": "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])) 这条查询返回的值代表什么含义？",
+        "choices": [
+            {"id": "A", "text": "99% 的请求延迟低于此值，即过去 5 分钟内第 99 百分位延迟的估算值"},
+            {"id": "B", "text": "延迟最高的 1% 请求的平均耗时"},
+            {"id": "C", "text": "延迟恰好等于第 99 个桶边界的请求数量"},
+            {"id": "D", "text": "所有请求延迟之和的 99%"},
+        ],
+        "correctAnswer": "A",
+        "explanation": "histogram_quantile(0.99, ...) 返回的是第 99 百分位数的估算值，含义是「将所有请求按延迟从小到大排序后，排在第 99% 位置的延迟值」。99% 的请求延迟低于此值，只有最慢的 1% 超过它。rate(...[5m]) 限定了时间窗口为过去 5 分钟，所以返回的是这 5 分钟内的 P99。B 选项描述的是「top 1% 的均值」，这是完全不同的统计量——P99 是一个分位点，不是均值。C 选项混淆了分位数和桶计数。D 选项对 0.99 参数的理解完全错误，它是百分位位置而非比例因子。",
+    },
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz2",
+        "question": "在 PromQL 中计算 P99 时，为什么必须对 _bucket 指标先调用 rate() 而不能直接使用原始值？",
+        "choices": [
+            {"id": "A", "text": "rate() 对数据做平滑处理，消除毛刺后分位数计算更准确"},
+            {"id": "B", "text": "rate() 将累积计数器转为指定时间窗口内的每秒速率，使 histogram_quantile() 计算的是「最近一段时间」而非「从启动至今」的分位数"},
+            {"id": "C", "text": "histogram_quantile() 函数只接受浮点数输入，rate() 负责把整数计数器转为浮点数"},
+            {"id": "D", "text": "不使用 rate() 也可以得到正确结果，rate() 只是一个可选的性能优化步骤"},
+        ],
+        "correctAnswer": "B",
+        "explanation": "Histogram 的 _bucket 指标是 Counter 类型（累积计数器），从服务启动开始只增不减。如果不套 rate()，histogram_quantile() 会基于从启动到当前的全部累积数据计算分位数，反映的是服务整个生命周期的延迟分布，而不是「过去 5 分钟」的情况。rate(xxx_bucket[5m]) 取 5 分钟窗口内的增量除以 300 秒，得到每秒速率，这样 histogram_quantile() 算出的就是最近 5 分钟的 P99。此外 rate() 还能自动处理 Counter 重置（比如服务重启后计数器归零）。A 选项说的平滑不是 rate() 的核心目的。C 选项错误——Counter 本身就是浮点数。D 选项错误——不用 rate() 得到的是全量分位数。",
+    },
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz3",
+        "question": "histogram_quantile() 内部是通过什么算法计算分位数的？",
+        "choices": [
+            {"id": "A", "text": "对所有桶边界值取加权平均，权重为各桶的计数占比"},
+            {"id": "B", "text": "使用指数平滑算法在所有桶之间做回归拟合"},
+            {"id": "C", "text": "找到目标排名所在的桶区间，在该桶的上下边界之间做线性插值"},
+            {"id": "D", "text": "选择累积计数最接近目标排名的那个桶，直接返回该桶的上边界值"},
+        ],
+        "correctAnswer": "C",
+        "explanation": "histogram_quantile() 的计算分三步。首先，用总请求速率乘以目标分位数 phi 得到目标排名（rank = total × phi）。然后，从最小的桶开始向上遍历，找到第一个累积计数 >= rank 的桶——此时 P99 就落在这个桶和上一个桶之间的区间内。最后，在这两个桶的边界之间做线性插值：P99 = lower_bound + (upper_bound - lower_bound) × (rank - count_at_lower) / (count_at_upper - count_at_lower)。这个公式假设桶内数据均匀分布。A 选项的加权平均会给出某种「平均值」而非分位数。B 选项的指数平滑是时间序列平滑技术，与分位数计算无关。D 选项是最近邻方法，丢失了桶内的精确位置信息。",
+    },
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz4",
+        "question": "根据题目中的 bucket 数据（总量 10000），le=\"0.2\" 的值是 9450，le=\"0.25\" 的值是 9920。histogram_quantile(0.99, ...) 的计算结果最接近哪个值？",
+        "choices": [
+            {"id": "A", "text": "200ms"},
+            {"id": "B", "text": "248ms"},
+            {"id": "C", "text": "250ms"},
+            {"id": "D", "text": "300ms"},
+        ],
+        "correctAnswer": "B",
+        "explanation": "目标排名 = 10000 × 0.99 = 9900。逐桶查找：le=\"0.2\" 计数 9450 < 9900，le=\"0.25\" 计数 9920 >= 9900，所以 P99 落在 0.2 到 0.25 秒之间。线性插值：P99 = 0.2 + (0.25 - 0.2) × (9900 - 9450) / (9920 - 9450) = 0.2 + 0.05 × 450/470 = 0.2 + 0.0479 ≈ 0.248 秒 = 248ms。A 选项 200ms 是 le=\"0.2\" 的桶边界值，只有在恰好 9900 个请求都 <= 200ms 时才成立，但实际 le=\"0.2\" 只有 9450。C 选项 250ms 是 le=\"0.25\" 的桶边界，需要 rank 等于 9920 才返回，但 rank 是 9900。D 选项 300ms 是 le=\"0.3\" 的桶边界，远超实际计算结果。",
+    },
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz5",
+        "question": "你写了 histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])))，Grafana 面板显示 NaN。最可能的原因是什么？",
+        "choices": [
+            {"id": "A", "text": "过去 5 分钟内没有任何请求流量"},
+            {"id": "B", "text": "rate() 不能应用于 Histogram 的 _bucket 指标"},
+            {"id": "C", "text": "sum() 没有加 by (le)，所有桶标签被合并成一条时间序列，histogram_quantile() 无法区分桶边界"},
+            {"id": "D", "text": "0.99 超出了 histogram_quantile() 的合法参数范围"},
+        ],
+        "correctAnswer": "C",
+        "explanation": "sum() 默认会移除所有标签。当你写 sum(rate(..._bucket[5m])) 而不加 by (le) 时，所有不同 le 值的时间序列被加在一起变成了一条没有 le 标签的序列。histogram_quantile() 需要一组带有不同 le 标签的时间序列来做插值——只有一条无 le 标签的序列，它没法区分桶边界，只能返回 NaN。正确写法是 sum by (le)(rate(..._bucket[5m]))。这是使用 histogram_quantile() 的第一号高频错误，几乎每个初次接触 Histogram 的人都会踩。A 选项在无流量时 rate() 返回空序列，Grafana 显示「No data」而非 NaN。B 和 D 选项都是基础语法误解。",
+    },
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz6",
+        "question": "你的接口延迟集中在 80ms-250ms，使用了 Prometheus 默认的 DefBuckets，Grafana 上 P99 曲线出现明显的阶梯式跳变。以下哪个措施最有效？",
+        "choices": [
+            {"id": "A", "text": "把 Prometheus 的 scrape_interval 从 15s 缩短到 5s"},
+            {"id": "B", "text": "在 80ms-300ms 范围内增加自定义桶边界，如 0.08, 0.1, 0.12, 0.15, 0.18, 0.2, 0.25, 0.3"},
+            {"id": "C", "text": "在 PromQL 中用 avg_over_time() 对 P99 结果做二次平滑"},
+            {"id": "D", "text": "改用 irate() 替代 rate() 以获得更即时的速率计算"},
+        ],
+        "correctAnswer": "B",
+        "explanation": "阶梯式跳变的根本原因是桶边界太稀疏。默认 DefBuckets（.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10）在 80ms-250ms 范围内只有 le=0.1 和 le=0.25 两个边界，间隔 150ms。histogram_quantile() 的线性插值只能在这两个点之间跳跃，表现为阶梯状。在关注区间内加密桶边界是唯一能从根源解决精度问题的方法。A 选项缩短 scrape_interval 只增加时间维度的密度，不影响桶边界精度。C 选项的 avg_over_time() 只是掩盖了跳变，P99 值本身仍然不准确。D 选项的 irate() 取最后两个样本计算瞬时速率，波动更大，不会改善阶梯问题。",
+    },
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz7",
+        "question": "关于 Histogram 桶边界的设计策略，以下哪个说法是正确的？",
+        "choices": [
+            {"id": "A", "text": "桶越多越好，每 1ms 一个桶可以得到最精确的分位数"},
+            {"id": "B", "text": "线性等间距桶在所有场景下的精度都优于指数增长桶"},
+            {"id": "C", "text": "指数增长桶（ExponentialBuckets）适合延迟跨越多个数量级的场景，在低延迟区间提供更高密度"},
+            {"id": "D", "text": "桶的数量对 Prometheus 的存储和查询性能没有实际影响"},
+        ],
+        "correctAnswer": "C",
+        "explanation": "指数增长桶（如 prometheus.ExponentialBuckets(0.005, 2, 14)）按倍数递增，在低延迟区间自然形成更密的桶。比如起始 5ms、倍率 2 会产生 5ms, 10ms, 20ms, 40ms, 80ms... 的序列，低延迟区间桶间距小（精度高），高延迟区间桶间距大（节省时间序列），非常适合延迟从几毫秒到几十秒都有分布的场景。A 选项的「每 1ms 一个桶」在 0-10s 范围内产生 10000 个桶，加上 Label 组合后时间序列爆炸，Prometheus 的内存和查询会崩溃。B 选项错误——线性桶在高延迟区间浪费精度。D 选项完全错误——每个桶产生一条独立时间序列，直接影响存储和查询开销。",
+    },
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz8",
+        "question": "以下哪种 Recording Rule 策略能正确预计算跨实例的全局 P99 延迟？",
+        "choices": [
+            {"id": "A", "text": "单条规则直接写 histogram_quantile(0.99, http_request_duration_seconds_bucket)，不使用 rate() 和 sum()"},
+            {"id": "B", "text": "分两步：先预计算 sum by (job, le) (rate(..._bucket[5m])) 存为中间指标，再对中间指标调用 histogram_quantile(0.99, ...)"},
+            {"id": "C", "text": "先对每个实例单独计算 P99，再用 avg by (job) 对所有实例的 P99 取平均得到全局值"},
+            {"id": "D", "text": "单条规则写 histogram_quantile(0.99, sum by (job) (rate(..._bucket[5m])))，在 sum by 中只保留 job 标签"},
+        ],
+        "correctAnswer": "B",
+        "explanation": "B 是标准做法——先用第一条规则预计算 sum by (job, le) 的聚合桶速率，再用第二条规则对预计算结果调用 histogram_quantile()。这种两步拆分的好处是：如果还需要 P50、P90 等分位数，都可以复用第一条规则的中间结果，避免重复计算 rate + sum。A 选项没有使用 rate()，计算的是从启动至今的全量分位数，也没有做跨实例聚合。C 选项先算每个实例的 P99 再取平均，在统计学上没有意义——分位数不具备可加性，10 个实例 P99 的平均值不是全局 P99。D 选项的 sum by (job) 漏掉了 le 标签，所有桶被合并成一条时间序列，histogram_quantile() 会返回 NaN。",
+    },
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz9",
+        "question": "histogram_quantile() 返回 +Inf 最可能的原因是什么？",
+        "choices": [
+            {"id": "A", "text": "Prometheus Server 内存不足导致查询超时"},
+            {"id": "B", "text": "目标分位数的排名超出了最高有限桶的累积计数，P99 落在最大有限桶和 +Inf 之间，无法做有意义的插值"},
+            {"id": "C", "text": "被查询的时间范围内完全没有数据"},
+            {"id": "D", "text": "Histogram 指标在客户端注册时没有设置任何桶边界"},
+        ],
+        "correctAnswer": "B",
+        "explanation": "当 P99 的目标排名（total × 0.99）大于最高有限桶（比如 le=\"10\"）的累积计数时，说明有超过 1% 的请求延迟超过了 10 秒。histogram_quantile() 需要在 le=\"10\" 和 le=\"+Inf\" 之间插值，但 +Inf 没有有限上界，无法计算出具体数值，所以返回 +Inf。解决方法是扩大桶边界上限——添加 le=\"30\" 或 le=\"60\" 的桶。A 选项描述的查询超时会返回 HTTP 错误或 timeout 提示，不是 +Inf。C 选项无数据时 rate() 返回空序列，Grafana 显示「No data」而非 +Inf。D 选项中如果没有设置桶，client_golang 会使用默认的 DefBuckets，不会产生 +Inf 问题。",
+    },
+    {
+        "id": "mon-prom-p99-calculation-q1-quiz10",
+        "question": "Grafana 面板显示 P99 延迟突然从 100ms 飙到 800ms，但 P50 一直稳定在 60ms 左右。最可能的原因和排查方向是什么？",
+        "choices": [
+            {"id": "A", "text": "这在数学上不可能发生——如果 P50 正常，P99 也应该正常"},
+            {"id": "B", "text": "有少量请求命中了慢路径（如慢 SQL、下游超时、GC STW），影响了最慢的 1% 但不影响中位数"},
+            {"id": "C", "text": "Histogram 的桶边界在最近一次部署中被意外修改了"},
+            {"id": "D", "text": "Prometheus 的 scrape 出现丢点，导致 rate() 计算出了异常偏高的值"},
+        ],
+        "correctAnswer": "B",
+        "explanation": "P50 正常而 P99 飙高是典型的「长尾延迟」现象。P50 反映的是中间 50% 用户的体验，P99 反映的是最慢 1% 的体验——两者可以完全独立变化。如果有 1% 的请求命中了慢查询（比如缺索引的 SQL 走了全表扫描）、下游服务超时（某个依赖 Pod 正在重启）、或者 Go Runtime 触发了一次较长的 GC 停顿（STW），就会出现 P50 不动但 P99 飙升的现象。排查方向是按 handler、instance、upstream 等维度拆分 P99，定位哪个接口或哪个实例贡献了长尾。A 选项对分位数的理解完全错误。C 选项桶边界变化需要重新部署代码，不会「突然」发生。D 选项 scrape 丢点通常导致 rate() 偏低。",
+    },
+]
+
+data = {
+    "id": "mon-prom-p99-calculation",
+    "name": "用 PromQL 计算服务 P99 延迟",
+    "domain": "monitoring",
+    "description": "掌握使用 PromQL histogram_quantile() 计算 P99 延迟的完整方法，包括 Bucket 设计、线性插值原理及常见精度陷阱",
+    "version": "1.0.0",
+    "questions": [
+        {
+            "id": "mon-prom-p99-calculation-q1",
+            "domain": "monitoring",
+            "type": "practice",
+            "difficulty": 3,
+            "tags": ["PromQL", "P99", "Histogram", "延迟计算", "最佳实践"],
+            "title": "如何用 PromQL 计算服务的 P99 延迟？",
+            "content": content,
+            "answer": answer,
+            "keyPoints": key_points,
+            "quiz": quiz,
+            "references": [
+                "https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile",
+                "https://prometheus.io/docs/practices/histograms/",
+                "https://prometheus.io/docs/concepts/metric_types/#histogram",
+            ],
+        }
+    ],
+}
+
+output_path = r"C:\Users\RigelShrimp\questions\public\question-packs\monitoring\mon-prom-p99-calculation.json"
+with open(output_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+
+# Validate
+with open(output_path, "r", encoding="utf-8") as f:
+    loaded = json.load(f)
+
+q = loaded["questions"][0]
+print(f"File size: {os.path.getsize(output_path)} bytes")
+print(f"Quiz: {len(q['quiz'])}, KeyPoints: {len(q['keyPoints'])}")
+print(f"Content: {len(q['content'])} chars, Answer: {len(q['answer'])} chars")
+print(f"Corner brackets: {q['content'].count(chr(0x300C)) + q['answer'].count(chr(0x300C))}")
+print(f"Bad quotes: {q['content'].count(chr(0x201C)) + q['answer'].count(chr(0x201C))}")
+print("JSON valid: OK")
