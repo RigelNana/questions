@@ -1,0 +1,155 @@
+{
+  "id": "db-long-transaction-issues",
+  "name": "长事务的危害与监控",
+  "domain": "database",
+  "description": "长事务对锁、undo log、复制的影响及生产环境监控与预防方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q047",
+      "domain": "database",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["MySQL", "长事务", "事务监控", "InnoDB", "性能问题"],
+      "title": "长事务的危害与如何监控和避免？",
+      "content": "周五晚上 11 点，你收到一连串报警：线上订单服务的接口 P99 延迟从正常的 30ms 飙到了 8 秒，Grafana 上 MySQL 的 `Innodb_row_lock_current_waits` 指标从 0 跳到了 47，慢查询日志里出现大量 Lock wait timeout exceeded 的报错。你登上数据库机器一看，SHOW ENGINE INNODB STATUS 的 TRANSACTIONS 段落里有一个事务已经跑了 3600 多秒：\n\n```\n---TRANSACTION 28193746, ACTIVE 3847 sec\nmysql tables in use 1, locked 1\nLOCK WAIT 2 lock struct(s), heap size 1136, 1 row lock(s)\nMySQL thread id 14829, OS thread handle 140362447321856, query id 892734 10.0.3.47 app_user updating\nUPDATE orders SET status = 'paid' WHERE order_id = 10086\n------- TRX HAS BEEN WAITING 38 sec FOR THIS LOCK TO BE GRANTED:\nRECORD LOCKS space id 142 page no 37 n bits 80 index PRIMARY of table `order_db`.`orders` trx id 28193746 lock_mode X locks rec but not gap waiting\n```\n\n再往上翻，你发现罪魁祸首是另一个事务：\n\n```\n---TRANSACTION 28190112, ACTIVE 3847 sec\n4 lock struct(s), heap size 1136, 127 row lock(s), undo log entries 3\nMySQL thread id 14502, OS thread handle 140362298304256, query id 889012 10.0.3.52 batch_user sleeping\n```\n\n线程 14502 持有着 127 个行锁，产生了 3 条 undo log entry，但状态是 sleeping——它早就不在执行任何 SQL 了，大概率是应用侧开了 BEGIN 之后做了一些事情，然后忘记 COMMIT 或者应用逻辑卡在了某个地方。这个事务跑了将近 65 分钟，期间所有需要修改它锁住的那些行的事务全部在排队等锁，直到超过 `innodb_lock_wait_timeout`（默认 50 秒）之后报错返回。\n\n与此同时，你注意到数据库的磁盘空间告警也在闪烁。`information_schema.innodb_metrics` 里 `trx_rseg_history_len`（也就是 undo log 的历史链表长度）已经涨到了 280 万，正常情况下这个值应该在几千以内。因为这个长事务的 Read View 一直不释放，purge 线程无法清理 280 万条旧版本数据，undo tablespace 在持续膨胀。\n\n这不是一个罕见的事故。长事务（Long Transaction）是 MySQL 运维中最常见的性能杀手之一。在一次面试中，面试官问你「长事务有哪些危害？你在生产中是怎么监控和处理长事务的？」。这道题考察的不仅仅是你对 InnoDB 事务机制的理解，更重要的是你有没有真正处理过这类线上问题、有没有建立起一套系统性的监控和防御体系。\n\n请结合 InnoDB 的锁机制、MVCC、undo log 和主从复制机制，完整分析长事务的危害，并给出生产环境中监控、发现和预防长事务的具体方案。",
+      "answer": "## 长事务的危害与生产环境监控防御体系\n\n### 什么是事务，为什么会出现长事务\n\n事务（Transaction）是数据库中一组操作的逻辑单元，这组操作要么全部成功提交（COMMIT），要么全部回滚撤销（ROLLBACK），不会出现执行了一半的中间状态。InnoDB 是 MySQL 中最常用的支持事务的存储引擎，所有通过 InnoDB 表执行的 DML 操作（INSERT、UPDATE、DELETE）天然运行在事务中——即使你没有显式写 BEGIN，MySQL 也会在 autocommit=1 的默认模式下为每条 SQL 自动开启并提交一个事务。\n\n事务的生命周期从 BEGIN（或 START TRANSACTION）开始，到 COMMIT 或 ROLLBACK 结束。在 autocommit=1 的默认配置下，如果你不显式写 BEGIN，每条 SQL 执行完就自动提交，事务的生命周期极短，通常只有几毫秒。但当你显式开启事务后，事务会一直存活，直到你手动 COMMIT 或 ROLLBACK，或者连接断开时被自动回滚。\n\n查看当前正在运行的事务，可以使用以下 SQL：\n\n```sql\n-- 查看所有活跃事务（InnoDB 维护的事务列表）\nSELECT trx_id, trx_state, trx_started,\n       TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS running_sec,\n       trx_rows_locked, trx_rows_modified, trx_query\nFROM information_schema.innodb_trx\nORDER BY trx_started ASC;\n```\n\n所谓「长事务」（Long Transaction），没有一个写死的秒数标准，但业界普遍的共识是：在 OLTP（Online Transaction Processing，在线事务处理）场景下，一个事务如果超过 1 秒还没提交就值得关注，超过 10 秒就应该告警，超过 60 秒基本可以判定为异常。在我们之前的事故场景中，那个 3847 秒（约 65 分钟）的事务显然是一个严重的长事务。\n\n长事务的产生原因通常有这几类：第一，应用代码在 BEGIN 之后执行了耗时的业务逻辑，比如在事务中间调用了外部 HTTP 接口、发送消息到 Kafka、等待用户输入等；第二，开发人员忘记了 COMMIT——在调试环境中手动执行了 BEGIN 但没有收尾，或者代码中某个异常分支漏掉了 COMMIT/ROLLBACK；第三，慢 SQL 导致事务被迫拉长——比如事务中包含一条全表扫描的 UPDATE，本身就需要执行几十秒；第四，框架层面的配置问题——比如连接池中的连接开启了事务，归还连接池时没有自动 COMMIT 或 ROLLBACK。\n\n### 危害一：锁长时间持有导致大面积阻塞\n\nInnoDB 的行锁（Row Lock）在事务提交或回滚时才会释放，这是最基本的锁行为。一个事务执行 `UPDATE orders SET status = 'paid' WHERE order_id = 10086` 时，会对 order_id = 10086 这一行加排他锁（X Lock）。只要这个事务不提交，其他任何想修改甚至用 `SELECT ... FOR UPDATE` 读取这一行的事务都必须等待。如果这个事务跑了 65 分钟，那么在这 65 分钟内所有涉及该行的写操作全部被阻塞。\n\n更糟糕的是，在 REPEATABLE READ（MySQL 默认隔离级别）下，InnoDB 使用 next-key lock（临键锁，即行锁加间隙锁的组合）。这意味着一个范围查询（比如 `SELECT * FROM orders WHERE user_id = 1234 FOR UPDATE`）不仅锁住了匹配的行，还会锁住索引间隙，阻止其他事务在这个范围内插入新行。长事务持有这种范围锁的时间越长，影响面越大。\n\n被阻塞的事务并不会无限期等待。InnoDB 有一个参数 `innodb_lock_wait_timeout`，默认值是 50 秒，超过这个时间还拿不到锁就会报错 `ERROR 1205 (HY000): Lock wait timeout exceeded; try restarting transaction`。这个报错意味着业务操作失败——在电商系统中，它可能表现为用户点击付款后等了 50 秒然后看到一个「系统繁忙」的提示。更严重的情况是引发连锁反应：当大量线程堆积在锁等待上，应用侧的数据库连接池被占满，新请求拿不到连接直接超时，整个服务变得不可用。\n\n此外，长事务显著增加了死锁（Deadlock）的概率。事务持有锁的时间越长，两个事务交叉加锁形成循环等待的可能性就越大。InnoDB 有内置的死锁检测机制（通过 `innodb_deadlock_detect` 参数控制，默认开启），检测到死锁时会选择一个代价较小的事务进行回滚。但在高并发下，死锁检测本身的开销也不小——每次加锁都要遍历等待图（Wait-for Graph）来判断是否成环，当等待的事务数很多时，这个检测过程会消耗大量 CPU。\n\n### 危害二：undo log 无法被 purge，磁盘空间膨胀\n\n这个危害涉及 InnoDB 的 MVCC（Multi-Version Concurrency Control，多版本并发控制）机制。InnoDB 中每一行数据都有一个隐藏的 trx_id（最后修改该行的事务 ID）和 roll_pointer（指向 undo log 中上一个版本的指针）。当一行数据被修改时，旧版本通过 undo log 保留下来，形成一条版本链。一个 SELECT 查询（快照读）通过 Read View 来判断应该看到版本链上的哪个版本——如果最新版本的 trx_id 对当前事务不可见，就沿着 roll_pointer 往前找，直到找到一个可见的版本。\n\nundo log 不能一直保留，否则磁盘会被撑爆。InnoDB 有一个后台的 purge 线程，负责清理那些「不再被任何活跃事务需要」的旧版本数据。关键点在这里：purge 线程判断一个旧版本能否清理的依据是——是否还有活跃的 Read View 需要看到这个版本。如果系统中存在一个长事务，它的 Read View 创建得很早（在 REPEATABLE READ 下，Read View 在首次 SELECT 时创建），那么在这个 Read View 创建之后产生的所有旧版本都不能被 purge，因为这个长事务理论上还可能去读这些旧版本。\n\n这就是为什么 content 中那个 65 分钟的事务会导致 `trx_rseg_history_len` 涨到 280 万。在这 65 分钟内，整个数据库所有表的所有 UPDATE 和 DELETE 产生的旧版本全部堆积在 undo log 中无法清理。可以用以下命令实时监控这个指标：\n\n```sql\n-- 查看 undo log 历史链表长度（purge 滞后程度的直接指标）\nSHOW GLOBAL STATUS LIKE 'Innodb_history_list_length';\n-- 正常值: 几百到几千\n-- 异常值: 超过 10 万就要排查是否有长事务\n```\n\n在 MySQL 5.7 及之前的版本中，undo log 默认存储在系统表空间 ibdata1 中。ibdata1 有一个臭名昭著的特性：它只会增长不会收缩——即使 undo log 被 purge 清理了，ibdata1 的磁盘空间也不会释放回操作系统，只是内部标记为可复用。这意味着一次长事务导致的 undo log 膨胀可能永久性地增大 ibdata1 文件。MySQL 8.0 改进了这一点：undo tablespace 默认独立于 ibdata1，并且支持自动 truncate（通过 `innodb_undo_log_truncate=ON`，这是 8.0 的默认值），清理后可以真正释放磁盘空间。\n\n### 危害三：Buffer Pool 被旧版本数据污染\n\nBuffer Pool 是 InnoDB 在内存中缓存数据页和索引页的区域，它的大小通常是数据库服务器物理内存的 60%-80%（通过 `innodb_buffer_pool_size` 设置）。当一个长事务的 Read View 迫使 purge 停滞时，大量旧版本数据页需要保留在 Buffer Pool 中以供该事务可能的快照读。这些页本来应该被淘汰来给热点数据腾出空间，现在却被钉在内存中。\n\n结果就是 Buffer Pool 的命中率下降。你可以通过以下命令观察：\n\n```sql\nSHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_read_requests';  -- 逻辑读（从 Buffer Pool 中读取）\nSHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_reads';           -- 物理读（Buffer Pool 未命中，从磁盘读取）\n-- Buffer Pool 命中率 = 1 - (reads / read_requests)\n-- 正常应该在 99% 以上，低于 95% 就要排查原因\n```\n\n当 Buffer Pool 命中率从 99.9% 掉到 95% 时，意味着物理磁盘 I/O 量增加了 50 倍（之前每 1000 次请求只有 1 次读磁盘，现在变成 50 次）。这对整体查询性能的影响是灾难性的。\n\n### 危害四：主从复制延迟\n\n在 MySQL 主从复制架构中，主库的事务提交后会写入 binlog（Binary Log），从库的 SQL 线程（MySQL 8.0.26+ 改称 applier 线程）拉取 binlog 并在从库上重放。一个长事务在主库可能执行了 65 分钟，但它的 binlog event 是在 COMMIT 时一次性写入的——这意味着从库收到的是一个包含 65 分钟所有修改的巨大事务，需要在从库上从头重放。\n\n假设这个长事务修改了 10 万行数据，从库的 applier 线程需要逐行重放这些修改（即使开启了并行复制 `replica_parallel_workers`，单个事务内的操作也无法并行），重放过程本身可能需要几十秒甚至几分钟。在这段时间内，从库的复制延迟（`Seconds_Behind_Source`，5.7 中是 `Seconds_Behind_Master`）持续增大。如果业务有读写分离，读从库的请求会读到延迟的数据，导致数据不一致的用户体验——比如用户刚付完款，刷新页面（读从库）却看到订单还是未支付状态。\n\n### 如何监控长事务\n\n生产环境中监控长事务的核心数据源是 `information_schema.innodb_trx` 表。以下是一条实用的监控 SQL，可以直接配置到 Prometheus 的 mysqld_exporter 自定义查询或者 Zabbix 的自定义监控项中：\n\n```sql\n-- 查找运行超过 60 秒的事务\nSELECT trx_id,\n       trx_state,\n       trx_started,\n       TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS duration_sec,\n       trx_rows_locked,\n       trx_rows_modified,\n       trx_query,\n       trx_mysql_thread_id\nFROM information_schema.innodb_trx\nWHERE TIMESTAMPDIFF(SECOND, trx_started, NOW()) > 60\nORDER BY trx_started ASC;\n```\n\n这条 SQL 返回的关键字段含义是：`trx_state` 表示事务当前状态（RUNNING 表示正在执行 SQL，LOCK WAIT 表示在等锁，其他还有 ROLLING BACK 等）；`trx_rows_locked` 是当前持有的行锁数量；`trx_rows_modified` 是已修改但未提交的行数（回滚时需要撤销的量）；`trx_query` 是事务正在执行的 SQL（如果事务处于 sleeping 状态，这个字段是 NULL）；`trx_mysql_thread_id` 是对应的 MySQL 连接线程 ID，可以直接用来 KILL。\n\n除了直接查 innodb_trx，还应该监控 `SHOW ENGINE INNODB STATUS` 输出中的 TRANSACTIONS 段落。这个输出里有两个关键信息：一是 `History list length`（等同于 `Innodb_history_list_length`），反映 undo log 堆积程度；二是每个活跃事务的详细状态，包括持有多少锁结构、多少 undo log entries。在排查问题时，结合 `information_schema.processlist`（或 `performance_schema.threads`）可以定位到是哪个客户端 IP、哪个用户、哪个应用发起的长事务：\n\n```sql\n-- 关联 innodb_trx 和 processlist，定位长事务的来源\nSELECT t.trx_id,\n       t.trx_started,\n       TIMESTAMPDIFF(SECOND, t.trx_started, NOW()) AS sec,\n       t.trx_rows_locked,\n       t.trx_rows_modified,\n       p.user,\n       p.host,\n       p.db,\n       p.command,\n       p.info AS current_sql\nFROM information_schema.innodb_trx t\nJOIN information_schema.processlist p\n  ON t.trx_mysql_thread_id = p.id\nORDER BY t.trx_started ASC;\n```\n\n当确认某个长事务需要终止时，使用 `KILL <trx_mysql_thread_id>` 即可。KILL 会触发事务回滚——如果事务已经修改了很多行（`trx_rows_modified` 很大），回滚本身也需要时间。所以 KILL 之后要继续关注回滚进度，可以通过 `SHOW ENGINE INNODB STATUS` 中的 `ROLLING BACK` 状态或 `Innodb_rows_deleted`、`Innodb_rows_updated` 等计数器的变化来判断回滚是否完成。\n\n### 如何预防长事务\n\n数据库层面可以设置几道防线。`innodb_lock_wait_timeout` 控制一个事务等待行锁的最大秒数，默认 50 秒，可以根据业务容忍度适当调小（比如 10 秒）。`lock_wait_timeout` 是另一个参数，控制的是获取元数据锁（MDL）的超时时间，默认 31536000 秒（一年），在生产环境建议调低到 60 秒。如果使用 MySQL 8.0.28+，还可以设置 `innodb_idle_transaction_timeout`，让空闲超过指定秒数的事务自动被 MySQL 断开连接。\n\n应用层面的预防更为关键。第一条黄金法则是「事务要短」——在 BEGIN 和 COMMIT 之间只放必要的 SQL 操作，绝对不要在事务中间做 HTTP 调用、RPC 调用、文件 I/O 或任何可能阻塞的操作。如果业务流程需要跨多个服务协调（比如下单时需要扣库存、创建物流单、发通知），不要把所有步骤放在一个数据库事务里，而是用 Saga 模式或本地消息表（Transactional Outbox）来实现最终一致性。\n\n第二条是在 ORM 或数据库连接池层面强制执行事务超时。Spring 框架中可以通过 `@Transactional(timeout = 5)` 设置事务最大执行时间为 5 秒；Go 语言中可以使用 `context.WithTimeout` 传入数据库操作，超时后连接会被取消。连接池归还连接时应该自动执行 ROLLBACK——大多数成熟的连接池（HikariCP、go-sql-driver/mysql）都有这个行为，但如果你用的是更底层的 driver，需要确认这一点。\n\n### 进阶：自动化猎杀与工具链\n\n在大规模生产环境中，靠人工盯着 innodb_trx 是不现实的。Percona Toolkit 中的 `pt-kill` 工具专门用来自动杀掉符合条件的连接。以下是一个典型的 pt-kill 命令，它会持续运行，每 10 秒检查一次，自动杀掉运行超过 60 秒的查询：\n\n```bash\npt-kill --host=127.0.0.1 --port=3306 --user=monitor --password=xxx \\\n  --busy-time 60 \\\n  --match-command Sleep \\\n  --kill \\\n  --interval 10 \\\n  --print \\\n  --log /var/log/pt-kill.log\n```\n\n其中 `--busy-time 60` 表示目标是运行时间超过 60 秒的连接，`--match-command Sleep` 表示只杀状态为 Sleep 的连接（也就是开了事务但当前没在执行 SQL 的那种），`--kill` 是真正执行 KILL（去掉这个参数则只打印不执行，适合测试），`--print` 会把被杀的连接信息打印到日志。\n\n对于更精细的控制，很多公司会编写自己的巡检脚本，结合 Prometheus 的 AlertManager 做分级告警：运行超过 30 秒的事务发 Warning 到 Slack，超过 120 秒的发 Critical 到 PagerDuty 并自动 KILL。这种分级策略能在保证业务安全的前提下，尽快消除长事务的影响。\n\nMySQL 8.0 在 undo tablespace 管理上有显著改进：默认将 undo log 从 ibdata1 分离到独立的 undo tablespace 文件中，并支持 `innodb_undo_log_truncate=ON`（默认开启），当 undo tablespace 大小超过 `innodb_max_undo_log_size`（默认 1GB）时会触发自动 truncate，将文件缩小到初始大小。这不会消除长事务的危害，但至少解决了 MySQL 5.7 时代 ibdata1 只涨不缩的老大难问题。\n\n### 面试角度的关键提示\n\n长事务这道题在面试中是一个「区分度」很高的问题。只能说出「锁等待、影响性能」的人拿不到高分。能说出 undo log 堆积、purge 停滞、Buffer Pool 污染、复制延迟这四个危害，并结合 innodb_trx 表的具体字段说清楚监控方案，再提到 pt-kill 和应用层事务超时策略的人，能让面试官判断出你有真实的生产运维经验，而不只是背了一堆概念。",
+      "keyPoints": [
+        "长事务持有行锁和间隙锁直到 COMMIT 或 ROLLBACK，期间所有需要修改相同行的事务被阻塞，超过 innodb_lock_wait_timeout（默认 50 秒）后报 Lock wait timeout exceeded 错误",
+        "长事务的 Read View 阻止 purge 线程清理 undo log 旧版本，导致 Innodb_history_list_length 飙升、undo tablespace 持续膨胀，在 MySQL 5.7 中还会撑大不可收缩的 ibdata1",
+        "旧版本数据无法被淘汰出 Buffer Pool，挤占热点数据的缓存空间，导致 Buffer Pool 命中率下降和物理磁盘 I/O 急剧增加",
+        "长事务在主库 COMMIT 时一次性写入 binlog，从库 applier 线程重放大事务耗时长，造成 Seconds_Behind_Source 增大和读写分离场景下的数据不一致",
+        "通过 information_schema.innodb_trx 表的 trx_started、trx_rows_locked、trx_rows_modified 字段可以精准定位长事务，结合 processlist 可追踪到发起事务的客户端 IP 和用户",
+        "预防长事务的核心策略：事务中不做 RPC/HTTP 调用、ORM 层设置事务超时（如 @Transactional(timeout=5)）、连接池归还时自动 ROLLBACK、使用 pt-kill 自动猎杀超时事务",
+        "MySQL 8.0 的 innodb_undo_log_truncate 默认开启，undo tablespace 超过 innodb_max_undo_log_size（默认 1GB）后自动 truncate 释放磁盘空间，解决了 5.7 时代 ibdata1 只涨不缩的问题"
+      ],
+      "quiz": [
+        {
+          "id": "db-q047-quiz-1",
+          "question": "以下哪个描述最准确地定义了 OLTP 场景中的「长事务」？",
+          "choices": [
+            {"id": "A", "text": "执行了超过 100 条 SQL 语句的事务"},
+            {"id": "B", "text": "从 BEGIN 到 COMMIT/ROLLBACK 之间经过的时间远超正常业务预期（通常超过数秒），且在此期间持续持有锁和 Read View 的事务"},
+            {"id": "C", "text": "修改了超过 1 万行数据的事务"},
+            {"id": "D", "text": "事务隔离级别设置为 SERIALIZABLE 的事务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "长事务的核心判定标准是事务存活时间远超正常预期，而不是 SQL 数量或修改行数。一个事务可能只执行了一条 UPDATE，但如果应用侧忘记 COMMIT，它就会变成一个长时间存活的事务，持续持有行锁并阻止 undo log 的 purge。A 选项的 SQL 数量不决定是否为长事务——100 条简单 INSERT 如果在 1 秒内提交就不算长事务。C 选项的修改行数也不是判定标准——批量修改 1 万行但 3 秒内提交也是正常的。D 选项的隔离级别与长事务无关，任何隔离级别下都可能出现长事务。"
+        },
+        {
+          "id": "db-q047-quiz-2",
+          "question": "InnoDB 的行锁（Row Lock）在什么时候释放？",
+          "choices": [
+            {"id": "A", "text": "当执行完持有锁的那条 SQL 语句后立即释放"},
+            {"id": "B", "text": "当事务提交（COMMIT）或回滚（ROLLBACK）时释放"},
+            {"id": "C", "text": "当 innodb_lock_wait_timeout 超时后自动释放"},
+            {"id": "D", "text": "当其他事务请求同一行的锁时，根据优先级动态释放"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 InnoDB 锁机制中最基础也最关键的一条规则：行锁的生命周期与事务绑定，只有在事务提交或回滚时才会释放。这就是长事务危害的根源——事务不结束，锁就不释放。A 选项是一个常见误解，在普通数据库课程中学过「两阶段锁协议」（2PL）的人知道，InnoDB 遵循的正是这个协议：加锁阶段可以获取锁但不释放，解锁阶段集中在事务结束时。C 选项描述的 innodb_lock_wait_timeout 是让等待锁的事务放弃等待，不是让持有锁的事务释放锁。D 选项的优先级释放机制在 InnoDB 中不存在。"
+        },
+        {
+          "id": "db-q047-quiz-3",
+          "question": "长事务导致 undo log 无法被 purge 的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "长事务产生了大量的 undo log entry，purge 线程处理速度跟不上"},
+            {"id": "B", "text": "长事务的 Read View 创建时间很早，purge 线程不能清理任何可能被该 Read View 需要的旧版本"},
+            {"id": "C", "text": "长事务持有表级锁，阻止了 purge 线程访问 undo tablespace"},
+            {"id": "D", "text": "长事务占用了过多的 Buffer Pool 空间，purge 线程无法分配内存来执行清理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考的是 MVCC 和 purge 机制的关系。InnoDB 的 purge 线程在清理旧版本数据时，必须确保没有任何活跃的 Read View 还需要看到这些旧版本。在 REPEATABLE READ 下，事务的 Read View 在首次 SELECT 时创建，之后一直复用。如果一个长事务在 1 小时前创建了 Read View，那么这 1 小时内所有表的所有行的旧版本都不能被 purge——不管这些旧版本是不是该长事务自己产生的。A 选项搞混了因果：问题不在于长事务自身产生了多少 undo log，而在于它的 Read View 阻止了全局的 purge。C 选项不正确，purge 不受行锁或表锁限制。D 选项的内存分配不是 purge 停滞的原因。"
+        },
+        {
+          "id": "db-q047-quiz-4",
+          "question": "当你通过 information_schema.innodb_trx 发现一个长事务的 trx_query 字段为 NULL，这意味着什么？",
+          "choices": [
+            {"id": "A", "text": "该事务已经完成了所有操作正在等待自动提交"},
+            {"id": "B", "text": "该事务当前没有在执行任何 SQL，处于空闲状态，但事务仍然活跃（未提交也未回滚）"},
+            {"id": "C", "text": "查询权限不足，无法显示该事务的 SQL 内容"},
+            {"id": "D", "text": "该事务执行的是 DDL 语句而非 DML 语句，所以不显示"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "innodb_trx 表的 trx_query 字段记录的是事务当前正在执行的 SQL 语句。当这个字段为 NULL 时，说明事务处于空闲状态——它已经开启了事务（BEGIN），可能之前执行过一些 SQL 并加了锁，但当前连接上没有正在运行的查询。这是长事务最典型的形态：应用代码在事务中间做了某个耗时操作（比如 HTTP 调用），或者开发人员忘记了 COMMIT，导致事务一直开着。A 选项的「等待自动提交」不对，显式 BEGIN 的事务必须显式 COMMIT。C 选项不正确，innodb_trx 对有 PROCESS 权限的用户完全可见。D 选项也不对，DDL 语句在 InnoDB 中同样会被记录。"
+        },
+        {
+          "id": "db-q047-quiz-5",
+          "question": "以下 SHOW ENGINE INNODB STATUS 输出片段中，哪个信息最直接反映了 undo log 的堆积程度？\n\n```\n------------\nTRANSACTIONS\n------------\nTrx id counter 28194102\nPurge done for trx's n:o < 28190112 undo n:o < 0 state: running but idle\nHistory list length 2831456\n```",
+          "choices": [
+            {"id": "A", "text": "Trx id counter 28194102 表示有 2800 多万个事务在排队"},
+            {"id": "B", "text": "Purge done for trx's n:o < 28190112 说明 purge 线程已经停止工作"},
+            {"id": "C", "text": "History list length 2831456 表示有 283 万条 undo log 旧版本记录等待被 purge 清理"},
+            {"id": "D", "text": "state: running but idle 表示事务引擎已经空闲，没有需要处理的工作"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "History list length（等同于 Innodb_history_list_length 状态变量）是衡量 undo log 堆积程度最直接的指标。它表示 undo log 中等待被 purge 线程清理的历史版本数量。正常情况下这个值应该在几百到几千的范围内，283 万说明 purge 严重滞后，几乎可以确定系统中存在长事务。A 选项理解错误，Trx id counter 是事务 ID 的递增计数器，不是排队的事务数。B 选项误读了 purge 行：n:o < 28190112 表示 purge 已清理到这个事务 ID 之前的版本，不代表停止工作。D 选项的 running but idle 描述的是 purge 线程的状态——它在运行但当前空闲，可能是因为已经清理到了长事务的 Read View 边界无法继续推进。"
+        },
+        {
+          "id": "db-q047-quiz-6",
+          "question": "在 autocommit=1（MySQL 默认值）的情况下，以下哪种操作方式不会产生长事务？",
+          "choices": [
+            {"id": "A", "text": "显式执行 BEGIN，然后执行多条 UPDATE，最后忘记 COMMIT"},
+            {"id": "B", "text": "不写 BEGIN，直接逐条执行 INSERT 语句"},
+            {"id": "C", "text": "在应用代码中开启事务后，在事务中间调用了一个响应时间为 30 秒的外部 HTTP 接口"},
+            {"id": "D", "text": "使用 SET autocommit=0 后执行查询，然后忘记手动 COMMIT"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 autocommit=1 且不显式写 BEGIN 时，每条 SQL 执行完毕后自动提交，事务的生命周期就是单条 SQL 的执行时间（通常几毫秒），不会产生长事务。A 选项的问题在于显式 BEGIN 关闭了自动提交，忘记 COMMIT 则事务一直存活。C 选项是典型的长事务成因：事务在等待外部 HTTP 响应的 30 秒内一直持有锁。D 选项设置了 autocommit=0，此时每条 SQL 执行后不会自动提交，事务会一直持续到你手动 COMMIT 或断开连接。B 选项是唯一安全的，因为 autocommit=1 + 无 BEGIN 意味着每条语句独立成事务并立即提交。"
+        },
+        {
+          "id": "db-q047-quiz-7",
+          "question": "对比 MySQL 5.7 和 MySQL 8.0 在 undo tablespace 管理上的差异，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "MySQL 5.7 默认将 undo log 存储在 ibdata1 中且 ibdata1 不可收缩；MySQL 8.0 默认使用独立 undo tablespace 并支持自动 truncate 释放磁盘空间"},
+            {"id": "B", "text": "MySQL 5.7 没有 undo log 机制，MVCC 完全靠 redo log 实现；MySQL 8.0 才引入 undo log"},
+            {"id": "C", "text": "两者的 undo log 管理完全相同，都存储在 ibdata1 中，唯一区别是 8.0 的 purge 速度更快"},
+            {"id": "D", "text": "MySQL 8.0 取消了 undo log，改用 write-ahead logging 来实现 MVCC"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "MySQL 5.7 中 undo log 默认存储在系统表空间 ibdata1 中（虽然 5.6 开始支持通过 innodb_undo_tablespaces 配置独立 undo tablespace，但默认值是 0 即不启用）。ibdata1 有一个著名的限制：即使里面的数据被清理了，文件也只涨不缩，释放的空间只是标记为内部可复用。MySQL 8.0 做了重大改进：默认使用 2 个独立的 undo tablespace，并且 innodb_undo_log_truncate 默认为 ON，当单个 undo tablespace 超过 innodb_max_undo_log_size（默认 1GB）时会自动 truncate 文件释放磁盘空间。B 选项完全错误，undo log 从 InnoDB 诞生之初就存在。C 选项不正确，两者的存储方式有本质区别。D 选项也是错误的，undo log 在 8.0 中依然是 MVCC 的核心组件。"
+        },
+        {
+          "id": "db-q047-quiz-8",
+          "question": "线上数据库出现大量 Lock wait timeout exceeded 报错，你通过 innodb_trx 定位到一个运行了 30 分钟的长事务（thread_id=14502），trx_rows_modified=50000。你决定 KILL 14502，此时会发生什么？",
+          "choices": [
+            {"id": "A", "text": "事务立即消失，所有锁立即释放，50000 行修改瞬间撤销"},
+            {"id": "B", "text": "MySQL 开始回滚该事务，需要逐行撤销 50000 行修改，回滚期间锁仍然被持有，回滚完成后锁才释放"},
+            {"id": "C", "text": "KILL 只断开连接但不影响事务，事务会继续运行直到自然结束"},
+            {"id": "D", "text": "MySQL 将该事务的修改直接提交以避免回滚开销，然后释放锁"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是很多人在处理长事务时忽略的关键点：KILL 一个有大量修改的长事务不会立即恢复正常，因为 InnoDB 需要通过 undo log 逐行撤销所有已修改的数据。如果 trx_rows_modified 是 50000，那回滚过程本身可能需要几分钟甚至十几分钟。更关键的是，在回滚完成之前，该事务持有的行锁不会释放——也就是说其他等待这些锁的事务仍然被阻塞。你可以通过 SHOW ENGINE INNODB STATUS 看到该事务进入 ROLLING BACK 状态。A 选项的「瞬间撤销」是错误的，InnoDB 的回滚有真实开销。C 选项不对，KILL 连接会触发事务回滚。D 选项完全违反事务的原子性原则。"
+        },
+        {
+          "id": "db-q047-quiz-9",
+          "question": "在 REPEATABLE READ 隔离级别下，一个长事务在 10:00 创建了 Read View（首次 SELECT），此后一直未提交。到 11:00，purge 线程能清理的 undo log 旧版本范围是？",
+          "choices": [
+            {"id": "A", "text": "不能清理任何 undo log，因为有活跃事务就完全停止 purge"},
+            {"id": "B", "text": "只能清理 10:00 之前产生的旧版本，10:00 之后所有表的所有旧版本都不能清理"},
+            {"id": "C", "text": "可以清理所有不被该长事务直接修改的表的 undo log"},
+            {"id": "D", "text": "可以正常清理所有 undo log，Read View 只影响读取结果不影响 purge"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题精确考察 Read View 与 purge 的关系。purge 线程清理旧版本的判断标准是：是否还有活跃的 Read View 可能需要看到这个版本。一个在 10:00 创建的 Read View 可能读取数据库中任意表的任意行，它需要看到的是 10:00 时刻的数据快照。因此 10:00 之后任何表上发生的 UPDATE 和 DELETE 所产生的旧版本都不能被 purge，因为这个 Read View 可能会去读这些行的 10:00 版本。A 选项过于绝对——10:00 之前产生的、不被任何 Read View 需要的旧版本是可以被清理的。C 选项的「直接修改的表」限定不正确，Read View 是全局的，不区分表。D 选项完全错误，Read View 是 purge 停滞的直接原因。"
+        },
+        {
+          "id": "db-q047-quiz-10",
+          "question": "以下哪种应用层实践最能有效预防长事务的产生？",
+          "choices": [
+            {"id": "A", "text": "将 innodb_lock_wait_timeout 设置为 1 秒，让锁等待尽快失败"},
+            {"id": "B", "text": "在事务中间插入 HTTP 调用来实现分布式一致性，确保所有服务都完成后再 COMMIT"},
+            {"id": "C", "text": "在 BEGIN 和 COMMIT 之间只放必要的 SQL 操作，将 HTTP/RPC 调用移到事务外部，用 Saga 模式处理跨服务协调"},
+            {"id": "D", "text": "将所有表改为 MyISAM 引擎以避免 InnoDB 的行锁问题"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "预防长事务最根本的原则是缩短事务生存时间，核心做法就是在事务中只做数据库操作，把所有非数据库操作（HTTP 调用、消息发送、文件 I/O 等）移到事务之外。跨服务的协调应该用 Saga 模式（将大事务拆分为多个本地事务加补偿操作）或 Transactional Outbox 模式（在本地事务中写消息表，由后台进程异步发送），而不是在一个数据库事务中等待所有服务响应。A 选项只是让等锁的一方更快失败，并没有解决长事务本身的问题。B 选项恰恰是长事务产生的典型原因——在事务中做 HTTP 调用。D 选项的 MyISAM 不支持事务，只有表级锁，问题更严重。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-trx-table.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-undo-tablespaces.html",
+        "https://docs.percona.com/percona-toolkit/pt-kill.html"
+      ]
+    }
+  ]
+}
