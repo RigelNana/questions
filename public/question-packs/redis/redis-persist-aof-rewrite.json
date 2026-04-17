@@ -1,0 +1,284 @@
+{
+  "id": "redis-persist-aof-rewrite",
+  "name": "AOF rewrite 的触发条件与执行过程",
+  "domain": "redis",
+  "description": "深入解析 AOF 重写的自动/手动触发机制、fork 子进程执行流程、Redis 7.0 Multi Part AOF 改进、COW 内存开销与生产调优策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-persist-aof-rewrite-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": [
+        "AOF重写",
+        "BGREWRITEAOF",
+        "触发条件",
+        "重写流程",
+        "管道优化",
+        "redis-persistence"
+      ],
+      "title": "AOF rewrite 是怎么触发的，执行过程是什么样的？",
+      "content": "面试官问「说说 AOF rewrite 是怎么回事」，大部分候选人能答出「AOF 文件太大了就触发重写，把冗余命令合并」，然后就卡住了。面试官期望的深度比这多得多：自动触发的两个阈值分别是什么？默认值是多少？rewrite 期间新写入的命令怎么保证不丢？Redis 7.0 的 Multi Part AOF 改了什么？为什么 rewrite 和 BGSAVE 不能同时跑？\n\nAOF（Append Only File）是 Redis 提供的一种持久化方案，与 RDB 快照不同，AOF 记录的是每一条写命令本身。客户端执行 `SET user:1001 Alice`，Redis 就把这条命令追加写入 AOF 文件。数据恢复时 Redis 把 AOF 文件中的命令从头到尾重放一遍，就能恢复到宕机前的状态。\n\n但问题来了——AOF 文件是追加写入的，同一个 key 被修改 100 次就会记录 100 条命令，但最终只有最后一条是有效的。随着时间推移，AOF 文件会不断膨胀，里面充斥着大量冗余命令。一个线上实例跑了几个月，实际数据只有 2GB，AOF 文件可能涨到了 20GB。这不仅浪费磁盘空间，更严重的是重启恢复时需要重放这 20GB 的命令，耗时可能超过 30 分钟。\n\nAOF rewrite 就是为了解决这个问题而设计的。它的核心思路是：不去分析旧 AOF 文件里的命令，而是直接根据当前内存中的数据状态，生成一组等效的最小命令集写入新的 AOF 文件。比如一个 key 被 SET 了 100 次，rewrite 后只保留最后一次的值对应的 SET 命令。一个 list 被 LPUSH 了 1000 次又 LPOP 了 500 次，rewrite 后只生成一条 RPUSH 包含当前剩余的 500 个元素。这样新 AOF 文件只包含重建当前数据所需的最少命令，体积通常能缩小到原来的十分之一甚至更多。\n\n以下是一个典型的 AOF 配置（redis.conf）：\n\n```ini\n# 启用 AOF 持久化\nappendonly yes\n\n# AOF 文件名（Redis 7.0+ 这是目录名）\nappendfilename \"appendonly.aof\"\n\n# fsync 策略：everysec 是推荐的平衡选项\nappendfsync everysec\n\n# rewrite 期间是否暂停 fsync\nno-appendfsync-on-rewrite no\n\n# 自动触发 rewrite 的两个阈值\nauto-aof-rewrite-percentage 100\nauto-aof-rewrite-min-size 64mb\n```\n\n现在核心问题来了：rewrite 到底什么时候触发？触发之后 Redis 内部的执行流程是怎样的？Redis 7.0 为什么要搞 Multi Part AOF 来替代旧的 aof_rewrite_buf 方案？rewrite 期间来了新的写请求怎么办？这些才是面试官要考察的重点。",
+      "answer": "## 一、AOF 持久化基础：先理解 rewrite 要解决的问题\n\n### 1.1 AOF 是什么\n\nAOF 的全称是 Append Only File，是 Redis 两大持久化方案之一（另一个是 RDB 快照）。AOF 的工作原理非常直观：Redis 每执行一条写命令（SET、DEL、INCR、LPUSH 等），就把这条命令以 RESP 协议格式追加到 AOF 文件的末尾。数据恢复时，Redis 启动后把 AOF 文件中的命令从头到尾重放一遍，就能精确恢复到宕机前的最新状态。\n\n相比 RDB 的定时快照，AOF 的核心优势是数据安全性更高。RDB 是每隔一段时间生成一次全量快照，两次快照之间如果 Redis 宕机，中间的写入就丢了。而 AOF 配合 `appendfsync everysec`（每秒刷盘一次），最多只丢 1 秒的数据；如果设成 `appendfsync always`（每条命令都刷盘），理论上可以做到零数据丢失，当然代价是性能下降明显。\n\n一个最简单的 AOF 使用流程如下。在 redis.conf 中启用 AOF，然后重启 Redis：\n\n```bash\n# redis.conf\nappendonly yes\nappendfsync everysec\n\n# 启动 Redis 后执行几条写命令\n127.0.0.1:6379> SET name Alice\nOK\n127.0.0.1:6379> SET name Bob\nOK\n127.0.0.1:6379> SET name Charlie\nOK\n```\n\n此时 AOF 文件中会记录三条 SET 命令（以 RESP 格式）：\n\n```\n*3\\r\\n$3\\r\\nSET\\r\\n$4\\r\\nname\\r\\n$5\\r\\nAlice\\r\\n\n*3\\r\\n$3\\r\\nSET\\r\\n$4\\r\\nname\\r\\n$3\\r\\nBob\\r\\n\n*3\\r\\n$3\\r\\nSET\\r\\n$4\\r\\nname\\r\\n$7\\r\\nCharlie\\r\\n\n```\n\n但 name 这个 key 最终的值只有 Charlie，前两条 SET 是完全冗余的。这就是 AOF 膨胀的根源——每次修改都追加记录，不管之前的值是否已经被覆盖。\n\n### 1.2 为什么必须有 rewrite\n\n在一个高写入的生产环境中，AOF 文件的膨胀速度是惊人的。假设你的 Redis 实例每秒处理 2 万次写请求，每条命令平均 100 字节，那么 AOF 文件每秒增长约 2MB，一天就是 172GB。即使实际有效数据只有 5GB，AOF 文件也会快速膨胀到几十上百 GB。\n\n这带来两个严重问题。第一是磁盘空间浪费，而且如果磁盘写满了 Redis 会直接拒绝写入，这在生产环境中是致命的。第二是恢复时间过长——Redis 重启时需要逐条重放 AOF 中的命令来恢复数据，一个 50GB 的 AOF 文件重放可能需要 40 分钟以上，期间实例完全不可用。\n\nAOF rewrite 的设计目标就是在不停机的情况下，将膨胀的 AOF 文件压缩为只包含重建当前数据所需的最小命令集。rewrite 之后，上面三条 SET 命令只会变成一条 `SET name Charlie`，文件体积可以缩小一到两个数量级。\n\n## 二、AOF rewrite 的触发机制\n\n### 2.1 手动触发：BGREWRITEAOF\n\nAOF rewrite 可以通过 `BGREWRITEAOF` 命令手动触发（BG 代表 Background，后台执行）。执行后 Redis 会 fork 出一个子进程在后台完成 rewrite 工作，主线程继续处理客户端请求：\n\n```bash\n127.0.0.1:6379> BGREWRITEAOF\nBackground append only file rewriting started\n\n# 查看 rewrite 状态\n127.0.0.1:6379> INFO persistence\n# Persistence\naof_enabled:1\naof_rewrite_in_progress:1\naof_rewrite_scheduled:0\naof_last_rewrite_time_sec:-1\naof_current_rewrite_time_sec:3\naof_last_bgrewrite_status:ok\n```\n\n这里 `aof_rewrite_in_progress:1` 表示当前有一个 rewrite 子进程正在运行，`aof_current_rewrite_time_sec:3` 表示已经跑了 3 秒。如果此时又有一个 BGSAVE 或 BGREWRITEAOF 请求进来，Redis 会直接拒绝，因为同一时刻只允许存在一个后台子进程（通过 `hasActiveChildProcess()` 检查）。不过有个特殊情况——如果当前正在执行 BGSAVE 而你触发了 BGREWRITEAOF，Redis 不会立即报错，而是将 rewrite 请求标记为 `aof_rewrite_scheduled:1`，等 BGSAVE 完成后自动开始 rewrite。\n\n### 2.2 自动触发：百分比阈值 + 最小体积\n\nRedis 提供了两个配置参数来控制 AOF rewrite 的自动触发，两个条件必须**同时满足**才会触发：\n\n`auto-aof-rewrite-percentage`（默认 100）：当前 AOF 文件大小相比上一次 rewrite 完成后的 AOF 文件大小增长了这个百分比时，满足条件。比如上次 rewrite 后 AOF 是 200MB，百分比设为 100，那么当前 AOF 达到 400MB（增长了 100%）时满足这个条件。\n\n`auto-aof-rewrite-min-size`（默认 64MB）：当前 AOF 文件大小必须超过这个最小阈值。这个参数的存在是为了避免 AOF 文件很小的时候频繁触发 rewrite——一个 2MB 的 AOF 涨到 4MB 就触发 rewrite 是没有意义的，fork 一次子进程的开销远大于收益。\n\nRedis 在 `serverCron` 定时任务中检查这两个条件，核心判断逻辑在 server.c 中（Redis 7.2 源码简化）：\n\n```c\n/* serverCron 中的自动 AOF rewrite 检查 */\nif (server.aof_state == AOF_ON &&\n    !hasActiveChildProcess() &&\n    server.aof_rewrite_perc &&\n    server.aof_current_size > server.aof_rewrite_min_size)\n{\n    long long base = server.aof_rewrite_base_size ?\n                     server.aof_rewrite_base_size : 1;\n    long long growth = (server.aof_current_size * 100 / base) - 100;\n    if (growth >= server.aof_rewrite_perc) {\n        rewriteAppendOnlyFileBackground();\n    }\n}\n```\n\n这段代码的逻辑很清晰：首先检查 AOF 是否启用且没有活跃子进程；然后检查当前 AOF 大小是否超过 `aof_rewrite_min_size`；最后计算增长百分比是否达到阈值。`server.aof_rewrite_base_size` 是上一次 rewrite 完成后的 AOF 文件大小，Redis 每次 rewrite 完成或启动加载 AOF 后都会更新这个值。如果 Redis 从来没做过 rewrite（首次启动），`aof_rewrite_base_size` 为 0，代码中用 1 做兜底避免除零。\n\n举个具体例子：假设默认配置（percentage=100, min-size=64MB），Redis 首次启动写入数据到 AOF 达到 64MB 时不会触发（因为 base 是 0，计算出的 growth 极大但 base 是 1，实际上第一次 AOF 达到 64MB 就会触发首次 rewrite）。首次 rewrite 后 AOF 压缩到 30MB，此时 base 更新为 30MB。之后 AOF 增长到 60MB 时满足 percentage 条件（增长了 100%）但不满足 min-size 条件（60MB < 64MB），所以不触发。继续增长到 64MB 时两个条件都满足，触发第二次 rewrite。\n\n## 三、AOF rewrite 的执行流程\n\n### 3.1 Redis 7.0 之前的经典流程\n\n在 Redis 7.0 之前，AOF rewrite 的执行流程是这样的：\n\n**第一步：fork 子进程。** 主进程调用 `fork()` 创建子进程。与 BGSAVE 一样，fork 利用操作系统的 COW（Copy-On-Write，写时复制）机制——子进程获得父进程内存数据的只读快照，物理内存页在父子进程间共享，只有当父进程修改某个页时才真正复制那一页。fork 本身只需复制页表结构，10GB 的 Redis 实例 fork 耗时通常在 20-50ms。\n\n**第二步：子进程生成新 AOF 文件。** 子进程遍历内存中的所有 key-value 数据，根据每个 key 当前的数据类型和值，生成等效的写命令写入一个临时文件 `temp-rewriteaof-bg-<pid>.aof`。比如一个 list 类型的 key 当前有 500 个元素，子进程直接生成一条 `RPUSH key e1 e2 ... e500` 命令（如果元素过多会拆分成多条，每条最多 64 个元素，防止单条命令过大）。\n\n**第三步：父进程同时维护 aof_rewrite_buf。** 在子进程工作期间，父进程继续处理客户端请求。每条新的写命令会同时写入两个地方：一是旧的 AOF 文件（保证即使 rewrite 失败数据也不丢），二是内存中的 `aof_rewrite_buf`（重写缓冲区）。这个缓冲区暂存了 rewrite 期间所有的增量写命令。\n\n**第四步：子进程完成后的数据追加。** 子进程完成序列化并写入临时文件后，通过管道通知父进程。父进程收到通知后，将 `aof_rewrite_buf` 中积累的所有增量命令追加到子进程生成的临时文件末尾。这一步保证了新 AOF 文件包含了 rewrite 期间所有的写操作，不会丢数据。\n\n**第五步：原子替换。** 父进程将临时文件通过 `rename()` 系统调用原子性地替换旧的 AOF 文件。`rename()` 在同一文件系统上是原子操作，要么成功要么失败，不会出现中间状态。至此，AOF rewrite 完成。\n\n这个流程有一个明显的问题：第四步中父进程需要把 `aof_rewrite_buf` 的内容追加到新文件，如果 rewrite 期间写入量非常大，这个缓冲区可能积累了几百 MB 甚至上 GB 的数据，追加写入的过程会阻塞主线程，造成一次明显的延迟尖刺。Redis 后来引入了管道（pipe）优化——在子进程还没完成的时候，父进程就开始通过管道把 `aof_rewrite_buf` 的数据分批发送给子进程，由子进程边做 rewrite 边追加增量数据。这样子进程完成时缓冲区中剩余的增量数据很少，父进程最后只需追加很小一部分，大幅减少了阻塞时间。\n\n### 3.2 Redis 7.0 Multi Part AOF：架构级改进\n\nRedis 7.0 对 AOF 做了一次架构级重构，引入了 Multi Part AOF（多部分 AOF）机制，彻底解决了 `aof_rewrite_buf` 带来的问题。这个改动的 PR 是 redis/redis#9788，由阿里云 Redis 团队贡献。\n\n在新架构下，AOF 不再是一个单独的文件，而是一个目录（默认名 `appendonlydir`），里面包含多个文件和一个 manifest（清单）文件：\n\n```bash\n$ ls appendonlydir/\nappendonly.aof.1.base.rdb       # base 文件：rewrite 生成的基准数据（RDB 格式或 AOF 格式）\nappendonly.aof.1.incr.aof       # incr 文件：rewrite 之后的增量命令\nappendonly.aof.2.incr.aof       # 新的 incr 文件（rewrite 期间的增量）\nappendonly.aof.manifest          # manifest 文件：记录当前有效的文件列表\n```\n\nAOF 文件被分成三种类型：BASE 文件是 rewrite 生成的基准数据文件（如果开启了 `aof-use-rdb-preamble yes`，BASE 文件的格式是 RDB，否则是 AOF 命令格式）；INCR 文件记录 rewrite 之后的增量写命令；MANIFEST 文件记录当前哪些 BASE 和 INCR 文件是有效的，以及它们的加载顺序。\n\n在这个架构下，rewrite 的执行流程变了。当 rewrite 触发时，Redis 先创建一个新的 INCR 文件，后续所有新的写命令直接追加到这个新 INCR 文件中（而不是写入 `aof_rewrite_buf`），然后 fork 子进程根据内存数据生成新的 BASE 文件。子进程完成后，Redis 更新 MANIFEST 文件，将旧的 BASE 和旧的 INCR 文件标记为无效，新的 BASE 文件加上新的 INCR 文件成为当前的有效文件组合。旧文件随后被异步删除。\n\n这个设计的精妙之处在于：rewrite 期间的增量命令直接写入新的 INCR 文件（磁盘 I/O 由操作系统内核缓冲处理），不再需要在内存中维护 `aof_rewrite_buf`。这带来了三个好处——内存开销大幅降低（不再需要可能达到几百 MB 的重写缓冲区），消除了 rewrite 完成时父进程追加缓冲区造成的阻塞，而且整个切换过程通过更新 MANIFEST 文件来完成，比旧方案的 `rename()` 更加优雅。\n\n数据恢复时，Redis 按照 MANIFEST 文件记录的顺序，先加载 BASE 文件恢复基准数据，再按顺序重放所有 INCR 文件中的增量命令。\n\n### 3.3 aof-use-rdb-preamble：混合持久化\n\n从 Redis 4.0 开始引入了 `aof-use-rdb-preamble` 配置（默认开启），开启后 rewrite 生成的 BASE 文件不是 AOF 命令格式，而是 RDB 二进制格式。这样做的好处是 RDB 格式更紧凑、加载更快。重启恢复时先加载 RDB 格式的 BASE 文件（速度极快），再重放 INCR 文件中的增量 AOF 命令。这种方案兼具了 RDB 的快速恢复和 AOF 的数据安全性，是目前生产环境的推荐配置。\n\n在混合持久化模式下，rewrite 子进程实际上调用的是 `rdbSaveRio()` 来序列化内存数据为 RDB 格式，生成的文件头部是 `REDIS` 魔数标识，与纯 RDB 文件一致。\n\n## 四、rewrite 期间的 COW 内存开销\n\nAOF rewrite 和 BGSAVE 一样基于 `fork()` 系统调用，因此面临同样的 COW（Copy-On-Write）内存开销问题。fork 之后父子进程共享物理内存页，当父进程处理写请求修改了某个内存页时，操作系统内核会为父进程复制一份该页的副本（页大小为 4KB），子进程仍然读取原始页。rewrite 持续时间越长、父进程写入越频繁，COW 导致的额外内存消耗就越大。\n\n可以通过 `INFO persistence` 中的 `aof_last_cow_size` 字段查看上一次 rewrite 的 COW 内存开销：\n\n```bash\n127.0.0.1:6379> INFO persistence\naof_last_cow_size:41943040\n```\n\n这里 41943040 字节 ≈ 40MB，说明上一次 rewrite 期间 COW 复制了约 40MB 的内存页。如果这个值持续偏高（比如超过实例内存的 20%），说明 rewrite 期间写入压力过大，需要考虑调整 rewrite 触发时机或拆分实例。\n\n### 4.1 no-appendfsync-on-rewrite 配置\n\n`no-appendfsync-on-rewrite` 这个配置项控制 rewrite 期间是否暂停对 AOF 文件的 fsync 操作。默认值是 `no`（不暂停）。\n\n当设置为 `yes` 时，Redis 在 rewrite 期间不会对当前 AOF 文件执行 fsync，所有写命令仍然追加到 AOF 文件（写入操作系统页缓存），但不强制刷盘。为什么要这样做？因为 rewrite 子进程在全力写入新的 AOF 文件，磁盘 I/O 已经很高了。如果父进程同时还在对旧 AOF 文件做 fsync，两者争抢磁盘带宽，在 HDD（机械硬盘）上尤其明显——fsync 可能阻塞几百毫秒甚至更长，导致 Redis 主线程出现延迟尖刺。\n\n当然，设为 `yes` 的代价是 rewrite 期间如果 Redis 崩溃，操作系统页缓存中尚未刷盘的 AOF 数据（最多 30 秒的数据，由 Linux 内核的 `vm.dirty_expire_centisecs` 控制）可能丢失。对于大多数业务来说这是可以接受的风险，因此在使用 HDD 的环境中建议设为 `yes`。SSD 环境中磁盘 I/O 竞争不严重，保持默认 `no` 即可。\n\n## 五、rewrite 与 BGSAVE 的互斥\n\nRedis 在任意时刻最多只允许一个后台子进程运行。这意味着 AOF rewrite 和 BGSAVE 不能同时执行。源码中通过 `hasActiveChildProcess()` 函数检查：\n\n```c\nint hasActiveChildProcess() {\n    return server.child_pid != -1;\n}\n```\n\n如果当前已有 BGSAVE 子进程在运行，再触发 BGREWRITEAOF 时 Redis 不会报错，而是设置 `server.aof_rewrite_scheduled = 1`，等 BGSAVE 完成后在下一个 `serverCron` 周期中自动启动 rewrite。反过来也一样——如果 rewrite 正在进行，触发 BGSAVE 会被延迟。\n\n为什么要互斥？核心原因是 COW 内存开销。如果两个子进程同时 fork 出来，父进程的每次写入都会触发两份 COW 页面复制（两个子进程各持有一份原始页引用），内存峰值可能直接翻倍甚至更多，在大内存实例上极易触发 OOM（Out of Memory）。\n\n## 六、生产调优与监控\n\n### 6.1 调整触发阈值\n\n默认的 `auto-aof-rewrite-percentage 100` 和 `auto-aof-rewrite-min-size 64mb` 适合中小实例。对于大内存实例（10GB 以上），rewrite 一次 fork 的 COW 开销不低，建议适当提高阈值减少 rewrite 频率：\n\n```ini\n# 大实例调优示例\nauto-aof-rewrite-percentage 200\nauto-aof-rewrite-min-size 512mb\n```\n\n把 percentage 提高到 200 意味着 AOF 文件要膨胀到上次 rewrite 后的 3 倍才触发，min-size 提高到 512MB 进一步过滤掉小文件的无意义 rewrite。代价是 AOF 文件在两次 rewrite 之间会更大，需要确保磁盘空间充足。\n\n### 6.2 关键监控指标\n\n通过 `INFO persistence` 可以获取所有 rewrite 相关的监控数据：\n\n```bash\n127.0.0.1:6379> INFO persistence\naof_enabled:1\naof_rewrite_in_progress:0          # 当前是否在 rewrite\naof_rewrite_scheduled:0            # 是否有等待执行的 rewrite\naof_last_rewrite_time_sec:5        # 上一次 rewrite 耗时（秒）\naof_current_rewrite_time_sec:-1    # 当前 rewrite 已运行时间（-1 表示没在 rewrite）\naof_last_bgrewrite_status:ok       # 上一次 rewrite 结果\naof_last_cow_size:41943040         # 上一次 rewrite 的 COW 内存开销\naof_current_size:134217728         # 当前 AOF 文件大小\naof_base_size:67108864             # 上次 rewrite 后的 AOF 基准大小\naof_rewrite_buffer_length:0        # rewrite 缓冲区大小（Redis < 7.0）\n```\n\n生产环境中应当监控 `aof_last_rewrite_time_sec`（如果持续增大说明数据量在增长，需要关注 fork 阻塞时间）、`aof_last_cow_size`（反映 rewrite 期间的写入压力）、以及 `aof_last_bgrewrite_status`（如果不是 ok 说明上次 rewrite 失败了，需要排查原因，常见的原因是磁盘空间不足或 fork 失败）。同时也要关注 `INFO stats` 中的 `latest_fork_usec`，这个值记录了最近一次 fork 的阻塞时长（微秒），包括 BGSAVE 和 AOF rewrite 的 fork。\n\n### 6.3 常见问题与避坑\n\n一个常见的坑是 rewrite 和 RDB 同时配置了自动触发，但没有合理错开时间。比如 `save 900 1` 触发了 BGSAVE，刚好此时 AOF 也达到了 rewrite 阈值，rewrite 被 schedule 到 BGSAVE 之后立即执行。这意味着 Redis 在短时间内 fork 了两次，对主线程造成两次阻塞，COW 内存也会有两波峰值。生产环境中如果同时使用 RDB 和 AOF，建议适当调低 RDB 的自动触发频率，或者在业务低峰期通过 crontab 手动触发 BGSAVE 和 BGREWRITEAOF 并错开时间。\n\n另一个值得注意的点是 Redis 7.0 之前的版本中，如果 rewrite 期间 Redis 实例被 `SHUTDOWN` 或被 kill，旧的 AOF 文件不会受影响（因为新文件还没有 rename 替换旧文件），数据是安全的。Redis 7.0 的 Multi Part AOF 也保持了这个安全性——MANIFEST 文件的更新是原子的，不管在哪个阶段崩溃，重启后都能通过 MANIFEST 找到一组完整的可恢复文件。",
+      "keyPoints": [
+        "AOF rewrite 不分析旧文件，而是根据当前内存数据直接生成最小等效命令集，文件体积通常缩小一到两个数量级",
+        "自动触发需同时满足两个条件：当前 AOF 大小超过 auto-aof-rewrite-min-size（默认 64MB），且相比上次 rewrite 后增长超过 auto-aof-rewrite-percentage（默认 100%）",
+        "Redis 7.0 之前 rewrite 期间新命令同时写入旧 AOF 和 aof_rewrite_buf，子进程完成后父进程追加缓冲区再 rename 替换旧文件",
+        "Redis 7.0 Multi Part AOF 用 BASE + INCR + MANIFEST 三类文件替代单文件方案，增量命令直接写入新 INCR 文件，消除了 aof_rewrite_buf 的内存开销和追加阻塞",
+        "rewrite 基于 fork + COW，与 BGSAVE 互斥执行，同一时刻只允许一个后台子进程，避免双倍 COW 导致 OOM",
+        "no-appendfsync-on-rewrite 设为 yes 可避免 rewrite 期间 fsync 与子进程写入争抢磁盘 I/O，代价是崩溃时可能多丢最多约 30 秒数据",
+        "aof-use-rdb-preamble 开启后 rewrite 生成 RDB 格式的 BASE 文件，兼具 RDB 快速恢复和 AOF 数据安全性，是生产推荐配置",
+        "通过 INFO persistence 中 aof_last_rewrite_time_sec、aof_last_cow_size、aof_last_bgrewrite_status 监控 rewrite 健康状态"
+      ],
+      "quiz": [
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz1",
+          "question": "AOF rewrite 是通过什么方式生成新 AOF 文件的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "逐条分析旧 AOF 文件中的命令，删除冗余命令后生成新文件"
+            },
+            {
+              "id": "B",
+              "text": "根据当前内存中的数据状态直接生成等效的最小命令集写入新文件"
+            },
+            {
+              "id": "C",
+              "text": "将旧 AOF 文件压缩为 gzip 格式以减小体积"
+            },
+            {
+              "id": "D",
+              "text": "把旧 AOF 文件转换为 RDB 二进制格式来替代"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "AOF rewrite 并不读取或分析旧的 AOF 文件。子进程遍历的是 Redis 当前内存中的所有 key-value 数据，根据每个 key 当前的类型和值生成等效的写命令。比如一个 key 被 SET 了 100 次，rewrite 只生成最后一次值对应的 SET 命令。选项 A 是一个常见误解——很多人以为 rewrite 是在旧文件上做「去重」，但实际上旧文件在 rewrite 期间甚至不会被读取。选项 C 把 rewrite 混淆为文件压缩，选项 D 描述的更接近 aof-use-rdb-preamble 的混合模式，但这只是 BASE 文件的格式选择，不是 rewrite 本身的机制。"
+        },
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz2",
+          "question": "AOF rewrite 自动触发需要同时满足哪两个条件？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "当前 AOF 大小超过 auto-aof-rewrite-min-size 且距离上次 rewrite 超过指定时间间隔"
+            },
+            {
+              "id": "B",
+              "text": "当前 AOF 大小超过 auto-aof-rewrite-min-size 且相比上次 rewrite 后的大小增长超过 auto-aof-rewrite-percentage"
+            },
+            {
+              "id": "C",
+              "text": "当前内存使用率超过 80% 且 AOF 文件大于 1GB"
+            },
+            {
+              "id": "D",
+              "text": "AOF 文件行数超过 100 万条命令且当前没有 BGSAVE 在运行"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 自动触发 AOF rewrite 的判断在 serverCron 定时任务中进行，需要同时满足两个条件：第一，当前 AOF 文件大小超过 auto-aof-rewrite-min-size（默认 64MB），防止小文件频繁触发 rewrite；第二，当前 AOF 大小相比上次 rewrite 完成后的基准大小（aof_rewrite_base_size）增长百分比达到 auto-aof-rewrite-percentage（默认 100%）。选项 A 的「时间间隔」是不存在的参数，Redis 用的是文件大小增长比例而非时间间隔。选项 C 和 D 的条件完全是虚构的，Redis 不以内存使用率或命令行数作为 rewrite 触发条件。"
+        },
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz3",
+          "question": "在 Redis 7.0 之前的经典 rewrite 流程中，rewrite 期间新的写命令被写入哪些地方？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "只写入旧的 AOF 文件，rewrite 完成后再从旧文件中提取增量"
+            },
+            {
+              "id": "B",
+              "text": "只写入 aof_rewrite_buf 缓冲区，旧 AOF 文件停止写入"
+            },
+            {
+              "id": "C",
+              "text": "同时写入旧的 AOF 文件和 aof_rewrite_buf 缓冲区"
+            },
+            {
+              "id": "D",
+              "text": "直接写入子进程正在生成的新 AOF 文件"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "在 Redis 7.0 之前的 rewrite 流程中，rewrite 期间每条新的写命令会同时写入两个目标：一是旧的 AOF 文件，保证即使 rewrite 中途失败，旧 AOF 文件仍然完整可用于恢复；二是内存中的 aof_rewrite_buf（重写缓冲区），用于在子进程完成后追加到新 AOF 文件中。选项 A 只写旧文件不维护缓冲区的话，子进程完成后没有办法补齐增量数据。选项 B 如果停止写入旧文件，一旦 rewrite 失败就会丢数据。选项 D 描述的更接近 Redis 7.0 Multi Part AOF 的行为，但在 7.0 之前并不是直接写入新文件。"
+        },
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz4",
+          "question": "Redis 7.0 Multi Part AOF 架构中，AOF 目录下有几种类型的文件？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "两种：RDB 文件和 AOF 文件"
+            },
+            {
+              "id": "B",
+              "text": "三种：BASE 文件（基准数据）、INCR 文件（增量命令）、MANIFEST 文件（清单）"
+            },
+            {
+              "id": "C",
+              "text": "两种：主 AOF 文件和 rewrite 临时文件"
+            },
+            {
+              "id": "D",
+              "text": "四种：BASE 文件、INCR 文件、MANIFEST 文件、HISTORY 文件（历史记录）"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 7.0 的 Multi Part AOF 架构将单个 AOF 文件拆分为三种类型的文件：BASE 文件存储 rewrite 生成的基准数据（格式取决于 aof-use-rdb-preamble 配置），INCR 文件记录 rewrite 之后的增量写命令，MANIFEST 文件记录当前有效的文件列表及加载顺序。选项 A 过于简化且不准确。选项 C 描述的是 Redis 7.0 之前的行为。选项 D 中的 HISTORY 文件虽然在 Redis 源码中确实用来标记待删除的旧文件，但它不是持久存在的有效文件类型，旧文件被标记后很快就会被异步删除，所以标准描述中 Multi Part AOF 有三种文件类型。"
+        },
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz5",
+          "question": "以下 INFO persistence 输出中，哪项数据表明 rewrite 期间的 COW 内存开销约为 80MB？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "aof_last_rewrite_time_sec:80"
+            },
+            {
+              "id": "B",
+              "text": "aof_rewrite_buffer_length:83886080"
+            },
+            {
+              "id": "C",
+              "text": "aof_last_cow_size:83886080"
+            },
+            {
+              "id": "D",
+              "text": "aof_current_size:83886080"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "aof_last_cow_size 记录的是上一次 AOF rewrite 子进程退出时统计到的 COW 内存复制量，单位是字节。83886080 字节 = 80MB，说明 rewrite 期间父进程因处理写请求导致了约 80MB 的物理页被复制。选项 A 的 aof_last_rewrite_time_sec 记录的是 rewrite 耗时（秒），80 表示耗时 80 秒，与内存无关。选项 B 的 aof_rewrite_buffer_length 是 Redis 7.0 之前 rewrite 缓冲区的大小，虽然也是字节单位但反映的是缓冲区内容而非 COW 开销。选项 D 的 aof_current_size 是当前 AOF 文件的总大小。"
+        },
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz6",
+          "question": "关于 no-appendfsync-on-rewrite 配置，以下哪个说法是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "设为 yes 时 rewrite 期间完全停止 AOF 写入，新的写命令不会被记录"
+            },
+            {
+              "id": "B",
+              "text": "设为 yes 时 rewrite 期间暂停 fsync，写命令仍追加到 AOF 但不强制刷盘，崩溃时可能多丢约 30 秒数据"
+            },
+            {
+              "id": "C",
+              "text": "设为 no 时 rewrite 子进程会跳过 fsync 以加速生成新 AOF 文件"
+            },
+            {
+              "id": "D",
+              "text": "该配置只对 appendfsync always 模式生效，对 everysec 模式无影响"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "no-appendfsync-on-rewrite 控制的是 rewrite 期间父进程是否对当前 AOF 文件执行 fsync。设为 yes 时，写命令仍然正常追加到 AOF 文件（写入操作系统页缓存），但 Redis 不调用 fsync 强制刷盘。这样做是为了避免 rewrite 子进程的磁盘写入和父进程的 fsync 争抢 I/O 带宽，尤其在 HDD 上效果显著。代价是如果 Redis 崩溃，页缓存中尚未刷盘的数据会丢失，最多约 30 秒（取决于内核 dirty page 刷新策略）。选项 A 错在「完全停止 AOF 写入」——写入没停，停的只是 fsync。选项 C 说反了对象。选项 D 是错的，该配置对 everysec 模式同样生效。"
+        },
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz7",
+          "question": "AOF rewrite 和 BGSAVE 为什么不能同时执行？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "因为两者都要写磁盘，同时写会导致文件损坏"
+            },
+            {
+              "id": "B",
+              "text": "因为两者都基于 fork，同时存在两个子进程会导致双倍 COW 内存开销，极易触发 OOM"
+            },
+            {
+              "id": "C",
+              "text": "因为 Redis 是单线程的，不支持同时执行两个后台命令"
+            },
+            {
+              "id": "D",
+              "text": "因为两者共用同一个临时文件路径，同时执行会产生文件名冲突"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "AOF rewrite 和 BGSAVE 都通过 fork() 创建子进程，fork 后子进程持有父进程内存页的只读引用。如果两个子进程同时存在，父进程每修改一个内存页就需要为两个子进程各保留一份原始副本，COW 的内存开销直接翻倍。对于大内存实例（比如 20GB），这可能意味着额外 40GB 的内存峰值需求，极易触发 OOM killer。选项 A 写磁盘不会导致文件损坏，它们写的是不同的文件。选项 C 虽然 Redis 主线程是单线程的，但 BGSAVE 和 rewrite 都在子进程中执行。选项 D 两者使用不同的临时文件名（temp-<pid>.rdb vs temp-rewriteaof-bg-<pid>.aof）。"
+        },
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz8",
+          "question": "一个 Redis 实例使用默认配置（auto-aof-rewrite-percentage 100，auto-aof-rewrite-min-size 64mb），上次 rewrite 后 AOF 大小为 50MB。当前 AOF 增长到 105MB 时会自动触发 rewrite 吗？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "会，因为增长了 110%（超过 100%）且大于 64MB"
+            },
+            {
+              "id": "B",
+              "text": "不会，因为虽然增长百分比满足但 105MB 没有达到 128MB（50MB 的两倍加上最小值）"
+            },
+            {
+              "id": "C",
+              "text": "会，因为 105MB 大于 64MB 且 (105-50)/50 = 110% ≥ 100%"
+            },
+            {
+              "id": "D",
+              "text": "不会，因为 auto-aof-rewrite-percentage 100 的意思是增长到 200MB（50MB + 100MB + 50MB）才触发"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "自动触发 rewrite 需要同时满足两个条件。第一个条件：当前 AOF 大小（105MB）大于 auto-aof-rewrite-min-size（64MB），满足。第二个条件：增长百分比 = (当前大小 - 基准大小) / 基准大小 × 100% = (105 - 50) / 50 × 100% = 110%，大于 auto-aof-rewrite-percentage 的 100%，满足。两个条件都满足所以会触发。选项 A 的计算结果正确但表述不够精确。选项 B 的计算方式是虚构的。选项 D 对 percentage 参数的理解完全错误——percentage 100 的意思是增长率达到 100%（即翻倍），而不是增长 100MB。"
+        },
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz9",
+          "question": "开启 aof-use-rdb-preamble 后，AOF rewrite 生成的 BASE 文件格式是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "标准的 RESP 协议命令格式（纯文本 AOF）"
+            },
+            {
+              "id": "B",
+              "text": "RDB 二进制格式，恢复时先加载 RDB 数据再重放 INCR 文件中的增量 AOF 命令"
+            },
+            {
+              "id": "C",
+              "text": "JSON 格式的数据快照，便于人工审查"
+            },
+            {
+              "id": "D",
+              "text": "gzip 压缩的 AOF 命令格式"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "aof-use-rdb-preamble 是 Redis 4.0 引入的混合持久化配置（默认开启）。开启后，AOF rewrite 生成的 BASE 文件使用 RDB 二进制格式序列化内存数据，而不是传统的 AOF 命令格式。数据恢复时，Redis 先加载 RDB 格式的 BASE 文件（速度极快，因为 RDB 是二进制格式不需要命令解析），再按顺序重放 INCR 文件中的增量 AOF 命令。这样既有 RDB 的快速恢复优势，又保留了 AOF 的增量数据安全性。选项 A 是关闭 aof-use-rdb-preamble 时的行为。选项 C 和 D 都是不存在的格式。"
+        },
+        {
+          "id": "redis-persist-aof-rewrite-q1-quiz10",
+          "question": "在一个 20GB 的 Redis 实例上，INFO persistence 显示 aof_last_rewrite_time_sec 从之前的 8 秒增长到了 25 秒，最可能的原因和应对措施是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "网络带宽不足导致 rewrite 变慢，应升级网卡"
+            },
+            {
+              "id": "B",
+              "text": "数据量增长导致子进程序列化耗时增加，应考虑拆分实例或调整 rewrite 触发阈值以在低峰期执行"
+            },
+            {
+              "id": "C",
+              "text": "AOF 文件损坏导致 rewrite 需要修复后重试，应执行 redis-check-aof 修复"
+            },
+            {
+              "id": "D",
+              "text": "客户端连接数过多导致主线程繁忙，应限制最大连接数"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "aof_last_rewrite_time_sec 记录的是 rewrite 子进程从 fork 到完成的总耗时。这个值从 8 秒增长到 25 秒，最直接的原因是 Redis 实例的数据量增大了——子进程需要遍历和序列化更多的 key-value 数据。对于 20GB 的实例，合理的应对措施包括：使用 Redis Cluster 将数据拆分到多个更小的分片上，每个分片的 rewrite 更快完成；或者调高 auto-aof-rewrite-percentage 和 auto-aof-rewrite-min-size，减少 rewrite 频率，并通过 crontab 在业务低峰期手动触发。选项 A 网络与 rewrite 无关，rewrite 是本地磁盘操作。选项 C AOF 文件损坏不会导致 rewrite 变慢。选项 D 客户端连接数影响的是主线程的请求处理，对子进程的序列化速度没有直接影响。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/",
+        "https://github.com/redis/redis/blob/7.2/src/aof.c",
+        "https://github.com/redis/redis/pull/9788",
+        "https://redis.io/docs/latest/commands/bgrewriteaof/"
+      ]
+    }
+  ]
+}
