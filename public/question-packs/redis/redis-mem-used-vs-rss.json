@@ -1,0 +1,158 @@
+{
+  "id": "redis-mem-used-vs-rss",
+  "name": "used_memory 与 used_memory_rss 的差异",
+  "domain": "redis",
+  "description": "深入讲解 Redis INFO memory 中 used_memory 与 used_memory_rss 的差异根因、jemalloc 碎片与管理开销、COW 影响、allocator_* 精细指标、overhead 与 dataset 拆分及生产监控最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-mem-used-vs-rss-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["used_memory", "used_memory_rss", "内存碎片", "jemalloc开销", "INFO memory", "redis-memory"],
+      "title": "为什么 Redis 实际内存占用通常比 used_memory 大",
+      "content": "## 面试场景\n\n面试官问你：「说说 Redis 的 `used_memory` 和 `used_memory_rss` 有什么区别？为什么 RSS 通常比 used_memory 大？」你回答说「碎片」。面试官点点头，继续追问：「碎片只是原因之一，还有哪些因素？`INFO memory` 输出里那么多指标，你能解释每个是什么意思吗？什么情况下 `used_memory` 反而比 RSS 大？如果让你做生产监控，你会盯哪些指标？」\n\n这道题看起来简单，但能考出你对 Redis 内存模型的理解深度。我们先看一个 Redis 7.2.4 实例在业务高峰期的 `INFO memory` 输出：\n\n```bash\n127.0.0.1:6379> INFO memory\n# Memory\nused_memory:4294967296\nused_memory_human:4.00G\nused_memory_rss:5905580032\nused_memory_rss_human:5.50G\nused_memory_peak:5368709120\nused_memory_peak_human:5.00G\nused_memory_peak_perc:80.00%\nused_memory_overhead:1073741824\nused_memory_dataset:3221225472\nused_memory_dataset_perc:75.00%\nused_memory_startup:946176\nallocator_allocated:4294967296\nallocator_active:5066547200\nallocator_resident:5637144576\ntotal_system_memory:33554432000\ntotal_system_memory_human:31.25G\nmaxmemory:8589934592\nmaxmemory_human:8.00G\nmaxmemory_policy:allkeys-lru\nallocator_frag_ratio:1.18\nallocator_frag_bytes:771579904\nallocator_rss_ratio:1.11\nallocator_rss_bytes:570597376\nrss_overhead_ratio:1.05\nrss_overhead_bytes:268435456\nmem_fragmentation_ratio:1.37\nmem_fragmentation_bytes:1610612736\nmem_allocator:jemalloc-5.3.0\nactive_defrag_running:0\nlazyfree_pending_objects:0\n```\n\n`used_memory` 是 4.00GB，但操作系统报告的 RSS 高达 5.50GB——中间差了 1.5GB。这 1.5GB 不全是碎片。如果你只回答「因为内存碎片」，那只说对了一部分。实际上 RSS 和 used_memory 之间的差距由多个层次的原因组成，而 Redis 4.0+ 提供的 `allocator_*` 系列指标恰好能帮你把这些原因逐层拆解开来。\n\n面试中能把这个拆解过程讲清楚的人非常少，但这正是区分「用过 Redis」和「真正理解 Redis 内存模型」的分水岭。",
+      "answer": "## 第一步：Redis 内存管理模型基础\n\n### Redis 的内存分配链路\n\n要理解 `used_memory` 和 `used_memory_rss` 的差异，必须先搞清楚 Redis 的内存分配链路。Redis 本身不直接调用操作系统的 `malloc`，而是封装了一层 `zmalloc`——它在内部调用 jemalloc（Redis 在 Linux 上的默认内存分配器）的 `je_malloc`，同时维护一个全局计数器 `used_memory`，每次分配时累加字节数，每次释放时扣减。这个计数器就是 `INFO memory` 中 `used_memory` 的来源。\n\n具体来说，`zmalloc` 的核心代码逻辑在 `src/zmalloc.c` 中：\n\n```c\n// src/zmalloc.c（简化）\nstatic _Atomic size_t used_memory = 0;\n\nvoid *zmalloc(size_t size) {\n    void *ptr = je_malloc(size);\n    // jemalloc 实际分配的可能比 size 大（size class 对齐）\n    // 但 zmalloc 用 je_malloc_usable_size() 获取真实分配量\n    update_zmalloc_stat_alloc(je_malloc_usable_size(ptr));\n    return ptr;\n}\n```\n\n注意这里有个细节：`zmalloc` 统计的不是你请求的字节数，而是 `je_malloc_usable_size()` 返回的实际可用字节数。比如你请求 30 字节，jemalloc 按 size class 对齐到 32 字节，`zmalloc` 记录的是 32 字节。所以 `used_memory` 已经包含了 jemalloc 的 size class 内部碎片（internal fragmentation），这部分碎片不是 RSS 和 used_memory 差异的主要来源。\n\n那 `used_memory` 具体包含哪些内容？它涵盖了 Redis 通过 `zmalloc` 分配的所有内存：用户数据（key-value 的 SDS 字符串、各种数据结构的节点）、内部管理结构（全局 dict、expires dict、每个 client 的输入/输出缓冲区）、Lua 脚本引擎的内存、以及各种内部缓冲区。简单说，凡是 Redis 代码中写了 `zmalloc()` / `zcalloc()` / `zrealloc()` 的地方，分配出去的内存都计入 `used_memory`。\n\n### used_memory_rss：操作系统视角的真实内存占用\n\n`used_memory_rss` 是另一个维度的度量——它来自操作系统。在 Linux 上，Redis 读取 `/proc/<pid>/stat` 文件中的第 24 个字段（RSS 页数），乘以系统页大小（通常 4KB）得到字节数。RSS 全称 Resident Set Size（常驻内存集大小），表示进程当前占用的物理内存总量——注意是物理内存，不包括被换出到 swap 的部分，也不包括纯虚拟映射但尚未实际分页的内存。\n\nRSS 包含的内容比 `used_memory` 广得多：除了 jemalloc 分配给 Redis 的数据内存之外，还包括 jemalloc 自身的管理开销（arena 元数据、bin 元数据、slab 的 bitmap、tcache 结构）、jemalloc 保留但尚未分配给 Redis 的空闲内存页（slab 中的空洞 region、已释放但未归还操作系统的 dirty pages）、Redis 进程自身的开销（代码段 `.text`、全局变量 `.data` / `.bss`、线程栈）、加载的共享库（`libc.so`、`libpthread.so` 等）映射到物理内存的部分、以及内核为进程维护的一些数据结构（页表项、socket 缓冲区的内核映射等）。\n\n理解了这两个指标的来源，就能理解为什么 RSS 几乎总是大于 `used_memory`——因为 `used_memory` 只统计了 Redis 代码主动分配的内存，而 RSS 包含了整个进程的全部物理内存占用。\n\n## 第二步：RSS 大于 used_memory 的逐层拆解\n\n### 第一层差距：jemalloc 的外部碎片（allocator_frag）\n\n这是最主要的差距来源。jemalloc 使用 slab 分配器管理小对象，每个 slab 被切割成固定大小的 region。当 Redis 释放一些 region 后，这些 region 变成空洞——slab 还在占用物理内存，但中间有些 region 是空的。这些空的 region 不计入 `used_memory`（因为 Redis 已经 `free` 了），但它们占用的物理页面仍然算在 RSS 中。这就是外部碎片（external fragmentation）。\n\nRedis 4.0+ 的 `INFO memory` 提供了精确量化这层差距的指标：\n\n```\nallocator_allocated:4294967296    # = used_memory，Redis 实际在用的内存\nallocator_active:5066547200       # jemalloc 中处于 active 状态的内存页总量\nallocator_frag_ratio:1.18         # = allocator_active / allocator_allocated\nallocator_frag_bytes:771579904    # = allocator_active - allocator_allocated ≈ 736MB\n```\n\n`allocator_allocated` 等于 `used_memory`，是 jemalloc 报告的「应用实际使用的字节数」（jemalloc 的 `stats.allocated`）。`allocator_active` 是 jemalloc 中所有处于 active 状态的页面总量（jemalloc 的 `stats.active`）——一个页面只要有至少一个 region 被分配出去，整个页面就算 active。两者的差值 736MB 就是纯粹的 jemalloc 外部碎片，也就是 slab 中的空洞 region 占用的内存。\n\n在题目的 `INFO memory` 输出中，`allocator_frag_ratio` 是 1.18，说明外部碎片占了已使用内存的 18%，这是一个相当正常的水平。碎片率超过 1.5 就需要关注，超过 2.0 需要干预（开启 `activedefrag` 或安排重启）。\n\n### 第二层差距：jemalloc 的 RSS 开销（allocator_rss）\n\n在 active 之上还有一层差距——jemalloc 通过 `mmap` 从操作系统申请了内存页，但这些页面中有一部分尚未被 jemalloc 标记为 active（比如刚释放的 dirty pages，jemalloc 还保留着等待复用）。这层差距用 `allocator_rss` 系列指标衡量：\n\n```\nallocator_active:5066547200\nallocator_resident:5637144576     # jemalloc 实际持有的物理内存\nallocator_rss_ratio:1.11          # = allocator_resident / allocator_active\nallocator_rss_bytes:570597376     # = allocator_resident - allocator_active ≈ 544MB\n```\n\n`allocator_resident` 是 jemalloc 报告的 `stats.resident`，代表 jemalloc 管理的所有物理内存页面的总量，包括 active 和保留未 active 的。这 544MB 的差距来自几个方面：jemalloc 的 arena 元数据（每个 arena 的 extent 树、bin 的 bitmap 索引结构，通常几十 MB）、jemalloc 的 tcache 缓存（每个线程持有的小对象缓存，Redis 线程不多所以这部分通常很小）、以及 jemalloc 释放后暂时保留的 dirty pages（jemalloc 5.x 默认保留 dirty pages 10 秒后才通过 `madvise(MADV_DONTNEED)` 归还操作系统）。\n\n### 第三层差距：操作系统层面的 RSS 开销（rss_overhead）\n\n最后还有一层差距——操作系统报告的 RSS 和 jemalloc 自己报告的 `stats.resident` 之间的差距：\n\n```\nallocator_resident:5637144576\nused_memory_rss:5905580032\nrss_overhead_ratio:1.05           # = used_memory_rss / allocator_resident\nrss_overhead_bytes:268435456      # = used_memory_rss - allocator_resident ≈ 256MB\n```\n\n这 256MB 完全不受 jemalloc 管理，它们属于进程本身的开销：Redis 二进制文件的代码段（`.text` 段，Redis 7.x 编译后大约 3-5MB）、全局变量和静态数据（`.data` / `.bss` 段）、线程栈空间（Linux 默认每个线程 8MB，Redis 有主线程加上 3 个 bio 后台线程，约 32MB）、加载的共享库映射到物理内存的部分（`libc`、`libpthread`、`libm` 等，几十 MB）、以及内核 socket 缓冲区——每个客户端连接的 TCP socket 在内核中有发送缓冲区和接收缓冲区（`net.core.rmem_default` 和 `net.core.wmem_default`，Linux 默认各 212KB），如果有 500 个并发连接，仅 socket 缓冲区就约 200MB。\n\n还有一个经常被忽视的因素：BGSAVE 和 BGREWRITEAOF 期间的 COW（Copy-On-Write）页面。当 Redis 执行 `BGSAVE` 时，会 `fork()` 一个子进程来生成 RDB 文件。`fork` 利用操作系统的 COW 机制——子进程和父进程共享同一份物理内存页，只有当父进程修改某一页时，操作系统才会复制那一页（所以叫 Copy-On-Write，写时复制）。在 BGSAVE 期间，父进程（Redis 主进程）每修改一个内存页，RSS 就会增长一个页面大小（4KB）。如果业务写入量很大，BGSAVE 期间的 COW 可以额外增加几百 MB 甚至几 GB 的 RSS。这些 COW 页面不计入 `used_memory`，但算在 RSS 中。\n\n### 完整的差距拆解公式\n\n把三层差距加起来：\n\n```\nused_memory_rss = used_memory\n                + allocator_frag_bytes    (jemalloc 外部碎片)\n                + allocator_rss_bytes     (jemalloc 管理开销与保留页)\n                + rss_overhead_bytes      (进程开销、共享库、socket 缓冲区、COW)\n\n在题目场景中：\n5905580032 = 4294967296 + 771579904 + 570597376 + 268435456\n5.50GB     = 4.00GB    + 0.74GB    + 0.54GB    + 0.26GB\n```\n\n面试时能画出这个拆解公式，面试官会非常满意——这说明你不只是知道「碎片导致 RSS 大」，而是能量化每一层的贡献。\n\n## 第三步：INFO memory 关键指标完整解读\n\n### used_memory_overhead 和 used_memory_dataset\n\n`used_memory` 内部还可以进一步拆分为 overhead 和 dataset。`used_memory_overhead` 是 Redis 内部管理结构占用的内存，包括：全局 dict 的哈希表（每个 db 两个 dict——keyspace 和 expires，每个 dict entry 约 64 字节）、每个 client 的结构体和输入/输出缓冲区（`querybuf`、`buf`、reply list）、replication backlog（默认 1MB）、AOF 缓冲区、Lua 脚本引擎占用、以及 Redis 进程启动时的基础内存消耗（`used_memory_startup`，通常不到 1MB）。\n\n`used_memory_dataset` 则是纯用户数据的内存——SDS 字符串、listpack 节点、skiplist 节点、intset 等。计算方式很简单：`used_memory_dataset = used_memory - used_memory_overhead`。`used_memory_dataset_perc` 表示 dataset 占 used_memory（减去 startup 后）的百分比。在题目场景中，dataset 占 75%，overhead 占 25%——如果 overhead 占比过高（比如超过 50%），通常意味着连接数过多导致 client 缓冲区膨胀，或者 key 数量极多但每个 value 很小（管理结构的固定开销占比变大）。\n\n### used_memory_peak 和碎片的时间维度\n\n`used_memory_peak` 记录了 Redis 启动以来 `used_memory` 的历史最大值。这个指标对碎片分析很重要：如果 peak 远大于当前值（比如题目中 peak 是 5.00GB，当前是 4.00GB），说明 Redis 曾经使用过更多内存然后释放了——这些被释放的内存可能导致 jemalloc 的 slab 中出现大量空洞，从而推高碎片率。一个典型场景是批量删除大量 key 后，`used_memory` 下降了但 RSS 基本不降，碎片率反而飙升。\n\n### 什么情况下 used_memory 大于 RSS\n\n前面一直在讲 RSS > used_memory 的情况，但反过来也可能发生。`mem_fragmentation_ratio < 1` 意味着 RSS 比 used_memory 小——这看起来矛盾，但原因是 Redis 的一部分内存页被操作系统换出到了 swap 分区。swap 中的页面不算 RSS（RSS 只统计物理内存中的页面），但 jemalloc 认为它们仍然是已分配的，所以 `used_memory` 不变。\n\n这是一个非常危险的信号。Redis 作为内存数据库，所有数据操作都直接访问内存。一旦某些数据页被 swap out，当 Redis 需要访问这些页面时会触发 page fault，操作系统需要从磁盘把页面换回来——这个过程在 HDD 上延迟约 10ms，在 SSD 上约 100μs，而正常内存访问只需要约 100ns。即使只有少量页面被 swap，也可能导致 Redis 的 P99 延迟从毫秒级暴增到几十毫秒甚至秒级。你可以通过以下方式确认 Redis 是否使用了 swap：\n\n```bash\n# 直接查看 Redis 进程的 swap 使用情况\n$ cat /proc/$(pgrep -f redis-server)/status | grep VmSwap\nVmSwap:    524288 kB    # 512MB 被换出到 swap，非常危险！\n\n# 或者用 smaps 查看更详细的页面信息\n$ cat /proc/$(pgrep -f redis-server)/smaps | grep -i swap | awk '{sum+=$2} END {print sum/1024 \"MB\"}'\n512MB\n```\n\n生产环境中应该对 `mem_fragmentation_ratio < 1` 设置最高级别告警，同时建议在 Redis 服务器上用 `sysctl vm.swappiness=1`（不设 0 是为了在极端情况下让内核有最后的退路，避免直接触发 OOM Killer）来最大限度减少 swap 的可能性。\n\n## 第四步：生产监控与面试延伸\n\n### 完整的内存监控指标体系\n\n生产环境中 Redis 的内存监控不能只看一个指标，需要构建多层次的监控体系。核心层要同时监控 `used_memory` 和 `used_memory_rss`——前者反映 Redis 数据量的增长趋势，后者反映实际物理内存压力。`mem_fragmentation_ratio` 是两者的比值，正常范围 1.0-1.5，告警阈值建议设在 1.5（warning）和 2.0（critical）。`mem_fragmentation_ratio < 1` 则需要最高优先级告警。\n\n进阶层要关注 `allocator_frag_ratio`、`allocator_rss_ratio` 和 `rss_overhead_ratio`——这三个指标帮你定位碎片到底来自哪一层。如果 `allocator_frag_ratio` 高但其他两个正常，说明是 jemalloc slab 碎片，开 `activedefrag` 就能解决。如果 `rss_overhead_ratio` 异常高，可能是连接数过多导致 socket 缓冲区膨胀，或者 BGSAVE 期间 COW 严重。\n\n业务层还要关注 `used_memory_overhead` 和 `used_memory_dataset` 的比例。如果 overhead 占比持续上升，排查方向是客户端连接数和缓冲区：\n\n```bash\n# 查看当前每个客户端的缓冲区使用情况\n127.0.0.1:6379> CLIENT LIST\nid=3 addr=10.0.1.5:43210 fd=8 name= db=0 sub=0 psub=0 multi=-1\n  qbuf=26 qbuf-free=32742 obl=0 oll=0 omem=0 ...\n\n# qbuf: 输入缓冲区已使用字节\n# qbuf-free: 输入缓冲区空闲字节\n# obl: 固定输出缓冲区长度\n# oll: 动态输出链表长度\n# omem: 输出缓冲区总内存\n```\n\n一个 Prometheus + redis_exporter 的监控配置示例：\n\n```yaml\ngroups:\n- name: redis_memory\n  rules:\n  - alert: RedisHighMemFragRatio\n    expr: redis_memory_fragmentation_ratio > 1.5\n    for: 30m\n    labels:\n      severity: warning\n  - alert: RedisSwapDetected\n    expr: redis_memory_fragmentation_ratio < 1\n    for: 5m\n    labels:\n      severity: critical\n  - alert: RedisRSSNearOOM\n    expr: redis_memory_used_rss_bytes / on(instance) node_memory_MemTotal_bytes > 0.85\n    for: 10m\n    labels:\n      severity: critical\n```\n\n### 碎片率变化趋势比瞬时值更重要\n\n在实际运维中，碎片率的变化趋势比某一时刻的绝对值更有诊断价值。一个稳定在 1.3 的碎片率虽然不算低，但如果它几周来没有变化，说明碎片已经达到了稳态，jemalloc 的内部复用效率在这个负载模式下就是这个水平，不需要太担心。相反，如果碎片率在一周内从 1.1 涨到 1.5，即使 1.5 还在「可接受」范围内，趋势本身就是一个预警信号——可能是业务模式发生了变化（比如 value 大小分布变了），或者某些大 key 被集中删除导致碎片加速积累。\n\n建议用 Grafana 画一个 `mem_fragmentation_ratio` 的 7 天趋势图，配合 `used_memory` 的变化做关联分析。如果 `used_memory` 稳定但碎片率上升，基本可以确认是碎片问题；如果两者同时上升，更可能是数据量增长导致的正常 RSS 增长。\n\n### Kubernetes 环境的特殊考量\n\n在容器化部署中，碎片问题更容易引发事故。Kubernetes Pod 的 `resources.limits.memory` 限制的是 cgroup 级别的 RSS + page cache，而非 `used_memory`。如果你设置 `maxmemory` 为 4GB，容器内存 limit 为 6GB，看起来留了 2GB 余量。但如果碎片率达到 1.5，RSS 就会到 6GB，触发 cgroup OOM Kill——Pod 会被直接杀掉，而且 Redis 的 maxmemory 淘汰策略根本来不及介入（因为 `used_memory` 还没到 4GB 上限，Redis 认为自己还有很多空间）。生产经验是 `maxmemory` 不超过容器内存 limit 的 60%，为碎片、COW 和进程开销留足余量。",
+      "keyPoints": [
+        "used_memory 是 Redis 通过 zmalloc 分配并由 je_malloc_usable_size() 统计的内存总量，包含 size class 对齐后的实际分配量，涵盖用户数据、内部管理结构和各种缓冲区",
+        "used_memory_rss 是操作系统从 /proc/<pid>/stat 读取的进程常驻物理内存（Resident Set Size），包含 jemalloc 管理的全部物理页面以及进程代码段、线程栈、共享库映射和内核 socket 缓冲区",
+        "RSS > used_memory 的差距可逐层拆解为三部分：allocator_frag（jemalloc slab 空洞导致的外部碎片）、allocator_rss（jemalloc 元数据和保留的 dirty pages）、rss_overhead（进程本身开销和 COW 页面）",
+        "BGSAVE/BGREWRITEAOF 执行期间 fork 子进程共享父进程内存页，父进程修改数据时 COW 机制逐页复制，会导致 RSS 临时增长数百 MB 甚至数 GB，但 used_memory 不受影响",
+        "mem_fragmentation_ratio = used_memory_rss / used_memory，正常值 1.0-1.5；超过 2.0 意味着近半物理内存是碎片；小于 1.0 说明 Redis 正在使用 swap，延迟会暴增",
+        "used_memory_overhead 包含 dict 哈希表、client 缓冲区、replication backlog 等管理结构；used_memory_dataset 才是用户数据；overhead 占比过高通常意味着连接数多或小 key 过多",
+        "allocator_allocated / allocator_active / allocator_resident 三级指标（Redis 4.0+）对应 jemalloc 的 stats.allocated / stats.active / stats.resident，能精确定位碎片来自 slab 外部碎片还是 jemalloc 管理开销",
+        "Kubernetes 容器的 memory limit 限制 cgroup RSS 而非 used_memory，碎片可导致 RSS 超限触发 OOM Kill 而 maxmemory 淘汰策略来不及介入，生产经验是 maxmemory 不超过容器 limit 的 60%"
+      ],
+      "quiz": [
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-1",
+          "question": "Redis 的 used_memory 指标的数据来源是什么？",
+          "choices": [
+            {"id": "A", "text": "Redis 的 zmalloc 层在每次分配/释放时维护的全局计数器，统计的是 je_malloc_usable_size() 返回的实际分配量"},
+            {"id": "B", "text": "操作系统通过 /proc/<pid>/stat 报告的进程常驻内存"},
+            {"id": "C", "text": "Redis 在代码中直接累加每个 key-value 的逻辑大小（strlen(key) + strlen(value)）"},
+            {"id": "D", "text": "jemalloc 的 stats.resident 统计，反映 jemalloc 向操作系统申请的总物理内存"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "used_memory 来自 Redis 的 zmalloc 封装层。zmalloc 在调用 je_malloc 分配内存后，通过 je_malloc_usable_size() 获取 jemalloc 实际分配的字节数（含 size class 对齐），并累加到一个全局原子计数器中。选项 B 描述的是 used_memory_rss 的来源。选项 C 完全错误，Redis 不是简单地累加字符串长度，而是统计 jemalloc 实际分配的内存量，其中包含了 SDS header、数据结构节点指针等管理开销。选项 D 描述的是 allocator_resident 指标的来源。"
+        },
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-2",
+          "question": "used_memory_rss 在 Linux 上是怎么获取的？",
+          "choices": [
+            {"id": "A", "text": "调用 jemalloc 的 malloc_stats_print() 接口读取分配器统计"},
+            {"id": "B", "text": "读取 /proc/<pid>/stat 文件中的 RSS 页数字段，乘以系统页大小（通常 4KB）"},
+            {"id": "C", "text": "通过 getrusage() 系统调用获取 ru_maxrss 字段"},
+            {"id": "D", "text": "累加 /proc/<pid>/smaps 中所有映射段的 Private_Dirty 字段"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 在 Linux 上通过读取 /proc/<pid>/stat 文件的第 24 个字段获取 RSS 页数，再乘以系统页大小（sysconf(_SC_PAGESIZE)，通常是 4096 字节）得到 used_memory_rss。选项 A 描述的是 MEMORY MALLOC-STATS 命令的实现方式，输出的是 jemalloc 内部统计，不是 RSS。选项 C 的 getrusage 确实能获取内存信息，但 ru_maxrss 是历史峰值而非当前值，且 Redis 实际使用的是 /proc 文件系统。选项 D 的 smaps 能提供更细粒度的信息，但 Redis 用的是更轻量的 stat 文件。"
+        },
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-3",
+          "question": "以下哪个公式正确描述了 used_memory_rss 与 allocator_* 指标的关系？",
+          "choices": [
+            {"id": "A", "text": "used_memory_rss = allocator_allocated + allocator_frag_bytes + allocator_rss_bytes + rss_overhead_bytes"},
+            {"id": "B", "text": "used_memory_rss = used_memory × mem_fragmentation_ratio × allocator_frag_ratio"},
+            {"id": "C", "text": "used_memory_rss = allocator_resident + allocator_frag_bytes"},
+            {"id": "D", "text": "used_memory_rss = allocator_active + rss_overhead_bytes"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "RSS 的完整拆解是三层差距累加：allocator_allocated（= used_memory）加上 allocator_frag_bytes（allocator_active 与 allocated 的差，即 slab 外部碎片）加上 allocator_rss_bytes（allocator_resident 与 active 的差，即 jemalloc 管理开销和保留页）加上 rss_overhead_bytes（used_memory_rss 与 allocator_resident 的差，即进程本身开销）。选项 B 混淆了比值和乘法关系。选项 C 把 frag_bytes 加在了 resident 上，而 frag_bytes 已经包含在 resident 中了。选项 D 忽略了 allocator_rss_bytes 这一层。"
+        },
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-4",
+          "question": "BGSAVE 期间 RSS 增长但 used_memory 不变，根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "BGSAVE 的子进程分配了新内存来存储 RDB 数据，子进程内存被算入父进程的 RSS"},
+            {"id": "B", "text": "fork 后父子进程共享内存页，父进程修改数据时 COW 机制逐页复制，新复制的页面增加了父进程的 RSS，但 zmalloc 计数器不受影响"},
+            {"id": "C", "text": "BGSAVE 期间 jemalloc 暂停了内存回收，导致 dirty pages 堆积推高 RSS"},
+            {"id": "D", "text": "RDB 文件在写入磁盘前先缓存在内存中，这部分缓存被计入 RSS 但不计入 used_memory"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis BGSAVE 通过 fork() 创建子进程，操作系统利用 COW（Copy-On-Write）机制让父子进程共享同一份物理内存页。此后父进程（Redis 主进程）每修改一个内存页，操作系统会先复制该页再让父进程写入——复制出来的新页面增加了父进程的 RSS。但从 Redis zmalloc 的角度看，没有发生新的 malloc/free 操作，used_memory 计数器不变。选项 A 错误，子进程的内存是独立统计的，不会算入父进程 RSS。选项 C 和 D 都不是真正的机制。写入量越大，COW 复制的页面越多，极端情况下可能翻倍 RSS。"
+        },
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-5",
+          "question": "某 Redis 实例的 INFO memory 输出显示 mem_fragmentation_ratio 为 0.85，这意味着什么？",
+          "choices": [
+            {"id": "A", "text": "内存碎片率为 15%，属于非常健康的状态"},
+            {"id": "B", "text": "jemalloc 的内存复用率达到 85%，分配效率很高"},
+            {"id": "C", "text": "used_memory_rss 小于 used_memory，说明部分 Redis 内存被操作系统换出到了 swap，性能会严重下降"},
+            {"id": "D", "text": "Redis 正在执行 activedefrag，碎片整理过程中临时出现的正常现象"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "mem_fragmentation_ratio = used_memory_rss / used_memory。当这个值小于 1.0 时，说明 RSS 比 used_memory 小，唯一合理的解释是 Redis 的部分内存页被操作系统换出到了 swap 分区。swap 中的页面不计入 RSS（RSS 只统计物理内存中的页面），但 jemalloc 仍认为这些页面已分配，所以 used_memory 不变。Redis 作为内存数据库，一旦使用 swap，访问被换出的页面会触发 page fault，延迟从纳秒级暴增到微秒甚至毫秒级。选项 A 和 B 把小于 1.0 误解为健康状态。选项 D 的 activedefrag 会降低碎片率但不会让它低于 1.0。"
+        },
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-6",
+          "question": "关于 used_memory_overhead 和 used_memory_dataset 的关系，以下哪个说法正确？",
+          "choices": [
+            {"id": "A", "text": "overhead 包含 dict 哈希表、client 缓冲区、replication backlog 等管理结构，dataset 是用户实际数据，两者之和等于 used_memory"},
+            {"id": "B", "text": "overhead 只包含 Redis 启动时的基础内存消耗（used_memory_startup），dataset 是 used_memory 减去 startup"},
+            {"id": "C", "text": "overhead 是 jemalloc 的 size class 对齐浪费，dataset 是 Redis 请求分配的精确字节数"},
+            {"id": "D", "text": "overhead 是 used_memory_rss 中不属于 used_memory 的部分，dataset 等于 used_memory"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "used_memory = used_memory_overhead + used_memory_dataset。overhead 涵盖了 Redis 所有内部管理结构占用的内存：每个 db 的 keyspace dict 和 expires dict 的哈希表、每个 client 连接的 querybuf 和输出缓冲区、replication backlog、AOF 缓冲区、Lua 引擎内存、以及 used_memory_startup。dataset 则是纯粹的用户数据——SDS 字符串、listpack、skiplist 节点、intset 等数据结构存储的实际内容。选项 B 把 overhead 缩窄为只有 startup 部分，实际 overhead 远大于 startup。选项 C 混淆了分配器碎片和 Redis 逻辑分层。选项 D 混淆了 RSS overhead 和 used_memory overhead。"
+        },
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-7",
+          "question": "allocator_frag_ratio 为 1.18 而 rss_overhead_ratio 为 1.25，应该优先排查什么？",
+          "choices": [
+            {"id": "A", "text": "优先排查 jemalloc slab 碎片，因为 allocator_frag_ratio 异常"},
+            {"id": "B", "text": "优先排查进程层面的 RSS 开销，因为 rss_overhead_ratio 偏高，可能是连接数过多或 BGSAVE COW 导致"},
+            {"id": "C", "text": "两者都不需要关注，都在正常范围内"},
+            {"id": "D", "text": "优先排查 jemalloc 的 dirty pages 保留策略，调低 dirty_decay_ms"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "allocator_frag_ratio 1.18 表示 jemalloc 外部碎片只有 18%，这在生产环境中属于非常健康的水平（通常低于 1.5 都不需要干预）。而 rss_overhead_ratio 1.25 意味着有 25% 的额外 RSS 不属于 jemalloc 管理范围——正常情况下这个值在 1.0-1.1 之间。偏高的原因可能是：客户端连接数过多导致 socket 内核缓冲区膨胀（每个连接约 400KB）、正在执行 BGSAVE 导致 COW 页面增多、或者加载了大量共享库。应该检查 CLIENT LIST 的连接数和 BGSAVE 状态。选项 A 的 1.18 碎片率不需要优先处理。选项 D 虽然 dirty_decay_ms 确实影响 allocator_rss，但 1.25 的 rss_overhead 不属于 jemalloc 管理范围内的问题。"
+        },
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-8",
+          "question": "在 Kubernetes 中部署 Redis，Pod 的 memory limit 设为 8GB，maxmemory 应该怎么设？",
+          "choices": [
+            {"id": "A", "text": "设为 8GB，与容器 limit 一致，maxmemory 淘汰策略会在达到上限前自动清理"},
+            {"id": "B", "text": "设为 7.5GB，留 500MB 给操作系统和 Redis 进程开销"},
+            {"id": "C", "text": "设为不超过 4.8GB（limit 的 60%），为碎片、COW 和进程开销留足余量，避免 RSS 超限触发 OOM Kill"},
+            {"id": "D", "text": "不设 maxmemory，让 Redis 自由使用内存，由 Kubernetes 的资源管理来控制"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Kubernetes 的 memory limit 限制的是 cgroup 级别的 RSS，而 maxmemory 限制的是 used_memory。由于碎片、COW、进程开销等因素，RSS 通常比 used_memory 大 30%-100%。如果 maxmemory 设为 8GB 等于 limit，当碎片率达到 1.3 时 RSS 就会到 10.4GB 超过 limit，Pod 直接被 OOM Kill。即使设 7.5GB 也不够安全——碎片率 1.5 时 RSS 就到 11.25GB。生产经验是 maxmemory 不超过 limit 的 60%，这样即使碎片率达到 1.5，RSS 也只到 7.2GB，仍在 8GB limit 以内。选项 D 不设 maxmemory 更危险，Redis 会一直使用内存直到被 OOM Kill。"
+        },
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-9",
+          "question": "Redis 4.0 之前（没有 allocator_* 指标），如何判断碎片是来自 jemalloc 内部还是进程层面的开销？",
+          "choices": [
+            {"id": "A", "text": "无法区分，只能看 mem_fragmentation_ratio 这一个指标"},
+            {"id": "B", "text": "用 MEMORY MALLOC-STATS 查看 jemalloc 的 stats.active 和 stats.resident，手动与 RSS 比较来拆分两层差距"},
+            {"id": "C", "text": "通过 /proc/<pid>/smaps 逐段分析 Redis 进程的每个内存映射区域"},
+            {"id": "D", "text": "对比 used_memory_peak 和 used_memory 的差值，差值越大说明 jemalloc 碎片越严重"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MEMORY MALLOC-STATS 命令在 Redis 4.0 就已引入，它直接输出 jemalloc 的内部统计（调用 malloc_stats_print()），包括 stats.allocated、stats.active、stats.resident 等关键数据。虽然 Redis 4.0 之前没有在 INFO memory 中暴露 allocator_* 指标，但可以通过 MEMORY MALLOC-STATS 手动获取这些数据：allocated 对应 used_memory，active 反映 jemalloc 活跃页面，resident 反映 jemalloc 持有的物理页面，再与 RSS 对比就能拆分碎片来源。选项 A 过于悲观。选项 C 虽然也能提供信息但操作复杂且难以对应到 jemalloc 的管理层次。选项 D 的 peak 差值反映的是数据量变化而非碎片来源。"
+        },
+        {
+          "id": "redis-mem-used-vs-rss-q1-quiz-10",
+          "question": "一个 Redis 实例连续 7 天的 used_memory 稳定在 4GB，但 mem_fragmentation_ratio 从 1.1 逐步上升到 1.6，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Redis 的数据量在增长，只是刚好 used_memory 统计不准确"},
+            {"id": "B", "text": "业务存在大量不同大小 value 的频繁写入和删除，导致 jemalloc slab 中空洞持续积累，RSS 上升而 used_memory 不变"},
+            {"id": "C", "text": "操作系统的内存页大小从 4KB 自动调整到了 2MB 的大页，导致 RSS 统计口径变大"},
+            {"id": "D", "text": "Lua 脚本内存泄漏导致 RSS 增长，但 Lua 内存不计入 used_memory"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "used_memory 稳定说明 Redis 存储的数据总量没有明显变化——写入量和删除量基本持平。但碎片率持续上升说明 RSS 在增长，这是典型的 jemalloc 外部碎片积累现象。当业务频繁写入和删除不同大小的 value 时，jemalloc 不同 size class 的 slab 中会出现越来越多的空洞 region——被释放的 128 字节 region 无法被 192 字节的新请求复用，只能分配新的 slab 页面。长此以往 slab 总量越来越大，RSS 上升，但 used_memory（只统计实际分配出去的 region）保持稳定。选项 A 与 used_memory 稳定矛盾。选项 C 中页大小不会自动改变。选项 D 中 Lua 内存是计入 used_memory 的。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/info/",
+        "https://redis.io/docs/latest/commands/memory-doctor/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/",
+        "https://jemalloc.net/jemalloc.3.html",
+        "https://github.com/redis/redis/blob/7.2/src/zmalloc.c"
+      ]
+    }
+  ]
+}
