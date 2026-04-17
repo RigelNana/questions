@@ -1,0 +1,159 @@
+{
+  "id": "redis-thread-slow-query-avoid",
+  "name": "单线程模型下如何避免慢查询阻塞",
+  "domain": "redis",
+  "description": "深入讲解 Redis 单线程模型下慢查询的危害、SLOWLOG 慢查询日志的使用、命令层面/数据设计层面/运维层面的避免策略、监控告警体系，以及线上 KEYS 命令导致故障的排查案例",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-thread-slow-query-avoid-q1",
+      "domain": "redis",
+      "type": "tuning",
+      "difficulty": 2,
+      "tags": ["慢查询", "SLOWLOG", "rename-command", "SCAN", "大key拆分", "命令复杂度", "redis-threading"],
+      "title": "在单线程模型下如何避免慢查询阻塞其他请求？",
+      "content": "## 面试场景\n\n你们团队有一个 Redis 6.2 实例，承载着用户画像和推荐缓存两块业务，日常 QPS 大约 3 万。某天下午 3 点，监控突然报出大量 Redis 超时告警——所有依赖 Redis 的微服务几乎同时出现延迟飙升，P99 延迟从平时的 0.5ms 跳到了 3000ms 以上，持续了大约 2 秒后恢复。你的第一反应是 Redis 实例挂了，但 `redis-cli PING` 响应正常，`INFO server` 显示进程运行稳定，没有重启痕迹。\n\n你查看监控面板，发现在告警时间点前后有一段明显的「空白期」——Redis 的 `instantaneous_ops_per_sec` 从 3 万骤降到 0，持续了约 2 秒，然后瞬间恢复。换句话说，有整整 2 秒 Redis 什么命令都没在处理。你在 Grafana 的 Redis 延迟面板上看到一个尖刺：\n\n```\n15:00:12  avg_latency: 0.08ms  p99: 0.45ms  ops/sec: 31204\n15:00:13  avg_latency: --       p99: --       ops/sec: 0\n15:00:14  avg_latency: --       p99: --       ops/sec: 0\n15:00:15  avg_latency: 0.12ms  p99: 0.52ms  ops/sec: 34891\n```\n\n你的同事怀疑是网络抖动，但你检查了网络监控没有任何异常。另一个同事说「会不会是 BGSAVE fork 导致的」，但你看了 `INFO persistence` 发现 `rdb_last_bgsave_time_sec` 是 0（上次 BGSAVE 很快完成）而且时间不吻合。\n\n最终你想到去看 SLOWLOG：\n\n```bash\n127.0.0.1:6379> SLOWLOG GET 5\n1) 1) (integer) 42\n   2) (integer) 1698234013\n   3) (integer) 2134578\n   4) 1) \"KEYS\"\n      2) \"user:profile:*\"\n   5) \"10.0.3.47:52341\"\n   6) \"recommend-service\"\n2) 1) (integer) 41\n   2) (integer) 1698234010\n   3) (integer) 15234\n   4) 1) \"HGETALL\"\n      2) \"user:attrs:10023847\"\n   5) \"10.0.3.52:48921\"\n   6) \"profile-service\"\n```\n\n真相大白：id 为 42 的慢查询记录显示，`recommend-service` 在 15:00:13 执行了一条 `KEYS user:profile:*` 命令，耗时 2134578 微秒——也就是 2.13 秒。因为 Redis 是单线程模型，这 2.13 秒内主线程被这一条 KEYS 命令完全占满，所有其他客户端的请求都在 socket 缓冲区里排队等待，直到 KEYS 执行完毕才开始处理。这就是为什么你看到那 2 秒的「空白期」。\n\n面试官看你排查到了根因，继续追问：「那你怎么从根本上避免这种情况发生？慢查询日志怎么配置？除了 KEYS 之外还有哪些命令容易造成阻塞？数据设计上有什么注意事项？运维层面有什么监控手段？」",
+      "answer": "## 第一步：理解单线程模型下慢查询的致命危害\n\n### Redis 单线程命令处理模型\n\nRedis 的命令执行模型在 Section 7 前面几道题中已经讲过：Redis 使用单线程事件循环来处理所有客户端请求。虽然 Redis 6.0 引入了多线程 I/O（`io-threads`），但那只负责网络数据的读写和协议解析，真正的命令执行——也就是操作内存数据结构的那一步——始终是在主线程中串行完成的。这意味着在任意时刻，Redis 只有一条命令在执行。\n\n这个设计在绝大部分场景下是完美的：Redis 的大部分命令都是 O(1) 或 O(log N) 复杂度，一条 GET 命令执行时间通常在微秒级别，10 万 QPS 不在话下。但问题出在少数「坏命令」上。当一条 O(N) 命令操作了一个包含百万元素的大 key 时，执行时间可能从微秒飙到秒级。而在这条命令执行期间，所有其他客户端的请求——哪怕只是简单的 `GET key`——都必须排队等待。表现在监控上就是所有客户端同时感受到延迟抖动，整个 Redis 实例在那几秒内像「冻住了」一样。\n\n这就是单线程模型的阿喀琉斯之踵：一条慢命令可以拖垮整个实例。MySQL 里一条慢 SQL 顶多占一个连接线程，其他连接不受影响；但在 Redis 里，一条慢命令是在独占整个服务的处理能力。\n\n## 第二步：SLOWLOG 慢查询日志——发现问题的第一步\n\n### 什么是 SLOWLOG\n\nSLOWLOG 是 Redis 内置的慢查询日志系统，它记录执行时间超过指定阈值的命令。注意这里的「执行时间」仅指命令在主线程中的实际计算时间，不包括网络传输时间和排队等待时间。这一点很重要：一条命令可能因为前面有慢命令在阻塞而等了很久，但如果它自身执行很快，就不会出现在 SLOWLOG 中。\n\nSLOWLOG 的数据保存在内存中的一个固定长度队列里，不会写入磁盘也不会影响性能。即使你把阈值设到 0（记录所有命令），对 Redis 性能的影响也微乎其微——不过这样做会导致队列迅速被填满，有意义的慢查询记录会被挤出去，所以生产环境不建议设为 0。\n\n### 配置 SLOWLOG\n\n两个核心参数控制 SLOWLOG 的行为：\n\n```bash\n# 慢查询阈值，单位是微秒。超过这个时间的命令会被记录。\n# 10000 微秒 = 10 毫秒。生产环境建议设为 5000-10000（5-10ms）\n127.0.0.1:6379> CONFIG SET slowlog-log-slower-than 10000\nOK\n\n# 慢查询日志最多保留的记录数。队列满后新记录会挤掉最老的。\n# 默认 128 条，建议调到 256 或更高，防止重要记录被覆盖\n127.0.0.1:6379> CONFIG SET slowlog-max-len 256\nOK\n```\n\n如果你想让这些配置持久化到重启后，需要同时写入 `redis.conf`：\n\n```conf\n# redis.conf\nslowlog-log-slower-than 10000\nslowlog-max-len 256\n```\n\n### 查看和管理 SLOWLOG\n\n```bash\n# 查看最近 5 条慢查询记录\n127.0.0.1:6379> SLOWLOG GET 5\n1) 1) (integer) 42           # 日志 id，递增的唯一标识\n   2) (integer) 1698234013   # Unix 时间戳（秒），命令执行的时间\n   3) (integer) 2134578      # 执行耗时（微秒），2134578us = 2.13s\n   4) 1) \"KEYS\"              # 命令名\n      2) \"user:profile:*\"    # 参数\n   5) \"10.0.3.47:52341\"      # 客户端 IP:端口\n   6) \"recommend-service\"    # 客户端名称（CLIENT SETNAME 设置的）\n\n# 查看当前慢查询日志中有多少条记录\n127.0.0.1:6379> SLOWLOG LEN\n(integer) 23\n\n# 清空慢查询日志（排查完毕后重置）\n127.0.0.1:6379> SLOWLOG RESET\nOK\n```\n\n每条 SLOWLOG 记录包含六个字段：自增 id、执行时间戳、耗时（微秒）、完整命令及参数、客户端地址和客户端名称。其中客户端名称这个字段非常实用——如果你的每个微服务在连接 Redis 时都执行 `CLIENT SETNAME <service-name>`，当慢查询出现时你能立刻知道是哪个服务发出的命令，而不用根据 IP 去反查。\n\n## 第三步：避免慢查询的核心策略\n\n### 命令层面：禁用危险命令，用安全替代方案\n\n**禁用高危命令**：在 `redis.conf` 中使用 `rename-command` 直接禁用那些在生产环境中几乎不应该出现的危险命令：\n\n```conf\n# redis.conf — 禁用危险命令\nrename-command KEYS \"\"         # KEYS 全库扫描 O(N)，彻底禁用\nrename-command FLUSHALL \"\"     # 清空所有 DB，禁用\nrename-command FLUSHDB \"\"      # 清空当前 DB，禁用\nrename-command DEBUG \"\"        # 调试命令，禁用\n```\n\n`rename-command KEYS \"\"` 意思是把 KEYS 命令重命名为空字符串，相当于彻底禁用。有些团队会把 KEYS 重命名为一个随机字符串比如 `rename-command KEYS \"KEYS_DO_NOT_USE_a8f3b2\"`，这样紧急情况下还能通过这个隐藏名称使用，但日常使用中任何人执行 `KEYS` 都会报 `ERR unknown command` 错误。\n\n**用 SCAN 替代 KEYS**：KEYS 的问题在于它一次性遍历整个 key 空间，时间复杂度 O(N)（N 是 key 总数）。如果你有 500 万个 key，一条 `KEYS user:*` 就要遍历所有 500 万个 key 来做匹配。而 SCAN 使用游标（cursor）分批遍历，每次只返回少量结果，不会阻塞主线程：\n\n```bash\n# KEYS 的危险用法（绝对不要在生产环境使用）\n127.0.0.1:6379> KEYS user:profile:*\n# 如果有 300 万个匹配 key，这条命令可能阻塞数秒\n\n# SCAN 的安全替代方案\n127.0.0.1:6379> SCAN 0 MATCH user:profile:* COUNT 100\n1) \"17408\"    # 下次迭代用的游标值\n2) 1) \"user:profile:10023\"\n   2) \"user:profile:58841\"\n   3) \"user:profile:77102\"\n   ... # 本次返回约 100 个结果\n\n# 用返回的游标继续下一批\n127.0.0.1:6379> SCAN 17408 MATCH user:profile:* COUNT 100\n1) \"0\"        # 游标为 0 表示遍历完成\n2) 1) ...\n```\n\nSCAN 的 `COUNT` 参数不是精确的返回数量，而是给 Redis 的一个「每次大概扫描多少个 slot」的提示。默认值是 10，生产环境建议设为 100-500，太小会导致遍历太慢，太大可能造成轻微的延迟波动。\n\n同理，对于聚合类型的遍历，也要使用对应的 SCAN 族命令。`HGETALL` 在一个有 50 万 field 的 Hash 上执行是 O(N) 操作，应该用 `HSCAN` 分批遍历。`SMEMBERS` 在一个百万级元素的 Set 上同样危险，应该用 `SSCAN`。`ZRANGEBYSCORE` 如果匹配范围包含大量元素也是 O(N+M)（N 是跳表长度，M 是结果数量），大范围查询应该用 `ZSCAN` 或者通过 `LIMIT offset count` 参数限制返回数量。\n\n**关注命令的时间复杂度**：Redis 官方文档对每条命令都标注了时间复杂度。常见的危险命令除了 KEYS 之外，还有 `SORT`（对大集合排序，O(N+M*log(M))）、`LREM`（从大 List 中删除匹配元素，O(N)）、`SUNION/SINTER/SDIFF`（大 Set 的集合运算，O(N*M)）。一个简单的判断标准：如果命令的复杂度包含 N 且 N 可能超过 1 万，就要格外小心。\n\n### 数据设计层面：控制 key 的大小\n\n命令本身可能没有问题，但如果操作的 key 太大，再温和的命令也会变慢。生产环境中建议控制单个 key 的元素数量：Hash、Set、Sorted Set 的元素控制在 1 万以内为佳，最多不超过 10 万。String 类型的 value 大小控制在 10KB 以内。\n\n**大 key 拆分**：如果业务需要存储大量元素，应该通过分片方式拆分成多个小 key。比如一个存储了 200 万用户 ID 的 Set `all_users`，可以按照 hash 取模拆分成 100 个小 Set：\n\n```python\n# 写入时分片\nimport hashlib\ndef add_user(redis_client, user_id):\n    shard = int(hashlib.md5(str(user_id).encode()).hexdigest(), 16) % 100\n    redis_client.sadd(f\"all_users:{shard}\", user_id)\n\n# 读取时遍历所有分片\ndef get_all_users(redis_client):\n    users = set()\n    for shard in range(100):\n        users.update(redis_client.smembers(f\"all_users:{shard}\"))\n    return users\n```\n\n拆分后每个 `all_users:{shard}` 只有约 2 万个元素，`SMEMBERS` 或 `SCARD` 操作的复杂度从 O(2000000) 降到 O(20000)，延迟从秒级降到毫秒级。\n\n### 运维层面：异步删除与大 key 扫描\n\n**用 UNLINK 替代 DEL 删除大 key**：DEL 命令是同步删除，如果删除一个包含 100 万元素的 Hash，主线程会阻塞直到所有元素释放完毕，可能耗时数百毫秒。从 Redis 4.0 开始，`UNLINK` 命令提供异步删除——它在主线程中将 key 从 key 空间移除（O(1)），然后把实际的内存释放工作丢给后台线程（bio 线程）处理：\n\n```bash\n# 同步删除 — 大 key 会阻塞主线程\n127.0.0.1:6379> DEL big_hash_key\n(integer) 1    # 如果 key 有百万 field，这条命令可能卡住几百毫秒\n\n# 异步删除 — 主线程几乎不阻塞\n127.0.0.1:6379> UNLINK big_hash_key\n(integer) 1    # 主线程只做 O(1) 的 key 移除，内存释放在后台进行\n```\n\n同时建议开启 Redis 4.0+ 的 lazyfree 系列配置，让 Redis 在内部操作（过期淘汰、maxmemory 驱逐等）中也使用异步释放：\n\n```conf\n# redis.conf — lazyfree 配置\nlazyfree-lazy-expire yes       # 过期 key 的删除放到后台线程\nlazyfree-lazy-eviction yes     # maxmemory 淘汰时放到后台线程\nlazyfree-lazy-server-del yes   # 内部隐式删除（如 RENAME 覆盖旧 key）放到后台线程\nlazyfree-lazy-user-del no      # 用户的 DEL 命令是否也走异步（默认 no，建议显式用 UNLINK）\n```\n\n**定期扫描大 key**：使用 `redis-cli --bigkeys` 可以快速扫描实例中各类型最大的 key：\n\n```bash\n$ redis-cli --bigkeys\n\n# Scanning the entire keyspace to find biggest keys\n[00.00%] Biggest string found so far '\"session:a8f3b2c1\"' with 8432 bytes\n[12.45%] Biggest hash   found so far '\"user:attrs:10023847\"' with 523841 fields\n[35.21%] Biggest set    found so far '\"all_users\"' with 2043891 members\n[67.89%] Biggest zset   found so far '\"leaderboard:daily\"' with 98234 members\n\n-------- summary -------\nSampled 4832910 keys in the keyspace!\nTotal key length in bytes is 96432810\nBiggest string found '\"session:a8f3b2c1\"' has 8432 bytes\nBiggest    hash found '\"user:attrs:10023847\"' has 523841 fields\nBiggest     set found '\"all_users\"' has 2043891 members\nBiggest    zset found '\"leaderboard:daily\"' has 98234 members\n```\n\n这个命令内部使用的是 SCAN 而不是 KEYS，所以不会阻塞 Redis。建议在非高峰期定期执行（比如凌晨通过 cron job），发现超过阈值的大 key 及时拆分或清理。\n\n## 第四步：监控与告警体系\n\n仅靠 SLOWLOG 手动查看是远远不够的。生产环境需要建立完整的慢查询监控体系。\n\n**SLOWLOG 定期采集**：写一个脚本（或使用 redis_exporter）每隔 30 秒执行 `SLOWLOG GET` 拉取新的慢查询记录，推送到 ELK 或日志系统。采集后执行 `SLOWLOG RESET` 避免重复采集。核心告警规则：单条命令耗时超过 50ms 触发 P2 告警，超过 500ms 触发 P1 告警。\n\n**INFO commandstats 命令统计**：`INFO commandstats` 输出每个命令的调用次数、总耗时和平均耗时，是发现潜在慢查询的利器：\n\n```bash\n127.0.0.1:6379> INFO commandstats\n# Commandstats\ncmdstat_get:calls=48293021,usec=19317208,usec_per_call=0.40\ncmdstat_set:calls=12847293,usec=7708376,usec_per_call=0.60\ncmdstat_hgetall:calls=284730,usec=42709500,usec_per_call=149.97\ncmdstat_keys:calls=3,usec=6403734,usec_per_call=2134578.00\n```\n\n这里能看到 `KEYS` 虽然只调用了 3 次，但 `usec_per_call` 高达 213 万微秒（2.13 秒），`HGETALL` 平均每次 150 微秒但调用了 28 万次，总耗时 42.7 秒。这些数据可以帮你发现两类问题：单次极慢的命令和频繁调用的「温水煮青蛙」式慢命令。\n\n**redis-cli --latency-history 延迟趋势**：这个命令每 15 秒采样一次 Redis 的 PING 延迟，用来监控延迟趋势：\n\n```bash\n$ redis-cli --latency-history\nmin: 0, max: 1, avg: 0.12 (1463 samples) -- 15.01 seconds range\nmin: 0, max: 2, avg: 0.14 (1458 samples) -- 15.00 seconds range\nmin: 0, max: 1842, avg: 12.34 (1102 samples) -- 15.01 seconds range  # <- 异常！\nmin: 0, max: 1, avg: 0.11 (1470 samples) -- 15.00 seconds range\n```\n\n第三行的 `max: 1842` 表示在这 15 秒的采样周期内，有一次 PING 请求等了 1842 毫秒才得到响应——这就是慢查询阻塞的直接表现。\n\n**Prometheus + Grafana 监控面板**：使用 `redis_exporter`（oliver006/redis_exporter）采集 Redis 指标到 Prometheus，关键监控项包括 `redis_slowlog_last_id`（慢查询 id 增长速率）、`redis_commands_duration_seconds_total`（按命令类型的耗时）、`redis_instantaneous_ops_per_sec`（瞬时 QPS，骤降为 0 是慢查询的典型信号）。\n\n## 第五步：Redis 7.0 的 ACL 命令级限制\n\nRedis 7.0 在 ACL（Access Control List，访问控制列表）系统中增强了命令级别的细粒度控制。虽然 Redis 7.0 没有直接提供「命令执行超时自动中止」的功能，但通过 ACL 你可以针对不同用户禁用特定命令，这比 `rename-command` 更灵活。`rename-command` 是全局禁用，而 ACL 可以按用户粒度控制——比如运维账户可以使用 KEYS 做紧急排查，但业务应用账户完全禁止：\n\n```bash\n# 创建一个业务应用账户，禁用危险命令\n127.0.0.1:6379> ACL SETUSER app-user on >strong_password ~* +@all -KEYS -FLUSHALL -FLUSHDB -DEBUG -SHUTDOWN\nOK\n\n# 创建一个运维账户，允许所有命令\n127.0.0.1:6379> ACL SETUSER ops-admin on >ops_password ~* +@all\nOK\n```\n\nRedis 7.0 还引入了 `ACL LOG` 命令来记录被 ACL 拒绝的命令请求，你可以通过它监控是否有服务在尝试执行被禁的命令。此外，社区在讨论命令级别的超时机制（command timeout），但截至 Redis 7.2 尚未正式实现。当前的替代方案是客户端侧设置命令超时——比如 Jedis 的 `JedisPoolConfig.setSocketTimeout()`、go-redis 的 `Options.ReadTimeout`——超时后客户端断开重连，但 Redis 服务端那条命令仍然会执行到完成。\n\n## 第六步：实际案例——一次 KEYS 命令导致的线上故障排查\n\n这是开头 content 中描述的场景的完整排查复盘。事件时间线：\n\n下午 14:58，推荐服务的一个开发人员在排查「某个用户画像 key 是否存在」时，在代码中调用了 `KEYS user:profile:*` 来列出所有匹配的 key（他的本意是做一次性数据核查，以为很快就能跑完）。这段代码被合并到了一个数据修复脚本中，下午 15:00:13 随着定时任务触发执行。\n\n下午 15:00:13，这条 `KEYS user:profile:*` 在 Redis 主线程开始执行。当时 key 空间中有 483 万个 key，其中约 310 万个匹配 `user:profile:*` 前缀。KEYS 命令需要遍历所有 483 万个 key 并对每个做 glob 匹配，耗时 2.13 秒。\n\n在这 2.13 秒内，Redis 主线程被完全占满。3 万 QPS 的请求持续涌入 Redis 的 socket 接收缓冲区，但主线程无法调用 `epoll_wait` 去取这些请求。所有客户端的请求堆积在 TCP 缓冲区中。\n\n下午 15:00:15，KEYS 命令执行完毕，主线程回到事件循环，`epoll_wait` 一次性拿到大量就绪的文件描述符，开始疯狂处理积压的请求。`ops/sec` 瞬间飙到 34891（比正常高，因为在消化积压）。\n\n**修复措施**：\n\n第一步（立即止血）：在 `redis.conf` 中添加 `rename-command KEYS \"\"`，重启 Redis 生效。从此任何服务执行 KEYS 都会报错。\n\n第二步（短期优化）：排查所有代码仓库中的 KEYS 调用，全部替换为 SCAN。在代码 review 的 lint 规则中加入对 Redis KEYS 命令的检测。\n\n第三步（长期治理）：配置 SLOWLOG 阈值为 5000 微秒（5ms），max-len 为 512。部署 redis_exporter 采集慢查询指标到 Prometheus，设置告警规则。使用 `redis-cli --bigkeys` 建立每日大 key 扫描任务。对超过 10 万元素的大 Hash（如 `user:attrs:10023847` 有 52 万 field）执行拆分。\n\n这次故障的根本教训是：在 Redis 的单线程世界里，没有「无关紧要的命令」。任何一条在生产 Redis 上执行的命令，如果执行时间超过几毫秒，都可能成为整个系统的瓶颈。SLOWLOG 监控、危险命令禁用、大 key 治理——这三件事应该在 Redis 实例上线第一天就配好，而不是等出了故障再补。",
+      "keyPoints": [
+        "Redis 命令执行始终在主线程串行完成，一条 O(N) 慢命令会独占主线程并阻塞所有其他客户端请求，表现为所有客户端同时出现延迟抖动",
+        "SLOWLOG 通过 slowlog-log-slower-than（微秒阈值）和 slowlog-max-len 控制，每条记录包含自增 id、时间戳、耗时、完整命令、客户端地址和客户端名称六个字段",
+        "使用 rename-command KEYS \"\" 在 redis.conf 中彻底禁用 KEYS 等 O(N) 危险命令，用 SCAN 游标分批遍历替代 KEYS 的全库扫描",
+        "聚合类型的大范围查询应使用 HSCAN/SSCAN/ZSCAN 替代 HGETALL/SMEMBERS/ZRANGEBYSCORE，避免一次性返回大量元素阻塞主线程",
+        "大 key 拆分是数据设计层面的核心策略——Hash/Set/ZSet 的元素数建议控制在万级以内，百万级 key 按 hash 取模拆分成多个小 key",
+        "使用 UNLINK 替代 DEL 异步删除大 key，同时开启 lazyfree-lazy-expire/lazyfree-lazy-eviction/lazyfree-lazy-server-del 让内部操作也走异步释放",
+        "完整的慢查询监控体系包括 SLOWLOG 定期采集、INFO commandstats 命令级统计、redis-cli --latency-history 延迟趋势、以及 Prometheus + Grafana 面板",
+        "Redis 7.0 的 ACL 系统可按用户粒度禁用危险命令，比 rename-command 的全局禁用更灵活，允许运维账户保留紧急排查能力"
+      ],
+      "quiz": [
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz1",
+          "question": "为什么 Redis 中一条慢查询会导致所有客户端同时感受到延迟抖动？",
+          "choices": [
+            { "id": "A", "text": "因为 Redis 命令执行在主线程串行完成，一条慢命令执行期间所有其他请求必须排队等待" },
+            { "id": "B", "text": "因为慢查询会消耗大量内存导致 Redis 触发 OOM 保护机制" },
+            { "id": "C", "text": "因为 Redis 6.0 的多线程 I/O 在处理慢查询时会关闭其他线程" },
+            { "id": "D", "text": "因为慢查询会导致 Redis 主从复制延迟，从而影响所有读请求" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 的命令执行始终在主线程中串行完成（即使 Redis 6.0 引入了多线程 I/O，那也只负责网络数据的读写和协议解析）。当一条 O(N) 命令在执行时，主线程被完全占满，无法调用 epoll_wait 去获取其他客户端的请求。所有请求堆积在 TCP 缓冲区中，直到慢命令执行完毕主线程回到事件循环才开始处理。B 选项描述的 OOM 与慢查询阻塞无关。C 选项完全错误，多线程 I/O 不会因为某条命令慢就关闭。D 选项描述的是主从复制的问题，跟单实例内的命令阻塞是不同的机制。"
+        },
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz2",
+          "question": "SLOWLOG 记录的「执行时间」具体指什么？",
+          "choices": [
+            { "id": "A", "text": "从客户端发送命令到收到响应的端到端时间，包含网络传输" },
+            { "id": "B", "text": "命令在主线程中的实际计算时间，不包含网络传输和排队等待时间" },
+            { "id": "C", "text": "命令从进入请求队列到执行完毕的总时间，包含排队等待" },
+            { "id": "D", "text": "命令执行加上结果序列化和发送响应的总时间" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SLOWLOG 记录的执行时间仅指命令在 Redis 主线程中的实际计算时间（即操作内存数据结构所花的时间），不包含网络传输时间和在队列中排队等待的时间。这个细节非常重要：如果一条 GET 命令因为前面有慢命令在阻塞而等了 2 秒才被执行，但 GET 本身只花了 0.01ms 完成，它不会出现在 SLOWLOG 中。A 选项的端到端时间是客户端侧的指标，不是 SLOWLOG 记录的。C 选项的排队时间不被 SLOWLOG 统计。D 选项的序列化和发送时间也不在 SLOWLOG 统计范围内。"
+        },
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz3",
+          "question": "SCAN 命令为什么不会像 KEYS 一样阻塞 Redis？",
+          "choices": [
+            { "id": "A", "text": "SCAN 在后台线程执行，不占用主线程" },
+            { "id": "B", "text": "SCAN 使用游标分批遍历，每次只扫描部分 key 空间然后将控制权交还给事件循环" },
+            { "id": "C", "text": "SCAN 比 KEYS 使用了更高效的算法，总时间复杂度是 O(log N)" },
+            { "id": "D", "text": "SCAN 会自动将大范围查询拆分成多个子线程并行执行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SCAN 的核心机制是游标（cursor）分批遍历。每次调用 SCAN 时，Redis 只扫描 key 空间字典的一小部分 slot（由 COUNT 参数控制），返回本批结果和一个游标值，客户端用这个游标发起下一次 SCAN 调用。虽然完整遍历的总时间复杂度仍然是 O(N)，但每次调用的时间很短（通常毫秒以内），两次 SCAN 之间主线程可以正常处理其他客户端请求。A 选项错误，SCAN 仍然在主线程执行。C 选项对时间复杂度的描述完全错误，SCAN 总复杂度也是 O(N)。D 选项的多线程并行是虚构的。"
+        },
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz4",
+          "question": "rename-command KEYS \"\" 和 ACL 禁用 KEYS 的关键区别是什么？",
+          "choices": [
+            { "id": "A", "text": "rename-command 是全局禁用，ACL 可以按用户粒度控制——如运维账户保留使用权限而业务账户禁用" },
+            { "id": "B", "text": "rename-command 只在配置文件中生效，ACL 可以通过 CONFIG SET 动态修改" },
+            { "id": "C", "text": "rename-command 彻底从 Redis 中删除命令的实现代码，ACL 只是拒绝调用" },
+            { "id": "D", "text": "rename-command 需要重启 Redis 才生效，ACL 不需要且性能更好" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "两者最核心的区别在于粒度。rename-command 是全局级别的——一旦执行 `rename-command KEYS \"\"`，Redis 实例上所有用户（包括运维人员）都无法使用 KEYS 命令。而 ACL 系统（Redis 6.0+）支持按用户粒度控制，你可以创建一个业务账户禁用 KEYS，同时保留一个运维账户拥有完整权限用于紧急排查。B 选项部分正确但不是关键区别——ACL SETUSER 确实可以动态执行，但 rename-command 也只需重启一次。C 选项错误，rename-command 不会删除实现代码，只是改了命令名映射。D 选项关于性能的说法没有依据。"
+        },
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz5",
+          "question": "以下 INFO commandstats 输出中，哪个命令最值得优先优化？\n\ncmdstat_get:calls=50000000,usec=20000000,usec_per_call=0.40\ncmdstat_hgetall:calls=300000,usec=45000000,usec_per_call=150.00\ncmdstat_set:calls=12000000,usec=8400000,usec_per_call=0.70",
+          "choices": [
+            { "id": "A", "text": "GET，因为调用次数最多（5000 万次）" },
+            { "id": "B", "text": "HGETALL，因为平均每次 150 微秒且总耗时最高（45 秒）" },
+            { "id": "C", "text": "SET，因为 usec_per_call 比 GET 高 75%" },
+            { "id": "D", "text": "三个命令都正常，不需要优化" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "HGETALL 虽然只调用了 30 万次，但平均每次耗时 150 微秒，这对于 Redis 命令来说偏高——正常的 HGET 单字段查询应该在 1 微秒级别。150 微秒的 HGETALL 说明被操作的 Hash key 很可能包含大量 field（可能数千甚至数万个），属于典型的大 key 问题。而且它的总耗时 45 秒在三个命令中最高。GET 的 0.40 微秒和 SET 的 0.70 微秒都是完全正常的值，调用次数多但单次很快就没问题。正确的优化方向是找到那些导致 HGETALL 慢的大 Hash，把它们拆分成小 Hash 或改用 HSCAN 分批读取。"
+        },
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz6",
+          "question": "DEL 和 UNLINK 在删除大 key 时的核心区别是什么？",
+          "choices": [
+            { "id": "A", "text": "DEL 同步释放内存会阻塞主线程，UNLINK 在主线程做 O(1) 的 key 移除后将实际内存释放交给后台线程" },
+            { "id": "B", "text": "DEL 立即释放内存，UNLINK 延迟到下一次 BGSAVE 时才释放" },
+            { "id": "C", "text": "DEL 和 UNLINK 效果完全一样，UNLINK 只是 DEL 的别名" },
+            { "id": "D", "text": "UNLINK 比 DEL 快是因为 UNLINK 不会触发 key 过期通知和 keyspace notification" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Redis 4.0 引入的关键优化。DEL 是同步删除——主线程执行 DEL 时会立即释放 key 对应的所有内存，如果这个 key 是一个包含百万元素的 Hash 或 Set，内存释放可能耗时数百毫秒，期间主线程无法处理其他请求。UNLINK 是异步删除——主线程只做两件事：从 key 空间的字典中移除这个 key 的引用（O(1)），然后把实际的内存释放工作丢到 bio（Background I/O）线程去做。这样主线程几乎不阻塞。B 选项错误，UNLINK 的内存释放跟 BGSAVE 没有关系。C 选项错误，两者行为完全不同。D 选项错误，UNLINK 同样会触发 keyspace notification。"
+        },
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz7",
+          "question": "关于 SLOWLOG 和 INFO commandstats 的对比，以下哪个说法正确？",
+          "choices": [
+            { "id": "A", "text": "SLOWLOG 记录超过阈值的单条慢命令的详情，commandstats 统计每类命令的调用次数和平均耗时——两者互补" },
+            { "id": "B", "text": "commandstats 包含了 SLOWLOG 的所有信息，有 commandstats 就不需要 SLOWLOG" },
+            { "id": "C", "text": "SLOWLOG 记录所有命令的耗时，commandstats 只记录慢命令" },
+            { "id": "D", "text": "两者记录的数据完全一样，只是展示格式不同" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "SLOWLOG 和 INFO commandstats 是两个互补的监控维度。SLOWLOG 记录的是「超过阈值的单条命令的完整详情」——包括具体执行了什么命令、什么参数、哪个客户端发出的、耗时多少。它能帮你定位到具体的那条慢命令。commandstats 记录的是「每种命令类型的聚合统计」——调用次数、总耗时、平均耗时。它能帮你发现趋势性问题，比如某个命令的平均耗时在逐渐增长。两者结合使用：commandstats 发现 HGETALL 平均耗时异常偏高，然后到 SLOWLOG 中找具体是哪些 key 的 HGETALL 慢。B 选项错误，commandstats 不包含具体命令参数和客户端信息。C 选项因果颠倒。D 选项完全不对。"
+        },
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz8",
+          "question": "生产环境中一个 Redis 实例有 500 万 key，需要查找所有匹配 \"order:2024*\" 的 key 进行数据清理。最安全的做法是？",
+          "choices": [
+            { "id": "A", "text": "直接执行 KEYS order:2024*，因为只匹配部分 key 不会太慢" },
+            { "id": "B", "text": "在从节点上执行 KEYS order:2024*，避免影响主节点" },
+            { "id": "C", "text": "使用 SCAN 0 MATCH order:2024* COUNT 200 循环遍历，对匹配的 key 用 UNLINK 删除" },
+            { "id": "D", "text": "使用 redis-cli --bigkeys 找到所有 order:2024 开头的 key 后批量删除" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "KEYS 命令不管匹配结果有多少，它都要遍历全部 500 万个 key 做 glob 匹配，时间复杂度是 O(N)（N 是 key 总数，不是匹配数）。所以 A 选项「只匹配部分 key 不会太慢」的理解是错误的。B 选项在从节点执行 KEYS 确实不影响主节点，但会阻塞从节点，如果从节点也在服务读请求就同样会出问题。C 选项使用 SCAN 分批遍历加 UNLINK 异步删除是标准的安全做法：SCAN 每次只扫描一小批 slot，不会长时间阻塞主线程；UNLINK 异步释放内存避免删除大 key 时的阻塞。D 选项的 --bigkeys 只能找各类型最大的 key，不支持按前缀查找，功能完全不匹配。"
+        },
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz9",
+          "question": "SCAN 命令的 COUNT 参数设为 10000 时，可能出现什么问题？",
+          "choices": [
+            { "id": "A", "text": "精确返回 10000 个 key，可能导致客户端内存溢出" },
+            { "id": "B", "text": "单次 SCAN 扫描的 slot 过多，可能导致毫秒级的延迟波动，在高 QPS 场景下影响其他请求" },
+            { "id": "C", "text": "COUNT 最大值只支持 1000，设为 10000 会报参数错误" },
+            { "id": "D", "text": "SCAN 会自动忽略过大的 COUNT 值，实际等同于 COUNT 100" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "COUNT 参数是给 Redis 的一个提示，告诉它每次大约扫描多少个字典 slot。如果 COUNT 设得太大，单次 SCAN 需要遍历的 slot 数量就很多，虽然不会像 KEYS 那样扫描全部 key 空间，但仍然可能造成毫秒级的延迟——在 QPS 极高的场景下（比如 10 万+），这种毫秒级的阻塞就可能导致其他请求出现延迟抖动。生产环境建议 COUNT 设为 100-500 之间。A 选项错误，COUNT 不是精确的返回数量，实际返回可能多于或少于 COUNT 值。C 选项错误，COUNT 没有最大值限制。D 选项错误，Redis 不会忽略 COUNT 值。"
+        },
+        {
+          "id": "redis-thread-slow-query-avoid-q1-quiz10",
+          "question": "监控发现 Redis 的 instantaneous_ops_per_sec 每隔几分钟就突然降到 0 持续约 500ms，SLOWLOG 却没有任何记录。以下哪个排查方向最可能找到原因？",
+          "choices": [
+            { "id": "A", "text": "检查是否有 BGSAVE/BGREWRITEAOF 的 fork 操作导致主线程短暂阻塞" },
+            { "id": "B", "text": "检查网络带宽是否被打满导致 Redis 无法接收新请求" },
+            { "id": "C", "text": "检查 slowlog-log-slower-than 是否设置过高导致慢查询未被记录" },
+            { "id": "D", "text": "检查 Redis 是否频繁进行 RDB 快照导致磁盘 I/O 瓶颈" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这道题的关键线索是「SLOWLOG 没有记录」。SLOWLOG 只记录命令执行时间超过阈值的命令，但 BGSAVE 和 BGREWRITEAOF 触发的 fork() 系统调用造成的阻塞不属于「命令执行时间」——fork 发生在命令处理之外的层面。在大内存实例（比如 10GB+）上，fork 操作需要复制进程的页表（page table），这个过程可能耗时数百毫秒甚至数秒，期间主线程被阻塞，但这段时间不会被 SLOWLOG 记录。可以通过 `INFO persistence` 查看 `rdb_last_cow_size` 和 `latest_fork_usec`（最近一次 fork 耗时，微秒）来验证。C 选项也是一个合理的排查方向，但题目说「每隔几分钟规律性出现」更符合定时 BGSAVE 的特征。B 和 D 选项虽然可能导致问题，但不符合「ops/sec 降到 0」这个现象。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/slowlog-get/",
+        "https://redis.io/docs/latest/commands/scan/",
+        "https://redis.io/docs/latest/commands/unlink/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/config-file/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/security/acl/"
+      ]
+    }
+  ]
+}
