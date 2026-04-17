@@ -1,0 +1,158 @@
+{
+  "id": "redis-expire-repl-deletion",
+  "name": "主从复制中过期 key 的删除由谁负责",
+  "domain": "redis",
+  "description": "深入讲解 Redis 主从架构下过期 key 的删除归属、DEL 命令同步机制、从节点脏读问题的历史演进（3.2 前后）、replica-lazy-expire 配置、Cluster 模式处理以及生产环境中主从 expires 不一致的监控排查",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-expire-repl-deletion-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["主从复制", "过期删除", "DEL同步", "脏读", "replica-lazy-expire", "redis-expiration", "redis-replication"],
+      "title": "主从复制中过期 key 的删除由谁负责",
+      "content": "## 面试场景\n\n面试官问你：「Redis 主从架构下，一个 key 在主节点上设了 TTL 过期了，从节点是怎么知道要删掉它的？从节点会自己判断 key 过期然后删除吗？」你回答说「从节点不会自主删除，靠主节点发 DEL 命令同步」。面试官继续追问：「那在主节点还没来得及发 DEL 之前，客户端从从节点读这个 key 会读到什么？Redis 3.2 之前和之后的行为一样吗？如果主从时钟不一致怎么办？从节点上大量过期 key 没被清理导致内存暴涨怎么排查？Redis 6.0 的 replica-lazy-expire 又是什么？Cluster 模式下是怎么处理的？」\n\n这些追问背后其实是一个 Redis 设计哲学问题——在异步复制模型下，谁有权修改数据。如果主从都能各自删 key，在时钟偏差和网络延迟的作用下，主从数据很快就会不一致。Redis 的答案非常明确：**一切数据变更由主节点统一发起，从节点只是忠实地回放主节点的操作序列。**\n\n这个设计看似简单，但它引出了一系列实际问题。我们先做一个实验来观察真实行为。准备一个主从架构（主节点 6379，从节点 6380），在主节点上创建一个带 TTL 的 key：\n\n```bash\n# 主节点 6379\n127.0.0.1:6379> SET session:user42 '{\"uid\":42,\"role\":\"vip\"}' EX 5\nOK\n127.0.0.1:6379> DEBUG SLEEP 3  # 等 3 秒，key 还没过期\n\n# 从节点 6380（此时 key 还没过期）\n127.0.0.1:6380> GET session:user42\n\"{\\\"uid\\\":42,\\\"role\\\":\\\"vip\\\"}\"   # 正常返回数据\n127.0.0.1:6380> TTL session:user42\n(integer) 2\n\n# 再等 5 秒，key 已经过期了\n# 从节点 6380\n127.0.0.1:6380> GET session:user42\n(nil)                            # Redis 3.2+ 返回 nil\n127.0.0.1:6380> DBSIZE\n(integer) 1                      # 但 key 物理上还在！DBSIZE 不骗人\n\n# 此时去主节点触发一下惰性删除\n127.0.0.1:6379> GET session:user42\n(nil)                            # 主节点触发删除，生成 DEL 同步到从节点\n\n# 回到从节点\n127.0.0.1:6380> DBSIZE\n(integer) 0                      # 从节点收到 DEL 后才真正删除\n```\n\n注意实验中的关键细节：从节点上 `GET` 返回了 nil（Redis 3.2+ 的行为），但 `DBSIZE` 仍然报告有 1 个 key——这说明从节点「假装」key 不存在，但并没有真正删除它。直到主节点那边触发了惰性删除并通过复制流同步了 DEL 命令，从节点才真正把这个 key 从内存中摘除。\n\n如果你用的是 Redis 3.2 之前的版本，那个 `GET` 会返回实际的数据内容，而不是 nil——这就是 Redis 社区著名的「从节点脏读」问题。这道题要把整个机制从设计原则到源码实现到历史演进再到生产排查全部讲清楚。",
+      "answer": "## 第一步：Redis 主从复制的核心概念\n\n### 什么是 Redis 主从复制\n\nRedis 主从复制（Replication）是 Redis 提供的最基础的高可用和读扩展机制。一个 Redis 实例被配置为主节点（master），一个或多个实例被配置为从节点（replica，旧版本叫 slave）。主节点接收所有写操作，然后将这些写操作以命令的形式异步传播到所有从节点，从节点按序回放这些命令使自身数据与主节点保持一致。客户端可以从从节点读取数据来分摊主节点的读压力，这就是经典的读写分离架构。\n\n建立主从关系非常简单。在从节点上执行 `REPLICAOF <master-ip> <master-port>`（Redis 5.0+ 的命令，旧版本用 `SLAVEOF`），或在配置文件中写 `replicaof 192.168.1.10 6379`，从节点就会连接到主节点开始同步。第一次建立连接时执行全量同步（full synchronization）：主节点 fork 子进程生成 RDB 快照发送给从节点，同时把 fork 之后收到的写命令缓存在 replication buffer 中，RDB 发送完成后再把缓冲区的命令也发过去。之后进入增量同步（partial synchronization）阶段，主节点的每一条写命令都实时通过 TCP 长连接发送给从节点。\n\n理解主从复制最重要的一点是：**复制是异步的，且从节点被设计为主节点的「只读副本」。** 从节点默认不接受客户端写命令（`replica-read-only yes`），它唯一的数据来源就是主节点通过复制流发来的命令序列。这个设计决策直接决定了过期 key 在主从架构中的删除策略。\n\n```bash\n# 查看主从复制状态\n127.0.0.1:6379> INFO replication\n# Replication\nrole:master\nconnected_slaves:2\nslave0:ip=192.168.1.11,port=6380,state=online,offset=1893572,lag=0\nslave1:ip=192.168.1.12,port=6381,state=online,offset=1893572,lag=1\nmaster_replid:a3f8c7e2b1d4e6f8a0c2d4e6f8a0b2c4d6e8f0a2\nmaster_repl_offset:1893572\nrepl_backlog_active:1\nrepl_backlog_size:1048576\n```\n\n上面的 `lag=0` 和 `lag=1` 表示从节点落后主节点的秒数。在网络正常的情况下 lag 通常是 0 或 1，但在网络抖动、从节点负载高、或复制缓冲区积压时，lag 可能会增大——这直接影响过期 key 的 DEL 命令到达从节点的时效性。\n\n## 第二步：过期 key 删除归属的核心机制\n\n### 主节点统一负责删除\n\nRedis 的过期 key 删除遵循一个核心原则：**所有过期 key 的删除操作由主节点（master）统一发起和协调，从节点（replica）不会自主删除任何过期 key。** 主节点通过两种策略发现过期 key：惰性删除（`expireIfNeeded()`，在访问 key 时顺便检查）和定期删除（`activeExpireCycle()`，在 `serverCron` 中周期性随机采样）。无论是哪种策略触发的删除，主节点都会做同一件事——生成一条 `DEL`（或 `UNLINK`）命令，通过复制流（replication stream）发送给所有从节点。从节点收到这条 DEL 命令后，像执行普通写命令一样把 key 从自己的 `dict` 和 `expires` 字典中删除。\n\n这个设计的关键在于：从节点的数据变更完全由主节点的命令序列驱动。从节点不做任何「自作主张」的数据修改操作。即使从节点本地判断一个 key 已经过期了（通过比较 `expires` 字典中的时间戳和当前时间），它也不会执行删除——它必须等待主节点发来 DEL 命令。\n\n在源码层面，这个逻辑体现在 `src/db.c` 的 `expireIfNeeded()` 函数中。当从节点执行读命令调用 `lookupKeyRead()` 时，内部会调用 `expireIfNeeded()` 检查 key 是否过期。函数发现 key 过期后，检查 `server.masterhost` 是否为 NULL——如果不为 NULL，说明当前节点是从节点，此时函数直接返回过期标记但**跳过实际的删除操作**：\n\n```c\n// src/db.c — expireIfNeeded() 中从节点的分支（Redis 7.x 简化版）\nint expireIfNeeded(redisDb *db, robj *key, int flags) {\n    if (!keyIsExpired(db, key)) return 0;  // 没过期，直接返回\n\n    // 从节点：不执行删除，只返回「已过期」的标记\n    if (server.masterhost != NULL) {\n        return 1;  // 告诉调用者 key 已过期，但不真正删除\n    }\n\n    // 以下只有主节点才会执行\n    server.stat_expiredkeys++;\n    propagateExpire(db, key, server.lazyfree_lazy_expire);\n    notifyKeyspaceEvent(NOTIFY_GENERIC, \"expired\", key, db->id);\n    int retval = server.lazyfree_lazy_expire ?\n        dbAsyncDelete(db, key) : dbSyncDelete(db, key);\n    return retval;\n}\n```\n\n主节点的 `propagateExpire()` 做的事情是：向 AOF 缓冲区追加一条 `DEL key` 命令，同时向所有从节点的复制输出缓冲区写入同一条 DEL 命令。这样 AOF 文件和从节点都会记录这次删除操作，保证了持久化和复制的一致性。\n\n### 从节点对过期 key 读行为的历史演进\n\n这是 Redis 主从复制中最著名的「坑」之一，它的修复历史值得在面试中详细讲述。\n\n**Redis 3.2 之前——从节点脏读问题。** 在 Redis 3.2 之前的版本中，从节点的 `expireIfNeeded()` 对过期 key 的处理极其粗暴——它什么都不做，直接返回 0（相当于告诉调用者「key 没过期」）。这意味着客户端从从节点读取一个实际上已经过期的 key，会得到正常的数据返回而不是 nil。这就是社区里广泛讨论的「从节点脏读」（stale read）问题。在读写分离架构中，应用程序把读请求分发到从节点以减轻主节点压力，结果读到了应该已经过期的数据——比如一个已经失效的登录 session、一个已经过期的促销价格、一个已经无效的验证码。这个问题导致了不少生产事故。\n\n**Redis 3.2+——逻辑过期修复（PR #1768）。** Redis 3.2 由 Oran Agra 提交的 PR #1768 修复了这个问题。修复方案是在从节点的 `expireIfNeeded()` 中增加一个判断：如果当前节点是从节点（`server.masterhost != NULL`）且 key 已过期，函数返回 1（表示已过期）但不执行删除操作。上层的 `lookupKeyRead()` 收到返回值 1 后，会像 key 不存在一样返回 NULL，让客户端看到 nil。这就是所谓的「逻辑过期」——从节点在逻辑上让过期 key 消失了，但物理上 key 仍然存在于内存中，等待主节点的 DEL 命令到来后才真正释放。\n\n**Redis 7.0 进一步完善。** Redis 7.0 对从节点的过期处理做了更多细化。在 7.0 之前，`lookupKeyWrite()` 路径在从节点上不检查过期，因为从节点不应该执行写命令。但 7.0 考虑到了 writable replica（可写从节点，通过 `replica-read-only no` 开启）的场景，在写路径上也增加了过期检查，避免可写从节点在写操作中使用已过期的 key 值。\n\n### 为什么从节点不能自主删除\n\n理解了表面行为后，更重要的是理解设计决策背后的原因。从节点不自主删除过期 key，核心原因有三个。\n\n第一个原因是**保持复制的操作序列一致性**。Redis 主从复制的本质是主节点向从节点发送一条条的写命令，从节点按序回放。如果从节点可以自主删除过期 key，那从节点的操作序列就变成了「主节点命令 + 自己的删除操作」的混合序列，这与主节点的操作序列不再一致。当从节点需要被提升为新的主节点（failover）时，它的数据状态可能与旧主节点在某个时间点的快照对不上。更严重的是，如果从节点删除了一个 key，而主节点随后又执行了一个修改这个 key 的命令（比如 `INCR`），这条命令传到从节点后找不到 key，行为就完全不同了。\n\n第二个原因是**主从时钟可能不同步**。Redis 判断 key 是否过期依赖的是 `mstime()` 返回的当前时间戳与 `expires` 字典中存储的过期时间戳的比较。主从两台机器的系统时钟可能存在偏差——即使配了 NTP，在某些情况下（NTP 服务挂了、时钟漂移、虚拟机时钟跳变）偏差可能达到秒级甚至分钟级。如果从节点的时钟比主节点快 5 秒，从节点会提前 5 秒认为 key 过期；如果从节点的时钟比主节点慢 5 秒，从节点会延迟 5 秒才认为 key 过期。让两边各自根据自己的时钟判断过期并执行删除，在时钟不一致时必然导致数据不一致。由主节点统一做过期判断、统一生成 DEL 命令，可以避免这个问题。\n\n第三个原因是**简化复制协议的正确性证明**。Redis 的复制模型是一个简单的状态机复制（state machine replication）：主节点是唯一的命令源，从节点是确定性的状态机。同样的命令序列输入，产生同样的状态输出。如果允许从节点自主产生 DEL 操作，就打破了「唯一命令源」的不变量，复制协议的正确性分析会变得复杂得多。\n\n## 第三步：潜在问题与生产场景\n\n### 从节点内存膨胀\n\n这是主从过期机制最直接的实际问题。由于从节点必须等待主节点的 DEL 命令才能真正删除过期 key，在 DEL 命令到来之前，过期 key 持续占用从节点内存。在以下场景中这个问题会特别严重：\n\n大量 key 集中过期但无人访问时，主节点的惰性删除不会被触发，只能依赖定期删除（`activeExpireCycle`）来清理。如果过期 key 的速率超过了定期删除的清理速率（比如一次活动写入了 500 万个 TTL=30min 的 key），主节点本身清理就需要一段时间，DEL 命令的生成是渐进式的，从节点的清理就更晚。你可能会看到从节点的 `used_memory` 比主节点高出 10%-30%。\n\n网络延迟或复制积压也会加剧这个问题。如果主从之间的网络出现抖动，复制缓冲区（repl_backlog）中的命令会积压，DEL 命令的到达被延迟。在极端情况下（从节点断连重连），从节点可能需要一次全量同步才能赶上主节点的状态，在全量同步完成前过期 key 的清理完全停滞。\n\n你可以通过对比主从的 `INFO keyspace` 和 `INFO memory` 来发现这种内存不一致：\n\n```bash\n# 主节点\n127.0.0.1:6379> INFO keyspace\ndb0:keys=2350000,expires=1800000,avg_ttl=900000\n\n127.0.0.1:6379> INFO memory\nused_memory_human:3.21G\n\n# 从节点——注意 keys 和 expires 都比主节点多\n127.0.0.1:6380> INFO keyspace\ndb0:keys=2520000,expires=1970000,avg_ttl=650000\n\n127.0.0.1:6380> INFO memory\nused_memory_human:3.58G\n```\n\n从节点多出了 17 万个 key（2520000 - 2350000），多占了约 370MB 内存。这些多出来的 key 就是已经在主节点被删除但 DEL 命令还没传到从节点的过期 key。\n\n### replica-lazy-expire 配置（Redis 6.0+）\n\nRedis 6.0 引入了 `replica-lazy-expire` 配置项（在 `redis.conf` 中），它的作用是让从节点在自己本地也运行过期扫描并删除过期 key，而不是完全依赖主节点的 DEL 命令。这个配置默认值是 `no`，也就是保持传统行为。当设置为 `yes` 时，从节点会在自己的 `activeExpireCycle` 中独立扫描并删除过期 key，减轻因等待主节点 DEL 而导致的内存膨胀问题。\n\n```bash\n# redis.conf\nreplica-lazy-expire yes  # 允许从节点独立清理过期 key（Redis 6.0+）\n\n# 运行时查看\n127.0.0.1:6380> CONFIG GET replica-lazy-expire\n1) \"replica-lazy-expire\"\n2) \"yes\"\n```\n\n需要注意的是，从节点独立删除过期 key 并不会通过复制流反向传播到主节点——它纯粹是从节点本地的内存清理行为。这意味着打开这个选项后，从节点的 key 数量可能暂时比主节点少（因为从节点自己删了一些 key，但主节点还没触发删除），但这不会导致数据正确性问题——那些 key 本来就过期了，客户端读到的结果是一样的。\n\n### Writable Replica 的复杂性\n\nRedis 允许通过 `replica-read-only no` 把从节点配置为可写模式。在这种配置下，客户端可以直接向从节点写入数据。这些数据不会被复制到主节点或其他从节点——它们只存在于这个可写从节点本地。如果客户端向可写从节点写入了带 TTL 的 key，这些 key 的过期删除就完全是从节点自己的事了，因为主节点根本不知道这些 key 的存在。Redis 7.0 之前在可写从节点上对这些本地 key 的过期处理存在一些边缘情况的 bug，7.0 之后做了较为完善的修复。生产环境中一般不推荐使用可写从节点，它的数据一致性语义很复杂，容易出问题。\n\n### Cluster 模式下的过期处理\n\nRedis Cluster 模式下，每个 master 节点负责一部分 slot（哈希槽，共 16384 个），每个 master 可以有自己的 replica。过期 key 的删除原则不变——仍然由每个 slot 所属的 master 节点负责删除并同步 DEL 命令给自己的 replica。区别在于 Cluster 模式下没有全局的过期扫描——每个 master 独立运行自己的 `activeExpireCycle()`，只扫描自己负责的 slot 中的 key。当发生 failover（replica 被提升为新 master）时，新 master 会接管相应 slot 的过期扫描职责，之前积压在旧 replica 上未清理的过期 key 会在新 master 的 `activeExpireCycle` 中被逐步清理。\n\nCluster 模式下一个值得注意的点是：在节点迁移 slot（`CLUSTER SETSLOT ... MIGRATING/IMPORTING`）的过程中，如果被迁移的 key 中有已过期但未清理的 key，`MIGRATE` 命令会连同过期信息一起迁移到目标节点。目标节点收到后会在自己的 `expires` 字典中注册这些过期时间，后续的过期清理由目标节点负责。\n\n## 第四步：生产环境监控与排查\n\n### 关键监控指标\n\n在生产环境中监控主从过期一致性，需要关注以下几个指标。`INFO stats` 中的 `expired_keys` 计数器记录了自启动以来该节点删除的过期 key 总数。在正常运行的主从架构中，主节点的 `expired_keys` 应该始终大于或等于从节点的——因为主节点是过期删除的发起方，从节点只是接收 DEL 命令执行删除。如果你发现从节点的 `expired_keys` 显著低于主节点，说明有大量 DEL 命令还在复制链路中排队或从节点处理不过来。\n\n```bash\n# 主节点\n127.0.0.1:6379> INFO stats | grep expired\nexpired_keys:12847593\nexpired_stale_perc:0.28\nexpired_time_cap_reached_count:12\n\n# 从节点\n127.0.0.1:6380> INFO stats | grep expired\nexpired_keys:12834201\nexpired_stale_perc:0.00\nexpired_time_cap_reached_count:0\n```\n\n主节点 `expired_keys` 是 12847593，从节点是 12834201，差了大约 13000——这是正常范围内的复制延迟。但如果差距持续增大到十万甚至百万级别，就需要排查复制链路是否有问题了。从节点的 `expired_stale_perc` 为 0 是正常的——因为从节点不运行 `activeExpireCycle` 的采样逻辑（除非开了 `replica-lazy-expire`），这个指标在从节点上没有参考意义。\n\n`INFO keyspace` 中主从 `keys` 数量的差异也是一个重要指标。前面已经演示过，从节点的 keys 比主节点多出来的部分，基本就是已过期但未收到 DEL 命令的 key。你可以把这个差值除以主节点的 keys 总量来计算一个「从节点过期积压率」，如果超过 5% 就值得关注了。\n\n另一个关键指标是 `INFO replication` 中的 `master_repl_offset` 和从节点的 `slave_repl_offset`（或 `replica_offset`）。两者之差就是复制偏移量的差距，差距越大说明从节点落后越多，DEL 命令的到达延迟就越大。结合 `lag` 字段（单位秒）可以直观判断复制延迟的严重程度。\n\n### 排查清单与实操命令\n\n当你怀疑从节点存在过期 key 积压问题时，可以用以下流程排查。首先用 `DBSIZE` 对比主从的 key 数量，确认是否存在差异。然后用 `INFO memory` 对比 `used_memory`，看内存差距是否与 key 数量差距吻合。接着用 `INFO replication` 检查复制延迟。最后如果需要精确定位哪些 key 是从节点上多出来的过期 key，可以用 `SCAN` 配合 `TTL` 在从节点上遍历：\n\n```bash\n# 在从节点上扫描所有 key，找出 TTL 已过期但仍然存在的 key\n# 注意：Redis 3.2+ 从节点上 TTL 对过期 key 返回 -2，所以这种方法需要配合 DEBUG OBJECT\n127.0.0.1:6380> SCAN 0 COUNT 1000\n1) \"23456\"\n2)  1) \"session:user1001\"\n    2) \"cache:product:5678\"\n    3) \"rate:limit:api:192.168.1.50\"\n\n# 对每个 key 检查 TTL\n127.0.0.1:6380> TTL session:user1001\n(integer) -2    # 已过期（从节点报告为不存在）\n127.0.0.1:6380> TTL cache:product:5678\n(integer) 1800  # 正常，还有 30 分钟\n```\n\n在 Redis 3.2+ 的从节点上，过期 key 通过 `GET` 读取返回 nil，通过 `TTL` 返回 -2，但通过 `DBSIZE` 和 `INFO keyspace` 仍然被计入总数。这种不一致本身就是从节点「逻辑过期但物理存在」的直接表现。\n\n### 面试高频追问与知识关联\n\n面试中如果你能把以上内容讲清楚，面试官通常会在以下几个方向继续追问。第一个方向是「如果主节点宕机了，从节点被提升为新主节点，上面那些未清理的过期 key 怎么办」——答案是新主节点启动后会正常运行 `activeExpireCycle` 和 `expireIfNeeded`，那些积压的过期 key 会通过定期删除和惰性删除逐步清理掉，不需要特殊处理。第二个方向是「能不能用 OBJECT HELP 或 DEBUG CHANGE-REPL-ID 之类的命令在从节点强制清理过期 key」——答案是正规做法不建议这样操作，应该从根源上解决问题（升级版本、优化 key 的 TTL 策略、确保复制链路健康）。第三个方向是与 Sentinel 哨兵的联动——Sentinel 在判断主节点客观下线后触发 failover，新主节点的过期清理机制自动接管，应用层不需要额外处理。\n\n这道题与 Redis 过期体系中的其他知识点紧密关联。惰性删除（`expireIfNeeded`）是主节点发现过期 key 的入口之一，定期删除（`activeExpireCycle`）是另一个入口，它们共同产生 DEL 命令喂给复制流。理解了这个机制，你就能串起 Redis 过期删除策略的完整链路：key 设置 TTL → `expires` 字典记录过期时间 → 惰性/定期删除发现过期 → 主节点执行删除 + 生成 DEL → 复制流传播到从节点 → 从节点执行 DEL → AOF 记录 DEL。这条链路上任何一环出问题，都可能导致主从数据不一致或从节点内存异常。",
+      "keyPoints": [
+        "过期 key 的删除由主节点统一负责，主节点通过 expireIfNeeded()（惰性删除）或 activeExpireCycle()（定期删除）发现过期 key 后生成 DEL 命令，经复制流同步到所有从节点",
+        "从节点的 expireIfNeeded() 检测到 key 过期后只返回过期标记不执行删除，从节点必须等待主节点的 DEL 命令才能真正从 dict 和 expires 字典中摘除 key",
+        "Redis 3.2 之前从节点对过期 key 的读操作会返回实际数据（脏读问题），3.2+ 修复后从节点对读操作返回 nil 实现逻辑过期但不物理删除",
+        "从节点不自主删除的根本原因是保证复制操作序列一致性、避免主从时钟不同步引发的数据分歧、以及维持单一命令源的状态机复制模型",
+        "主节点还未清理的过期 key 会持续占用从节点内存，可通过对比主从 INFO keyspace 的 keys 数量差异和 INFO memory 的 used_memory 差异来发现积压",
+        "Redis 6.0+ 的 replica-lazy-expire 配置允许从节点独立运行过期扫描清理过期 key，减轻因等待 DEL 同步导致的内存膨胀",
+        "Redis Cluster 模式下过期删除原则不变，每个 master 独立负责其 slot 中 key 的过期扫描与 DEL 同步，failover 后新 master 自动接管过期清理职责",
+        "监控从节点过期积压的关键指标包括 expired_keys 计数器差值、DBSIZE 差异、master_repl_offset 与 replica_offset 的偏移差距以及 replication lag"
+      ],
+      "quiz": [
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz1",
+          "question": "在 Redis 主从架构中，过期 key 的删除操作由谁发起？",
+          "choices": [
+            {"id": "A", "text": "由主节点统一发起，通过复制流向从节点发送 DEL 命令"},
+            {"id": "B", "text": "由从节点各自独立判断并删除，不需要主节点参与"},
+            {"id": "C", "text": "由 Sentinel 哨兵协调主从节点同时执行删除"},
+            {"id": "D", "text": "主从节点各自独立执行过期扫描和删除，互不干扰"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 主从复制遵循「单一命令源」原则，所有数据变更（包括过期删除）由主节点统一发起。主节点通过惰性删除（expireIfNeeded）或定期删除（activeExpireCycle）发现过期 key 后，执行删除并生成 DEL 命令通过复制流同步给所有从节点。B 和 D 选项描述的「从节点自主删除」会打破复制操作序列的一致性，在主从时钟不同步时导致数据分歧。C 选项中 Sentinel 的职责是监控节点健康和执行故障转移，不参与数据层面的过期删除。"
+        },
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz2",
+          "question": "Redis 从节点的 expireIfNeeded() 函数在发现 key 已过期时，具体做了什么？",
+          "choices": [
+            {"id": "A", "text": "调用 dbSyncDelete() 同步删除 key 并向主节点发送确认"},
+            {"id": "B", "text": "返回过期标记（返回值 1）但不执行实际的删除操作，让读操作返回 nil"},
+            {"id": "C", "text": "将过期 key 加入一个待删除队列，等空闲时批量删除"},
+            {"id": "D", "text": "直接忽略过期状态，像正常 key 一样返回数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 Redis 3.2+ 的源码中，expireIfNeeded() 检测到 server.masterhost 不为 NULL（即当前为从节点）时，跳过所有删除操作（不调用 dbSyncDelete/dbAsyncDelete、不调用 propagateExpire、不递增 expired_keys 计数器），只返回 1 告诉调用者 key 已过期。上层 lookupKeyRead() 收到返回值 1 后返回 NULL，让 GET 等读命令返回 nil。A 选项描述的从节点主动删除并反向通知主节点在 Redis 中不存在。D 选项描述的是 Redis 3.2 之前的旧行为（脏读问题），已被修复。"
+        },
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz3",
+          "question": "Redis 3.2 之前的从节点存在什么著名问题？",
+          "choices": [
+            {"id": "A", "text": "从节点无法接收主节点的 RDB 文件，全量同步必定失败"},
+            {"id": "B", "text": "从节点读取已过期的 key 时会返回实际数据而非 nil，导致脏读"},
+            {"id": "C", "text": "从节点会自主删除过期 key，导致与主节点数据不一致"},
+            {"id": "D", "text": "从节点不支持 TTL 命令，无法查看 key 的剩余存活时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 3.2 之前，从节点的 expireIfNeeded() 不做任何过期检查，对已过期的 key 像正常 key 一样返回数据。在读写分离架构中，客户端从从节点读取数据时会读到已经在主节点上过期的脏数据——比如过期的 session、失效的缓存值。这是 Redis 社区广泛讨论的一个 bug/设计缺陷，由 PR #1768 在 Redis 3.2 中修复。修复方案是让从节点在检测到过期后返回 nil（逻辑过期），但不执行物理删除。A、C、D 选项描述的问题在 Redis 中不存在。"
+        },
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz4",
+          "question": "为什么 Redis 设计上不让从节点自主删除过期 key？以下哪个不是核心原因？",
+          "choices": [
+            {"id": "A", "text": "从节点自主删除会打破复制操作序列的一致性"},
+            {"id": "B", "text": "主从时钟可能不同步，各自判断过期时间会导致数据分歧"},
+            {"id": "C", "text": "从节点没有 expires 字典，无法判断 key 是否过期"},
+            {"id": "D", "text": "保持单一命令源的状态机复制模型，简化正确性保证"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "从节点在全量同步时会完整接收主节点的数据，包括 expires 字典中的所有过期时间信息。从节点完全有能力判断 key 是否过期——事实上 Redis 3.2+ 从节点的 expireIfNeeded() 就是这么做的，只是判断后不执行删除。C 选项的前提「从节点没有 expires 字典」是错误的。A、B、D 都是真正的原因：A 说的是操作序列一致性，B 说的是时钟同步问题（NTP 偏差可达秒级），D 说的是复制模型的设计简洁性。"
+        },
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz5",
+          "question": "以下是一组主从节点的 INFO keyspace 输出：\n主节点：db0:keys=1000000,expires=700000,avg_ttl=600000\n从节点：db0:keys=1085000,expires=785000,avg_ttl=350000\n这说明什么？",
+          "choices": [
+            {"id": "A", "text": "从节点有约 85000 个已过期但未被主节点 DEL 命令清理的 key 积压在内存中"},
+            {"id": "B", "text": "从节点写入了 85000 个主节点没有的本地数据"},
+            {"id": "C", "text": "主节点丢失了 85000 个 key，数据已损坏"},
+            {"id": "D", "text": "数据完全正常，主从 key 数量允许有任意差异"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "从节点比主节点多出 85000 个 key（1085000 - 1000000），且多出的 key 几乎全部在 expires 中（785000 - 700000 = 85000）。这是典型的从节点过期 key 积压现象：主节点已经通过惰性/定期删除清理了这些过期 key，但 DEL 命令还没全部传到从节点。从节点的 avg_ttl 比主节点低（350000 < 600000）也印证了这一点——从节点上有大量 TTL 已过或即将到期的 key 拉低了平均值。B 选项描述的场景需要 replica-read-only no 才可能，且默认不会出现。D 选项忽视了正常主从应该高度一致的事实。"
+        },
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz6",
+          "question": "在 Redis 3.2+ 的从节点上执行 DBSIZE，对于已过期但未被主节点 DEL 清理的 key，返回的数量中是否包含这些 key？",
+          "choices": [
+            {"id": "A", "text": "不包含，DBSIZE 会自动过滤已过期的 key"},
+            {"id": "B", "text": "包含，DBSIZE 直接返回 dict 字典的总 key 数量，不做过期检查"},
+            {"id": "C", "text": "取决于配置，开启 lazyfree-lazy-expire 后不包含"},
+            {"id": "D", "text": "包含一半，DBSIZE 会对一半 key 做过期检查"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "DBSIZE 命令的实现非常简单——它直接返回 db->dict 字典的 dictSize()，即所有 key 的数量，不会对每个 key 调用 expireIfNeeded() 做过期检查。这意味着从节点上那些已过期但物理上还存在的 key 会被计入 DBSIZE 的返回值。这就是为什么在从节点上你可能看到 GET 返回 nil 但 DBSIZE 报告还有 key 的矛盾现象。这个行为在主节点上也存在——主节点上惰性删除/定期删除还没清理到的过期 key 同样会被 DBSIZE 计入。SCAN 系列命令则不同，它会对遍历到的每个 key 调用 expireIfNeeded()。"
+        },
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz7",
+          "question": "Redis 6.0 引入的 replica-lazy-expire 配置设置为 yes 时，以下哪种描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "从节点会独立运行过期扫描清理过期 key，但删除操作不会反向传播到主节点"},
+            {"id": "B", "text": "从节点的过期删除会通过复制流反向同步到主节点"},
+            {"id": "C", "text": "从节点完全禁用过期机制，所有 key 永不过期"},
+            {"id": "D", "text": "从节点改为使用定时器精确删除，不再依赖随机采样"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "replica-lazy-expire 设置为 yes 时，从节点会在本地独立运行 activeExpireCycle 过期扫描，发现过期 key 后直接在本地删除以释放内存。这个删除操作是纯本地行为，不会通过复制流反向传播到主节点——Redis 的复制流是单向的（master → replica），从节点不能向主节点发送写命令。这个功能的目的是解决从节点因等待 DEL 同步而导致的内存膨胀问题。B 选项描述的反向复制在 Redis 中不存在。D 选项描述的定时器精确删除不是 Redis 的过期实现方式。"
+        },
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz8",
+          "question": "生产环境中发现从节点 used_memory 比主节点高出 20%，但业务数据量相同，最可能的原因和排查方向是？",
+          "choices": [
+            {"id": "A", "text": "从节点积压了大量未清理的过期 key，应对比主从 DBSIZE、expired_keys 计数器和 replication lag"},
+            {"id": "B", "text": "从节点的 jemalloc 分配器版本不同导致内存碎片率差异，与过期 key 无关"},
+            {"id": "C", "text": "主节点开启了内存压缩而从节点没有，需要同步配置"},
+            {"id": "D", "text": "从节点的 output buffer 积压了大量待发送给客户端的数据"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "从节点 used_memory 比主节点高出 20% 且业务数据量相同，最常见的原因就是从节点积压了大量已过期但未收到 DEL 命令的 key。排查步骤是：首先 DBSIZE 对比主从 key 数量差异，然后 INFO stats 对比 expired_keys 计数器差值，再 INFO replication 检查 replication lag 和偏移量差距。如果确认是过期积压，可以考虑升级到 Redis 6.0+ 并开启 replica-lazy-expire。B 选项的内存碎片确实可能导致差异但通常不会到 20%。C 选项中 Redis 没有「内存压缩」配置。D 选项中 output buffer 积压一般是客户端慢消费引起的，不会达到 20% 差距。"
+        },
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz9",
+          "question": "在 Redis Cluster 模式下，某个 master 节点宕机，其 replica 被提升为新 master 后，原来积压在这个 replica 上的过期 key 会怎么处理？",
+          "choices": [
+            {"id": "A", "text": "需要手动执行 FLUSHDB 清理过期 key 后才能正常服务"},
+            {"id": "B", "text": "新 master 会自动运行 activeExpireCycle 和 expireIfNeeded，逐步清理积压的过期 key"},
+            {"id": "C", "text": "过期 key 会永远留在内存中，因为原来的 DEL 命令已经丢失"},
+            {"id": "D", "text": "Sentinel 会向新 master 补发所有缺失的 DEL 命令"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 replica 被提升为新 master 后，它的 server.masterhost 被清空，变成一个完整功能的主节点。此时它会正常运行 activeExpireCycle（定期删除）和 expireIfNeeded（惰性删除），自主发现并删除过期 key。原来积压的过期 key 会在后续的定期删除扫描中被逐步清理——不需要原 master 的 DEL 命令，因为新 master 自己可以判断 key 是否过期并执行删除。A 选项的 FLUSHDB 会清除所有数据，不是正确做法。C 选项忽略了新 master 自身具备完整的过期删除能力。D 选项中 Sentinel 不负责数据层面的操作。"
+        },
+        {
+          "id": "redis-expire-repl-deletion-q1-quiz10",
+          "question": "以下哪种做法最能有效缓解从节点因过期 key 积压导致的内存膨胀问题？",
+          "choices": [
+            {"id": "A", "text": "降低主节点的 hz 参数值（如从 10 改为 1），让 activeExpireCycle 运行更少以减轻主节点负担"},
+            {"id": "B", "text": "在业务层将大量同时过期的 key 打散到不同时间点（如 TTL 加随机偏移），并升级到 Redis 6.0+ 开启 replica-lazy-expire"},
+            {"id": "C", "text": "在从节点上定期手动执行 DEL 命令删除已过期的 key"},
+            {"id": "D", "text": "关闭从节点的 replica-read-only 配置，让从节点自行处理所有过期逻辑"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "从节点过期积压的根本原因有两个：主节点清理不够快导致 DEL 生成慢，以及复制链路延迟导致 DEL 到达晚。B 选项从两个层面解决——业务层给 TTL 加随机偏移（比如 TTL=3600+random(0,300)）避免大量 key 同一时刻过期造成 activeExpireCycle 清理不过来，同时升级 Redis 6.0+ 开启 replica-lazy-expire 让从节点自行清理。A 选项降低 hz 会让定期删除频率更低，反而加重积压。C 选项在默认 replica-read-only=yes 时不可行，即使关闭只读手动删除也会造成主从数据序列不一致。D 选项关闭只读不会自动启用过期删除逻辑，反而带来数据一致性风险。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/replication/",
+        "https://github.com/redis/redis/pull/1768",
+        "https://github.com/redis/redis/blob/7.2/src/db.c",
+        "https://redis.io/docs/latest/commands/expire/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/"
+      ]
+    }
+  ]
+}
