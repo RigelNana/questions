@@ -1,0 +1,165 @@
+{
+  "id": "redis-repl-diskless",
+  "name": "无盘复制的原理与配置",
+  "domain": "redis",
+  "description": "深入解析 Redis 无盘复制（Diskless Replication）的原理、Master 端 repl-diskless-sync 与 Replica 端 repl-diskless-load 的三种模式、适用场景判断与生产配置实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-repl-diskless-q1",
+      "domain": "redis",
+      "type": "concept",
+      "difficulty": 3,
+      "tags": [
+        "无盘复制",
+        "repl-diskless-sync",
+        "repl-diskless-load",
+        "socket传输",
+        "RDB",
+        "fork",
+        "redis-replication"
+      ],
+      "title": "Redis 的无盘复制是怎么工作的？和传统复制比有什么优势？",
+      "content": "面试问到 Redis 主从复制的全量同步，大多数人都能答出「Master 执行 BGSAVE 生成 RDB，然后把 RDB 文件传给 Replica」。但如果面试官追问一句：「BGSAVE 生成的 RDB 文件一定要先落盘吗？有没有办法跳过磁盘直接传？」——很多人就卡住了。\n\n传统全量复制的数据流路径是这样的：Master fork 子进程 → 子进程将内存数据序列化写入磁盘上的 `dump.rdb` → Master 主进程从磁盘读取 RDB 文件 → 通过网络发送给 Replica → Replica 将 RDB 写入本地磁盘 → Replica 从磁盘加载 RDB 到内存。数据经历了「内存 → 磁盘 → 网络 → 磁盘 → 内存」五次搬运，其中两次磁盘 IO 在很多场景下就是瓶颈所在。\n\n考虑这样一个真实场景：你在云上跑 Redis，用的是标准 SSD 云盘，顺序写大约 200MB/s。一个 12GB 数据的 Master，RDB 经过 LZF 压缩后约 4GB。光是把 RDB 写到磁盘就要 20 秒，从磁盘读出来再发送又要 20 秒——磁盘 IO 占了全量复制总耗时的近一半。而如果你的实例跑在万兆网卡（约 1.1GB/s 实际吞吐）上，同样 4GB 的 RDB 通过网络只需要不到 4 秒。磁盘成了明显的短板。\n\n```bash\n# 一次传统全量复制的 INFO replication 输出\n127.0.0.1:6379> INFO replication\n# Replication\nrole:master\nconnected_slaves:2\nslave0:ip=10.0.1.2,port=6379,state=send_bulk,offset=0,lag=5\nslave1:ip=10.0.1.3,port=6379,state=wait_bgsave,offset=0,lag=0\nmaster_replid:d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3\nmaster_repl_offset:1587342\nrepl_backlog_active:1\nrepl_backlog_size:268435456\n```\n\n注意 `slave1` 的 `state=wait_bgsave`——它正在排队等 BGSAVE 完成。在传统 disk-backed 模式下，Master 可以复用同一份 RDB 文件发给多个 Replica；但如果我们能绕过磁盘呢？无盘复制（Diskless Replication）就是 Redis 给出的答案。\n\n那么问题来了：无盘复制的数据流到底是怎样的？Master 端的 `repl-diskless-sync` 和 Replica 端的 `repl-diskless-load` 分别解决什么问题？`repl-diskless-sync-delay` 这个 5 秒的等待窗口是做什么用的？Replica 端的 `swapdb` 模式怎么做到加载 RDB 期间不中断读服务？什么场景该开无盘复制，什么场景反而不该开？",
+      "answer": "## Redis 主从复制基础回顾\n\nRedis 的主从复制（Replication）是整个高可用体系的基石。无论是 Sentinel 还是 Cluster，底层都依赖主从复制来做数据冗余和故障转移。复制的核心思路很简单：Replica 连接到 Master 后，Master 把全部数据同步过去（全量复制），之后 Master 每执行一条写命令都实时传播给 Replica（增量复制）。建立复制关系只需要一条命令：\n\n```bash\n# 在 Replica 端执行\n127.0.0.1:6380> REPLICAOF 10.0.1.1 6379\nOK\n# Redis 5.0 之前用 SLAVEOF，5.0+ 改名为 REPLICAOF，旧命令仍兼容\n```\n\n全量复制的触发场景有几种：Replica 首次连接 Master 时发送 `PSYNC ? -1` 必然触发；Replica 断线重连后如果 offset 不在 replication backlog 范围内也会退化为全量；故障转移导致 Replication ID 不匹配同样会触发。无论哪种情况，全量复制的核心动作都是一样的——Master 要把内存中的全部数据打包成 RDB 格式发给 Replica。问题在于，这个「打包并发送」的过程中间要不要经过磁盘，由此引出了两种模式的根本分歧。\n\n## 传统全量复制的磁盘瓶颈\n\n在默认的 disk-backed 模式下，全量复制的数据要经过五次搬运。Master fork 一个子进程，子进程遍历 Redis 的全部 keyspace，把每个 key-value 按 RDB 格式序列化后写入磁盘上的 `dump.rdb` 文件。等子进程写完之后，Master 主进程再从磁盘读取这个 RDB 文件，通过 TCP socket 发送给 Replica。Replica 收到数据后先写入本地磁盘的一个临时 RDB 文件，写完之后再从磁盘加载到内存。整条链路可以画成：\n\n```\n传统 disk-backed 全量复制数据流：\n\nMaster 内存 → [fork 子进程序列化] → Master 磁盘(dump.rdb)\n                                         ↓\n                                   [主进程读磁盘]\n                                         ↓\n                                     TCP socket\n                                         ↓\n                               Replica 磁盘(temp-rdb)\n                                         ↓\n                               [Replica 读磁盘加载]\n                                         ↓\n                                   Replica 内存\n```\n\n这条链路中有两个磁盘 IO 环节：Master 端写+读磁盘，Replica 端写+读磁盘。我在一个线上环境实测过这个开销——一个 15GB 数据的 Redis 实例，跑在云上配了标准 SSD（顺序读写约 200MB/s），万兆内网。RDB 经过 LZF 压缩后约 5GB。BGSAVE 子进程写磁盘耗时 25 秒，Master 从磁盘读 RDB 并发送耗时约 22 秒（磁盘读取成为瓶颈，网络传输本身只需 5 秒），Replica 端写磁盘+加载又花了 30 多秒。全量复制总耗时接近 80 秒，其中磁盘 IO 就吃掉了将近 50 秒。如果换成机械硬盘（HDD），情况更加恶劣——顺序读写速度可能只有 100–150MB/s，同样的数据全量复制耗时能翻倍。\n\ndisk-backed 模式有一个优势：RDB 文件写到磁盘后是一个完整的静态文件，Master 可以同时打开多个文件描述符分别发送给多个 Replica，互不干扰。也就是说一次 BGSAVE 可以服务多个 Replica 的全量复制请求。\n\n## 无盘复制的核心原理\n\nRedis 2.8.18 引入了无盘复制（Diskless Replication）。思路很直接：既然磁盘是瓶颈，那就绕过它。Master fork 子进程后，子进程不再把 RDB 写到磁盘文件，而是直接将序列化后的 RDB 字节流通过 TCP socket 发送给 Replica。数据流变成了：\n\n```\n无盘复制（Master 端）数据流：\n\nMaster 内存 → [fork 子进程序列化] → TCP socket → Replica\n                  （不经过磁盘）\n```\n\n从源码层面看（`src/rdb.c` 中的 `rdbSaveToSlavesSockets()` 函数），无盘模式下 fork 出的子进程不调用 `rdbSave()` 写文件，而是调用 `rdbSaveRioWithEOFMark()` 直接向 socket 的文件描述符写入 RDB 数据流。子进程通过管道（pipe）与父进程通信，告知传输的进度和最终状态。子进程结束后，父进程通过管道拿到退出状态，判断传输是否成功。\n\n无盘复制有一个重要的结构性差异：在 disk-backed 模式下，RDB 是一个磁盘上的完整文件，可以多次读取、多次发送。但在无盘模式下，RDB 是一个一次性的流（stream），数据序列化后直接写入 socket，没有第二次机会。这意味着如果 3 个 Replica 同时需要全量复制，无盘模式必须要么在一个 fork 子进程中同时向 3 个 socket 写数据（Redis 就是这么做的），要么为每个 Replica 各 fork 一次（开销更大，Redis 不这样做）。\n\n实际实现中，Redis 无盘复制的做法是：fork 一个子进程，这个子进程持有所有需要全量复制的 Replica 的 socket 文件描述符，然后向所有 socket 并行写入同一份 RDB 数据流。写入过程中如果某个 Replica 的 socket 出错（比如网络断开），子进程标记该 Replica 失败但继续向其他 Replica 发送，不会中断整个过程。\n\n## repl-diskless-sync 配置\n\n通过 `repl-diskless-sync` 参数控制 Master 是否启用无盘复制。Redis 6.0 及之前版本默认为 `no`，即使用传统 disk-backed 模式。从 Redis 6.2 开始，默认值改为 `yes`——Redis 官方认为无盘模式在大多数场景下已经足够稳定，可以作为默认选项了。\n\n```bash\n# redis.conf 中启用无盘复制\nrepl-diskless-sync yes\n\n# 确认当前配置\n127.0.0.1:6379> CONFIG GET repl-diskless-sync\n1) \"repl-diskless-sync\"\n2) \"yes\"\n```\n\n这个配置可以在运行时通过 `CONFIG SET repl-diskless-sync yes` 动态修改，不需要重启 Redis。修改后下一次触发全量复制时就会使用新模式。\n\n## repl-diskless-sync-delay 的等待窗口\n\n无盘模式有一个独特的问题：因为 RDB 是直接流式发送的，一次 fork 的数据只能发一次。如果 Replica A 触发了全量复制，Master 立即 fork 子进程开始发送，3 秒后 Replica B 也要求全量复制——此时 Master 不得不再 fork 一次。两次 fork 意味着两次页表复制的阻塞、两次 COW 的内存开销。\n\n为了优化这个场景，Redis 设计了 `repl-diskless-sync-delay` 参数，默认值 5 秒。当 Master 收到第一个全量复制请求时，它不会立即 fork，而是启动一个倒计时。在这 5 秒的等待窗口内，如果有更多 Replica 也发来全量复制请求，它们会被加入等待列表。5 秒倒计时结束后，Master 执行一次 fork，子进程同时向等待列表中的所有 Replica 发送 RDB 数据流。\n\n```bash\n# 等待窗口配置\nrepl-diskless-sync-delay 5\n# 设置为 0 表示收到请求立即开始，不等待其他 Replica\n# 生产环境中如果 Replica 数量较多，可以适当增大到 10-15 秒\n```\n\n这个设计的核心思想是「攒批」——用少量的等待延迟换取更少的 fork 次数。在实际场景中，多个 Replica 同时触发全量复制往往发生在 Master 重启或故障转移之后，这时候所有 Replica 几乎同时重连，5 秒的延迟足以等到大多数 Replica。不过要注意一点：在等待窗口期间，已经排队的 Replica 还不能开始加载数据，它们的 `master_sync_in_progress` 会保持为 1 但实际上还在等待。\n\n设置为 0 可以禁用这个等待，收到请求立即开始传输。这在只有一个 Replica 的简单架构下是合理的，没必要等。\n\n## Replica 端无盘加载：repl-diskless-load\n\nMaster 端的无盘复制解决了「Master 写磁盘」的瓶颈，但传统模式下 Replica 收到 RDB 数据后仍然是先写磁盘再加载。Redis 6.0 引入了 `repl-diskless-load` 参数，让 Replica 端也可以跳过磁盘，直接从 socket 流中解析并加载 RDB 数据到内存。\n\n这个参数有三个可选值，每个值代表不同的安全性和可用性权衡：\n\n**`disabled`（默认值）**：Replica 收到 RDB 数据后先写入本地磁盘的临时文件，写完后再从磁盘加载到内存。这是最安全的模式——如果加载过程中出错（比如 RDB 数据损坏），Replica 还保留着之前的数据，可以重新尝试同步。但代价是多了一次完整的磁盘读写。\n\n**`on-empty-db`**：只有当 Replica 当前的数据库是空的时候，才使用无盘加载。逻辑是这样的——如果 Replica 本身没有数据，加载失败也没什么损失（反正本来就是空的），所以可以冒险直接从 socket 流加载；但如果 Replica 已经有数据在服务读请求，直接从 socket 加载意味着要先 `FLUSHALL` 清空数据再开始，一旦加载中途失败，Replica 就彻底没数据了，既丢了旧数据又没拿到新数据。这个模式适合 Replica 首次同步的场景。\n\n**`swapdb`**：这是最激进也是最精巧的模式。Replica 不清空当前数据库，而是在内存中创建一个全新的临时数据库，将 RDB 数据流直接解析加载到这个临时库中。加载期间旧数据库继续正常服务读请求——也就是说 Replica 在全量复制期间不会中断读服务。等新数据库完全加载完成后，Replica 执行一次原子性的数据库切换（swap），用新库替换旧库。\n\n```bash\n# Replica 端配置无盘加载\nrepl-diskless-load swapdb\n\n# 启用后 Replica 的 INFO replication 中可以观察到\n127.0.0.1:6380> INFO replication\nrole:slave\nmaster_host:10.0.1.1\nmaster_port:6379\nmaster_link_status:up\nmaster_sync_in_progress:1\nmaster_sync_perc:67\nmaster_sync_left_bytes:1342177280\n# master_sync_perc 显示加载进度，swapdb 模式下此时旧数据仍可读\n```\n\nswapdb 模式的代价是内存：加载期间需要同时在内存中保存新旧两份数据。如果 Redis 实例有 10GB 数据，swapdb 过程中峰值内存可能达到 20GB。如果机器内存不够，系统触发 OOM Killer 会直接杀掉 Redis 进程。所以使用 swapdb 模式时，要确保机器的可用内存至少是 Redis 数据量的 2.5 倍（留一些余量给操作系统和其他进程）。\n\n## 适用场景分析\n\n无盘复制不是万能的，它的收益取决于磁盘和网络的相对速度。核心判断标准很简单：如果你的磁盘比网络慢，开无盘复制；如果网络比磁盘慢，不开。\n\n最适合无盘复制的场景是：云环境下使用标准 SSD 或网络存储（如 EBS），磁盘 IOPS 和吞吐有限，但内网带宽充足（万兆甚至更高）。在这种环境下，磁盘读写 200MB/s 对比网络 1.1GB/s，无盘模式能让全量复制耗时缩短 30%–50%。\n\n不适合开无盘复制的场景是：Master 挂载了 NVMe SSD（顺序读写 3GB/s 以上），但网络只有千兆（约 110MB/s）。这种情况下磁盘不是瓶颈，网络才是。开无盘复制没有收益，反而失去了 disk-backed 模式「RDB 文件可以复用」的优势——如果后续又有新 Replica 需要全量复制，disk-backed 模式可以直接发送磁盘上已有的 RDB 文件，不需要再次 fork。\n\n另一个需要考虑的因素是 Replica 数量。disk-backed 模式下，一次 BGSAVE 生成的 RDB 文件可以反复读取发送给任意数量的 Replica，顺序到达的 Replica 可以复用已有的 RDB 文件。无盘模式下所有 Replica 必须在同一个 delay 窗口内到齐，错过窗口的 Replica 需要等下一次 fork。如果你的架构有大量 Replica（比如 10 个以上）且不太可能同时触发全量复制，disk-backed 模式反而更灵活。\n\n## 生产环境配置与观察\n\n一份完整的无盘复制生产配置如下：\n\n```bash\n# ===== Master 端 redis.conf =====\n# 启用无盘复制\nrepl-diskless-sync yes\n# 等待 5 秒攒批（多 Replica 场景可增大到 10-15）\nrepl-diskless-sync-delay 5\n# 复制积压缓冲区，至少 256MB\nrepl-backlog-size 256mb\n# 复制超时，大数据量实例适当增大\nrepl-timeout 120\n# Replica 输出缓冲区限制，防止全量复制期间被断开\nclient-output-buffer-limit replica 512mb 128mb 120\n\n# ===== Replica 端 redis.conf =====\n# 无盘加载（内存充足时推荐 swapdb）\nrepl-diskless-load swapdb\n# 连接 Master\nreplicaof 10.0.1.1 6379\nmasterauth your_password\n# Replica 只读\nreplica-read-only yes\n# 懒删除，减少 FLUSHALL 阻塞（Redis 6.0+）\nreplica-lazy-flush yes\n```\n\n配置完成后，通过 `INFO replication` 观察复制状态：\n\n```bash\n# Master 端 — 全量复制进行中\n127.0.0.1:6379> INFO replication\nrole:master\nconnected_slaves:2\nslave0:ip=10.0.1.2,port=6379,state=online,offset=1587342,lag=0\nslave1:ip=10.0.1.3,port=6379,state=send_bulk,offset=0,lag=2\nmaster_replid:d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3\nmaster_repl_offset:1587342\n\n# state=send_bulk 说明正在发送 RDB 数据流（无盘模式下直接通过 socket）\n# state=online 说明 slave0 已完成同步，在正常增量复制中\n\n# 监控全量复制次数\n127.0.0.1:6379> INFO stats | grep sync\nsync_full:3\nsync_partial_ok:127\nsync_partial_err:2\n# sync_full 是全量复制次数，正常运行后不应持续增长\n# sync_partial_err 是部分复制失败退化为全量的次数\n```\n\n一个容易被忽略的监控指标是 `master_sync_perc`（在 Replica 端可见），它显示当前全量复制的进度百分比。在 swapdb 模式下你可以通过这个指标预估切换时间，提前做好客户端流量调度。\n\n## 常见坑点与避坑指南\n\n第一个坑是 swapdb 模式下的内存不足。很多人开了 `repl-diskless-load swapdb` 但没有给机器留够内存。全量复制触发时新旧数据并存，内存直接翻倍，OOM Killer 一刀切掉 Redis 进程。解决方案是设置 `maxmemory` 不超过物理内存的 40%（给 swapdb 期间的双倍数据、COW、以及操作系统留足空间），或者在内存吃紧时退回到 `disabled` 或 `on-empty-db` 模式。\n\n第二个坑是 delay 窗口设置不当。`repl-diskless-sync-delay` 设太小（比如 0），多个 Replica 先后到达时每个都会触发一次 fork，失去了攒批的意义；设太大（比如 60 秒），第一个到达的 Replica 要白等 60 秒才能开始同步，全量复制的总耗时反而变长了。实际经验是 5–10 秒对大多数场景够用，除非你有超过 10 个 Replica 且重连时间差距较大，才需要设更大。\n\n第三个坑是无盘模式下的传输失败处理。disk-backed 模式下如果 RDB 传输中途失败，Master 磁盘上还有完整的 RDB 文件，Replica 重连后可以直接重发不需要再次 fork。但无盘模式下 RDB 数据是一次性流，传输失败后只能重新 fork 生成。如果你的网络不稳定、经常出现 Replica 断线重连，无盘模式会导致更频繁的 fork 操作，反而增加了 Master 的负担。\n\n## 面试要点总结\n\n面试官问无盘复制时的高频追问方向包括：无盘复制跳过了哪些 IO 操作（Master 端磁盘写+读，Replica 端磁盘写+读）、`repl-diskless-sync-delay` 的攒批设计思想、swapdb 模式的原子切换原理和内存代价、以及什么场景下不该用无盘复制（磁盘快+网络慢的场景）。还有一个进阶问题是 Redis 6.2 为什么把 `repl-diskless-sync` 的默认值从 `no` 改成了 `yes`——答案是随着云计算普及，大部分生产环境的网络带宽已经远超磁盘吞吐，无盘模式在主流部署场景下已经是更优选择。",
+      "keyPoints": [
+        "传统 disk-backed 全量复制数据流经过「内存→Master 磁盘→网络→Replica 磁盘→内存」五次搬运，两次磁盘 IO 在 SSD 或 HDD 场景下占全量复制总耗时的 30%–50%",
+        "无盘复制（repl-diskless-sync）让 Master fork 的子进程跳过磁盘，直接将 RDB 字节流通过 socket 发送给 Replica，Redis 2.8.18 引入，Redis 6.2 起默认启用",
+        "repl-diskless-sync-delay 默认 5 秒，作用是攒批等待更多 Replica 加入后一次 fork 同时向所有 Replica 发送 RDB 流，避免多次 fork 的 CPU 和内存开销",
+        "Replica 端 repl-diskless-load 有三种模式：disabled（先写磁盘再加载，最安全）、on-empty-db（空库时直接从 socket 加载）、swapdb（加载到临时库后原子切换，不中断读服务）",
+        "swapdb 模式在加载期间需要同时保存新旧两份数据，峰值内存约为正常的 2 倍，必须确保机器物理内存充足以避免 OOM",
+        "无盘复制适用于「磁盘慢+网络快」的场景（如云 SSD + 万兆内网），在「磁盘快+网络慢」场景下（NVMe + 千兆网络）disk-backed 模式反而更优",
+        "无盘模式下 RDB 是一次性流不可重发，传输失败后必须重新 fork，网络不稳定时会导致更频繁的 fork 操作",
+        "监控 INFO stats 中的 sync_full 和 sync_partial_err 指标可判断全量复制是否频繁发生，Replica 端的 master_sync_perc 可追踪加载进度"
+      ],
+      "quiz": [
+        {
+          "id": "redis-repl-diskless-q1-quiz-01",
+          "question": "传统 disk-backed 全量复制中，RDB 数据从 Master 到 Replica 的完整路径是什么？",
+          "choices": [
+            {"id": "A", "text": "Master 内存 → Master 磁盘 → 网络 → Replica 磁盘 → Replica 内存"},
+            {"id": "B", "text": "Master 内存 → 网络 → Replica 内存（直接内存到内存传输）"},
+            {"id": "C", "text": "Master 内存 → Master 磁盘 → 网络 → Replica 内存（Replica 不写磁盘）"},
+            {"id": "D", "text": "Master 内存 → 网络 → Replica 磁盘 → Replica 内存（Master 不写磁盘）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "传统 disk-backed 模式下，数据经过五次搬运：Master fork 子进程将内存数据序列化写入磁盘上的 dump.rdb（Master 内存→Master 磁盘），然后主进程从磁盘读取 RDB 文件通过网络发送（Master 磁盘→网络），Replica 收到后写入本地磁盘的临时文件（网络→Replica 磁盘），最后从磁盘加载到内存（Replica 磁盘→Replica 内存）。B 选项描述的跳过所有磁盘是无盘复制在 Master 和 Replica 两端都开启时的效果，不是传统模式。C 和 D 各只跳过了一端的磁盘操作，分别对应只在 Replica 端或只在 Master 端开启无盘的场景。"
+        },
+        {
+          "id": "redis-repl-diskless-q1-quiz-02",
+          "question": "repl-diskless-sync 参数在哪个 Redis 版本开始默认为 yes？",
+          "choices": [
+            {"id": "A", "text": "Redis 2.8.18（无盘复制首次引入时就默认开启）"},
+            {"id": "B", "text": "Redis 5.0（与 REPLICAOF 命令一起引入）"},
+            {"id": "C", "text": "Redis 6.2（官方认为无盘模式在主流场景下已足够稳定）"},
+            {"id": "D", "text": "Redis 7.0（与 repl-diskless-load 的 swapdb 模式一起默认开启）"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 2.8.18 引入了无盘复制功能，但当时默认为 no，因为这是一个实验性特性。Redis 5.0 虽然做了很多改进（如 REPLICAOF 命令更名），但 repl-diskless-sync 仍然默认关闭。直到 Redis 6.2，官方经过多个版本的稳定性验证，认为无盘模式在绝大多数场景下表现良好，才将默认值改为 yes。Redis 7.0 确实引入了更多复制相关改进，但默认值的变更发生在 6.2。选 A 的常见误区是认为功能引入就等于默认启用。"
+        },
+        {
+          "id": "redis-repl-diskless-q1-quiz-03",
+          "question": "repl-diskless-sync-delay 默认 5 秒的设计目的是什么？",
+          "choices": [
+            {"id": "A", "text": "给 Master 足够时间完成 BGSAVE 操作"},
+            {"id": "B", "text": "等待更多 Replica 的全量复制请求到达，一次 fork 同时服务多个 Replica"},
+            {"id": "C", "text": "限制全量复制的频率，防止 Replica 频繁触发 BGSAVE"},
+            {"id": "D", "text": "给 Replica 时间清空旧数据，为接收 RDB 做准备"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "repl-diskless-sync-delay 的核心目的是「攒批」。无盘模式下 RDB 是一次性的流式传输，一次 fork 的数据只能发送一次。如果 Replica 逐个到达，每个都立即触发 fork，Master 要承受多次 fork 带来的页表复制阻塞和 COW 内存开销。通过设置 5 秒的等待窗口，Master 在收到第一个全量复制请求后等待 5 秒，收集这段时间内到达的所有 Replica 请求，然后只 fork 一次同时向所有等待中的 Replica 发送 RDB 流。这个场景典型发生在 Master 重启后所有 Replica 几乎同时重连的时候。A、C、D 的描述都不是 delay 参数的实际用途。"
+        },
+        {
+          "id": "redis-repl-diskless-q1-quiz-04",
+          "question": "无盘复制模式下，Master fork 的子进程是如何处理多个 Replica 的？",
+          "choices": [
+            {"id": "A", "text": "为每个 Replica 各 fork 一个独立的子进程，分别序列化和发送"},
+            {"id": "B", "text": "子进程将 RDB 写入共享内存，多个 Replica 各自从共享内存中读取"},
+            {"id": "C", "text": "一个子进程持有所有等待中 Replica 的 socket 描述符，同时向所有 socket 写入同一份 RDB 数据流"},
+            {"id": "D", "text": "子进程将 RDB 写入管道，Master 主进程从管道读取后分别转发给各个 Replica"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 无盘复制的实现是由一个 fork 子进程持有所有需要全量复制的 Replica 的 socket 文件描述符，然后遍历 keyspace 序列化 RDB 数据并同时写入所有 socket。这样只需要一次 fork、一次内存遍历就能服务所有 Replica。如果某个 Replica 的 socket 在传输过程中出错，子进程标记该 Replica 失败但继续向其他 Replica 发送，不中断整体流程。A 选项（每个 Replica 一个子进程）开销太大且 Redis 不这么做。B 选项的共享内存方案不是 Redis 的实现方式。D 选项描述的管道确实用于子进程和父进程通信传递状态，但不是用来传输 RDB 数据的。"
+        },
+        {
+          "id": "redis-repl-diskless-q1-quiz-05",
+          "question": "以下 INFO stats 输出表明 Redis 正在经历什么问题？\n\n```\nsync_full:47\nsync_partial_ok:12\nsync_partial_err:35\n```",
+          "choices": [
+            {"id": "A", "text": "系统运行正常，全量复制和部分复制比例合理"},
+            {"id": "B", "text": "replication backlog 太小，大量部分复制请求失败退化为全量复制"},
+            {"id": "C", "text": "Replica 数量过多，Master 无法处理全量复制请求"},
+            {"id": "D", "text": "网络延迟过高，导致 RDB 传输超时被反复中断"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这组指标需要关联分析。sync_partial_err = 35 表示有 35 次部分复制请求失败了——Replica 带着 offset 来请求增量同步，但 Master 发现 offset 已经不在 backlog 范围内，不得不退化为全量复制。加上首次连接必然触发的全量复制（sync_full 的一部分），总共 47 次全量复制中有 35 次是本可避免的。这是 repl-backlog-size 配置过小的典型症状——默认仅 1MB 的 backlog 在写入量稍大的场景下几秒就被写满，Replica 稍微断线重连就无法做增量同步。解决方案是将 repl-backlog-size 增大到 256MB 甚至更高。C 和 D 虽然也可能导致全量复制，但不会表现为 sync_partial_err 这么高。"
+        },
+        {
+          "id": "redis-repl-diskless-q1-quiz-06",
+          "question": "Replica 端配置 repl-diskless-load swapdb 后，以下哪种说法是错误的？",
+          "choices": [
+            {"id": "A", "text": "全量复制加载 RDB 期间，Replica 仍可用旧数据正常服务读请求"},
+            {"id": "B", "text": "新 RDB 加载完成后，Replica 执行原子性数据库切换替换旧数据"},
+            {"id": "C", "text": "swapdb 模式不会增加额外内存开销，因为旧数据会被立即释放"},
+            {"id": "D", "text": "如果机器内存不足以容纳新旧两份数据，可能触发 OOM Killer 杀掉 Redis 进程"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "C 是错误的说法。swapdb 模式的核心机制是在内存中同时维护新旧两个数据库——旧数据库继续服务读请求，新数据库在后台从 socket 流中加载 RDB 数据。这意味着在加载期间，Replica 的内存使用量接近正常时的两倍。如果一个 10GB 的 Redis 实例使用 swapdb 模式，峰值内存可能达到 20GB。只有在新库完全加载成功并完成原子切换之后，旧数据库才会被释放。A 准确描述了 swapdb 的核心优势——加载期间不中断服务。B 正确描述了切换机制。D 正确指出了内存不足的风险。使用 swapdb 时建议 maxmemory 不超过物理内存的 40%。"
+        },
+        {
+          "id": "redis-repl-diskless-q1-quiz-07",
+          "question": "在以下哪种硬件环境中，无盘复制（repl-diskless-sync yes）收益最大？",
+          "choices": [
+            {"id": "A", "text": "NVMe SSD（3GB/s）+ 千兆网卡（110MB/s）"},
+            {"id": "B", "text": "云标准 SSD（200MB/s）+ 万兆网卡（1.1GB/s）"},
+            {"id": "C", "text": "NVMe SSD（3GB/s）+ 万兆网卡（1.1GB/s）"},
+            {"id": "D", "text": "机械 HDD（100MB/s）+ 百兆网卡（12MB/s）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "无盘复制的核心价值是跳过磁盘 IO，所以只有在磁盘是瓶颈、网络有富余带宽的场景下收益才最大。B 选项中云标准 SSD 的 200MB/s 远低于万兆网卡的 1.1GB/s，磁盘是明确的短板，跳过磁盘 IO 能显著缩短全量复制耗时。A 选项中 NVMe 的 3GB/s 远快于千兆网络的 110MB/s，瓶颈在网络而非磁盘，开无盘复制几乎没有收益。C 选项磁盘和网络都很快，无盘复制有一些收益但不明显。D 选项磁盘和网络都慢，虽然磁盘比网络快一些，但网络才是最大瓶颈，无盘复制也解决不了网络传输慢的问题。"
+        },
+        {
+          "id": "redis-repl-diskless-q1-quiz-08",
+          "question": "生产环境中，一个 12GB 的 Master 配置了 repl-diskless-sync yes 和 repl-diskless-load swapdb，有 3 个 Replica。Master 重启后所有 Replica 同时重连触发全量复制。为防止问题，以下哪项配置最关键？",
+          "choices": [
+            {"id": "A", "text": "将 repl-diskless-sync-delay 设为 0，让 Replica 尽快开始同步"},
+            {"id": "B", "text": "确保每台 Replica 机器有至少 30GB 的可用物理内存"},
+            {"id": "C", "text": "将 repl-backlog-size 设为 1MB 以节省 Master 内存"},
+            {"id": "D", "text": "将 repl-timeout 设为 10 秒以快速检测失败的 Replica"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这个场景中 swapdb 模式是最大的内存风险点。12GB 的 Redis 数据在 swapdb 加载期间需要同时保存新旧两份，峰值约 24GB，加上 COW 和操作系统开销，每台 Replica 至少需要 30GB 的可用物理内存才安全。A 选项恰恰相反——Master 重启后 3 个 Replica 同时重连，应该保持 delay 让一次 fork 同时服务 3 个 Replica，设为 0 会导致先到的 Replica 触发 fork 后、后到的 Replica 还要再等下一轮。C 选项 1MB 的 backlog 在 Master 重启后几乎必然导致全量复制（虽然重启后本身就需要全量），但更重要的是日常运行中会频繁触发不必要的全量复制。D 选项 10 秒的超时对大数据量实例太短，全量复制本身可能需要几十秒。"
+        },
+        {
+          "id": "redis-repl-diskless-q1-quiz-09",
+          "question": "关于 repl-diskless-load 的 on-empty-db 模式，以下哪个描述最准确？",
+          "choices": [
+            {"id": "A", "text": "无论 Replica 是否有数据，都直接从 socket 流加载 RDB，加载前先清空数据库"},
+            {"id": "B", "text": "只有当 Replica 数据库为空时才从 socket 流直接加载，有数据时退回到先写磁盘再加载的模式"},
+            {"id": "C", "text": "Replica 在空数据库中创建临时表，加载完成后与正式表交换"},
+            {"id": "D", "text": "仅在 Replica 首次启动且未加载任何持久化文件时生效"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "on-empty-db 的逻辑是一个条件判断：如果 Replica 当前所有数据库都是空的（没有任何 key），就直接从 socket 流解析 RDB 加载到内存，跳过磁盘写入；如果 Replica 已经有数据，则退回到 disabled 模式，先把 RDB 写到磁盘再加载。设计思路是——空库加载失败也没损失，可以冒险跳过磁盘；但有数据时直接从 socket 加载意味着要先 FLUSHALL 清空，如果中途失败 Replica 就彻底没数据了。A 描述的是无条件从 socket 加载，这是 swapdb 或强制模式的行为。C 描述的是 swapdb 模式的特征。D 过于局限，on-empty-db 不限于首次启动，任何时候数据库为空都适用。"
+        },
+        {
+          "id": "redis-repl-diskless-q1-quiz-10",
+          "question": "运维团队发现开启 repl-diskless-sync yes 后，全量复制反而比之前更慢了。以下哪种情况最可能是原因？",
+          "choices": [
+            {"id": "A", "text": "Master 使用 NVMe SSD 但只有千兆网络，磁盘读写远快于网络传输，无盘模式失去了磁盘缓存优势"},
+            {"id": "B", "text": "repl-diskless-sync-delay 设置过大导致 Replica 等待时间过长"},
+            {"id": "C", "text": "无盘复制不支持 LZF 压缩，导致传输的数据量比 disk-backed 模式更大"},
+            {"id": "D", "text": "无盘复制会占用 Master 的主线程进行序列化，影响了正常请求处理"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "无盘模式在「磁盘快+网络慢」的环境下不仅没有优势，还可能更慢。原因在于 disk-backed 模式下 RDB 写到磁盘后是一个完整文件，操作系统的页缓存（page cache）会缓存文件内容，后续通过网络发送时实际是从内存中读取的。NVMe SSD 的 3GB/s 速度意味着 RDB 写盘非常快，而千兆网络只有 110MB/s，网络传输才是真正瓶颈，跳过磁盘操作节省的时间微乎其微。此外 disk-backed 模式生成的 RDB 文件可以被后续到达的 Replica 复用，无盘模式做不到。B 虽然 delay 过大会增加等待时间，但不会让传输本身变慢。C 是错误的，无盘复制同样支持 RDB 压缩。D 也不对，无盘复制的序列化仍然在 fork 子进程中完成，不影响主线程。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/replication/",
+        "https://github.com/redis/redis/blob/7.2/src/rdb.c",
+        "https://github.com/redis/redis/blob/7.2/src/replication.c",
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/internals/replication/"
+      ]
+    }
+  ]
+}
