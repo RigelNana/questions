@@ -1,0 +1,157 @@
+{
+  "id": "redis-internal-hash-encoding-switch",
+  "name": "Hash 编码转换：listpack 到 hashtable",
+  "domain": "redis",
+  "description": "详解 Redis Hash 类型从 listpack/ziplist 转为 hashtable 编码的触发条件、不可逆性及生产调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-internal-hash-encoding-switch-q1",
+      "domain": "redis",
+      "type": "env-config",
+      "difficulty": 2,
+      "tags": ["Hash", "encoding", "ziplist", "listpack", "hashtable", "编码转换", "redis-internals", "配置"],
+      "title": "Hash 类型何时从 ziplist/listpack 转为 hashtable 编码？",
+      "content": "你刚接手一个 Redis 缓存集群，业务方用 Hash 类型存储用户画像数据，每个用户大约 20 个字段、每个字段值平均 30 字节。运维同事告诉你，最近有个新需求要往用户画像里加一个 `bio` 字段，内容是用户的个人简介，长度可能达到 200-500 字节。他担心这会导致 Redis 内存暴涨，让你评估一下影响。\n\n你登上 redis-cli 先看了几个现有的用户画像键：\n\n```\n127.0.0.1:6379> HLEN user:10001\n(integer) 20\n127.0.0.1:6379> OBJECT ENCODING user:10001\n\"listpack\"\n127.0.0.1:6379> MEMORY USAGE user:10001\n(integer) 856\n```\n\n当前 20 个字段的 Hash 使用 listpack 编码，单个键占用 856 字节内存。然后你模拟加入 `bio` 字段后的效果：\n\n```\n127.0.0.1:6379> HSET user:10001 bio \"这是一段大约200字节的用户个人简介文本...\"\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING user:10001\n\"hashtable\"\n127.0.0.1:6379> MEMORY USAGE user:10001\n(integer) 2456\n```\n\n加了一个字段之后，编码从 listpack 变成了 hashtable，内存从 856 字节飙升到 2456 字节——接近 3 倍。如果线上有 500 万用户画像，这意味着额外增加约 8GB 的内存消耗。\n\n你需要搞清楚：Redis Hash 的编码转换究竟在什么条件下触发？为什么加一个长字段就会导致编码变化？这个转换可以逆转吗？有没有办法在保持 listpack 编码的前提下存储更长的字段值？当前服务器的编码转换阈值配置是多少，该怎么调整？",
+      "answer": "## 第一步：Redis Hash 数据类型基础\n\nRedis 的 Hash 类型是一种键值对集合，你可以把它理解成一张小型的哈希表，嵌套在 Redis 的某个 key 下面。比如 `user:10001` 这个键对应的 Hash 里可以存 `name → \"张三\"`、`age → \"28\"`、`city → \"上海\"` 这样的字段-值对。在业务中，Hash 类型最典型的用途是存储对象属性——用户画像、商品信息、会话数据这些场景天然适合用 Hash 来建模，因为你可以只读写其中一个字段而不用序列化/反序列化整个对象。\n\n在 redis-cli 中操作 Hash 非常直观。HSET 设置字段，HGET 读取字段，HGETALL 获取所有字段和值，HDEL 删除字段，HLEN 查看字段数量：\n\n```\n127.0.0.1:6379> HSET user:10001 name \"张三\" age \"28\" city \"上海\"\n(integer) 3\n127.0.0.1:6379> HGET user:10001 name\n\"张三\"\n127.0.0.1:6379> HLEN user:10001\n(integer) 3\n127.0.0.1:6379> HGETALL user:10001\n1) \"name\"\n2) \"张三\"\n3) \"age\"\n4) \"28\"\n5) \"city\"\n6) \"上海\"\n```\n\n但 Hash 类型真正值得深挖的不是它的命令接口，而是它的底层编码策略。Redis 对外暴露的数据类型（通过 TYPE 命令看到的 hash）和底层实际使用的数据结构（通过 OBJECT ENCODING 看到的 listpack 或 hashtable）是分离的。Redis 会根据 Hash 中的数据特征自动选择最合适的底层编码方式，这就是面试中反复考到的「编码转换」话题。\n\n## 第二步：编码转换的精准深度解答\n\n### listpack 和 hashtable 两种底层编码\n\nRedis Hash 类型底层有且仅有两种编码方式：listpack（在 Redis 7.0 之前是 ziplist）和 hashtable。这两种编码在数据结构上完全不同，代表着「内存紧凑」和「查找高效」两种不同的设计取向。\n\nlistpack 是一块连续的内存区域，Hash 中的 field 和 value 交替紧凑排列在这段内存里：`[field1][value1][field2][value2]...[end]`。没有指针、没有哈希桶、没有额外的元数据开销，所有字节都在一块连续内存中。当你执行 HGET 查找一个字段时，Redis 从 listpack 的头部开始逐个遍历，每跳过两个 entry（一个 field 一个 value）就比较一次字段名。这意味着查找的时间复杂度是 O(n)，其中 n 是字段数量。但对于少量字段（比如 20 个以内），线性扫描一块连续内存的速度比你想象得快很多，因为 CPU 缓存行（cache line，通常 64 字节）可以一次加载多个 entry，不会出现指针追踪导致的缓存未命中（cache miss）。\n\nhashtable 编码使用的是 Redis 内部的 dict 结构——一个标准的链式哈希表。每个 field-value 对被封装成一个 dictEntry 节点，包含指向 key（field）和 value 的指针、指向下一个节点的 next 指针，再加上哈希桶数组本身。查找是 O(1) 的，但每个 entry 的内存开销远大于 listpack：在 64 位系统上，一个 dictEntry 至少需要 24 字节（三个指针），加上两个 redisObject 各 16 字节，再加上 SDS 字符串头部和实际数据——一个只存 `name → \"张三\"` 的 entry 可能就要吃掉 100 多字节。同样的数据在 listpack 里可能只需要十几字节。\n\n### 触发编码转换的两个条件\n\nRedis 在每次对 Hash 执行写操作（HSET、HMSET、HINCRBY 等）时，都会检查是否需要将编码从 listpack 转为 hashtable。触发条件有两个，满足任意一个就会立即转换：\n\n第一个条件是字段数量超过 `hash-max-listpack-entries` 阈值。在 Redis 7.x 中这个参数默认值是 128，意味着当 Hash 的字段数从 128 变成 129 时，编码会从 listpack 切换为 hashtable。你可以用以下实验来验证：\n\n```\n127.0.0.1:6379> CONFIG GET hash-max-listpack-entries\n1) \"hash-max-listpack-entries\"\n2) \"128\"\n\n-- 创建一个恰好 128 个字段的 Hash\n127.0.0.1:6379> EVAL \"for i=1,128 do redis.call('HSET','test:h','f'..i,'v'..i) end\" 0\n(nil)\n127.0.0.1:6379> HLEN test:h\n(integer) 128\n127.0.0.1:6379> OBJECT ENCODING test:h\n\"listpack\"\n\n-- 加入第 129 个字段\n127.0.0.1:6379> HSET test:h f129 v129\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING test:h\n\"hashtable\"\n```\n\n128 个字段时还是 listpack，第 129 个字段写入后立刻变成 hashtable。这个转换是在 HSET 命令的执行路径中同步完成的——Redis 会分配一个新的 dict 结构，把 listpack 中的所有 entry 逐个迁移过去，然后释放 listpack 的内存。\n\n第二个条件是任意一个 field 或 value 的长度超过 `hash-max-listpack-value` 阈值，默认 64 字节。这正是题目场景中发生的事情：用户画像原来的 20 个字段都不超过 64 字节，所以维持 listpack 编码。但新加入的 `bio` 字段有 200 字节，超过了阈值，触发了编码转换。实验如下：\n\n```\n127.0.0.1:6379> HSET test:val shortkey \"abc\"\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING test:val\n\"listpack\"\n\n-- 写入一个超过 64 字节的值（用 Python 生成 65 个字符的字符串）\n127.0.0.1:6379> HSET test:val longkey \"aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeefffff12345\"\n(integer) 1\n127.0.0.1:6379> STRLEN test:val longkey\n-- 假设这里恰好是 60 字节，还是 listpack\n127.0.0.1:6379> OBJECT ENCODING test:val\n\"listpack\"\n\n127.0.0.1:6379> HSET test:val longkey \"aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeefffffggggg12345\"\n(integer) 0\n127.0.0.1:6379> HSTRLEN test:val longkey\n(integer) 65\n127.0.0.1:6379> OBJECT ENCODING test:val\n\"hashtable\"\n```\n\n注意检查的是每个 field 或 value 的**单独长度**，不是所有字段的总长度。哪怕 Hash 里只有一个字段，只要那个 value 超过 64 字节就会转为 hashtable。而且 field 名本身也算——如果你的 field 名超过 64 字节（虽然实际中很少见），同样会触发转换。\n\n### 编码转换是单向不可逆的\n\n这是面试中的重点考察点：一旦 Hash 从 listpack 转为 hashtable，**即使你把字段删到只剩一个、把长值缩短到 1 字节，它也不会自动转回 listpack**。你可以用以下实验验证这个不可逆性：\n\n```\n127.0.0.1:6379> HSET test:irr f1 v1\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING test:irr\n\"listpack\"\n\n-- 写入一个长字段触发转换\n127.0.0.1:6379> HSET test:irr f2 \"aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeefffffggggg12345\"\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING test:irr\n\"hashtable\"\n\n-- 删除那个长字段\n127.0.0.1:6379> HDEL test:irr f2\n(integer) 1\n127.0.0.1:6379> HLEN test:irr\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING test:irr\n\"hashtable\"   <-- 仍然是 hashtable，没有转回来\n```\n\n为什么 Redis 不做反向转换？原因很实际：从 hashtable 转回 listpack 需要遍历整个哈希表、逐个检查字段和值的长度、重新分配连续内存块并紧凑地序列化所有 entry。这个操作的代价是 O(n)，而且涉及大量内存分配和拷贝。如果 Hash 的字段数量频繁在阈值附近波动（比如不断添加和删除字段），反复转换会带来严重的性能抖动。Redis 的设计哲学是：转换只发生一次、只向复杂度更高的方向发展，宁可多用一点内存也不愿意冒运行时性能不稳定的风险。\n\n如果你确实需要「重置」编码，唯一的方法是删除整个键再重建：\n\n```\n127.0.0.1:6379> DEL test:irr\n(integer) 1\n127.0.0.1:6379> HSET test:irr f1 v1\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING test:irr\n\"listpack\"   <-- 新键重新从 listpack 开始\n```\n\n### Redis 6.x 与 7.x 的配置名差异\n\n在 Redis 6.x 及更早版本中，Hash 的小数据编码是 ziplist（压缩列表），对应的配置参数名为 `hash-max-ziplist-entries`（默认 512）和 `hash-max-ziplist-value`（默认 64）。Redis 7.0 用 listpack 全面替代了 ziplist 之后，参数名改为 `hash-max-listpack-entries`（默认 128）和 `hash-max-listpack-value`（默认 64）。注意默认的 entries 阈值从 512 降到了 128——这是因为 listpack 在大量 entry 时的线性扫描开销比 ziplist 更大（listpack 每个 entry 需要自行编码长度信息），Redis 团队权衡后降低了默认阈值。如果你在做版本升级时没注意这一点，可能会发现升级到 7.0 后大量 Hash 键突然从 listpack 转为 hashtable，内存使用量意外上涨。\n\n你可以用 CONFIG GET 来查看当前版本使用的参数名：\n\n```\n-- Redis 7.x\n127.0.0.1:6379> CONFIG GET hash-max-listpack-*\n1) \"hash-max-listpack-entries\"\n2) \"128\"\n3) \"hash-max-listpack-value\"\n4) \"64\"\n\n-- Redis 6.x\n127.0.0.1:6379> CONFIG GET hash-max-ziplist-*\n1) \"hash-max-ziplist-entries\"\n2) \"512\"\n3) \"hash-max-ziplist-value\"\n4) \"64\"\n```\n\n## 第三步：体系化扩展与生产实践\n\n### 调整阈值的实践建议\n\n回到题目的场景——500 万用户画像要新增一个可能 200-500 字节的 `bio` 字段。你有几个选择：\n\n最直接的做法是调大 `hash-max-listpack-value` 参数。比如 `CONFIG SET hash-max-listpack-value 512`，这样 bio 字段不超过 512 字节时 Hash 仍然保持 listpack 编码。但这不是无代价的：listpack 越大，每次 HGET/HSET 的线性扫描范围就越大。对于 20 个字段、总大小约 1-2KB 的 Hash，线性扫描的开销仍然可以接受，因为整个 listpack 几乎可以放进 L1 缓存（通常 32-64KB）。但如果你把阈值调到 4096 甚至更高，当 Hash 有几十个字段且每个值都很长时，每次 HGET 都要扫描几十 KB 的内存，CPU 开销会显著上升。\n\n一个有效的经验法则是：listpack 总大小控制在 1-2KB 以内时，线性扫描的性能开销可以忽略不计；超过 4KB 就要开始关注 CPU 影响了。你可以用 `MEMORY USAGE key` 来监控 listpack 的实际大小，结合 `redis-cli --bigkeys` 扫描来发现异常大的 Hash 键。\n\n另一个方案是把 `bio` 字段单独存到一个 String 键中（比如 `user:10001:bio`），用户画像的其他短字段仍然放在 Hash 里保持 listpack 编码。这种拆分策略在实际生产中非常常见，本质上是用应用层的复杂度换取存储层的内存效率。\n\n### ZSet 和 List 的类似编码转换\n\nHash 的 listpack → hashtable 编码转换模式并不是孤例，Redis 的其他复合数据类型也有几乎相同的机制。Sorted Set（ZSet）在字段少且短时使用 listpack 编码，element 和 score 交替存储并按 score 排序，当元素数量超过 `zset-max-listpack-entries`（默认 128）或任意元素长度超过 `zset-max-listpack-value`（默认 64 字节）时转为 skiplist 编码（实际上是 skiplist + hashtable 的复合结构）。List 类型则是从 listpack 转为 quicklist（一个双向链表，每个节点内部是一个 listpack），由 `list-max-listpack-size`（默认 -2，即每个节点最大 8KB）控制。Set 类型更复杂一些，有 intset（全整数小集合）、listpack（Redis 7.2+ 非全整数小集合）、hashtable 三种编码。\n\n所有这些转换都共享一个核心设计思想：小数据用紧凑编码节省内存，数据增长到一定规模后自动切换到高效编码保证查找性能，且转换是单向不可逆的。\n\n### 常见坑点与避坑指南\n\n生产环境中最常见的一个坑是「批量导入数据后发现内存比预期高很多」。比如你用一个脚本往 Redis 里写入 100 万个 Hash 键，每个 Hash 有 130 个字段。你预期每个 Hash 占用 1KB 左右，100 万个键大约 1GB。但实际上因为 130 > 128（默认阈值），所有 Hash 都用了 hashtable 编码，每个键占用 3-5KB，总内存飙到 3-5GB。解决办法是在导入前先 `CONFIG SET hash-max-listpack-entries 256`，让 130 个字段的 Hash 仍然保持 listpack 编码。\n\n另一个坑是「动态调整阈值不影响已有键」。即使你在运行时用 CONFIG SET 提高了 hash-max-listpack-entries，已经转为 hashtable 编码的键不会自动转回 listpack。只有新创建的键会受益于新的阈值。如果你需要让存量键也用上新阈值，必须写脚本逐个 DUMP + RESTORE 或者 DEL + 重新写入。\n\n### 面试高频考点与回答策略\n\n面试官问「Hash 什么时候从 listpack 转为 hashtable」，入门级的回答是说出两个阈值和默认值。进阶的回答需要补充三个关键信息：转换是单向不可逆的、Redis 6.x 到 7.x 的配置名和默认值变化、以及你在实际项目中如何调优这些参数。如果能进一步说出「listpack 线性扫描在小数据量时性能反而优于 hashtable，因为 CPU 缓存友好」、「我们生产环境把 hash-max-listpack-value 从 64 调到 256 来适配业务场景，内存节省了 40%」这种带有具体数字和真实场景的回答，面试官基本会满意。这个知识点还常常和 OBJECT ENCODING 命令、MEMORY USAGE 命令、Redis 的 ziplist → listpack 演进历史（连锁更新问题）一起出现在连环追问中，建议关联复习。",
+      "keyPoints": [
+        "Redis Hash 底层有 listpack（7.0 前为 ziplist）和 hashtable 两种编码，小数据用 listpack 紧凑存储节省内存，大数据用 hashtable 保证 O(1) 查找性能",
+        "编码转换有两个触发条件：字段数量超过 hash-max-listpack-entries（默认 128）或任意单个 field/value 长度超过 hash-max-listpack-value（默认 64 字节），满足任一即转换",
+        "编码转换是单向不可逆的，从 listpack 转为 hashtable 后即使删除字段或缩短值也不会自动转回，唯一的重置方式是删除键后重新写入",
+        "Redis 6.x 的对应配置名是 hash-max-ziplist-entries（默认 512）和 hash-max-ziplist-value（默认 64），升级到 7.0 后参数名和 entries 默认值都变了",
+        "listpack 是连续内存存储，field 和 value 交替排列，查找是 O(n) 线性扫描但 CPU 缓存友好；hashtable 查找 O(1) 但每个 entry 有指针和元数据开销",
+        "调大 hash-max-listpack-value 可以让更多 Hash 保持 listpack 编码节省内存，但要权衡线性扫描的 CPU 开销，经验上 listpack 总大小控制在 1-2KB 以内性能影响可忽略",
+        "动态 CONFIG SET 修改阈值只影响后续新写入的键，已经转为 hashtable 的存量键不会自动回退",
+        "ZSet（listpack → skiplist）、List（listpack → quicklist）、Set（intset/listpack → hashtable）都有类似的单向编码转换机制"
+      ],
+      "quiz": [
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz1",
+          "question": "在 Redis 7.x 中，Hash 类型底层使用的两种编码分别是什么？",
+          "choices": [
+            {"id": "A", "text": "listpack 和 hashtable"},
+            {"id": "B", "text": "ziplist 和 hashtable"},
+            {"id": "C", "text": "listpack 和 skiplist"},
+            {"id": "D", "text": "quicklist 和 hashtable"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 7.0 全面用 listpack 替代了 ziplist，因此 7.x 版本中 Hash 的两种底层编码是 listpack（小数据紧凑编码）和 hashtable（大数据高效编码）。B 选项是 Redis 6.x 及更早版本的情况，ziplist 在 7.0 中已被淘汰；C 选项中的 skiplist 是 Sorted Set 大数据编码，不用于 Hash；D 选项中的 quicklist 是 List 类型的大数据编码，同样不用于 Hash。"
+        },
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz2",
+          "question": "以下哪个条件不会触发 Hash 从 listpack 转为 hashtable？",
+          "choices": [
+            {"id": "A", "text": "字段数量从 128 增加到 129（默认配置下）"},
+            {"id": "B", "text": "写入一个值长度为 65 字节的字段（默认配置下）"},
+            {"id": "C", "text": "Hash 中所有字段的值的总字节数超过 64 字节"},
+            {"id": "D", "text": "写入一个 field 名长度为 70 字节的字段（默认配置下）"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "编码转换的阈值检查针对的是「单个 field 或 value 的长度」和「字段总数量」，而不是所有值的总字节数之和。A 选项触发了 hash-max-listpack-entries 阈值（128）；B 和 D 选项都触发了 hash-max-listpack-value 阈值（64），注意 field 名的长度也会被检查，不仅仅是 value 的长度。C 选项描述的是总字节数，Redis 并不做这个检查。"
+        },
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz3",
+          "question": "listpack 编码的 Hash 在执行 HGET 查找字段时，时间复杂度是多少？",
+          "choices": [
+            {"id": "A", "text": "O(1)，因为有内部索引"},
+            {"id": "B", "text": "O(n)，需要从头遍历连续内存中的 entry"},
+            {"id": "C", "text": "O(log n)，使用二分查找"},
+            {"id": "D", "text": "O(n²)，因为存在连锁更新"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "listpack 是一块连续内存，field 和 value 交替紧凑排列，没有索引结构。HGET 需要从头开始逐个比较 field 名，直到找到目标或到达末尾，因此是 O(n) 线性扫描。A 选项描述的是 hashtable 编码的查找复杂度；C 选项描述的是 intset 编码（有序整数数组）的查找方式；D 选项中的连锁更新是 ziplist 的问题，不是 listpack 的，而且连锁更新发生在写入时而非查找时。"
+        },
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz4",
+          "question": "Redis 内部在什么时机检查是否需要对 Hash 进行编码转换？",
+          "choices": [
+            {"id": "A", "text": "在后台定时任务中周期性检查所有 Hash 键"},
+            {"id": "B", "text": "在 HGET 等读操作时检查并延迟转换"},
+            {"id": "C", "text": "在 HSET 等写操作执行路径中同步检查和转换"},
+            {"id": "D", "text": "在 RDB 或 AOF 持久化时检查并批量转换"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 的编码转换发生在写命令（HSET、HMSET、HINCRBY 等）的执行路径中。每次写操作完成后，Redis 会同步检查当前 Hash 的字段数量和新写入 field/value 的长度是否超过阈值，如果超过则立即完成编码转换。A 选项不存在这样的后台任务；B 选项中读操作不会触发编码转换，只有写操作才会；D 选项中持久化过程不会改变内存中的编码方式。"
+        },
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz5",
+          "question": "以下 redis-cli 操作的输出，哪一组是合理的？",
+          "choices": [
+            {"id": "A", "text": "HSET h f1 v1 → OBJECT ENCODING h 返回 listpack → HSET h f2 (65字节值) → OBJECT ENCODING h 返回 hashtable"},
+            {"id": "B", "text": "HSET h f1 v1 → OBJECT ENCODING h 返回 hashtable → HDEL h f1 → OBJECT ENCODING h 返回 listpack"},
+            {"id": "C", "text": "HSET h f1 v1 → OBJECT ENCODING h 返回 ziplist（Redis 7.2 环境）"},
+            {"id": "D", "text": "HSET h f1 (65字节值) → OBJECT ENCODING h 返回 listpack（默认配置）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 选项完整演示了编码转换过程：初始一个字段时 Hash 使用 listpack，写入一个超过 64 字节值的字段后触发转换为 hashtable，完全符合默认配置下的行为。B 选项违反了编码转换的不可逆性原则——一旦转为 hashtable，删除字段不会转回 listpack。C 选项不合理，Redis 7.2 环境下 OBJECT ENCODING 返回的是 listpack 而非 ziplist，ziplist 在 7.0 已被替代。D 选项中 65 字节超过了默认阈值 64，应该触发转换返回 hashtable 而非 listpack。"
+        },
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz6",
+          "question": "一个 Hash 已经从 listpack 转为 hashtable 编码后，你用 HDEL 把字段数从 200 删到只剩 5 个，此时 OBJECT ENCODING 返回什么？",
+          "choices": [
+            {"id": "A", "text": "listpack，因为 5 个字段远低于阈值 128，Redis 会自动转回"},
+            {"id": "B", "text": "hashtable，因为编码转换是单向不可逆的"},
+            {"id": "C", "text": "取决于 Redis 版本，7.0+ 会转回但 6.x 不会"},
+            {"id": "D", "text": "取决于剩余字段的值长度，短值会转回 listpack"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Redis 编码转换最重要的特性之一：单向不可逆。不管你怎么删除字段、缩短值，已经从 listpack 转为 hashtable 的 Hash 绝不会自动转回来。A 选项的理解是错误的——Redis 不做反向转换，因为频繁的编码转换会带来大量的内存分配和数据迁移开销。C 选项也是错误的，所有 Redis 版本的行为都一致，编码只会单向升级。D 选项同样错误，Redis 不会在删除操作后检查剩余数据是否满足 listpack 条件。唯一的「重置」方式是 DEL 删除整个键再重新写入。"
+        },
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz7",
+          "question": "对比 Redis 6.x 和 7.x 的 Hash 编码转换阈值配置，以下说法正确的是？",
+          "choices": [
+            {"id": "A", "text": "参数名完全相同，只是默认值不同"},
+            {"id": "B", "text": "7.x 参数名从 hash-max-ziplist-* 改为 hash-max-listpack-*，且 entries 默认值从 512 降为 128"},
+            {"id": "C", "text": "7.x 参数名改了但默认值完全一致"},
+            {"id": "D", "text": "6.x 没有这些配置参数，编码转换阈值是硬编码的"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 7.0 用 listpack 全面替代 ziplist 后，配置参数名从 hash-max-ziplist-entries / hash-max-ziplist-value 变成了 hash-max-listpack-entries / hash-max-listpack-value。同时，entries 的默认值从 512 降低为 128，这是因为 listpack 在大量 entry 时线性扫描的开销被重新评估后做出的调整。value 的默认阈值仍然是 64 字节未变。A 和 C 选项都忽略了参数名和默认值的双重变化。D 选项错误，Redis 6.x 同样可以通过 CONFIG SET 动态调整这些参数。"
+        },
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz8",
+          "question": "你的线上 Redis 7.2 存储了 300 万个用户画像 Hash，每个 Hash 有 130 个字段、每个值约 20 字节。你发现内存消耗比预期高 3 倍。最可能的原因和解决方案是什么？",
+          "choices": [
+            {"id": "A", "text": "130 > 128（默认阈值），所有 Hash 都是 hashtable 编码；将 hash-max-listpack-entries 调大到 256 后重新导入数据"},
+            {"id": "B", "text": "每个值 20 字节超过了默认阈值，应调大 hash-max-listpack-value"},
+            {"id": "C", "text": "300 万个键本身占用了大量内存，与编码方式无关"},
+            {"id": "D", "text": "调大 hash-max-listpack-entries 后无需重新导入，已有键会自动转回 listpack"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "130 个字段刚好超过默认的 hash-max-listpack-entries 阈值 128，导致所有 Hash 都使用了 hashtable 编码，单键内存从约 1KB 膨胀到 3-5KB。解决方案是将阈值调大到覆盖 130 个字段（比如设为 256），但关键是——调大阈值只影响后续新写入的键，已有的 300 万个 hashtable 编码的键不会自动转回，必须重新导入数据。B 选项的判断错误，20 字节远低于默认阈值 64。C 选项忽略了编码差异带来的巨大内存影响。D 选项违反了编码不可逆的原则。"
+        },
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz9",
+          "question": "以下关于 listpack 编码 Hash 性能特征的说法，哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "listpack 的 HGET 比 hashtable 慢，所以数据量小时也应该尽量用 hashtable"},
+            {"id": "B", "text": "listpack 在小数据量时因连续内存和 CPU 缓存友好性，实际 HGET 性能可能优于 hashtable"},
+            {"id": "C", "text": "listpack 和 hashtable 的 HGET 性能完全一致，区别只在于内存占用"},
+            {"id": "D", "text": "listpack 使用哈希索引加速查找，因此不存在线性扫描开销"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "虽然 listpack 的 HGET 理论复杂度是 O(n) 而 hashtable 是 O(1)，但在字段数量很少（比如 20 个以内）的场景下，listpack 因为数据紧凑地存储在一块连续内存中，CPU 缓存行（cache line，通常 64 字节）可以一次加载多个 entry，避免了 hashtable 中指针追踪导致的缓存未命中。实际基准测试中，小数据量 Hash 的 listpack 编码 HGET 性能往往与 hashtable 持平甚至更优。A 选项的结论是错误的；C 选项忽略了不同数据结构的性能差异；D 选项不存在，listpack 没有哈希索引。"
+        },
+        {
+          "id": "redis-internal-hash-encoding-switch-q1-quiz10",
+          "question": "你在 redis-cli 中执行 CONFIG SET hash-max-listpack-value 256 后，一个已经转为 hashtable 编码的 Hash 键会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Redis 会在后台异步将该键转回 listpack 编码"},
+            {"id": "B", "text": "下次对该键执行写操作时会检查并转回 listpack"},
+            {"id": "C", "text": "该键不会受到影响，仍然保持 hashtable 编码"},
+            {"id": "D", "text": "CONFIG SET 会报错，因为不允许在运行时修改此参数"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "CONFIG SET 动态修改编码阈值只对后续新写入或新创建的 Hash 键生效。已经完成编码转换的存量键不会受到任何影响，仍然保持 hashtable 编码。这是因为 Redis 不会主动回扫已有键来检查编码是否需要「降级」——这种操作的代价太高且可能影响服务性能。A 和 B 选项都基于错误的假设，认为 Redis 会做反向编码转换。D 选项也是错的，hash-max-listpack-value 完全可以在运行时通过 CONFIG SET 动态修改，不需要重启。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/develop/data-types/hashes/",
+        "https://redis.io/docs/latest/commands/object-encoding/",
+        "https://redis.io/docs/latest/commands/config-set/",
+        "https://github.com/redis/redis/blob/7.2/src/t_hash.c"
+      ]
+    }
+  ]
+}
