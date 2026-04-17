@@ -1,0 +1,159 @@
+{
+  "id": "redis-lua-timeout",
+  "name": "Lua 脚本超时会怎样：BUSY 错误、SCRIPT KILL 与生产排查",
+  "domain": "redis",
+  "description": "深入排查 Redis Lua 脚本超时场景：lua-time-limit 软超时机制、BUSY 错误响应、SCRIPT KILL 的只读限制、SHUTDOWN NOSAVE 的最后手段、Sentinel 误判故障转移及生产预防策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-lua-timeout-q1",
+      "domain": "redis",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["Lua超时", "lua-time-limit", "SCRIPT KILL", "SHUTDOWN NOSAVE", "慢脚本", "BUSY错误", "redis-scripting"],
+      "title": "Lua 脚本超时会怎样？线上 Redis 突然返回 BUSY 错误怎么排查",
+      "content": "## 故障现场\n\n周五晚上 11 点，你刚准备下班，突然收到告警：线上所有依赖 Redis 的服务同时报错，错误信息是这样的：\n\n```\n(error) BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\n```\n\n你打开 Grafana 一看，Redis 的命令延迟从平时的 0.1ms 直接飙到了超时上限，所有 GET、SET 请求全部失败。但是 Redis 进程还在，端口还在监听，`redis-cli ping` 也返回 BUSY 错误而不是连接超时。也就是说 Redis 没有挂，它只是在「忙」。\n\n你用 `redis-cli INFO server` 也拿不到任何信息，所有命令都被一个正在执行的 Lua 脚本给阻塞了。监控显示这个状态已经持续了 30 秒，而且没有自动恢复的迹象。\n\n你的同事问了三个问题：第一，为什么一个 Lua 脚本能把整个 Redis 搞瘫痪？第二，`lua-time-limit` 不是默认 5 秒吗，为什么 30 秒了还没超时终止？第三，现在应该怎么办，能不能直接 `SCRIPT KILL` 杀掉？\n\n这道题不只是理论——我在两个不同的团队见过这个故障。一次是有人写了个遍历百万级 key 的 Lua 脚本，另一次更离谱，是一个 `while true` 死循环不小心上了线。两次都导致了 Redis 全量不可用，第二次还因为脚本执行了写操作无法 KILL，最终不得不 `SHUTDOWN NOSAVE` 重启，丢了大约 3 分钟的数据。\n\n请完整讲清楚：Lua 脚本超时的底层机制是什么，`lua-time-limit` 到底是什么性质的超时，超时后有哪些处理手段，各自的限制条件是什么，以及生产环境应该怎么预防这类事故。",
+      "answer": "## 第一步：Redis Lua 脚本的基础概念\n\n### Redis 内嵌 Lua 解释器\n\nRedis 从 2.6.0 版本（2012 年发布）开始内嵌了一个 Lua 5.1 解释器，通过 `EVAL` 命令可以在 Redis 服务端直接执行 Lua 脚本。所谓「内嵌」，是指 Lua 解释器直接编译链接到 Redis 的 C 代码中，在同一个进程空间内运行——不是通过 IPC 调外部进程，而是在 Redis 主线程里直接调 Lua 的 C API。这个设计让 Lua 脚本的执行开销极低，和一条普通 Redis 命令在同一个数量级。\n\nLua 脚本在 Redis 中最核心的价值是原子性：整个脚本作为一个不可分割的「超级命令」执行，中间不会被其他客户端的命令插队。这让它成了实现分布式锁释放、原子性库存扣减、滑动窗口限流等场景的事实标准。一个最经典的例子是分布式锁的原子释放——先检查锁持有者身份，再执行删除，两步合为一个原子操作：\n\n```bash\n# 分布式锁原子释放：检查持有者 + 删除，原子执行\n127.0.0.1:6379> EVAL \"\n  if redis.call('GET', KEYS[1]) == ARGV[1] then\n    return redis.call('DEL', KEYS[1])\n  else\n    return 0\n  end\n\" 1 mylock \"holder-uuid-abc123\"\n(integer) 1\n```\n\n### 为什么 Lua 脚本能把 Redis 搞瘫痪\n\nLua 脚本的原子性来自 Redis 的单线程命令处理模型。Redis 主线程在执行 Lua 脚本期间，不会去事件循环中处理其他客户端的请求——其他客户端发来的命令虽然已经到达了 TCP 接收缓冲区，但主线程不会去读取和处理它们。这意味着：如果一段 Lua 脚本执行了 10 秒，那整个 Redis 在这 10 秒内对所有客户端完全不可用。如果脚本里有个死循环——那恭喜你，Redis 就永久卡死了。\n\n这不是一个理论上的极端情况。生产中最常见的两种触发场景：一是有人在 Lua 脚本里对一个百万级元素的 Set 做了 `SMEMBERS` 或者对一个大 Sorted Set 做了 `ZRANGEBYSCORE` 全量返回；二是脚本逻辑中有条件分支不严谨导致的死循环，比如一个 `while` 循环的退出条件依赖某个 key 的值，但这个 key 在脚本执行过程中永远不会达到退出条件。\n\n## 第二步：Lua 脚本超时机制的深度排查\n\n### lua-time-limit：不是你以为的「硬超时」\n\nRedis 有一个 `lua-time-limit` 配置项，默认值是 5000（单位毫秒，即 5 秒）。很多人以为这是一个硬性超时——脚本跑超过 5 秒就自动被杀。这是一个非常危险的误解。\n\n`lua-time-limit` 实际上是一个「软超时」阈值。超过这个时间后，Redis 不会自动终止脚本，而是做了两件事：第一，Redis 开始对其他客户端发来的所有命令返回 BUSY 错误；第二，Redis 从拒绝所有命令的状态切换为只接受两个特殊命令——`SCRIPT KILL` 和 `SHUTDOWN NOSAVE`。换句话说，`lua-time-limit` 的本质是一个「告警阈值」，它让 Redis 从「完全不响应」变成「返回错误提示并接受干预命令」。\n\n你可以在 `redis.conf` 中修改这个值，也可以运行时用 `CONFIG SET` 动态修改：\n\n```bash\n# 查看当前 lua-time-limit 配置\n127.0.0.1:6379> CONFIG GET lua-time-limit\n1) \"lua-time-limit\"\n2) \"5000\"\n\n# 设为 10 秒（生产环境不建议设太大）\n127.0.0.1:6379> CONFIG SET lua-time-limit 10000\nOK\n```\n\n为什么 Redis 不设计成硬性超时自动终止？因为 Redis 的设计者 Antirez 认为，自动终止一个执行到一半的脚本可能比让它继续跑更危险。想象一个脚本已经执行了 SET A 100 但还没执行 SET B 200，如果此时自动终止，A 和 B 的数据就不一致了。Redis 没有事务回滚机制（这是它和 MySQL 的一个根本区别），所以它选择了「通知管理员来决策」而不是「自己动手终止」。\n\n### BUSY 错误：超时后的客户端体验\n\n一旦 Lua 脚本执行时间超过 `lua-time-limit`，所有其他客户端的命令都会收到如下错误：\n\n```\n(error) BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\n```\n\n这个错误信息本身就是一个排查线索——它明确告诉你 Redis 被一个脚本卡住了，并且给出了两个可用的干预手段。需要注意的是，在 `lua-time-limit` 到达之前（比如脚本刚跑了 3 秒），其他客户端的体验是「请求被阻塞等待」而不是「收到 BUSY 错误」。只有超过 `lua-time-limit` 之后，Redis 才会开始主动返回 BUSY 错误。这意味着如果你把 `lua-time-limit` 设得很大（比如 60 秒），那在这 60 秒内客户端不会收到 BUSY 错误，只会一直超时——这会让排查变得更困难，因为你不知道 Redis 到底在忙什么。\n\n### 完整排查 CLI 演示\n\n下面用两个终端完整模拟这个故障场景。首先是一个只读的死循环脚本（可以被 SCRIPT KILL）：\n\n```bash\n# ===== 终端 A：模拟死循环脚本 =====\n127.0.0.1:6379> EVAL \"while true do end\" 0\n# 脚本卡住，终端 A 无响应……\n\n# ===== 终端 B：5 秒后尝试执行普通命令 =====\n127.0.0.1:6379> GET mykey\n(error) BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\n\n# 用 SCRIPT KILL 终止脚本\n127.0.0.1:6379> SCRIPT KILL\nOK\n\n# 脚本被终止后，Redis 恢复正常\n127.0.0.1:6379> GET mykey\n\"hello\"\n\n# ===== 终端 A 收到错误返回 =====\n(error) ERR Error running script (call to ...) @user_script:1:\n  Script killed by user with SCRIPT KILL...\n```\n\n接下来是一个更危险的场景——脚本已经执行了写操作：\n\n```bash\n# ===== 终端 A：执行一个先写再死循环的脚本 =====\n127.0.0.1:6379> EVAL \"\n  redis.call('SET', KEYS[1], 'written')\n  while true do end\n\" 1 testkey\n# 脚本先写入了 testkey，然后进入死循环……\n\n# ===== 终端 B：尝试 SCRIPT KILL =====\n127.0.0.1:6379> SCRIPT KILL\n(error) UNKILLABLE Sorry the script already executed write\ncommands against the dataset. Only SHUTDOWN NOSAVE can\nkill it now.\n\n# SCRIPT KILL 失败了！脚本已经执行了写操作，无法安全终止\n# 此时只有一个选项：\n127.0.0.1:6379> SHUTDOWN NOSAVE\n# Redis 进程退出，不保存任何数据\n# 重启后数据回滚到最后一次 RDB/AOF 持久化的状态\n```\n\n这段演示清楚地展示了两种处理路径的分叉点：脚本是否执行了写操作。Redis 在内部通过一个标志位追踪当前 Lua 脚本是否调用过任何写命令（SET、DEL、INCR 等），一旦这个标志被设为 true，`SCRIPT KILL` 命令的处理函数就会直接拒绝执行并返回 UNKILLABLE 错误。\n\n### SCRIPT KILL 的精确语义\n\n`SCRIPT KILL` 只在一个严格条件下才能成功：当前正在执行的 Lua 脚本没有执行过任何写操作。这个设计的原因很直接——Redis 没有 WAL（Write-Ahead Log，预写日志）级别的事务回滚机制。如果一个脚本已经执行了 `redis.call('SET', 'key1', 'new_value')` 但还没执行后续的 `redis.call('SET', 'key2', 'new_value')`，此时终止脚本意味着 key1 被修改了而 key2 没有，数据处于不一致状态。Redis 无法回滚已经生效的 SET 操作（不像 MySQL 的 InnoDB 可以通过 undo log 回滚），所以它选择拒绝 SCRIPT KILL，让管理员自己决定是等脚本执行完还是 SHUTDOWN NOSAVE。\n\n从源码层面看，Redis 在 `scripting.c` 中维护了一个 `server.script_caller->flags` 标志。每当 Lua 脚本通过 `redis.call()` 执行一条写命令时，Redis 会将 `CLIENT_SCRIPT_WRITE` 标志设为 1。当收到 `SCRIPT KILL` 命令时，Redis 检查这个标志——如果为 1，直接返回 UNKILLABLE 错误。\n\n### SHUTDOWN NOSAVE：最后的手段\n\n当 SCRIPT KILL 被拒绝时，唯一的出路是 `SHUTDOWN NOSAVE`。这条命令告诉 Redis「不要保存任何数据，直接关闭进程」。执行后 Redis 进程退出，所有内存数据丢失。重新启动 Redis 后，它会从最后一次持久化的快照恢复——如果你配置了 RDB，数据回到最后一次 BGSAVE 的状态；如果配置了 AOF，数据回到最后一次 fsync 的状态。\n\n这意味着从上次持久化到 SHUTDOWN NOSAVE 之间的所有写入都会丢失。在一个配置了 `save 300 10`（每 5 分钟且至少 10 次写入时触发 BGSAVE）的实例上，最坏情况可能丢失 5 分钟的数据。如果配置了 `appendfsync everysec` 的 AOF，丢失量通常在 1 秒以内——但那个失控脚本本身执行的写入也会丢失，因为 NOSAVE 意味着不做任何持久化就退出。\n\n值得注意的是，`SHUTDOWN NOSAVE` 和 `SHUTDOWN` 不同。普通的 `SHUTDOWN` 会在关闭前执行一次 RDB 快照保存（如果配置了 save 规则）或 AOF 重写，而 `SHUTDOWN NOSAVE` 跳过所有持久化操作直接退出。在脚本阻塞的场景下，你必须用 NOSAVE——因为普通的 SHUTDOWN 需要主线程参与持久化操作，而主线程正在被 Lua 脚本占用。\n\n## 第三步：体系化扩展\n\n### 与 Sentinel 的致命交互\n\n这是很多人没想到的问题。如果你的 Redis 使用了 Sentinel 做高可用，Lua 脚本超时期间 Sentinel 会怎么看？Sentinel 通过定期发送 PING 来检测 Redis 主节点是否存活。当 Lua 脚本阻塞了 Redis 主线程时，Redis 无法响应 Sentinel 的 PING（或者返回 BUSY 错误，Sentinel 可能视为不正常响应）。如果阻塞时间超过了 Sentinel 的 `down-after-milliseconds` 配置（默认 30000ms 即 30 秒），Sentinel 会把主节点标记为 SDOWN（主观下线），如果多个 Sentinel 达成一致还会标记为 ODOWN（客观下线），然后触发自动故障转移——把从节点提升为新主节点。\n\n这意味着：一个死循环的 Lua 脚本不仅让当前 Redis 不可用，还可能触发一次不必要的故障转移。等你 SCRIPT KILL 成功后，原来的主节点恢复了，但 Sentinel 已经把它降级为从节点了。更糟糕的是，如果原主节点上有还没来得及同步到从节点的写入数据（异步复制的特性），这些数据就丢失了。\n\n预防措施是确保 `lua-time-limit` 远小于 `down-after-milliseconds`。一个推荐的配置组合是 `lua-time-limit 5000`（5 秒，默认值即可）配合 `down-after-milliseconds 60000`（60 秒），给你留出足够的手动干预时间窗口。\n\n```bash\n# redis.conf 推荐配置\nlua-time-limit 5000  # 默认 5 秒，Lua 脚本超过此时间后开始返回 BUSY\n\n# sentinel.conf 配置\nsentinel down-after-milliseconds mymaster 60000  # 60 秒后才判定主观下线\n# 确保 down-after-milliseconds 远大于 lua-time-limit\n# 给 SCRIPT KILL 留出足够的手动干预窗口\n```\n\n### 生产环境预防措施\n\n第一道防线是代码审查。所有提交到生产的 Lua 脚本都必须经过严格 review，重点检查三件事：有没有循环？循环的退出条件是否可靠？脚本中是否有对大 key 的全量操作（如 `SMEMBERS`、`HGETALL`、`ZRANGEBYSCORE` 不带 LIMIT）？一个经验法则是：Lua 脚本应该保持在 20 行以内，执行时间控制在毫秒级。如果你的脚本需要遍历上万个元素，应该拆分成多次调用，或者用 `SCAN` 系列命令在应用层做增量遍历。\n\n第二道防线是监控。Redis 的 `SLOWLOG` 是发现慢脚本的利器。`SLOWLOG GET` 会记录执行时间超过 `slowlog-log-slower-than`（默认 10000 微秒即 10 毫秒）的命令，包括 EVAL 和 EVALSHA：\n\n```bash\n# 查看慢日志\n127.0.0.1:6379> SLOWLOG GET 5\n1) 1) (integer) 42              # 慢日志 ID\n   2) (integer) 1700000000      # Unix 时间戳\n   3) (integer) 3500000         # 执行时间：3.5 秒（3500000 微秒）\n   4) 1) \"EVAL\"                 # 命令\n      2) \"local keys = redis.call('KEYS', '*') ...\"  # 脚本内容\n      3) \"0\"\n   5) \"192.168.1.100:54321\"     # 客户端地址\n   6) \"app-server-01\"           # 客户端名称\n\n# 设置慢日志阈值为 5ms，更敏感地捕获慢脚本\n127.0.0.1:6379> CONFIG SET slowlog-log-slower-than 5000\nOK\n\n# 保留最近 256 条慢日志\n127.0.0.1:6379> CONFIG SET slowlog-max-len 256\nOK\n```\n\n第三道防线是运行时监控指标。你应该监控 `INFO commandstats` 中 EVAL 和 EVALSHA 的 `usec_per_call`（每次调用平均耗时），以及 `INFO server` 中的 `busy_script` 字段（脚本是否正在执行）和 `busy_script_elapsed`（当前脚本已执行的时间）。在 Prometheus + Grafana 的监控体系中，`redis_commands_duration_seconds_total{cmd=\"eval\"}` 和 `redis_commands_duration_seconds_total{cmd=\"evalsha\"}` 是必须设告警的指标。\n\n### Redis 7.0+ 的改进\n\nRedis 7.0（2022 年发布）引入了 Redis Functions 机制，其中一个与超时直接相关的改进是 `no-writes` 标志。在传统 EVAL 模式下，Redis 只能在脚本执行过程中动态追踪是否有写操作——你无法在脚本加载时就声明「这个脚本是只读的」。Functions 允许你在注册函数时通过 flags 声明脚本特性：\n\n```bash\n# Redis 7.0+：注册一个声明了 no-writes 标志的只读函数\n127.0.0.1:6379> FUNCTION LOAD \"#!lua name=mylib\nredis.register_function{function_name='readonly_func',\n  callback=function(keys, args)\n    return redis.call('GET', keys[1])\n  end,\n  flags={'no-writes'}  -- 声明此函数不执行写操作\n}\"\n\"mylib\"\n\n# 用 FCALL_RO 调用只读函数（只能在只读副本上执行）\n127.0.0.1:6379> FCALL_RO readonly_func 1 mykey\n\"hello\"\n```\n\n`no-writes` 标志带来两个好处：第一，声明为 `no-writes` 的函数可以通过 `FCALL_RO` 在只读副本（read replica）上执行，分担主节点的读压力；第二，在超时场景下，Redis 可以确信这个函数不会有写操作，`SCRIPT KILL` 一定能成功执行——不会出现 UNKILLABLE 的困境。这比传统 EVAL 的运行时动态追踪写操作标志要安全和可预测得多。\n\nRedis 7.0 还增加了 `FUNCTION STATS` 命令，可以在脚本执行期间查看当前正在运行的函数名称和已运行时间，比传统的 BUSY 错误提供了更多排查信息：\n\n```bash\n# Redis 7.0+：查看当前正在执行的函数信息\n127.0.0.1:6379> FUNCTION STATS\n1) \"running_script\"\n2) 1) \"name\"           # 函数名（EVAL 模式下只有 SHA1）\n   2) \"my_slow_func\"\n   3) \"command\"         # 调用命令\n   4) 1) \"fcall\"\n      2) \"my_slow_func\"\n      3) \"1\"\n      4) \"mykey\"\n   5) \"duration_ms\"     # 已运行时间\n   6) (integer) 8500\n3) \"engines\"\n4) 1) \"LUA\"\n   2) 1) \"libraries_count\"\n      2) (integer) 1\n      3) \"functions_count\"\n      4) (integer) 1\n```\n\n### 故障应急排查清单\n\n当你在生产中遇到 BUSY 错误时，完整的排查和处理流程应该是这样的：\n\n```bash\n# 第 1 步：确认是 Lua 脚本阻塞（用一个新连接）\n$ redis-cli -h <host> -p <port> PING\n# 如果返回 BUSY 错误，确认是脚本阻塞\n\n# 第 2 步：（Redis 7.0+）查看正在执行的脚本信息\n$ redis-cli -h <host> -p <port> FUNCTION STATS\n# 或者查看 CLIENT LIST 找到执行 EVAL 的客户端\n$ redis-cli -h <host> -p <port> CLIENT LIST\n# 在 BUSY 状态下 CLIENT LIST 也可能返回 BUSY\n# 但 SCRIPT KILL 和 SHUTDOWN NOSAVE 一定可以执行\n\n# 第 3 步：尝试 SCRIPT KILL\n$ redis-cli -h <host> -p <port> SCRIPT KILL\n# 如果返回 OK —— 脚本终止，Redis 恢复正常\n# 如果返回 UNKILLABLE —— 脚本已执行写操作，进入第 4 步\n\n# 第 4 步：评估 SHUTDOWN NOSAVE 的数据丢失风险\n# 检查最后一次持久化时间\n$ redis-cli -h <host> -p <port> LASTSAVE\n(integer) 1700000000  # Unix 时间戳，换算成可读时间评估丢失量\n\n# 第 5 步：如果确认可以接受数据丢失，执行 SHUTDOWN NOSAVE\n$ redis-cli -h <host> -p <port> SHUTDOWN NOSAVE\n# Redis 进程退出，不保存数据\n\n# 第 6 步：重启 Redis 并验证数据\n$ redis-server /etc/redis/redis.conf\n$ redis-cli -h <host> -p <port> DBSIZE\n(integer) 1523487  # 确认数据从持久化恢复\n```\n\n### 面试高频考点\n\n面试中关于 Lua 脚本超时的考察集中在四个层次。第一层是机制认知：`lua-time-limit` 是软超时不是硬超时，超时后不会自动终止脚本，而是返回 BUSY 错误。第二层是处理手段：`SCRIPT KILL` 只能终止没有执行过写操作的脚本，已执行写操作的脚本只能用 `SHUTDOWN NOSAVE`。第三层是原因理解：为什么不自动终止（没有回滚机制，自动终止可能导致数据不一致），为什么写脚本不能 KILL（已写入的数据无法回滚）。第四层是生产经验：代码审查防死循环、SLOWLOG 发现慢脚本、监控 EVAL 耗时、Sentinel 交互问题。如果你能从故障现象出发，讲清楚排查流程，再到原理机制，最后到预防措施，这道 debugging 题就是满分回答。",
+      "keyPoints": [
+        "lua-time-limit 默认 5000ms 是软超时阈值而非硬性限制，超时后 Redis 不会自动终止脚本，而是开始对其他客户端返回 BUSY 错误并只接受 SCRIPT KILL 和 SHUTDOWN NOSAVE 两个命令",
+        "SCRIPT KILL 只能终止没有执行过写操作的 Lua 脚本，Redis 通过内部 CLIENT_SCRIPT_WRITE 标志位追踪脚本是否调用过 SET/DEL/INCR 等写命令，一旦标志为 true 就返回 UNKILLABLE 拒绝执行",
+        "SHUTDOWN NOSAVE 是处理已执行写操作的失控脚本的最后手段，它不保存数据直接关闭 Redis 进程，重启后数据回滚到最后一次 RDB/AOF 持久化状态，中间的所有写入丢失",
+        "Lua 脚本超时期间 Sentinel 无法收到正常 PING 响应，如果阻塞时间超过 down-after-milliseconds 会触发不必要的自动故障转移，因此 down-after-milliseconds 应远大于 lua-time-limit",
+        "生产预防三道防线：代码审查杜绝死循环和大 key 全量操作、SLOWLOG 监控捕获超过阈值的 EVAL 命令、Prometheus 对 eval/evalsha 的 usec_per_call 设告警",
+        "Redis 7.0 Functions 的 no-writes 标志让只读函数可通过 FCALL_RO 在副本上执行，且超时时 SCRIPT KILL 一定可以成功，避免了 UNKILLABLE 困境",
+        "在 lua-time-limit 到达之前，其他客户端的请求表现为阻塞等待而非收到错误响应，只有超时后才开始返回 BUSY 错误，因此 lua-time-limit 设得过大会延迟问题发现",
+        "SHUTDOWN NOSAVE 和普通 SHUTDOWN 的关键区别是不执行持久化操作就退出，在脚本阻塞场景下必须用 NOSAVE，因为普通 SHUTDOWN 的持久化操作需要被占用的主线程参与"
+      ],
+      "quiz": [
+        {
+          "id": "redis-lua-timeout-q1-quiz1",
+          "question": "Redis 的 lua-time-limit 配置默认值是多少，它的作用是什么？",
+          "choices": [
+            { "id": "A", "text": "默认 5000ms，超过此时间 Redis 自动终止脚本并回滚数据" },
+            { "id": "B", "text": "默认 5000ms，超过此时间 Redis 不会终止脚本，但开始对其他客户端返回 BUSY 错误，只接受 SCRIPT KILL 和 SHUTDOWN NOSAVE" },
+            { "id": "C", "text": "默认 10000ms，超过此时间 Redis 将脚本移到后台线程继续执行" },
+            { "id": "D", "text": "默认 5000ms，超过此时间 Redis 自动终止脚本，但不回滚已写入的数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "lua-time-limit 默认值是 5000 毫秒（5 秒），但它是一个「软超时」阈值而非硬性限制。超过此时间后，Redis 并不会自动终止脚本，而是做两件事：第一，开始对所有其他客户端返回 BUSY 错误（错误信息是「BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE」）；第二，从拒绝所有命令切换为只接受 SCRIPT KILL 和 SHUTDOWN NOSAVE 这两个干预命令。选项 A 最具迷惑性——Redis 不会自动终止脚本，更不存在回滚机制。选项 C 的默认值和后台线程说法都是错误的。选项 D 虽然说不回滚是对的，但「自动终止」这个前提是错的。"
+        },
+        {
+          "id": "redis-lua-timeout-q1-quiz2",
+          "question": "为什么 Redis 选择不自动终止超时的 Lua 脚本？",
+          "choices": [
+            { "id": "A", "text": "技术上无法实现，Lua 解释器不支持从外部中断正在执行的脚本" },
+            { "id": "B", "text": "Redis 没有事务回滚机制，自动终止执行到一半的写脚本会导致数据不一致" },
+            { "id": "C", "text": "自动终止会导致 Redis 进程崩溃，需要重启才能恢复" },
+            { "id": "D", "text": "Lua 脚本在独立线程中执行，主线程无法直接控制其生命周期" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 不自动终止超时 Lua 脚本的根本原因是它没有类似 MySQL InnoDB 的 undo log 事务回滚机制。想象一个脚本已经执行了 SET key1 'new_value' 但还没来得及执行 SET key2 'new_value'，如果此时自动终止，key1 已被修改而 key2 没有，数据就处于不一致状态。Redis 无法把 key1 回滚到修改前的值，所以设计者 Antirez 选择让管理员自己判断该怎么处理——是 SCRIPT KILL（只读脚本可用）还是 SHUTDOWN NOSAVE（接受数据丢失）。选项 A 不准确，Redis 实际上可以通过 Lua hook 机制中断脚本（SCRIPT KILL 就是这么实现的），但选择不自动这样做。选项 D 完全错误，Lua 脚本在 Redis 主线程中执行。"
+        },
+        {
+          "id": "redis-lua-timeout-q1-quiz3",
+          "question": "SCRIPT KILL 命令在什么条件下会被 Redis 拒绝执行？",
+          "choices": [
+            { "id": "A", "text": "当没有正在执行的 Lua 脚本时" },
+            { "id": "B", "text": "当脚本执行时间还未超过 lua-time-limit 时" },
+            { "id": "C", "text": "当正在执行的 Lua 脚本已经调用过写命令（如 SET、DEL、INCR）时，返回 UNKILLABLE 错误" },
+            { "id": "D", "text": "当 Redis 实例处于 Cluster 模式且脚本涉及多个 slot 时" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "SCRIPT KILL 的成功条件是：当前正在执行的 Lua 脚本没有执行过任何写命令。Redis 在内部通过 CLIENT_SCRIPT_WRITE 标志位追踪脚本是否调用过 SET、DEL、INCR、LPUSH 等写命令。一旦检测到脚本有写操作，SCRIPT KILL 返回 `(error) UNKILLABLE Sorry the script already executed write commands against the dataset. Only SHUTDOWN NOSAVE can kill it now.` 错误。原因很直接：Redis 没有回滚机制，终止一个已经执行了部分写入的脚本会导致数据不一致。选项 A 说的情况确实会返回错误，但错误信息是 NOTBUSY 而非 UNKILLABLE，且不是本题重点。选项 B 不准确，SCRIPT KILL 在 lua-time-limit 之前也可以执行。选项 D 与 SCRIPT KILL 的限制条件无关。"
+        },
+        {
+          "id": "redis-lua-timeout-q1-quiz4",
+          "question": "执行 SHUTDOWN NOSAVE 后，Redis 重启时数据恢复到什么状态？",
+          "choices": [
+            { "id": "A", "text": "恢复到 Lua 脚本开始执行前的状态（脚本的所有写入被回滚）" },
+            { "id": "B", "text": "恢复到最后一次 RDB 快照或 AOF 持久化的状态，中间所有未持久化的写入（包括脚本的写入）都丢失" },
+            { "id": "C", "text": "恢复到 Redis 启动时的空数据库状态" },
+            { "id": "D", "text": "恢复到最后一次 BGSAVE 的状态，但 AOF 中记录的增量写入会被重放" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SHUTDOWN NOSAVE 的 NOSAVE 关键字意味着不执行任何持久化操作就直接退出 Redis 进程。重启后 Redis 从磁盘上已有的持久化文件恢复数据——如果配置了 AOF 且存在 appendonly.aof 文件，就从 AOF 恢复（AOF 优先级高于 RDB）；如果只配置了 RDB，就从最后一次 BGSAVE 生成的 dump.rdb 恢复。关键点是：从上次持久化到 SHUTDOWN NOSAVE 之间的所有写入都会丢失，包括那个失控脚本产生的写入。选项 A 的「回滚」说法是错误的，Redis 没有事务回滚机制。选项 C 不对，只要磁盘上有持久化文件就会恢复。选项 D 的描述在 NOSAVE 场景下也不完全准确——NOSAVE 退出时不会生成新的持久化文件，AOF 恢复的是 NOSAVE 之前已经 fsync 到磁盘的内容。"
+        },
+        {
+          "id": "redis-lua-timeout-q1-quiz5",
+          "question": "以下 Redis 输出说明了什么情况？\n```\n127.0.0.1:6379> GET user:1001\n(error) BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\n127.0.0.1:6379> SCRIPT KILL\n(error) UNKILLABLE Sorry the script already executed write commands against the dataset.\n```",
+          "choices": [
+            { "id": "A", "text": "Redis 正在执行一个超时的只读 Lua 脚本，但因为并发冲突导致 SCRIPT KILL 失败" },
+            { "id": "B", "text": "Redis 正在执行一个超时的 Lua 脚本，该脚本已经执行了写命令，无法被 SCRIPT KILL 终止，只能 SHUTDOWN NOSAVE" },
+            { "id": "C", "text": "Redis 内存不足触发了 OOM 保护，所有写命令被拒绝" },
+            { "id": "D", "text": "Redis 正在执行 BGSAVE 持久化操作，暂时无法处理其他命令" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这段输出展示了 Lua 脚本超时最危险的场景。第一条命令 GET user:1001 返回 BUSY 错误，说明有一个 Lua 脚本正在执行且已超过 lua-time-limit 时间限制，Redis 开始对其他客户端返回 BUSY 状态。第二条命令 SCRIPT KILL 返回 UNKILLABLE 错误，说明这个脚本已经执行了写操作（调用过 SET、DEL 等写命令），Redis 拒绝终止它以避免数据不一致。此时管理员只有两个选择：要么继续等待脚本自行执行完毕（如果脚本有退出条件的话），要么执行 SHUTDOWN NOSAVE 强制关闭 Redis 并接受数据丢失。选项 C 和 D 与 BUSY 和 UNKILLABLE 这两个错误信息完全不相关。"
+        },
+        {
+          "id": "redis-lua-timeout-q1-quiz6",
+          "question": "以下哪种 Lua 脚本写法最可能在生产中导致 Redis 不可用？",
+          "choices": [
+            { "id": "A", "text": "EVAL \"return redis.call('GET', KEYS[1])\" 1 mykey" },
+            { "id": "B", "text": "EVAL \"local members = redis.call('SMEMBERS', KEYS[1]) ...\" 1 big_set（big_set 有 200 万个元素）" },
+            { "id": "C", "text": "EVAL \"redis.call('SET', KEYS[1], ARGV[1])\" 1 mykey myvalue" },
+            { "id": "D", "text": "EVAL \"return redis.call('INCR', KEYS[1])\" 1 counter" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 对一个包含 200 万元素的 Set 执行 SMEMBERS，这是一个 O(n) 操作，会将所有 200 万个元素一次性加载到 Lua 的内存中。这个操作可能耗时数秒甚至十几秒，在此期间 Redis 主线程被完全阻塞，无法处理其他客户端的任何请求。这是生产中最常见的 Lua 脚本超时场景之一——脚本本身没有 bug，但操作的 key 数据量过大导致执行时间超出预期。正确做法是避免在 Lua 脚本中对大 key 做全量操作，如果必须遍历大 Set 应在应用层使用 SSCAN 分批获取。选项 A、C、D 都是简单的 O(1) 操作，执行时间在微秒级，不会造成阻塞问题。"
+        },
+        {
+          "id": "redis-lua-timeout-q1-quiz7",
+          "question": "Lua 脚本超时对 Redis Sentinel 高可用架构有什么影响？",
+          "choices": [
+            { "id": "A", "text": "没有影响，Sentinel 的健康检查走独立的管理端口，不受 Lua 脚本阻塞" },
+            { "id": "B", "text": "如果脚本阻塞时间超过 Sentinel 的 down-after-milliseconds，Sentinel 会误判主节点宕机并触发不必要的故障转移" },
+            { "id": "C", "text": "Sentinel 会自动检测到脚本阻塞并执行 SCRIPT KILL" },
+            { "id": "D", "text": "Sentinel 会暂停故障检测直到脚本执行完毕" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Sentinel 通过在 Redis 的命令端口（默认 6379）上发送 PING 命令来检测主节点是否存活。当 Lua 脚本阻塞 Redis 主线程时，Redis 无法正常响应 Sentinel 的 PING。如果这种无响应状态持续超过 Sentinel 配置的 down-after-milliseconds（默认 30 秒），Sentinel 会将主节点标记为主观下线（SDOWN），如果多个 Sentinel 达成共识还会标记为客观下线（ODOWN），随后触发自动故障转移——将一个从节点提升为新主节点。这在 Lua 脚本只是暂时阻塞的情况下完全是不必要的。选项 A 不正确，Sentinel 和普通客户端走同一个端口。选项 C 也不对，Sentinel 没有自动 SCRIPT KILL 的功能。预防手段是确保 down-after-milliseconds 远大于 lua-time-limit。"
+        },
+        {
+          "id": "redis-lua-timeout-q1-quiz8",
+          "question": "生产环境中发现 SLOWLOG 里频繁出现 EVAL 命令耗时 800ms，以下哪个处理方案最合理？",
+          "choices": [
+            { "id": "A", "text": "把 lua-time-limit 从 5000ms 调高到 30000ms，避免触发 BUSY 错误" },
+            { "id": "B", "text": "分析脚本逻辑，拆分大 key 操作为多次小批量调用，优化脚本将执行时间降到毫秒级" },
+            { "id": "C", "text": "把 slowlog-log-slower-than 调高到 1 秒，这样 800ms 的脚本就不会出现在 SLOWLOG 里了" },
+            { "id": "D", "text": "关闭 SLOWLOG 功能以减少 Redis 的开销" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "EVAL 命令耗时 800ms 意味着 Redis 主线程被阻塞了 0.8 秒，对于一个通常响应时间在 0.1ms 级别的 Redis 来说，这已经是严重的性能问题。正确做法是定位脚本中的性能瓶颈——最常见的原因是脚本中有对大 key 的 O(n) 操作（如 SMEMBERS、HGETALL、ZRANGEBYSCORE 不带 LIMIT），应该改为小批量操作或在应用层用 SCAN 增量遍历。选项 A 是典型的掩耳盗铃做法，调高 lua-time-limit 只是延迟了 BUSY 错误的出现，脚本仍然阻塞 Redis 长达 800ms。选项 C 和 D 更离谱，都是隐藏问题而非解决问题——SLOWLOG 是发现性能隐患的重要工具，关闭或调高阈值只会让你对问题一无所知直到出大事。"
+        },
+        {
+          "id": "redis-lua-timeout-q1-quiz9",
+          "question": "Redis 7.0 Functions 的 no-writes 标志在超时场景下提供了什么优势？",
+          "choices": [
+            { "id": "A", "text": "声明 no-writes 的函数超时后会被 Redis 自动终止" },
+            { "id": "B", "text": "声明 no-writes 的函数可以绕过 lua-time-limit 限制，执行时间不受约束" },
+            { "id": "C", "text": "声明 no-writes 的函数在超时时 SCRIPT KILL 一定可以成功执行，不会出现 UNKILLABLE 困境" },
+            { "id": "D", "text": "声明 no-writes 的函数不会阻塞 Redis 主线程，在后台异步执行" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 7.0 Functions 允许在注册函数时通过 flags 声明 no-writes 标志，表明该函数不会执行任何写操作。这在超时场景下的核心价值是：管理员可以确信对这个函数执行 SCRIPT KILL 一定会成功——因为 Redis 知道它没有写操作，不会出现传统 EVAL 中「运行时才发现脚本已写入数据，SCRIPT KILL 返回 UNKILLABLE」的尴尬局面。此外 no-writes 函数还可以通过 FCALL_RO 在只读副本上执行，分担主节点压力。选项 A 不对，no-writes 不改变 Redis 不自动终止脚本的行为。选项 B 不对，lua-time-limit 对所有脚本和函数都生效。选项 D 也不对，即使声明了 no-writes，函数仍然在主线程中同步执行。"
+        },
+        {
+          "id": "redis-lua-timeout-q1-quiz10",
+          "question": "线上 Redis 出现 BUSY 错误，你先执行了 SCRIPT KILL 并成功终止了脚本，接下来的排查步骤应该优先做什么？",
+          "choices": [
+            { "id": "A", "text": "立即重启 Redis 以清除脚本缓存，防止同一脚本被再次执行" },
+            { "id": "B", "text": "检查 SLOWLOG 和 CLIENT LIST 定位是哪个客户端执行了什么脚本，找到根因后修复代码并加强脚本审查机制" },
+            { "id": "C", "text": "把 lua-time-limit 设为 0 以禁用 Lua 脚本功能" },
+            { "id": "D", "text": "删除 Redis 中所有的脚本缓存（SCRIPT FLUSH）并禁止使用 EVAL 命令" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SCRIPT KILL 成功后 Redis 恢复了正常服务，但这只是止血——你必须找到根因。首先用 SLOWLOG GET 查看最近的慢命令记录，里面会包含导致超时的 EVAL/EVALSHA 命令及其脚本内容和客户端来源。同时检查 CLIENT LIST 或应用日志定位是哪个服务发起的脚本调用，找到后修复代码并建立 Lua 脚本的代码审查机制和 SLOWLOG 告警。选项 A 是过度反应，重启会影响所有在线业务且脚本缓存清除并不能阻止客户端重新 EVAL。选项 C 设为 0 不会禁用 Lua 脚本，只是让 Redis 永远不返回 BUSY 错误，脚本仍然阻塞反而更危险。选项 D 过于极端，正确做法是治理而非禁用。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/develop/interact/programmability/eval-intro/",
+        "https://redis.io/docs/latest/commands/script-kill/",
+        "https://redis.io/docs/latest/commands/eval/",
+        "https://redis.io/docs/latest/develop/interact/programmability/functions-intro/",
+        "https://redis.io/docs/latest/commands/shutdown/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/config/"
+      ]
+    }
+  ]
+}
