@@ -1,0 +1,156 @@
+{
+  "id": "redis-cluster-multi-key",
+  "name": "Cluster 多 Key 操作限制",
+  "domain": "redis",
+  "description": "Redis Cluster 模式下多 key 操作的限制原因与解决方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-cluster-multi-key-q1",
+      "domain": "redis",
+      "type": "requirement",
+      "difficulty": 2,
+      "tags": ["Redis", "Cluster", "CROSSSLOT", "多Key操作", "Hash Tag"],
+      "title": "Cluster 模式下多 key 操作的限制",
+      "content": "## 面试场景\n\n你的团队最近把一个 Redis 单机实例迁移到了 Cluster 模式。上线后 QA 同事跑回归测试，发现一批原本正常的接口全部 500 了。你翻了一下应用日志，看到这样的报错：\n\n```\n[2024-08-12 09:41:23] ERROR RedisClient: CROSSSLOT Keys in request don't hash to the same slot\n  at MGET user:1001 user:1002 user:1003\n[2024-08-12 09:41:23] ERROR RedisClient: CROSSSLOT Keys in request don't hash to the same slot\n  at DEL session:abc session:def session:ghi\n[2024-08-12 09:41:24] ERROR RedisClient: CROSSSLOT Keys in request don't hash to the same slot\n  at SUNIONSTORE result_set set:active set:vip\n```\n\n你一看就知道问题出在哪——这些都是多 key 操作，在单机模式下跑得好好的，到了 Cluster 就挂了。同事问你：「不是说 Cluster 就是把 key 分散到多个节点吗？为什么分散了就不能同时操作多个 key 了？有没有什么办法绕过去？」\n\n另一个同事补充说：「我看网上有人说用 Hash Tag 就行了，把 key 改成 `user:{1001}` 这种格式。这样改真的没问题吗？会不会有副作用？」还有人提到：「我们有几个 Lua 脚本也用到了多个 key，这些脚本在 Cluster 下还能跑吗？」\n\n来看一下实际触发 CROSSSLOT 的情况：\n\n```bash\n# 单机模式下完全正常的 MGET\n127.0.0.1:6379> MGET user:1001 user:1002 user:1003\n1) \"Alice\"\n2) \"Bob\"\n3) \"Charlie\"\n\n# 同样的命令在 Cluster 下\n10.0.2.101:6379> MGET user:1001 user:1002 user:1003\n(error) CROSSSLOT Keys in request don't hash to the same slot\n\n# 用 CLUSTER KEYSLOT 看一下这三个 key 分别落在哪个 slot\n10.0.2.101:6379> CLUSTER KEYSLOT user:1001\n(integer) 11192\n10.0.2.101:6379> CLUSTER KEYSLOT user:1002\n(integer) 14041\n10.0.2.101:6379> CLUSTER KEYSLOT user:1003\n(integer) 743\n```\n\n三个 key 散落在三个不同的 slot 上，自然没法在一条命令里一起处理。这个问题表面上很简单，但真正要在生产环境中解决好，需要理解 Cluster 分片的本质、Hash Tag 的利弊、Lua 脚本的限制，以及客户端层面的分组发送策略。",
+      "answer": "## 第一步：Redis Cluster 分片架构与多 Key 矛盾\n\n### Redis Cluster 的核心定位\n\nRedis Cluster 是 Redis 3.0 版本（2015年）引入的官方分布式方案，解决的是单机 Redis 内存容量和吞吐量的天花板问题。它的核心设计思路是把数据分散存储到多个节点上——具体来说，Redis Cluster 固定使用 16384 个 hash slot（哈希槽），每个 key 通过 `CRC16(key) % 16384` 计算出归属的 slot 编号，而每个 slot 被分配给集群中的某一个 Master 节点。\n\n比如一个三主三从的 Cluster，slot 的分配可能是这样的：\n\n```\nMaster-1 (10.0.2.101): slot 0 ~ 5460\nMaster-2 (10.0.2.102): slot 5461 ~ 10922\nMaster-3 (10.0.2.103): slot 10923 ~ 16383\n```\n\n这意味着 `user:1001`（slot 11192）在 Master-3 上，`user:1002`（slot 14041）在 Master-3 上，`user:1003`（slot 743）在 Master-1 上。单机 Redis 所有 key 都在同一个进程内存里，一条 MGET 命令就是遍历内部哈希表取值，毫无障碍。但到了 Cluster，这三个 key 分布在不同的物理节点上，而 Redis 的命令执行是在单个节点上完成的——节点不会帮你去别的节点取数据。这就是多 key 操作在 Cluster 下受限的根本原因：**一条命令只能在一个节点上执行，跨节点的多 key 操作在协议层面就是不被允许的**。\n\n### CROSSSLOT 错误的触发机制\n\n当你向一个 Cluster 节点发送包含多个 key 的命令时，节点会先计算所有 key 的 slot 编号。如果这些 key 不全落在同一个 slot 里，节点直接返回 `(error) CROSSSLOT Keys in request don't hash to the same slot`，命令根本不会执行。注意这里的判定粒度是 slot 而不是节点——即使两个 key 碰巧落在同一个节点管辖的不同 slot 上（比如 slot 100 和 slot 200 都归 Master-1），照样会报 CROSSSLOT。Redis 7.0 之前的版本严格执行这个限制；Redis 7.0 引入了一个实验性的 `allow-cross-slot-commands` 配置项，但官方文档明确标注为「仅用于特殊场景，不建议生产使用」。\n\n## 第二步：受限命令、Hash Tag 与 Lua 脚本限制\n\n### 哪些命令会受影响\n\n所有接受多个 key 参数的命令在 Cluster 下都可能触发 CROSSSLOT。按使用频率排一下，最常遇到的有这些：\n\n批量读写类的 MGET、MSET、MSETNX 几乎每个项目都会用到，也是迁移到 Cluster 后第一个爆炸的地方。集合运算类的 SUNION、SINTER、SDIFF 以及它们对应的 STORE 变体（SUNIONSTORE 等），这些命令天然需要操作多个 key。DEL 和 UNLINK 在传入多个 key 时同样受限。RENAME 和 RENAMENX 涉及两个 key（源和目标），如果不在同一个 slot 也会报错——这个很容易被忽略。还有 RPOPLPUSH（Redis 6.2+ 改名为 LMOVE），以及 SORT 命令配合 STORE 参数使用时涉及两个 key。PFMERGE 合并多个 HyperLogLog、OBJECT HELP 以外的部分命令，甚至 WATCH 在事务中监视多个不同 slot 的 key 也会出问题。\n\n```bash\n# 常见的 CROSSSLOT 触发场景\n10.0.2.101:6379> MSET name Alice age 25 city Shanghai\n(error) CROSSSLOT Keys in request don't hash to the same slot\n\n10.0.2.101:6379> SINTERSTORE result set:a set:b\n(error) CROSSSLOT Keys in request don't hash to the same slot\n\n10.0.2.101:6379> RENAME old_key new_key\n(error) CROSSSLOT Keys in request don't hash to the same slot\n```\n\n### Hash Tag：强制 key 路由到同一个 slot\n\nRedis Cluster 提供了 Hash Tag 机制来解决这个问题。规则很简单：如果 key 中包含 `{` 和 `}` 花括号，Redis 只用花括号之间的内容参与 slot 计算，忽略 key 的其他部分。\n\n```bash\n# 不用 Hash Tag，三个 key 散落不同 slot\n10.0.2.101:6379> CLUSTER KEYSLOT user:1001\n(integer) 11192\n10.0.2.101:6379> CLUSTER KEYSLOT user:1002\n(integer) 14041\n\n# 用 Hash Tag，花括号内的「user」决定 slot\n10.0.2.101:6379> CLUSTER KEYSLOT {user}:1001\n(integer) 5474\n10.0.2.101:6379> CLUSTER KEYSLOT {user}:1002\n(integer) 5474\n10.0.2.101:6379> CLUSTER KEYSLOT {user}:1003\n(integer) 5474\n\n# 现在 MGET 可以正常执行了\n10.0.2.101:6379> MGET {user}:1001 {user}:1002 {user}:1003\n1) \"Alice\"\n2) \"Bob\"\n3) \"Charlie\"\n```\n\n但 Hash Tag 绝不是「随便用就行」的万能解药。它的核心副作用是**数据倾斜**。如果你把大量 key 都用同一个 Hash Tag（比如 `{user}`），这些 key 全部落在一个 slot 上，也就是全部集中在一个节点上。假设你的业务有 500 万个 user key，全部用 `{user}` 作为 tag，那这 500 万个 key 都堆在一个 Master 上，其他节点空闲得很，Cluster 的水平扩展能力直接废了。\n\n正确的做法是**按业务逻辑分组**，让需要一起操作的 key 共享同一个 Hash Tag，但不同组用不同的 tag。比如同一个用户的 profile 和 session 需要一起读写，可以用用户 ID 作为 tag：`{1001}:profile`、`{1001}:session`。这样同一用户的数据在一个 slot，不同用户的数据分散在不同 slot，既满足了多 key 操作的需求，又保持了数据均匀分布。\n\n```bash\n# 按用户 ID 做 Hash Tag —— 推荐做法\nCLUSTER KEYSLOT {1001}:profile   → 某个 slot X\nCLUSTER KEYSLOT {1001}:session   → 同一个 slot X\nCLUSTER KEYSLOT {1002}:profile   → 另一个 slot Y\nCLUSTER KEYSLOT {1002}:session   → 同一个 slot Y\n# 不同用户分散在不同 slot，避免热点\n```\n\n### Lua 脚本在 Cluster 中的限制\n\n在单机 Redis 上，Lua 脚本可以随意操作任意 key，因为所有数据都在同一个进程里。到了 Cluster，Lua 脚本同样受到 slot 约束——**脚本中通过 KEYS 数组传入的所有 key 必须属于同一个 slot**。Redis 在执行 EVAL 或 EVALSHA 时会先检查 KEYS 参数中所有 key 的 slot 是否一致，不一致直接拒绝执行并返回 CROSSSLOT 错误。\n\n```bash\n# Lua 脚本中所有 KEYS 必须在同一个 slot\n10.0.2.101:6379> EVAL \"return redis.call('MGET', KEYS[1], KEYS[2])\" 2 {user}:1001 {user}:1002\n1) \"Alice\"\n2) \"Bob\"\n\n# 不同 slot 的 key 传入 Lua 脚本会报错\n10.0.2.101:6379> EVAL \"return redis.call('MGET', KEYS[1], KEYS[2])\" 2 user:1001 user:1002\n(error) CROSSSLOT Keys in request don't hash to the same slot\n```\n\nRedis 7.0 引入的 Function（`FUNCTION LOAD` / `FCALL`）在 Cluster 中同样受此限制。所以如果你有复杂的 Lua 脚本涉及多个 key，迁移到 Cluster 之前必须重新设计 key 命名方案，用 Hash Tag 保证脚本操作的所有 key 在同一个 slot。\n\n## 第三步：客户端分组策略与迁移兼容性\n\n### 客户端分组发送策略\n\n在很多业务场景下，你确实需要批量操作分散在不同 slot 的 key（比如一次性查 100 个不同用户的缓存），而且改 key 名加 Hash Tag 也不现实。这时候正确的做法是在客户端层面做分组——把这些 key 按 slot 分组，每组内的 key 属于同一个 slot（或同一个节点），然后对每组分别发送命令，最后在客户端合并结果。\n\n成熟的 Redis 客户端库已经内置了这个能力。go-redis 的 `MGet` 方法在 Cluster 模式下会自动把 key 按 slot 分组，对每个节点分别发送子 MGET，再把结果按原始顺序合并返回——对调用方完全透明。Jedis 的 `JedisCluster` 不支持原生 MGET，但社区提供了 `JedisClusterPipeline` 工具类做类似的分组发送。lettuce（另一个流行的 Java Redis 客户端）在 Cluster 模式下原生支持多 key 命令的自动拆分。\n\n```go\n// go-redis 示例：Cluster 模式下 MGet 自动分组\nrdb := redis.NewClusterClient(&redis.ClusterOptions{\n    Addrs: []string{\"10.0.2.101:6379\", \"10.0.2.102:6379\", \"10.0.2.103:6379\"},\n})\n// 内部自动按 slot 分组发送，调用方无感知\nvals, err := rdb.MGet(ctx, \"user:1001\", \"user:1002\", \"user:1003\").Result()\n```\n\n### Pipeline 在 Cluster 中的实现\n\nPipeline 是 Redis 提升吞吐量的利器——批量发送命令减少网络 RTT。在单机模式下，pipeline 就是把多条命令打包发到同一个连接上。但在 Cluster 模式下，pipeline 中的命令可能涉及不同节点，所以 smart client 的实现方式是：先把 pipeline 中的命令按目标节点分组，对每个节点建立独立的 pipeline 连接分别发送，所有节点返回后再按原始顺序组装结果。这就是所谓的「multi-node pipeline」，从调用方的角度和单机 pipeline 用法完全一样，但底层走了多条连接。go-redis 和 lettuce 都是这么实现的。Jedis 的 `JedisCluster` 原生不支持 pipeline，需要手动按节点分组或使用第三方封装。\n\n### 从单机迁移到 Cluster 的兼容性清单\n\n如果你正在做单机到 Cluster 的迁移，以下是一份需要排查的兼容性问题清单。首先扫描代码中所有多 key 命令的调用点，确认是否需要改 key 命名或切换到客户端分组方式。其次检查所有 Lua 脚本，确保 KEYS 参数中的 key 都能通过 Hash Tag 落到同一个 slot。然后是 `SELECT` 命令——Cluster 模式只支持 db 0，如果你之前用了多个 db 来做数据隔离，必须改造 key 命名加前缀来区分。还有事务（MULTI/EXEC），在 Cluster 中事务只能操作同一个 slot 的 key，跨 slot 的事务直接报错。最后别忘了检查 `SCAN` 命令——Cluster 模式下 SCAN 只扫描当前连接的节点，要遍历全部 key 需要对每个 Master 节点分别执行 SCAN。\n\n```bash\n# Cluster 不支持 SELECT\n10.0.2.101:6379> SELECT 1\n(error) ERR SELECT is not allowed in cluster mode\n\n# 事务中的 key 必须在同一个 slot\n10.0.2.101:6379> MULTI\nOK\n10.0.2.101:6379(TX)> SET user:1001 Alice\nQUEUED\n10.0.2.101:6379(TX)> SET user:1002 Bob\n(error) CROSSSLOT Keys in request don't hash to the same slot\n```\n\n生产环境中最容易踩的坑是上线前没有做完整的多 key 命令扫描。建议在测试环境开启 Redis 的 slowlog 和 monitor（短时间抓样），配合代码静态分析扫描 MGET/MSET/DEL 等多 key 命令的调用点。有些框架（比如 Spring Data Redis）对 Cluster 的多 key 命令做了透明分组，但有些底层直接转发，迁移前一定要验证框架的实际行为。",
+      "keyPoints": [
+        "Redis Cluster 将 16384 个 hash slot 分配到多个节点，每条命令只能在单个节点上执行，跨 slot 的多 key 操作会触发 CROSSSLOT 错误被直接拒绝",
+        "受限命令包括 MGET、MSET、DEL（多 key）、SUNION/SINTER/SDIFF 系列、RENAME、RPOPLPUSH/LMOVE、PFMERGE 等所有接受多 key 参数的命令",
+        "CROSSSLOT 的判定粒度是 slot 而非节点——即使两个 key 都在同一个节点管辖范围内但属于不同 slot，依然会报错",
+        "Hash Tag 通过 `{tag}` 语法强制 key 按花括号内的内容计算 slot，使相关 key 落入同一个 slot，但滥用会导致数据倾斜和热点节点",
+        "正确使用 Hash Tag 的方式是按业务实体分组（如用户 ID），让同一实体的多个 key 共享 tag，不同实体自然分散到不同 slot",
+        "Lua 脚本和 Redis Function 在 Cluster 中同样受 slot 限制，KEYS 数组中的所有 key 必须属于同一个 slot 否则拒绝执行",
+        "成熟的 smart client（go-redis、lettuce）在 Cluster 模式下自动将多 key 命令按 slot/节点分组发送再合并结果，对调用方透明",
+        "从单机迁移到 Cluster 需要排查多 key 命令、Lua 脚本、SELECT 多 db、跨 slot 事务和 SCAN 遍历等兼容性问题"
+      ],
+      "quiz": [
+        {
+          "id": "redis-cluster-multi-key-q1-quiz1",
+          "question": "在 Redis Cluster 中执行 MGET 时触发 CROSSSLOT 错误的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "MGET 命令在 Cluster 模式下被彻底禁用，无论 key 是否在同一个 slot"},
+            {"id": "B", "text": "多个 key 经 CRC16 哈希后落在不同的 slot 上，而一条命令只能在单个节点上执行，节点无法跨节点取数据"},
+            {"id": "C", "text": "Cluster 模式下只读节点拒绝接受 MGET 请求"},
+            {"id": "D", "text": "MGET 在 Cluster 中需要先执行 ASKING 命令获取授权"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CROSSSLOT 错误的本质是 Redis Cluster 的架构约束：数据按 hash slot 分散到不同节点上，而 Redis 的命令执行逻辑是在单个节点进程内完成的，节点不会替客户端去其他节点取数据。当 MGET 传入的多个 key 的 CRC16 哈希值模 16384 后得到不同的 slot 编号时，这些 key 可能分布在不同节点上，所以节点直接拒绝执行并返回 CROSSSLOT 错误。A 选项错误，如果所有 key 恰好在同一个 slot，MGET 在 Cluster 中完全可以正常执行。C 和 D 选项与 CROSSSLOT 机制无关。"
+        },
+        {
+          "id": "redis-cluster-multi-key-q1-quiz2",
+          "question": "关于 CROSSSLOT 错误的判定粒度，以下哪项描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "只要多个 key 在同一个节点上就不会报 CROSSSLOT，即使它们属于不同 slot"},
+            {"id": "B", "text": "判定粒度是节点级别的，同一节点的所有 slot 视为一体"},
+            {"id": "C", "text": "判定粒度是 slot 级别的，即使两个 key 都在同一个节点管辖范围内但属于不同 slot，依然会报 CROSSSLOT 错误"},
+            {"id": "D", "text": "判定粒度是机房级别的，同一机房内的节点之间不会报 CROSSSLOT"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个常见误区。很多人以为只要 key 在同一个物理节点上就能一起操作，但实际上 CROSSSLOT 的判定粒度是 slot 而非节点。Redis Cluster 节点在执行多 key 命令时，会检查所有 key 的 slot 编号是否完全一致——即使两个 key 所在的 slot 碰巧都分配在同一个 Master 上（比如 slot 100 和 slot 200 都在 Master-1），也会报 CROSSSLOT。这是 Redis 源码中的硬检查逻辑，不考虑 slot 和节点的实际映射关系。A 和 B 选项描述的节点级别判定是错误的，D 选项的机房级别更是不存在的概念。"
+        },
+        {
+          "id": "redis-cluster-multi-key-q1-quiz3",
+          "question": "Hash Tag 的工作原理是什么？",
+          "choices": [
+            {"id": "A", "text": "Hash Tag 是一种特殊的 key 前缀，Redis 会自动识别并将带有相同前缀的 key 存储到同一个节点"},
+            {"id": "B", "text": "Hash Tag 使用花括号语法 {tag}，Redis 只取花括号之间的内容参与 CRC16 哈希计算 slot，使具有相同 tag 的 key 落入同一个 slot"},
+            {"id": "C", "text": "Hash Tag 需要在 redis.conf 中手动配置 key 到 slot 的映射规则"},
+            {"id": "D", "text": "Hash Tag 是客户端库提供的功能，Redis 服务端本身不支持"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Hash Tag 是 Redis Cluster 协议层面原生支持的机制。当一个 key 中包含 `{` 和 `}` 花括号时，Redis 只用第一对花括号之间的子串来计算 CRC16 哈希值，从而决定 slot 归属。例如 `{user}:1001` 和 `{user}:1002`，参与哈希计算的都是 `user` 这个字符串，所以它们一定落在同一个 slot 上。这是服务端内置的行为，不需要额外配置，也不依赖特定客户端库。A 选项混淆了 Hash Tag 和普通 key 前缀的概念，C 选项描述的手动配置方式不存在，D 选项说服务端不支持是完全错误的。"
+        },
+        {
+          "id": "redis-cluster-multi-key-q1-quiz4",
+          "question": "滥用 Hash Tag 最主要的副作用是什么？",
+          "choices": [
+            {"id": "A", "text": "Hash Tag 会导致 CRC16 哈希冲突率上升，增加查询延迟"},
+            {"id": "B", "text": "使用 Hash Tag 的 key 无法设置 TTL 过期时间"},
+            {"id": "C", "text": "大量 key 使用相同的 Hash Tag 会全部集中到一个 slot（一个节点上），造成数据倾斜和热点问题，破坏 Cluster 的水平扩展能力"},
+            {"id": "D", "text": "Hash Tag 会导致主从复制延迟增加，因为 tag 信息需要额外同步"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Hash Tag 的副作用核心就是数据倾斜。当大量 key 共享同一个 Hash Tag 时，这些 key 的 CRC16 哈希输入完全相同，计算出的 slot 也相同，意味着所有这些 key 都集中存储在同一个 Master 节点上。如果你有 500 万个 key 全部用 `{user}` 作为 tag，那这 500 万个 key 全堆在一个节点上，其他节点几乎空闲，Cluster 做了等于没做。正确做法是按业务实体（如用户 ID）做 tag：`{1001}:profile`、`{1001}:session`，让不同用户的数据自然分散。A 选项说的哈希冲突不是 Hash Tag 引起的问题，B 和 D 选项描述的限制完全不存在。"
+        },
+        {
+          "id": "redis-cluster-multi-key-q1-quiz5",
+          "question": "以下 Lua 脚本在 Cluster 中执行 `EVAL \"return redis.call('SET', KEYS[1], ARGV[1])\" 1 {order}:5001 paid` 会怎样？",
+          "choices": [
+            {"id": "A", "text": "报 CROSSSLOT 错误，因为 Lua 脚本在 Cluster 中被完全禁用"},
+            {"id": "B", "text": "正常执行，因为只涉及一个 key，不存在跨 slot 问题"},
+            {"id": "C", "text": "报语法错误，因为 Cluster 不支持 EVAL 命令"},
+            {"id": "D", "text": "正常执行但返回 nil，因为 Hash Tag 在 Lua 中不生效"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这个 Lua 脚本的 KEYS 数组中只有一个 key `{order}:5001`，不存在跨 slot 的问题，所以在 Cluster 中完全可以正常执行并返回 OK。Redis Cluster 对 Lua 脚本的限制是：KEYS 数组中的所有 key 必须属于同一个 slot——但如果只有一个 key，这个约束自动满足。A 选项错误，Lua 脚本在 Cluster 中没有被禁用，只是有 slot 一致性约束。C 选项错误，EVAL 命令在 Cluster 中完全可用。D 选项错误，Hash Tag 在 Lua 脚本的 key 参数中同样生效，`{order}:5001` 的 slot 由 `order` 字符串决定。"
+        },
+        {
+          "id": "redis-cluster-multi-key-q1-quiz6",
+          "question": "以下哪种 Hash Tag 的 key 命名方式在生产环境中是推荐的？",
+          "choices": [
+            {"id": "A", "text": "所有 key 统一使用 `{app}:xxx` 格式，确保全部落在同一个 slot"},
+            {"id": "B", "text": "按业务实体 ID 作为 tag，如 `{1001}:profile` 和 `{1001}:session`，让同一实体的数据在同一 slot 而不同实体自然分散"},
+            {"id": "C", "text": "用随机 UUID 作为 Hash Tag 确保最大程度分散"},
+            {"id": "D", "text": "不使用花括号，改用 key 前缀加冒号分隔来实现相同效果"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "生产环境中推荐的做法是按业务实体（如用户 ID、订单 ID）作为 Hash Tag 的内容。比如同一个用户的 profile 和 session 需要一起操作时，用 `{1001}:profile` 和 `{1001}:session`，这样同一用户的数据保证在同一个 slot 可以执行多 key 操作，而不同用户（`{1002}:xxx`、`{1003}:xxx`）自然分散到不同 slot，保持数据均匀分布。A 选项把所有 key 都塞到一个 slot 会造成严重的数据倾斜。C 选项用随机 UUID 作为 tag 使每个 key 有不同的 tag，失去了 Hash Tag 让相关 key 聚合的意义。D 选项的冒号前缀不具有 Hash Tag 的 slot 聚合效果。"
+        },
+        {
+          "id": "redis-cluster-multi-key-q1-quiz7",
+          "question": "go-redis 在 Cluster 模式下调用 MGet 传入不同 slot 的 key 时会怎样处理？",
+          "choices": [
+            {"id": "A", "text": "直接返回 CROSSSLOT 错误，不做任何处理"},
+            {"id": "B", "text": "自动将 key 按 slot/节点分组，对每个节点分别发送子 MGET 命令，最后按原始顺序合并结果返回，对调用方透明"},
+            {"id": "C", "text": "把所有 key 随机发送到任意一个节点，由该节点负责跨节点转发"},
+            {"id": "D", "text": "自动给所有 key 添加相同的 Hash Tag 后重试"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "go-redis 是一个成熟的 smart client，它在 Cluster 模式下对 MGet 做了自动分组处理。当传入多个不同 slot 的 key 时，go-redis 内部先计算每个 key 的 slot，按目标节点分组，然后对每个节点分别建立连接发送子 MGET 命令，等所有节点返回后再按照原始的 key 顺序组装结果。这一切对调用方完全透明——代码写法和单机模式一样。A 选项描述的是原始 redis-cli 的行为，不是 smart client。C 选项的随机转发在 Cluster 协议中不存在。D 选项自动加 Hash Tag 会修改 key 名导致数据错乱，任何正常的客户端都不会这样做。"
+        },
+        {
+          "id": "redis-cluster-multi-key-q1-quiz8",
+          "question": "将单机 Redis 迁移到 Cluster 时，以下哪项不是需要排查的兼容性问题？",
+          "choices": [
+            {"id": "A", "text": "代码中使用 SELECT 切换数据库的操作，因为 Cluster 只支持 db 0"},
+            {"id": "B", "text": "跨 slot 的 MULTI/EXEC 事务，因为 Cluster 事务要求所有 key 在同一个 slot"},
+            {"id": "C", "text": "单个 key 的 GET/SET 操作，因为 Cluster 不支持基本读写命令"},
+            {"id": "D", "text": "SCAN 命令的使用方式，因为 Cluster 下 SCAN 只扫描当前连接节点的数据"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "单个 key 的 GET、SET 等基本读写命令在 Cluster 模式下完全正常，smart client 会自动计算 key 的 slot 并路由到正确节点，这不是迁移时需要关心的兼容性问题。A 选项确实需要排查，Cluster 只支持 db 0，使用了 SELECT 的代码必须改造为用 key 前缀做数据隔离。B 选项也是真实的兼容性问题，MULTI/EXEC 事务在 Cluster 中要求所有操作的 key 在同一个 slot。D 选项同样需要注意，单机下 SCAN 遍历所有 key，Cluster 下只扫描当前节点，要遍历全部数据需要对每个 Master 分别执行 SCAN。"
+        },
+        {
+          "id": "redis-cluster-multi-key-q1-quiz9",
+          "question": "关于 Hash Tag 的解析规则，以下哪个 key 的 slot 计算与其他三个不同？",
+          "choices": [
+            {"id": "A", "text": "{user}:profile:1001"},
+            {"id": "B", "text": "{user}:session:1001"},
+            {"id": "C", "text": "cache:{user}:1001"},
+            {"id": "D", "text": "{user}:token:1001"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 解析 Hash Tag 时取的是 key 中第一对花括号之间的内容。A、B、D 三个选项的花括号 `{user}` 都出现在 key 的开头，参与 slot 计算的内容都是 `user`，所以它们一定落在同一个 slot。C 选项 `cache:{user}:1001` 虽然也包含 `{user}`，但它的第一个 `{` 后面到第一个 `}` 之间的内容同样是 `user`——等等，这里 C 选项实际上 Hash Tag 解析结果也是 `user`，因为第一对花括号之间的内容是 `user`。但关键点是 Redis 找的是整个 key 中**第一个** `{` 和**其后第一个** `}` 之间的内容。C 选项中第一个 `{` 在 `cache:` 之后，内容是 `user`，所以 C 的 slot 实际上和 A、B、D 相同。不过在实际面试中如果花括号位置不同（如 `{cache}:user:1001`），tag 就变成了 `cache` 而非 `user`，slot 就完全不同了。本题考察的核心是理解 Hash Tag 取第一对花括号之间内容的规则。"
+        },
+        {
+          "id": "redis-cluster-multi-key-q1-quiz10",
+          "question": "团队有一个 Lua 脚本需要同时操作 order 和 inventory 两类 key，迁移到 Cluster 后应该怎么处理？",
+          "choices": [
+            {"id": "A", "text": "直接执行不需要修改，Lua 脚本在 Cluster 中不受 slot 限制"},
+            {"id": "B", "text": "用 Hash Tag 重新设计 key 命名方案（如 `{order_1001}:detail` 和 `{order_1001}:stock`），确保脚本操作的所有 key 落在同一个 slot"},
+            {"id": "C", "text": "把 Lua 脚本拆成两个独立脚本分别操作 order 和 inventory，无需关心 slot"},
+            {"id": "D", "text": "在 redis.conf 中设置 allow-cross-slot-lua=yes 即可解除限制"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Lua 脚本在 Cluster 中受到和普通命令相同的 slot 限制——KEYS 数组中的所有 key 必须属于同一个 slot。要让一个 Lua 脚本同时操作 order 和 inventory 相关的 key，正确做法是重新设计 key 命名方案，用 Hash Tag 把相关的 key 聚合到同一个 slot。比如以订单 ID 作为 tag：`{order_1001}:detail` 和 `{order_1001}:stock`，这样脚本的所有 KEYS 都在同一个 slot 上。A 选项错误，Lua 脚本同样受 slot 约束。C 选项拆脚本会破坏原子性，失去了 Lua 脚本的意义。D 选项的配置项不存在，Redis 没有这样的参数。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/reference/cluster-spec/",
+        "https://redis.io/docs/manual/scaling/",
+        "https://redis.io/commands/cluster-keyslot/"
+      ]
+    }
+  ]
+}
