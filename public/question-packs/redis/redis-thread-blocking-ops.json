@@ -1,0 +1,159 @@
+{
+  "id": "redis-thread-blocking-ops",
+  "name": "哪些 Redis 操作仍然会阻塞主线程",
+  "domain": "redis",
+  "description": "系统排查 Redis 中仍会阻塞主线程的危险操作——KEYS、大 key DEL、fork、AOF fsync 等，涵盖 SLOWLOG 定位、lazy-free 机制与生产防御策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-thread-blocking-ops-q1",
+      "domain": "redis",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["阻塞操作", "KEYS", "大key删除", "fork", "SLOWLOG", "慢查询", "redis-threading"],
+      "title": "哪些 Redis 操作仍然会阻塞主线程？",
+      "content": "## 故障场景\n\n你所在团队维护一个日活 200 万的电商平台，核心业务依赖一台 Redis 6.2 实例做会话缓存和商品库存扣减。某天下午 14:30 大促期间，监控突然告警：Redis 的 P99 延迟从平时的 0.2ms 飙升到 3200ms，几乎所有业务服务都在报 `redis.clients.jedis.exceptions.JedisConnectionException: Read timed out`。持续了大约 4 秒后自动恢复，但 5 分钟后又来了一次。\n\n你 SSH 到 Redis 所在机器，先看了一眼 SLOWLOG：\n\n```\n127.0.0.1:6379> SLOWLOG GET 5\n1) 1) (integer) 42\n   2) (integer) 1700000000\n   3) (integer) 3215400\n   4) 1) \"KEYS\"\n      2) \"session:*\"\n   5) \"10.0.1.55:43210\"\n   6) \"app-session-cleaner\"\n2) 1) (integer) 41\n   2) (integer) 1699999980\n   3) (integer) 487320\n   4) 1) \"DEL\"\n      2) \"product:detail:cache:8847291\"\n   5) \"10.0.1.60:38712\"\n   6) \"cache-invalidator\"\n```\n\n第一条记录显示 `KEYS session:*` 耗时 3215ms（约 3.2 秒），第二条 `DEL product:detail:cache:8847291` 耗时 487ms。你用 `redis-cli DEBUG OBJECT product:detail:cache:8847291` 查看过这个 key——它是一个包含 120 万个 field 的 Hash（商品详情缓存，之前的同事把整个商品目录塞进了一个 key）。\n\n同时你注意到 `INFO stats` 里有一行：\n\n```\nlatest_fork_usec:289341\n```\n\nfork 耗时 289ms。结合 `INFO persistence` 中 `rdb_last_bgsave_time_sec:14` 的记录，BGSAVE 在大促期间被触发了。\n\n问题来了：为什么 Redis 号称「单线程高性能」，却会出现这种秒级阻塞？除了 SLOWLOG 里看到的 KEYS 和大 key DEL，还有哪些操作会阻塞主线程？你会怎么系统性地排查和防御这类问题？",
+      "answer": "## 第一步：Redis 单线程模型的核心含义\n\n要理解为什么 Redis 会出现秒级阻塞，首先要搞清楚「Redis 是单线程」这句话到底是什么意思。很多人把这句话理解成「Redis 整个进程只有一个线程」，这是不准确的。准确的说法是：Redis 的命令执行（也就是数据读写的核心逻辑）在主线程中串行完成。从 Redis 6.0 开始，网络 I/O 可以由多个 I/O 线程并行处理（通过 `io-threads` 配置），但命令本身的执行——从查找 key、操作数据结构到生成响应——始终是单线程的。\n\n这个设计带来了一个非常重要的推论：主线程在执行任何一条命令的时候，其他所有客户端的请求都在排队等待。如果一条命令执行了 100ms，那么在这 100ms 内到达的所有请求都会被延迟至少 100ms。Redis 之所以快，是因为绝大多数命令的时间复杂度是 O(1) 或 O(log N)——一条 `GET` 只需要几微秒，一条 `ZADD` 只需要几十微秒。但只要有一条命令打破了这个「微秒级执行」的假设，整个实例的所有客户端都会受影响。\n\n我们先用一条命令看看 Redis 的基本延迟基线。在一台空闲的 Redis 实例上执行 `redis-cli --latency`，你会看到类似这样的输出：\n\n```bash\n$ redis-cli --latency\nmin: 0, max: 1, avg: 0.12 (8523 samples)\n```\n\n平均延迟 0.12ms，最大 1ms——这就是 Redis 正常状态下的表现。如果你看到 max 突然跳到几百甚至几千毫秒，说明有什么东西阻塞了主线程。\n\n## 第二步：系统分类——哪些操作会阻塞主线程\n\n### 危险命令——O(N) 的隐形炸弹\n\n最容易踩坑的是那些时间复杂度为 O(N) 的命令，尤其是 N 等于整个 keyspace 或者某个大集合的大小时。\n\n`KEYS pattern` 是排在第一位的危险命令。它需要遍历整个数据库的哈希表来匹配 pattern，时间复杂度是 O(N)，这里的 N 是数据库中所有 key 的数量——注意不是匹配结果的数量，而是全部 key 的数量。一个包含 500 万个 key 的 Redis 实例，执行 `KEYS *` 在我们的测试中平均耗时 2.8 秒，执行 `KEYS session:*` 也需要 2.6 秒（因为即使只匹配一部分，它仍然要扫描所有 key）。场景中 SLOWLOG 记录的 3215ms 就是这个命令造成的。\n\n`FLUSHDB` 和 `FLUSHALL` 在不带 `ASYNC` 参数时也是同步操作，需要逐个释放所有 key 的内存。一个包含 1000 万个 key 的数据库，`FLUSHDB` 可能需要数秒。Redis 6.2 之后 `lazyfree-lazy-user-flush` 配置可以让 `FLUSHDB`/`FLUSHALL` 默认走异步路径，但如果你用的是更早的版本，必须显式写 `FLUSHDB ASYNC`。\n\n还有一类危险命令是获取大集合全部元素的操作：`SMEMBERS` 返回 Set 的所有成员，`HGETALL` 返回 Hash 的所有 field-value 对，`LRANGE key 0 -1` 返回 List 的所有元素。这些命令的复杂度都是 O(N)，当集合很大时就是灾难。场景中那个 120 万 field 的 Hash，如果有人对它执行 `HGETALL`，不仅主线程要花几百毫秒遍历所有 field，还要把几十 MB 的数据序列化到输出缓冲区——这可能连输出缓冲区的内存上限都会被打爆。`SORT` 命令也属于这一类，它对大集合做排序的复杂度是 O(N+M*log(M))，N 是集合大小，M 是结果集大小。\n\n### 大 key 删除——内存释放的隐形陷阱\n\n`DEL` 命令看起来人畜无害，但当目标 key 是一个包含大量元素的集合类型（Hash、Set、Sorted Set、List）时，它需要同步释放每个元素占用的内存。释放内存涉及调用 `free()` 归还给内存分配器（Redis 默认用 jemalloc），这个过程的耗时与元素数量成正比。\n\n我们可以用一个简单的 benchmark 来感受。往一个 Hash 里写入 100 万个 field，然后用 `DEL` 删除：\n\n```bash\n# 写入 100 万个 field 的 Hash\n$ redis-benchmark -n 1000000 -c 1 -P 100 HSET bigkey field_%rand_int% value_%rand_int%\n\n# 查看 key 大小\n127.0.0.1:6379> HLEN bigkey\n(integer) 983521\n127.0.0.1:6379> DEBUG OBJECT bigkey\nValue at:0x7f4b2c000000 refcount:1 encoding:hashtable serializedlength:23847291 lru:14529130 lru_seconds_idle:2 type:hash\n\n# 删除并观察耗时\n127.0.0.1:6379> DEL bigkey\n(integer) 1\n(0.48s)   # <-- 阻塞了 480ms！\n```\n\n480ms 的阻塞意味着在这半秒内所有客户端都在等。场景中那个 487ms 的 DEL 就是这个问题。\n\nRedis 4.0 引入了 `UNLINK` 命令作为 `DEL` 的异步替代。`UNLINK` 在主线程中只做两件事：从 keyspace 中移除 key 的引用（O(1)），然后把实际的内存释放丢给后台的 `bio_lazy_free` 线程异步完成。主线程几乎不阻塞：\n\n```\n127.0.0.1:6379> UNLINK bigkey\n(integer) 1\n(0.00s)   # <-- 主线程瞬间返回\n```\n\n### fork 操作——页表复制的代价\n\n`BGSAVE`（RDB 快照）和 `BGREWRITEAOF`（AOF 重写）都需要调用 `fork()` 创建子进程。fork 这个系统调用本身需要复制父进程的页表（page table，操作系统用来记录虚拟内存到物理内存映射的数据结构）。Redis 进程占用的内存越大，页表越大，fork 耗时就越长。\n\n在 Linux 上，一个页表条目（PTE）8 字节，对应一个 4KB 的内存页。10GB 的 Redis 进程有大约 10GB / 4KB = 2621440 个页表条目，占用约 20MB。fork 需要复制这 20MB 的页表到子进程，在现代服务器上通常需要 200-400ms。场景中 `latest_fork_usec:289341` 就是 289ms 的 fork 耗时——在这 289ms 内主线程完全阻塞，无法处理任何客户端请求。\n\n这里有一个容易被忽略的细节：如果你开启了 Linux 的 Transparent Huge Pages（THP，透明大页），每个页面从 4KB 变成 2MB，页表条目数量虽然减少了，但 fork 后的 COW（Copy-On-Write）机制在写入时需要复制整个 2MB 的大页而不是 4KB 的小页，导致 fork 之后的内存使用量急剧增加。所以 Redis 官方文档明确建议关闭 THP：\n\n```bash\necho never > /sys/kernel/mm/transparent_hugepage/enabled\n```\n\n### AOF fsync——磁盘 I/O 反噬主线程\n\nRedis 的 AOF 持久化有三种 fsync 策略：`always`、`everysec`（默认）、`no`。`appendfsync always` 模式下，每轮事件循环的 `beforeSleep` 中都会调用 `fsync()` 将 AOF 数据同步到磁盘。`fsync` 是一个阻塞调用，在磁盘忙时可能需要几十毫秒甚至更久——它直接卡在主线程上。\n\n即使用的是默认的 `everysec` 模式，也不是完全安全的。`everysec` 的 fsync 由后台 `bio_aof_fsync` 线程执行，但 Redis 有一个 2 秒保护机制：如果 `beforeSleep` 中发现上一次 fsync 还没完成（通过检查 `aof_bio_fsync_status`），并且距离上次成功的 fsync 已经超过 2 秒，主线程会阻塞等待 fsync 完成再继续。这是为了防止磁盘 I/O 完全失控导致 AOF 数据丢失过多，但代价是主线程被卡住。你可以通过 `INFO persistence` 中的 `aof_delayed_fsync` 计数器监控这种情况：\n\n```\n127.0.0.1:6379> INFO persistence\n# Persistence\naof_enabled:1\naof_delayed_fsync:7     # <-- 如果这个数字在涨，说明磁盘 I/O 跟不上\naof_last_bgrewrite_status:ok\n```\n\n### 集群管理命令\n\n在 Redis Cluster 模式下，某些管理命令也会阻塞主线程。`CLUSTER FLUSHSLOTS` 会同步清理所有 slot 分配信息；`CLUSTER RESET` 会重置集群状态。这些命令在日常运维中不常用，但如果在线上误操作，影响是灾难性的。\n\n## 第三步：排查方法——四板斧定位阻塞源\n\n### SLOWLOG——慢查询日志\n\n`SLOWLOG` 是排查阻塞的第一个工具。它记录执行时间超过阈值的命令，默认阈值是 10ms（`slowlog-log-slower-than 10000` 微秒），最多保留 128 条（`slowlog-max-len 128`）。生产环境建议把阈值调低、条数调高：\n\n```bash\nCONFIG SET slowlog-log-slower-than 5000    # 5ms 以上就记录\nCONFIG SET slowlog-max-len 1024            # 保留 1024 条\n```\n\n查看慢查询：`SLOWLOG GET 20` 返回最近 20 条。每条记录包含 ID、时间戳、耗时（微秒）、命令及参数、客户端地址和客户端名称。如果你看到 `KEYS`、`HGETALL`、`SMEMBERS`、`DEL`（大 key）、`SORT` 频繁出现，就找到了元凶。\n\n### redis-cli --latency——实时延迟监控\n\n`redis-cli --latency` 持续发送 `PING` 并记录延迟，适合实时观察：\n\n```bash\n$ redis-cli --latency-history -i 5\nmin: 0, max: 1, avg: 0.15 (993 samples) -- 15.01 seconds range\nmin: 0, max: 487, avg: 2.34 (876 samples) -- 15.01 seconds range  # <-- 出现 487ms 毛刺\nmin: 0, max: 1, avg: 0.14 (991 samples) -- 15.01 seconds range\n```\n\n看到 max 突然跳高，说明那个时间段有阻塞操作。配合 SLOWLOG 的时间戳交叉对比，就能精确定位。\n\n### INFO commandstats——命令级别统计\n\n`INFO commandstats` 给出每个命令的调用次数、总耗时和平均耗时：\n\n```\n127.0.0.1:6379> INFO commandstats\n# Commandstats\ncmdstat_get:calls=28491032,usec=14245516,usec_per_call=0.50\ncmdstat_set:calls=9831204,usec=6882842,usec_per_call=0.70\ncmdstat_keys:calls=12,usec=38584800,usec_per_call=3215400.00  # <-- 平均 3.2 秒！\ncmdstat_del:calls=48231,usec=31048923,usec_per_call=643.56     # <-- 平均 0.64ms，但有大 key 拉高\ncmdstat_hgetall:calls=3847,usec=19283410,usec_per_call=5012.34 # <-- 平均 5ms，疑似大 Hash\n```\n\n`keys` 命令只被调用了 12 次，但 `usec_per_call` 高达 3215400 微秒（3.2 秒），这就是定时任务里那个 `KEYS session:*`。\n\n### INFO stats 中的 fork 耗时\n\n`INFO stats` 中的 `latest_fork_usec` 记录最近一次 fork 的耗时。如果这个值超过 100ms，说明你的 Redis 内存太大或者操作系统有问题（比如 THP 没关）。监控这个指标，设置告警阈值（建议 200ms）。\n\n## 第四步：Redis 4.0+ lazy-free 机制——异步释放的救赎\n\nRedis 4.0 引入的 lazy-free 机制是解决大 key 删除阻塞的核心方案。它的原理是把内存释放操作从主线程卸载到后台的 `bio_lazy_free` 线程（Redis 内部的 Background I/O 线程之一）。\n\n除了前面提到的 `UNLINK` 替代 `DEL`，Redis 还提供了四个 lazyfree 配置项让各种隐式删除也走异步路径：\n\n```bash\n# redis.conf 推荐配置（Redis 6.0+）\nlazyfree-lazy-expire yes        # 过期 key 删除走异步（key TTL 到期时）\nlazyfree-lazy-server-del yes    # RENAME 等命令覆盖旧 key 时走异步删除\nlazyfree-lazy-user-del yes      # 让 DEL 命令的行为等同于 UNLINK（Redis 6.0+）\nlazyfree-lazy-user-flush yes    # FLUSHDB/FLUSHALL 不带 ASYNC 也走异步（Redis 6.2+）\n```\n\n`lazyfree-lazy-user-del yes` 是一个特别实用的配置——设置后 `DEL` 命令在底层自动转换为异步删除，不需要修改任何业务代码就能消除大 key DEL 的阻塞风险。当然，手动执行 `FLUSHDB ASYNC` 和 `FLUSHALL ASYNC` 也是安全的做法。\n\n## 第五步：生产环境的防御策略\n\n### 禁用危险命令\n\n在 `redis.conf` 中通过 `rename-command` 直接禁用或重命名高危命令：\n\n```bash\nrename-command KEYS \"\"              # 彻底禁用 KEYS\nrename-command FLUSHDB \"\"           # 禁用 FLUSHDB\nrename-command FLUSHALL \"\"          # 禁用 FLUSHALL\nrename-command CONFIG \"REDIS_CONFIG_b8a2f\"  # 重命名 CONFIG 防止误操作\n```\n\n禁用 `KEYS` 后，用 `SCAN` 命令增量遍历 keyspace。`SCAN` 每次只返回一小批 key（默认 10 个，通过 `COUNT` 参数控制），不会阻塞主线程：\n\n```bash\n# SCAN 增量遍历替代 KEYS session:*\n127.0.0.1:6379> SCAN 0 MATCH session:* COUNT 100\n1) \"17920\"       # 下一次迭代的 cursor\n2) 1) \"session:abc123\"\n   2) \"session:def456\"\n   3) \"session:ghi789\"\n   # ... 本批最多返回约 100 个\n```\n\n### 控制单个 key 的大小\n\n大 key 是万恶之源。生产环境中应该对 key 的大小做约束：Hash/Set/ZSet 的元素数量建议不超过 5000，String 类型的 value 建议不超过 10KB。如果业务确实需要大集合，应该做拆分——比如把一个 120 万 field 的 Hash 拆成 1200 个 Hash，每个 1000 个 field，key 名用分片后缀 `product:detail:cache:{shard_id}`。\n\n可以用 `redis-cli --bigkeys` 扫描实例中的大 key：\n\n```bash\n$ redis-cli --bigkeys\n# Scanning the entire keyspace to find biggest keys\n[00.00%] Biggest hash found so far 'product:detail:cache:8847291' with 1200000 fields\n[00.00%] Biggest string found so far 'config:full-dump' with 524288 bytes\n...\n-------- summary -------\nBiggest   hash: product:detail:cache:8847291 (1200000 fields)\nBiggest string: config:full-dump (524288 bytes)\n```\n\n### 监控 fork 耗时并控制内存\n\n`latest_fork_usec` 超过 200ms 就应该告警。如果 fork 耗时过长，要么减小 Redis 的内存占用（拆分到多个实例），要么确认操作系统层面的优化是否到位：关闭 THP、确保 `vm.overcommit_memory=1`（避免 fork 被 OOM Killer 拒绝）。\n\n对于内存超过 10GB 的实例，可以考虑关闭 RDB 自动触发（把 `save` 配置清空），改用 AOF 持久化 + 从节点做 RDB 备份的架构，把 fork 的开销从主节点卸载到从节点。\n\n### 完整的阻塞防御清单\n\n把以上所有策略总结成一个可执行的 redis.conf 配置片段：\n\n```bash\n# === 阻塞防御配置 ===\n# 禁用危险命令\nrename-command KEYS \"\"\nrename-command FLUSHDB \"\"\nrename-command FLUSHALL \"\"\n\n# lazy-free 全开\nlazyfree-lazy-expire yes\nlazyfree-lazy-server-del yes\nlazyfree-lazy-user-del yes\nlazyfree-lazy-user-flush yes\n\n# 慢查询监控\nslowlog-log-slower-than 5000    # 5ms\nslowlog-max-len 1024\n\n# AOF 使用 everysec，避免 always 的同步 fsync\nappendfsync everysec\n\n# 关闭 THP（需在操作系统层面执行）\n# echo never > /sys/kernel/mm/transparent_hugepage/enabled\n```\n\n回到场景中的故障，根本原因是两个叠加：一个定时任务在用 `KEYS session:*` 清理过期会话（应该用 SCAN + TTL 替代），加上一个缓存失效服务在用 `DEL` 删除包含 120 万 field 的大 Hash（应该用 UNLINK 或开启 `lazyfree-lazy-user-del`）。再叠加大促期间触发了 BGSAVE 的 fork，三者接连命中主线程，形成了秒级阻塞的完美风暴。",
+      "keyPoints": [
+        "Redis 命令执行在主线程串行完成，任何一条命令的执行耗时都会阻塞所有其他客户端的请求处理",
+        "KEYS 命令遍历整个 keyspace 复杂度 O(N)，500 万 key 的实例执行 KEYS * 可阻塞 2-3 秒，应禁用并用 SCAN 增量替代",
+        "DEL 大 key（如百万元素的 Hash/Set/ZSet）需要同步释放内存，可阻塞数百毫秒；Redis 4.0+ 应使用 UNLINK 异步删除",
+        "BGSAVE/BGREWRITEAOF 触发 fork() 需复制页表，10GB Redis 的 fork 耗时约 200-400ms，期间主线程完全阻塞",
+        "appendfsync always 每轮事件循环同步 fsync 会阻塞主线程；everysec 模式下如上次 fsync 未完成超 2 秒，主线程也会被阻塞等待",
+        "SLOWLOG GET、redis-cli --latency-history、INFO commandstats、latest_fork_usec 是定位阻塞操作的四个核心工具",
+        "lazyfree-lazy-expire/server-del/user-del/user-flush 四个配置项可让各种隐式删除走异步路径，建议生产环境全部开启",
+        "大 key 拆分（单 Hash/Set/ZSet 元素不超过 5000）和 rename-command 禁用 KEYS 是预防阻塞的两项基本架构规范"
+      ],
+      "quiz": [
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz1",
+          "question": "关于 Redis 的「单线程」含义，以下哪个说法是准确的？",
+          "choices": [
+            { "id": "A", "text": "Redis 整个进程只有一个线程，所有工作（网络 I/O、命令执行、持久化）都在这个线程完成" },
+            { "id": "B", "text": "Redis 的命令执行在主线程串行完成，但网络 I/O（6.0+）、AOF fsync、lazy-free 等由后台线程处理" },
+            { "id": "C", "text": "Redis 6.0 之后已经是完全多线程的，命令执行也可以并行" },
+            { "id": "D", "text": "Redis 的单线程指的是每个客户端连接绑定一个线程，但不同客户端之间是并行的" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 的「单线程」准确含义是命令执行（数据读写的核心逻辑）在主线程中串行完成。但 Redis 并非只有一个线程：从 Redis 4.0 开始，后台有 bio_lazy_free 线程处理异步内存释放、bio_aof_fsync 线程处理 AOF 同步；从 Redis 6.0 开始，io-threads 可以并行处理网络读写。选项 A 忽略了后台线程的存在。选项 C 错在命令执行仍然是单线程串行的，6.0 的多线程只处理网络 I/O。选项 D 描述的是 Memcached 的 worker 线程模型，不是 Redis。"
+        },
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz2",
+          "question": "KEYS session:* 在一个包含 500 万个 key 的 Redis 实例上执行，其时间复杂度和扫描范围是什么？",
+          "choices": [
+            { "id": "A", "text": "O(M)，M 是匹配结果数量，只扫描以 session: 开头的 key" },
+            { "id": "B", "text": "O(N)，N 是数据库中所有 key 的数量，即使只有 100 个匹配结果也要扫描全部 500 万个 key" },
+            { "id": "C", "text": "O(log N)，利用内部排序索引进行前缀查找" },
+            { "id": "D", "text": "O(1)，Redis 对 key 的 pattern 建立了反向索引" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "KEYS 命令的实现是遍历整个数据库的哈希表（dictScan），逐个检查每个 key 是否匹配 pattern。因此无论 pattern 能匹配多少 key，它都必须扫描所有 N 个 key。在 500 万 key 的实例上，即使 pattern 只匹配 10 个结果，KEYS 仍然要扫描全部 500 万个——这就是它危险的根本原因。选项 A 的「只扫描匹配 key」是最常见的误解，Redis 的 key 存储在哈希表中而非有序结构，无法按前缀跳过不匹配的 key。选项 C 和 D 都假设了 Redis 不存在的索引结构。"
+        },
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz3",
+          "question": "DEL 一个包含 100 万个 field 的 Hash 会阻塞主线程约 400-500ms，其根本原因是什么？",
+          "choices": [
+            { "id": "A", "text": "DEL 需要同步遍历 Hash 的所有 field 并逐个调用 free() 释放内存，内存释放操作的开销与元素数量成正比" },
+            { "id": "B", "text": "DEL 需要将删除操作写入 AOF 文件，100 万个 field 的 AOF 记录很大" },
+            { "id": "C", "text": "DEL 需要同步通知所有订阅了该 key 的客户端" },
+            { "id": "D", "text": "DEL 需要等待从节点确认删除才能返回" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "当 DEL 的目标是一个大集合类型（Hash/Set/ZSet/List）时，Redis 主线程需要同步遍历集合中的每个元素，逐一释放它们占用的内存。对于 hashtable 编码的 Hash，这意味着遍历底层 dict 的所有 bucket 和每个 entry，调用 zfree 释放 field 和 value 的 SDS 字符串以及 entry 本身。100 万次 free 调用累积起来就是几百毫秒。这也是 Redis 4.0 引入 UNLINK 的原因——UNLINK 在主线程只做 O(1) 的引用移除，实际内存释放交给后台 bio_lazy_free 线程。选项 B 的 AOF 写入只记录一条 DEL 命令，开销很小。选项 C 和 D 都不是 DEL 的实际行为。"
+        },
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz4",
+          "question": "BGSAVE 触发 fork() 时主线程为什么会阻塞？fork 10GB Redis 进程的典型耗时是多少？",
+          "choices": [
+            { "id": "A", "text": "fork 需要复制 10GB 的全量内存数据到子进程，耗时数十秒" },
+            { "id": "B", "text": "fork 需要复制父进程的页表（约 20MB），不复制实际内存数据，耗时约 200-400ms" },
+            { "id": "C", "text": "fork 本身不阻塞，是子进程的 RDB 写盘操作阻塞了主线程" },
+            { "id": "D", "text": "fork 需要暂停所有 I/O 线程并做内存屏障同步，耗时约 10ms" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "fork() 系统调用使用 COW（Copy-On-Write）机制，不会复制实际的内存数据页。它只需要复制父进程的页表——记录虚拟地址到物理地址映射的数据结构。10GB 内存约有 10GB/4KB = 2621440 个页表条目，每个 8 字节，共约 20MB。复制这 20MB 页表在现代服务器上通常需要 200-400ms，期间主线程在内核态等待 fork 返回，完全无法处理客户端请求。选项 A 的「复制全量内存」是对 fork 最常见的误解，COW 的核心就是避免全量复制。选项 C 错在 fork 调用本身确实阻塞主线程。选项 D 混淆了 fork 的机制。"
+        },
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz5",
+          "question": "在以下 SLOWLOG 输出中，哪条记录最值得关注？为什么？\n\n```\n1) id:88 ts:1700000100 usec:12400 cmd:\"ZADD\" \"leaderboard\" ...\n2) id:87 ts:1700000099 usec:3150000 cmd:\"KEYS\" \"user:*\"\n3) id:86 ts:1700000098 usec:8200 cmd:\"HSET\" \"config\" \"timeout\" \"30\"\n4) id:85 ts:1700000097 usec:487000 cmd:\"DEL\" \"cache:product:big\"\n```",
+          "choices": [
+            { "id": "A", "text": "记录 1（ZADD 12ms），因为 ZADD 正常应该是亚毫秒级" },
+            { "id": "B", "text": "记录 2（KEYS 3.15 秒）最危险，它会完全阻塞主线程 3 秒以上导致所有客户端超时" },
+            { "id": "C", "text": "记录 3（HSET 8ms），单个 HSET 不应该这么慢" },
+            { "id": "D", "text": "记录 4（DEL 487ms），因为 DEL 是最常见的命令，影响面最大" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "记录 2 的 KEYS user:* 耗时 3150000 微秒（3.15 秒）是最危险的。在这 3.15 秒内，Redis 主线程完全被 KEYS 命令占据，所有其他客户端的请求都在排队等待——如果客户端的超时设置是 2 秒，那大部分请求都会超时报错。记录 4 的 DEL 487ms 也很严重（疑似大 key 同步删除），但阻塞时间远小于 KEYS。记录 1 的 ZADD 12ms 虽然偏慢（可能是大 Sorted Set），但影响相对可控。记录 3 的 HSET 8ms 可能是偶发的慢查询（比如触发了 dict rehash）。排查优先级应该是 KEYS > 大 key DEL > 其他。"
+        },
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz6",
+          "question": "关于 appendfsync everysec 模式，以下哪个说法是常见的错误认知？",
+          "choices": [
+            { "id": "A", "text": "everysec 模式的 fsync 由后台 bio 线程执行，主线程完全不受磁盘 I/O 影响" },
+            { "id": "B", "text": "如果上次 fsync 未完成且超过 2 秒，主线程会阻塞等待其完成再继续写入" },
+            { "id": "C", "text": "aof_delayed_fsync 计数器记录了因 fsync 延迟导致主线程被阻塞的次数" },
+            { "id": "D", "text": "everysec 模式在极端情况下最多丢失约 2 秒的数据" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "「everysec 模式主线程完全不受磁盘 I/O 影响」是一个非常常见的错误认知。虽然 fsync 本身确实由后台 bio_aof_fsync 线程执行，但 Redis 有一个 2 秒保护机制：beforeSleep 中的 flushAppendOnlyFile 检查上次 fsync 是否完成，如果未完成且距离上次成功 fsync 超过 2 秒，主线程会被阻塞直到 fsync 完成。这是为了防止数据丢失超过预期范围。所以在磁盘 I/O 繁忙的时候（比如 BGSAVE 正在写 RDB 文件），everysec 模式的 Redis 也会出现延迟毛刺。选项 B、C、D 的描述都是正确的。"
+        },
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz7",
+          "question": "UNLINK 和 DEL 的核心区别是什么？UNLINK 在什么情况下性能优势不明显？",
+          "choices": [
+            { "id": "A", "text": "UNLINK 在主线程异步释放内存，对任何 key 都比 DEL 快；即使是小 key 也应该全部用 UNLINK" },
+            { "id": "B", "text": "UNLINK 主线程只做 O(1) 引用移除、内存释放交给后台线程；对小 key（如短 String）两者差异极小，因为释放本身就是微秒级" },
+            { "id": "C", "text": "UNLINK 是 DEL 的别名，在 Redis 内部实现完全相同" },
+            { "id": "D", "text": "UNLINK 不删除数据只删除 key 的引用，数据仍占用内存直到手动回收" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "UNLINK 在主线程中做两件事：将 key 从 keyspace 哈希表中移除（O(1)），然后评估释放代价——如果 key 是 String 类型或元素数量很少的集合，释放代价极低（几微秒），Redis 会直接在主线程释放而不走后台线程（因为创建异步任务本身也有开销）。只有当释放代价超过阈值（lazyfree_effort 评估元素数量大于 64）时，才真正丢给 bio_lazy_free 线程异步处理。所以对于小 key，UNLINK 和 DEL 的性能几乎没有差异。选项 A 的「任何 key 都比 DEL 快」不准确。选项 C 完全错误，两者实现不同。选项 D 的「不释放内存」更是错误，内存最终一定会被释放。"
+        },
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz8",
+          "question": "生产环境中有一个电商大促场景，Redis 实例 12GB 内存，开启了 RDB 自动 save。大促期间写入量激增，你观察到 latest_fork_usec 从平时的 80ms 跳到 350ms。最合理的应对方案是什么？",
+          "choices": [
+            { "id": "A", "text": "将 save 配置清空关闭主节点的 RDB 自动触发，改由从节点执行 BGSAVE 做备份，避免主节点 fork" },
+            { "id": "B", "text": "将 maxmemory 从 12GB 提高到 24GB 减少 fork 频率" },
+            { "id": "C", "text": "开启 Transparent Huge Pages（THP）加速 fork 的页表复制" },
+            { "id": "D", "text": "将 appendfsync 从 everysec 改为 always 减少数据丢失风险" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "对于内存较大的 Redis 主节点，fork 的耗时不可避免（页表复制的开销与内存大小成正比）。最有效的方案是在主节点关闭 RDB 自动 save（清空 save 配置），改由从节点执行 BGSAVE 做备份。从节点 fork 阻塞的是从节点的主线程，不影响主节点的客户端请求。选项 B 提高 maxmemory 反而会增加 fork 耗时（内存更大页表更大）。选项 C 完全反向——THP 虽然减少页表条目数量加速 fork，但 COW 时每次复制 2MB 大页而非 4KB 小页，会导致 fork 后内存使用急剧膨胀，Redis 官方明确建议关闭 THP。选项 D 将 appendfsync 改为 always 会让每条写命令都 fsync，在高写入量下更是雪上加霜。"
+        },
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz9",
+          "question": "以下哪种 lazyfree 配置组合能最大程度防止大 key 删除阻塞，且不需要修改任何业务代码？",
+          "choices": [
+            { "id": "A", "text": "只设置 lazyfree-lazy-expire yes，其他保持默认" },
+            { "id": "B", "text": "lazyfree-lazy-expire yes + lazyfree-lazy-server-del yes + lazyfree-lazy-user-del yes + lazyfree-lazy-user-flush yes 全部开启" },
+            { "id": "C", "text": "只把业务代码中的 DEL 全部替换为 UNLINK，不需要配置 lazyfree" },
+            { "id": "D", "text": "设置 lazyfree-lazy-user-del yes 就够了，其他场景不会产生大 key 删除" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "四个 lazyfree 配置项分别覆盖不同场景的隐式删除：lazyfree-lazy-expire 覆盖 key 过期时的自动删除；lazyfree-lazy-server-del 覆盖 RENAME 等命令覆盖旧 key 时的删除；lazyfree-lazy-user-del 让 DEL 命令自动走异步（无需改业务代码）；lazyfree-lazy-user-flush 让 FLUSHDB/FLUSHALL 默认异步。全部开启才能做到「零代码改动，全场景覆盖」的最大化防护。选项 A 只覆盖了过期场景。选项 C 需要修改业务代码且遗漏了过期和 RENAME 等隐式删除场景。选项 D 忽略了过期、RENAME、FLUSH 等非用户显式调用的删除操作。"
+        },
+        {
+          "id": "redis-thread-blocking-ops-q1-quiz10",
+          "question": "排查 Redis 延迟毛刺时，你用 redis-cli --latency-history 发现每 5 分钟出现一次 200-400ms 的延迟尖峰，SLOWLOG 中没有任何记录。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "有客户端在执行 KEYS 命令但 SLOWLOG 阈值设置过高没有记录" },
+            { "id": "B", "text": "BGSAVE 的 save 规则每 5 分钟触发一次 fork，fork 本身不是命令不会被 SLOWLOG 记录，但会阻塞主线程" },
+            { "id": "C", "text": "网络抖动导致的延迟，与 Redis 本身无关" },
+            { "id": "D", "text": "后台的 activeExpireCycle 过期扫描耗时过长" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一道经典的排查题。SLOWLOG 只记录命令的执行耗时，而 fork() 是系统调用不是 Redis 命令，所以不会出现在 SLOWLOG 中——这就是为什么 SLOWLOG 里「干净得很」但延迟确实存在。每 5 分钟一次的规律性尖峰高度吻合 RDB 的 save 规则（比如 save 300 10 表示 300 秒内有 10 次修改就触发 BGSAVE）。排查方法是检查 INFO stats 中的 latest_fork_usec 和 INFO persistence 中 rdb_last_bgsave_time_sec 的时间戳，与延迟尖峰的时间交叉对比。选项 A 如果 KEYS 超过了延迟阈值也会被 SLOWLOG 记录。选项 C 网络抖动不会呈现如此规律的 5 分钟周期。选项 D 的过期扫描有时间限制（25% CPU），不会造成数百毫秒的阻塞。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/keys/",
+        "https://redis.io/docs/latest/commands/unlink/",
+        "https://redis.io/docs/latest/commands/slowlog-get/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/",
+        "https://github.com/redis/redis/blob/7.2/src/lazyfree.c",
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/internals/internals-rediseventlib/"
+      ]
+    }
+  ]
+}
