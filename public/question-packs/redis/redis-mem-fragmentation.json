@@ -1,0 +1,157 @@
+{
+  "id": "redis-mem-fragmentation",
+  "name": "内存碎片率过高如何处理",
+  "domain": "redis",
+  "description": "深入讲解 Redis 内存碎片的产生原理、mem_fragmentation_ratio 指标解读、jemalloc 分配策略、activedefrag 主动碎片整理机制及生产环境的监控告警实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-mem-fragmentation-q1",
+      "domain": "redis",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["内存碎片", "mem_fragmentation_ratio", "activedefrag", "jemalloc", "内存优化", "redis-memory"],
+      "title": "Redis 内存碎片率过高怎么排查和处理",
+      "content": "## 故障场景\n\n你负责的一个 Redis 6.2.14 实例近几天频繁触发内存告警。这个实例跑在一台 32GB 物理内存的机器上，`maxmemory` 设的是 16GB，跑的是一个社交 feed 流业务——大量短生命周期的 key（用户 feed 缓存，TTL 10 分钟），同时混杂着一些长期存在的计数器和排行榜 sorted set。业务特点是写入和删除都非常频繁，高峰期每秒约 5 万次 SET/DEL 操作。\n\n凌晨两点你被告警叫醒，登上机器拉了一把 `INFO memory`：\n\n```bash\n127.0.0.1:6379> INFO memory\n# Memory\nused_memory:6442450944\nused_memory_human:6.00G\nused_memory_rss:12348030976\nused_memory_rss_human:11.50G\nused_memory_peak:8589934592\nused_memory_peak_human:8.00G\nmem_fragmentation_ratio:1.92\nmem_fragmentation_bytes:5765046272\nmem_allocator:jemalloc-5.2.1\nallocator_frag_ratio:1.85\nallocator_frag_bytes:5368709120\nallocator_rss_ratio:1.04\nallocator_rss_bytes:268435456\n```\n\n你注意到几个关键数字：`used_memory` 只有 6GB——也就是说 Redis 认为自己的数据只占了 6GB 内存。但 `used_memory_rss` 高达 11.5GB——操作系统看到的 Redis 进程实际吃掉了 11.5GB 物理内存。`mem_fragmentation_ratio` 是 1.92，意味着 RSS 是 used_memory 的将近两倍。中间差出来的 5.37GB（`mem_fragmentation_bytes`）全是碎片。\n\n更让你担心的是：虽然 `used_memory` 只有 6GB，远没到 16GB 的 maxmemory 上限，但 RSS 已经 11.5GB 了。如果 RSS 继续涨到接近 32GB，操作系统的 OOM Killer 可能直接把 Redis 干掉——而 maxmemory 根本拦不住这种情况，因为 maxmemory 限制的是 `used_memory`，不是 RSS。\n\n你的同事建议「重启 Redis 就好了」，另一个同事说「开 activedefrag 试试」。到底应该怎么处理？碎片是怎么涨到 1.92 的？开 activedefrag 有什么风险？什么情况下应该选择重启而不是 activedefrag？",
+      "answer": "## 第一步：Redis 内存管理与 jemalloc 分配器基础\n\n### Redis 的内存分配模型\n\n要搞懂内存碎片，必须先理解 Redis 是怎么管理内存的。Redis 本身不直接调用操作系统的 `malloc` / `free`，而是通过一个内存分配器来统一管理所有内存申请和释放。Redis 从 2.4 版本开始默认使用 jemalloc（全称 je malloc，由 Jason Evans 开发的高性能内存分配器）作为内存分配器，你可以通过 `INFO memory` 中的 `mem_allocator` 字段确认当前使用的分配器版本。在上面的故障场景中，`mem_allocator:jemalloc-5.2.1` 说明用的是 jemalloc 5.2.1。\n\njemalloc 的核心设计思想是用空间换时间——它把内存预先划分成固定大小的「尺寸类（size class）」来加速分配和减少锁竞争。当 Redis 向 jemalloc 申请一块内存时，jemalloc 不会精确地分配你要求的字节数，而是向上取整到最近的尺寸类。jemalloc 5.x 的小对象尺寸类序列大致是 8、16、32、48、64、80、96、112、128、160、192、224、256 字节，然后以更大的步进递增。假设 Redis 要存一个 SDS（Simple Dynamic String，Redis 自己实现的动态字符串）需要 30 字节，jemalloc 实际分配的是 32 字节——多出来的 2 字节就是「内部碎片（internal fragmentation）」。单看 2 字节微不足道，但当你有几千万个 key 时，这些碎片累积起来可以达到 GB 级别。\n\n### jemalloc 的 arena 和 slab 架构\n\njemalloc 的分配架构分三层：arena、bin 和 slab。arena 是最顶层的概念——jemalloc 创建多个 arena（默认数量是 CPU 核数的 4 倍），每个线程绑定一个 arena，这样不同线程的内存分配操作不需要竞争同一把锁。Redis 虽然是单线程处理命令，但后台线程（bio 线程处理 lazy-free、AOF fsync 等）也会参与内存分配，所以多 arena 仍有意义。\n\n每个 arena 内部按尺寸类划分出多个 bin，每个 bin 管理一种固定大小的内存块。bin 下面的具体分配单元叫 slab——一个 slab 是一整块连续的内存页（通常是 4KB 或其整数倍），被切成若干个相同大小的 region。举个例子：一个管理 64 字节对象的 bin 可能有一个 4KB 的 slab，这个 slab 被切成 64 个 64 字节的 region。当 Redis 释放其中一些 region 后，这些 region 变成「空洞」——slab 还在，但中间有些 region 空着。这就是「外部碎片（external fragmentation）」的来源。\n\n理解了这两层碎片的区别，再看 `INFO memory` 中的指标就清晰了。`used_memory` 是 Redis 认为自己「正在使用」的内存总量，由 jemalloc 的 `stats.allocated` 统计——只计算 Redis 代码中实际 `zmalloc` 出去的字节数。`used_memory_rss` 是操作系统通过 `/proc/<pid>/stat` 报告的进程常驻内存（Resident Set Size）——这包含了 jemalloc 分配器保留但未分配给 Redis 的空闲 region、slab 内部的空洞、以及操作系统的页表和共享库映射等所有物理内存占用。\n\n### mem_fragmentation_ratio 到底在说什么\n\n`mem_fragmentation_ratio` 的计算公式是 `used_memory_rss / used_memory`。这个比值大于 1.0 是正常的——因为 jemalloc 的尺寸类对齐和 slab 预分配必然导致 RSS 大于 allocated，通常在 1.0 到 1.5 之间波动。当这个比值超过 1.5，说明碎片已经比较严重——接近三分之一的物理内存被浪费在碎片上。在我们的故障场景中，1.92 意味着将近一半的 RSS 是碎片，5.37GB 的内存完全被浪费了。\n\n但还有一个更危险的情况：`mem_fragmentation_ratio < 1`。这意味着 `used_memory_rss` 比 `used_memory` 还小——看起来违反直觉，但原因是 Redis 的一部分内存被操作系统换出到了 swap 分区。swap 的读写速度比内存慢几个数量级（DRAM 延迟约 100ns，SSD swap 延迟约 100μs，HDD swap 延迟约 10ms），Redis 作为内存数据库一旦用上 swap，性能会断崖式下降。如果你在 `INFO memory` 中看到 `mem_fragmentation_ratio` 小于 1，那比碎片率过高更紧急——你需要立即排查内存不足的原因，可能是 maxmemory 设得太大超过了物理内存，或者同机器上其他进程抢占了内存。\n\n## 第二步：碎片产生的根因分析与排查方法\n\n### 碎片是怎么涨到 1.92 的\n\n回到故障场景，碎片率飙到 1.92 的根本原因是业务的访问模式。社交 feed 流缓存的特点是：大量 key 以 10 分钟 TTL 写入，过期后被删除，然后新的 feed 数据又被写入。问题在于，这些 key 的 value 大小不一致——有的 feed 只有几百字节（纯文本），有的包含图片 URL 列表和用户信息可能达到几 KB。不同大小的 value 被 jemalloc 分配到不同尺寸类的 slab 中。\n\n当一批 10 分钟前写入的 key 过期被删除时，jemalloc 回收了这些 region，但这些 region 分散在不同 slab 的不同位置。紧接着新的写入请求到来，新 value 的大小可能跟刚被删除的不同——比如一个 128 字节的 region 被释放了，但新 value 需要 192 字节，jemalloc 无法复用那个 128 字节的 region，只能从 192 字节的 bin 中分配新空间。久而久之，小尺寸 slab 中充满了空洞（free region），大尺寸 slab 不断申请新页面，RSS 越来越大，但 `used_memory` 并没有相应增长——碎片就是这么来的。\n\n另一个加重碎片的因素是大 key 的删除。如果你的排行榜 sorted set 有几万个成员，占据数 MB 的连续内存，当这个 key 被 DEL 或 UNLINK 删除后，这块内存被释放回 jemalloc。但 jemalloc 不一定会把这块内存归还给操作系统——它可能会保留在自己的 free list 中，等待下次分配。如果后续没有类似大小的分配需求，这块内存就一直「空转」，RSS 居高不下。\n\n### 排查碎片的具体命令\n\n排查碎片的第一步是看 `INFO memory` 的全貌，但 Redis 4.0+ 提供了更细粒度的分配器统计。`allocator_frag_ratio` 和 `allocator_frag_bytes` 是 jemalloc 层面的碎片统计——排除了操作系统层面的额外 RSS 开销（如页表、共享库等），更准确地反映分配器内部的碎片情况。在故障场景中，`allocator_frag_ratio:1.85` 和 `mem_fragmentation_ratio:1.92` 差不多，说明几乎所有碎片都来自 jemalloc 内部，操作系统层面的额外开销很小（`allocator_rss_ratio` 只有 1.04）。\n\n如果你需要更详细的 jemalloc 内部统计，可以使用 `MEMORY MALLOC-STATS` 命令：\n\n```bash\n127.0.0.1:6379> MEMORY MALLOC-STATS\n___ Begin jemalloc statistics ___\nVersion: \"5.2.1-0-g0\"\n...\nMerged arenas stats:\nsmall:     allocated:   4831838208    active:   8019632128 ...\nlarge:     allocated:   1610612736    active:   1610612736 ...\nmapped:    12884901888   retained:    2147483648\n...\n```\n\n这段输出中 `small: allocated` 是小对象实际使用的字节数，`active` 是 jemalloc 为小对象保留的活跃页面总字节数——两者之差就是小对象的碎片。在上面的例子中，小对象碎片约 3GB（8019632128 - 4831838208 ≈ 3.18GB），占了碎片总量的大头。`mapped` 是 jemalloc 通过 `mmap` 向操作系统申请的虚拟内存总量，`retained` 是 jemalloc 已释放但尚未归还给操作系统的内存。\n\n你还可以用 `MEMORY DOCTOR` 命令让 Redis 自己给出内存健康诊断：\n\n```bash\n127.0.0.1:6379> MEMORY DOCTOR\nSam, I have a few things to report. High fragmentation: The allocator\nexternal fragmentation is above 1.1. This means that the Resident Set Size\nof this process is much larger than what the allocator actually allocated.\nThis is likely caused by a pattern of keys being freed and allocated with\ndifferent sizes...\n```\n\nRedis 会明确告诉你碎片过高，并提示可能的原因。\n\n## 第三步：解决方案——activedefrag 与重启\n\n### 方案一：Redis 4.0+ 的 activedefrag 主动碎片整理\n\nRedis 4.0 引入了一个革命性的特性——`activedefrag`（Active Defragmentation，主动碎片整理）。它的原理是：在 Redis 主线程的事件循环空闲时（也就是没有客户端命令需要处理的时候），扫描 jemalloc 管理的内存，找到碎片化严重的 slab 中的数据，把它们「搬迁」到新的连续内存区域中，然后释放旧的碎片化 slab。底层依赖 jemalloc 提供的 `je_mallctl` 接口来获取内存统计信息，以及 `je_rallocx` 等接口来实现内存迁移。\n\n开启 activedefrag 的命令非常简单：\n\n```bash\n# 动态开启，即时生效\n127.0.0.1:6379> CONFIG SET activedefrag yes\nOK\n\n# 或者在 redis.conf 中配置\nactivedefrag yes\n```\n\n但仅仅开启 `activedefrag yes` 并不意味着 Redis 会立即开始整理碎片。Redis 还设置了一组触发条件和资源控制参数，避免碎片整理本身占用过多 CPU 影响正常业务。以下是完整的配置参数及其含义：\n\n```bash\n# 主开关：是否启用主动碎片整理\nactive-defrag-enabled yes\n\n# 触发条件一：碎片浪费的绝对字节数超过此值才触发\n# 默认 100MB——碎片量不到 100MB 时不值得整理\nactive-defrag-ignore-bytes 104857600\n\n# 触发条件二：碎片率百分比的下限阈值\n# 默认 10——碎片率超过 10% 才开始整理\nactive-defrag-threshold-lower 10\n\n# 触发条件三：碎片率百分比的上限阈值\n# 默认 100——碎片率超过 100% 时使用最大 CPU 周期整理\nactive-defrag-threshold-upper 100\n\n# 整理过程使用的最小 CPU 百分比（碎片率刚超过下限时）\n# 默认 1——整理开始时只用 1% 的 CPU\nactive-defrag-cycle-min 1\n\n# 整理过程使用的最大 CPU 百分比（碎片率达到或超过上限时）\n# 默认 25——即使碎片非常严重，最多也只用 25% 的 CPU\nactive-defrag-cycle-max 25\n\n# 每轮碎片扫描处理的 set/hash/zset/list 的最大 field 数量\n# 默认 65536——避免处理一个超大 key 时阻塞太久\nactive-defrag-max-scan-fields 65536\n```\n\n这些参数之间的逻辑关系是这样的：只有当碎片字节数超过 `active-defrag-ignore-bytes`（默认 100MB）**并且**碎片率超过 `active-defrag-threshold-lower`（默认 10%）时，activedefrag 才会启动。启动后，Redis 根据当前碎片率在 `active-defrag-cycle-min` 和 `active-defrag-cycle-max` 之间线性插值确定本轮整理的 CPU 占用比例。碎片率刚过 10% 时用 1% CPU，碎片率到 100%（也就是 `mem_fragmentation_ratio` 到 2.0）时用满 25% CPU。\n\n在我们的故障场景中，`mem_fragmentation_ratio` 是 1.92，碎片字节数 5.37GB 远超 100MB，碎片率 92% 接近上限阈值——所以开启 activedefrag 后它会以接近 `active-defrag-cycle-max`（25%）的 CPU 占比运行。对于一个 QPS 5 万的实例，25% 的 CPU 用于碎片整理意味着可用于处理命令的 CPU 减少了四分之一。在高峰期这可能导致 P99 延迟上升，所以建议在低峰期开启，或者先调小 `active-defrag-cycle-max` 到 15 左右，牺牲整理速度换取更平滑的业务体验。\n\nactivedefrag 工作时的内部流程大致如下：Redis 在每次事件循环的空闲回调（`beforeSleep`）中检查碎片率是否满足触发条件。如果满足，它会遍历数据库的字典（dict），对每个 key 的 SDS 字符串、value 对象本身以及内部数据结构（如 ziplist / listpack / skiplist 节点）检查其所在 slab 的利用率。如果某个数据块所在的 slab 利用率很低（大量空洞），Redis 会调用 `je_rallocx` 让 jemalloc 把数据迁移到利用率更高的 slab 中，然后更新 Redis 内部的指针引用。旧 slab 的 region 被释放，当一个 slab 所有 region 都被释放后，整个 slab 可以归还给操作系统，RSS 随之下降。\n\n你可以通过 `INFO memory` 中的 `active_defrag_running` 字段确认整理是否正在运行：\n\n```bash\n127.0.0.1:6379> INFO memory\n...\nactive_defrag_running:1          # 1 表示正在整理\nactive_defrag_hits:48236710      # 成功迁移的内存分配次数\nactive_defrag_misses:12059178    # 扫描但无需迁移的次数\nactive_defrag_key_hits:3891204   # 有碎片需要整理的 key 数量\nactive_defrag_key_misses:8204571 # 扫描但碎片不严重的 key 数量\n```\n\n当 `active_defrag_running` 变回 0 且 `mem_fragmentation_ratio` 降到 1.0-1.1 范围时，说明整理已经完成。在生产实践中，一个 6GB 数据量、碎片率 1.92 的实例，activedefrag 大约需要 30 分钟到 2 小时才能把碎片率降到 1.1 以下，具体取决于 `active-defrag-cycle-max` 的设置和业务负载。\n\n### 方案二：重启 Redis 重新加载数据\n\n如果碎片率极端高（比如超过 3.0），或者你的 Redis 版本低于 4.0 不支持 activedefrag，还有一个简单粗暴但非常有效的方案——重启 Redis。\n\n为什么重启能解决碎片？因为重启后 Redis 从 RDB 文件或 AOF 文件重新加载数据，所有数据在内存中重新分配。jemalloc 在空的状态下接收连续的分配请求，会按照最紧凑的方式使用 slab——没有旧的空洞，没有历史遗留的碎片化 slab。重新加载完成后，`mem_fragmentation_ratio` 通常在 1.0 到 1.05 之间，碎片几乎为零。\n\n重启方案的操作步骤：\n\n```bash\n# 1. 先手动触发 BGSAVE 确保 RDB 文件是最新的\n127.0.0.1:6379> BGSAVE\nBackground saving started\n\n# 2. 等待 BGSAVE 完成\n127.0.0.1:6379> LASTSAVE\n(integer) 1719446400\n\n# 3. 优雅关闭 Redis（SHUTDOWN 会先做一次 SAVE 再退出）\n127.0.0.1:6379> SHUTDOWN NOSAVE\n# 如果已经 BGSAVE 完成了，用 NOSAVE 避免重复持久化\n\n# 4. 重新启动 Redis\n$ redis-server /etc/redis/redis.conf\n\n# 5. 确认碎片率恢复正常\n127.0.0.1:6379> INFO memory\n...\nmem_fragmentation_ratio:1.03\n```\n\n但重启方案有明显的缺点：重启期间 Redis 不可用（除非有从节点可以故障转移），重新加载大量数据需要时间（一个 6GB 的 RDB 文件加载大约需要 30-60 秒），而且如果业务的访问模式不变，碎片会很快重新积累。所以重启通常作为应急手段，长期治理还是要靠 activedefrag 配合业务层面的优化。\n\n在有 Sentinel 或 Cluster 的高可用架构中，重启的最佳做法是先重启从节点，确认从节点碎片率正常后，执行手动故障转移（`CLUSTER FAILOVER` 或 Sentinel 的 `SENTINEL failover`）把从节点提升为主节点，然后重启原来的主节点。这样整个过程对业务的影响可以控制在秒级。\n\n## 第四步：生产环境的监控、告警与长效治理\n\n### 监控告警设置\n\n生产环境中你应该对以下几个碎片相关指标设置监控和告警：\n\n```yaml\n# Prometheus + redis_exporter 告警规则示例\ngroups:\n- name: redis_memory_fragmentation\n  rules:\n  - alert: RedisHighFragmentation\n    expr: redis_memory_fragmentation_ratio > 1.5\n    for: 30m\n    labels:\n      severity: warning\n    annotations:\n      summary: \"Redis 碎片率 {{ $value }} 超过 1.5\"\n  - alert: RedisCriticalFragmentation\n    expr: redis_memory_fragmentation_ratio > 2.0\n    for: 10m\n    labels:\n      severity: critical\n    annotations:\n      summary: \"Redis 碎片率 {{ $value }} 超过 2.0，存在 OOM 风险\"\n  - alert: RedisSwapDetected\n    expr: redis_memory_fragmentation_ratio < 1\n    for: 5m\n    labels:\n      severity: critical\n    annotations:\n      summary: \"Redis 碎片率 {{ $value }} 小于 1，疑似使用 swap\"\n```\n\n注意 `mem_fragmentation_ratio < 1` 的告警级别应该设为 critical——这意味着 Redis 正在使用 swap，延迟会暴增，需要立即处理。\n\n### 从业务层减少碎片产生\n\n除了 activedefrag 这个「治标」方案，还应该从业务层减少碎片产生。核心原则是让写入 Redis 的 value 大小尽量统一。如果你的 value 大小在 100-500 字节之间随机波动，碎片会比统一 200 字节的场景严重得多。可以考虑的方案包括：对 value 做定长填充或压缩到统一大小区间、避免频繁对同一个 key 做 APPEND 操作（每次 APPEND 都可能触发 SDS 的重新分配）、对大 key 使用 `UNLINK` 异步删除而非 `DEL` 同步删除（`UNLINK` 在 Redis 4.0+ 可用，它会在后台线程释放内存，减少主线程阻塞造成的突发碎片）。\n\n### 面试中的碎片话题延伸\n\n面试官如果深入追问，可能会问到以下几个进阶方向：第一，jemalloc 的 `dirty pages` 和 `muzzy pages` 机制——jemalloc 在释放内存时不会立刻通过 `madvise(MADV_DONTNEED)` 归还给操作系统，而是先标记为 dirty page 保留一段时间（默认 10 秒），如果这段时间内有新的分配请求可以直接复用，避免反复的系统调用开销。你可以通过 `jemalloc.arenas.dirty_decay_ms` 和 `jemalloc.arenas.muzzy_decay_ms` 来调整这个行为。第二，Redis 7.0 引入了 `jemalloc bg_thread` 的改进——jemalloc 5.1+ 支持后台线程自动 purge 不再使用的 dirty pages，Redis 7.0 默认开启了这个特性，进一步降低了碎片积累的速度。第三，在 Kubernetes 环境中，容器的内存 limit 限制的是 cgroup 级别的 RSS，碎片导致 RSS 超过 limit 后容器会被 OOMKilled，这种情况下 maxmemory 需要设得更保守（建议不超过容器内存 limit 的 60%）。",
+      "keyPoints": [
+        "mem_fragmentation_ratio = used_memory_rss / used_memory，大于 1.5 通常认为碎片率过高，大于 2.0 存在 OOM 风险；小于 1.0 则说明 Redis 正在使用 swap，性能会断崖式下降",
+        "jemalloc 使用固定尺寸类（8/16/32/48/64...字节）分配内存，请求 30 字节实际分配 32 字节产生内部碎片；频繁增删不同大小的 key 导致 slab 中出现空洞产生外部碎片",
+        "Redis 4.0+ 引入 activedefrag 主动碎片整理，在主线程空闲时扫描碎片化 slab 并迁移数据到连续空间，底层依赖 jemalloc 的 je_rallocx 接口实现内存搬迁",
+        "activedefrag 有两个触发条件须同时满足：碎片字节数超过 active-defrag-ignore-bytes（默认 100MB）且碎片率超过 active-defrag-threshold-lower（默认 10%）",
+        "active-defrag-cycle-min（默认 1%）和 active-defrag-cycle-max（默认 25%）控制整理过程的 CPU 占比，高峰期建议降低 cycle-max 避免影响业务延迟",
+        "重启 Redis 通过 RDB/AOF 重新加载数据获得紧凑的内存布局，可以彻底消除碎片，但需要停机时间且碎片会随业务模式重新积累",
+        "INFO memory 中 allocator_frag_ratio 是 jemalloc 层面的碎片统计，排除了操作系统层面的额外 RSS 开销，比 mem_fragmentation_ratio 更精准地反映分配器内部碎片",
+        "生产监控建议对 mem_fragmentation_ratio > 1.5 设置 warning 告警、> 2.0 设置 critical 告警、< 1.0 设置最高优先级告警（疑似 swap）"
+      ],
+      "quiz": [
+        {
+          "id": "redis-mem-fragmentation-q1-quiz1",
+          "question": "mem_fragmentation_ratio 的计算公式是什么？",
+          "choices": [
+            { "id": "A", "text": "used_memory_rss / used_memory" },
+            { "id": "B", "text": "used_memory / used_memory_rss" },
+            { "id": "C", "text": "(used_memory_rss - used_memory) / used_memory_rss" },
+            { "id": "D", "text": "used_memory_peak / used_memory" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "mem_fragmentation_ratio 的计算公式是 used_memory_rss / used_memory，其中 used_memory_rss 是操作系统报告的 Redis 进程实际物理内存占用，used_memory 是 jemalloc 分配器报告的已分配内存总量。B 选项把分子分母搞反了，那样算出来的值会小于 1。C 选项计算的是碎片占 RSS 的比例而非碎片率本身，虽然有参考价值但不是 Redis 使用的定义。D 选项用的是 used_memory_peak（历史内存峰值），与碎片率无关，它是一个用于容量规划的只读统计指标。"
+        },
+        {
+          "id": "redis-mem-fragmentation-q1-quiz2",
+          "question": "当 mem_fragmentation_ratio 小于 1.0 时，最可能说明什么问题？",
+          "choices": [
+            { "id": "A", "text": "Redis 的内存使用非常紧凑高效，几乎没有碎片" },
+            { "id": "B", "text": "Redis 的部分内存被操作系统换出到 swap 分区，性能会严重下降" },
+            { "id": "C", "text": "jemalloc 分配器出现了 bug，统计数据不准确" },
+            { "id": "D", "text": "Redis 刚刚重启完成，内存还没完全加载" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 mem_fragmentation_ratio < 1 时，意味着 used_memory_rss（物理内存占用）比 used_memory（分配器报告的已分配量）还小。这只有一种合理解释：Redis 的部分内存页被操作系统换出到了 swap 分区，所以物理内存中的 RSS 变小了，但 jemalloc 认为自己分配了那么多内存。A 选项理解完全相反——碎片率小于 1 不是好事。C 选项虽然理论上可能但极其罕见。D 选项不成立，刚重启时 RSS 可能暂时大于 used_memory（因为加载过程中的临时缓冲区），碎片率通常略大于 1.0。这个场景比碎片率高更危险，因为 swap 会导致 Redis 延迟从微秒级退化到毫秒甚至秒级。"
+        },
+        {
+          "id": "redis-mem-fragmentation-q1-quiz3",
+          "question": "jemalloc 内存碎片产生的核心原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 单线程无法并行回收内存，导致释放速度跟不上分配速度" },
+            { "id": "B", "text": "jemalloc 按固定尺寸类分配内存，实际需求与分配的块大小不匹配产生内部碎片；频繁增删不同大小的对象导致 slab 中出现空洞产生外部碎片" },
+            { "id": "C", "text": "操作系统的虚拟内存页大小固定为 4KB，小于 4KB 的分配都会浪费空间" },
+            { "id": "D", "text": "Redis 的 RDB 持久化过程中 fork 子进程触发 COW，导致内存页被复制" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "jemalloc 的碎片来自两个层面。内部碎片（internal fragmentation）是因为 jemalloc 按固定尺寸类序列（8/16/32/48/64...字节）分配，请求 30 字节分配 32 字节，多出的 2 字节就是内部碎片。外部碎片（external fragmentation）是因为频繁增删不同大小的对象，slab 中的 region 被释放后留下空洞，新的请求如果需要不同尺寸就无法复用这些空洞。A 选项混淆了碎片和内存回收速度的概念。C 选项说的是操作系统层面的页内碎片，不是 jemalloc 层面的问题。D 选项描述的是 COW 导致的额外内存拷贝，跟碎片无关。"
+        },
+        {
+          "id": "redis-mem-fragmentation-q1-quiz4",
+          "question": "activedefrag 的底层工作原理是什么？",
+          "choices": [
+            { "id": "A", "text": "fork 一个子进程，在子进程中重新组织内存布局，完成后替换主进程的内存映射" },
+            { "id": "B", "text": "在主线程空闲时扫描碎片化的 slab，通过 jemalloc 的 je_rallocx 接口将数据迁移到连续的内存区域，然后释放旧 slab" },
+            { "id": "C", "text": "调用操作系统的 madvise(MADV_COMPACT) 系统调用，让内核合并物理内存页" },
+            { "id": "D", "text": "暂停所有客户端请求（STW），对全部内存进行一次性的碎片整理，然后恢复服务" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "activedefrag 的工作方式是增量式的：它在 Redis 主线程的事件循环空闲回调（beforeSleep）中运行，每次只处理一小批 key。对于碎片化严重的数据，它调用 jemalloc 的 je_rallocx 接口将数据搬迁到利用率更高的 slab 中，然后更新 Redis 内部的指针。旧 region 被释放后，如果整个 slab 都空了就归还给操作系统。A 选项描述的类似 BGSAVE 的 fork 方式，activedefrag 不使用子进程。C 选项的 MADV_COMPACT 在 Linux 中不存在。D 选项描述的 STW 方式在 Redis 中不被采用，activedefrag 通过 cycle-min/cycle-max 控制 CPU 占比来避免阻塞。"
+        },
+        {
+          "id": "redis-mem-fragmentation-q1-quiz5",
+          "question": "以下 INFO memory 输出中，哪个数据组合最能说明碎片问题严重？\n\n```\nused_memory:4294967296\nused_memory_rss:8589934592\nmem_fragmentation_ratio:2.00\nmem_fragmentation_bytes:4294967296\nallocator_frag_ratio:1.95\n```",
+          "choices": [
+            { "id": "A", "text": "used_memory 为 4GB 说明数据量太大，应该先淘汰数据再处理碎片" },
+            { "id": "B", "text": "mem_fragmentation_ratio 为 2.0 说明 RSS 是实际数据量的两倍，4GB 物理内存全是碎片；allocator_frag_ratio 接近 2.0 确认碎片主要来自 jemalloc 内部" },
+            { "id": "C", "text": "mem_fragmentation_bytes 为 4GB 说明 Redis 产生了 4GB 的临时数据还没释放" },
+            { "id": "D", "text": "allocator_frag_ratio 为 1.95 说明操作系统层面的内存碎片比 jemalloc 碎片更严重" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这组数据清晰地展示了严重碎片：used_memory 是 4GB 但 used_memory_rss 高达 8GB，碎片率 2.0 意味着每存储 1 字节有效数据就浪费了 1 字节在碎片上。mem_fragmentation_bytes 的 4GB 是碎片的绝对量。关键佐证是 allocator_frag_ratio 为 1.95 接近 mem_fragmentation_ratio 的 2.0——这说明几乎所有碎片都来自 jemalloc 内部（尺寸类对齐和 slab 空洞），操作系统层面的额外开销极小。A 选项混淆了数据量大和碎片的概念。C 选项把碎片误解为未释放的临时数据。D 选项对 allocator_frag_ratio 的理解完全相反。"
+        },
+        {
+          "id": "redis-mem-fragmentation-q1-quiz6",
+          "question": "以下关于 activedefrag 的说法，哪个是错误的？",
+          "choices": [
+            { "id": "A", "text": "activedefrag 需要 Redis 编译时链接 jemalloc 才能工作，如果使用 libc malloc 则不支持" },
+            { "id": "B", "text": "activedefrag 在碎片字节数超过 active-defrag-ignore-bytes 且碎片率超过 active-defrag-threshold-lower 时才会启动" },
+            { "id": "C", "text": "activedefrag 会启动一个独立的后台线程来整理碎片，不影响主线程处理命令" },
+            { "id": "D", "text": "active-defrag-cycle-max 默认是 25，表示碎片整理最多使用 25% 的 CPU 周期" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "C 选项是错误的。activedefrag 不是在独立的后台线程中运行的——它在 Redis 主线程的事件循环空闲回调中执行。这意味着碎片整理和命令处理共享同一个线程，activedefrag 通过 cycle-min 和 cycle-max 参数控制每次整理的时间片长度，在空闲时执行整理，有命令到来时让出 CPU。正因为如此，cycle-max 设得太高会影响命令的 P99 延迟。A 选项正确——activedefrag 依赖 jemalloc 的 je_rallocx 等接口。B 选项正确描述了双重触发条件。D 选项的默认值 25% 也是正确的。"
+        },
+        {
+          "id": "redis-mem-fragmentation-q1-quiz7",
+          "question": "在碎片率达到 1.92 的紧急场景下，开启 activedefrag 和直接重启 Redis 相比，各自的优劣是什么？",
+          "choices": [
+            { "id": "A", "text": "activedefrag 不需要停机但整理速度慢且占用 CPU；重启后通过 RDB/AOF 重新加载可彻底消除碎片但有停机时间" },
+            { "id": "B", "text": "activedefrag 只能降低碎片率到 1.5 左右无法彻底消除；重启可以降到 1.0 但需要清空所有数据" },
+            { "id": "C", "text": "两者效果完全相同，activedefrag 本质上就是在后台自动重启 Redis 进程" },
+            { "id": "D", "text": "activedefrag 对所有版本的 Redis 都可用；重启方案只适用于开启了 RDB 持久化的实例" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 选项准确概括了两种方案的核心权衡。activedefrag 的优点是在线整理、不需要停机，缺点是整理速度取决于 cycle-max 配置和业务负载，可能需要几十分钟到数小时，且整理过程中会占用主线程 CPU 影响延迟。重启的优点是彻底——重新加载后碎片率接近 1.0，缺点是需要停机（除非通过主从切换实现平滑迁移）。B 选项说 activedefrag 只能降到 1.5 是不对的，充足时间内可以降到 1.0-1.1。C 选项完全错误。D 选项也不对，activedefrag 是 Redis 4.0+ 才有的功能，重启方案则不限于 RDB 持久化——AOF 同样可以。"
+        },
+        {
+          "id": "redis-mem-fragmentation-q1-quiz8",
+          "question": "生产环境中一个 Redis 实例跑在容器里，容器内存 limit 是 8GB，maxmemory 设成了 6GB。运行一段时间后 OOMKilled 了，但 used_memory 只有 5.2GB。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 存在内存泄漏，used_memory 统计不准确" },
+            { "id": "B", "text": "内存碎片导致 used_memory_rss 远超 used_memory，RSS 超过了容器的 8GB 内存 limit 触发 cgroup OOMKill" },
+            { "id": "C", "text": "maxmemory 6GB 超过了容器 limit 的 75%，Redis 自动触发了保护性退出" },
+            { "id": "D", "text": "BGSAVE 过程中 fork 子进程的内存占用被计入了容器的 cgroup 限制，导致总 RSS 超限" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个典型的生产陷阱。maxmemory 限制的是 used_memory 而不是 used_memory_rss。used_memory 只有 5.2GB 没有触发 maxmemory 的 6GB 上限，但如果碎片率是 1.6，实际 RSS 就是 5.2 × 1.6 ≈ 8.32GB，超过了容器的 8GB 内存 limit。Kubernetes 和 Docker 通过 cgroup 限制的是物理内存 RSS，RSS 超限就会触发 OOMKill。D 选项描述的 BGSAVE COW 也是可能导致 OOMKill 的原因之一，但题目说 used_memory 才 5.2GB（远低于 maxmemory），最直接的原因还是碎片。C 选项描述的保护性退出机制在 Redis 中不存在。在容器环境中 maxmemory 建议不超过 limit 的 60%，为碎片和 COW 留空间。"
+        },
+        {
+          "id": "redis-mem-fragmentation-q1-quiz9",
+          "question": "以下哪种业务场景最容易导致 Redis 出现严重的内存碎片？",
+          "choices": [
+            { "id": "A", "text": "大量相同大小的 key-value 对，TTL 统一为 24 小时，读多写少" },
+            { "id": "B", "text": "频繁创建和删除大小差异很大的 key（从几十字节到几 KB），TTL 短且不统一" },
+            { "id": "C", "text": "只做 GET 和 SET 操作，value 固定为 JSON 格式，大小在 200-210 字节之间" },
+            { "id": "D", "text": "使用 Redis Stream 做消息队列，消息大小固定 512 字节，消费后使用 XTRIM 裁剪" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "碎片的根本来源是「不同大小的内存块在 slab 中交替分配和释放」。B 选项描述的场景完美命中了碎片产生的条件：value 大小差异大（几十字节到几 KB 横跨多个 jemalloc 尺寸类），频繁创建和删除导致 slab 中出现大量空洞，短 TTL 加速了这个循环。A 选项的 value 大小统一且读多写少，碎片产生速度很慢。C 选项 value 大小在 200-210 字节的窄区间内，jemalloc 大概率分配到同一个尺寸类（224 字节），碎片极小。D 选项的消息大小固定，XTRIM 是顺序裁剪不会在中间产生空洞。"
+        },
+        {
+          "id": "redis-mem-fragmentation-q1-quiz10",
+          "question": "你在排查碎片时执行了 MEMORY MALLOC-STATS，看到 small 类别 allocated 为 4GB 而 active 为 7GB。这说明什么？",
+          "choices": [
+            { "id": "A", "text": "jemalloc 为小对象预分配了 7GB 但只用了 4GB，剩余 3GB 是小对象的 slab 碎片" },
+            { "id": "B", "text": "Redis 的小对象数据有 4GB，另外 3GB 是大对象（large 类别）的数据" },
+            { "id": "C", "text": "7GB 的 active 表示 jemalloc 总共向操作系统申请了 7GB 虚拟内存" },
+            { "id": "D", "text": "allocated 和 active 的差值 3GB 是 Redis 客户端输出缓冲区占用的内存" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "MEMORY MALLOC-STATS 输出中，small 类别的 allocated 是 Redis 代码中小对象（通常小于 16KB）实际分配使用的字节数，active 是 jemalloc 为小对象的 slab 保留的活跃页面总字节数。两者之差（7GB - 4GB = 3GB）就是小对象层面的碎片——这些是 slab 中已分配页面但未被 Redis 使用的空洞 region。B 选项混淆了 small 和 large 分类——large 有自己独立的统计行。C 选项把 active 与 mapped（jemalloc 向操作系统 mmap 的总量）搞混了。D 选项把碎片误认为是客户端缓冲区——缓冲区的内存分配会包含在 allocated 中而不是在差值里。这个信息对诊断碎片来源非常有价值。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/",
+        "https://redis.io/docs/latest/commands/memory-doctor/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/internals/internals-redisobj/",
+        "https://jemalloc.net/jemalloc.3.html"
+      ]
+    }
+  ]
+}
