@@ -1,0 +1,157 @@
+{
+  "id": "redis-expire-lazy-deletion",
+  "name": "Redis 惰性删除的实现原理",
+  "domain": "redis",
+  "description": "深入讲解 Redis 惰性删除（Lazy Expiration）的触发时机、expireIfNeeded() 函数实现、主从复制中的过期行为差异、Redis 4.0+ lazy-free 异步删除机制以及惰性删除的局限性",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-expire-lazy-deletion-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["惰性删除", "expireIfNeeded", "lazy-free", "过期检查", "db.expires", "redis-expiration"],
+      "title": "Redis 惰性删除是怎么实现的",
+      "content": "## 面试场景\n\n面试官问你：「Redis 的 key 设了过期时间之后，到了时间是怎么被删掉的？」你回答说「有定期删除和惰性删除两种策略」。面试官点了点头继续追问：「惰性删除具体是怎么实现的？在源码层面是哪个函数负责的？如果一个 key 已经过期了但一直没人访问，它会不会永远留在内存里？主从架构下从节点会自己删过期 key 吗？如果过期的是一个几百 MB 的大 key，删除会阻塞主线程吗？」\n\n这些追问全部围绕一个核心机制——惰性删除（Lazy Expiration，也叫 Passive Expiration）。大部分人知道「访问时检查、过期就删」这一层，但真正能讲清楚 `expireIfNeeded()` 的判断流程、从节点为什么不能自己删 key、以及 Redis 4.0 之后大 key 过期怎么避免阻塞主线程的人，并不多。\n\n我们先来看一个直观的实验。往 Redis 里写一个 key 并设置 5 秒过期，然后在过期后用 DEBUG OBJECT 查看它是否还在内存中：\n\n```bash\n127.0.0.1:6379> SET session:user1001 '{\"uid\":1001,\"role\":\"admin\"}' EX 5\nOK\n127.0.0.1:6379> TTL session:user1001\n(integer) 4\n\n# 等 10 秒后……\n127.0.0.1:6379> DBSIZE\n(integer) 1        # key 还在！DBSIZE 不触发惰性删除\n127.0.0.1:6379> GET session:user1001\n(nil)              # GET 触发了惰性删除，返回 nil\n127.0.0.1:6379> DBSIZE\n(integer) 0        # 现在才真正删掉了\n```\n\n注意上面的细节——key 过期 10 秒后 `DBSIZE` 仍然报告有 1 个 key，说明 Redis 并没有在过期时间到达的那一刻立刻删除它。直到执行 `GET` 命令访问了这个 key，Redis 才检查发现它过期了并将其删除。这就是惰性删除的核心行为：不主动巡逻，只在访问时顺便检查。\n\n那么问题来了：这个「访问时检查」到底是怎么实现的？检查逻辑在源码中的位置在哪里？如果过期 key 一直没人访问怎么办？主从复制架构下从节点碰到过期 key 怎么处理？如果过期的是一个包含 500 万元素的 Hash，删除操作会卡住整个 Redis 吗？",
+      "answer": "## 第一步：Redis 过期机制的全局认知\n\n### Redis 如何存储过期时间\n\nRedis 的每个数据库（默认有 16 个，编号 0-15）在内存中由一个 `redisDb` 结构体表示。这个结构体里有两个核心的字典（hash table）：一个叫 `dict`，存放所有键值对，是你日常操作的主字典；另一个叫 `expires`，专门存放设了过期时间的 key 及其过期时间戳。当你执行 `SET mykey value EX 60` 或 `EXPIRE mykey 60` 时，Redis 做两件事：把键值对写入 `dict`，同时把 `mykey → 过期时间戳（毫秒级 Unix timestamp）` 写入 `expires`。这两个字典共享 key 的 SDS 指针，不会浪费内存做两份拷贝。\n\n你可以用 `DEBUG OBJECT` 和 `PTTL` 来观察过期信息的存储：\n\n```bash\n127.0.0.1:6379> SET cache:product:2048 '{\"name\":\"耳机\",\"price\":299}' EX 3600\nOK\n127.0.0.1:6379> PTTL cache:product:2048\n(integer) 3599842    # 毫秒级精度的剩余存活时间\n127.0.0.1:6379> TTL cache:product:2048\n(integer) 3599       # 秒级精度\n```\n\n`PTTL` 返回的值是通过 `expires` 字典中存储的过期时间戳减去当前时间计算出来的。理解了这个存储结构，你就知道了惰性删除的检查逻辑为什么很快——只需要在 `expires` 字典里做一次 O(1) 的查找，然后比较两个时间戳。\n\n### 两种过期删除策略的协作\n\n既然 Redis 知道每个 key 什么时候过期，理论上最直觉的做法是设一个定时器，到点就删。但给每个 key 都设一个定时器在高并发场景下开销太大了——想象一个 Redis 实例里有 1000 万个带 TTL 的 key，维护 1000 万个定时器会消耗大量 CPU。所以 Redis 选择了两种策略的组合：**惰性删除**负责在访问时顺便清理已过期的 key，**定期删除**负责在后台周期性地随机抽样清理一部分过期 key。这两种策略互相补充——惰性删除保证你永远不会读到过期数据，定期删除保证没人访问的过期 key 也不会永远赖在内存里。这篇文章聚焦惰性删除的实现。\n\n## 第二步：expireIfNeeded() 函数的实现细节\n\n### 核心入口：每次命令执行前都会调用\n\n惰性删除的核心实现在 Redis 源码的 `src/db.c` 文件中的 `expireIfNeeded()` 函数。这个函数的调用位置很关键——它不是在某个后台线程里跑的，而是嵌入在每个读写命令的执行路径中。具体来说，当 Redis 执行一个命令需要查找 key 时，会调用 `lookupKeyRead()`（读操作）或 `lookupKeyWrite()`（写操作），而这两个函数内部都会先调用 `expireIfNeeded()` 检查 key 是否已经过期。也就是说，惰性删除是「搭便车」在正常的命令执行流程中完成的，不需要额外的线程或定时器。\n\n`expireIfNeeded()` 的执行流程可以分为以下几个关键步骤。首先，它检查当前 key 是否在 `db->expires` 字典中有记录——如果没有过期时间，直接返回 0（表示 key 有效），几乎零开销。然后，获取 `expires` 字典中该 key 对应的过期时间戳，与当前服务器时间（`mstime()`，毫秒精度）进行比较。如果当前时间还没到过期时间，同样返回 0。只有当当前时间已经超过过期时间时，才进入实际的删除逻辑。\n\n用伪代码表示 `expireIfNeeded()` 的核心判断：\n\n```c\n// src/db.c — expireIfNeeded() 核心逻辑简化版\nint expireIfNeeded(redisDb *db, robj *key) {\n    // 1. 检查 key 是否设了过期时间\n    long long when = getExpire(db, key);\n    if (when < 0) return 0;  // 没有过期时间，直接返回\n\n    // 2. 比较当前时间与过期时间\n    mstime_t now = mstime();\n    if (now < when) return 0;  // 还没过期\n\n    // 3. 从节点特殊处理：不真正删除，只返回已过期\n    if (server.masterhost != NULL) return 1;\n\n    // 4. 主节点：真正执行删除\n    server.stat_expiredkeys++;           // 更新 expired_keys 计数器\n    propagateExpire(db, key, server.lazyfree_lazy_expire);\n    notifyKeyspaceEvent(NOTIFY_GENERIC, \"expired\", key, db->id);\n\n    // 5. 根据配置选择同步删除还是异步删除\n    if (server.lazyfree_lazy_expire)\n        return dbAsyncDelete(db, key);   // 异步删除（Redis 4.0+）\n    else\n        return dbSyncDelete(db, key);    // 同步删除\n}\n```\n\n这段代码里有几个值得展开的细节。`propagateExpire()` 函数负责把这次过期删除事件传播到 AOF 文件和从节点——它会向 AOF 文件追加一条 DEL 命令，并且通过复制链路向所有从节点发送 DEL 命令，保证主从数据一致。`notifyKeyspaceEvent()` 触发键空间通知（Keyspace Notification），如果客户端订阅了 `__keyevent@0__:expired` 频道，就能收到过期事件的通知。`server.stat_expiredkeys` 就是 `INFO stats` 输出中 `expired_keys` 的那个计数器，它记录了自 Redis 启动以来通过惰性删除和定期删除总共删掉了多少个过期 key。\n\n```bash\n127.0.0.1:6379> INFO stats | grep expired\nexpired_keys:1523467       # 累计删除的过期 key 数量\nexpired_stale_perc:0.15    # 抽样估算的过期 key 占比\nexpired_time_cap_reached_count:0\n```\n\n### 不同命令对过期 key 的处理差异\n\n并不是所有命令都以相同的方式处理过期 key。`GET`、`SET`、`HGET` 等标准读写命令在执行前都会调用 `expireIfNeeded()`，如果 key 已过期就直接删除并返回 nil（读操作）或当作 key 不存在来处理（写操作）。但有些命令的行为比较特殊。\n\n`EXISTS` 命令在 Redis 3.2+ 中对已过期的 key 返回 0（不存在），跟 GET 的行为一致。但在 Redis 3.2 之前的从节点上，`EXISTS` 对已过期但未被主节点删除的 key 会返回 1，这是一个历史遗留的坑。`TTL` 和 `PTTL` 命令也会触发 `expireIfNeeded()`，如果 key 已过期会返回 -2（表示 key 不存在）。`DBSIZE` 命令比较特殊，它直接返回主字典 `dict` 的 key 数量，不会逐个检查过期，所以它的返回值可能包含已过期但未被清理的 key——这就是前面实验中 `DBSIZE` 返回 1 而 `GET` 返回 nil 的原因。\n\n`SCAN` 系列命令（SCAN、HSCAN、SSCAN、ZSCAN）同样会对遍历到的每个 key 调用 `expireIfNeeded()`，所以用 SCAN 遍历 keyspace 时，过期 key 会被跳过并删除，不会出现在结果集中。`RANDOMKEY` 命令也会循环调用 `expireIfNeeded()`，如果随机到一个过期 key 就删掉并重新随机，直到找到一个有效 key 或者确认库是空的。\n\n## 第三步：主从复制中的惰性删除行为\n\n### 从节点不主动删除过期 key\n\n这是 Redis 主从架构中最容易踩坑的一个知识点。在 Redis 的复制协议中，从节点（replica）被设计为主节点的「精确副本」，它不会自主做任何修改数据的操作——包括删除过期 key。从节点上的 `expireIfNeeded()` 检测到 key 已过期后，不会真正调用 `dbSyncDelete()` 或 `dbAsyncDelete()` 去删除它，而是只返回 1（告诉调用者这个 key 已过期），让读操作返回 nil。真正的删除动作由主节点发起：主节点通过惰性删除或定期删除发现某个 key 过期后，生成一条 DEL 命令通过复制链路发送给从节点，从节点收到这条 DEL 命令后才真正删除数据。\n\n这个设计在 Redis 3.2 之前有一个严重的问题。在 3.2 之前的版本中，从节点的 `expireIfNeeded()` 不会返回「已过期」的标记，它对过期 key 的处理跟未过期 key 完全一样——也就是说，在从节点上执行 `GET` 一个已过期的 key，居然还能读到数据！这在读写分离（读从节点）的架构中会导致客户端读到脏数据。Redis 3.2 修复了这个问题：从节点虽然不删除过期 key，但对读操作（`lookupKeyRead`）会检查 key 是否在 `expires` 字典中且已超时，如果是就返回 nil，表现得好像 key 已经被删除了一样。\n\n但写操作路径（`lookupKeyWrite`）在从节点上不做过期检查，因为从节点本身不执行客户端的写命令（除非是从主节点复制过来的写命令）。这一点在实际运维中通常不会有问题，但理解它有助于排查一些边缘情况下的主从数据不一致问题。\n\n### 主从过期的延迟窗口\n\n由于从节点依赖主节点的 DEL 命令来删除过期 key，在主节点尚未触发惰性删除或定期删除的那段时间窗口内，从节点上这个 key 物理上仍然存在。虽然 Redis 3.2+ 的读操作会返回 nil，但这个 key 仍然占用内存。如果主节点上有大量过期 key 长时间未被访问，且定期删除的频率不够高，从节点的内存使用会比预期高。你可以通过 `INFO keyspace` 对比主从的 key 数量来发现这种情况：\n\n```bash\n# 主节点\n127.0.0.1:6379> INFO keyspace\ndb0:keys=500000,expires=320000,avg_ttl=1800000\n\n# 从节点（可能比主节点多出一些未清理的过期 key）\n127.0.0.1:6380> INFO keyspace\ndb0:keys=515000,expires=335000,avg_ttl=1200000\n```\n\n## 第四步：lazy-free 异步删除机制（Redis 4.0+）\n\n### 大 key 过期的阻塞风险\n\n在 Redis 4.0 之前，`expireIfNeeded()` 发现 key 过期后调用的是 `dbSyncDelete()`，这是一个同步操作——它在主线程中直接释放 key 对应的所有内存。对于小 key（比如一个 100 字节的 String），同步删除的耗时可以忽略不计。但如果过期的是一个包含 500 万元素的 Hash 或 Set，同步释放内存可能需要几百毫秒甚至几秒钟，在这段时间内 Redis 主线程被阻塞，无法处理任何其他命令，所有客户端请求都会超时。\n\n这个问题在生产环境中非常常见。一个典型场景是用 Redis 的 Set 存储某个活动的参与用户列表，活动持续 7 天，Set 里积累了 800 万个元素，活动结束后 key 过期——某个倒霉的客户端碰巧在这一刻访问了这个 key，触发了同步删除，整个 Redis 卡顿了 2 秒，所有在线业务的缓存请求全部超时。\n\nRedis 4.0 引入了 lazy-free 机制来解决这个问题。通过配置 `lazyfree-lazy-expire yes`，你可以让 `expireIfNeeded()` 在需要删除过期 key 时调用 `dbAsyncDelete()` 而不是 `dbSyncDelete()`。`dbAsyncDelete()` 的工作方式是：首先在主线程中以 O(1) 的时间把 key 从主字典 `dict` 和过期字典 `expires` 中摘除（解除关联），然后把这个 key 对应的 value 对象（也就是那个 500 万元素的 Hash）扔到一个后台线程队列中去慢慢释放内存。后台线程在 Redis 中叫 bio（Background I/O）线程，专门处理这种「慢速但不需要在主线程做」的操作。\n\n```bash\n# Redis 4.0+ 配置 lazy-free 过期删除\n# redis.conf\nlazyfree-lazy-expire yes      # 过期 key 使用异步删除\nlazyfree-lazy-server-del yes  # 隐式删除（如 RENAME 覆盖旧 key）使用异步删除\nlazyfree-lazy-user-del no     # 用户显式 DEL 命令仍然同步（可配 yes）\nreplica-lazy-flush no         # 从节点全量同步前 FLUSHALL 是否异步\n\n# 动态查看配置\n127.0.0.1:6379> CONFIG GET lazyfree-lazy-expire\n1) \"lazyfree-lazy-expire\"\n2) \"yes\"\n```\n\n需要注意一个实现细节：`dbAsyncDelete()` 并不是对所有 key 都走异步路径。对于 value 是 String 类型或元素数量小于 64 的集合类型（Hash、Set、ZSet、List），Redis 会判定同步删除的开销足够小，仍然在主线程中直接释放，避免了把小对象扔给后台线程的额外调度开销。只有当集合的元素数量超过 64 时，`dbAsyncDelete()` 才会真正把释放任务交给 bio 线程。这个阈值是硬编码在 `lazyfreeGetFreeEffort()` 函数中的，源码在 `src/lazyfree.c`：\n\n```c\n// src/lazyfree.c — 简化版\nsize_t lazyfreeGetFreeEffort(robj *key, robj *obj) {\n    if (obj->type == OBJ_LIST)\n        return listTypeLength(obj);      // List 返回元素数量\n    else if (obj->type == OBJ_SET && obj->encoding == OBJ_ENCODING_HT)\n        return dictSize((dict*)obj->ptr); // Set（hashtable 编码）返回元素数量\n    else if (obj->type == OBJ_ZSET && obj->encoding == OBJ_ENCODING_SKIPLIST)\n        return ((zset*)obj->ptr)->zsl->length; // ZSet 返回跳表长度\n    else if (obj->type == OBJ_HASH && obj->encoding == OBJ_ENCODING_HT)\n        return dictSize((dict*)obj->ptr); // Hash 返回字段数量\n    // String 类型和小集合（ziplist/listpack 编码）返回 1\n    return 1;\n}\n```\n\n当 `lazyfreeGetFreeEffort()` 返回值大于 64 时，`dbAsyncDelete()` 才会把释放任务提交给 bio 线程；否则直接在主线程同步释放。这个设计是一个权衡——对于小对象，多线程调度的开销（锁竞争、内存屏障、线程唤醒）可能反而比直接释放还大。\n\n## 第五步：惰性删除的局限性与面试延伸\n\n### 不被访问的过期 key 永远不会被惰性删除\n\n惰性删除最核心的局限性在于它的被动本质。如果一个 key 已经过期了，但从此再也没有任何客户端来访问它，那惰性删除永远不会触发，这个 key 就永远占着内存。这就是为什么 Redis 必须同时有定期删除策略——由 `activeExpireCycle()` 函数在每个事件循环周期中随机采样一批带 TTL 的 key，检查它们是否过期并删除。两种策略的协作关系是：惰性删除保证「用户永远不会读到过期数据」，定期删除保证「长时间无人访问的过期 key 最终也会被清理掉」。\n\n在某些极端场景下，如果写入带 TTL 的 key 的速度远超定期删除的清理速度（比如一次性写入了 5000 万个 TTL 为 10 秒的 key，但之后再也不访问它们），过期 key 可能会在内存中积压一段时间。你可以通过 `INFO stats` 中的 `expired_stale_perc` 指标来监控这个比例——它表示当前 expires 字典中已过期但尚未清理的 key 的估算百分比，如果这个值持续偏高（比如超过 25%），说明定期删除跟不上过期速度，可能需要关注内存水位。\n\n### 生产环境最佳实践\n\n在生产环境中，关于惰性删除有几个值得注意的实践经验。首先，Redis 4.0 以上的版本强烈建议开启 `lazyfree-lazy-expire yes`，避免大 key 过期时阻塞主线程。Redis 6.0 以后这个选项默认已经是 yes 了，但 4.x 和 5.x 版本默认是 no，需要手动开启。其次，避免在业务中创建超大集合并设置统一的过期时间——比如 800 万元素的 Set 到点一起过期的场景。更好的做法是按时间片拆分 key（比如按小时：`activity:users:20240115_14`），让过期分散到不同时间点，避免集中过期导致的 CPU 和内存压力尖峰。\n\n读写分离架构中要特别注意 Redis 版本。如果你的从节点版本低于 3.2，客户端从从节点读到过期数据是一个真实存在的 bug，升级到 3.2+ 是唯一的解决方案。另外，可以在应用层做双重校验——读到数据后检查业务层面的时间戳或版本号，不完全依赖 Redis 的过期机制，为主从延迟导致的极端情况兜底。\n\n### 面试高频追问与知识关联\n\n面试官在你回答完惰性删除后，最常见的追问有几个方向。第一个是「惰性删除和定期删除是怎么配合的」，核心回答是：惰性删除保证读操作的正确性，定期删除保证内存最终会被回收，二者缺一不可。第二个是「Redis 的过期是精确的吗」，答案是 Redis 用毫秒级时间戳比较，时间判断本身是精确的，但实际删除的时机不精确——惰性删除依赖访问触发，定期删除依赖随机采样，所以一个 key 的实际存活时间可能比设定的 TTL 稍长。第三个方向是 lazy-free 和 UNLINK 命令的关系——`UNLINK` 是 Redis 4.0 新增的命令，它是 `DEL` 的异步版本，逻辑与 `dbAsyncDelete()` 相同，用于用户手动异步删除大 key。\n\n惰性删除作为 Redis 过期策略的一半，与定期删除（`activeExpireCycle`）、内存淘汰（`maxmemory-policy`）、AOF/RDB 持久化中的过期 key 处理共同构成了 Redis 的完整过期体系。理解惰性删除的实现细节，是深入掌握 Redis 内存管理和主从一致性的基础。",
+      "keyPoints": [
+        "Redis 为每个数据库维护两个字典：dict 存储所有键值对，expires 存储设了过期时间的 key 及其毫秒级过期时间戳，两个字典共享 key 的 SDS 指针不会重复占用内存",
+        "惰性删除通过 expireIfNeeded() 函数实现，嵌入在 lookupKeyRead() 和 lookupKeyWrite() 中，每次命令执行查找 key 时都会先检查是否过期，检查逻辑为 O(1) 的字典查找加时间戳比较",
+        "key 过期后 expireIfNeeded() 会执行删除、向 AOF 追加 DEL 命令、通过复制链路向从节点发送 DEL、触发 keyspace 通知并递增 expired_keys 计数器",
+        "从节点不主动删除过期 key，而是依赖主节点发送的 DEL 命令完成删除；Redis 3.2+ 从节点对读操作返回 nil 但不真正删除数据，3.2 之前从节点会返回已过期的脏数据",
+        "Redis 4.0 引入 lazyfree-lazy-expire 配置，开启后过期 key 通过 dbAsyncDelete() 异步释放内存，由 bio 后台线程处理，避免大 key 过期时阻塞主线程",
+        "dbAsyncDelete() 不是对所有 key 都走异步路径——通过 lazyfreeGetFreeEffort() 计算释放开销，只有集合元素数量超过 64 时才提交给后台线程，小对象仍然同步释放",
+        "惰性删除的核心局限是被动触发——不被访问的过期 key 永远不会被惰性删除清理，必须配合 activeExpireCycle() 定期删除策略才能保证过期 key 最终被回收",
+        "DBSIZE、RANDOMKEY 等命令对过期 key 的处理各不相同——DBSIZE 不触发惰性删除可能包含过期 key，SCAN 遍历时会触发删除并跳过过期 key"
+      ],
+      "quiz": [
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz1",
+          "question": "Redis 惰性删除的核心思想是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 为每个带 TTL 的 key 设置一个定时器，到点立即删除" },
+            { "id": "B", "text": "Redis 不主动检查过期，只在访问 key 时检查是否过期，如果过期就删除" },
+            { "id": "C", "text": "Redis 后台线程每秒全量扫描 expires 字典，删除所有已过期的 key" },
+            { "id": "D", "text": "Redis 在内存达到 maxmemory 上限时才检查并删除过期 key" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "惰性删除（Lazy Expiration / Passive Expiration）的核心思想就是「不主动巡逻，只在被访问时顺便检查」。当客户端执行 GET、SET 等命令需要查找某个 key 时，Redis 会先调用 expireIfNeeded() 检查该 key 是否在 expires 字典中有过期记录且已超时，如果是就删除它。A 选项描述的是定时器策略，Redis 没有为每个 key 设独立定时器，因为在海量 key 场景下开销太大。C 选项描述的全量扫描也不是 Redis 的做法，定期删除用的是随机采样而非全量扫描。D 选项混淆了过期删除和内存淘汰——内存淘汰（maxmemory-policy）是在内存达到上限时触发的，与过期删除是两个独立的机制。"
+        },
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz2",
+          "question": "expireIfNeeded() 函数在 Redis 源码中的调用位置是哪里？",
+          "choices": [
+            { "id": "A", "text": "在 Redis 事件循环的 beforeSleep() 回调中，每个事件循环周期调用一次" },
+            { "id": "B", "text": "在 lookupKeyRead() 和 lookupKeyWrite() 内部，每次命令查找 key 时调用" },
+            { "id": "C", "text": "在 bio 后台线程中，由独立线程异步调用" },
+            { "id": "D", "text": "在 serverCron() 定时任务中，每 100ms 调用一次" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "expireIfNeeded() 函数嵌入在 lookupKeyRead() 和 lookupKeyWrite() 中，这两个函数是 Redis 执行几乎所有命令时查找 key 的入口。每当一个命令需要读取或操作某个 key，Redis 都会先通过 lookupKeyRead/Write 查找这个 key，在查找过程中顺便调用 expireIfNeeded() 检查过期。A 选项描述的 beforeSleep() 确实在事件循环中被调用，但不是 expireIfNeeded() 的调用位置。C 选项错误，expireIfNeeded() 在主线程中执行，不在 bio 线程中。D 选项描述的 serverCron() 是定期删除（activeExpireCycle）的调用位置，不是惰性删除。"
+        },
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz3",
+          "question": "Redis 存储过期信息的数据结构是什么？",
+          "choices": [
+            { "id": "A", "text": "在 redisObject 结构体的 lru 字段中存储过期时间戳" },
+            { "id": "B", "text": "在主字典 dict 的每个 entry 中增加一个 expire 字段" },
+            { "id": "C", "text": "在 redisDb 结构体中维护一个独立的 expires 字典，key 映射到毫秒级过期时间戳" },
+            { "id": "D", "text": "使用一个全局的最小堆（min-heap），按过期时间排序所有带 TTL 的 key" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 的每个数据库（redisDb）中维护两个字典：dict 存储所有键值对，expires 专门存储设了过期时间的 key 及其过期时间戳（毫秒级 Unix timestamp）。两个字典共享 key 的 SDS 指针，不会重复占用内存。A 选项中的 lru 字段确实存在于 redisObject 中，但它存储的是最近访问时间（用于 LRU 淘汰策略）而不是过期时间。B 选项的做法虽然在技术上可行，但 Redis 没有这样设计——使用独立的 expires 字典可以让没有过期时间的 key 零额外开销。D 选项的最小堆方案在理论上效率更高（可以精确找到最快过期的 key），但维护堆的开销较大，Redis 选择了更简单的字典方案配合随机采样。"
+        },
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz4",
+          "question": "expireIfNeeded() 检测到 key 过期后，除了删除数据还会做哪些操作？",
+          "choices": [
+            { "id": "A", "text": "只是简单地从 dict 和 expires 字典中移除 key，不做其他操作" },
+            { "id": "B", "text": "向 AOF 追加 DEL 命令、向从节点发送 DEL 命令、触发 keyspace 通知、递增 expired_keys 计数器" },
+            { "id": "C", "text": "向所有已连接的客户端广播过期事件，通知它们删除本地缓存" },
+            { "id": "D", "text": "立即触发 RDB 快照，将过期状态持久化到磁盘" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "expireIfNeeded() 在删除过期 key 时会执行一系列副作用操作：通过 propagateExpire() 向 AOF 文件追加一条 DEL 命令以保证持久化一致性，同时通过复制链路向所有从节点发送 DEL 命令以保证主从一致性；通过 notifyKeyspaceEvent() 触发键空间通知（需要客户端主动订阅 __keyevent@*__:expired 频道才能收到）；递增 server.stat_expiredkeys 计数器（INFO stats 中的 expired_keys）。A 选项遗漏了这些关键的副作用操作。C 选项错误，Redis 不会主动向客户端广播，只有订阅了相应频道的客户端才会收到通知。D 选项完全错误，过期删除不会触发 RDB 快照。"
+        },
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz5",
+          "question": "执行以下操作后，DBSIZE 返回什么？\n\n```\nSET key1 val1 EX 1\n(等待 5 秒)\nDBSIZE\n```",
+          "choices": [
+            { "id": "A", "text": "返回 0，因为 key1 已经过期被自动删除了" },
+            { "id": "B", "text": "返回 1，因为 DBSIZE 不触发惰性删除，过期 key 仍计入总数" },
+            { "id": "C", "text": "返回 -1，表示有一个已过期的 key" },
+            { "id": "D", "text": "返回 0 或 1，取决于定期删除是否在这 5 秒内碰巧清理了这个 key" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "这道题的关键在于理解 DBSIZE 的行为和定期删除的随机性。DBSIZE 命令直接返回主字典 dict 中的 key 总数，不会对每个 key 调用 expireIfNeeded()，所以它不会触发惰性删除。但在等待的 5 秒内，Redis 的定期删除机制（activeExpireCycle）会在后台随机采样 expires 字典中的 key 并检查是否过期，如果碰巧采样到了 key1 就会删除它。所以 DBSIZE 返回 0 还是 1 取决于定期删除是否在这段时间内碰巧扫到了 key1。A 选项忽略了 DBSIZE 不触发惰性删除这个细节。B 选项忽略了定期删除可能已经清理了该 key。C 选项虚构了 DBSIZE 不存在的返回值。"
+        },
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz6",
+          "question": "在 Redis 3.2 之前的从节点上，对一个已过期但主节点尚未发送 DEL 的 key 执行 GET，会发生什么？",
+          "choices": [
+            { "id": "A", "text": "返回 nil，从节点会自主判断 key 已过期并拒绝返回数据" },
+            { "id": "B", "text": "返回 key 的实际数据，因为从节点不检查过期状态" },
+            { "id": "C", "text": "返回错误信息 (error) READONLY，因为从节点不能执行删除操作" },
+            { "id": "D", "text": "返回 nil 并向主节点报告该 key 需要被删除" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Redis 3.2 之前一个臭名昭著的 bug。在 3.2 之前的版本中，从节点的 expireIfNeeded() 不会对过期 key 做任何特殊处理，它跟处理正常 key 完全一样——也就是说，GET 一个已过期的 key 会返回它的实际数据，就好像它没有过期一样。这在读写分离架构中会导致客户端读到脏数据。Redis 3.2 修复了这个问题：从节点虽然仍然不主动删除过期 key（删除要等主节点发 DEL 命令），但对读操作会检查 key 是否已超时，如果是就返回 nil。A 选项描述的是 3.2+ 的行为而非 3.2 之前。C 和 D 选项都是虚构的行为。"
+        },
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz7",
+          "question": "lazyfree-lazy-expire 配置的作用是什么？它与 UNLINK 命令的关系是什么？",
+          "choices": [
+            { "id": "A", "text": "让过期 key 不立即删除而是延迟一段时间再删，UNLINK 是触发延迟删除的命令" },
+            { "id": "B", "text": "让过期 key 的内存释放交给 bio 后台线程异步执行，避免大 key 阻塞主线程；UNLINK 是同一机制的用户手动版本" },
+            { "id": "C", "text": "让过期检查本身变为异步操作，expireIfNeeded() 在后台线程中运行；UNLINK 与此无关" },
+            { "id": "D", "text": "让 Redis 完全跳过过期检查以提升性能，UNLINK 用于手动批量清理过期 key" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "lazyfree-lazy-expire 配置（Redis 4.0+）控制的是过期 key 被删除时的内存释放方式。开启后，expireIfNeeded() 在发现 key 过期时调用 dbAsyncDelete() 而非 dbSyncDelete()——主线程以 O(1) 时间将 key 从字典中摘除，然后把 value 对象的内存释放任务提交给 bio 后台线程异步处理。UNLINK 命令是同一个异步释放机制的用户手动版本，它是 DEL 的异步替代品，底层同样调用 dbAsyncDelete()。A 选项错误，lazy-free 不是延迟删除，key 会立即从字典中移除（对客户端不可见），只是内存释放是异步的。C 选项错误，过期检查（expireIfNeeded）始终在主线程中执行。D 选项完全错误。"
+        },
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz8",
+          "question": "生产环境中一个 800 万元素的 Set 过期了，未开启 lazyfree-lazy-expire，此时某客户端恰好 GET 该 key。最可能的现象是什么？",
+          "choices": [
+            { "id": "A", "text": "GET 立即返回 nil，对其他客户端无影响" },
+            { "id": "B", "text": "GET 返回 nil 但 Redis 主线程被阻塞数秒，期间所有客户端请求超时" },
+            { "id": "C", "text": "Redis 发现 key 太大拒绝删除，返回 OOM 错误" },
+            { "id": "D", "text": "Redis 自动将删除任务转给后台线程，不会阻塞" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "未开启 lazyfree-lazy-expire 时，expireIfNeeded() 调用的是 dbSyncDelete()，它在主线程中同步释放 key 对应的所有内存。对于一个 800 万元素的 Set（hashtable 编码），同步释放需要逐个释放每个元素的内存，可能耗时数秒。在这段时间内 Redis 主线程被完全阻塞，无法处理任何其他命令，所有在线客户端都会遇到请求超时。GET 命令最终返回 nil，但代价是整个 Redis 实例短暂不可用。A 选项低估了同步删除大 key 的影响。C 选项虚构了不存在的行为。D 选项描述的是开启了 lazyfree-lazy-expire 时的行为。这就是为什么 Redis 4.0+ 强烈建议开启 lazyfree-lazy-expire。"
+        },
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz9",
+          "question": "dbAsyncDelete() 是否对所有 key 都走异步释放路径？",
+          "choices": [
+            { "id": "A", "text": "是的，只要开启 lazyfree-lazy-expire，所有过期 key 都由 bio 线程异步释放" },
+            { "id": "B", "text": "不是，通过 lazyfreeGetFreeEffort() 计算释放开销，只有集合元素超过 64 时才异步，小对象仍然同步释放" },
+            { "id": "C", "text": "不是，只有 String 类型走异步，集合类型始终同步" },
+            { "id": "D", "text": "不是，根据 key 的内存大小判断——超过 1MB 走异步，否则同步" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "dbAsyncDelete() 内部会调用 lazyfreeGetFreeEffort() 来评估释放这个 value 对象需要多大的工作量。对于 String 类型，effort 始终返回 1（释放一个 SDS 是 O(1) 操作）；对于集合类型（List、Set、ZSet、Hash），effort 返回其元素数量。当 effort 大于 64 时，dbAsyncDelete() 才会把释放任务提交给 bio 后台线程；当 effort 小于等于 64 时，直接在主线程同步释放，因为对于这么小的集合，走异步的线程调度开销反而可能更大。A 选项过于绝对。C 选项完全反了——String 类型因为 effort 为 1 反而走同步路径。D 选项的 1MB 阈值是虚构的，实际判断标准是元素数量而非内存大小。"
+        },
+        {
+          "id": "redis-expire-lazy-deletion-q1-quiz10",
+          "question": "如果一个 Redis 实例中有大量带 TTL 的 key 过期后长时间无人访问，会出现什么问题？应该关注哪个监控指标？",
+          "choices": [
+            { "id": "A", "text": "不会有问题，Redis 的惰性删除会确保所有过期 key 最终被清理" },
+            { "id": "B", "text": "过期 key 占用内存无法释放，应关注 expired_stale_perc 指标，持续偏高说明定期删除跟不上过期速度" },
+            { "id": "C", "text": "Redis 会自动触发 BGSAVE 来清理过期 key 并释放内存" },
+            { "id": "D", "text": "Redis 会拒绝新的 EXPIRE 命令，防止更多 key 进入过期状态" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "惰性删除是被动触发的，如果过期 key 不被访问就永远不会被惰性删除清理。虽然定期删除（activeExpireCycle）会在后台随机采样过期 key 并删除，但如果新增过期 key 的速度远超定期删除的清理速度，已过期但未被清理的 key 就会在内存中积压。INFO stats 中的 expired_stale_perc 指标可以监控这个状况——它估算了 expires 字典中已过期未清理 key 的百分比，如果持续高于 25% 就需要关注。A 选项错误，惰性删除不能保证清理无人访问的 key，那是定期删除的职责。C 选项错误，BGSAVE 是 RDB 持久化操作，不负责清理过期 key。D 选项完全虚构了不存在的行为。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/expire/",
+        "https://github.com/redis/redis/blob/7.2/src/db.c",
+        "https://redis.io/docs/latest/develop/reference/eviction/",
+        "https://github.com/redis/redis/blob/7.2/src/lazyfree.c"
+      ]
+    }
+  ]
+}

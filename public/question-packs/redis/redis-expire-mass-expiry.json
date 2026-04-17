@@ -1,0 +1,157 @@
+{
+  "id": "redis-expire-mass-expiry",
+  "name": "大量 key 同时过期会造成什么问题",
+  "domain": "redis",
+  "description": "深入讲解大量 key 集中过期导致的 Redis 延迟抖动、缓存雪崩、内存碎片问题，以及 TTL 随机化、activeExpireCycle 调参、实战排查方法等解决方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-expire-mass-expiry-q1",
+      "domain": "redis",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["批量过期", "延迟抖动", "TTL随机化", "activeExpireCycle", "缓存雪崩", "redis-expiration"],
+      "title": "大量 key 同时过期会造成什么问题？怎么排查和解决？",
+      "content": "## 故障场景\n\n你负责一个电商平台的商品缓存服务。每天凌晨 2:00 跑一个缓存预热任务，把次日要推荐的 20 万个商品详情批量写入 Redis，全部设置 `EX 86400`（24 小时过期）。服务上线两周一切正常，直到有一天下午 2:00 前后，运维告警群里开始密集报警。\n\n你看到的现象是这样的：\n\n```\n[14:01:23] ALERT: Redis P99 latency spike — 正常 0.3ms → 当前 47ms\n[14:01:25] ALERT: 商品详情接口 5xx 错误率从 0.01% 飙升到 12.7%\n[14:01:28] ALERT: MySQL 主库 CPU 使用率从 35% 飙升到 92%\n[14:01:31] ALERT: 连接池耗尽 — HikariPool-1: Connection is not available, request timed out after 30000ms\n```\n\n你赶紧登上 Redis 服务器，用 `redis-cli --latency-history` 看延迟趋势：\n\n```bash\n$ redis-cli --latency-history -i 5\nmin: 0, max: 3, avg: 0.42 (971 samples) -- 13:55:00\nmin: 0, max: 5, avg: 0.51 (965 samples) -- 13:56:00\nmin: 0, max: 48, avg: 12.73 (412 samples) -- 14:01:00\nmin: 0, max: 63, avg: 18.91 (287 samples) -- 14:02:00\nmin: 0, max: 41, avg: 9.44 (534 samples) -- 14:03:00\nmin: 0, max: 8, avg: 1.22 (891 samples) -- 14:08:00\n```\n\n14:01 到 14:03 之间出现了一个明显的延迟尖峰，样本数也从每轮约 970 下降到 287——说明大量请求被阻塞了。你又跑了一下 `INFO stats`：\n\n```bash\n127.0.0.1:6379> INFO stats\n# Stats\nexpired_keys:3847291\nexpired_stale_perc:38.75\nexpired_time_cap_reached_count:247\n```\n\n`expired_stale_perc` 高达 38.75%，`expired_time_cap_reached_count` 在过去几分钟增加了 247 次。与此同时，你的业务方反馈说大量商品详情页显示「系统繁忙」，数据库直接被打满了。\n\n**问题**：分析这个故障的根本原因。大量 key 同时过期到底会造成哪些问题？你会怎么排查、怎么修复、怎么防止它再次发生？",
+      "answer": "## 第一步：Redis 过期删除机制基础回顾\n\n### Redis 的过期策略：两种机制协同工作\n\n要理解大量 key 同时过期为什么会出大问题，必须先搞清楚 Redis 删除过期 key 的机制。Redis 不会给每个 key 设置一个精确的定时器（那样百万级 key 的定时器维护成本太高），而是采用两种策略的组合。第一种是惰性删除（Lazy Expiration）：当客户端访问某个 key 时，Redis 会先调用 `expireIfNeeded()` 检查这个 key 是否过期，如果过期了就当场删除并返回 nil。这种方式零额外 CPU 开销，但缺点很明显——如果一个过期 key 永远没人访问，它就一直占着内存不走。\n\n第二种是定期删除（Active Expiration）：Redis 的心跳函数 `serverCron`（默认每秒执行 `hz` 次，`hz` 默认值为 10）会调用 `activeExpireCycle()` 函数，主动从 expires 字典中随机采样 key 并删除已过期的。具体来说，每次采样 `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP`（默认 20）个 key，删除其中已过期的，然后统计过期比例。如果过期比例超过 25%，说明过期 key 密度很高，还得继续采样，于是进入下一轮循环。这个循环会一直持续，直到过期比例降到 25% 以下或者达到时间上限。\n\n时间上限是关键的安全阀：slow 模式（在正常 `serverCron` 调用中）最多占用 `1000/hz * 25%` 毫秒（`hz=10` 时就是 25ms），fast 模式（在事件循环的 `beforeSleep` 中）最多 1ms。理解了这个机制之后，大量 key 同时过期的问题就很容易推导了。\n\n## 第二步：大量 key 同时过期的三大问题\n\n### 问题一：Redis 自身延迟抖动\n\n这是最直接、最容易被忽视的问题。场景中 20 万个 key 全部设了 `EX 86400`，它们在写入后精确的 86400 秒后同时过期。当过期时刻来临时，`activeExpireCycle()` 开始采样——随机取 20 个 key，发现其中 18 个都过期了，过期比例 90%，远超 25% 的阈值，于是继续采样；再取 20 个，又有 17 个过期，继续；再取 20 个，还是 16 个过期……这个循环根本停不下来，直到达到 25ms 的时间上限才被强制中断。\n\n但 25ms 只是一次 `serverCron` 调用的限制。下一次 `serverCron`（100ms 后）又会触发 `activeExpireCycle()`，发现过期比例还是很高，又跑满 25ms。如此反复，意味着在过期 key 被清理完之前的这段时间里，Redis 每 100ms 就有 25ms 在做过期 key 删除——这就是 slow 模式下的 25% CPU 时间上限。\n\n这 25ms 的过期删除操作跑在 Redis 主线程上，会阻塞同一时间段内的所有客户端命令。你的 `GET product:1001` 本来只需要 0.1ms，但如果它恰好在 `activeExpireCycle()` 执行期间到达，就得等这一轮过期扫描结束后才能被处理。这就是为什么 `SLOWLOG` 里会出现正常命令的耗时变长——不是命令本身慢了，而是它被阻塞在等待过期扫描完成。\n\n你可以通过 `INFO stats` 中的 `expired_time_cap_reached_count` 指标来确认这个问题。这个计数器记录了 `activeExpireCycle()` 因超时被中断的次数。正常情况下这个值应该极少增长（甚至为 0），如果你发现它在短时间内暴增，就说明大量 key 集中过期导致定期删除反复跑满时间限制。场景中这个值在几分钟内增加了 247 次，完全吻合。\n\n```bash\n# 实时监控 expired_time_cap_reached_count 的增速\n$ redis-cli INFO stats | grep expired_time_cap\nexpired_time_cap_reached_count:247\n\n# 10 秒后再看\n$ redis-cli INFO stats | grep expired_time_cap\nexpired_time_cap_reached_count:289\n# 10 秒增加了 42 次 → 说明 activeExpireCycle 几乎每次调用都跑满了\n```\n\n同时，`expired_stale_perc` 这个指标反映了最近一次采样中过期 key 的残留比例。正常值应该在 0-5% 之间。场景中 38.75% 意味着 expires 字典中接近四成的 key 都已过期但还没来得及清理，积压非常严重。\n\n### 问题二：缓存雪崩（Cache Avalanche）\n\n如果说延迟抖动是 Redis 层面的问题，缓存雪崩就是整个系统架构层面的灾难。20 万个商品缓存 key 在同一时间窗口内失效，意味着接下来每一个商品详情请求都会 cache miss，全部穿透到后端数据库。如果系统的正常缓存命中率是 95%，那在雪崩期间命中率骤降到接近 0%。原本数据库只需要扛 5% 的流量（假设总 QPS 是 1 万，数据库扛 500 QPS），现在突然要扛 100% 的 1 万 QPS。\n\n更要命的是，这些请求不是均匀到达的。用户端感知到的是「页面加载变慢了」，于是刷新重试——重试流量进一步放大数据库压力。数据库连接池被打满，新请求拿不到连接开始超时，应用层看到的就是 `Connection is not available, request timed out after 30000ms`，返回 5xx。如果你的数据库没有做好限流和熔断，级联故障会一路蔓延：数据库慢了 → 应用线程被占满 → 上游调用方超时 → 更上游也开始报错……这就是经典的「一个缓存过期引发的血案」。\n\n缓存雪崩和缓存击穿（Cache Breakdown）有一个关键区别：击穿是指单个热点 key 过期后大量并发请求穿透到数据库，雪崩是大量 key 同时失效导致的系统性穿透。雪崩的影响范围远大于击穿，因为它不是一个 key 的问题，而是整个缓存层在一个时间窗口内失去保护能力。\n\n### 问题三：内存与碎片的突变\n\n这是一个容易被忽略的问题。20 万个 key 被集中删除后，Redis 的 `used_memory` 会在短时间内大幅下降。但 Redis 使用的内存分配器 jemalloc（Redis 默认编译的分配器）不会立即把释放的内存归还给操作系统。jemalloc 的设计哲学是：释放的内存先保留在自己的空闲列表（free list）里，等后续有同等大小的分配请求时直接复用，避免频繁的 `mmap`/`munmap` 系统调用。\n\n这意味着你会在 `INFO memory` 中看到一个有趣的现象：\n\n```bash\n127.0.0.1:6379> INFO memory\n# Memory\nused_memory:1073741824         # Redis 认为自己在用 1GB\nused_memory_rss:2684354560     # 操作系统看到的 RSS 是 2.5GB\nmem_fragmentation_ratio:2.50   # 碎片率 = RSS / used_memory = 2.5\n```\n\n`mem_fragmentation_ratio` 在大量 key 被集中删除后可能会飙升。正常情况下这个比值应该在 1.0 到 1.5 之间。如果超过 2.0，说明 jemalloc 持有大量已释放但未归还的内存页。虽然这些内存最终会被复用或者在一段时间后被 jemalloc 的后台线程归还给操作系统（`jemalloc` 的 `dirty page purging` 机制），但在短期内 RSS 居高不下可能触发运维的内存告警，甚至在内存紧张的机器上触发 OOM Killer。\n\nRedis 4.0 引入了 `activedefrag`（主动碎片整理）功能来应对碎片问题。开启后 Redis 会在后台用 jemalloc 的 `je_malloc_stats_print` 和指针迁移来压缩碎片。但碎片整理本身也会消耗 CPU，所以它有专门的控制参数来限制资源占用。\n\n## 第三步：解决方案与最佳实践\n\n### 方案一：TTL 随机化（最核心的防御手段）\n\n最有效也是最简单的预防措施就是给 TTL 加一个随机偏移量，把过期时间打散。基本思路是在一个基准 TTL 上叠加一个随机区间：\n\n```python\nimport random\n\nBASE_TTL = 86400  # 基准过期时间 24 小时\nJITTER = 300      # 随机抖动范围 0~300 秒（5分钟）\n\ndef set_with_jitter(redis_client, key, value):\n    ttl = BASE_TTL + random.randint(0, JITTER)\n    redis_client.set(key, value, ex=ttl)\n\n# 20 万个 key 的过期时间从原来的精确 86400 秒\n# 变成了 86400~86700 秒之间的均匀分布\n# 5 分钟的窗口内 20 万 key 分散过期 → 平均每秒约 667 个\n```\n\n随机偏移量设多大合适？这取决于你的 key 总数和 Redis 的过期处理能力。一个简单的估算方法：`activeExpireCycle()` 每次采样 20 个 key，`hz=10` 时每秒调 10 次，理想情况下每秒能处理约 200 个过期 key（实际上如果过期比例高会循环多次，处理能力更强）。20 万个 key 如果要在不触发 `expired_time_cap` 的前提下平滑删除，至少需要分散在 `200000 / 200 ≈ 1000 秒`（约 17 分钟）以上。所以对于大批量缓存预热场景，300 秒的 jitter 可能还不够，建议至少设到 600-1800 秒。\n\n### 方案二：分批设置过期时间\n\n如果你的缓存预热任务是一次性写入大量 key，可以在代码层面做分批处理。不是改 TTL 随机化（当然也可以同时用），而是把写入操作分散在一段时间内：\n\n```python\nimport time\n\ndef batch_warm_cache(redis_client, items, batch_size=1000, interval=0.5):\n    \"\"\"分批预热缓存，每批 1000 个 key，间隔 0.5 秒\"\"\"\n    for i in range(0, len(items), batch_size):\n        batch = items[i:i + batch_size]\n        pipe = redis_client.pipeline()\n        for item in batch:\n            ttl = 86400 + random.randint(0, 600)\n            pipe.set(f\"product:{item['id']}\", json.dumps(item), ex=ttl)\n        pipe.execute()\n        time.sleep(interval)  # 每批之间休息 0.5 秒\n```\n\n这种方式的好处是不仅过期时间被分散了，写入时的 Redis 压力也被平滑了（避免一次性 pipeline 20 万条命令导致的网络和内存峰值）。\n\n### 方案三：热点 key 提前续期\n\n对于访问频率高的热点 key，可以在应用层实现「提前续期」逻辑。思路是：当读取一个 key 时顺便检查它的剩余 TTL，如果 TTL 低于某个阈值就异步刷新缓存并延长 TTL。这样高频访问的 key 永远不会真正过期：\n\n```python\nASYNC_REFRESH_THRESHOLD = 600  # TTL 低于 10 分钟时触发异步刷新\n\ndef get_product(redis_client, product_id):\n    key = f\"product:{product_id}\"\n    value = redis_client.get(key)\n    if value is None:\n        # cache miss — 回源查数据库并回填缓存\n        return load_and_cache(redis_client, product_id)\n    \n    # cache hit — 检查是否需要提前续期\n    ttl = redis_client.ttl(key)\n    if ttl < ASYNC_REFRESH_THRESHOLD:\n        # 异步刷新，不阻塞当前请求\n        async_refresh_cache.delay(product_id)\n    \n    return json.loads(value)\n```\n\n### 方案四：调整 hz 与 active-expire-effort\n\n如果集中过期无法完全避免（比如业务上确实需要精确的 24 小时过期），可以通过调整 Redis 配置来提升过期清理能力。提高 `hz` 值会让 `serverCron` 执行得更频繁，`activeExpireCycle()` 的调用次数也相应增加。默认 `hz=10`（每秒 10 次），可以提到 25 或 50，但不建议超过 100，因为更高的 hz 意味着更多 CPU 开销花在心跳维护上。\n\nRedis 7.4 引入了一个更精细的参数 `active-expire-effort`（取值 1-500，默认 100）。这个参数直接控制 `activeExpireCycle()` 每次采样的 key 数量和时间预算比例。设为 200 相当于采样数翻倍、时间预算翻倍，过期清理效率大幅提升，但相应的 CPU 占用也会增加。\n\n```bash\n# Redis 7.4+ 调整 active-expire-effort\n127.0.0.1:6379> CONFIG SET active-expire-effort 200\nOK\n\n# 老版本可以通过提高 hz 间接提升\n127.0.0.1:6379> CONFIG SET hz 25\nOK\n```\n\n## 第四步：实战排查方法\n\n如果你遇到了类似场景中的告警，排查步骤应该是这样的。\n\n第一步，确认 Redis 延迟是否异常。`redis-cli --latency-history -i 5` 可以每 5 秒输出一次延迟统计。如果 avg 从亚毫秒级跳到几十毫秒，说明有阻塞性操作在占用主线程。同时用 `redis-cli --intrinsic-latency 10` 测量操作系统本身的延迟基线，排除宿主机层面的问题。\n\n第二步，看 `INFO stats` 里的过期指标。重点关注三个值：`expired_keys` 的增速（用 `redis-cli INFO stats | grep expired_keys` 间隔几秒看两次做差）、`expired_stale_perc` 是否远高于 0、`expired_time_cap_reached_count` 是否在增长。如果三个指标同时异常，基本可以确定是大量 key 集中过期。\n\n```bash\n# 5 秒间隔采样过期 key 删除速率\n$ redis-cli INFO stats | grep expired_keys\nexpired_keys:3847291\n$ sleep 5\n$ redis-cli INFO stats | grep expired_keys\nexpired_keys:3859482\n# 5 秒删了 12191 个 → 每秒约 2438 个过期 key 被删除\n```\n\n第三步，用 `SLOWLOG GET 20` 检查是否有正常命令被异常延迟。如果你看到一堆简单的 `GET`、`SET` 命令执行时间超过 10ms，而这些命令在正常情况下不到 0.1ms，那几乎可以确定是被 `activeExpireCycle()` 阻塞了——命令本身不慢，是它排队等 `activeExpireCycle()` 释放主线程。\n\n```bash\n127.0.0.1:6379> SLOWLOG GET 5\n1) 1) (integer) 12345          # 日志 ID\n   2) (integer) 1700000000     # 时间戳\n   3) (integer) 38214          # 执行时间 38ms！\n   4) 1) \"GET\"                 # 就是一个普通的 GET 命令\n      2) \"product:5678\"\n   5) \"10.0.1.23:52341\"        # 客户端地址\n   6) \"\"\n```\n\n第四步，定位哪些 key 在集中过期。可以用 `SCAN` 配合 `TTL` 来检查 key 的过期时间分布。如果你发现大量 key 的 TTL 非常接近（比如都在 0-10 之间或者都在某个精确值附近），就找到了根因：\n\n```bash\n# 用 SCAN 抽样看 key 的 TTL 分布\n$ redis-cli --scan --pattern 'product:*' | head -100 | while read key; do\n    ttl=$(redis-cli TTL \"$key\")\n    echo \"$key TTL=$ttl\"\ndone | sort -t= -k2 -n\n```\n\n### 与缓存雪崩的关系\n\n大量 key 同时过期是缓存雪崩最经典的诱因之一，但缓存雪崩的成因不止于此。Redis 实例宕机（整个缓存层不可用）、网络分区（应用连不上 Redis）也会导致雪崩。防御缓存雪崩通常需要多层策略配合：TTL 随机化防止集中过期、本地缓存（如 Caffeine、Guava Cache）作为 L1 缓存挡住瞬时穿透、数据库层面的限流和熔断防止级联崩溃、以及合理的缓存预热策略确保冷启动时不会一次性灌入相同 TTL 的 key。\n\n### 面试中如何回答\n\n面试官问「大量 key 同时过期会造成什么问题」时，回答的层次应该是：先说 Redis 自身的延迟抖动（`activeExpireCycle` 占用 CPU、阻塞主线程），再说上层的缓存雪崩（请求穿透到数据库），最后提一下内存碎片的问题。解决方案先说 TTL 随机化（最核心），再提分批过期、提前续期、调参数。如果你能在回答中提到 `expired_time_cap_reached_count` 这个指标和 `redis-cli --latency-history` 这个命令，面试官会觉得你是真的在生产环境处理过这类问题的。",
+      "keyPoints": [
+        "大量 key 设置相同 TTL 会导致同时过期，activeExpireCycle 发现过期比例远超 25% 阈值后反复循环采样删除，slow 模式最多占用 25ms/100ms 的 CPU 时间阻塞主线程命令处理",
+        "INFO stats 中 expired_time_cap_reached_count 持续增长是集中过期的关键确认指标，expired_stale_perc 高于 5% 说明过期 key 积压严重",
+        "大量缓存 key 同时失效导致缓存雪崩——请求全部穿透到数据库，瞬间压力暴增可能引发级联故障（连接池耗尽、上游超时、整条链路崩溃）",
+        "集中删除大量 key 后 jemalloc 不会立即归还内存给操作系统，RSS 居高不下导致 mem_fragmentation_ratio 飙升，可能触发内存告警或 OOM Killer",
+        "TTL 随机化是最核心的防御手段：在基准 TTL 上加 random(0, N) 的偏移量把过期时间打散，N 的大小取决于 key 总数和期望的每秒过期处理量",
+        "排查命令组合：redis-cli --latency-history 看延迟趋势、INFO stats 看 expired_keys 增速和 expired_time_cap_reached_count、SLOWLOG GET 看正常命令是否被阻塞",
+        "Redis 7.4 引入 active-expire-effort 参数（1-500，默认 100）可更精细地控制过期扫描的采样数和时间预算，比单纯调 hz 更灵活",
+        "缓存雪崩的完整防御需要多层策略配合：TTL 随机化 + 本地 L1 缓存 + 数据库限流熔断 + 热点 key 提前续期"
+      ],
+      "quiz": [
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz1",
+          "question": "Redis 的 activeExpireCycle() 在 slow 模式下，每次执行的最大时间限制是多少（按默认 hz=10 计算）？",
+          "choices": [
+            {"id": "A", "text": "10ms，占一个 serverCron 周期的 10%"},
+            {"id": "B", "text": "25ms，占一个 serverCron 周期（100ms）的 25%"},
+            {"id": "C", "text": "50ms，占一个 serverCron 周期的 50%"},
+            {"id": "D", "text": "100ms，可以占满整个 serverCron 周期"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "activeExpireCycle() 在 slow 模式下的时间上限是 serverCron 周期时长的 25%。当 hz=10 时，serverCron 每 100ms 执行一次，所以时间上限是 100ms × 25% = 25ms。选项 A 的 10% 比例和选项 C 的 50% 比例都不是 Redis 源码中的实际设定。选项 D 更不可能——如果 activeExpireCycle 能占满整个周期，其他所有 serverCron 任务（客户端超时检查、rehash 推进、AOF/RDB 监控等）就没有执行时间了。25% 是 Redis 在过期清理效率和主线程命令处理能力之间的平衡点。"
+        },
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz2",
+          "question": "activeExpireCycle() 的循环退出条件是什么？",
+          "choices": [
+            {"id": "A", "text": "当采样中过期 key 占比降到 25% 以下，或达到时间上限"},
+            {"id": "B", "text": "当 expires 字典中所有过期 key 都被删除后退出"},
+            {"id": "C", "text": "当连续 3 次采样都没有发现过期 key 时退出"},
+            {"id": "D", "text": "当已删除的过期 key 数量达到 10000 个时退出"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "activeExpireCycle() 每轮从 expires 字典随机采样 20 个 key，删除其中过期的，然后统计过期比例。如果过期比例超过 25%（即 20 个里有超过 5 个过期），说明过期 key 密度很高，继续下一轮采样。循环退出有两个条件：要么过期比例降到 25% 以下（说明大部分过期 key 已经清理差不多了），要么达到时间上限被强制中断。选项 B 的「所有过期 key 都删除」在大量 key 集中过期时可能需要几十秒才能完成，会完全阻塞主线程。选项 C 和 D 都不是 Redis 源码中的实际逻辑。"
+        },
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz3",
+          "question": "大量 key 同时过期导致 Redis 延迟飙高的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "过期 key 在网络层产生了大量的 DEL 命令回复，占满了网络带宽"},
+            {"id": "B", "text": "Redis 为每个过期 key 触发了独立的定时器回调，定时器队列溢出"},
+            {"id": "C", "text": "过期 key 的删除触发了大量 AOF 写入，磁盘 IO 成为瓶颈"},
+            {"id": "D", "text": "activeExpireCycle() 在主线程反复循环扫描删除过期 key，阻塞了正常命令的执行"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Redis 是单线程执行命令的架构，activeExpireCycle() 也跑在主线程上。当大量 key 同时过期时，每次采样的过期比例都远超 25%，activeExpireCycle 反复循环直到跑满时间限制（slow 模式 25ms）。在这段时间内，所有等待处理的客户端命令都被阻塞了。选项 A 不对——过期删除是 Redis 内部行为，不是客户端发起的 DEL 命令，不存在网络回复的问题。选项 B 不对——Redis 恰恰不使用定时器来处理过期 key。选项 C 虽然 AOF 确实会记录 DEL 命令，但 AOF 写入有 fsync 策略控制，通常不是延迟飙高的主因。"
+        },
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz4",
+          "question": "INFO stats 中哪个指标能最直接地确认 activeExpireCycle 因过期 key 过多而被反复限时中断？",
+          "choices": [
+            {"id": "A", "text": "expired_keys — 累计过期删除的 key 总数"},
+            {"id": "B", "text": "evicted_keys — 内存淘汰的 key 总数"},
+            {"id": "C", "text": "expired_time_cap_reached_count — activeExpireCycle 被限时中断的次数"},
+            {"id": "D", "text": "expired_stale_perc — 采样中过期 key 的残留比例"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "expired_time_cap_reached_count 记录了 activeExpireCycle() 因达到时间上限被强制中断的累计次数。这个值持续快速增长意味着 Redis 的过期清理频繁跑满时间预算，是集中过期的直接证据。选项 A 的 expired_keys 只是累计总数，无法区分是均匀过期还是集中过期——需要对它求导看瞬时速率。选项 B 的 evicted_keys 是内存淘汰机制的计数器，和过期删除是两个不同的机制。选项 D 的 expired_stale_perc 能反映过期积压程度，但它不如 expired_time_cap_reached_count 那样直接证明「activeExpireCycle 被限时中断」这个事实。"
+        },
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz5",
+          "question": "以下 SLOWLOG 输出中，GET 命令执行时间为 38ms，最可能的原因是什么？\n\n```\n1) 1) (integer) 12345\n   2) (integer) 1700000000\n   3) (integer) 38214\n   4) 1) \"GET\"\n      2) \"product:5678\"\n```",
+          "choices": [
+            {"id": "A", "text": "product:5678 是一个超大 key（比如 100MB 的 String），读取耗时长"},
+            {"id": "B", "text": "GET 命令被 activeExpireCycle() 阻塞等待，实际命令执行时间远低于 38ms"},
+            {"id": "C", "text": "Redis 正在执行 BGSAVE，fork 导致了主线程暂停 38ms"},
+            {"id": "D", "text": "客户端到 Redis 之间的网络延迟是 38ms"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "SLOWLOG 记录的时间包含命令在 Redis 主线程上从开始处理到返回结果的总时间。一个普通的 GET 命令操作哈希表查找一般不超过 0.1ms。如果它在 SLOWLOG 中显示 38ms，最大可能是它到达时主线程正被 activeExpireCycle() 占用，命令排队等待了 37.9ms 才真正执行。选项 A 不太合理——即使 key 值很大，Redis 的读取操作是纯内存操作，100MB 的读取也不需要 38ms。选项 C 中 fork 确实会短暂阻塞主线程，但 fork 导致的延迟通常是几毫秒级且只在 BGSAVE 瞬间发生一次。选项 D 不对——SLOWLOG 记录的是 Redis 内部处理时间，不包含网络传输时间。"
+        },
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz6",
+          "question": "以下哪种 TTL 设置方式无法有效预防大量 key 同时过期？",
+          "choices": [
+            {"id": "A", "text": "SET key value EX (86400 + random(0, 600))"},
+            {"id": "B", "text": "SET key value EX 86400，然后在应用层对热点 key 做 TTL 低于阈值时异步刷新"},
+            {"id": "C", "text": "所有 key 统一设置 EX 86400，但把 Redis 的 hz 从 10 提高到 100"},
+            {"id": "D", "text": "分批预热缓存，每批之间间隔几秒，同时每个 key 的 TTL 加随机偏移"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "提高 hz 只是让 activeExpireCycle 执行得更频繁，增强了过期清理的「处理能力」，但并不改变 20 万个 key 在同一秒过期的事实。hz=100 意味着每秒调用 100 次 activeExpireCycle，每次仍然会发现过期比例远超 25% 并跑满时间限制，只不过时间限制变成了 10ms×25%=2.5ms 而已。主线程被阻塞的总时间可能反而更长（因为调用次数更多）。选项 A 通过随机偏移把过期时间分散到 600 秒窗口内。选项 B 对热点 key 做提前续期可以避免它们真正过期。选项 D 同时做了分批写入和 TTL 随机化，是最完善的方案。"
+        },
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz7",
+          "question": "缓存雪崩和缓存击穿的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "雪崩是 Redis 宕机，击穿是 key 过期"},
+            {"id": "B", "text": "雪崩是大量 key 同时失效导致系统性穿透，击穿是单个热点 key 失效导致并发穿透"},
+            {"id": "C", "text": "雪崩只影响读请求，击穿只影响写请求"},
+            {"id": "D", "text": "雪崩发生在 Redis Cluster 模式，击穿发生在单机模式"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "缓存雪崩是大面积的缓存失效——可能是大量 key 同时过期、也可能是 Redis 实例整体不可用——导致大量请求同时穿透到数据库，造成系统性压力。缓存击穿是单个热点 key 过期后，短时间内的大量并发请求都 miss 并穿透到数据库。雪崩的影响范围远大于击穿，因为它影响的是大量 key 而非单个 key。选项 A 不完整——Redis 宕机只是雪崩的成因之一，大量 key 同时过期也会导致雪崩。选项 C 的说法完全没有依据，两者都主要影响读请求。选项 D 与 Redis 部署模式无关。"
+        },
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz8",
+          "question": "大量 key 被集中删除后，INFO memory 中 mem_fragmentation_ratio 从 1.1 飙升到 2.5，最合理的解释是？",
+          "choices": [
+            {"id": "A", "text": "Redis 发生了内存泄漏，used_memory 在持续上涨"},
+            {"id": "B", "text": "jemalloc 释放的内存保留在空闲列表中未归还操作系统，RSS 居高不下而 used_memory 已大幅下降"},
+            {"id": "C", "text": "操作系统的交换分区（swap）被大量使用，导致 RSS 计算异常"},
+            {"id": "D", "text": "Redis 的 RDB 子进程占用了额外的内存，被计入了 RSS"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "mem_fragmentation_ratio = used_memory_rss / used_memory。当大量 key 被删除后，Redis 的 used_memory 会大幅下降，但 jemalloc 内存分配器不会立即把释放的内存页通过 munmap 归还给操作系统。jemalloc 的设计是将释放的内存保留在自己的 free list 中等待复用，所以操作系统看到的 RSS 短期内不会明显下降，ratio 就会飙高。选项 A 描述的是内存泄漏场景，那时 used_memory 会上涨而非下降。选项 C 中 swap 的使用会让延迟飙高但不会导致 RSS 计算异常。选项 D 中 RDB 子进程的内存在 INFO memory 的 used_memory_rss 中不会被重复计算。"
+        },
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz9",
+          "question": "Redis 7.4 引入的 active-expire-effort 参数（默认值 100，范围 1-500）的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "控制惰性删除时 expireIfNeeded() 的调用频率"},
+            {"id": "B", "text": "控制 activeExpireCycle 每次采样的 key 数量和时间预算比例，值越大过期清理越积极"},
+            {"id": "C", "text": "控制过期 key 被删除后多久归还内存给操作系统"},
+            {"id": "D", "text": "控制主从复制中过期 DEL 命令的传播延迟阈值"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "active-expire-effort 是 Redis 7.4 引入的参数，用于更精细地调控 activeExpireCycle 的激进程度。默认值 100 表示标准行为，设为 200 相当于采样数量和时间预算都翻倍，过期清理效率大幅提升但 CPU 开销也相应增加。这比单纯调 hz 更灵活，因为 hz 影响的是整个 serverCron 的频率，而 active-expire-effort 只影响过期清理这一个环节。选项 A 不对——惰性删除是在每次命令执行前自动调用的，没有频率控制的概念。选项 C 描述的是 jemalloc 的行为，与 Redis 配置无关。选项 D 纯属虚构。"
+        },
+        {
+          "id": "redis-expire-mass-expiry-q1-quiz10",
+          "question": "生产环境中排查「大量 key 集中过期导致延迟飙高」问题时，以下排查步骤的正确顺序是？\n\n① SLOWLOG GET 看是否有简单命令被异常延迟\n② redis-cli --latency-history 确认延迟趋势\n③ SCAN + TTL 抽样检查 key 的过期时间分布\n④ INFO stats 看 expired_time_cap_reached_count 和 expired_stale_perc",
+          "choices": [
+            {"id": "A", "text": "③ → ① → ④ → ②"},
+            {"id": "B", "text": "② → ④ → ① → ③"},
+            {"id": "C", "text": "① → ② → ③ → ④"},
+            {"id": "D", "text": "④ → ③ → ② → ①"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "排查思路应该是从现象到原因逐步收敛。首先用 redis-cli --latency-history（步骤②）确认 Redis 确实存在延迟异常，确定问题的时间范围和严重程度。然后用 INFO stats（步骤④）检查过期相关指标，确认延迟是否由集中过期引起。接着用 SLOWLOG GET（步骤①）查看具体哪些命令受到了影响，验证「正常命令被阻塞」的假设。最后用 SCAN + TTL（步骤③）定位具体是哪批 key 设置了相同的过期时间，找到根因以便修复。选项 A 先做 SCAN 抽样太早了——你还不确定问题是集中过期导致的。选项 C 先看 SLOWLOG 虽然也可以但不如先看全局延迟趋势。选项 D 的顺序基本颠倒了。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/expire/",
+        "https://redis.io/docs/latest/develop/reference/eviction/",
+        "https://github.com/redis/redis/blob/7.2/src/expire.c",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/"
+      ]
+    }
+  ]
+}

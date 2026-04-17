@@ -1,0 +1,157 @@
+{
+  "id": "redis-expire-periodic-deletion",
+  "name": "Redis 定期删除的频率与采样策略",
+  "domain": "redis",
+  "description": "深入剖析 Redis activeExpireCycle 的 slow/fast 双模式、serverCron 调用链、hz 与 dynamic-hz 频率控制、25% 阈值采样循环、关键常量及生产环境监控调优",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-expire-periodic-deletion-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["定期删除", "activeExpireCycle", "serverCron", "hz", "采样策略", "ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP", "redis-expiration"],
+      "title": "Redis 定期删除是怎么工作的？讲讲 activeExpireCycle 的采样策略和频率控制",
+      "content": "## 面试场景\n\n你已经知道 Redis 的过期 key 靠「惰性删除 + 定期删除」两把刷子来清理。惰性删除好理解——有人访问才检查，没人访问就不管。但定期删除这一块，面试官经常会深挖：Redis 每秒扫几次？每次扫多少 key？如果过期 key 特别多，它怎么判断要不要多扫几轮？时间预算怎么算的？这些问题一旦追问到源码级别，很多人就答不上来了。\n\n我们先看一个生产环境中很常见的现象。你部署了一个 Redis 6.2 实例，业务高峰期往里面写了大约 800 万个带 TTL 的 session key，TTL 统一是 30 分钟。高峰过后流量骤降，但你发现 `used_memory` 并没有像预期那样在 30 分钟后迅速回落，而是花了将近 45 分钟才降下来。你去看 `INFO stats`：\n\n```bash\n127.0.0.1:6379> INFO stats\n# Stats\nexpired_keys:7893421\nexpired_stale_perc:12.35\nexpired_time_cap_reached_count:847\n```\n\n`expired_time_cap_reached_count` 高达 847——这意味着 `activeExpireCycle()` 在 847 次调用中都跑满了时间上限被强制中断了。换句话说，过期 key 太多，Redis 在每次定期删除的时间预算内清理不完，只能分批慢慢消化。\n\n这引出了几个核心问题：`activeExpireCycle()` 到底是谁在什么时机调用它的？它的时间预算是怎么算的？每次采样多少个 key？根据什么条件决定要不要继续采样？`hz` 这个参数是怎么影响这一切的？这道题就要把定期删除的完整机制从 `serverCron` 的调用链到采样循环的每一个分支条件，全部拆清楚。\n\n如果你能在面试中画出 `activeExpireCycle()` 的流程图、说出 `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP = 20` 和 `25%` 这两个关键数字、解释清楚 slow 模式和 fast 模式的区别，基本上 Redis 过期机制这块就稳了。",
+      "answer": "## 第一步：Redis 定期删除的基础认知\n\n### Redis 过期删除机制的全景\n\nRedis 是一个基于内存的键值存储系统，当你通过 `EXPIRE`、`PEXPIRE`、`SET ... EX` 等命令给一个 key 设置了过期时间后，Redis 在内部将过期时间存入 `redisDb` 结构体的 `expires` 字典中，值为毫秒精度的绝对 Unix 时间戳。过期 key 的清理依赖两种策略协作：惰性删除（Lazy Expiration）在每次读写 key 时调用 `expireIfNeeded()` 检查并删除已过期的 key；定期删除（Active Expiration）由 Redis 自己主动在后台周期性地采样检查 expires 字典，批量清理过期 key。惰性删除是被动的「兜底机制」，对 CPU 零额外开销但无法清理不被访问的过期 key；定期删除是主动的「清扫机制」，确保那些永远不会再被客户端访问到的过期 key 也能被及时回收内存。\n\n两者配合的核心逻辑是：定期删除以概率采样的方式覆盖大部分过期 key，惰性删除在客户端访问时兜底处理漏网之鱼。这道题的重点就在于拆解定期删除的每一个实现细节。\n\n### serverCron：Redis 的心跳定时器\n\nRedis 的网络模型是基于事件循环（event loop）的单线程模型，在 `src/ae.c` 中实现。事件循环处理两类事件：文件事件（File Event，即客户端连接的网络 I/O）和时间事件（Time Event，即定时执行的后台任务）。`serverCron` 就是 Redis 中最重要的时间事件回调函数，定义在 `src/server.c` 中。它每隔一段时间被事件循环唤醒一次，负责执行一系列周期性的维护任务——过期 key 清理、客户端超时断连、渐进式 rehash 推进、AOF/RDB 后台任务状态检查、cluster 节点心跳、内存碎片整理触发等。\n\n`serverCron` 的执行频率由 `redis.conf` 中的 `hz` 参数控制。`hz` 的含义是「每秒调用 serverCron 多少次」，默认值为 10，即每 100 毫秒执行一次。可以通过命令动态调整：\n\n```bash\n# 查看当前 hz 配置\n127.0.0.1:6379> CONFIG GET hz\n1) \"hz\"\n2) \"10\"\n\n# 调高频率：每秒执行 50 次（每 20ms 一次）\n127.0.0.1:6379> CONFIG SET hz 50\nOK\n```\n\n`hz` 越大，`serverCron` 执行越频繁，过期 key 清理也就越及时，但 CPU 开销越大。官方文档的建议是：绝大多数场景下默认的 10 就够用了，只有在 key 的过期量特别大、对内存回收及时性要求非常高的场景下才考虑调到 25 甚至 100，不建议超过 500。\n\n在 `serverCron` 的代码中，调用 `activeExpireCycle()` 的那一行是这样的：\n\n```c\n// Redis 7.0 源码 src/server.c — serverCron() 节选\nint serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {\n    // ... 更新缓存时间、处理 shutdown、检查客户端超时 ...\n\n    // 定期删除过期 key — slow 模式\n    activeExpireCycle(ACTIVE_EXPIRE_CYCLE_SLOW);\n\n    // ... rehash、AOF/RDB 检查、cluster 心跳 ...\n\n    // 返回下一次调用的间隔：1000/hz 毫秒\n    return 1000 / server.hz;\n}\n```\n\n注意 `serverCron` 返回的是下次调用的间隔（毫秒），即 `1000/hz`。当 `hz=10` 时返回 100，意味着 100ms 后再次调用。\n\n## 第二步：activeExpireCycle 的深度解析\n\n### 两种运行模式\n\n`activeExpireCycle()` 接受一个 `type` 参数，区分两种运行模式：\n\n**ACTIVE_EXPIRE_CYCLE_SLOW（慢模式）**：在 `serverCron` 中被调用，是定期删除的主力。它的时间预算计算公式是 `timelimit = 1000000 / hz * ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC / 100`（单位微秒）。其中 `ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC` 是一个编译期常量，值为 25，表示 slow 模式最多占用一次 serverCron 周期的 25% CPU 时间。当 `hz=10` 时，一次 serverCron 周期是 100ms = 100000μs，25% 就是 25000μs = 25ms。这意味着每次 slow 模式调用最多跑 25ms 就必须退出，把 CPU 让给命令处理。\n\n**ACTIVE_EXPIRE_CYCLE_FAST（快模式）**：在事件循环的 `beforeSleep()` 回调中被调用。`beforeSleep()` 是 Redis 在每次事件循环迭代中、处理完所有就绪的文件事件之后、进入下一轮 `epoll_wait` 等待之前执行的回调。快模式的时间预算是一个硬编码常量 `ACTIVE_EXPIRE_CYCLE_FAST_DURATION = 1000`（微秒，即 1ms），远小于 slow 模式。快模式的设计目的是在两次 serverCron 之间「见缝插针」地多清理一点过期 key，但严格控制时间不影响命令响应延迟。\n\n快模式有一个重要的触发条件：只有当上一次 slow 模式因超时退出（即跑满了 timelimit 被强制中断）时，才会触发快模式。这个设计非常精妙——如果 slow 模式在时间预算内就完成了所有采样（说明过期 key 不多），那快模式没必要启动；只有 slow 模式清理不过来（过期 key 积压严重）时，快模式才介入补充清理。此外，两次快模式调用之间必须间隔至少 `ACTIVE_EXPIRE_CYCLE_FAST_DURATION * 2 = 2000μs`（2ms），防止快模式被过于频繁地触发。\n\n以下是 Redis 7.0 源码中 `activeExpireCycle()` 的关键常量和模式判断逻辑（位于 `src/expire.c`）：\n\n```c\n// src/expire.c — 关键常量定义\n#define ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP 20     // 每轮采样 key 数\n// 注：在早期版本中名为 ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP\n#define ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC 25    // slow 模式占 CPU 时间比例\n#define ACTIVE_EXPIRE_CYCLE_FAST_DURATION  1000   // fast 模式时间上限（微秒）\n\nvoid activeExpireCycle(int type) {\n    static int current_db = 0;          // 记住上次扫到哪个 db\n    static int timelimit_exit = 0;      // 上次是否因超时退出\n    static long long last_fast_cycle = 0; // 上次 fast 模式的时间戳\n\n    // fast 模式的触发判断\n    if (type == ACTIVE_EXPIRE_CYCLE_FAST) {\n        // 如果上次 slow 模式不是因超时退出的，直接返回\n        if (!timelimit_exit) return;\n        // 距离上次 fast 调用不足 2ms，也直接返回\n        if (start < last_fast_cycle + (long long)ACTIVE_EXPIRE_CYCLE_FAST_DURATION * 2)\n            return;\n        last_fast_cycle = start;\n    }\n\n    // 计算时间预算\n    long long timelimit;\n    if (type == ACTIVE_EXPIRE_CYCLE_SLOW) {\n        timelimit = config_hz < 1 ? 1 : config_hz;\n        timelimit = 1000000 / timelimit * ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC / 100;\n    } else {\n        timelimit = ACTIVE_EXPIRE_CYCLE_FAST_DURATION;\n    }\n    // ...\n}\n```\n\n### 采样循环的完整流程\n\n时间预算算好之后，`activeExpireCycle()` 进入核心的采样循环。整个流程可以概括为「外层遍历数据库，内层采样 + 循环判断」。Redis 默认有 16 个数据库（db0 到 db15），`activeExpireCycle()` 用一个 `static` 变量 `current_db` 记录上一次扫到了哪个 db，下一次调用时从下一个 db 继续，实现轮流扫描。对于每个 db，采样循环的步骤如下：\n\n第一步，检查该 db 的 `expires` 字典是否为空。如果没有任何 key 设置了过期时间，跳过这个 db。第二步，从该 db 的 `expires` 字典中随机采样 `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP`（默认 20）个 key。这里的「随机采样」使用的是 `dictGetRandomKey()` 函数，它从哈希表中随机选一个桶（bucket），再从桶的链表中随机选一个 entry，时间复杂度 O(1)。第三步，对采样到的每个 key 检查过期时间，如果 `当前时间戳 > 该 key 的过期时间戳`，则删除这个 key（同时从 `dict` 和 `expires` 两个字典中移除），并更新 `server.stat_expiredkeys` 计数器。\n\n关键在第四步：统计本轮采样中过期 key 的比例。如果 20 个采样 key 中过期的超过 25%（即超过 5 个），说明这个 db 中过期 key 的密度还很高，于是继续对同一个 db 进行下一轮采样。如果过期比例不超过 25%，则跳到下一个 db。这个 25% 的阈值是一个统计学上的巧妙设计——当随机采样中过期比例低于 25% 时，可以合理推断整个 expires 字典中的过期 key 比例也不高，继续扫描的边际收益很低。\n\n整个采样循环在每次迭代结束后都会检查已用时间是否超过 `timelimit`。如果超时，设置 `timelimit_exit = 1`（记录「因超时退出」的状态，供 fast 模式判断）并立即退出。如果所有 db 都扫描完了或者每个 db 的过期比例都低于 25%，则正常退出并设置 `timelimit_exit = 0`。\n\n用伪代码描述完整流程：\n\n```\nfunction activeExpireCycle(type):\n    if type == FAST:\n        if 上次slow模式不是超时退出: return\n        if 距离上次fast调用 < 2ms: return\n        timelimit = 1000μs (1ms)\n    else:  // SLOW\n        timelimit = (1000000/hz) * 25/100  // 默认 25000μs = 25ms\n\n    start_time = now()\n    timelimit_exit = 0\n\n    for db in databases[current_db ... current_db+dbs_per_call]:\n        if db.expires.size() == 0: continue\n\n        repeat:\n            // 采样 20 个 key\n            sampled = random_sample(db.expires, 20)\n            expired_count = 0\n\n            for key in sampled:\n                if key.expire_time < now():\n                    delete(key)\n                    expired_count++\n                    server.stat_expiredkeys++\n\n            // 检查时间预算\n            if now() - start_time > timelimit:\n                timelimit_exit = 1\n                return   // 超时强制退出\n\n        until expired_count / sampled.size() <= 25%\n        // 过期比例 ≤ 25%，跳到下一个 db\n\n    current_db = next_db  // 记住扫描位置\n```\n\n### slow 模式和 fast 模式的协作时序\n\n把两种模式放在 Redis 事件循环的时间线上看，你能更清楚地理解它们的协作关系。假设 `hz=10`，一次事件循环迭代大约是这样的：\n\n```\n时间线（不等比例）：\n\n│←──── serverCron 周期 100ms ────→│\n│                                  │\n├─ [serverCron]                    ├─ [serverCron]\n│   └─ activeExpireCycle(SLOW)     │   └─ activeExpireCycle(SLOW)\n│       timelimit = 25ms           │       timelimit = 25ms\n│                                  │\n│  ┌─ epoll_wait ─┐               │\n│  │  处理客户端命令  │               │\n│  └──────────────┘               │\n│  ┌─ beforeSleep ─┐              │\n│  │  activeExpireCycle(FAST)      │\n│  │  timelimit = 1ms             │\n│  │  仅在上次SLOW超时退出时触发    │\n│  └──────────────┘               │\n│  ┌─ epoll_wait ─┐               │\n│  │  处理客户端命令  │               │\n│  └──────────────┘               │\n│  ┌─ beforeSleep ─┐              │\n│  │  (距上次FAST<2ms? → 跳过)     │\n│  └──────────────┘               │\n```\n\n在一个 100ms 的 serverCron 周期内，SLOW 模式调用一次（最多 25ms），FAST 模式可能在多次 `beforeSleep` 回调中被触发（每次最多 1ms，且间隔 ≥ 2ms）。在极端情况下（过期 key 非常多），一个周期内 SLOW 占 25ms + 多次 FAST 各占 1ms，定期删除总共可以占用约 25 + N×1 毫秒的 CPU 时间。\n\n## 第三步：hz 调优与生产实践\n\n### hz 参数的影响分析\n\n`hz` 直接决定了定期删除的激进程度。提高 `hz` 带来两个效果：SLOW 模式调用更频繁（从每秒 10 次变成每秒 50 次），但每次的时间预算也按比例减小（从 25ms 减到 5ms，因为周期从 100ms 缩短为 20ms，25% 不变）。总的 CPU 时间占比仍然是 25%，但清理的「粒度」更细了——更短的间隔意味着过期 key 被发现和删除的延迟更低。\n\n| hz 值 | serverCron 周期 | SLOW 每次时间预算 | SLOW 每秒调用次数 | 每秒总清理时间上限 |\n|-------|----------------|-----------------|-----------------|------------------|\n| 10    | 100ms          | 25ms            | 10 次           | 250ms (25%)      |\n| 25    | 40ms           | 10ms            | 25 次           | 250ms (25%)      |\n| 50    | 20ms           | 5ms             | 50 次           | 250ms (25%)      |\n| 100   | 10ms           | 2.5ms           | 100 次          | 250ms (25%)      |\n\n从表中可以看出，不管 `hz` 设多大，SLOW 模式的 CPU 时间占比上限始终是 25%。但更高的 `hz` 意味着更频繁的采样，对过期 key 的感知速度更快，内存释放更及时。代价是 `serverCron` 本身的调度开销增大（时间事件触发、函数调用的 overhead），以及更频繁地打断 `epoll_wait`（可能略增网络事件处理延迟）。\n\n实际生产中的经验值：如果你的 Redis 实例过期 key 数量在百万级以下，默认 `hz=10` 完全够用。如果是千万级过期 key 的场景（比如大量短 TTL 的 session、限流计数器），可以调到 25-50。调到 100 以上的场景非常少见，通常需要配合监控确认确实有收益。\n\n### dynamic-hz：智能频率调节\n\nRedis 5.0 引入了 `dynamic-hz` 配置（Redis 7.0 默认开启 `yes`），解决的问题是：在低流量时段（比如凌晨），没必要按照高峰期配置的 `hz` 频率执行 `serverCron`，白白浪费 CPU。开启 `dynamic-hz` 后，Redis 会根据当前连接的客户端数量动态调整实际执行频率。\n\n```bash\n127.0.0.1:6379> CONFIG GET dynamic-hz\n1) \"dynamic-hz\"\n2) \"yes\"\n\n# 查看当前实际的客户端连接数\n127.0.0.1:6379> INFO clients\n# Clients\nconnected_clients:847\n```\n\n`dynamic-hz` 的计算逻辑在 `src/server.c` 的 `adaptiveHzValue()` 函数中。大致原理是把实际 hz 设为 `configured_hz + configured_hz * (connected_clients / config_hz_adapt_clients_threshold)`，上限不超过 `CONFIG_MAX_HZ`（500）。当客户端数量很少时，实际 hz 接近配置值；当客户端数量显著增长时，实际 hz 按比例上浮，使过期清理和客户端超时检测更加及时。\n\n### 监控指标与告警\n\n生产环境中判断定期删除是否「跟得上」，最直接的指标来自 `INFO stats`：\n\n```bash\n127.0.0.1:6379> INFO stats\n# Stats\nexpired_keys:15238471          # 累计过期删除的 key 总数\nexpired_stale_perc:0.45        # 最近一次采样中过期 key 的比例\nexpired_time_cap_reached_count:12  # SLOW 模式因超时被中断的累计次数\n```\n\n`expired_keys` 是一个只增不减的计数器。在 Prometheus + Redis Exporter 的监控体系中，通常对它做 `rate()` 求导，得到每秒过期删除速率。如果这个速率突然飙高，说明有大量 key 集中过期。`expired_stale_perc` 反映了 expires 字典中过期 key 的「残留浓度」，这个值是最近一次 `activeExpireCycle` 退出时的采样过期比例。如果长期大于 0（比如稳定在 5%+），意味着过期 key 始终有积压。最关键的告警指标是 `expired_time_cap_reached_count`——对它求导后得到每秒超时退出的次数，如果这个值持续大于 0，说明 SLOW 模式每次都跑满了 25ms 还清不完，此时需要考虑调高 `hz` 或排查是否存在大量 key 同时过期的问题。\n\n```yaml\n# Prometheus 告警规则示例\ngroups:\n  - name: redis-expiration\n    rules:\n      - alert: RedisExpireCycleOverloaded\n        expr: rate(redis_expired_time_cap_reached_count[5m]) > 0.5\n        for: 10m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"Redis 定期删除超时频率过高\"\n          description: \"实例 {{ $labels.instance }} 的 activeExpireCycle 在过去 5 分钟内平均每秒超时 {{ $value }} 次，过期 key 积压严重。\"\n```\n\n### Keyspace Notification：过期事件通知\n\n每当一个 key 被过期删除（无论是惰性删除还是定期删除触发），Redis 都会发布一个 Keyspace Notification 事件。这个机制默认关闭，需要通过 `notify-keyspace-events` 配置开启。当配置中包含 `Ex` 时（E 表示 Keyevent 事件，x 表示过期事件），Redis 会在 key 被删除时向 `__keyevent@<db>__:expired` 频道发布消息，消息内容是被删除的 key 名称。\n\n```bash\n# 开启过期事件通知\n127.0.0.1:6379> CONFIG SET notify-keyspace-events Ex\nOK\n\n# 订阅 db0 的过期事件\n127.0.0.1:6379> SUBSCRIBE __keyevent@0__:expired\nReading messages... (press Ctrl-C to quit)\n1) \"subscribe\"\n2) \"__keyevent@0__:expired\"\n3) (integer) 1\n\n# 当某个 key 过期被删除时，会收到：\n1) \"message\"\n2) \"__keyevent@0__:expired\"\n3) \"session:user1001\"\n```\n\n需要注意的一个关键点：过期事件不是在 key 的 TTL 到达时立即发出的，而是在 key 实际被删除时才发出。如果一个 key 在凌晨 3:00 过期，但直到 3:05 才被 `activeExpireCycle` 采样到并删除，那么过期事件是在 3:05 发出的。因此不要依赖 Keyspace Notification 做精确的定时任务——它的时效性取决于定期删除的采样频率和惰性删除的访问时机。如果业务需要精确的过期回调，应该使用 Redis Stream + 消费者组或者外部的延迟队列（如 RabbitMQ 的 TTL + Dead Letter Exchange）来实现。\n\n### 大量 key 同时过期的性能影响与优化\n\n理解了采样循环的机制后，你就能解释为什么大量 key 同时过期会导致延迟飙高。假设 800 万个 key 的 TTL 全部相同，在过期时刻，`activeExpireCycle(SLOW)` 的每轮采样 20 个 key 几乎全部过期（比例远超 25%），所以它会对同一个 db 反复采样，每次删 20 个，直到跑满 25ms 时间上限被强制退出。下一次 serverCron 又是如此，周而复始。在这期间每次 serverCron 都有 25ms 花在过期清理上，加上 FAST 模式见缝插针的补充，命令响应的 P99 延迟会从正常的亚毫秒级飙到数十毫秒。\n\n生产环境的标准优化手段是给 TTL 加随机抖动，把集中过期打散：\n\n```python\nimport redis\nimport random\n\nr = redis.Redis()\nbase_ttl = 1800  # 30 分钟\n\nfor uid in range(8_000_000):\n    jitter = random.randint(0, 300)  # 随机 0-300 秒抖动\n    r.set(f\"session:{uid}\", f'{{\"uid\":{uid}}}', ex=base_ttl + jitter)\n```\n\n加了 300 秒的随机抖动后，800 万个 key 的过期时间被分散到一个 5 分钟的窗口内，每秒平均过期约 26667 个 key，`activeExpireCycle` 可以从容地分批消化，不会出现超时退出的情况。\n\n### 源码级细节补充：dbs_per_call 与采样上限\n\n`activeExpireCycle()` 每次调用并不会遍历所有 16 个数据库。它使用 `dbs_per_call` 变量控制每次最多检查多少个 db，这个值在 SLOW 模式下等于 `CRON_DBS_PER_CALL`（值为 16，即最多扫描全部 db）；在 FAST 模式下等于 `min(CRON_DBS_PER_CALL, server.dbnum)`（同样最多 16 个）。但实际上，如果某个 db 的过期 key 很多导致反复采样，可能还没轮到后面的 db 时间预算就用完了。这也是为什么 `current_db` 需要用 `static` 变量记住上次的位置——下一次调用从上次断开的地方继续，确保每个 db 都能被「雨露均沾」。\n\n还有一个不太被注意到的细节：在采样过程中，如果 `expires` 字典中 key 的总量小于 `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP`（比如某个 db 只有 5 个设了过期的 key），那就把这 5 个全部检查一遍，不做随机采样了。这个优化避免了小数据量时随机采样可能重复命中同一个 key 的问题。",
+      "keyPoints": [
+        "activeExpireCycle 有 SLOW 和 FAST 两种模式：SLOW 在 serverCron 中调用，时间预算为 1000000/hz*25/100 微秒（默认 25ms）；FAST 在 beforeSleep 中调用，时间预算硬编码 1000μs（1ms）",
+        "FAST 模式仅在上一次 SLOW 模式因超时退出时才触发，且两次 FAST 调用间隔必须 ≥ 2ms，设计目的是在 serverCron 间隔之间补充清理积压的过期 key",
+        "每轮从 expires 字典随机采样 ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP（默认 20）个 key，删除其中已过期的，若过期占比 > 25% 则继续对同一 db 采样下一轮",
+        "hz 参数控制 serverCron 频率（默认 10 即每秒 10 次），hz 越大清理越及时但调度开销越大；SLOW 模式的 CPU 时间占比上限始终是 25% 不随 hz 变化",
+        "Redis 5.0 引入 dynamic-hz（7.0 默认开启），根据连接客户端数量动态调整实际 hz，低负载时节省 CPU、高负载时加快清理",
+        "INFO stats 中 expired_time_cap_reached_count 是最关键的告警指标，持续增长说明 SLOW 模式每次都跑满时间上限、过期 key 积压严重",
+        "过期删除（无论惰性还是定期）会触发 __keyevent@<db>__:expired 通知，但事件发出时机是 key 被实际删除时而非 TTL 到达时，不能用于精确定时",
+        "大量 key 同时过期会导致 activeExpireCycle 反复跑满时间上限，推高命令延迟；生产中应给 TTL 加随机抖动分散过期时间"
+      ],
+      "quiz": [
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz1",
+          "question": "Redis 的 activeExpireCycle(SLOW) 默认情况下（hz=10）每次调用的时间预算上限是多少？",
+          "choices": [
+            { "id": "A", "text": "10ms，即一个 serverCron 周期的 10%" },
+            { "id": "B", "text": "1ms，与 FAST 模式相同" },
+            { "id": "C", "text": "25ms，即一个 serverCron 周期的 25%" },
+            { "id": "D", "text": "100ms，即整个 serverCron 周期" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "SLOW 模式的时间预算计算公式是 1000000/hz * ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC/100 微秒。hz=10 时，一个周期是 100ms（即 100000μs），ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC=25，所以时间上限是 100000*25/100=25000μs=25ms。选项 A 错在比例是 10% 而不是 25%。选项 D 错在让定期删除占满整个周期，那就没有时间处理其他维护任务和客户端命令了。选项 B 混淆了 SLOW 和 FAST 模式的时间预算——1ms 是 FAST 模式的限制，SLOW 模式需要更大的时间窗口来做深度清理。记住 25% 这个数字是一个编译期常量 ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC，不可配置。"
+        },
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz2",
+          "question": "activeExpireCycle 在每轮采样中，默认从 expires 字典中随机采样多少个 key？",
+          "choices": [
+            { "id": "A", "text": "20 个，由 ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP 常量定义" },
+            { "id": "B", "text": "10 个，由 ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP 常量定义" },
+            { "id": "C", "text": "100 个，由 hz 参数动态决定" },
+            { "id": "D", "text": "不固定，取决于 expires 字典的大小，默认采样 1% 的 key" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP 是一个编译期常量，在 Redis 7.0 中值为 20。每轮采样固定随机取 20 个 key 检查是否过期。选项 B 的 10 个是一个常见的错误记忆，可能与 hz 的默认值 10 搞混了。选项 C 错在采样数与 hz 无关——hz 影响的是 serverCron 调用频率和时间预算，不影响单轮采样数量。选项 D 描述的是按比例采样，而 Redis 实际使用的是固定数量采样，这样实现更简单且性能可预测。不过有一个特殊情况：如果某个 db 的 expires 字典 key 总数小于 20，Redis 会把所有 key 都检查一遍，不做随机采样。"
+        },
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz3",
+          "question": "activeExpireCycle 在一轮采样后，根据什么条件决定是否继续对同一个 db 进行下一轮采样？",
+          "choices": [
+            { "id": "A", "text": "如果本轮删除了任何过期 key，就继续采样；如果一个都没删，才跳到下一个 db" },
+            { "id": "B", "text": "如果本轮采样中过期 key 占比超过 25%，继续采样；不超过 25% 则跳到下一个 db" },
+            { "id": "C", "text": "如果本轮采样中过期 key 占比超过 50%，继续采样；不超过 50% 则跳到下一个 db" },
+            { "id": "D", "text": "每个 db 固定采样 3 轮，然后无条件跳到下一个 db" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "25% 是 activeExpireCycle 采样循环中的核心阈值。每轮采样 20 个 key 后，如果其中过期的超过 25%（即 5 个以上），说明这个 db 的过期 key 密度仍然很高，有必要继续清理，所以会再采样一轮。如果过期比例 ≤ 25%，说明过期 key 已经不太密集了，继续采样的边际收益不高，跳到下一个 db 更有效率。选项 A 的条件过于宽松，只要有 1 个过期就不停，会导致过度清理浪费 CPU。选项 C 的 50% 阈值过高，很多过期积压的情况下采样比例在 25%-50% 之间就会被错误地跳过。选项 D 的固定轮次策略无法自适应过期 key 的实际分布情况。"
+        },
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz4",
+          "question": "FAST 模式的 activeExpireCycle 是在什么时机被调用的？它的触发条件是什么？",
+          "choices": [
+            { "id": "A", "text": "在 serverCron 中调用，触发条件是当前 expires 字典非空" },
+            { "id": "B", "text": "在 beforeSleep 中调用，触发条件是上一次 SLOW 模式因超时退出" },
+            { "id": "C", "text": "在每次客户端命令执行后调用，触发条件是刚刚有 key 被惰性删除" },
+            { "id": "D", "text": "在 beforeSleep 中调用，每次都无条件执行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "FAST 模式在事件循环的 beforeSleep() 回调中被调用——beforeSleep 是 Redis 在处理完当前就绪的文件事件后、进入下一轮 epoll_wait 之前执行的函数。FAST 模式的触发需要满足两个条件：第一，上一次 SLOW 模式必须是因为超时（timelimit_exit=1）而退出的，说明过期 key 积压严重需要补充清理；第二，距离上一次 FAST 模式调用必须超过 2ms（ACTIVE_EXPIRE_CYCLE_FAST_DURATION*2），防止过于频繁。选项 A 混淆了 SLOW 模式的调用位置。选项 C 描述的更像是惰性删除的行为，与定期删除无关。选项 D 忽略了触发条件——如果无条件执行，每次 beforeSleep 都花 1ms 做过期清理会显著增加命令延迟。"
+        },
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz5",
+          "question": "以下是一段 Redis INFO stats 输出。根据这些指标，哪个判断最准确？\n\n```\nexpired_keys:5023847\nexpired_stale_perc:18.75\nexpired_time_cap_reached_count:2341\n```",
+          "choices": [
+            { "id": "A", "text": "一切正常，expired_keys 大说明过期清理很及时" },
+            { "id": "B", "text": "expired_time_cap_reached_count 很高，说明 activeExpireCycle 频繁超时退出，过期 key 积压严重" },
+            { "id": "C", "text": "expired_stale_perc 为 18.75 说明有接近 19% 的 key 已过期但未被删除" },
+            { "id": "D", "text": "需要立即执行 FLUSHDB 清理所有数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这三个指标中最值得关注的是 expired_time_cap_reached_count=2341。这个数字表示 SLOW 模式的 activeExpireCycle 因跑满时间上限而被强制中断的累计次数，2341 是一个很高的值，说明系统长期存在过期 key 积压。expired_stale_perc=18.75 表示最近一次采样中约 18.75% 的 key 已过期，已接近 25% 的阈值，也佐证了积压问题。选项 A 的判断完全相反——expired_keys 大只说明历史上删了很多过期 key，不代表清理及时。选项 C 的理解有偏差——expired_stale_perc 是采样比例，不是全局比例。选项 D 过于极端，正确的做法是调高 hz、检查是否有大批 key 同时过期、给 TTL 加抖动。"
+        },
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz6",
+          "question": "关于 hz 参数和定期删除的关系，以下哪个说法是错误的？",
+          "choices": [
+            { "id": "A", "text": "hz 从 10 调到 100 后，SLOW 模式每次的时间预算从 25ms 降为 2.5ms，但每秒总的 CPU 时间占比仍为 25%" },
+            { "id": "B", "text": "hz 越大，activeExpireCycle 被调用越频繁，过期 key 的发现和删除越及时" },
+            { "id": "C", "text": "hz 从 10 调到 100 后，每次 SLOW 模式的采样 key 数也从 20 增加到 200" },
+            { "id": "D", "text": "官方建议 hz 通常设为 10 即可，高流量场景可以考虑调到 100，不建议超过 500" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "选项 C 是错误的。ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP 是一个编译期常量（值为 20），不受 hz 参数的影响。无论 hz 是 10 还是 100，每轮采样都是固定的 20 个 key。hz 影响的是 serverCron 的调用频率和每次 SLOW 模式的时间预算，不影响单轮采样数量。选项 A 正确：hz=100 时周期为 10ms，25% 就是 2.5ms，每秒 100 次 × 2.5ms = 250ms，占比仍然是 25%。选项 B 正确：更高的 hz 意味着更频繁的采样，过期 key 的平均「残留时间」更短。选项 D 也正确：Redis 官方文档明确建议大多数场景用默认值 10，不建议超过 500。"
+        },
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz7",
+          "question": "将 activeExpireCycle 的 SLOW 模式和 FAST 模式对比，以下哪项描述最准确？",
+          "choices": [
+            { "id": "A", "text": "SLOW 模式每次最多扫描 1 个 db，FAST 模式可以扫描所有 db" },
+            { "id": "B", "text": "SLOW 模式在 serverCron 中调用、时间预算 25ms（hz=10）；FAST 模式在 beforeSleep 中调用、时间预算 1ms、且仅在上次 SLOW 超时退出时触发" },
+            { "id": "C", "text": "SLOW 模式用于删除大 key，FAST 模式用于删除小 key" },
+            { "id": "D", "text": "SLOW 和 FAST 的唯一区别是时间预算不同，调用时机和触发条件完全相同" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 准确概括了两种模式的核心差异。SLOW 模式是定期删除的主力，在 serverCron 定时器中被调用，时间预算按公式 1000000/hz*25/100 计算（hz=10 时为 25ms）。FAST 模式是补充清理手段，在 beforeSleep 回调中被调用，时间预算固定 1ms，且必须满足「上次 SLOW 超时退出」和「距上次 FAST ≥ 2ms」两个条件。选项 A 错误，SLOW 模式每次最多可以扫描 CRON_DBS_PER_CALL（16）个 db。选项 C 完全是编造的，两种模式的删除对象没有大小区分。选项 D 忽略了 FAST 模式特有的触发条件——如果上次 SLOW 正常退出（没超时），FAST 模式根本不会执行。"
+        },
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz8",
+          "question": "生产环境中有 500 万个 key 设了相同的 TTL=1800s，到期后你观察到 Redis 命令的 P99 延迟从 0.5ms 飙到 35ms。最可能的原因和最佳优化方案分别是什么？",
+          "choices": [
+            { "id": "A", "text": "原因是惰性删除在大量 GET 请求中同步删除大 key；优化方案是开启 lazyfree" },
+            { "id": "B", "text": "原因是 activeExpireCycle(SLOW) 在每次 serverCron 中跑满 25ms 时间上限清理过期 key；优化方案是给 TTL 加随机抖动分散过期时间" },
+            { "id": "C", "text": "原因是 RDB 持久化正在做 BGSAVE；优化方案是关闭 RDB 持久化" },
+            { "id": "D", "text": "原因是内存淘汰策略触发了大量 key 的驱逐；优化方案是增加 maxmemory" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "500 万个 key 在同一时刻过期是典型的「过期风暴」场景。所有 key 到期后，activeExpireCycle(SLOW) 的每轮采样 20 个 key 几乎全部过期（远超 25% 阈值），导致对每个 db 反复采样直到跑满 25ms 时间预算。每次 serverCron 周期内 25ms 被定期删除占用，加上 FAST 模式的补充清理，命令处理被挤占导致延迟飙升。最佳方案是给 TTL 加随机抖动（如 TTL=1800+random(0,300)），把 500 万个 key 的过期时间分散到 5 分钟窗口内。选项 A 中惰性删除是逐个触发的、开销很小，不是主因。选项 C 和 D 描述的场景与「大量 key 同时过期」无直接关系。"
+        },
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz9",
+          "question": "关于 Redis 过期删除与 Keyspace Notification 的关系，以下哪个说法是正确的？",
+          "choices": [
+            { "id": "A", "text": "过期事件在 key 的 TTL 到达的精确时刻立即发出，延迟不超过 1ms" },
+            { "id": "B", "text": "过期事件在 key 被实际删除时才发出，可能晚于 TTL 到达时间，不适合做精确定时任务" },
+            { "id": "C", "text": "Keyspace Notification 默认开启，不需要任何配置" },
+            { "id": "D", "text": "过期事件只有惰性删除才会触发，定期删除不会触发" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 的 Keyspace Notification 过期事件（__keyevent@<db>__:expired）是在 key 被实际删除时才发出的，而不是在 TTL 到达的瞬间。一个 key 过期后，可能需要等到 activeExpireCycle 采样到它或者有客户端访问触发惰性删除时才会真正被删除。如果过期 key 密度不高且 hz 较低，这个延迟可能达到秒级甚至更长。因此不应该依赖过期事件做精确定时任务。选项 A 完全错误，Redis 不保证毫秒级的过期通知精度。选项 C 错误，Keyspace Notification 默认关闭，需要通过 notify-keyspace-events 配置开启。选项 D 也错误，惰性删除和定期删除都会触发过期事件通知。"
+        },
+        {
+          "id": "redis-expire-periodic-deletion-q1-quiz10",
+          "question": "你的 Redis 7.0 实例开启了 dynamic-hz=yes，配置的 hz=10。白天高峰期有 2000 个客户端连接，凌晨只有 5 个连接。关于 dynamic-hz 的行为，以下哪个描述最准确？",
+          "choices": [
+            { "id": "A", "text": "白天和凌晨的实际 hz 都严格等于 10，dynamic-hz 只影响 FAST 模式" },
+            { "id": "B", "text": "dynamic-hz 会在凌晨把 hz 降到 0 以完全停止 serverCron" },
+            { "id": "C", "text": "白天客户端多时实际 hz 高于 10（加快清理和超时检测），凌晨客户端少时实际 hz 接近配置值 10（节省 CPU）" },
+            { "id": "D", "text": "dynamic-hz 根据 CPU 使用率自动调节 hz，与客户端连接数无关" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "dynamic-hz 的核心逻辑是根据当前连接的客户端数量动态调整 serverCron 的实际执行频率。当客户端数量多（如白天 2000 个连接）时，说明负载较高，需要更频繁的 serverCron 来及时清理过期 key、检测客户端超时、推进 rehash 等维护任务，所以实际 hz 会高于配置值。凌晨只有 5 个连接时负载很低，实际 hz 接近配置值 10 即可满足需求，节省 CPU。选项 A 错误，dynamic-hz 会改变实际的 serverCron 频率，影响包括 SLOW 模式在内的所有周期性任务。选项 B 错误，hz 不可能降到 0，serverCron 需要持续运行维护 Redis 的各项功能。选项 D 错误，dynamic-hz 的调节依据是客户端连接数而非 CPU 使用率。"
+        }
+      ],
+      "references": [
+        "https://github.com/redis/redis/blob/7.0/src/expire.c",
+        "https://github.com/redis/redis/blob/7.0/src/server.c",
+        "https://redis.io/docs/latest/develop/reference/internals/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/config/"
+      ]
+    }
+  ]
+}
