@@ -1,0 +1,158 @@
+{
+  "id": "redis-expire-two-strategies",
+  "name": "Redis 过期 key 的两种删除策略",
+  "domain": "redis",
+  "description": "深入讲解 Redis 惰性删除与定期删除的实现机制、expires 字典存储、activeExpireCycle 采样流程、hz 配置影响及生产环境监控指标",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-expire-two-strategies-q1",
+      "domain": "redis",
+      "type": "concept",
+      "difficulty": 1,
+      "tags": ["过期删除", "惰性删除", "定期删除", "expires字典", "serverCron", "redis-expiration"],
+      "title": "Redis 过期 key 是怎么被删除的？讲讲两种删除策略",
+      "content": "## 面试场景\n\n你用 `EXPIRE` 或 `SET key value EX 60` 给一个 key 设了 60 秒的过期时间。60 秒到了，这个 key 是在第 60 秒的瞬间就被立刻删除了吗？还是说 Redis 有别的处理方式？\n\n这个问题看似简单，但很多人的回答是「到期了 Redis 就自动删了」，然后就说不下去了。面试官一追问——「Redis 怎么知道哪些 key 到期了？它是每秒扫描所有 key 吗？如果有一千万个过期 key，Redis 怎么扛得住？」——就卡住了。\n\n我们先做一个实验，看看过期 key 的真实行为：\n\n```bash\n127.0.0.1:6379> SET session:user1001 '{\"uid\":1001,\"role\":\"admin\"}' EX 5\nOK\n127.0.0.1:6379> TTL session:user1001\n(integer) 4\n\n# 等待 6 秒后\n127.0.0.1:6379> TTL session:user1001\n(integer) -2          # -2 表示 key 不存在\n127.0.0.1:6379> GET session:user1001\n(nil)\n\n# 但这个 key 真的在第 5 秒就被删除了吗？\n# 如果没有人来访问它，它可能还「活」在内存里\n```\n\n注意最后那行注释——这才是这道题的核心。一个已经过期的 key，如果没有任何人来访问它，它完全可能还占着内存。这不是 bug，而是 Redis 的设计选择。Redis 没有给每个 key 设置一个精确的定时器（那样做的代价太大了），而是采用了两种策略的组合来处理过期 key：惰性删除（Lazy Expiration）和定期删除（Active Expiration）。\n\n理解这两种策略的工作原理，需要先知道 Redis 是怎么存储过期时间的，然后再看它在什么时机、以什么方式去检查和删除过期 key。这道题的答案层次分明：先讲 expires 字典的存储结构，再分别讲两种删除策略的触发时机和实现细节，最后解释为什么这样设计以及生产环境中该关注哪些指标。",
+      "answer": "## 第一步：Redis 过期机制的基础认知\n\n### Redis 的过期时间设置\n\nRedis 作为内存数据库，天然需要一种机制来让数据自动失效。无论是 session 登录态、验证码缓存、限流计数器，还是热点数据的临时缓存，过期时间几乎是 Redis 最常用的功能之一。Redis 提供了多种设置过期时间的方式：`EXPIRE key seconds` 设置秒级过期、`PEXPIRE key milliseconds` 设置毫秒级过期、`EXPIREAT key timestamp` 设置绝对过期时间戳、`SET key value EX seconds` 在写入时直接指定过期时间，以及 Redis 6.2 引入的 `GETEX key EX seconds`（读取的同时设置过期时间）。不管你用哪种命令，Redis 在内部存储时都会统一转换成一个绝对时间戳（毫秒精度的 Unix 时间戳）。\n\n```bash\n# 各种设置过期时间的方式，内部都转为毫秒级绝对时间戳\n127.0.0.1:6379> SET mykey \"hello\" EX 300\nOK\n127.0.0.1:6379> PTTL mykey\n(integer) 299874    # 返回剩余毫秒数\n127.0.0.1:6379> DEBUG OBJECT mykey\n# ... at:0x7f... ... lru_seconds_idle:0 ...\n\n# 查看当前 Redis 实例的时间\n127.0.0.1:6379> TIME\n1) \"1700000000\"      # 秒级时间戳\n2) \"123456\"          # 微秒部分\n```\n\n### expires 字典：过期信息的存储结构\n\nRedis 的每个数据库（默认 16 个，编号 0-15）在内部是一个 `redisDb` 结构体。这个结构体里有两个核心的哈希表：一个是 `dict *dict`，存储所有的 key-value 数据；另一个是 `dict *expires`，专门存储设置了过期时间的 key 和它们的过期时间戳。这两个哈希表共享 key 的 SDS（Simple Dynamic String）对象指针，不会重复占用内存来存储 key 本身。\n\n```c\n// Redis 7.0 源码 src/server.h\ntypedef struct redisDb {\n    dict *dict;       // 键空间：所有 key -> value 的映射\n    dict *expires;    // 过期字典：设了过期的 key -> 过期时间戳（毫秒）\n    dict *blocking_keys;\n    dict *ready_keys;\n    dict *watched_keys;\n    int id;           // 数据库编号 0-15\n    // ...\n} redisDb;\n```\n\n当你执行 `SET mykey \"hello\" EX 300` 时，Redis 做了两件事：在 `dict` 中写入 key-value 映射，在 `expires` 中写入 `mykey -> 当前时间戳 + 300000`（毫秒）。当你执行 `PERSIST mykey`（移除过期时间）时，Redis 只是从 `expires` 字典中删除这个 key 的条目，`dict` 中的数据不受影响。\n\n理解了存储结构之后，核心问题就来了：Redis 怎么利用 expires 字典来判断和清理过期的 key？答案就是两种删除策略的配合。\n\n## 第二步：两种过期删除策略的深度解析\n\n### 策略一：惰性删除（Lazy Expiration）\n\n惰性删除的思路非常直觉——不主动去找过期 key，而是等有人来访问这个 key 的时候再检查。如果发现它已经过期了，就当场删除并返回 nil，就好像这个 key 从来没存在过一样。\n\n在 Redis 源码中，惰性删除的实现位于 `src/db.c` 的 `expireIfNeeded()` 函数。这个函数会在几乎所有的读写命令执行前被调用——不管是 `GET`、`SET`、`HGET`、`LPUSH` 还是 `ZADD`，只要涉及到一个 key 的操作，Redis 都会先调一次 `expireIfNeeded()` 来检查这个 key 是否过期。整个检查流程可以概括为：先去 `expires` 字典中查这个 key 有没有过期时间，如果没有就直接放行；如果有，就拿当前时间戳和存储的过期时间戳做比较，发现已经过期就删除这个 key（同时从 `dict` 和 `expires` 两个字典中移除）并返回过期标记。\n\n```c\n// Redis 7.0 源码 src/db.c — 简化版\nint expireIfNeeded(redisDb *db, robj *key, int flags) {\n    // 从 expires 字典中取出过期时间戳\n    long long when = getExpire(db, key);\n    if (when < 0) return 0;  // 没有设置过期时间，直接返回\n\n    // 如果正在执行 Lua 脚本或 MULTI/EXEC 事务\n    // 为了保证原子性，使用脚本开始时的时间做判断\n    mstime_t now = commandTimeSnapshot();\n    if (now <= when) return 0;  // 还没到过期时间\n\n    // key 已过期，执行删除\n    server.stat_expiredkeys++;  // 更新统计计数器\n    propagateExpire(db, key, server.lazyfree_lazy_expire);\n    // ...\n    if (server.lazyfree_lazy_expire)\n        return dbAsyncDelete(db, key);  // 异步删除（4.0+ lazyfree）\n    else\n        return dbSyncDelete(db, key);   // 同步删除\n}\n```\n\n注意代码中的 `server.lazyfree_lazy_expire` 这个标志位。从 Redis 4.0 开始引入了 lazyfree 机制，如果这个配置开启（Redis 6.0 默认开启），删除大 key 时会把实际的内存释放操作扔到后台线程去做，避免阻塞主线程。这对于删除一个包含百万元素的 Hash 或 Set 来说非常重要——同步删除可能阻塞主线程数百毫秒。\n\n惰性删除的最大优点是 CPU 友好：不需要任何额外的后台扫描或定时任务，零开销，只在访问时顺手检查一下。但它有一个明显的缺陷——如果一个过期的 key 一直没有人访问它，它就会一直赖在内存里不走。想象一个极端场景：你的 Redis 里有 500 万个 session key，用户登录后设置了 30 分钟过期。到了凌晨 3 点，大部分 session 都过期了，但没有用户在凌晨访问这些 key。如果只靠惰性删除，这 500 万个过期 key 会一直占着内存，直到白天用户重新登录时才被一个一个地「发现并删除」。这就是为什么 Redis 还需要第二种策略。\n\n### 策略二：定期删除（Active Expiration）\n\n定期删除是 Redis 用来主动清理过期 key 的机制，它不需要等待客户端访问，而是 Redis 自己定时去 expires 字典里抽样检查。这个机制的核心入口是 `activeExpireCycle()` 函数（位于 `src/expire.c`），它由 Redis 的时间事件处理器 `serverCron` 周期性调用。\n\n`serverCron` 是 Redis 的「心跳函数」，负责执行各种定期维护任务：过期 key 清理、客户端超时检查、rehash 推进、AOF/RDB 后台任务监控等。它的执行频率由 `redis.conf` 中的 `hz` 参数控制，默认值是 10，意味着每秒执行 10 次（即每 100 毫秒一次）。也就是说，`activeExpireCycle()` 默认每秒被调用 10 次。\n\n每次 `activeExpireCycle()` 被调用时，它的工作流程是这样的：遍历每个数据库（不是一次全部遍历，而是轮流处理），从该数据库的 expires 字典中随机采样 `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP` 个 key（这个常量在 Redis 7.0 中是 20），检查每个采样 key 是否过期，过期的就删除。然后统计这批采样中过期 key 的比例——如果超过 25%（即 20 个里有 5 个以上过期），说明过期 key 的密度很高，还有大量过期 key 没被清理，于是继续下一轮采样。这个循环会一直进行，直到某一轮采样中过期比例降到 25% 以下，或者到达了时间限制。\n\n```\nactiveExpireCycle() 每次调用的执行流程：\n\n  ┌─────────────────────────────┐\n  │  从 expires 字典随机取 20 个 key │\n  └──────────────┬──────────────┘\n                 ▼\n  ┌─────────────────────────────┐\n  │  删除其中已过期的 key          │\n  └──────────────┬──────────────┘\n                 ▼\n  ┌─────────────────────────────┐\n  │  过期 key 占比 > 25% ?        │\n  │  且未超过时间限制?             │\n  └──────┬──────────────┬───────┘\n         │ 是            │ 否\n         ▼              ▼\n    继续下一轮采样     本次退出\n```\n\n时间限制是定期删除的安全阀。`activeExpireCycle()` 有两种运行模式：slow 模式和 fast 模式。slow 模式在正常的 `serverCron` 调用中执行，时间上限是每次 `serverCron` 周期时长的 25%，按默认 `hz=10`（周期 100ms）算就是 25 毫秒。fast 模式在事件循环的 `beforeSleep()` 回调中执行（即每次处理完客户端命令、进入下一轮事件等待之前），时间上限只有 1 毫秒，而且必须距离上一次 fast 模式调用超过 2 毫秒才会真正执行。fast 模式的设计意图是在两次 `serverCron` 之间见缝插针地多清理一点过期 key，但不能影响正常命令的响应延迟。\n\n```bash\n# 查看 hz 配置\n127.0.0.1:6379> CONFIG GET hz\n1) \"hz\"\n2) \"10\"    # 默认值：serverCron 每秒执行 10 次\n\n# 提高 hz 会增加定期删除的频率，清理过期 key 更及时\n# 但也会增加 CPU 开销，一般不建议超过 100\n127.0.0.1:6379> CONFIG SET hz 25\nOK\n\n# Redis 7.0 默认开启 dynamic-hz\n127.0.0.1:6379> CONFIG GET dynamic-hz\n1) \"dynamic-hz\"\n2) \"yes\"   # 根据连接的客户端数量动态调整实际 hz\n```\n\n`dynamic-hz` 是 Redis 5.0 引入的优化（Redis 7.0 默认开启）。它的原理是：当连接的客户端数量较少时（比如开发环境只有几个连接），没必要频繁执行 `serverCron`，实际的 hz 可以比配置值低一些来节省 CPU；当客户端数量很多时（比如生产环境有上千个连接），说明负载较高，此时会按配置的 hz 值甚至更高的频率执行 `serverCron`，确保过期 key 被及时清理、客户端超时被及时检测。实际的 hz 值计算公式大致是 `configured_hz + configured_hz * (connected_clients / some_threshold)`，上限是配置值的两倍。\n\n### 为什么不给每个 key 设一个定时器？\n\n学过操作系统或编程语言定时器的同学可能会想：最直观的方案不是给每个带过期时间的 key 注册一个 timer，到时间自动回调删除吗？这种方式叫「定时删除」（Timer-based Expiration），理论上最精确——key 一过期就立刻被删除，内存回收最及时。\n\n问题在于规模。一个生产环境的 Redis 实例可能有数百万甚至上千万个设置了过期时间的 key。给每个 key 创建一个定时器意味着需要维护一个百万级的定时器队列。即使用最优的数据结构（比如时间轮 Timing Wheel 或最小堆 Min-Heap），百万级定时器的维护开销也是非常可观的——每次插入、删除、到期触发都有 O(log n) 的成本。更关键的是，如果大量 key 在同一时刻过期（比如你给一批 key 设了相同的 TTL），定时器会集中触发，在短时间内产生大量的删除操作，导致 CPU 飙高甚至主线程阻塞。Redis 是单线程模型（命令执行在一个线程上），任何阻塞主线程的操作都会直接影响所有客户端的响应延迟。\n\n所以 Redis 选择了惰性删除 + 定期删除的组合策略，在内存回收的及时性和 CPU 开销之间取得平衡：定期删除以概率采样的方式批量清理大部分过期 key，惰性删除在客户端访问时兜底处理漏网之鱼。\n\n## 第三步：生产环境的扩展知识\n\n### 大量 key 同时过期的「雪崩」风险\n\n虽然定期删除有时间限制的保护，但如果你的业务存在大量 key 在同一时刻过期的情况（典型场景：缓存预热时给一批 key 设了相同的 TTL），`activeExpireCycle()` 可能会在多个连续的 `serverCron` 周期中都跑满时间上限，持续占用 CPU 资源。这段时间内 Redis 的命令响应延迟会明显上升。生产环境中的标准做法是给 TTL 加一个随机抖动，比如 `TTL = 基准值 + random(0, 60秒)`，把过期时间分散开。\n\n```bash\n# 不好的做法：所有缓存过期时间一样\nSET product:1001 '{...}' EX 3600\nSET product:1002 '{...}' EX 3600\nSET product:1003 '{...}' EX 3600\n# 3600 秒后大量 key 同时过期\n\n# 好的做法：加随机抖动\nSET product:1001 '{...}' EX 3660  # 3600 + random(0,120)\nSET product:1002 '{...}' EX 3585  # 3600 + random(0,120)\nSET product:1003 '{...}' EX 3710  # 3600 + random(0,120)\n```\n\n### 监控指标：怎么知道过期 key 的清理情况\n\nRedis 的 `INFO stats` 命令中有几个与过期删除直接相关的指标：\n\n```bash\n127.0.0.1:6379> INFO stats\n# Stats\n...\nexpired_keys:1523847         # 累计已过期删除的 key 总数（惰性+定期）\nexpired_stale_perc:0.15      # 最近一次 activeExpireCycle 采样中过期 key 的比例\nexpired_time_cap_reached_count:3  # activeExpireCycle 因时间限制被中断的累计次数\n...\n```\n\n`expired_keys` 是一个只增不减的累计计数器，你可以通过监控系统（比如 Prometheus + Redis Exporter）对它求导来得到每秒过期删除的 key 数量。如果这个速率突然飙高，说明有大量 key 集中过期。`expired_stale_perc` 反映当前 expires 字典中过期 key 的「残留浓度」，如果长期高于 0 说明过期 key 的积压在加剧。`expired_time_cap_reached_count` 是最值得关注的指标——如果这个数字持续增长，说明 `activeExpireCycle()` 经常因为超时而被迫中断，过期 key 清理不过来了。此时你应该考虑提高 `hz` 值，或者检查是否存在大量 key 同时过期的问题。\n\n### 过期删除与持久化的交互\n\n过期 key 在 RDB 和 AOF 持久化中的处理方式值得了解。生成 RDB 快照时（`BGSAVE`），Redis 会跳过所有已过期的 key——它们不会被写入 RDB 文件。加载 RDB 时，master 节点会忽略已过期的 key，slave 节点在 Redis 3.2 之前会加载所有 key（包括过期的），3.2 之后 slave 也会跳过过期 key。对于 AOF，写入时不做过期过滤（过期信息通过 `PEXPIREAT` 命令记录），但 AOF 重写时会跳过已过期的 key。当一个过期 key 被惰性删除或定期删除时，Redis 会往 AOF 文件追加一条 `DEL`（或 `UNLINK`）命令，确保 AOF 回放时也能正确删除。\n\n### 主从复制中的过期处理\n\n在主从架构中，过期 key 的删除是由 master 驱动的——slave 不会自己判断 key 是否过期。当 master 的惰性删除或定期删除触发了一个 key 的删除时，master 会向所有 slave 发送一条 `DEL` 命令来同步删除。在 Redis 3.2 之前，slave 上如果有客户端读取一个已经过期但还没收到 master `DEL` 命令的 key，slave 会返回数据（而不是 nil），这会导致读到过期数据。Redis 3.2 修复了这个问题：slave 在读取 key 时也会检查过期时间，如果过期就返回 nil（但不执行删除，删除仍然等 master 的 `DEL` 命令）。这个行为变更对于读写分离架构非常重要。\n\n### 面试高频考点关联\n\n过期删除策略是 Redis 面试的高频基础题，它和内存淘汰策略（maxmemory-policy）是两个不同但经常被混淆的概念。过期删除处理的是「设了 TTL 的 key 到期后怎么清理」，内存淘汰处理的是「内存满了之后怎么腾空间」。一个 key 可以同时受到两种机制的影响：即使它还没过期，如果内存满了并且它被淘汰策略选中，也会被删除；反过来，即使内存充足，到期的 key 也会被过期删除机制清理。理解这两者的区别和协作关系，是 Redis 内存管理知识体系的关键脉络。",
+      "keyPoints": [
+        "每个设了过期时间的 key 在 expires 字典中存储毫秒精度的绝对时间戳，expires 字典与 dict 字典共享 key 的 SDS 指针不重复占用内存",
+        "惰性删除在每次读写 key 前调用 expireIfNeeded() 检查过期，过期则删除并返回 nil，CPU 零额外开销但存在过期 key 长期不被访问导致内存泄漏的风险",
+        "定期删除由 serverCron 中的 activeExpireCycle() 执行，默认每秒 10 次（hz=10），每次从 expires 字典随机采样 20 个 key 并删除其中已过期的",
+        "activeExpireCycle 的循环判断：采样中过期 key 占比超过 25% 则继续下一轮采样，直到比例降至 25% 以下或达到时间限制（slow 模式 25ms，fast 模式 1ms）",
+        "不使用定时删除（给每个 key 设 timer）是因为百万级定时器的维护开销和集中触发时的 CPU 峰值会阻塞 Redis 单线程模型",
+        "Redis 7.0 默认开启 dynamic-hz，根据连接客户端数量动态调整 serverCron 执行频率，在低负载时节省 CPU、高负载时加快过期清理",
+        "INFO stats 中 expired_keys 记录累计过期删除数、expired_stale_perc 反映过期 key 残留浓度、expired_time_cap_reached_count 反映定期删除是否被限时中断",
+        "主从架构中过期删除由 master 驱动并通过 DEL 命令同步到 slave，Redis 3.2 起 slave 读取时也会检查过期但不自行删除"
+      ],
+      "quiz": [
+        {
+          "id": "redis-expire-two-strategies-q1-quiz1",
+          "question": "Redis 中设置了过期时间的 key，其过期时间在内部是以什么形式存储的？",
+          "choices": [
+            { "id": "A", "text": "存储在 key 对应的 redisObject 结构体中的一个专用字段里" },
+            { "id": "B", "text": "存储在 redisDb 的 expires 字典中，值为毫秒精度的绝对 Unix 时间戳" },
+            { "id": "C", "text": "存储在 key 的 value 数据末尾，作为元数据追加" },
+            { "id": "D", "text": "存储在一个全局的定时器堆中，按过期时间排序" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 的每个数据库（redisDb 结构体）内部维护两个字典：dict 存储所有 key-value 数据，expires 专门存储设了过期时间的 key 及其过期时间戳。过期时间统一转换为毫秒精度的绝对 Unix 时间戳存储，不管你用 EXPIRE、PEXPIRE 还是 EXPIREAT 设置。选项 A 混淆了 redisObject 的 lru 字段（那是给内存淘汰用的，不是过期时间）。选项 C 的「追加在 value 末尾」完全不符合 Redis 的存储架构，key 的元数据和 value 数据是分离管理的。选项 D 描述的是定时删除方案，Redis 明确没有采用这种实现方式。"
+        },
+        {
+          "id": "redis-expire-two-strategies-q1-quiz2",
+          "question": "关于 Redis 的惰性删除（Lazy Expiration），以下哪个描述是正确的？",
+          "choices": [
+            { "id": "A", "text": "Redis 有一个专门的后台线程定期扫描所有 key 来执行惰性删除" },
+            { "id": "B", "text": "惰性删除只在 GET 命令时触发，SET 命令不会检查过期" },
+            { "id": "C", "text": "每次对 key 执行读写操作前，expireIfNeeded() 会检查该 key 是否过期，过期则删除" },
+            { "id": "D", "text": "惰性删除会将过期 key 标记为「待删除」状态，在下一次 serverCron 中统一清理" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "惰性删除的核心是 expireIfNeeded() 函数，它在几乎所有涉及 key 的命令（包括 GET、SET、HGET、LPUSH、ZADD 等读写操作）执行之前被调用，检查目标 key 是否已过期。如果过期就立即删除并返回过期标记，调用方会将其视为 key 不存在。选项 A 描述的是主动扫描，不是惰性删除的工作方式，惰性删除的核心特征就是「不主动扫描，访问时才检查」。选项 B 把触发范围缩小到了只有 GET 命令，实际上所有读写命令都会触发。选项 D 描述的「标记待删除」也不正确，expireIfNeeded() 发现过期后是立即删除（同步或异步释放内存），不存在中间状态。"
+        },
+        {
+          "id": "redis-expire-two-strategies-q1-quiz3",
+          "question": "Redis 定期删除（Active Expiration）中，activeExpireCycle() 每次从 expires 字典中采样多少个 key？",
+          "choices": [
+            { "id": "A", "text": "每次采样 10 个 key，由 maxmemory-samples 配置控制" },
+            { "id": "B", "text": "每次采样 20 个 key，由 ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP 常量定义" },
+            { "id": "C", "text": "每次采样 5 个 key，与内存淘汰的采样数量相同" },
+            { "id": "D", "text": "每次采样数量根据 expires 字典的大小动态计算" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "activeExpireCycle() 的采样数量由源码中的常量 ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP 定义，在 Redis 7.0 中这个值是 20。这意味着每次调用时从 expires 字典中随机取 20 个 key 来检查是否过期。选项 A 的 maxmemory-samples 是内存淘汰（eviction）时的采样数量，与过期删除的采样是两套独立的参数，不能混淆。选项 C 的 5 个也是 maxmemory-samples 的默认值，和过期删除无关。选项 D 看似合理但实际上 Redis 没有这样实现——采样数量是硬编码的常量而不是动态计算的。这道题考的是过期删除和内存淘汰这两个机制的参数区分。"
+        },
+        {
+          "id": "redis-expire-two-strategies-q1-quiz4",
+          "question": "在 activeExpireCycle() 的执行过程中，什么条件会让它继续进行下一轮采样而不是退出？",
+          "choices": [
+            { "id": "A", "text": "只要 expires 字典中还存在过期 key 就继续采样" },
+            { "id": "B", "text": "本轮采样中过期 key 的数量超过 5 个（即占比超过 25%），且未超过时间限制" },
+            { "id": "C", "text": "本轮采样中过期 key 的数量超过 10 个（即占比超过 50%）" },
+            { "id": "D", "text": "当内存使用超过 maxmemory 时才会继续多轮采样" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "activeExpireCycle() 每轮采样 20 个 key，如果其中过期 key 的占比超过 25%（即超过 5 个），说明 expires 字典中过期 key 的密度还很高，仍有大量过期 key 需要清理，于是继续下一轮采样。这个循环会持续到某一轮采样中过期比例降到 25% 以下，或者达到了时间限制（slow 模式 25ms，fast 模式 1ms）。选项 A 的「只要还有过期 key 就继续」没有考虑时间限制和比例阈值，如果真这样实现，遇到大量过期 key 时 Redis 会被长时间阻塞。选项 C 的 50% 阈值不正确，Redis 源码中的阈值是 25%。选项 D 混淆了过期删除和内存淘汰——activeExpireCycle 不看 maxmemory。"
+        },
+        {
+          "id": "redis-expire-two-strategies-q1-quiz5",
+          "question": "执行 INFO stats 时看到 expired_time_cap_reached_count 值持续增长，这意味着什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 内存不足，需要立刻增加 maxmemory" },
+            { "id": "B", "text": "activeExpireCycle() 频繁因达到时间限制被迫中断，过期 key 的清理速度跟不上产生速度" },
+            { "id": "C", "text": "有大量客户端连接超时，需要检查 timeout 配置" },
+            { "id": "D", "text": "RDB 持久化任务执行时间过长" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "expired_time_cap_reached_count 记录的是 activeExpireCycle() 因超过时间限制（slow 模式 25ms、fast 模式 1ms）而被迫中断的累计次数。如果这个值持续增长，说明每次定期删除都因为过期 key 太多而没清理完就被时间卡住了。此时你应该考虑提高 hz 值来增加清理频率，或者排查是否有大量 key 设置了相同的 TTL 导致集中过期。选项 A 把过期删除和内存淘汰混为一谈——这个指标和 maxmemory 无关。选项 C 的客户端超时和选项 D 的 RDB 持久化更是完全无关的概念。"
+        },
+        {
+          "id": "redis-expire-two-strategies-q1-quiz6",
+          "question": "一个常见的错误认知：「Redis 会给每个设了过期时间的 key 设置一个定时器，到期自动删除。」这种做法 Redis 没有采用的根本原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 是用 C 语言写的，C 语言不支持定时器" },
+            { "id": "B", "text": "百万级定时器的维护开销大，且大量 key 同时到期时会造成 CPU 峰值阻塞单线程" },
+            { "id": "C", "text": "定时器方案不支持持久化，无法在 RDB/AOF 中记录" },
+            { "id": "D", "text": "定时器方案无法在主从复制中同步过期删除事件" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "定时删除方案的核心问题是规模化开销。一个生产环境的 Redis 可能有百万级甚至千万级设了过期时间的 key，给每个 key 注册一个定时器意味着维护一个巨大的定时器数据结构（无论是时间轮还是最小堆），插入和到期触发都有 O(log n) 的开销。更严重的问题是：如果大量 key 在同一时刻过期（比如同一批 key 设了相同的 TTL），定时器会集中触发大量删除操作，占用 CPU 并阻塞 Redis 的单线程模型。选项 A 完全错误，C 语言通过系统调用完全支持定时器。选项 C 和 D 虽然听起来有一定道理，但它们不是根本原因——定时器方案技术上可以和持久化、复制配合，只是性能代价不可接受。"
+        },
+        {
+          "id": "redis-expire-two-strategies-q1-quiz7",
+          "question": "惰性删除和定期删除各有优缺点。以下关于两者取舍的描述，哪个是正确的？",
+          "choices": [
+            { "id": "A", "text": "惰性删除 CPU 友好但可能导致过期 key 长期占内存，定期删除主动清理但需要消耗额外 CPU" },
+            { "id": "B", "text": "定期删除能保证所有过期 key 都被及时清理，惰性删除只是备用方案" },
+            { "id": "C", "text": "惰性删除比定期删除消耗更多 CPU，因为每次命令都要调用 expireIfNeeded()" },
+            { "id": "D", "text": "在 Redis 6.0 之后惰性删除已经被废弃，完全由定期删除取代" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "惰性删除的优点是零额外 CPU 开销——它只在访问 key 时顺便检查，不需要额外的后台扫描。缺点是如果过期 key 一直没被访问，就永远不会被清理，导致内存浪费。定期删除的优点是能主动清理没人访问的过期 key，缺点是需要消耗 CPU 资源进行定期采样扫描。两者是互补关系。选项 B 说「定期删除能保证所有过期 key 都被及时清理」是错误的——定期删除是概率采样，不是全量扫描，一定会有遗漏，所以才需要惰性删除兜底。选项 C 的说法虽然 expireIfNeeded() 确实每次都调用，但这个检查是 O(1) 的字典查找，开销极小，远远不如定期删除的批量扫描消耗 CPU。选项 D 纯属虚构，惰性删除在所有 Redis 版本中都存在。"
+        },
+        {
+          "id": "redis-expire-two-strategies-q1-quiz8",
+          "question": "你的 Redis 实例有 500 万个 session key，全部设了 30 分钟过期。凌晨流量低谷时大量 session 集中过期，导致 Redis 延迟升高。以下哪种方案最有效？",
+          "choices": [
+            { "id": "A", "text": "把 maxmemory-policy 从 noeviction 改为 allkeys-lru" },
+            { "id": "B", "text": "给 TTL 加随机抖动（比如 30 分钟 ± 随机 60 秒），把过期时间分散开" },
+            { "id": "C", "text": "关闭定期删除，只依赖惰性删除" },
+            { "id": "D", "text": "把 hz 设为 1，减少 serverCron 的执行频率" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "大量 key 集中过期导致延迟升高的根本原因是 activeExpireCycle() 在短时间内被反复触发，每次都需要清理大量过期 key 并可能跑满时间限制。最有效的解决方案是从源头分散过期时间——给 TTL 加随机抖动，让 key 的过期时间均匀分布在一个时间窗口内，避免集中触发。选项 A 的 maxmemory-policy 是内存淘汰策略，控制的是内存满时如何淘汰数据，与过期 key 的集中清理问题无关。选项 C 关闭定期删除会导致过期 key 大量堆积在内存中无法被清理，问题更严重。选项 D 把 hz 降为 1 会让定期删除频率降为每秒 1 次，清理速度更慢，过期 key 积压更严重，只是把峰值削平了但总时间拉长了，对延迟的改善有限。"
+        },
+        {
+          "id": "redis-expire-two-strategies-q1-quiz9",
+          "question": "在 Redis 主从复制架构中，slave 节点上一个已过期但 master 还未发送 DEL 命令的 key，客户端读取时会得到什么结果？（Redis 3.2+）",
+          "choices": [
+            { "id": "A", "text": "slave 返回该 key 的数据，因为 slave 不负责判断过期" },
+            { "id": "B", "text": "slave 返回 nil，但不执行删除操作，等待 master 的 DEL 命令" },
+            { "id": "C", "text": "slave 自行删除该 key 并返回 nil" },
+            { "id": "D", "text": "slave 向 master 发送询问请求确认 key 是否过期" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 3.2 修复了一个在读写分离架构中很重要的问题。在 3.2 之前，slave 不检查 key 的过期时间，即使 key 已经过期也会返回数据，导致客户端读到脏数据。3.2 之后，slave 在读取 key 时也会检查 expires 字典中的过期时间，如果发现已过期就返回 nil（对客户端来说等于 key 不存在），但 slave 不会自行执行删除操作——删除仍然由 master 驱动，master 删除后通过复制流向 slave 发送 DEL 命令来同步。选项 A 是 Redis 3.2 之前的行为。选项 C 的「slave 自行删除」违反了 Redis 主从复制的原则——slave 的数据变更必须来自 master 的复制流。选项 D 的询问机制在 Redis 中不存在。"
+        },
+        {
+          "id": "redis-expire-two-strategies-q1-quiz10",
+          "question": "关于 Redis 7.0 的 dynamic-hz 配置，以下哪个描述是正确的？",
+          "choices": [
+            { "id": "A", "text": "dynamic-hz 根据内存使用率动态调整 hz 值，内存使用越高 hz 越大" },
+            { "id": "B", "text": "dynamic-hz 默认关闭，需要手动开启才能使用" },
+            { "id": "C", "text": "dynamic-hz 默认开启，根据连接的客户端数量动态调整 serverCron 执行频率" },
+            { "id": "D", "text": "dynamic-hz 会直接修改 redis.conf 中的 hz 配置值" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "dynamic-hz 功能在 Redis 5.0 引入、Redis 7.0 默认开启。它的原理是根据当前连接的客户端数量动态调整 serverCron 的实际执行频率：客户端连接少（如开发环境）时，降低频率节省 CPU；客户端连接多（如生产高负载）时，提高频率确保过期 key 清理、客户端超时检测等维护任务更及时。实际 hz 的上限是配置值的两倍。选项 A 的「根据内存使用率」不正确，dynamic-hz 看的是客户端连接数而非内存使用率。选项 B 说默认关闭也是错误的——Redis 7.0 中 dynamic-hz 的默认值是 yes。选项 D 说会修改 redis.conf 更是错误的，dynamic-hz 只在运行时动态调整实际频率，不会改变配置文件中的 hz 值。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/expire/",
+        "https://redis.io/docs/latest/develop/reference/eviction/",
+        "https://github.com/redis/redis/blob/7.0/src/expire.c",
+        "https://github.com/redis/redis/blob/7.0/src/db.c",
+        "https://github.com/redis/redis/blob/7.0/src/server.h"
+      ]
+    }
+  ]
+}
