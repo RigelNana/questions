@@ -1,0 +1,157 @@
+{
+  "id": "redis-stream-xack",
+  "name": "XACK 命令的作用与消息确认机制",
+  "domain": "redis",
+  "description": "深入讲解 Redis Stream 消费组中 XACK 命令的语法、消息确认流程、PEL 机制、批量 ACK 策略、幂等性保证以及死信处理的完整方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-stream-xack-q1",
+      "domain": "redis",
+      "type": "purpose",
+      "difficulty": 2,
+      "tags": ["XACK", "消息确认", "PEL", "Pending", "至少一次投递", "XPENDING", "redis-stream"],
+      "title": "说说 XACK 命令的作用以及 Redis Stream 的消息确认机制",
+      "content": "## 面试场景\n\n面试官问你「XACK 在 Redis Stream 里是做什么的」，很多人回答「就是确认消息已经被消费了」就停了。这个回答不算错，但完全没有深度。面试官真正想考察的是：你知不知道不 ACK 会发生什么？PEL 里存了哪些字段？为什么 Redis Stream 要设计这套确认机制而不像 Pub/Sub 那样 Fire-and-forget？消费者崩溃了还没 ACK 的消息怎么办？\n\n这道题是 Redis Stream 消费组体系中一个非常关键的知识点。消息确认机制直接关系到「至少一次投递」（at-least-once delivery）语义能不能落地，是生产环境使用 Stream 做消息队列时必须理解的核心概念。\n\n我们来看一个最直观的场景。假设你有一个订单处理服务，使用 Redis Stream 作为消息队列，消费组 `order-group` 中有三个消费者实例 `worker-1`、`worker-2`、`worker-3`。`worker-1` 通过 XREADGROUP 拿到了一条订单消息开始处理，处理到一半机器宕机了——这条消息到底算消费了还是没消费？如果 Redis 把它当作已消费，这笔订单就丢了；如果 Redis 把它当作未消费，那机器恢复后（或者由 `worker-2` 接手时）就能重新处理。XACK 就是用来告诉 Redis 这个「边界」的：你不调 XACK，Redis 就认为这条消息还没处理完，会一直把它留在 PEL（Pending Entries List）里。\n\n下面是一组完整的 CLI 操作，展示从消息写入到确认的全流程：\n\n```bash\n# 1. 写入一条消息\n127.0.0.1:6379> XADD mystream * msg \"hello\"\n\"1718900000000-0\"\n\n# 2. 创建消费组（从 ID 0 开始，即消费历史消息）\n127.0.0.1:6379> XGROUP CREATE mystream mygroup 0\nOK\n\n# 3. 消费者 consumer1 读取一条消息\n127.0.0.1:6379> XREADGROUP GROUP mygroup consumer1 COUNT 1 STREAMS mystream >\n1) 1) \"mystream\"\n   2) 1) 1) \"1718900000000-0\"\n         2) 1) \"msg\"\n            2) \"hello\"\n\n# 4. 此时查看 PEL，有 1 条 pending 消息\n127.0.0.1:6379> XPENDING mystream mygroup\n1) (integer) 1                   # pending 消息总数\n2) \"1718900000000-0\"              # 最小 pending 消息 ID\n3) \"1718900000000-0\"              # 最大 pending 消息 ID\n4) 1) 1) \"consumer1\"              # 消费者名\n      2) \"1\"                      # 该消费者的 pending 数量\n\n# 5. 确认消息\n127.0.0.1:6379> XACK mystream mygroup 1718900000000-0\n(integer) 1\n\n# 6. 再看 PEL，已经清空\n127.0.0.1:6379> XPENDING mystream mygroup\n1) (integer) 0\n2) (nil)\n3) (nil)\n4) (nil)\n```\n\n这个流程里步骤 4 和步骤 6 的对比就是 XACK 最直观的作用：它把消息从 PEL 中移除了。那么 PEL 里到底记录了什么？不 ACK 的后果具体是什么？如何在生产环境中正确使用 XACK？这些问题我们在下面的解答中逐一拆解。",
+      "answer": "## 第一步：Redis Stream 消费组核心概念详解\n\n### Redis Stream 是什么\n\nRedis Stream 是 Redis 5.0（2018 年发布）引入的数据结构，它的定位是 Redis 内置的消息队列。在 Stream 出现之前，Redis 社区用 List 的 LPUSH/BRPOP 做简易队列，用 Pub/Sub 做实时广播，但两者都有致命缺陷：List 没有消费组和消息确认机制，一条消息只能被一个消费者 POP 走，消费失败了消息就没了；Pub/Sub 是 Fire-and-forget 模式，消息不持久化，订阅者离线期间的消息永久丢失。Stream 就是为了彻底解决这些问题而设计的——它同时支持消息持久化、消费组、消息确认、历史消息回溯，是 Redis 对标 Kafka Consumer Group 概念的原生实现。\n\nStream 在底层使用 Radix Tree（基数树）存储消息，每条消息有一个唯一的 ID，默认格式是 `<毫秒时间戳>-<序列号>`，比如 `1718900000000-0`。消息一旦写入 Stream 就会持久化到 RDB 和 AOF 中，这和 Pub/Sub 的非持久化特性形成了鲜明对比。\n\n### 消费组（Consumer Group）的工作模型\n\n理解 XACK 之前必须先理解消费组的工作模型。一个消费组绑定到一个 Stream 上，组内可以有多个消费者。消费组维护一个叫做 `last-delivered-id` 的游标，记录已经分发到哪条消息了。当消费者执行 `XREADGROUP GROUP mygroup consumer1 COUNT 1 STREAMS mystream >` 时，这里的 `>` 是一个特殊标记，意思是「给我还没分发过的新消息」。Redis 会从 `last-delivered-id` 之后取出下一条消息交给 `consumer1`，然后把 `last-delivered-id` 向前推进。\n\n关键点在于：消息被分发给消费者之后，Redis 并不认为它已经被「成功处理」了。分发只是第一步，消费者拿到消息后还需要做业务处理（写数据库、调用外部 API、更新缓存等），这些操作随时可能失败。所以 Redis 在分发消息的同时，会把这条消息的相关信息记录到一个叫做 PEL（Pending Entries List）的结构中，表示「这条消息已经交出去了但还没确认处理完成」。只有当消费者显式调用 XACK 命令确认后，消息才会从 PEL 中移除。这就是 Redis Stream 实现「至少一次投递」语义的核心机制。\n\n### XACK 命令的语法与基本行为\n\nXACK 命令的语法非常简洁：\n\n```\nXACK key group id [id ...]\n```\n\n三个参数分别是 Stream 的 key 名、消费组名和要确认的消息 ID，可以一次传入多个 ID 进行批量确认。返回值是一个整数，表示成功确认的消息数量。注意这个返回值可能小于你传入的 ID 数量——如果某个 ID 本来就不在 PEL 中（已经被 ACK 过了或者根本不存在），它不会计入返回值，但也不会报错。\n\n来看一个返回值的细节演示：\n\n```bash\n# 确认一条存在于 PEL 中的消息\n127.0.0.1:6379> XACK mystream mygroup 1718900000000-0\n(integer) 1          # 成功确认 1 条\n\n# 再次确认同一条消息（幂等操作）\n127.0.0.1:6379> XACK mystream mygroup 1718900000000-0\n(integer) 0          # 已经不在 PEL 中了，返回 0，不报错\n\n# 确认一个根本不存在的消息 ID\n127.0.0.1:6379> XACK mystream mygroup 9999999999999-0\n(integer) 0          # 不在 PEL 中，返回 0，不报错\n```\n\n这个幂等特性非常重要——在分布式系统中，消费者可能因为网络超时等原因不确定 XACK 是否成功送达 Redis，于是重试发送 XACK。因为 XACK 是幂等的，重复确认不会产生任何副作用，这让重试逻辑变得非常简单。\n\n## 第二步：PEL 机制与消息确认流程深度解析\n\n### PEL 里到底存了什么\n\nPEL（Pending Entries List）是消费组级别的数据结构，每个消费组维护一个 PEL。在 Redis 的源码中（`stream.h`），PEL 的底层是一个 Radix Tree，以消息 ID 为 key，每条记录存储四个字段：消息 ID（message ID）、所属消费者名称（consumer name）、消息被分发的时间戳（delivery time，Unix 毫秒时间戳）、投递次数（delivery count，初始为 1，每次通过 XCLAIM 或 XAUTOCLAIM 转移时递增）。\n\n你可以用 XPENDING 的详细模式查看 PEL 中每条记录的具体信息：\n\n```bash\n# XPENDING key group start end count —— 查看 PEL 中的详细记录\n127.0.0.1:6379> XPENDING mystream mygroup - + 10\n1) 1) \"1718900000000-0\"        # 消息 ID\n   2) \"consumer1\"              # 所属消费者\n   3) (integer) 38420          # 空闲时间（idle time），单位毫秒，即距离上次分发已过去约 38 秒\n   4) (integer) 1              # 投递次数（delivery count）\n2) 1) \"1718900001000-0\"\n   2) \"consumer2\"\n   3) (integer) 12300\n   4) (integer) 3              # 这条消息已经被投递了 3 次（被 XCLAIM 转移过 2 次）\n```\n\n这四个字段每一个都有实际意义。idle time（空闲时间）告诉你这条消息「被搁置」了多久，如果一条消息的 idle time 特别大（比如超过 5 分钟），通常意味着负责它的消费者已经挂了或者卡死了。delivery count（投递次数）告诉你这条消息被尝试处理了多少次，如果一条消息被投递了 5 次还没 ACK，很可能是这条消息本身有问题（比如消息体格式错误导致业务代码抛异常），需要转入死信队列人工处理。\n\n### 消费者从 XREADGROUP 到 XACK 的完整工作流\n\n理解了 PEL 之后，我们把完整的消息消费流程串一遍。这个流程分成四个阶段，每个阶段 Redis 内部的状态变化都不同。\n\n**第一阶段：消费者拉取新消息**。消费者执行 `XREADGROUP GROUP mygroup consumer1 COUNT 5 STREAMS mystream >`。Redis 从 Stream 中取出 `last-delivered-id` 之后的最多 5 条消息，将这些消息返回给 `consumer1`，同时把每条消息写入 PEL（delivery time 设为当前时间，delivery count 设为 1），并更新 `last-delivered-id`。从这一刻起，这些消息就处于「已分发、未确认」的状态。\n\n**第二阶段：消费者处理消息**。这一步发生在应用代码中，Redis 不参与。消费者拿到消息后执行业务逻辑——可能是把订单写入数据库、调用支付 API、发送通知邮件等。这一步可能成功也可能失败，可能耗时几毫秒也可能耗时几秒。\n\n**第三阶段：确认成功处理的消息**。如果业务逻辑成功完成，消费者执行 `XACK mystream mygroup <id1> <id2> ...`。Redis 收到 XACK 后，从 PEL 中删除对应的记录。从此这些消息就是「已确认」状态，不会再被任何消费者看到（除非用 XRANGE 之类的命令直接查 Stream 原始数据）。\n\n**第四阶段：如果消费者崩溃了**。假设 `consumer1` 在第二阶段处理到一半进程被 kill 了，XACK 永远不会被执行。那些消息会一直留在 PEL 中，idle time 不断增长。此时其他消费者（或者恢复后的 `consumer1` 自己）可以通过 XCLAIM 或 XAUTOCLAIM 把这些消息「认领」过来重新处理。这就是「至少一次投递」的保证——消息不会因为消费者崩溃而丢失，总会有人来处理它。\n\n### 不 ACK 的代价\n\n在生产环境中，如果消费者一直读取消息但忘记调用 XACK（这种 bug 比你想象的常见得多），后果会逐步升级。首先，PEL 会持续膨胀。每条 PEL 记录大约占用 100-150 字节的内存，如果你的 Stream 每秒写入 1000 条消息且全部不 ACK，一天下来 PEL 就会积累 8640 万条记录，占用约 10-12 GB 内存。其次，XPENDING 命令会变慢。XPENDING 的摘要模式（不带 start/end 参数）需要遍历整个 PEL 统计信息，当 PEL 达到百万级别时，这个命令的耗时会显著增加。更严重的是，如果你的监控系统基于 XPENDING 检测异常消息并触发 XCLAIM 转移，PEL 过大会导致监控逻辑本身变慢，形成恶性循环。\n\n来看一个监控 PEL 大小的实用命令组合：\n\n```bash\n# 快速查看消费组的 PEL 概况\n127.0.0.1:6379> XPENDING mystream mygroup\n1) (integer) 52834               # 当前有 52834 条 pending 消息——这是个危险信号\n2) \"1718800000000-0\"\n3) \"1718900045000-0\"\n4) 1) 1) \"consumer1\"\n      2) \"48201\"                  # consumer1 积压了 48201 条\n   2) 1) \"consumer2\"\n      2) \"4633\"                   # consumer2 积压了 4633 条\n\n# 查看 consumer1 中 idle time 超过 5 分钟的消息（可能已经处理失败）\n127.0.0.1:6379> XPENDING mystream mygroup IDLE 300000 - + 10\n1) 1) \"1718800000000-0\"\n   2) \"consumer1\"\n   3) (integer) 3600000           # idle 了 3600 秒=1小时\n   4) (integer) 5                 # 已经被投递了 5 次\n```\n\n上面这个例子中，`consumer1` 积压了近 5 万条消息并且有 idle 超过 1 小时、投递 5 次的记录，几乎可以确定 `consumer1` 已经出了问题。\n\n## 第三步：体系化扩展——生产环境中的消息确认策略\n\n### 批量 ACK vs 逐条 ACK\n\nXACK 支持在一条命令中确认多个消息 ID，这在性能上有显著优势。假设消费者一次用 `XREADGROUP ... COUNT 100` 拉取了 100 条消息，逐条 ACK 意味着 100 次网络往返（round-trip），而批量 ACK 只需要 1 次。在网络延迟为 0.5ms 的内网环境中，100 次 ACK 就浪费了 50ms；如果是跨机房部署延迟 5ms 的场景，100 次就是 500ms。\n\n生产环境的推荐做法是：消费者一次拉取一批消息（比如 COUNT 50 或 COUNT 100），用一个数组收集处理成功的消息 ID，全部处理完后一次性 XACK：\n\n```bash\n# 一次确认 3 条消息\n127.0.0.1:6379> XACK mystream mygroup 1718900000000-0 1718900001000-0 1718900002000-0\n(integer) 3\n```\n\n但批量 ACK 也有一个权衡：如果消费者在处理第 50 条时崩溃了，前 49 条虽然已经处理成功但还没 ACK，重启后会被重新投递。这意味着你的业务处理逻辑必须是幂等的（同一条消息处理两次不会产生错误结果），否则就需要缩小批次大小或者在处理完每一条后立即 ACK。这是吞吐量和消息重复之间的经典权衡。\n\n### 幂等性——消费者端的责任\n\nXACK 命令本身是幂等的（对同一条消息重复 ACK 只是返回 0 而不报错），但这只是 Redis 端的幂等。真正的挑战在消费者端：因为「至少一次投递」意味着同一条消息可能被处理多次（消费者处理完了还没来得及 ACK 就崩溃了，重启后消息被重新投递），业务处理逻辑也必须是幂等的。\n\n常见的幂等策略包括：用消息 ID 作为数据库操作的唯一键（INSERT ... ON CONFLICT DO NOTHING），用消息 ID 作为 Redis SET 的 key 做去重检查（SETNX），或者在业务操作本身就是幂等的场景（比如「把用户状态设置为 active」这种覆盖操作）下不需要额外处理。\n\n### XCLAIM 和 XAUTOCLAIM——消息转移与故障恢复\n\n当某个消费者长时间不 ACK 消息时（通常意味着它已经挂了），我们需要把它的 pending 消息转移给其他消费者继续处理。Redis 提供了两种方式。\n\nXCLAIM 是手动转移，语法是 `XCLAIM key group consumer min-idle-time id [id ...]`。比如 `XCLAIM mystream mygroup consumer2 300000 1718900000000-0` 的意思是：如果消息 `1718900000000-0` 在 PEL 中的 idle time 超过 300000 毫秒（5 分钟），就把它的所属消费者从原来的消费者改为 `consumer2`，同时 delivery count 加 1。如果 idle time 不够 5 分钟，XCLAIM 不会执行转移。\n\nRedis 6.2 引入的 XAUTOCLAIM 更加方便，语法是 `XAUTOCLAIM key group consumer min-idle-time start [COUNT count]`。它会自动扫描 PEL，找到 idle time 超过阈值的消息并批量转移给指定消费者，不需要你事先知道具体的消息 ID：\n\n```bash\n# 自动认领 idle 超过 5 分钟的消息，从 PEL 开头开始扫描，最多认领 10 条\n127.0.0.1:6379> XAUTOCLAIM mystream mygroup consumer2 300000 0-0 COUNT 10\n1) \"1718900005000-0\"              # 下次扫描的起始 ID（用于分页）\n2) 1) 1) \"1718900000000-0\"        # 被认领的消息 ID 和内容\n      2) 1) \"msg\"\n         2) \"hello\"\n3) (empty array)                  # 已不在 Stream 中的消息 ID（被 XTRIM 删除的）\n```\n\n在生产环境中，通常会有一个专门的「监护者」（sentinel consumer）进程定期执行 XAUTOCLAIM，把长时间 idle 的消息转移到自己名下重新处理。\n\n### 死信处理——反复失败的消息怎么办\n\nRedis Stream 本身没有原生的死信队列（Dead Letter Queue）概念，但 PEL 中的 delivery count 字段为你提供了实现死信处理的基础。思路很直接：如果一条消息的 delivery count 超过了你设定的阈值（比如 5 次），说明它反复被投递、反复处理失败，继续重试只会浪费资源，应该把它转入一个专门的死信 Stream 供人工排查。\n\n实现这个逻辑的伪代码如下：\n\n```python\n# 定期扫描 PEL 中的异常消息\npending = redis.xpending_range('mystream', 'mygroup', '-', '+', count=100)\nfor entry in pending:\n    msg_id = entry['message_id']\n    delivery_count = entry['times_delivered']\n    idle_ms = entry['time_since_delivered']\n    \n    if delivery_count >= 5:\n        # 投递超过 5 次仍未成功，转入死信队列\n        msg_data = redis.xrange('mystream', msg_id, msg_id)\n        if msg_data:\n            redis.xadd('mystream:dead-letter', {'original_id': msg_id, **msg_data[0][1]})\n        # 从原 PEL 中确认掉，避免继续占用资源\n        redis.xack('mystream', 'mygroup', msg_id)\n        log.warning(f'消息 {msg_id} 投递 {delivery_count} 次仍失败，已转入死信队列')\n    elif idle_ms > 300000:\n        # idle 超过 5 分钟但 delivery count 还没到阈值，尝试转移重新处理\n        redis.xclaim('mystream', 'mygroup', 'recovery-worker', 300000, msg_id)\n```\n\n这里有个细节值得注意：把消息转入死信队列后一定要对原消息执行 XACK，否则它还会留在 PEL 中继续被 XAUTOCLAIM 捡到，形成死循环。\n\n### 生产环境最佳实践\n\n第一，始终在 try/finally 结构中调用 XACK。消费者的处理逻辑无论成功还是失败，都应该在 finally 块中决定是否 ACK。成功了就 ACK，已知不可恢复的失败（比如消息格式错误）也应该 ACK 并记录日志，只有可恢复的失败（比如下游服务暂时不可用）才不 ACK 让它留在 PEL 中等待重试。\n\n第二，监控 PEL 大小。在你的 Prometheus 监控中加上 XPENDING 的摘要数据采集，设置告警规则：当某个消费组的 pending 数量超过阈值（比如 10000）或者最大 idle time 超过阈值（比如 10 分钟）时触发告警。PEL 的异常增长几乎总是消费者出了问题的第一信号。\n\n第三，合理设置 COUNT。XREADGROUP 的 COUNT 参数和 XACK 的批量大小应该匹配。生产经验是 COUNT 设为 50-200 之间，太小则网络往返开销大，太大则消费者崩溃时重复处理的消息过多。具体数值要根据单条消息的处理耗时来定——如果单条处理需要 100ms，COUNT 100 意味着一批处理需要 10 秒，中途崩溃的概率就会增加。\n\n第四，注意 XACK 只对通过 XREADGROUP 读取的消息有意义。如果你用 XREAD（不带 GROUP）或 XRANGE 直接读取 Stream 数据，这些消息根本不会进入任何消费组的 PEL，对它们调用 XACK 只会返回 0 而不会有任何效果。\n\n### 面试高频考点关联\n\nXACK 和 PEL 机制是面试中 Redis Stream 部分的核心考点，经常和以下知识点结合考察。和 Kafka 的 offset commit 对比：Kafka 消费者提交 offset 表示「这个 offset 之前的所有消息都处理完了」，是基于位置的确认；Redis Stream 的 XACK 是逐条（或批量逐条）确认，粒度更细，但也意味着 PEL 需要为每条未确认的消息单独维护记录，内存开销更大。和 RabbitMQ 的 basic.ack 对比：两者语义相似，都是消费者显式确认后消息才从 broker 的待处理列表中移除。但 RabbitMQ 支持 basic.reject/basic.nack 将消息重新入队或直接丢弃，Redis Stream 没有 XNACK 命令——不 ACK 就自动等于「留在 PEL 中等待后续处理」。另外面试官还喜欢问 XACK 和 XDEL 的区别：XACK 只是从消费组的 PEL 中移除记录，消息本身仍然存在于 Stream 中，可以用 XRANGE 查到；XDEL 是从 Stream 中物理删除消息，即使没有 ACK 过。",
+      "keyPoints": [
+        "XACK 语法为 XACK key group id [id ...]，用于确认消费组中消息已成功处理，返回值是本次成功确认的消息数量，对不存在于 PEL 中的 ID 返回 0 且不报错",
+        "消费者通过 XREADGROUP 读取消息后，消息自动进入 PEL（Pending Entries List），只有 XACK 之后才从 PEL 移除，这是实现「至少一次投递」语义的核心机制",
+        "PEL 每条记录包含四个字段：消息 ID、所属消费者名、分发时间戳（用于计算 idle time）、投递次数（delivery count，XCLAIM 转移时递增），可通过 XPENDING 详细模式查看",
+        "XACK 是幂等操作，重复确认同一消息只返回 0 不报错，但消费者端的业务处理逻辑也必须保证幂等性以应对「至少一次投递」带来的重复处理",
+        "不 ACK 的消息持续占用 PEL 内存（每条约 100-150 字节），PEL 膨胀会导致 XPENDING 变慢并影响监控效率，生产环境必须监控 PEL 大小和最大 idle time",
+        "XCLAIM 手动转移和 XAUTOCLAIM（Redis 6.2+）自动转移用于故障恢复，将长时间 idle 的消息从崩溃消费者转给其他消费者重新处理",
+        "死信处理通过检查 delivery count 实现：超过阈值的消息转入 dead-letter Stream 并对原消息执行 XACK 从 PEL 清除，避免无限重试",
+        "XACK 仅对通过 XREADGROUP 读取的消息有效，XREAD 或 XRANGE 读取的消息不进入 PEL，且 XACK 只移除 PEL 记录不删除 Stream 中的消息本身（XDEL 才物理删除）"
+      ],
+      "quiz": [
+        {
+          "id": "redis-stream-xack-q1-quiz1",
+          "question": "XACK 命令的返回值表示什么？",
+          "choices": [
+            { "id": "A", "text": "成功从 PEL 中移除的消息数量，即本次真正被确认的消息条数" },
+            { "id": "B", "text": "消费组中当前剩余的 pending 消息总数" },
+            { "id": "C", "text": "Stream 中剩余的未消费消息总数" },
+            { "id": "D", "text": "操作耗时的毫秒数" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "XACK 的返回值是一个整数，表示本次操作成功确认（即从 PEL 中移除）的消息数量。如果你传入 3 个 ID 但只有 2 个在 PEL 中，返回值就是 2 而不是 3。已经被 ACK 过的 ID 或者不存在的 ID 不会计入返回值，也不会报错。选项 B 描述的是 XPENDING 摘要模式的第一个返回元素。选项 C 描述的是 XLEN 命令的功能。选项 D 纯属编造，Redis 命令不会在返回值中包含耗时信息。"
+        },
+        {
+          "id": "redis-stream-xack-q1-quiz2",
+          "question": "消费者通过 XREADGROUP 读取了一条消息后，这条消息会处于什么状态？",
+          "choices": [
+            { "id": "A", "text": "消息从 Stream 中删除，转入消费者的本地缓冲区" },
+            { "id": "B", "text": "消息仍在 Stream 中，同时被记录到消费组的 PEL 中，状态为已分发未确认" },
+            { "id": "C", "text": "消息被标记为已消费，其他消费组也无法再读取" },
+            { "id": "D", "text": "消息自动进入已确认状态，不需要额外的 ACK 操作" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "XREADGROUP 读取消息后，消息本身仍然完整保留在 Stream 的 Radix Tree 中不会被删除，但 Redis 会在消费组的 PEL 中新增一条记录（包含消息 ID、消费者名、分发时间、投递次数=1），表示「已分发但未确认」。选项 A 错误因为 Stream 消息不会因为被读取而删除，只有 XDEL 或 XTRIM 才能删除。选项 C 错误因为不同消费组是独立的，一个消费组读取不影响其他消费组。选项 D 错误因为 Redis Stream 要求显式 XACK 确认，这正是它和 Pub/Sub 的关键区别。"
+        },
+        {
+          "id": "redis-stream-xack-q1-quiz3",
+          "question": "PEL 中每条记录包含哪些核心字段？",
+          "choices": [
+            { "id": "A", "text": "消息 ID、消费者名、分发时间戳、投递次数（delivery count）" },
+            { "id": "B", "text": "消息 ID、消息完整内容、消费者名、消费组名" },
+            { "id": "C", "text": "消息 ID、消费者名、消费者 IP 地址、确认截止时间" },
+            { "id": "D", "text": "消息 ID、消息内容的哈希值、分发时间、过期时间" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "PEL 记录的核心字段是消息 ID、所属消费者名称、消息被分发的时间戳（用于计算 idle time）和投递次数（初始为 1，每次 XCLAIM/XAUTOCLAIM 转移时递增）。注意 PEL 不存储消息的实际内容——消息内容仍然存储在 Stream 的 Radix Tree 中，PEL 只记录元数据。选项 B 错误因为 PEL 不存储消息内容，这是刻意的设计以节省内存。选项 C 的 IP 地址和确认截止时间是编造的字段。选项 D 的哈希值和过期时间也不存在于 PEL 结构中。"
+        },
+        {
+          "id": "redis-stream-xack-q1-quiz4",
+          "question": "Redis Stream 通过 XACK 和 PEL 机制实现了什么级别的消息投递保证？",
+          "choices": [
+            { "id": "A", "text": "恰好一次投递（exactly-once delivery），每条消息保证被精确处理一次" },
+            { "id": "B", "text": "至少一次投递（at-least-once delivery），消息可能被重复处理但不会丢失" },
+            { "id": "C", "text": "最多一次投递（at-most-once delivery），消息可能丢失但不会重复" },
+            { "id": "D", "text": "不提供任何投递保证，和 Pub/Sub 的 Fire-and-forget 模式相同" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis Stream 的消费组通过 PEL + XACK 机制实现了「至少一次投递」语义。消息分发后进入 PEL，消费者崩溃或处理失败时消息仍留在 PEL 中可被重新投递（通过 XCLAIM/XAUTOCLAIM），因此消息不会丢失。但如果消费者处理成功后还没执行 XACK 就崩溃了，重启后消息会被再次投递，导致重复处理。所以消费者必须保证业务逻辑的幂等性。选项 A 的恰好一次在分布式系统中几乎不可能实现，Redis Stream 也不例外。选项 C 是 Pub/Sub 的语义。选项 D 完全错误，PEL 机制正是和 Pub/Sub 的关键差异。"
+        },
+        {
+          "id": "redis-stream-xack-q1-quiz5",
+          "question": "执行 XPENDING mystream mygroup - + 10 后看到某条消息的 idle time 为 3600000，delivery count 为 5，这说明什么？",
+          "choices": [
+            { "id": "A", "text": "这条消息已经被成功处理了 5 次，每次处理耗时约 1 小时" },
+            { "id": "B", "text": "这条消息距离上次被分发已过去 1 小时，且已被投递/转移了 5 次仍未确认，很可能是问题消息需要人工排查或转入死信队列" },
+            { "id": "C", "text": "这条消息将在 3600 秒后自动过期并从 PEL 中移除" },
+            { "id": "D", "text": "这条消息的大小为 3600000 字节，被 5 个不同的消费者读取过" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "XPENDING 详细模式返回的第三个字段是 idle time（空闲时间），单位毫秒，3600000ms 即 1 小时，表示距离最后一次被分发或转移已经过去了 1 小时。第四个字段是 delivery count，值为 5 表示这条消息已经被投递了 5 次（初始投递 1 次 + XCLAIM/XAUTOCLAIM 转移了 4 次），但仍然没有被 XACK。这种情况高度提示消息本身存在问题（比如格式错误导致消费者反复处理失败），应该根据预设的阈值策略将其转入死信队列。选项 A 错误因为 delivery count 代表投递次数而非成功处理次数。选项 C 错误因为 PEL 没有自动过期机制。选项 D 完全是错误的字段解读。"
+        },
+        {
+          "id": "redis-stream-xack-q1-quiz6",
+          "question": "消费者用 XREAD（不带 GROUP）读取了 Stream 中的消息后，对这条消息执行 XACK 会怎样？",
+          "choices": [
+            { "id": "A", "text": "正常确认消息，从 PEL 中移除" },
+            { "id": "B", "text": "报错，XACK 只能用于 XREADGROUP 读取的消息" },
+            { "id": "C", "text": "返回 (integer) 0，因为该消息不在任何消费组的 PEL 中，命令执行但无效果" },
+            { "id": "D", "text": "消息被直接从 Stream 中删除" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "XREAD 是不带消费组的读取方式，读取的消息不会进入任何消费组的 PEL，因此对这些消息执行 XACK 时，Redis 在指定消费组的 PEL 中找不到对应的消息 ID，返回 (integer) 0 表示没有成功确认任何消息。XACK 不会报错，它的设计就是幂等安全的——对不存在于 PEL 中的 ID 执行 XACK 只是静默返回 0。选项 B 错误因为 XACK 不会报错。选项 D 混淆了 XACK 和 XDEL 的区别——XACK 只操作 PEL，不会删除 Stream 中的消息。"
+        },
+        {
+          "id": "redis-stream-xack-q1-quiz7",
+          "question": "关于批量 XACK 和逐条 XACK，以下哪种说法最准确？",
+          "choices": [
+            { "id": "A", "text": "批量 XACK 是原子操作，要么全部确认成功要么全部失败" },
+            { "id": "B", "text": "批量 XACK 减少网络往返提高吞吐量，但消费者崩溃时未 ACK 的已处理消息会被重复投递，需要业务逻辑保证幂等性" },
+            { "id": "C", "text": "逐条 XACK 的总耗时一定比批量 XACK 短，因为单条命令更轻量" },
+            { "id": "D", "text": "批量 XACK 和逐条 XACK 在性能上完全没有区别，因为 Redis 是单线程处理" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "批量 XACK 的核心优势是减少网络往返（round-trip）。假设一次拉取 100 条消息全部处理成功，逐条 ACK 需要 100 次往返，批量 ACK 只需 1 次。但代价是：如果消费者在处理第 80 条时崩溃，前 79 条虽然已经处理成功但尚未 ACK，重启后会被重新投递导致重复处理，因此业务逻辑必须是幂等的。选项 A 错误因为批量 XACK 中每个 ID 是独立处理的，有的在 PEL 中有的不在，返回的是实际成功确认的数量。选项 C 和 D 忽略了网络开销是主要瓶颈——即使 Redis 单线程处理命令本身很快，100 次网络往返的累计延迟远大于 1 次。"
+        },
+        {
+          "id": "redis-stream-xack-q1-quiz8",
+          "question": "生产环境中消费者突然宕机，已分发但未 ACK 的消息该如何恢复处理？",
+          "choices": [
+            { "id": "A", "text": "这些消息已经丢失，无法恢复，需要生产者重新发送" },
+            { "id": "B", "text": "Redis 会自动将超时的 pending 消息重新分发给消费组内的其他消费者" },
+            { "id": "C", "text": "通过 XCLAIM 或 XAUTOCLAIM 命令将 idle 超时的 pending 消息转移给其他消费者重新处理" },
+            { "id": "D", "text": "只能等宕机的消费者恢复后自行处理，其他消费者无法接管" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis Stream 不会自动将超时消息重新分发——这是需要应用层主动处理的。XCLAIM 命令可以手动指定消息 ID 进行转移，Redis 6.2 引入的 XAUTOCLAIM 更方便，它自动扫描 PEL 中 idle time 超过指定阈值的消息并批量转移给新消费者，同时递增 delivery count。生产环境通常会部署一个独立的监护进程定期执行 XAUTOCLAIM。选项 A 错误因为消息仍在 PEL 和 Stream 中。选项 B 错误因为 Redis 不会自动重分发，需要应用层触发。选项 D 错误因为 XCLAIM/XAUTOCLAIM 正是为跨消费者转移设计的。"
+        },
+        {
+          "id": "redis-stream-xack-q1-quiz9",
+          "question": "XACK 和 XDEL 有什么区别？",
+          "choices": [
+            { "id": "A", "text": "XACK 和 XDEL 功能完全相同，都是从 Stream 中删除消息" },
+            { "id": "B", "text": "XACK 从消费组的 PEL 中移除记录但消息仍在 Stream 中，XDEL 从 Stream 中物理删除消息但不影响 PEL" },
+            { "id": "C", "text": "XACK 只能操作 pending 消息，XDEL 只能操作已 ACK 的消息" },
+            { "id": "D", "text": "XACK 需要指定消费组名，XDEL 需要指定消费者名" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个常见的混淆点。XACK 操作的对象是消费组的 PEL，它将指定消息从 PEL 的「已分发未确认」列表中移除，但消息本身仍然完整存在于 Stream 的底层 Radix Tree 中，你仍然可以通过 XRANGE 查到这条消息。XDEL 操作的对象是 Stream 本身，它将消息从 Stream 中物理删除（实际上是标记删除，当整个 Radix Tree 节点中的所有消息都被删除后才真正释放内存）。两者是独立的操作，作用于不同的数据结构。选项 C 错误因为 XDEL 可以删除任何消息不管是否 ACK 过。选项 D 错误因为 XDEL 的语法是 XDEL key id [id ...]，不需要指定消费者。"
+        },
+        {
+          "id": "redis-stream-xack-q1-quiz10",
+          "question": "消费者在处理消息过程中发现消息格式错误（如 JSON 解析失败），但消息会通过 XCLAIM 被反复重新投递，最佳处理策略是什么？",
+          "choices": [
+            { "id": "A", "text": "不做任何处理，让消息一直留在 PEL 中等待人工修复消息内容" },
+            { "id": "B", "text": "捕获异常后直接 XACK 确认消息，在日志中记录错误信息便于排查" },
+            { "id": "C", "text": "将消息内容和原始 ID 写入死信 Stream，然后 XACK 原消息从 PEL 移除，并设置告警通知人工处理" },
+            { "id": "D", "text": "调用 XDEL 直接从 Stream 中删除这条消息，同时清理 PEL 记录" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "对于确定无法处理的消息（如格式错误），最佳实践是实现死信队列模式：将消息转存到专门的 dead-letter Stream 中保留现场以便后续排查，然后对原消息执行 XACK 将其从 PEL 中清除避免无限重试浪费资源，同时通过告警系统通知运维或开发人员。选项 A 会导致 PEL 无限膨胀且消息被反复无效投递，浪费资源并可能掩盖新的问题。选项 B 虽然阻止了重试但丢失了消息内容，无法事后排查根因。选项 D 直接删除消息太激进，丢失了排查线索，而且 XDEL 不会自动清理 PEL（需要单独 XACK）。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/xack/",
+        "https://redis.io/docs/latest/commands/xpending/",
+        "https://redis.io/docs/latest/commands/xautoclaim/",
+        "https://redis.io/docs/latest/develop/data-types/streams/"
+      ]
+    }
+  ]
+}
