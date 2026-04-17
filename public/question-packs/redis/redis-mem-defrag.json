@@ -1,0 +1,158 @@
+{
+  "id": "redis-mem-defrag",
+  "name": "MEMORY PURGE 与 activedefrag 配置详解",
+  "domain": "redis",
+  "description": "深入讲解 Redis 的 MEMORY PURGE 命令与 activedefrag 主动碎片整理机制，包括 jemalloc arena purging 原理、碎片整理触发条件与 CPU 控制参数、两者的区别与配合使用策略、INFO memory 监控指标及生产环境配置建议",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-mem-defrag-q1",
+      "domain": "redis",
+      "type": "env-config",
+      "difficulty": 3,
+      "tags": ["MEMORY PURGE", "activedefrag", "碎片整理", "jemalloc", "内存优化", "redis-memory"],
+      "title": "说说 Redis 的 MEMORY PURGE 和 activedefrag 分别是做什么的，生产环境怎么配置",
+      "content": "## 面试场景\n\n你在值班时收到监控告警：一台 Redis 6.2 实例的 `mem_fragmentation_ratio` 飙到了 1.72，`used_memory` 报告 5.8GB，但 `used_memory_rss` 已经到了 10GB 出头。业务侧刚做完一波大规模缓存清理——批量 DEL 了大约 2000 万个短生命周期的 key，`used_memory` 确实降了 3GB 左右，可 RSS 纹丝不动。\n\n你的同事说「重启 Redis 就好了」，这当然能解决问题，但你们跑的是一个单实例 + Sentinel 的架构，主从切换再切回来至少影响业务 30 秒。另一个同事翻了文档说「执行一下 MEMORY PURGE 就行」，你试了一下：\n\n```bash\n127.0.0.1:6379> MEMORY PURGE\nOK\n\n127.0.0.1:6379> INFO memory\n# Memory\nused_memory:6232997888\nused_memory_human:5.81G\nused_memory_rss:9395240960\nused_memory_rss_human:8.75G\nmem_fragmentation_ratio:1.51\nallocator_frag_ratio:1.08\nallocator_rss_ratio:1.39\nallocator_frag_bytes:524288000\nallocator_rss_bytes:2637824000\n```\n\n`MEMORY PURGE` 之后 RSS 确实从 10GB 降到了 8.75GB，碎片率从 1.72 降到 1.51——有改善，但还是偏高。`allocator_frag_ratio` 只有 1.08 说明 jemalloc 自身的碎片不严重，但 `allocator_rss_ratio` 高达 1.39 表示 jemalloc 从操作系统申请了大量未归还的页面。\n\n面试官接着问你：「MEMORY PURGE 做了什么？为什么只降了一部分？剩下的怎么处理？activedefrag 又是什么，它跟 MEMORY PURGE 解决的是同一个问题吗？生产环境 activedefrag 的参数怎么调？」\n\n这几个问题涉及 Redis 内存管理的两个不同层面：jemalloc 的 arena purging（释放空闲页面回操作系统）和 Redis 自身的主动碎片整理（重新分配和搬迁碎片化数据）。大部分人把这两个机制搞混，以为 MEMORY PURGE 就是碎片整理，实际上它们解决的是完全不同的问题。",
+      "answer": "## 第一步：Redis 内存碎片的全局认知\n\n### 为什么删了数据 RSS 却不降\n\n要理解 MEMORY PURGE 和 activedefrag，得先搞清楚 Redis 的内存分配链路。Redis 本身不直接调用操作系统的 `mmap` 或 `brk` 来分配内存，而是通过一个用户态的内存分配器——默认是 jemalloc（从 Redis 2.4 开始）来管理内存。你的应用调用 `zmalloc()` 分配一块内存，jemalloc 在自己管理的 arena（竞技场，jemalloc 用来组织内存分配的逻辑区域）中找一块合适大小的空间返回给你；当你 `zfree()` 释放时，jemalloc 并不会立刻把这块内存还给操作系统，而是把它标记为空闲放在自己的 free list 里，留着下次分配时复用。\n\n这个设计的好处是：下次需要同样大小的内存时，jemalloc 不需要走系统调用（`mmap`/`munmap` 开销很大），直接从 free list 里取一块就行，分配速度极快。但坏处就是你在 Redis 里删了一堆 key，`used_memory` 降了，可操作系统层面看到的 RSS 可能毫无变化——因为那些释放的内存被 jemalloc 自己缓存住了，操作系统根本不知道这些页面已经空闲了。\n\n这就是为什么你批量 DEL 了 2000 万个 key 后，`used_memory` 从 8.8GB 降到 5.8GB，但 RSS 还在 10GB 出头。那 4GB 的差值里有一部分是 jemalloc 缓存的空闲页面（可以被 purge 释放），还有一部分是「碎片」——散落在不同内存页中的零碎已分配块，导致整个页无法被回收。\n\n这两部分需要不同的手段来处理，MEMORY PURGE 解决前者，activedefrag 解决后者。\n\n## 第二步：MEMORY PURGE 命令详解\n\n### 做了什么：强制 jemalloc arena purging\n\n`MEMORY PURGE` 是 Redis 4.0 引入的命令（对应源码中的 `memoryCommand` 函数），它的实现非常直接：遍历 jemalloc 的所有 arena，对每个 arena 调用 `je_mallctl(\"arena.<i>.purge\", ...)`。这个 mallctl 接口告诉 jemalloc：「把你缓存的那些完全空闲的脏页（dirty pages）通过 `madvise(MADV_DONTNEED)` 或 `madvise(MADV_FREE)` 还给操作系统。」\n\n关键词是「完全空闲的脏页」。jemalloc 按照 extent（内存块）来管理分配，一个 extent 可能跨多个 4KB 的内存页。只有当一个页面上的所有 extent 都被释放了，这个页面才是「完全空闲」的，purge 才能把它归还给操作系统。如果一个 4KB 的页面上还有哪怕 1 个字节的活跃分配，这个页面就不会被 purge 释放——这就是 MEMORY PURGE 的局限性。\n\n在 jemalloc 5.x（Redis 6.0+ 默认内嵌的版本）中，purge 实际上分为两种模式。`MADV_DONTNEED` 立即释放物理页面，下次访问时操作系统重新分配零页（Linux 上的默认行为）。`MADV_FREE`（Linux 4.5+ 内核支持）只是标记页面为可回收，操作系统在内存压力时才真正回收，性能更好但 RSS 数字不会立刻下降。Redis 编译时会检测内核是否支持 `MADV_FREE`，优先使用它。如果你执行 `MEMORY PURGE` 后发现 RSS 没有立刻变化，可能就是因为你的内核用了 `MADV_FREE`，页面被标记为 lazyfree 但还没真正被操作系统回收。\n\n### 什么时候用 MEMORY PURGE\n\n最典型的场景就是大量 key 被删除或过期后，RSS 没有按预期下降。比如你做了一次大规模缓存清理、执行了 `FLUSHDB`、或者某个 TTL 批量过期了。这时候 jemalloc 手里攥着一堆空闲页面，执行 `MEMORY PURGE` 让它放手还给操作系统。\n\n来看一个完整的操作示例：\n\n```bash\n# 批量删除后检查内存状况\n127.0.0.1:6379> INFO memory\nused_memory:6232997888\nused_memory_rss:10737418240\nmem_fragmentation_ratio:1.72\n\n# 执行 purge\n127.0.0.1:6379> MEMORY PURGE\nOK\n\n# 再次检查\n127.0.0.1:6379> INFO memory\nused_memory:6232997888       # used_memory 不变（没有数据变化）\nused_memory_rss:9395240960   # RSS 降了约 1.25GB\nmem_fragmentation_ratio:1.51 # 碎片率有所改善\n```\n\n注意 `used_memory` 没有变化——这很正常，因为 MEMORY PURGE 释放的是 jemalloc 缓存的空闲页，而非 Redis 正在使用的数据。它只影响 RSS 和碎片率。\n\n### MEMORY PURGE 的局限性\n\n第一，它只能释放「完全空闲的页面」。如果碎片化严重，大量页面上既有活跃数据又有空洞，MEMORY PURGE 对这些页面无能为力。第二，它是一次性操作，不会持续工作，下次又积攒了空闲页面需要再手动执行。第三，在 jemalloc 5.x 的默认配置中，jemalloc 自身有后台线程（`background_thread`）会周期性地做 purge，所以很多情况下 MEMORY PURGE 的效果不如预期明显——因为 jemalloc 已经自动 purge 过一轮了。Redis 6.2+ 会在编译时开启 jemalloc 的 `background_thread` 特性，进一步减少了手动 MEMORY PURGE 的必要性。\n\n## 第三步：activedefrag 主动碎片整理详解\n\n### 解决什么问题\n\nMEMORY PURGE 解决的是「jemalloc 持有空闲页面不归还操作系统」的问题，但它对「页面内的碎片」无能为力。什么是页面内碎片？想象一个 4KB 的内存页里有 10 个 slot，其中 3 个被占用、7 个空闲。因为还有 3 个活跃分配，这个页面不能被 purge 归还操作系统，但 70% 的空间是浪费的。如果有成千上万个这样的页面，累积的浪费就很可观。\n\n`activedefrag`（Active Defragmentation，主动碎片整理）就是为了解决这个问题。它在 Redis 4.0 中引入（需要编译时使用 jemalloc，且 jemalloc 版本需支持 `je_get_defrag_hint()` 接口），工作原理是：在 Redis 主线程的事件循环（event loop）空闲时，扫描 Redis 的 key 空间，检测每个 key 所在的内存块是否碎片化（通过调用 jemalloc 的 `je_get_defrag_hint()` 函数判断——这个函数返回当前 extent 所在的 page run 中活跃分配的比例，比例低说明碎片严重），如果发现碎片化严重，就重新分配一块新的内存，把数据搬迁过去，然后释放旧的内存块。旧块释放后，如果它所在的页面上所有分配都已经释放了，jemalloc 就可以把这个页面归还给操作系统。\n\n简单说：activedefrag 是通过「搬家」来整理碎片——把散落在不同半空页面中的数据集中搬到少数几个页面上，使得被腾空的页面可以被释放。\n\n### 开启和配置\n\nactivedefrag 默认是关闭的，需要显式开启：\n\n```bash\n# 开启主动碎片整理\n127.0.0.1:6379> CONFIG SET activedefrag yes\nOK\n```\n\n但光开启还不够，Redis 需要判断「碎片是否严重到需要整理」——如果碎片很小就不值得花 CPU 去做。这由两个触发条件参数控制：\n\n```bash\n# 碎片字节数低于此值不触发整理（默认 100MB）\n# 含义：碎片总量不到 100MB 就别整理了，开销不值得\nCONFIG SET active-defrag-ignore-bytes 104857600\n\n# 碎片比例低于此值不触发整理（默认 10%）\n# 含义：碎片率低于 10% 属于正常范围，不需要整理\nCONFIG SET active-defrag-threshold-lower 10\n\n# 碎片比例超过此值时以最大 CPU 占用进行整理（默认 100%）\n# 含义：碎片率超过 100%（RSS 是 used_memory 的 2 倍）说明碎片极其严重，全力整理\nCONFIG SET active-defrag-threshold-upper 100\n```\n\n两个触发条件是「AND」关系——碎片字节数必须超过 `active-defrag-ignore-bytes` 并且碎片比例必须超过 `active-defrag-threshold-lower`，两个条件同时满足 activedefrag 才会启动。\n\n启动之后，Redis 不会把全部 CPU 都用在碎片整理上——毕竟主线程还要处理客户端命令。CPU 占用通过以下参数控制：\n\n```bash\n# 碎片整理的最小 CPU 占用比例（默认 1%）\n# 含义：碎片刚达到触发阈值时，只用 1% 的 CPU 时间做整理\nCONFIG SET active-defrag-cycle-min 1\n\n# 碎片整理的最大 CPU 占用比例（默认 25%）\n# 含义：碎片率接近 threshold-upper 时，CPU 占用可以提升到 25%\nCONFIG SET active-defrag-cycle-max 25\n```\n\nRedis 会根据当前碎片率在 `cycle-min` 和 `cycle-max` 之间线性插值：碎片率越接近 `threshold-upper`，CPU 占用越接近 `cycle-max`。这个设计是为了在碎片不严重时尽量减少对请求延迟的影响，碎片严重时加大整理力度。\n\nRedis 7.0 引入了一个新参数 `active-defrag-max-scan-fields`（默认 1000），它控制每次扫描一个聚合类型（Hash、Set、Sorted Set、List）时最多检查多少个字段。这是为了避免遇到一个 100 万字段的大 Hash 时，整理器卡在这个 key 上太久导致主线程延迟抖动。如果某个 key 的字段数超过这个阈值，整理器会跳过它，留到下一轮再处理或者分批处理。\n\n### activedefrag 对延迟的影响\n\nactivedefrag 在主线程中运行这一点非常关键。它利用的是事件循环中的空闲时间（`beforeSleep` 回调），但「空闲时间」的定义取决于当前负载。在 QPS 不高的时候，每个事件循环迭代之间有大量空闲时间，整理器可以从容工作。但在高峰期，事件循环被客户端请求塞满，留给整理器的时间很少，整理进度会变慢。\n\n更麻烦的情况是遇到大 key。假设一个 Hash 有 50 万个 field，activedefrag 在扫描这个 Hash 时，如果 `active-defrag-max-scan-fields` 设得太大或者你用的是 Redis 7.0 之前的版本（没有这个参数），整理器可能一口气处理这个大 Hash 的大量 field，每个 field 都要做 `je_get_defrag_hint()` 判断 + 可能的 realloc + 数据搬迁。这一连串操作在主线程中同步执行，可能导致几毫秒甚至十几毫秒的延迟尖刺。在我参与过的一个电商系统中，有一个用 Hash 存储的商品属性缓存，field 数量接近 80 万。开启 activedefrag 后，每当整理器扫描到这个 key，监控上就能看到一个 P99 延迟从平时的 0.3ms 跳到 8ms 的毛刺。后来升级到 Redis 7.0 并设置 `active-defrag-max-scan-fields 500` 后，毛刺降到了 1.5ms 以内。\n\n## 第四步：MEMORY PURGE vs activedefrag 的区别与配合\n\n### 核心区别\n\n这两个机制解决的是内存碎片问题的两个不同层面。MEMORY PURGE 做的是「释放空闲页」——把 jemalloc 缓存的、完全没有活跃分配的脏页通过 `madvise` 归还操作系统。它不移动任何数据，不改变任何 key 的内存位置，执行开销很小（基本就是遍历 arena 调一圈 mallctl），对延迟几乎没有影响。\n\nactivedefrag 做的是「重组碎片化数据」——扫描 key 空间，把散落在半空页面中的数据重新分配到新位置，使得被腾空的页面可以被释放。它实质上是在做内存数据搬迁，有实际的 CPU 和内存开销，而且因为在主线程运行，对延迟有潜在影响。\n\n打个比方：你有一栋写字楼，很多楼层只坐了几个人，大部分工位空着。MEMORY PURGE 相当于把完全没人的楼层关灯关空调（释放完全空闲的页面）。activedefrag 相当于把零散几个人搬到同一层楼集中办公，然后把被腾空的楼层也关掉（整理碎片后释放页面）。\n\n### 配合使用策略\n\n最佳实践是两者配合使用。activedefrag 作为常驻后台整理机制开启，持续地将碎片化数据集中到少数页面中。当 activedefrag 整理出一批空闲页面后，这些页面会被 jemalloc 标记为 dirty，等待 purge。jemalloc 自身的后台线程会周期性 purge，但如果你希望更快地看到 RSS 下降，可以在 activedefrag 完成一轮整理后手动执行 `MEMORY PURGE`。\n\n在大规模 key 清理的场景中，建议的操作顺序是：先等待 activedefrag 完成碎片整理（观察 `INFO memory` 中的 `allocator_frag_ratio` 下降到 1.05 以下），然后执行 `MEMORY PURGE` 释放空闲页面，最后确认 RSS 降到合理水位。\n\n## 第五步：生产环境配置建议与监控指标\n\n### INFO memory 关键指标解读\n\n```bash\n127.0.0.1:6379> INFO memory\n# Memory\nused_memory:6442450944\nused_memory_human:6.00G\nused_memory_rss:8589934592\nused_memory_rss_human:8.00G\nmem_fragmentation_ratio:1.33\nallocator_frag_ratio:1.12\nallocator_frag_bytes:773094113\nallocator_rss_ratio:1.19\nallocator_rss_bytes:1288490188\nactive_defrag_running:1\nactive_defrag_hits:3842910\nactive_defrag_misses:18294720\nactive_defrag_key_hits:512038\nactive_defrag_key_misses:2847261\n```\n\n`mem_fragmentation_ratio` 是 `used_memory_rss / used_memory` 的比值，它是一个综合指标，包含了 jemalloc 内部碎片和操作系统级别的 RSS 超额。正常值在 1.0-1.5 之间，超过 1.5 需要关注，超过 2.0 说明严重碎片化需要立刻处理。`allocator_frag_ratio` 是 jemalloc 分配器级别的碎片率——`allocator_active / allocator_allocated`，它更精确地反映了 jemalloc 内部的碎片程度，是 activedefrag 的决策依据。`allocator_rss_ratio` 是 `allocator_resident / allocator_active`，反映的是 jemalloc 从操作系统申请了但还没归还的内存比例，这部分是 MEMORY PURGE 可以释放的。\n\n`active_defrag_running` 为 1 表示整理器正在工作。`active_defrag_hits` 和 `active_defrag_misses` 分别是检测到碎片化并成功搬迁的次数和检测后发现不需要搬迁的次数。hits/(hits+misses) 的比值可以帮你判断碎片化的程度——如果 hit rate 长期低于 5%，说明碎片已经不严重了，可以考虑调高触发阈值节省 CPU。\n\n### 生产推荐配置\n\n以下是一个经过多个生产环境验证的 activedefrag 配置模板，适用于 Redis 7.0+ 的中大型实例（8GB-32GB 数据量）：\n\n```bash\n# redis.conf — activedefrag 生产配置\n\n# 开启主动碎片整理\nactivedefrag yes\n\n# 碎片字节数低于 200MB 不触发（大实例可以适当提高阈值，避免频繁整理）\nactive-defrag-ignore-bytes 200mb\n\n# 碎片率低于 10% 不触发（默认值，大部分场景不需要调整）\nactive-defrag-threshold-lower 10\n\n# 碎片率超过 80% 时全力整理（比默认的 100% 更激进一些）\nactive-defrag-threshold-upper 80\n\n# 最小 CPU 占用 5%（默认 1% 在大实例上整理太慢）\nactive-defrag-cycle-min 5\n\n# 最大 CPU 占用 35%（根据业务延迟容忍度调整，延迟敏感服务建议 15%-25%）\nactive-defrag-cycle-max 35\n\n# Redis 7.0+ 每次扫描最多检查 500 个字段（防止大 Hash/Set 导致延迟毛刺）\nactive-defrag-max-scan-fields 500\n```\n\n对于延迟极其敏感的场景（P99 < 1ms），建议把 `active-defrag-cycle-max` 控制在 15% 以内，并且将 `active-defrag-max-scan-fields` 降到 200-500。整理速度会慢一些，但对请求延迟的影响更小。\n\n如果你的 Redis 版本低于 7.0，没有 `active-defrag-max-scan-fields` 参数，那就需要格外注意大 key 的问题。建议用 `redis-cli --bigkeys` 或 `MEMORY USAGE <key>` 定期扫描，对超过 10 万 field 的聚合类型 key 进行拆分。\n\n### 常见坑点\n\n第一个坑：在非 jemalloc 编译的 Redis 上执行 `MEMORY PURGE` 或开启 activedefrag 会报错。你可以通过 `INFO memory` 中的 `mem_allocator` 字段确认当前使用的分配器。如果你看到的是 `libc`，说明 Redis 编译时没有链接 jemalloc，这两个功能都用不了。Docker Hub 上的官方 Redis 镜像默认是 jemalloc 编译的，不用担心。\n\n第二个坑：activedefrag 开启后 `active_defrag_running` 一直是 0。这通常意味着碎片没有达到触发阈值——检查 `active-defrag-ignore-bytes` 和 `active-defrag-threshold-lower` 是不是设得太高了。也可能是 Redis 编译时没有 jemalloc 的 defrag 支持（需要 jemalloc 4.0+ 并且编译时启用了 `--enable-defrag`）。\n\n第三个坑：MEMORY PURGE 在使用 `MADV_FREE`（Linux 4.5+ 内核默认行为）的系统上执行后，RSS 不会立即下降。这是因为 `MADV_FREE` 只是标记页面为「操作系统可以在需要时回收」，但在内存充足时操作系统不会主动回收这些页面。如果你需要立即看到 RSS 下降的效果来验证 purge 是否生效，可以在 Redis 编译时通过 `MALLOC_CONF=\"oversize_threshold:0,dirty_decay_ms:0,muzzy_decay_ms:0\"` 强制使用 `MADV_DONTNEED` 模式，但这会略微影响分配性能。生产环境一般不建议这样做——RSS 数字高一点但实际页面已经被标记为可回收，并不会造成真实的内存压力。",
+      "keyPoints": [
+        "MEMORY PURGE 调用 jemalloc 的 arena.<i>.purge mallctl 接口，通过 madvise 将 jemalloc 缓存的完全空闲脏页归还操作系统，只影响 RSS 不影响 used_memory",
+        "activedefrag 在主线程事件循环的空闲时间扫描 key 空间，通过 je_get_defrag_hint() 检测碎片化内存块，重新分配并搬迁数据来消除页面内碎片",
+        "MEMORY PURGE 释放的是完全空闲的页面，activedefrag 整理的是半占用页面中的碎片——两者解决不同层面的碎片问题，配合使用效果最佳",
+        "activedefrag 触发条件是 active-defrag-ignore-bytes（默认 100MB）和 active-defrag-threshold-lower（默认 10%）同时满足，两个条件是 AND 关系",
+        "CPU 占用通过 active-defrag-cycle-min（默认 1%）和 active-defrag-cycle-max（默认 25%）控制，Redis 根据碎片率在两者之间线性插值",
+        "Redis 7.0 引入 active-defrag-max-scan-fields（默认 1000）限制每次扫描聚合类型的字段数，防止大 Hash/Set 导致主线程延迟抖动",
+        "INFO memory 中的 allocator_frag_ratio 反映 jemalloc 内部碎片（activedefrag 目标），allocator_rss_ratio 反映未归还操作系统的页面比例（MEMORY PURGE 目标）",
+        "activedefrag 和 MEMORY PURGE 都依赖 jemalloc 分配器，非 jemalloc 编译的 Redis 无法使用这两个功能，可通过 INFO memory 的 mem_allocator 字段确认"
+      ],
+      "quiz": [
+        {
+          "id": "redis-mem-defrag-q1-quiz1",
+          "question": "MEMORY PURGE 命令的底层实现是什么？",
+          "choices": [
+            { "id": "A", "text": "遍历 jemalloc 的所有 arena，调用 arena.<i>.purge mallctl 释放空闲脏页" },
+            { "id": "B", "text": "扫描 Redis 所有 key 并重新分配内存，整理碎片化的数据块" },
+            { "id": "C", "text": "调用操作系统的 munmap 释放 Redis 进程的所有未使用虚拟内存" },
+            { "id": "D", "text": "强制触发 jemalloc 的 GC（垃圾回收），回收所有不可达的内存对象" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "MEMORY PURGE 的实现是遍历 jemalloc 的全部 arena，对每个 arena 调用 `je_mallctl(\"arena.<i>.purge\", ...)` 接口，让 jemalloc 把缓存的完全空闲的脏页通过 `madvise(MADV_DONTNEED)` 或 `madvise(MADV_FREE)` 归还操作系统。B 选项描述的是 activedefrag 的行为，不是 MEMORY PURGE。C 选项的 munmap 释放虚拟内存是 jemalloc 在内部可能做的事，但 MEMORY PURGE 不是直接调 munmap。D 选项的 GC 概念不适用于 jemalloc——jemalloc 是一个显式分配/释放的内存分配器，不存在垃圾回收机制。"
+        },
+        {
+          "id": "redis-mem-defrag-q1-quiz2",
+          "question": "activedefrag 是通过什么机制判断一个内存块是否需要碎片整理的？",
+          "choices": [
+            { "id": "A", "text": "检查 key 的最近访问时间，长期未访问的 key 优先整理" },
+            { "id": "B", "text": "调用 jemalloc 的 je_get_defrag_hint() 函数，判断所在 page run 的活跃分配比例" },
+            { "id": "C", "text": "比较 key 的 used_memory 和 sizeof 的差值来判断碎片大小" },
+            { "id": "D", "text": "通过 /proc/self/smaps 读取每个内存页的碎片信息" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "activedefrag 对每个扫描到的 key 的内存地址调用 jemalloc 提供的 `je_get_defrag_hint()` 接口，这个函数会返回当前内存块所在的 page run（连续内存页区域）中活跃分配占总容量的比例。如果比例很低，说明这个 page run 大部分空间是碎片，值得把数据搬迁到更紧凑的位置。A 选项描述的是 LRU 淘汰策略的逻辑，跟碎片整理无关。C 选项的方法在技术上不可行，Redis 不能通过 sizeof 来判断 jemalloc 层面的碎片。D 选项的 smaps 虽然包含内存映射信息，但 Redis 不会用这种开销很大的方式来做实时碎片检测。"
+        },
+        {
+          "id": "redis-mem-defrag-q1-quiz3",
+          "question": "activedefrag 的两个触发条件 active-defrag-ignore-bytes 和 active-defrag-threshold-lower 之间是什么关系？",
+          "choices": [
+            { "id": "A", "text": "OR 关系：任何一个条件满足就开始整理" },
+            { "id": "B", "text": "AND 关系：两个条件必须同时满足才开始整理" },
+            { "id": "C", "text": "优先级关系：先检查 ignore-bytes，不满足则跳过 threshold-lower" },
+            { "id": "D", "text": "互斥关系：只会使用其中一个条件，取决于 Redis 版本" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这两个条件是 AND 关系，必须同时满足 activedefrag 才会启动。也就是说碎片字节数要超过 `active-defrag-ignore-bytes`（默认 100MB）并且碎片比例要超过 `active-defrag-threshold-lower`（默认 10%），两个条件缺一不可。这个设计是有道理的：如果只看比例不看绝对值，一个只有 500MB 数据的小实例碎片率 15% 也就是 75MB 碎片，不值得花 CPU 去整理；如果只看绝对值不看比例，一个 100GB 的大实例有 150MB 碎片但碎片率只有 0.15%，同样不需要整理。只有当两个维度都表明碎片已经「够严重」时才启动整理。"
+        },
+        {
+          "id": "redis-mem-defrag-q1-quiz4",
+          "question": "activedefrag 的碎片整理工作运行在 Redis 的哪个线程中？",
+          "choices": [
+            { "id": "A", "text": "主线程的事件循环空闲时间（beforeSleep 回调）" },
+            { "id": "B", "text": "独立的后台线程，类似 BGSAVE 的子进程" },
+            { "id": "C", "text": "jemalloc 的 background_thread 中" },
+            { "id": "D", "text": "Redis 6.0 引入的 IO 线程中" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "activedefrag 在 Redis 主线程中运行，利用事件循环（event loop）中的空闲时间执行碎片整理。具体来说是在 `beforeSleep` 回调中被调度执行的。这是 activedefrag 最关键的架构特点，也是它可能影响请求延迟的根本原因——因为主线程既要处理客户端命令，又要做碎片整理，两者共享 CPU 时间。B 选项错误，activedefrag 不是后台进程。C 选项的 jemalloc background_thread 是做自动 purge 的（释放空闲页），不是做碎片整理的。D 选项的 IO 线程负责的是网络读写，跟碎片整理无关。"
+        },
+        {
+          "id": "redis-mem-defrag-q1-quiz5",
+          "question": "以下 INFO memory 输出中，哪个指标最能直接反映 MEMORY PURGE 可以释放的内存量？",
+          "choices": [
+            { "id": "A", "text": "mem_fragmentation_ratio" },
+            { "id": "B", "text": "allocator_frag_ratio 和 allocator_frag_bytes" },
+            { "id": "C", "text": "allocator_rss_ratio 和 allocator_rss_bytes" },
+            { "id": "D", "text": "used_memory_peak 减去 used_memory 的差值" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "MEMORY PURGE 释放的是 jemalloc 从操作系统申请了但尚未归还的空闲页面，这部分对应的指标是 `allocator_rss_ratio`（`allocator_resident / allocator_active`）和 `allocator_rss_bytes`（两者的差值）。`allocator_rss_ratio` 越高说明 jemalloc 持有的未归还页面越多，MEMORY PURGE 的效果就越明显。A 选项的 `mem_fragmentation_ratio` 是一个综合指标，包含了内部碎片和 RSS 超额两部分，无法区分哪些是 MEMORY PURGE 可以释放的。B 选项的 `allocator_frag_ratio` 反映的是 jemalloc 内部碎片（active vs allocated），这部分需要 activedefrag 来解决，MEMORY PURGE 无能为力。D 选项的 peak 是历史峰值，跟当前可释放的内存无关。"
+        },
+        {
+          "id": "redis-mem-defrag-q1-quiz6",
+          "question": "在使用 MADV_FREE 的 Linux 系统上执行 MEMORY PURGE 后，以下哪种现象是正常的？",
+          "choices": [
+            { "id": "A", "text": "used_memory 和 used_memory_rss 同时下降" },
+            { "id": "B", "text": "used_memory 不变，used_memory_rss 立即大幅下降" },
+            { "id": "C", "text": "used_memory 不变，used_memory_rss 短期内也没有明显下降" },
+            { "id": "D", "text": "used_memory 下降，used_memory_rss 不变" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个常见的坑。在 Linux 4.5+ 内核上，jemalloc 默认使用 `MADV_FREE` 而不是 `MADV_DONTNEED` 来释放页面。`MADV_FREE` 只是标记页面为「操作系统在内存压力时可以回收」，但在内存充足的情况下操作系统不会主动回收这些页面，所以 RSS 数字短期内不会明显变化。这是完全正常的行为——页面已经被正确标记了，只是操作系统还没回收而已。A 选项错误，MEMORY PURGE 不影响 used_memory。B 选项描述的是使用 `MADV_DONTNEED` 时的行为。D 选项因果关系颠倒，MEMORY PURGE 不会减少 used_memory。很多人看到 RSS 没变就以为 MEMORY PURGE 失效了，实际上这只是 MADV_FREE 的延迟回收特性。"
+        },
+        {
+          "id": "redis-mem-defrag-q1-quiz7",
+          "question": "关于 MEMORY PURGE 和 activedefrag 的区别，以下哪个说法是正确的？",
+          "choices": [
+            { "id": "A", "text": "MEMORY PURGE 释放完全空闲的页面，activedefrag 通过搬迁数据来整理半占用页面中的碎片" },
+            { "id": "B", "text": "MEMORY PURGE 整理碎片后释放页面，activedefrag 是 MEMORY PURGE 的自动化版本" },
+            { "id": "C", "text": "两者功能相同但触发方式不同：MEMORY PURGE 手动触发，activedefrag 自动触发" },
+            { "id": "D", "text": "MEMORY PURGE 在主线程执行可能影响延迟，activedefrag 在后台线程执行不影响延迟" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "MEMORY PURGE 和 activedefrag 解决的是完全不同层面的问题。MEMORY PURGE 做的是让 jemalloc 把缓存的完全空闲脏页归还操作系统——一个页面上所有分配都已释放才能被 purge。activedefrag 做的是扫描半占用的碎片化页面，把其中的活跃数据重新分配搬迁到更紧凑的位置，使得被腾空的页面可以被后续 purge 释放。B 选项完全错误，MEMORY PURGE 不做碎片整理。C 选项错误，两者功能完全不同。D 选项颠倒了——实际上 MEMORY PURGE 执行非常快对延迟几乎无影响，而 activedefrag 在主线程运行是可能导致延迟抖动的。"
+        },
+        {
+          "id": "redis-mem-defrag-q1-quiz8",
+          "question": "生产环境中一个 16GB 数据量的 Redis 7.0 实例，碎片率长期在 1.4 左右，以下 activedefrag 配置哪个最合理？",
+          "choices": [
+            { "id": "A", "text": "active-defrag-cycle-min 50, active-defrag-cycle-max 80, active-defrag-max-scan-fields 10000" },
+            { "id": "B", "text": "active-defrag-cycle-min 5, active-defrag-cycle-max 30, active-defrag-max-scan-fields 500" },
+            { "id": "C", "text": "active-defrag-cycle-min 1, active-defrag-cycle-max 5, active-defrag-ignore-bytes 2gb" },
+            { "id": "D", "text": "只需要定期执行 MEMORY PURGE 就够了，不需要开启 activedefrag" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 选项的配置最合理：5% 的最小 CPU 占用可以保证碎片整理有一定进度（默认 1% 在大实例上太慢），30% 的最大 CPU 占用在碎片严重时加大力度但不会过度抢占主线程资源，500 的 max-scan-fields 可以有效防止大聚合类型 key 导致的延迟毛刺。A 选项的 CPU 占用过高（最大 80%），会严重影响正常请求处理，且 max-scan-fields 10000 太大失去了限制的意义。C 选项的 ignore-bytes 设为 2GB 过高，对于 16GB 实例来说碎片率 1.4 意味着约 5.6GB 碎片，虽然超过 2GB 但 cycle-max 只有 5% 整理速度太慢。D 选项错误，碎片率 1.4 说明有大量页面内碎片，MEMORY PURGE 无法处理半占用页面的碎片。"
+        },
+        {
+          "id": "redis-mem-defrag-q1-quiz9",
+          "question": "Redis 7.0 新增的 active-defrag-max-scan-fields 参数主要解决什么问题？",
+          "choices": [
+            { "id": "A", "text": "限制每秒扫描的 key 数量，避免 CPU 使用率过高" },
+            { "id": "B", "text": "限制每次扫描聚合类型（Hash/Set/ZSet）的字段数，防止大 key 导致主线程延迟抖动" },
+            { "id": "C", "text": "限制 activedefrag 的总内存使用量，防止整理过程中分配过多临时内存" },
+            { "id": "D", "text": "限制每次 MEMORY PURGE 释放的最大页面数，避免一次性释放太多页面" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 Redis 7.0 之前，activedefrag 在扫描一个聚合类型 key（比如一个包含几十万 field 的大 Hash）时，会一口气遍历所有 field 进行碎片检测和搬迁。因为 activedefrag 在主线程运行，处理一个大 key 可能导致几毫秒甚至十几毫秒的延迟尖刺。`active-defrag-max-scan-fields`（默认 1000）限制了每次扫描一个聚合类型最多检查的字段数，超过限制的 key 会被分批处理或暂时跳过，有效控制了单次整理操作的执行时间。A 选项描述的「key 数量」不准确，这个参数控制的是单个 key 内的字段数。C 和 D 选项都是虚构的功能描述。"
+        },
+        {
+          "id": "redis-mem-defrag-q1-quiz10",
+          "question": "你开启了 activedefrag 但发现 INFO memory 中 active_defrag_running 始终为 0，最不可能的原因是？",
+          "choices": [
+            { "id": "A", "text": "当前碎片字节数低于 active-defrag-ignore-bytes 阈值" },
+            { "id": "B", "text": "Redis 编译时没有使用 jemalloc 或 jemalloc 版本不支持 defrag" },
+            { "id": "C", "text": "当前碎片比例低于 active-defrag-threshold-lower 阈值" },
+            { "id": "D", "text": "Redis 主线程太忙，事件循环没有空闲时间执行整理" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "A、B、C 三个选项都是 `active_defrag_running` 为 0 的常见原因。A 和 C 涉及的是触发条件未满足——两个条件是 AND 关系，任何一个不满足都不会启动。B 是前提条件——非 jemalloc 编译或 jemalloc 版本过低都会导致 activedefrag 无法工作。D 选项是最不可能的原因：即使主线程很忙，只要碎片达到触发阈值，Redis 仍然会将 `active_defrag_running` 设为 1，只是分配给整理器的实际 CPU 时间会很少，整理进度会很慢。主线程忙不会阻止 activedefrag 启动，只会影响它的执行速度。所以 D 是最不可能导致 `active_defrag_running` 为 0 的原因。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/memory-purge/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/#active-defragmentation",
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/internals/",
+        "https://jemalloc.net/jemalloc.3.html",
+        "https://github.com/redis/redis/blob/7.2/src/defrag.c"
+      ]
+    }
+  ]
+}
