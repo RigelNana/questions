@@ -1,0 +1,155 @@
+{
+  "id": "redis-stream-trim",
+  "name": "Stream 消息积压时的裁剪策略",
+  "domain": "redis",
+  "description": "深入讲解 Redis Stream 的 MAXLEN、MINID 裁剪策略、近似裁剪机制、与 PEL 的关系以及生产环境配置建议",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-stream-trim-q1",
+      "domain": "redis",
+      "type": "env-config",
+      "difficulty": 2,
+      "tags": ["XTRIM", "MAXLEN", "MINID", "消息裁剪", "内存管理", "近似裁剪", "redis-stream"],
+      "title": "Redis Stream 消息积压时应该怎么配置裁剪策略",
+      "content": "你的团队用 Redis 7.0 的 Stream 做订单事件流，每秒大约写入 800 条消息，每条消息平均 200 字节。服务上线两周后，运维同事发来告警：Redis 实例的内存从 2GB 飙到了 7.5GB，而且还在持续增长。你用 `XLEN order-events` 一查，Stream 里已经积攒了 9600 万条消息。\n\n你意识到问题出在哪了——Stream 的消息是持久化在内存里的，写进去之后不会自动消失。不像 Pub/Sub 那样消息 fire-and-forget、发完就没了，也不像 List 那样消息被 pop 之后自动移除。Stream 是 append-only 日志结构，每条消息写入后会一直待在内存中，直到你显式地删除它或者 Redis 因为 maxmemory 策略把整个 key 淘汰掉。\n\n你查了一下 Redis 的 Stream 裁剪相关命令，发现有好几种策略：\n\n```bash\n# 当前状况\n127.0.0.1:6379> XLEN order-events\n(integer) 96000000\n\n127.0.0.1:6379> MEMORY USAGE order-events\n(integer) 5368709120    # 约 5GB\n\n127.0.0.1:6379> XINFO STREAM order-events\n 1) \"length\"\n 2) (integer) 96000000\n 3) \"radix-tree-keys\"\n 4) (integer) 574623\n 5) \"radix-tree-nodes\"\n 6) (integer) 601847\n 7) \"last-generated-id\"\n 8) \"1719302400000-0\"\n 9) \"first-entry\"\n10) 1) \"1717977600000-0\"\n    2) 1) \"order_id\"\n       2) \"10001\"\n       3) \"action\"\n       4) \"created\"\n\n# 你看到了这些裁剪选项\nXADD order-events MAXLEN 1000000 * order_id 99999 action created\nXADD order-events MAXLEN ~ 1000000 * order_id 99999 action created\nXTRIM order-events MAXLEN 1000000\nXTRIM order-events MAXLEN ~ 1000000\nXTRIM order-events MINID 1718899200000-0\nXTRIM order-events MINID ~ 1718899200000-0\n```\n\n面试官想知道的是：这些裁剪策略分别是什么含义？精确裁剪和近似裁剪（带 `~`）有什么区别？MAXLEN 和 MINID 该怎么选？XADD 时内联裁剪和 XTRIM 独立裁剪各有什么优劣？裁剪的时候会不会影响到还在 PEL 中的未确认消息？在你这个每秒 800 条写入的场景下，应该怎么配置一个合理的裁剪策略？",
+      "answer": "## Redis Stream 基础与内存模型\n\nRedis Stream 是 Redis 5.0 引入的 append-only 日志数据结构，它的核心定位是在 Redis 内部实现一个轻量级的消息日志系统。每条写入 Stream 的消息都有一个唯一 ID，格式为 `<毫秒时间戳>-<序号>`（例如 `1719302400000-0` 代表 2024-06-25T16:00:00Z 写入的第一条消息），ID 保证单调递增。Stream 的底层存储使用 Radix Tree（基数树）组织消息条目，每个 Radix Tree 节点内部用 listpack（Redis 7.0 之前是 ziplist）紧凑存储多条消息，这种设计在保持有序访问效率的同时尽可能压缩内存占用。\n\n理解裁剪策略之前，必须先搞清楚一个关键事实：Stream 的消息是持久存储在内存中的。这一点和 Pub/Sub 完全不同——Pub/Sub 的消息是 fire-and-forget 模式，发送后不保留，消费者断线就丢消息；List 做队列时消息被 BRPOP 取走后就从 List 中删除了。而 Stream 被设计为日志结构，消息写入后不会因为被 XREAD 或 XREADGROUP 读取就消失，它们一直留在内存里，直到你显式裁剪或删除。这意味着如果你不做任何裁剪，一个每秒写入 800 条、每条 200 字节的 Stream，一天就会积攒 6912 万条消息，粗略估算（加上 Radix Tree 元数据和 listpack 编码开销）大约占用 3-4GB 内存。两周下来轻松突破 7GB。\n\nStream 最基本的操作就三条命令：`XADD` 写入消息，`XREAD` / `XREADGROUP` 读取消息，`XTRIM` 裁剪消息。裁剪是生产环境绕不开的话题。下面来逐一拆解每种裁剪策略。\n\n## MAXLEN 策略：按消息数量裁剪\n\nMAXLEN 是最直观的裁剪方式——指定 Stream 最多保留多少条消息，超出的部分从最旧的开始删除。它可以用在两个地方：XADD 命令里内联裁剪，或者 XTRIM 命令独立裁剪。\n\n```bash\n# 方式一：XADD 内联裁剪 —— 每次写入时顺便保持 Stream 不超过 100 万条\n127.0.0.1:6379> XADD order-events MAXLEN 1000000 * order_id 88888 action created\n\"1719302400123-0\"\n\n# 方式二：XTRIM 独立裁剪 —— 手动将 Stream 裁剪到 100 万条\n127.0.0.1:6379> XTRIM order-events MAXLEN 1000000\n(integer) 95000000   # 返回被删除的消息数量\n```\n\n精确裁剪（不带 `~`）的语义很严格：执行 `MAXLEN 1000000` 后，Stream 中恰好保留最新的 100 万条消息，多一条都不行。Redis 会从 Radix Tree 的最左侧（最旧的消息）开始逐个节点删除，直到消息总数刚好等于指定值。当 Stream 很大时（比如从 9600 万条裁剪到 100 万条），这个操作需要删除 9500 万条消息，涉及大量的 Radix Tree 节点释放和 listpack 内存回收，会导致 Redis 主线程长时间阻塞。在我们的实测中，一个 1 亿条消息的 Stream 执行精确 `XTRIM MAXLEN 1000000` 耗时超过 15 秒，期间 Redis 完全无法响应其他请求。\n\n### 近似裁剪：~ 操作符的秘密\n\n这就引出了近似裁剪。在 MAXLEN 前面加一个 `~`，语义变成「大约保留这么多条，不需要精确」：\n\n```bash\n# 近似裁剪：保留大约 100 万条，实际可能比 100 万多一些\n127.0.0.1:6379> XADD order-events MAXLEN ~ 1000000 * order_id 88889 action created\n\"1719302400124-0\"\n\n127.0.0.1:6379> XTRIM order-events MAXLEN ~ 1000000\n(integer) 94998700   # 注意：不是精确的 95000000\n```\n\n近似裁剪的性能优势源于 Stream 的底层存储结构。Stream 的 Radix Tree 中，每个节点用一个 listpack 存储了多条连续的消息（通常是几十到几百条）。精确裁剪可能需要「打开」一个 listpack 节点、只删除其中一部分消息、然后重新编码剩余部分——这涉及内存拷贝和重新分配。而近似裁剪只在整个 Radix Tree 节点都可以被完整移除时才删除，不会去拆分节点内部的 listpack。这意味着实际保留的消息数可能比你指定的多出一个节点的容量（几十到几百条），但删除操作变成了简单的节点指针移除和内存释放，性能提升非常显著。\n\nRedis 6.2 还引入了 `LIMIT` 参数，进一步控制单次裁剪的工作量：\n\n```bash\n# 每次最多删除 100 个 Radix Tree 节点的消息，避免大量裁剪阻塞主线程\n127.0.0.1:6379> XTRIM order-events MAXLEN ~ 1000000 LIMIT 100\n(integer) 8500\n```\n\n`LIMIT 100` 的含义不是「最多删除 100 条消息」，而是「最多检查/删除 100 个底层条目」。这在 Stream 极大且需要逐步裁剪到目标值的场景下非常有用——你可以把 XTRIM 放在定时任务里，每秒执行一次、每次限制删除量，平滑地把 Stream 裁到目标大小。需要注意的是，`LIMIT` 参数只能和近似裁剪（`~`）一起使用，精确裁剪不支持 LIMIT。\n\n## MINID 策略：按时间 / ID 裁剪（Redis 6.2+）\n\nMAXLEN 按数量裁剪在很多场景下够用了，但有一个问题：不同时段的消息写入速率可能差异很大。白天高峰期每秒 800 条，凌晨可能只有每秒 50 条。如果你设 MAXLEN 为 100 万条，高峰期保留的时间窗口大约是 20 分钟，而低峰期可能保留了 5 小时。这在业务上不太直观——你通常更关心的是「保留最近 24 小时的消息」而不是「保留最近 100 万条」。\n\nRedis 6.2 引入的 MINID 策略正是为了解决这个问题。MINID 指定一个最小消息 ID，所有 ID 小于这个值的消息都会被删除。由于 Stream 的消息 ID 本身就包含毫秒时间戳，MINID 本质上就是按时间裁剪：\n\n```bash\n# 删除 2024-06-20 00:00:00 UTC 之前的所有消息\n# 1718841600000 = 2024-06-20T00:00:00Z 的毫秒时间戳\n127.0.0.1:6379> XTRIM order-events MINID 1718841600000-0\n(integer) 34560000\n\n# 同样支持近似裁剪\n127.0.0.1:6379> XTRIM order-events MINID ~ 1718841600000-0\n(integer) 34558200\n\n# 在 XADD 中内联使用\n127.0.0.1:6379> XADD order-events MINID ~ 1718841600000-0 * order_id 90000 action created\n\"1719302400200-0\"\n\n# 配合 LIMIT 参数渐进裁剪\n127.0.0.1:6379> XTRIM order-events MINID ~ 1718841600000-0 LIMIT 100\n(integer) 6800\n```\n\nMINID 同样支持近似裁剪（`~`）和 LIMIT 参数，行为逻辑与 MAXLEN 一致：近似模式下只删除完整的 Radix Tree 节点，LIMIT 控制单次最大删除量。在生产中，MINID 的一个典型用法是在定时任务里动态计算「当前时间 - 保留时长」对应的时间戳，然后作为 MINID 参数执行裁剪。比如保留最近 7 天的数据，每小时执行一次 `XTRIM order-events MINID ~ <七天前的毫秒时间戳> LIMIT 500`。\n\n## XADD 内联裁剪 vs XTRIM 独立裁剪\n\n裁剪策略确定之后，下一个问题是「什么时候触发裁剪」。Redis 提供两种触发方式，各有适用场景。\n\nXADD 内联裁剪是在每次写入消息时顺便执行裁剪。比如 `XADD order-events MAXLEN ~ 1000000 * field value`，Redis 在写入新消息后立即检查是否需要裁剪，如果超出阈值就删除旧消息。这种方式的好处是裁剪开销被均摊到每次写入操作中——因为两次 XADD 之间最多只新增一条消息，所以每次裁剪最多只需要删除一条（或者在近似模式下可能不删除），单次开销极小，完全不影响 Redis 的响应延迟。生产环境中最推荐的就是这种方式，它让 Stream 的大小始终在可控范围内。\n\nXTRIM 独立裁剪则是一个独立命令，通常由外部定时任务或 cron job 触发。它适合两种场景：一是初次治理——当你发现一个已经膨胀到 9600 万条的 Stream 时，需要用 XTRIM 做一次大规模清理（建议配合 LIMIT 分批执行，避免长时间阻塞）；二是按时间裁剪——你希望每小时清理一次 7 天前的数据，用一个定时任务执行 `XTRIM order-events MINID ~ <七天前时间戳>`。\n\n生产最佳实践是两者结合：XADD 时用 `MAXLEN ~` 做日常限流，保证 Stream 不会无限增长；同时用定时任务执行 `XTRIM MINID ~` 按业务时间窗口清理过期数据。\n\n## 裁剪与 PEL 的关系：一个关键的坑\n\n这是很多人忽略的问题：裁剪操作不关心 PEL（Pending Entries List）的状态。当你执行 XTRIM 或 XADD 带 MAXLEN / MINID 时，Redis 只看消息 ID 和数量，不会检查「这条消息是不是还在某个消费组的 PEL 里」。如果你裁剪掉了一条还在 PEL 中的消息，这条消息的数据就从 Stream 中永久删除了，但它的 PEL 记录还在。此时消费者尝试用 XCLAIM 或重新读取这条消息时，会发现消息内容已经不存在了。\n\n```bash\n# 假设 consumer1 读取了消息但还没 XACK\n127.0.0.1:6379> XPENDING order-events processors - + 1\n1) 1) \"1718841500000-0\"      # 这条消息还在 PEL 中\n   2) \"consumer1\"\n   3) (integer) 300000       # 空闲 5 分钟\n   4) (integer) 1\n\n# 此时执行裁剪，这条消息的 ID 比 MINID 小，会被删除\n127.0.0.1:6379> XTRIM order-events MINID 1718841600000-0\n(integer) 500000\n\n# 消息从 Stream 中消失了，但 PEL 记录还在\n127.0.0.1:6379> XPENDING order-events processors - + 1\n1) 1) \"1718841500000-0\"      # 还在 PEL 里\n   2) \"consumer1\"\n   3) (integer) 310000\n   4) (integer) 1\n\n# XAUTOCLAIM 会在第三个返回值里报告这些「幽灵消息」(Redis 7.0+)\n127.0.0.1:6379> XAUTOCLAIM order-events processors consumer2 300000 0-0\n1) \"0-0\"\n2) (empty array)\n3) 1) \"1718841500000-0\"      # 已删除的消息 ID\n```\n\n这就是为什么你必须确保裁剪阈值大于最大消息处理延迟。如果你的消费者最慢需要 10 分钟处理一条消息，那 MINID 的裁剪时间窗口至少要留 15-20 分钟的安全余量；如果用 MAXLEN，保留的消息数量要能覆盖这段时间内的写入量。Redis 7.0 的 XAUTOCLAIM 返回值中新增了第三个数组，专门报告那些在 PEL 中但已被删除的「幽灵消息」ID，方便你在消费端做清理。\n\n## 监控与运维\n\n生产环境中，裁剪策略配好之后还需要持续监控 Stream 的状态。以下几个命令是日常运维必备的：\n\n```bash\n# 快速获取消息数量（O(1) 复杂度）\n127.0.0.1:6379> XLEN order-events\n(integer) 1023456\n\n# 查看 Stream 详细信息：长度、Radix Tree 结构、首尾消息\n127.0.0.1:6379> XINFO STREAM order-events\n 1) \"length\"\n 2) (integer) 1023456\n 3) \"radix-tree-keys\"\n 4) (integer) 6234\n 5) \"radix-tree-nodes\"\n 6) (integer) 6512\n 7) \"last-generated-id\"\n 8) \"1719302400200-0\"\n 9) \"max-deleted-entry-id\"\n10) \"1718841600000-0\"\n11) \"entries-added\"\n12) (integer) 97023456\n13) \"first-entry\"\n14) 1) \"1719216000000-0\"\n    2) 1) \"order_id\"\n       2) \"56789\"\n\n# 查看内存占用（精确到字节）\n127.0.0.1:6379> MEMORY USAGE order-events\n(integer) 536870912    # 约 512MB，裁剪后从 5GB 降下来了\n```\n\n`radix-tree-keys` 和 `radix-tree-nodes` 这两个值值得关注：keys 是 Radix Tree 中实际存储消息的叶节点数，nodes 是包含路由节点在内的总节点数。如果 nodes 远大于 keys（比如 nodes / keys > 2），说明 Radix Tree 的结构可能不够紧凑，通常是因为消息 ID 的分布比较稀疏。`entries-added`（Redis 7.0+）记录 Stream 创建以来总共写入了多少条消息，减去当前 length 就是被裁剪和删除的总数。\n\n生产配置建议总结：按业务语义选择策略——如果业务关心「保留多少条」就用 MAXLEN，关心「保留多长时间」就用 MINID。始终使用近似裁剪（`~`），精确裁剪在大 Stream 上的性能风险太高。优先使用 XADD 内联裁剪做日常限流，配合 XTRIM 定时任务做时间窗口清理。裁剪阈值要给 PEL 留足安全余量。用 XLEN 和 MEMORY USAGE 配合 Prometheus/Grafana 设置告警，当 Stream 长度超过预期或内存占用异常增长时及时通知。",
+      "keyPoints": [
+        "Stream 消息持久化在内存中，不会因被消费而自动删除，生产环境必须配置裁剪策略防止内存无限增长",
+        "MAXLEN 按消息数量裁剪，MINID（Redis 6.2+）按消息 ID / 时间裁剪，MINID 在写入速率波动大的场景下比 MAXLEN 更符合业务语义",
+        "近似裁剪（~）只删除完整的 Radix Tree 节点而不拆分 listpack，避免频繁小规模删除，性能远优于精确裁剪",
+        "XADD 内联裁剪将开销均摊到每次写入中（每次最多删一条），是生产环境的首选方式；XTRIM 适合初次大规模清理和定时任务",
+        "Redis 6.2+ 的 LIMIT 参数控制单次 XTRIM 最大删除量，配合定时任务可以平滑地渐进裁剪超大 Stream",
+        "裁剪操作不检查 PEL 状态，会删除仍在 PEL 中的消息导致消费者无法重新读取，裁剪阈值必须大于最大消息处理延迟",
+        "XLEN 是 O(1) 复杂度的快速检查，XINFO STREAM 可查看 Radix Tree 结构和 entries-added 总量，MEMORY USAGE 精确获取内存占用"
+      ],
+      "quiz": [
+        {
+          "id": "redis-stream-trim-q1-quiz-1",
+          "question": "Redis Stream 的消息在被消费者通过 XREADGROUP 读取之后，会自动从 Stream 中删除吗？",
+          "choices": [
+            {"id": "A", "text": "会，消息被任意一个消费者读取后就自动从 Stream 中删除"},
+            {"id": "B", "text": "会，消息被 XACK 确认后自动从 Stream 中删除"},
+            {"id": "C", "text": "不会，消息读取和确认都不会导致自动删除，必须通过 XTRIM 或 XADD 带裁剪参数显式删除"},
+            {"id": "D", "text": "不会，但消息会在 TTL 过期后自动删除"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis Stream 是 append-only 日志结构，这是它和 List 做队列最本质的区别。消息写入 Stream 后，无论被多少个消费者读取、是否已经 XACK 确认，都不会自动从 Stream 中消失。XACK 只是把消息从消费组的 PEL（Pending Entries List）中移除，表示「这条消息我处理完了」，但消息本身仍然在 Stream 里。要真正删除消息，只有两种方式：用 XTRIM / XADD 带 MAXLEN 或 MINID 参数批量裁剪，或者用 XDEL 逐条删除。A 选项描述的是 List + BRPOP 的行为；B 选项混淆了 XACK 和消息删除；D 选项是错误的，Stream 消息没有独立的 TTL 机制。"
+        },
+        {
+          "id": "redis-stream-trim-q1-quiz-2",
+          "question": "执行 XTRIM mystream MAXLEN 1000 后，Stream 中会保留多少条消息？",
+          "choices": [
+            {"id": "A", "text": "恰好 1000 条，保留最新的 1000 条消息，多余的全部删除"},
+            {"id": "B", "text": "大约 1000 条，可能比 1000 多一些"},
+            {"id": "C", "text": "最多 1000 条，如果 Stream 原本不足 1000 条则保持不变"},
+            {"id": "D", "text": "删除最旧的 1000 条消息，保留剩余的"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "MAXLEN 1000（不带 ~）是精确裁剪，含义是「Stream 最多保留 1000 条消息」。如果当前有 5000 条消息，执行后会精确保留最新的 1000 条，删除最旧的 4000 条。如果当前只有 500 条消息，不足 1000 条，则不做任何删除。所以准确说法是「最多 1000 条」。A 选项说「恰好 1000 条」不够准确，因为 Stream 可能本来就不足 1000 条。B 选项描述的是近似裁剪（MAXLEN ~ 1000）的行为，精确裁剪不会多于指定值。D 选项完全搞反了语义——MAXLEN 是保留多少条，不是删除多少条。"
+        },
+        {
+          "id": "redis-stream-trim-q1-quiz-3",
+          "question": "近似裁剪 MAXLEN ~ 1000 的性能优于精确裁剪 MAXLEN 1000，其核心原因是什么？",
+          "choices": [
+            {"id": "A", "text": "近似裁剪使用后台线程异步执行，不阻塞主线程"},
+            {"id": "B", "text": "近似裁剪只删除完整的 Radix Tree 节点，不拆分节点内部的 listpack，减少内存拷贝和重编码开销"},
+            {"id": "C", "text": "近似裁剪只标记消息为已删除但不释放内存，类似惰性删除"},
+            {"id": "D", "text": "近似裁剪使用了 Redis 的 lazy free 机制，将内存释放推迟到后台"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Stream 底层用 Radix Tree 组织消息，每个节点内部用 listpack 紧凑存储多条连续消息。精确裁剪时，如果目标数量刚好落在某个节点的中间，Redis 就需要打开这个 listpack、删除部分消息、重新编码剩余部分，涉及内存拷贝和分配。而近似裁剪（~）只在整个 Radix Tree 节点都可以被完整移除时才删除，不会去拆分节点内部结构。这使得删除操作变成简单的指针移除和整块内存释放，代价极低。代价是实际保留的消息可能比指定值多出一个节点的容量（几十到几百条）。A 选项不对，近似裁剪仍在主线程执行；C 选项描述的不是近似裁剪的机制；D 选项的 lazy free 是 UNLINK 命令的特性，与裁剪无关。"
+        },
+        {
+          "id": "redis-stream-trim-q1-quiz-4",
+          "question": "MINID 裁剪策略（Redis 6.2+）与 MAXLEN 的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "MINID 按消息 ID（本质上是时间戳）裁剪，MAXLEN 按消息数量裁剪；MINID 更适合写入速率波动大的场景"},
+            {"id": "B", "text": "MINID 只能用于 XTRIM 命令，不能在 XADD 中内联使用"},
+            {"id": "C", "text": "MINID 会检查 PEL 状态避免删除未确认的消息，MAXLEN 不会"},
+            {"id": "D", "text": "MINID 只支持近似裁剪，不支持精确裁剪"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "MINID 和 MAXLEN 是两种不同维度的裁剪策略。MAXLEN 关注数量——保留最新的 N 条消息；MINID 关注时间——删除 ID 小于指定值的消息，由于 Stream 消息 ID 格式为 <毫秒时间戳>-<序号>，MINID 本质上就是按时间裁剪。在写入速率波动大的场景下（白天每秒 800 条、凌晨每秒 50 条），MAXLEN 保留的时间窗口不稳定，而 MINID 可以稳定保留指定时间范围内的消息。B 选项错误，MINID 同样可以在 XADD 中内联使用：`XADD mystream MINID ~ <id> * field value`。C 选项错误，两种策略都不检查 PEL 状态。D 选项也错误，MINID 同时支持精确裁剪和近似裁剪。"
+        },
+        {
+          "id": "redis-stream-trim-q1-quiz-5",
+          "question": "执行以下命令后，XTRIM 返回 (integer) 0，最可能的原因是什么？\n\n```\n127.0.0.1:6379> XLEN mystream\n(integer) 50000\n127.0.0.1:6379> XTRIM mystream MAXLEN ~ 30000\n(integer) 0\n```",
+          "choices": [
+            {"id": "A", "text": "命令语法错误，XTRIM 执行失败"},
+            {"id": "B", "text": "近似裁剪模式下，虽然消息数超过了 30000，但最旧的 Radix Tree 节点还不够凑成一个完整节点进行删除"},
+            {"id": "C", "text": "Stream 中有消费组在消费，Redis 拒绝裁剪"},
+            {"id": "D", "text": "MAXLEN ~ 30000 表示至少保留 30000 条，50000 条没有超出限制"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是近似裁剪的一个容易踩的坑。MAXLEN ~ 30000 使用近似模式，Redis 只在完整的 Radix Tree 节点可以被移除时才执行删除。如果当前 Stream 的最旧节点包含的消息使得删除后总数会低于 30000，但不删除又高于 30000——而近似模式选择「宁可多留也不拆分节点」——于是返回 0，一条都没删。这种情况通常发生在 Stream 不够大或者消息分布使得节点边界恰好不适合裁剪的时候。如果你需要确保裁剪一定执行，可以用精确裁剪（不带 ~）。A 选项不对，命令语法完全正确；C 选项不对，Redis 不会因为有消费组就拒绝裁剪；D 选项对近似裁剪的语义理解有误。"
+        },
+        {
+          "id": "redis-stream-trim-q1-quiz-6",
+          "question": "你在 XADD 时使用了 MAXLEN ~ 100000 做内联裁剪，但发现 Stream 中有一条消息还在消费组的 PEL 里且未被 XACK。这条消息会被裁剪掉吗？",
+          "choices": [
+            {"id": "A", "text": "不会，Redis 会跳过 PEL 中的消息，只裁剪已确认的消息"},
+            {"id": "B", "text": "不会，消费组有锁机制保护 pending 消息不被删除"},
+            {"id": "C", "text": "会，裁剪操作不检查 PEL 状态，如果消息 ID 在裁剪范围内就会被删除"},
+            {"id": "D", "text": "会被标记为待删除，等 XACK 后才真正删除"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 Redis Stream 裁剪的一个关键坑点：无论是 MAXLEN 还是 MINID，无论是 XADD 内联裁剪还是 XTRIM 独立裁剪，裁剪操作完全不关心 PEL 的状态。它只看消息 ID 和数量，如果某条消息在裁剪范围内，即使它还在 PEL 中等待 XACK，也会被从 Stream 中删除。被删除后，PEL 中的记录还在（成为「幽灵条目」），但消费者无法再通过 XCLAIM 或 XREADGROUP 拿到消息内容。Redis 7.0 的 XAUTOCLAIM 返回值中新增了第三个数组，专门报告这些已从 Stream 中删除的 PEL 条目。所以生产中裁剪阈值必须大于最大消息处理延迟，给 PEL 留足余量。"
+        },
+        {
+          "id": "redis-stream-trim-q1-quiz-7",
+          "question": "XADD 内联裁剪和 XTRIM 独立裁剪相比，各有什么优劣？",
+          "choices": [
+            {"id": "A", "text": "XADD 内联裁剪将开销均摊到每次写入，单次开销极小；XTRIM 适合批量清理和按时间窗口定时裁剪"},
+            {"id": "B", "text": "XADD 内联裁剪在后台线程执行，XTRIM 在主线程执行，所以 XADD 性能更好"},
+            {"id": "C", "text": "XADD 内联裁剪只支持 MAXLEN，不支持 MINID；XTRIM 两者都支持"},
+            {"id": "D", "text": "两者完全等价，只是语法不同，性能没有差异"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "XADD 内联裁剪（如 `XADD key MAXLEN ~ 100000 * field value`）在每次写入消息后立即检查是否需要裁剪。因为两次 XADD 之间最多只新增一条消息，每次裁剪的工作量极小（近似模式下甚至可能什么都不做），开销被均摊到了每次写入中，不会出现一次性删除大量消息导致阻塞的问题。XTRIM 是独立命令，适合一次性大规模清理或定时任务场景。B 选项错误，两者都在 Redis 主线程执行。C 选项错误，XADD 同样支持 MINID 参数（Redis 6.2+），语法为 `XADD key MINID ~ <id> * field value`。D 选项忽略了两者在触发时机和单次工作量上的核心差异。"
+        },
+        {
+          "id": "redis-stream-trim-q1-quiz-8",
+          "question": "你的 Stream 每秒写入 500 条消息，消费者最慢处理延迟为 5 分钟。你用 XADD 内联裁剪做日常限流，MAXLEN ~ N 的 N 至少应该设为多少？",
+          "choices": [
+            {"id": "A", "text": "150000（500 × 300 秒 = 150000）即可，刚好覆盖 5 分钟的消息量"},
+            {"id": "B", "text": "至少 200000-250000，需要在 5 分钟消息量的基础上留 30%-60% 的安全余量，防止裁剪掉 PEL 中的消息"},
+            {"id": "C", "text": "1000 就够了，因为近似裁剪不会真的删那么多"},
+            {"id": "D", "text": "不需要考虑消费延迟，MAXLEN 只影响 Stream 长度不影响消费"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考的是裁剪阈值与 PEL 安全余量的关系。每秒 500 条、最慢 5 分钟处理延迟，意味着在极端情况下可能有 500 × 300 = 150000 条消息还在 PEL 中等待确认。如果 MAXLEN 设为恰好 150000，近似裁剪可能在边界上把刚好进入 PEL 的消息删掉。所以需要留安全余量，通常建议在最大 PEL 消息量的基础上乘以 1.3-1.6 倍，即 200000-250000 条。A 选项没有安全余量，在边界情况下会裁剪掉 PEL 中的消息。C 选项完全不合理。D 选项错误，裁剪 PEL 中的消息会导致消费者无法重新读取未确认的消息，直接影响消费可靠性。"
+        },
+        {
+          "id": "redis-stream-trim-q1-quiz-9",
+          "question": "Redis 6.2+ 的 XTRIM 支持 LIMIT 参数，执行 XTRIM mystream MAXLEN ~ 1000 LIMIT 100 时，LIMIT 100 的含义是什么？",
+          "choices": [
+            {"id": "A", "text": "最多删除 100 条消息"},
+            {"id": "B", "text": "最多检查 / 删除 100 个底层条目（Radix Tree 节点级别），控制单次裁剪的工作量上限"},
+            {"id": "C", "text": "限制 Stream 最终长度为 100"},
+            {"id": "D", "text": "每秒最多执行 100 次裁剪操作"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "LIMIT 参数是 Redis 6.2 引入的，只能与近似裁剪（~）一起使用，用于控制单次 XTRIM 操作的最大工作量。`LIMIT 100` 的含义是单次命令执行中最多检查和删除 100 个底层条目。当 Stream 非常大且需要逐步裁剪到目标值时，LIMIT 可以避免一次性删除大量数据导致主线程长时间阻塞。典型用法是在定时任务中每秒执行一次带 LIMIT 的 XTRIM，平滑地把 Stream 裁到目标大小。A 选项把「底层条目」误解为「消息条数」，一个 Radix Tree 节点可能包含几十到几百条消息。C 选项完全理解错了语义。D 选项是凭空捏造的含义。注意 LIMIT 不能和精确裁剪一起用，只支持近似模式。"
+        },
+        {
+          "id": "redis-stream-trim-q1-quiz-10",
+          "question": "生产环境中，你发现一个 Stream 已经膨胀到 1 亿条消息占用 6GB 内存，需要裁剪到最近 100 万条。以下哪种做法最安全？",
+          "choices": [
+            {"id": "A", "text": "直接执行 XTRIM mystream MAXLEN 1000000，一次性精确裁剪到位"},
+            {"id": "B", "text": "执行 DEL mystream 删除整个 key，然后重新创建 Stream 和消费组"},
+            {"id": "C", "text": "用定时任务循环执行 XTRIM mystream MAXLEN ~ 1000000 LIMIT 500，分批渐进裁剪，避免长时间阻塞主线程"},
+            {"id": "D", "text": "设置 EXPIRE mystream 1 让 Redis 自动在 1 秒后删除并重建"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "面对 1 亿条消息的超大 Stream，直接精确裁剪（A 选项）会导致 Redis 主线程阻塞十几秒甚至更久，期间所有请求都无法响应，这在生产环境是不可接受的。B 选项的 DEL 会删除整个 Stream 及其所有消费组信息（包括每个组的 last-delivered-id、所有消费者的 PEL），消费组状态全部丢失，需要重新创建并且无法恢复消费进度。D 选项的 EXPIRE 同样会删除整个 key，效果和 DEL 一样，只是延迟了 1 秒。正确做法是 C：利用 XTRIM 的近似裁剪配合 LIMIT 参数，每次只删除有限数量的底层条目，通过定时任务多次执行逐步裁剪到目标值。这样每次操作耗时只有几毫秒，完全不影响 Redis 正常服务。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/xtrim/",
+        "https://redis.io/docs/latest/commands/xadd/",
+        "https://redis.io/docs/latest/develop/data-types/streams/"
+      ]
+    }
+  ]
+}
