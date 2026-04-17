@@ -1,0 +1,156 @@
+{
+  "id": "redis-cluster-resharding",
+  "name": "Cluster Resharding 过程",
+  "domain": "redis",
+  "description": "Redis Cluster resharding（slot 迁移）的完整流程与生产实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-cluster-resharding-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 4,
+      "tags": ["Redis", "Cluster", "Resharding", "Slot迁移", "MIGRATE", "在线扩容"],
+      "title": "Cluster 的 resharding 过程详解",
+      "content": "## 面试场景\n\n你们的业务增长很快，线上一个三主三从的 Redis Cluster 单节点内存已经逼近 16GB 的 maxmemory 上限，运维决定扩容到五主五从。新节点加入集群后执行 `redis-cli --cluster reshard`，你在 Grafana 上盯着监控，发现迁移到一半的时候业务侧出现了一波 P99 延迟抖动，部分请求报了 ASK 重定向，还有几个大 key 迁移直接超时失败了。\n\n事后复盘，团队对 resharding 的理解停留在「把 slot 从一个节点搬到另一个节点」这一句话。面试官在这个基础上追问：resharding 的底层到底经历了哪几个步骤？源节点和目标节点分别处于什么状态？一个 slot 里可能有几千个 key，它们是一次性原子搬走的还是逐个搬的？迁移到一半的时候客户端请求怎么路由？如果迁移中途进程挂了，slot 会处于什么状态，怎么恢复？\n\n来看一个真实的迁移过程中的集群状态：\n\n```bash\n# 迁移进行中，用 CLUSTER NODES 查看 slot 状态\n$ redis-cli -p 7000 CLUSTER NODES\nabc123 10.0.2.101:7000@17000 master - 0 1718841600000 1 connected 0-5460 [7276->-def456]\ndef456 10.0.2.104:7003@17003 master - 0 1718841600000 7 connected 15001-16383 [7276-<-abc123]\nghi789 10.0.2.102:7001@17001 master - 0 1718841600000 2 connected 5461-10922\njkl012 10.0.2.103:7002@17002 master - 0 1718841600000 3 connected 10923-15000\n```\n\n注意第一行末尾的 `[7276->-def456]` 和第二行的 `[7276-<-abc123]`——这分别表示 slot 7276 正从节点 abc123 向 def456 迁出（MIGRATING）和导入（IMPORTING）。这个中间状态是 resharding 最复杂也是面试最爱考的部分。\n\n如果你能完整讲清楚 SETSLOT IMPORTING/MIGRATING → CLUSTER GETKEYSINSLOT → MIGRATE → SETSLOT NODE 这四步，再说清楚迁移期间的 ASK 重定向机制和大 key 超时处理，这道题就拿满分了。",
+      "answer": "## 第一步：Redis Cluster Resharding 基础概念\n\n### Redis Cluster 与数据分片\n\nRedis Cluster 是 Redis 3.0 正式引入的原生分布式方案，核心思路是将 16384 个 hash slot 分配到多个 Master 节点上。每个 key 通过 `CRC16(key) % 16384` 确定归属的 slot，再根据 slot 与节点的映射关系定位实际存储位置。这种「key → slot → node」的两级映射是整个架构的基石——扩缩容时只需要在节点之间搬运 slot，不用对所有 key 重新做哈希。\n\n### 什么是 Resharding\n\nResharding 就是把一批 slot 从一个或多个源节点迁移到一个或多个目标节点的过程。它不是一个原子操作，而是以单个 slot 为粒度逐个完成的，每个 slot 内部又以单个 key（或一批 key）为粒度逐步搬运。最常见的触发场景有两个：扩容时新节点加入集群但还没有任何 slot，需要从现有节点「匀」一些过去；缩容时要下线某个节点，必须先把它身上的 slot 全部迁走。\n\nResharding 和 rebalance 的关系经常被搞混。Resharding 是底层操作，指定「把 slot X 从节点 A 搬到节点 B」；rebalance 是上层策略，它自动计算每个节点应该持有多少 slot，然后规划一系列 resharding 操作使集群负载均匀。你执行 `redis-cli --cluster rebalance` 时，底层就是在批量调用 resharding 逻辑。\n\n### Resharding 的基本命令入口\n\n生产环境中最常用的入口是 `redis-cli --cluster reshard`，交互式地选择迁移多少个 slot、从哪个节点迁到哪个节点：\n\n```bash\n# 交互式 reshard，连接集群中任意一个节点即可\n$ redis-cli --cluster reshard 10.0.2.101:7000\n>>> Performing Cluster Check (using node 10.0.2.101:7000)\nM: abc123 10.0.2.101:7000 slots:[0-5460] (5461 slots) master\nM: ghi789 10.0.2.102:7001 slots:[5461-10922] (5462 slots) master\nM: jkl012 10.0.2.103:7002 slots:[10923-16383] (5461 slots) master\nM: def456 10.0.2.104:7003 slots: (0 slots) master  # 新加入的空节点\n\nHow many slots do you want to move (from 1 to 16384)? 4096\nWhat is the receiving node ID? def456\nPlease enter all the source node IDs.\n  Type 'all' to use all the nodes as source nodes for the hash slots.\nSource node #1: all\n```\n\n这个命令背后执行的就是接下来要详细拆解的四步迁移流程。理解了底层步骤，你才能在迁移出问题时知道该检查什么、怎么恢复。\n\n## 第二步：Resharding 完整迁移流程深度解析\n\n### 第一阶段：设置 IMPORTING 和 MIGRATING 标记\n\n迁移一个 slot 的第一步是在源节点和目标节点上分别打标记。假设要把 slot 7276 从节点 A（abc123）迁到节点 B（def456）：\n\n```bash\n# 在目标节点 B 上设置 IMPORTING 状态\n$ redis-cli -h 10.0.2.104 -p 7003 CLUSTER SETSLOT 7276 IMPORTING abc123\nOK\n\n# 在源节点 A 上设置 MIGRATING 状态\n$ redis-cli -h 10.0.2.101 -p 7000 CLUSTER SETSLOT 7276 MIGRATING def456\nOK\n```\n\n执行完这两条命令后，slot 7276 进入一个特殊的「迁移中」状态。源节点对该 slot 的处理逻辑变了：如果客户端请求的 key 在本地存在，正常处理并返回结果；如果 key 在本地不存在（已经被搬走了），返回 `-ASK 7276 10.0.2.104:7003` 重定向。目标节点这边也变了：对于 IMPORTING 状态的 slot，它默认拒绝外部请求（返回 MOVED 踢回源节点），只有当连接先发过 `ASKING` 命令时才接受请求。\n\n这个设计非常精妙——它保证了迁移过程中每个 key 都有且只有一个明确的「应答者」，不会出现两个节点同时写同一个 key 导致数据冲突。\n\n### 第二阶段：获取 Slot 中的 Key 列表\n\n标记打好之后，需要知道这个 slot 里有哪些 key 要搬。`CLUSTER GETKEYSINSLOT` 命令从源节点获取指定 slot 中的 key 列表：\n\n```bash\n# 从 slot 7276 中获取最多 100 个 key\n$ redis-cli -h 10.0.2.101 -p 7000 CLUSTER GETKEYSINSLOT 7276 100\n1) \"order:2001\"\n2) \"order:2002\"\n3) \"order:2003\"\n... (假设该 slot 中共有 847 个 key)\n```\n\n这个命令不会一次返回所有 key，而是通过 count 参数分批获取。redis-cli --cluster reshard 内部的默认 pipeline 批大小是 10（即每次取 10 个 key），但在 Redis 5.0+ 的版本中，MIGRATE 命令支持一次迁移多个 key，所以实际的批大小可以设得更大。\n\n### 第三阶段：MIGRATE 逐批搬运 Key\n\n拿到 key 列表后，用 `MIGRATE` 命令把它们从源节点搬到目标节点。这是整个 resharding 中最耗时也最容易出问题的一步：\n\n```bash\n# 批量迁移多个 key（Redis 3.0.6+ 支持 KEYS 参数）\n$ redis-cli -h 10.0.2.101 -p 7000 MIGRATE 10.0.2.104 7003 \"\" 0 5000 KEYS order:2001 order:2002 order:2003\nOK\n```\n\nMIGRATE 命令的执行过程值得仔细拆解。它在源节点上是一个「序列化 + 网络传输 + 等待确认 + 本地删除」的复合操作：源节点先对目标 key 做 DUMP 序列化（和 RDB 格式相同），通过内部连接发送 RESTORE 命令到目标节点，目标节点收到后反序列化并写入本地数据库，然后回复 OK。源节点收到 OK 后才删除本地的 key。如果目标节点回复超时（默认超时由 MIGRATE 的 timeout 参数控制，上面设的是 5000ms），源节点不会删除 key，MIGRATE 返回 IOERR。\n\n这里有几个关键细节。第一，MIGRATE 在源节点上是阻塞的——执行期间源节点无法处理其他命令。对于小 key 这个阻塞时间几乎感知不到（微秒级），但如果遇到一个 100MB 的大 Hash，序列化和网络传输可能需要好几秒，直接导致源节点卡住。这就是生产中大 key 迁移超时的根源。第二，MIGRATE 对单个 key 的操作是原子的——要么完整搬过去并删除本地副本，要么什么都不做。但批量 MIGRATE 多个 key 时，如果中间某个 key 失败了，已经成功迁移的 key 不会回滚。第三，MIGRATE 使用的是 RESTORE 命令附带 REPLACE 标记（Redis 3.0+ 默认行为），如果目标节点上已经存在同名 key，会被覆盖。\n\n针对大 key 超时的问题，生产中常用的策略是：迁移前先用 `redis-cli --bigkeys` 或 `MEMORY USAGE` 命令扫描出大 key，人工决定是先拆分再迁移还是加大 MIGRATE 超时。redis-cli --cluster reshard 的 `--cluster-timeout` 参数可以设置 MIGRATE 超时，默认是 60000ms（60 秒），对付大部分场景够用了。\n\n```bash\n# 扫描大 key\n$ redis-cli -h 10.0.2.101 -p 7000 --bigkeys\n...\n[00.00%] Biggest hash   found so far 'session:pool' with 128934 fields\n[00.00%] Biggest string found so far 'cache:product:mega' with 52428800 bytes  # 50MB！\n...\n\n# 查看具体 key 的内存占用\n$ redis-cli -h 10.0.2.101 -p 7000 MEMORY USAGE cache:product:mega\n(integer) 52430128  # 约 50MB\n```\n\n### 第四阶段：SETSLOT NODE 完成归属变更\n\n当 slot 7276 中所有 key 都迁移完毕后，最后一步是通知整个集群「slot 7276 现在归节点 B 了」：\n\n```bash\n# 在集群中每个 Master 节点上执行\n$ redis-cli -h 10.0.2.104 -p 7003 CLUSTER SETSLOT 7276 NODE def456\nOK\n$ redis-cli -h 10.0.2.101 -p 7000 CLUSTER SETSLOT 7276 NODE def456\nOK\n$ redis-cli -h 10.0.2.102 -p 7001 CLUSTER SETSLOT 7276 NODE def456\nOK\n$ redis-cli -h 10.0.2.103 -p 7002 CLUSTER SETSLOT 7276 NODE def456\nOK\n```\n\n这一步会清除源节点上的 MIGRATING 标记和目标节点上的 IMPORTING 标记，同时更新所有节点的 slot 映射表。从这一刻起，客户端访问 slot 7276 如果还发到源节点 A，就会收到 `-MOVED 7276 10.0.2.104:7003` 永久重定向，smart client 会刷新本地缓存。\n\n实际操作中有一个建议：先对目标节点执行 `SETSLOT NODE`，再对源节点和其他节点执行。原因是如果先对源节点执行，源节点立刻解除 MIGRATING 状态并认为 slot 不属于自己了，但目标节点可能还没来得及更新，这个短暂窗口内请求可能被踢皮球。Redis 的 Gossip 协议最终也会传播这个信息，但主动通知所有节点可以缩短不一致窗口。\n\n### 迁移期间的 ASK 重定向详解\n\n迁移过程中，客户端对 slot 7276 的请求会经历三种情况。如果请求的 key 还在源节点上（尚未被 MIGRATE），源节点正常返回结果，一跳命中。如果 key 已经被搬到目标节点，源节点返回 `-ASK 7276 10.0.2.104:7003`，客户端需要先向目标节点发 `ASKING` 命令，再发实际操作命令，共三跳。如果整个 slot 迁移已完成并执行了 SETSLOT NODE，客户端收到 `-MOVED` 重定向并刷新缓存，后续一跳命中。\n\n`ASKING` 命令的存在是为了安全性——它给当前连接设置一个一次性的 `CLIENT_ASKING` 标记，表示「我是被 ASK 重定向过来的，请接受我对这个 IMPORTING slot 的请求」。如果不发 ASKING 就直接请求 IMPORTING 状态的 slot，目标节点会返回 MOVED 把你踢回源节点，形成路由循环。\n\n## 第三步：扩展延伸与生产实践\n\n### redis-cli --cluster reshard 的自动化流程\n\n`redis-cli --cluster reshard` 封装了上述全部手动步骤。它的内部循环大致是：选定源和目标节点后，对每个要迁移的 slot 依次执行 SETSLOT IMPORTING/MIGRATING → 循环调用 GETKEYSINSLOT + MIGRATE 直到 slot 清空 → SETSLOT NODE。它还支持非交互式参数一行搞定：\n\n```bash\n# 非交互式：从 abc123 迁移 4096 个 slot 到 def456\n$ redis-cli --cluster reshard 10.0.2.101:7000 \\\n  --cluster-from abc123 \\\n  --cluster-to def456 \\\n  --cluster-slots 4096 \\\n  --cluster-timeout 60000 \\\n  --cluster-pipeline 10 \\\n  --cluster-yes\n```\n\n`--cluster-pipeline` 控制每次 MIGRATE 批量搬运的 key 数，默认是 10。在 key 普遍较小的场景下可以调到 50-100 来加速迁移，但如果有大 key 混在里面就要小心了——批量 MIGRATE 的总数据量可能导致单次操作时间过长。\n\n### 在线 Resharding 的延迟影响\n\n在线 resharding 对业务延迟的影响来自两个方面。第一是 MIGRATE 的阻塞效应：每次 MIGRATE 执行期间源节点无法响应其他请求，如果单次 MIGRATE 搬运的数据量大（大 key 或批量过多），源节点的命令队列就会堆积，P99 延迟飙升。实测数据：在一个 8 核 32GB 的实例上，迁移一个 1MB 的 key 大约阻塞 0.5-1ms，10MB 的 key 阻塞 5-10ms，100MB 的 key 阻塞 50-100ms。第二是 ASK 重定向带来的额外网络开销：已迁移的 key 需要三跳才能拿到数据，延迟翻了约 3 倍。\n\n生产中减少影响的经验包括：在业务低峰期执行 resharding；提前用 `--bigkeys` 扫描并处理大 key；`--cluster-pipeline` 不要设太大（10-20 比较安全）；监控源节点的 `latency latest` 和 `slowlog get`，发现阻塞异常立刻暂停迁移。\n\n### 迁移中断与恢复\n\n如果 resharding 过程中 redis-cli 进程被 kill 了，或者网络中断导致迁移停在半路，slot 会留在 MIGRATING/IMPORTING 状态。这个状态不会自己恢复——集群会一直带着这个半完成的迁移标记运行下去，对应 slot 的请求都会走 ASK 重定向。\n\n恢复的方法取决于你想「继续迁移」还是「放弃回滚」。要继续迁移，重新执行 `redis-cli --cluster reshard` 指定同样的源和目标节点，它会检测到未完成的迁移并从断点继续。要放弃回滚，在源节点和目标节点上分别执行 `CLUSTER SETSLOT <slot> STABLE` 清除 MIGRATING/IMPORTING 标记，然后需要检查目标节点上是否有已经搬过去的 key——如果有，你需要决定是把它们 MIGRATE 回来还是手动清理。\n\n```bash\n# 检查 slot 7276 的迁移状态\n$ redis-cli -p 7000 CLUSTER NODES | grep '7276'\nabc123 ... [7276->-def456]\ndef456 ... [7276-<-abc123]\n\n# 方案一：清除标记继续运行（slot 归属不变，但已搬走的 key 在目标节点上成了孤儿数据）\n$ redis-cli -p 7000 CLUSTER SETSLOT 7276 STABLE\n$ redis-cli -p 7003 CLUSTER SETSLOT 7276 STABLE\n\n# 方案二（推荐）：用 redis-cli --cluster fix 自动修复\n$ redis-cli --cluster fix 10.0.2.101:7000\n>>> Fixing open slot 7276\n>>> Set as migrating in: abc123\n>>> Set as importing in: def456\n>>> Moving slot 7276 from abc123 to def456\n...\n[OK] All 16384 slots covered.\n```\n\n`redis-cli --cluster fix` 是处理这类「slot 卡在中间状态」最可靠的工具，它会自动检测未完成的迁移并选择最合理的方向完成它。\n\n### 与 Codis 方案的对比\n\nCodis 是豌豆荚开源的 Redis 代理方案，同样支持在线 slot 迁移。两者的核心差异在于：Redis Cluster 的迁移是 P2P 的，源节点直接用 MIGRATE 把 key 发给目标节点，没有中间代理参与；Codis 的迁移由 Dashboard 协调，代理层（codis-proxy）负责转发请求，迁移逻辑在 codis-server（修改版 Redis）和 Dashboard 之间完成。Redis Cluster 的优势是原生支持、不依赖额外组件、社区维护活跃；Codis 的优势是代理层对客户端完全透明（客户端不需要支持 Cluster 协议），而且 Dashboard 提供了更好的 Web 管理界面和迁移进度可视化。不过 Codis 在 Redis 4.0 之后就基本停止了更新，新项目几乎都用原生 Redis Cluster 了。",
+      "keyPoints": [
+        "Resharding 以 slot 为粒度逐个迁移，每个 slot 内部以 key 为粒度逐批搬运，整个过程非原子，支持在线执行不中断服务",
+        "完整的四步迁移流程：SETSLOT IMPORTING/MIGRATING 打标记 → CLUSTER GETKEYSINSLOT 获取 key 列表 → MIGRATE 逐批搬运 key → SETSLOT NODE 通知全集群完成归属变更",
+        "MIGRATE 命令在源节点上是阻塞执行的，对单个 key 保证原子性（要么搬成功并删除源端副本，要么什么都不做），大 key 迁移会导致源节点毫秒到百毫秒级的卡顿",
+        "迁移期间源节点对 MIGRATING slot 采取「本地有则返回、本地无则 ASK 重定向」策略，目标节点对 IMPORTING slot 仅接受带 ASKING 标记的连接请求",
+        "迁移中断后 slot 会停留在 MIGRATING/IMPORTING 状态不会自动恢复，推荐使用 redis-cli --cluster fix 自动检测并完成未完成的迁移",
+        "redis-cli --cluster reshard 封装了全部手动步骤，--cluster-pipeline 控制批量 key 数（默认 10），--cluster-timeout 控制 MIGRATE 超时（默认 60 秒）",
+        "在线 resharding 对延迟的影响来自 MIGRATE 阻塞和 ASK 三跳开销，生产建议在低峰期执行、提前处理大 key、pipeline 批大小控制在 10-20"
+      ],
+      "quiz": [
+        {
+          "id": "redis-cluster-resharding-q1-quiz1",
+          "question": "Redis Cluster resharding 迁移一个 slot 的正确步骤顺序是什么？",
+          "choices": [
+            {"id": "A", "text": "SETSLOT IMPORTING/MIGRATING → GETKEYSINSLOT → MIGRATE → SETSLOT NODE"},
+            {"id": "B", "text": "MIGRATE → SETSLOT IMPORTING → GETKEYSINSLOT → SETSLOT NODE"},
+            {"id": "C", "text": "SETSLOT NODE → GETKEYSINSLOT → MIGRATE → SETSLOT STABLE"},
+            {"id": "D", "text": "GETKEYSINSLOT → MIGRATE → SETSLOT IMPORTING/MIGRATING → SETSLOT NODE"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确顺序是先在目标节点设置 IMPORTING、源节点设置 MIGRATING 标记，然后用 GETKEYSINSLOT 从源节点获取 key 列表，再用 MIGRATE 逐批搬运，最后用 SETSLOT NODE 通知所有节点完成归属变更。B 选项把 MIGRATE 放在了打标记之前，此时源节点不知道 slot 在迁移中，MIGRATE 虽然能执行但不会触发 ASK 重定向逻辑。C 选项把 SETSLOT NODE 放在最前面，这等于先宣布迁移完成再搬数据，完全错误。D 选项跳过了打标记步骤，没有 MIGRATING/IMPORTING 状态就没有 ASK 重定向保护。"
+        },
+        {
+          "id": "redis-cluster-resharding-q1-quiz2",
+          "question": "关于 resharding 和 rebalance 的关系，以下哪项描述最准确？",
+          "choices": [
+            {"id": "A", "text": "resharding 和 rebalance 是两个完全独立的功能，互不调用"},
+            {"id": "B", "text": "rebalance 是上层策略，它自动计算每个节点应持有的 slot 数量，底层通过批量调用 resharding 操作来实现均衡"},
+            {"id": "C", "text": "resharding 会自动调用 rebalance 来确保迁移后各节点负载均匀"},
+            {"id": "D", "text": "rebalance 只在集群初始化时执行一次，之后的扩缩容都使用 resharding"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "rebalance 是一个高级命令，它会根据集群当前的 slot 分布和节点权重计算目标分布，然后规划一系列 resharding 操作来达到均衡状态。每个 resharding 操作依然是指定「把 slot X 从 A 搬到 B」的底层步骤。A 选项错误，rebalance 底层就是调用 resharding。C 选项因果颠倒了，是 rebalance 调用 resharding 而非反过来。D 选项错误，rebalance 可以在任何时候执行，不限于集群初始化。"
+        },
+        {
+          "id": "redis-cluster-resharding-q1-quiz3",
+          "question": "MIGRATE 命令在源节点上的执行特性是什么？",
+          "choices": [
+            {"id": "A", "text": "MIGRATE 是异步非阻塞的，源节点把 key 放入发送队列后立刻返回，不影响其他请求"},
+            {"id": "B", "text": "MIGRATE 在源节点上是阻塞执行的，会序列化 key、发送到目标节点、等待确认后再删除本地副本，期间源节点无法处理其他命令"},
+            {"id": "C", "text": "MIGRATE 只阻塞对正在迁移的 slot 的请求，其他 slot 的请求不受影响"},
+            {"id": "D", "text": "MIGRATE 使用后台线程执行，类似 BGSAVE 的 fork 子进程方式"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MIGRATE 是一个同步阻塞命令，它在源节点的主线程中完成整个「DUMP 序列化 → 网络传输 → 等待 RESTORE 确认 → DEL 本地 key」的流程。在此期间，Redis 的单线程事件循环被独占，源节点上所有 slot 的所有请求都会排队等待。这就是为什么大 key 迁移会导致整个节点的延迟抖动，而不仅仅是被迁移 slot 的延迟抖动。A 选项描述的是一种理想化的异步实现，但 Redis 的 MIGRATE 不是这样工作的。C 选项的「只阻塞对应 slot」也是常见误解。D 选项混淆了 MIGRATE 和 BGSAVE 的执行方式。"
+        },
+        {
+          "id": "redis-cluster-resharding-q1-quiz4",
+          "question": "当 slot 处于 MIGRATING 状态时，源节点收到对该 slot 中一个 key 的 GET 请求，处理逻辑是什么？",
+          "choices": [
+            {"id": "A", "text": "直接返回 -MOVED 重定向到目标节点"},
+            {"id": "B", "text": "如果 key 在本地存在则正常返回结果，如果不存在则返回 -ASK 重定向到目标节点"},
+            {"id": "C", "text": "无论 key 是否在本地都返回 -ASK 重定向"},
+            {"id": "D", "text": "返回 -CLUSTERDOWN 错误，拒绝服务直到迁移完成"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MIGRATING 状态下源节点的策略是「尽量本地处理」：先在本地数据库中查找请求的 key，找到了就正常执行命令返回结果（因为这个 key 还没被 MIGRATE 走），这种情况和普通请求没有任何区别。如果本地找不到（说明已经被 MIGRATE 搬到目标节点了），才返回 -ASK 重定向告诉客户端临时去目标节点获取。A 选项描述的 MOVED 是 slot 迁移完成后的行为，不是迁移中的行为。C 选项的「无论是否存在都 ASK」会导致还在本地的 key 被白白重定向，浪费网络开销。D 选项完全错误，slot 迁移不会导致集群不可用。"
+        },
+        {
+          "id": "redis-cluster-resharding-q1-quiz5",
+          "question": "以下 CLUSTER NODES 输出中，`[7276->-def456]` 和 `[7276-<-abc123]` 分别表示什么？",
+          "choices": [
+            {"id": "A", "text": "前者表示 slot 7276 正从当前节点向 def456 迁出（MIGRATING），后者表示 slot 7276 正从 abc123 向当前节点导入（IMPORTING）"},
+            {"id": "B", "text": "前者表示 slot 7276 的主从复制方向，后者表示故障转移的候选方向"},
+            {"id": "C", "text": "前者表示 slot 7276 已经迁移完成到 def456，后者表示正在从 abc123 恢复数据"},
+            {"id": "D", "text": "两者都表示 slot 7276 处于只读模式，`->` 和 `-<-` 分别表示读取来源方向"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在 CLUSTER NODES 的输出中，`[slot->-nodeId]` 格式表示该节点正在将指定 slot 迁出（MIGRATING）到目标节点，`[slot-<-nodeId]` 表示该节点正在从源节点导入（IMPORTING）指定 slot。这是 resharding 过程中判断迁移状态的关键信息。箭头的方向直观地表示了数据流向：`->-` 是「流出去」，`-<-` 是「流进来」。B 选项把迁移标记和复制关系搞混了。C 选项的「已完成」是错误的，迁移完成后这些标记会被清除不再显示。D 选项的只读模式纯属编造。"
+        },
+        {
+          "id": "redis-cluster-resharding-q1-quiz6",
+          "question": "如果客户端收到 ASK 重定向后没有先发送 ASKING 命令就直接向目标节点请求，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "目标节点正常处理请求并返回结果"},
+            {"id": "B", "text": "目标节点返回 -MOVED 重定向把请求踢回源节点，形成路由循环"},
+            {"id": "C", "text": "目标节点返回 -CLUSTERDOWN 错误"},
+            {"id": "D", "text": "目标节点返回 (nil)，因为没有 ASKING 标记无法读取 IMPORTING slot 中的数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "目标节点对处于 IMPORTING 状态的 slot 有严格的访问控制：只有当前连接先发过 ASKING 命令（设置了 CLIENT_ASKING 标记）才被允许操作该 slot 中的 key。如果没有 ASKING 标记，目标节点会认为客户端「不知道迁移在进行」，按照正常路由逻辑判断该 slot 的归属仍然是源节点，于是返回 -MOVED 把请求踢回源节点。客户端收到 MOVED 后去源节点，源节点发现 key 不在本地又返回 ASK——这就形成了路由循环，直到客户端的重定向次数超限报错。这个设计是为了防止不支持 ASK 协议的旧客户端在迁移期间误更新缓存。"
+        },
+        {
+          "id": "redis-cluster-resharding-q1-quiz7",
+          "question": "resharding 过程中遇到一个 50MB 的大 Hash key 导致 MIGRATE 超时，最合理的处理策略是什么？",
+          "choices": [
+            {"id": "A", "text": "增大 --cluster-timeout 到 300 秒，强制等待 MIGRATE 完成"},
+            {"id": "B", "text": "先暂停迁移，用 UNLINK 删除该大 key 后再继续，或者将其拆分成多个小 key 后重新迁移"},
+            {"id": "C", "text": "直接跳过这个 key，手动在目标节点上创建一个空 key 占位"},
+            {"id": "D", "text": "把源节点的 maxmemory 设为 0 来解除内存限制，让 MIGRATE 有足够空间执行"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "大 key 迁移的核心问题是 MIGRATE 阻塞时间过长。虽然增大超时（A 选项）在技术上可行，但 50MB 的 key 在 MIGRATE 期间源节点会被阻塞数百毫秒甚至数秒，这对生产环境的影响是不可接受的——期间所有请求都会排队。最佳实践是先暂停迁移（redis-cli --cluster reshard 可以中断），分析这个大 key 是否可以拆分（比如把一个大 Hash 拆成多个小 Hash），或者如果业务允许丢失则直接用 UNLINK 异步删除。C 选项的「跳过」在 MIGRATE 层面做不到，而且会导致数据丢失。D 选项完全答非所问，maxmemory 和 MIGRATE 超时是两个不相关的问题。"
+        },
+        {
+          "id": "redis-cluster-resharding-q1-quiz8",
+          "question": "生产环境执行 resharding 时，以下哪种做法最能减少对业务延迟的影响？",
+          "choices": [
+            {"id": "A", "text": "在业务高峰期执行，因为高峰期集群 CPU 利用率高，数据迁移效率更好"},
+            {"id": "B", "text": "把 --cluster-pipeline 设为 1000，一次性搬运尽可能多的 key 来加速迁移"},
+            {"id": "C", "text": "在业务低峰期执行，提前扫描处理大 key，pipeline 批大小控制在 10-20，同时监控源节点 slowlog"},
+            {"id": "D", "text": "先对集群做一次 BGSAVE 快照再执行迁移，确保数据安全"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "减少 resharding 对业务影响的核心策略有三个：选择低峰期执行（减少被阻塞请求的数量）、提前处理大 key（避免单次 MIGRATE 阻塞时间过长）、控制 pipeline 批大小（每次 MIGRATE 搬运的数据量不要太大）。A 选项的逻辑完全错误，高峰期执行会放大 MIGRATE 阻塞带来的影响。B 选项的 pipeline=1000 意味着单次 MIGRATE 可能搬运大量数据，如果这 1000 个 key 加起来很大，阻塞时间会非常长。D 选项的 BGSAVE 和 resharding 没有关系，而且在迁移前做 BGSAVE 反而会因为 fork 带来额外的内存和 CPU 压力。"
+        },
+        {
+          "id": "redis-cluster-resharding-q1-quiz9",
+          "question": "resharding 执行到一半时 redis-cli 进程被意外 kill 了，slot 会处于什么状态？如何恢复？",
+          "choices": [
+            {"id": "A", "text": "slot 自动回滚到迁移前状态，已搬运的 key 会自动从目标节点删除"},
+            {"id": "B", "text": "slot 停留在 MIGRATING/IMPORTING 状态不会自动恢复，可用 redis-cli --cluster fix 自动检测并完成迁移"},
+            {"id": "C", "text": "集群会自动检测到未完成的迁移并在 10 秒内完成剩余 key 的搬运"},
+            {"id": "D", "text": "slot 被标记为 FAIL 状态，需要手动删除 slot 并重新创建"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis Cluster 的 resharding 没有自动回滚和自动恢复机制。如果迁移中断，slot 会一直带着 MIGRATING/IMPORTING 标记运行，已搬走的 key 在目标节点上，未搬走的 key 还在源节点上。这个状态下请求仍然可以通过 ASK 重定向正常处理，但不是理想状态。恢复的推荐方式是用 `redis-cli --cluster fix` 命令，它会自动检测「open slot」（即处于 MIGRATING/IMPORTING 状态的 slot），然后选择最合理的方向完成迁移。也可以手动用 `CLUSTER SETSLOT STABLE` 清除标记，但需要自己处理已搬走的孤儿 key。A 选项和 C 选项描述的自动恢复机制在 Redis Cluster 中不存在。D 选项的 FAIL 状态是节点级别的概念，不是 slot 级别的。"
+        },
+        {
+          "id": "redis-cluster-resharding-q1-quiz10",
+          "question": "关于 Redis Cluster 原生 resharding 和 Codis 方案的 slot 迁移，以下对比哪项是正确的？",
+          "choices": [
+            {"id": "A", "text": "Redis Cluster 的迁移由代理层协调，Codis 的迁移由节点间 P2P 完成"},
+            {"id": "B", "text": "Redis Cluster 是源节点通过 MIGRATE 直接 P2P 发送给目标节点，Codis 由 Dashboard 协调、代理层转发，对客户端完全透明"},
+            {"id": "C", "text": "两者的迁移流程完全相同，只是管理界面不同"},
+            {"id": "D", "text": "Codis 不支持在线 slot 迁移，必须停机操作"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis Cluster 的 slot 迁移是去中心化的 P2P 模式——源节点直接通过 MIGRATE 命令把 key 发送给目标节点，不经过任何中间代理。Codis 的迁移由 Dashboard（中央协调组件）发起和监控，codis-proxy（代理层）在迁移期间负责请求的透明转发，客户端不需要感知 slot 迁移的存在，也不需要处理 ASK/MOVED 重定向。A 选项把两者的架构说反了。C 选项忽略了架构层面的本质差异。D 选项错误，Codis 支持在线 slot 迁移，这是它的核心功能之一。另外值得注意的是 Codis 在 Redis 4.0 之后基本停止了维护，新项目几乎都用原生 Redis Cluster。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/management/scaling/",
+        "https://redis.io/commands/cluster-setslot/",
+        "https://redis.io/commands/migrate/",
+        "https://redis.io/commands/cluster-getkeysinslot/"
+      ]
+    }
+  ]
+}
