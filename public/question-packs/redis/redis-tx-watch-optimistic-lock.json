@@ -1,0 +1,156 @@
+{
+  "id": "redis-tx-watch-optimistic-lock",
+  "name": "WATCH 命令实现乐观锁的原理",
+  "domain": "redis",
+  "description": "深入解析 Redis WATCH 命令的 CAS 乐观锁机制，包括 watched_keys 字典结构、CLIENT_DIRTY_CAS 标记位、touchWatchedKey 触发流程及典型重试模式",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-tx-watch-optimistic-lock-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["WATCH", "乐观锁", "CAS", "UNWATCH", "事务冲突", "watched_keys", "redis-transaction"],
+      "title": "WATCH 命令实现乐观锁的原理",
+      "content": "## 面试场景\n\n面试官问你「Redis 的 WATCH 是怎么实现乐观锁的？」，这道题是 Redis 事务系列的必考进阶题。很多候选人能答出「WATCH 监视 key，key 被改了事务就取消」，但面试官真正想听的不是这一句话——他想知道你是否理解 WATCH 在 Redis 内部到底维护了什么数据结构，什么时候检测冲突，以及为什么这套机制被称为 CAS 乐观锁。\n\n先看一段最经典的 WATCH 使用模式。假设你要实现一个安全的「读取-修改-写入」操作，在 redis-cli 中的交互是这样的：\n\n```bash\n# 先监视 key\n127.0.0.1:6379> WATCH mykey\nOK\n# 读取当前值\n127.0.0.1:6379> GET mykey\n\"100\"\n# 开启事务\n127.0.0.1:6379> MULTI\nOK\n# 基于读到的值做修改（100 + 1 = 101）\n127.0.0.1:6379(TX)> SET mykey \"101\"\nQUEUED\n# 提交事务\n127.0.0.1:6379(TX)> EXEC\n1) OK\n```\n\n如果在 `WATCH mykey` 之后、`EXEC` 之前，另一个客户端修改了 `mykey`，那么 EXEC 的返回值就变成了 nil，事务中所有命令都不会执行：\n\n```bash\n# 客户端 A                          # 客户端 B\nWATCH mykey                          \nGET mykey  -> \"100\"                  \nMULTI                                \n                                     SET mykey \"200\"  -> OK\nSET mykey \"101\"  -> QUEUED           \nEXEC  -> (nil)                       # 事务被取消！\n```\n\n这就是 WATCH 的核心行为：它在 MULTI 之前对一个或多个 key 建立监视，如果这些 key 在 EXEC 执行之前被任何客户端（包括自己在事务外的操作）修改过，EXEC 就会返回 nil 放弃整个事务。这个模式本质上就是 CAS（Check-And-Set）——先读取数据，再基于读到的值提交修改，如果发现数据已经被别人改了就放弃提交。\n\n但面试不会停在这里。面试官接下来会追问：WATCH 在 Redis 内部是怎么知道 key 被改了的？`watched_keys` 是什么数据结构？`CLIENT_DIRTY_CAS` 这个 flag 是什么时候被置位的？为什么说 WATCH 是乐观锁而不是悲观锁？高竞争场景下 WATCH 会有什么问题？下面会从 Redis 源码层面一步步拆解这些问题。",
+      "answer": "## 第一步：Redis 事务与乐观锁的概念基础\n\n### 为什么需要 WATCH\n\n要理解 WATCH，首先得理解 Redis 事务的一个根本局限：`MULTI/EXEC` 事务保证了命令的连续执行不被插队，但它无法保证「先读后写」这种模式的正确性。举个例子，你想把 `mykey` 的值加 1，直觉上会这样做——先 `GET mykey` 拿到当前值 100，再 `SET mykey 101`。如果把 SET 放在 MULTI/EXEC 里，确实没有其他命令会插在你的 SET 中间，但问题出在 GET 和 MULTI 之间：在你读到 100 之后、开启事务之前，另一个客户端可能已经把值改成了 200。你的事务还是会执行 `SET mykey 101`，本该设置为 201 的值被你覆盖成了 101。这就是经典的「检查-执行」竞态条件（TOCTOU，Time-Of-Check to Time-Of-Use）。\n\nRedis 没有传统数据库那种 `SELECT ... FOR UPDATE` 的悲观锁机制，它选择了另一条路——乐观锁。乐观锁的核心思想是：假设冲突不常发生，不去提前加锁阻塞别人，而是在提交时检查数据有没有被别人改过，如果改了就放弃重来。WATCH 就是 Redis 实现乐观锁的工具，它实现了 CAS（Check-And-Set，检查并设置）语义：监视一个或多个 key，如果在提交事务时发现这些 key 被改过了，事务自动取消。\n\n### WATCH 的基本用法\n\nWATCH 的语法非常简单：`WATCH key [key ...]`，可以一次监视一个或多个 key。WATCH 必须在 `MULTI` 之前调用——如果你已经在事务状态中再调用 WATCH，Redis 会直接报错。一个完整的 WATCH + 事务模式分为四步：第一步调用 `WATCH` 监视你关心的 key；第二步用普通命令（不在事务中）读取这些 key 的当前值；第三步调用 `MULTI` 开启事务，基于读到的值构造写命令入队；第四步调用 `EXEC` 提交事务——如果被监视的 key 在第一步和第四步之间被修改过，EXEC 返回 nil，否则正常执行返回结果数组。\n\n来看一个实际场景：实现安全的余额扣减。假设 `balance:1001` 存储的是用户 1001 的余额，你要扣减 30 元。\n\n```bash\n127.0.0.1:6379> WATCH balance:1001\nOK\n127.0.0.1:6379> GET balance:1001\n\"100\"\n# 应用层判断：100 >= 30，余额充足，可以扣减\n127.0.0.1:6379> MULTI\nOK\n127.0.0.1:6379(TX)> DECRBY balance:1001 30\nQUEUED\n127.0.0.1:6379(TX)> EXEC\n1) (integer) 70\n```\n\n如果在 WATCH 之后另一个客户端把余额改成了 20，你的 EXEC 会返回 nil，这是正确的行为——因为此时余额只剩 20，扣减 30 会导致余额为负。应用层拿到 nil 后重新走一遍 WATCH → GET → 判断 → MULTI → EXEC 的流程。\n\n### WATCH 的自动取消规则\n\nWATCH 不需要手动清理。Redis 在三种情况下会自动取消所有监视：第一，`EXEC` 执行之后——无论事务成功还是被取消（返回 nil），WATCH 都会自动解除；第二，`DISCARD` 之后——放弃事务同时也会取消所有 WATCH；第三，客户端连接断开时——Redis 会自动清理该客户端的所有 WATCH 状态。另外还有一个手动取消的命令 `UNWATCH`，它会取消当前客户端的所有监视，不需要指定具体哪些 key。UNWATCH 通常用在这样的场景：你 WATCH 了一个 key，GET 之后发现不满足条件（比如余额不足），这时你不需要开事务了，直接调用 UNWATCH 释放监视即可。\n\n## 第二步：WATCH 的内部实现原理\n\n### 两个核心数据结构\n\nWATCH 的实现在 Redis 源码的 `multi.c` 文件中，核心涉及两个数据结构。\n\n第一个是每个数据库（`redisDb`）维护的 `watched_keys` 字典。这个字典的 key 是被监视的 Redis key 名称，value 是一个客户端链表，记录了所有正在监视这个 key 的客户端。它的作用是：当某个 key 被修改时，Redis 能快速找到所有监视了这个 key 的客户端，通知它们「你监视的数据变了」。\n\n第二个是每个客户端（`client`）维护的 `watched_keys` 链表。这个链表记录了该客户端当前监视的所有 key（以及每个 key 所在的数据库）。它的作用是：当需要取消某个客户端的所有监视时（比如 EXEC 之后或连接断开时），Redis 能快速遍历这个客户端监视的所有 key，从数据库的 `watched_keys` 字典中把自己移除。\n\n用 ASCII 图表示这两个结构的关系：\n\n```\nredisDb.watched_keys (字典):\n┌─────────────┬──────────────────────────────┐\n│ key         │ 监视该 key 的客户端链表        │\n├─────────────┼──────────────────────────────┤\n│ \"balance\"   │ client-A → client-C          │\n│ \"stock\"     │ client-A → client-B          │\n│ \"counter\"   │ client-B                     │\n└─────────────┴──────────────────────────────┘\n\nclient-A.watched_keys (链表):\n  [\"balance\", db0] → [\"stock\", db0]\n\nclient-B.watched_keys (链表):\n  [\"stock\", db0] → [\"counter\", db0]\n\nclient-C.watched_keys (链表):\n  [\"balance\", db0]\n```\n\n### WATCH 命令的执行流程\n\n当客户端执行 `WATCH mykey` 时，Redis 在 `watchCommand()` 函数中做了两件事。第一，在当前数据库的 `watched_keys` 字典中查找 `mykey` 这个 key，如果不存在就创建一个新的客户端链表，然后把当前客户端追加到链表尾部。第二，在当前客户端的 `watched_keys` 链表中追加一个节点，记录被监视的 key 和它所在的数据库指针。整个过程没有任何锁操作，因为 Redis 主线程是单线程执行的。\n\n### touchWatchedKey：冲突检测的触发点\n\n真正关键的是 `touchWatchedKey()` 函数。每当 Redis 执行一个会修改数据的命令（SET、DEL、INCR、LPUSH 等等），在命令执行完成后，Redis 会调用 `signalModifiedKey()`，这个函数内部会调用 `touchWatchedKey(db, key)`。`touchWatchedKey()` 的逻辑很直接：在当前数据库的 `watched_keys` 字典中查找这个被修改的 key，如果找到了，就遍历它的客户端链表，对每个客户端设置 `CLIENT_DIRTY_CAS` 标志位。\n\n用伪代码表示就是：\n\n```c\nvoid touchWatchedKey(redisDb *db, robj *key) {\n    // 在数据库的 watched_keys 字典中查找这个 key\n    list *clients = dictFetchValue(db->watched_keys, key);\n    if (!clients) return;  // 没有人监视这个 key，直接返回\n\n    // 遍历监视这个 key 的所有客户端\n    listIter li;\n    listNode *ln;\n    listRewind(clients, &li);\n    while ((ln = listNext(&li)) != NULL) {\n        client *c = listNodeValue(ln);\n        // 给客户端打上「数据已脏」的标记\n        c->flags |= CLIENT_DIRTY_CAS;\n    }\n}\n```\n\n注意 `CLIENT_DIRTY_CAS` 这个标志位一旦被设置，就不会被清除（直到 EXEC 或 UNWATCH 重置整个 WATCH 状态）。这意味着即使 key 被改了又改回了原来的值，WATCH 依然会判定为冲突——Redis 检测的是「key 是否被写过」，而不是「key 的值是否发生了变化」。这和 CAS 的原始语义（比较值是否相等）有一个微妙的区别，但在实践中这种更保守的策略反而更安全。\n\n### EXEC 时的冲突判断\n\n当客户端发送 `EXEC` 时，Redis 在 `execCommand()` 函数中做的第一件事就是检查客户端的标志位。如果 `CLIENT_DIRTY_CAS` 已经被置位，Redis 直接丢弃整个命令队列，给客户端返回 nil（空的 MultiBulk 回复），然后取消该客户端的所有 WATCH。如果 `CLIENT_DIRTY_CAS` 没有被置位，Redis 正常遍历命令队列执行每条命令，然后同样取消 WATCH。无论事务执行与否，EXEC 之后 WATCH 都会被解除。\n\n在 Redis 源码（redis 7.2 的 `multi.c`）中，这段逻辑大致如下：\n\n```c\nvoid execCommand(client *c) {\n    // ...\n    // 检查是否有 WATCH 冲突或命令入队错误\n    if (c->flags & (CLIENT_DIRTY_CAS | CLIENT_DIRTY_EXEC)) {\n        // 返回 nil 表示事务取消\n        addReply(c, c->flags & CLIENT_DIRTY_EXEC\n                    ? shared.execaborterr : shared.nullarray);\n        discardTransaction(c);  // 清空队列 + 取消 WATCH\n        return;\n    }\n    // 正常执行事务...\n}\n```\n\n这里有个细节：`CLIENT_DIRTY_EXEC` 是另一个标志位，它在命令入队时出现语法错误时被设置。如果两个标志位都被设置了，`CLIENT_DIRTY_EXEC` 优先——因为语法错误意味着事务本身就有问题，返回 `EXECABORT` 错误比返回 nil 更精确。\n\n### 乐观锁 vs 悲观锁：为什么 Redis 选择了乐观锁\n\n理解了 WATCH 的原理之后，有必要从并发控制的角度把乐观锁和悲观锁做一个对比。悲观锁的思路是「假设冲突经常发生」——在操作数据之前先把数据锁住，不让别人碰，操作完了再释放锁。MySQL 的 `SELECT ... FOR UPDATE` 就是典型的悲观锁，它会对选中的行加排他锁，其他事务想修改同一行必须等锁释放。悲观锁的好处是不存在重试，一旦拿到锁就一定能成功；坏处是锁会阻塞其他客户端，如果持锁时间长，并发性能会严重下降。\n\n乐观锁的思路正好相反——「假设冲突不常发生」，不提前加锁，让所有客户端都去读数据、计算结果，到了提交的时候再检查数据有没有被别人改过。如果没改，提交成功；如果改了，放弃重试。WATCH 实现的就是这种语义：WATCH 不会阻止其他客户端修改被监视的 key，它只是在 EXEC 的时候检查有没有冲突。这和 Java 中 `AtomicInteger.compareAndSet()` 的思路是一样的——先读取当前值，计算新值，然后用 CAS 原子操作提交，如果当前值已经变了就返回 false 让你重试。\n\nRedis 选择乐观锁有两个原因。第一，Redis 是单线程模型，如果引入悲观锁（即让一个客户端在持有锁期间阻塞其他客户端的请求），整个 Redis 实例的吞吐量会断崖式下跌。第二，Redis 的典型使用场景是高读低写，大部分时候多个客户端不会同时修改同一个 key，乐观锁的冲突率很低，重试成本可以忽略。\n\n## 第三步：体系化扩展延伸\n\n### 典型重试模式的代码实现\n\nWATCH 乐观锁在冲突时需要应用层重试。下面是一个用 Python（redis-py 库）实现安全余额扣减的完整示例：\n\n```python\nimport redis\n\ndef deduct_balance(r: redis.Redis, user_key: str, amount: int) -> bool:\n    \"\"\"安全扣减余额，使用 WATCH 实现乐观锁，失败自动重试\"\"\"\n    max_retries = 5\n    for attempt in range(max_retries):\n        try:\n            # 开始 WATCH，进入 pipeline 的乐观锁模式\n            pipe = r.pipeline(True)  # True 表示启用事务模式\n            pipe.watch(user_key)\n\n            # WATCH 之后用普通命令读取当前余额\n            balance = int(pipe.get(user_key) or 0)\n            if balance < amount:\n                pipe.unwatch()  # 余额不足，取消监视\n                return False\n\n            # 开启事务，基于读到的值做扣减\n            pipe.multi()\n            pipe.decrby(user_key, amount)\n            pipe.execute()  # 相当于 EXEC\n            return True  # 事务成功\n\n        except redis.WatchError:\n            # EXEC 返回 nil -> redis-py 抛出 WatchError\n            # 说明有其他客户端在 WATCH 之后修改了 user_key\n            continue  # 重试\n\n    return False  # 超过最大重试次数\n\n# 使用示例\nr = redis.Redis(host='127.0.0.1', port=6379, db=0)\nr.set('balance:1001', 100)\nsuccess = deduct_balance(r, 'balance:1001', 30)\nprint(f\"扣减结果: {success}\")  # True，余额变为 70\n```\n\nredis-py 封装了 WATCH 的细节：`pipeline.watch(key)` 发送 WATCH 命令，`pipeline.multi()` 发送 MULTI 命令，`pipeline.execute()` 发送 EXEC 命令。如果 EXEC 返回 nil，redis-py 会抛出 `WatchError` 异常，你在 except 块中捕获它然后重试即可。\n\n### WATCH 的局限性与 Lua 脚本替代\n\nWATCH 在低竞争场景下表现很好，但它有一个本质的局限：竞争越激烈，重试次数越多，吞吐量下降越严重。假设有 100 个客户端同时对同一个 key 做 WATCH + MULTI + EXEC，第一轮只有 1 个客户端能成功提交，其余 99 个都因为 `CLIENT_DIRTY_CAS` 被置位而失败。第二轮这 99 个客户端重试，又只有 1 个成功……在秒杀场景下，几千个请求同时抢一个库存 key，WATCH 的冲突率趋近 100%，实际吞吐量可能只有个位数 TPS。\n\n这种场景下应该用 Lua 脚本替代 WATCH。Lua 脚本在 Redis 中是原子执行的——脚本执行期间不会被其他命令打断，天然就是一个「事务」，不存在竞态条件，也不需要重试。上面的余额扣减用 Lua 实现非常简洁：\n\n```lua\n-- deduct_balance.lua\nlocal balance = tonumber(redis.call('GET', KEYS[1]) or '0')\nif balance >= tonumber(ARGV[1]) then\n    redis.call('DECRBY', KEYS[1], ARGV[1])\n    return 1  -- 扣减成功\nend\nreturn 0  -- 余额不足\n```\n\n```bash\n# CLI 调用\n127.0.0.1:6379> EVAL \"local balance = tonumber(redis.call('GET', KEYS[1]) or '0') if balance >= tonumber(ARGV[1]) then redis.call('DECRBY', KEYS[1], ARGV[1]) return 1 end return 0\" 1 balance:1001 30\n(integer) 1\n```\n\nLua 脚本没有重试成本，在高竞争场景下性能远优于 WATCH。但 Lua 脚本也有它的代价——脚本执行期间整个 Redis 实例被阻塞，复杂的长时间 Lua 脚本会影响所有其他客户端的请求延迟。经验法则是：低竞争场景（冲突率低于 5%）用 WATCH，高竞争场景用 Lua 脚本，脚本逻辑要尽量精简控制在微秒级。\n\n### 容易踩的坑\n\n第一个坑是 WATCH 之后在事务外修改了被监视的 key。有些开发者写出这样的代码：先 WATCH key，然后 SET key（不在 MULTI 里），再 MULTI + EXEC。这时候 EXEC 一定会返回 nil，因为你自己在事务外修改了 key，`touchWatchedKey()` 也会给你自己的客户端置位 `CLIENT_DIRTY_CAS`。WATCH 不区分「自己修改」和「别人修改」，只要 key 被写过，WATCH 就认为冲突了。\n\n第二个坑是 WATCH 了一个不存在的 key。WATCH 可以监视一个当前不存在的 key，如果在 EXEC 之前这个 key 被创建了（比如别的客户端 SET 了它），事务同样会被取消。反过来，如果 WATCH 了一个存在的 key，在 EXEC 之前这个 key 被 DEL 了，事务也会取消。DELETE 操作一样会触发 `touchWatchedKey()`。\n\n第三个坑是 EXPIRE 也会触发 WATCH。当一个 key 因为 TTL 到期被 Redis 的过期删除机制清理时，这次删除同样会调用 `touchWatchedKey()`。所以如果你 WATCH 了一个即将过期的 key，过期事件恰好发生在 WATCH 和 EXEC 之间，事务就会被取消。在 Redis 的惰性过期策略下，这个时机很微妙——key 过期后并不会立刻被删除，而是在下次被访问时才删除。但如果 Redis 的定期过期扫描（默认每秒 10 次）恰好扫到了这个 key，也会触发删除。\n\n### WATCH 在 Redis Cluster 中的行为\n\n在 Redis Cluster 模式下，WATCH 仍然可用，但有一个前提：WATCH 的 key 和事务中操作的 key 必须落在同一个 slot 上。因为 MULTI/EXEC 事务只在单个节点上执行，如果你 WATCH 了 node-A 上的 key 却在事务中操作 node-B 上的 key，这两件事之间没有任何关联。实践中如果需要对多个 key 做 WATCH + 事务操作，通常用 hash tag 把它们强制路由到同一个 slot。比如 `{user:1001}:balance` 和 `{user:1001}:credit` 都会被分配到 `user:1001` 这个 hash tag 对应的 slot。\n\n### 面试高频考点总结\n\n面试中关于 WATCH 的问题通常围绕几个层次展开。第一层是基本用法：WATCH + MULTI/EXEC 的流程，EXEC 返回 nil 表示冲突。第二层是内部原理：`watched_keys` 字典、`CLIENT_DIRTY_CAS` 标志位、`touchWatchedKey()` 的触发时机。第三层是乐观锁 vs 悲观锁的权衡，以及什么时候该用 WATCH 什么时候该用 Lua。第四层是 WATCH 与 Redis Cluster、key 过期、Pipeline 等特性的交叉影响。能答到第三层基本可以拿到这道题的满分，第四层是加分项。",
+      "keyPoints": [
+        "WATCH 在 MULTI 之前监视一个或多个 key，如果被监视的 key 在 EXEC 之前被任何客户端修改，EXEC 返回 nil 取消整个事务，实现了 CAS（Check-And-Set）乐观锁语义",
+        "Redis 维护两个关联数据结构：每个数据库的 watched_keys 字典（key → 监视该 key 的客户端链表）和每个客户端的 watched_keys 链表（该客户端监视的所有 key），二者配合实现双向快速查找",
+        "任何写命令修改 key 后会调用 touchWatchedKey()，遍历该 key 的监视客户端链表，对每个客户端设置 CLIENT_DIRTY_CAS 标志位；EXEC 时检查此标志位决定事务执行还是取消",
+        "WATCH 检测的是「key 是否被写过」而非「值是否变化」，即使 key 被改回原值也会触发冲突；DEL、EXPIRE 过期删除等操作同样触发 touchWatchedKey()",
+        "EXEC 和 DISCARD 执行后 WATCH 自动取消，客户端断开连接也会自动清理；UNWATCH 命令可手动取消所有监视，常用于读取后发现不满足条件提前退出的场景",
+        "乐观锁假设冲突不常发生，不阻塞其他客户端，冲突时重试；悲观锁假设冲突频繁，先加锁阻塞其他客户端再操作。Redis 选择乐观锁是因为单线程模型下悲观锁会导致全实例阻塞",
+        "高竞争场景下 WATCH 的重试成本急剧上升（N 个客户端竞争每轮只有 1 个成功），此时应改用 Lua 脚本替代——Lua 脚本在 Redis 中原子执行，无需重试，但会短暂阻塞其他命令"
+      ],
+      "quiz": [
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz1",
+          "question": "以下关于 Redis WATCH 命令的描述，哪一项是正确的？",
+          "choices": [
+            { "id": "A", "text": "WATCH 会对被监视的 key 加排他锁，阻止其他客户端修改" },
+            { "id": "B", "text": "WATCH 必须在 MULTI 之前调用，监视一个或多个 key，如果 key 在 EXEC 前被修改则事务取消" },
+            { "id": "C", "text": "WATCH 只能监视一个 key，不支持同时监视多个 key" },
+            { "id": "D", "text": "WATCH 必须在 MULTI 之后、EXEC 之前调用" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "WATCH 的核心作用是在 MULTI 之前监视一个或多个 key，实现乐观锁而非悲观锁。选项 A 是对 WATCH 最常见的误解——WATCH 不会加任何锁，不会阻止其他客户端修改被监视的 key，它只是在 EXEC 时检查 key 有没有被改过。选项 C 错在 WATCH 支持 `WATCH key1 key2 key3` 的多 key 监视。选项 D 错在 WATCH 必须在 MULTI 之前调用，在事务状态中调用 WATCH 会报错。乐观锁的核心就是不加锁、不阻塞，只在提交时检查冲突。"
+        },
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz2",
+          "question": "Redis 内部通过什么机制检测被 WATCH 的 key 是否被修改？",
+          "choices": [
+            { "id": "A", "text": "在 EXEC 时重新读取 key 的值，与 WATCH 时记录的值做比较" },
+            { "id": "B", "text": "每个 key 维护一个版本号，WATCH 时记录版本号，EXEC 时比较版本号" },
+            { "id": "C", "text": "任何写命令修改 key 时调用 touchWatchedKey()，对监视该 key 的客户端设置 CLIENT_DIRTY_CAS 标志位" },
+            { "id": "D", "text": "通过 Pub/Sub 机制，key 被修改时发布通知给监视它的客户端" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis WATCH 的内部实现是基于标志位的即时通知机制。每当一个写命令修改了某个 key，Redis 会调用 touchWatchedKey() 函数，在数据库的 watched_keys 字典中查找这个 key，遍历监视它的客户端链表，给每个客户端设置 CLIENT_DIRTY_CAS 标志位。EXEC 时只需检查这个标志位即可判断是否有冲突。选项 A 错在 Redis 不会记录和比较 key 的值，它只跟踪 key 是否被写过。选项 B 的版本号机制并不是 Redis WATCH 的实现方式。选项 D 的 Pub/Sub 与 WATCH 机制完全无关。"
+        },
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz3",
+          "question": "在 Redis 的 watched_keys 数据结构设计中，以下说法正确的是？",
+          "choices": [
+            { "id": "A", "text": "只有数据库级别维护 watched_keys 字典，客户端不维护任何 WATCH 相关状态" },
+            { "id": "B", "text": "数据库维护 watched_keys 字典（key → 客户端链表），客户端维护 watched_keys 链表（该客户端监视的所有 key），两者互相关联" },
+            { "id": "C", "text": "每个 key 对象内部存储一个 watcher_count 计数器" },
+            { "id": "D", "text": "Redis 使用一个全局的 watched_keys 字典，不区分数据库" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "WATCH 的实现依赖两个互相关联的数据结构。数据库级别的 watched_keys 字典用于正向查找——当 key 被修改时，O(1) 找到字典条目，然后遍历客户端链表设置标志位。客户端级别的 watched_keys 链表用于反向清理——当客户端 EXEC、DISCARD 或断开连接时，遍历自己监视的 key 列表，从数据库字典中移除自己。选项 A 忽略了客户端侧的数据结构。选项 C 不符合 Redis 的实现方式，key 对象本身不存储 watcher 信息。选项 D 错在 watched_keys 是每个数据库各自维护的。"
+        },
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz4",
+          "question": "客户端 A 执行 WATCH mykey，此时 mykey 的值是 \"hello\"。之后客户端 B 执行 SET mykey \"world\"，然后又执行 SET mykey \"hello\"（改回了原值）。客户端 A 此时执行 EXEC，结果是什么？",
+          "choices": [
+            { "id": "A", "text": "EXEC 正常执行，因为 mykey 的值没有实际变化" },
+            { "id": "B", "text": "EXEC 返回 nil，事务取消" },
+            { "id": "C", "text": "EXEC 返回错误 EXECABORT" },
+            { "id": "D", "text": "取决于 Redis 的配置，默认正常执行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "EXEC 返回 nil，事务被取消。这是一个关键细节：WATCH 检测的是「key 是否被写过」，而不是「key 的值是否发生了变化」。客户端 B 第一次 SET mykey \"world\" 时，touchWatchedKey() 被调用，给客户端 A 设置了 CLIENT_DIRTY_CAS 标志位。即使客户端 B 随后又把值改回了 \"hello\"，CLIENT_DIRTY_CAS 一旦被置位就不会被清除。当客户端 A 执行 EXEC 时，检测到标志位已置位，直接返回 nil。选项 C 中的 EXECABORT 只在命令入队时有语法错误（CLIENT_DIRTY_EXEC）的情况下出现。"
+        },
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz5",
+          "question": "执行以下命令序列后，GET counter 的结果是什么？\n```\nSET counter 10\nWATCH counter\nMULTI\nINCR counter\nSET counter 999     # 另一个客户端在 EXEC 之前执行了这条\nEXEC\nGET counter\n```",
+          "choices": [
+            { "id": "A", "text": "\"11\"，因为 INCR 已经入队会照常执行" },
+            { "id": "B", "text": "\"999\"，因为 EXEC 返回 nil 事务取消，counter 保留另一个客户端设置的值" },
+            { "id": "C", "text": "\"10\"，因为事务被取消，counter 回滚到 WATCH 时的值" },
+            { "id": "D", "text": "\"1000\"，因为 INCR 在另一个客户端的 SET 之后执行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "另一个客户端在 EXEC 之前修改了 counter，触发了 touchWatchedKey()，给当前客户端设置了 CLIENT_DIRTY_CAS。当前客户端执行 EXEC 时检测到标志位，返回 nil，事务中的 INCR counter 不会被执行。因此 counter 的值就是另一个客户端 SET 的 999。选项 A 忽略了 WATCH 的冲突检测机制。选项 C 是最经典的误解——Redis 不会回滚到 WATCH 时的值，WATCH 只是「检测变化后放弃事务」，不是「发现冲突后恢复原值」。选项 D 混淆了事务队列命令的执行时机。"
+        },
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz6",
+          "question": "以下哪种做法会导致 WATCH 乐观锁出现意料之外的失败？",
+          "choices": [
+            { "id": "A", "text": "在 WATCH 之后、MULTI 之前用 GET 读取被监视的 key" },
+            { "id": "B", "text": "在 WATCH 之后、MULTI 之前用 SET 修改被监视的 key" },
+            { "id": "C", "text": "在 MULTI 之后用 SET 修改被监视的 key（入队）" },
+            { "id": "D", "text": "WATCH 一个不存在的 key" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 是一个常见的踩坑场景：在 WATCH 之后、MULTI 之前用普通命令修改了被监视的 key。由于这条 SET 不在事务中，它会立即执行，并触发 touchWatchedKey() 给当前客户端自己设置 CLIENT_DIRTY_CAS 标志位。WATCH 不区分「自己修改」和「别人修改」，只要 key 被写过就判定冲突，所以后续的 EXEC 一定返回 nil。选项 A 的 GET 是只读操作，不会触发 touchWatchedKey()。选项 C 的 SET 在 MULTI 之后只是入队不执行，不会触发 touchWatchedKey()。选项 D 是合法操作，WATCH 可以监视不存在的 key。"
+        },
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz7",
+          "question": "关于乐观锁和悲观锁的对比，以下哪项最准确地描述了 Redis 选择乐观锁（WATCH）的原因？",
+          "choices": [
+            { "id": "A", "text": "乐观锁在所有场景下性能都优于悲观锁" },
+            { "id": "B", "text": "Redis 是单线程模型，悲观锁会阻塞整个实例，而乐观锁通过冲突重试避免了阻塞" },
+            { "id": "C", "text": "Redis 没有能力实现悲观锁，只能用乐观锁" },
+            { "id": "D", "text": "乐观锁不需要重试，实现更简单" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 选择乐观锁的核心原因是它的单线程执行模型。如果 Redis 引入悲观锁，一个客户端持有锁期间，其他客户端的所有请求都会被阻塞（因为只有一个主线程），整个实例的吞吐量会断崖式下跌。乐观锁通过 WATCH 标记 + EXEC 检查的方式，在不阻塞任何客户端的前提下实现了冲突检测。选项 A 过于绝对，高竞争场景下乐观锁因为频繁重试性能反而不如悲观锁。选项 C 不准确，Redis 通过 Lua 脚本或外部分布式锁（如 Redlock）可以实现类似悲观锁的效果。选项 D 错误，乐观锁在冲突时需要重试。"
+        },
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz8",
+          "question": "在一个秒杀场景中，1000 个客户端同时对同一个库存 key 执行 WATCH + MULTI + DECRBY + EXEC。以下哪种描述最准确？",
+          "choices": [
+            { "id": "A", "text": "1000 个客户端都会成功，因为 Redis 单线程会按顺序处理" },
+            { "id": "B", "text": "每轮只有 1 个客户端成功，其余需要重试，高竞争下效率极低，应改用 Lua 脚本" },
+            { "id": "C", "text": "Redis 会自动将 WATCH 升级为悲观锁来应对高竞争" },
+            { "id": "D", "text": "1000 个客户端中约 50% 会成功，因为 WATCH 只检测直接冲突" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 WATCH 最大的局限性所在。当 1000 个客户端同时 WATCH 同一个 key 时，第一个执行 EXEC 的客户端成功后，touchWatchedKey() 会把其余 999 个客户端的 CLIENT_DIRTY_CAS 都置位，导致它们的 EXEC 全部返回 nil。第二轮 999 个客户端重试，又只有 1 个成功……这就是乐观锁在高竞争场景下的致命缺陷。此时应该用 Lua 脚本替代——Lua 脚本原子执行，不存在竞态条件，不需要重试，1000 个请求被 Redis 串行处理，每个请求都能得到明确的结果（成功或库存不足），吞吐量远高于 WATCH 重试模式。"
+        },
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz9",
+          "question": "如果一个被 WATCH 的 key 在 WATCH 和 EXEC 之间因为 TTL 过期被 Redis 自动删除了，EXEC 的结果是什么？",
+          "choices": [
+            { "id": "A", "text": "EXEC 正常执行，因为过期删除不算客户端主动修改" },
+            { "id": "B", "text": "EXEC 返回 nil，事务取消，因为过期删除也会触发 touchWatchedKey()" },
+            { "id": "C", "text": "EXEC 返回错误 KEYEXPIRED" },
+            { "id": "D", "text": "取决于是惰性删除还是定期删除，只有定期删除会触发 WATCH" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 中无论是惰性删除（客户端访问时发现已过期）还是定期删除（后台扫描发现已过期），过期 key 的清理都会调用相应的删除逻辑，进而触发 signalModifiedKey() → touchWatchedKey()，给监视该 key 的客户端设置 CLIENT_DIRTY_CAS。因此 EXEC 会返回 nil。这是一个容易被忽略的生产坑点——如果你 WATCH 了一个即将过期的 key，过期事件恰好发生在 WATCH 和 EXEC 之间，事务就会意外取消。选项 A 和 D 都低估了 Redis 对过期删除的处理一致性，选项 C 编造了一个不存在的错误类型。"
+        },
+        {
+          "id": "redis-tx-watch-optimistic-lock-q1-quiz10",
+          "question": "在 Redis Cluster 模式下使用 WATCH，以下哪种做法是正确的？",
+          "choices": [
+            { "id": "A", "text": "WATCH 可以跨节点监视任意 key，Cluster 会自动协调冲突检测" },
+            { "id": "B", "text": "WATCH 的 key 和事务中操作的 key 必须在同一个 slot 上，可以通过 hash tag 保证" },
+            { "id": "C", "text": "Redis Cluster 模式下不支持 WATCH 命令" },
+            { "id": "D", "text": "只要 WATCH 的 key 和事务操作的 key 在同一个节点上就行，不需要在同一个 slot" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 Redis Cluster 中，MULTI/EXEC 事务只在单个节点上执行，因此 WATCH 监视的 key 和事务中操作的 key 必须落在同一个 slot 上——实际上 Cluster 要求单个事务中所有涉及的 key 都在同一个 slot。如果需要对多个 key 做 WATCH + 事务操作，可以使用 hash tag 强制它们路由到同一个 slot，比如 `{order:1001}:stock` 和 `{order:1001}:status` 都会根据 `order:1001` 这个 hash tag 计算 slot。选项 A 错在 Cluster 不会跨节点协调 WATCH。选项 C 过于绝对，Cluster 支持 WATCH 但有 slot 限制。选项 D 混淆了节点和 slot 的概念。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/develop/interact/transactions/#optimistic-locking-using-check-and-set",
+        "https://github.com/redis/redis/blob/7.2/src/multi.c",
+        "https://redis.io/commands/watch/",
+        "https://redis.io/commands/unwatch/"
+      ]
+    }
+  ]
+}
