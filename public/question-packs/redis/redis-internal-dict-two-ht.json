@@ -1,0 +1,157 @@
+{
+  "id": "redis-internal-dict-two-ht",
+  "name": "dict 双哈希表设计解析",
+  "domain": "redis",
+  "description": "深入分析 Redis dict 为什么需要同时维护 ht[0] 和 ht[1] 两个哈希表，以及渐进式 rehash 的实现原理",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-internal-dict-two-ht-q1",
+      "domain": "redis",
+      "type": "purpose",
+      "difficulty": 3,
+      "tags": ["dict", "hashtable", "rehash", "ht[0]", "ht[1]", "redis-internals", "data-structure"],
+      "title": "dict 为什么需要两个哈希表（ht[0] 和 ht[1]）？",
+      "content": "翻开 Redis 6.2 的源码 src/dict.h，你会看到 dict 结构体里嵌着两个 dictht：\n\n```c\ntypedef struct dict {\n    dictType *type;\n    void *privdata;\n    dictht ht[2];       // 两个哈希表\n    long rehashidx;     // rehash 进度，-1 表示未在 rehash\n    int16_t pauserehash; // >0 时暂停 rehash\n} dict;\n```\n\n而 dictht 本身是一个标准的链地址法哈希表：\n\n```c\ntypedef struct dictht {\n    dictEntry **table;  // 哈希桶数组\n    unsigned long size; // 桶数量，始终是 2 的幂\n    unsigned long sizemask; // size - 1，用于位运算取模\n    unsigned long used; // 已有的键值对数量\n} dictht;\n```\n\n你可能会觉得奇怪：一个哈希表只需要一个桶数组就够了，为什么 Redis 要在 dict 里放两个 dictht？Java 的 HashMap 只有一个 table 数组，Go 的 map 也只有一个 buckets 指针，凭什么 Redis 非要搞两个？更费解的是，如果你在一个没有正在 rehash 的 Redis 实例上用 GDB 看 dict 的内存布局，会发现 ht[1].table 是 NULL、ht[1].size 是 0——也就是说第二个哈希表平时压根没在用，只是占着结构体里的空间。\n\n那这个「闲置」的 ht[1] 到底什么时候启用？它和渐进式 rehash 是什么关系？如果没有 ht[1]，Redis 在面对哈希表扩容时会遇到什么麻烦？为什么不干脆用三个、四个表来做更细粒度的迁移？\n\n这道题考的是你对 Redis 字典底层设计的理解深度。不只是「ht[1] 用于 rehash」一句话能糊弄过去的——面试官会追问 rehash 期间读写操作怎么在两个表之间路由、迁移的粒度是怎么控制的、内存峰值有多高。",
+      "answer": "## 第一步：Redis dict 的基础概念与核心定位\n\n### 什么是 dict\n\ndict（字典）是 Redis 中使用最广泛的底层数据结构之一，它本质上是一个基于哈希表的键值对容器。Redis 的键空间本身就是一个巨大的 dict——每一条 SET、GET、DEL 命令最终都要在这个 dict 上做查找和写入。除了键空间之外，Hash 类型在元素数量超过 hash-max-listpack-entries（Redis 7.0 默认 128）时也会使用 dict 作为底层编码，Sorted Set 内部也维护了一个 dict 来实现 O(1) 的成员查找。可以说 dict 是 Redis 最核心的「基础设施」数据结构。\n\ndict 的实现位于 src/dict.h 和 src/dict.c，总共大约 1200 行代码。它采用经典的链地址法（separate chaining）解决哈希冲突——每个桶（bucket）是一个单链表，哈希值相同的键值对被串在同一个链表上。哈希函数在 Redis 5.0+ 中使用 SipHash（定义在 src/siphash.c），替换了更早版本的 MurmurHash2 和 djb hash，主要是为了防御哈希洪水攻击（hash-flooding attack，攻击者精心构造大量哈希冲突的键，把 O(1) 的哈希查找退化成 O(N) 的链表遍历）。\n\n### 基本工作流程\n\n在没有 rehash 的正常状态下，dict 的读写操作非常直观。以查找一个键为例：先用哈希函数算出键的 hash 值，然后用 `hash & ht[0].sizemask` 得到桶的下标（sizemask 是 size - 1，因为 size 始终是 2 的幂，所以位与运算等价于取模但更快），最后遍历该桶的链表逐一比较键是否相等。插入和删除也是类似的流程。所有正常读写都在 ht[0] 上进行，ht[1] 在非 rehash 期间是一个空表（table 指针为 NULL，size 和 used 都是 0）。\n\n这就是 dict 的常规工作模式：只有一个活跃的哈希表 ht[0]，第二个表 ht[1] 处于休眠状态。\n\n## 第二步：为什么需要两个哈希表——渐进式 rehash 的核心解答\n\n### 哈希表为什么需要 rehash\n\n任何哈希表都有一个核心矛盾：桶的数量是固定的，但存入的键值对数量是动态增长的。当键值对数量远大于桶数量时，每个桶的链表会越来越长，查找的平均时间从 O(1) 退化到 O(N/M)（N 是元素总数，M 是桶数量）。这个比值 N/M 就是负载因子（load factor）。Redis 的扩容条件是：当负载因子 >= 1 且没有在执行 BGSAVE/BGREWRITEAOF 时触发扩容；或者当负载因子 >= 5 时无论是否在做持久化都强制扩容。收缩条件是负载因子 < 0.1。扩容时新表大小是第一个大于等于 used * 2 的 2 的幂，收缩时是第一个大于等于 used 的 2 的幂。\n\n### 一次性 rehash 的致命问题\n\n假设 Redis 只有一个哈希表。当触发 rehash 时，你需要：分配一个新的更大的桶数组，把旧表中的所有键值对重新计算哈希值并插入新表，然后释放旧表。问题在于「把所有键值对迁移到新表」这一步。如果 dict 里有 100 万个键值对，你需要遍历旧表的每一个桶、每一个链表节点，重新计算哈希并插入新桶——这个操作的时间复杂度是 O(N)。Redis 是单线程事件循环模型（在 Redis 6.0 引入 I/O 多线程之前所有命令处理都在主线程），一个 O(N) 的操作意味着在迁移完成之前，Redis 无法处理任何客户端请求。\n\n让我们算一笔账：假设一个 Redis 实例有 1000 万个键，每个键的迁移（计算哈希 + 链表操作）大约需要 100ns，那一次性 rehash 需要 1000 万 × 100ns = 1 秒。这 1 秒内 Redis 完全停止服务——对于 P99 延迟要求在个位数毫秒的业务来说，这是不可接受的。\n\n这就是 Java 的 HashMap.resize() 的做法：分配新数组，一次性把所有 entry 搬过去。Java 能这么做是因为 HashMap 不是全局共享的单线程服务，它只是某个线程的局部变量，阻塞一下没人在乎。但 Redis 的 dict 是全局键空间，阻塞主线程就等于阻塞所有客户端。\n\n### 两个表如何实现渐进式 rehash\n\nRedis 的解决方案是渐进式 rehash（incremental rehash）：不一次性把所有数据搬完，而是把迁移工作分摊到后续的每一次字典操作中。要实现这一点，就必须在迁移期间同时维护新旧两个哈希表——这就是 ht[0] 和 ht[1] 存在的根本原因。\n\n渐进式 rehash 的完整流程如下。当 dict 判断需要扩容或收缩时，调用 dictExpand 为 ht[1] 分配一个新大小的桶数组，并将 rehashidx 从 -1 设置为 0。rehashidx 的含义是「ht[0] 中下一个要迁移的桶下标」。从这一刻起，dict 进入 rehash 状态。\n\n在 rehash 状态下，每当有客户端命令触发 dict 的增删改查操作，Redis 会「顺便」执行一步迁移：调用 `_dictRehashStep(d)`，这个函数把 ht[0].table[rehashidx] 这个桶中的所有节点重新哈希并插入 ht[1]，然后 rehashidx++。src/dict.c 中的关键代码如下：\n\n```c\n// Redis 6.2 src/dict.c — dictRehash 核心逻辑\nint dictRehash(dict *d, int n) {\n    int empty_visits = n * 10; // 最多访问的空桶数\n    if (!dictIsRehashing(d)) return 0;\n\n    while(n-- && d->ht[0].used != 0) {\n        dictEntry *de, *nextde;\n\n        // 跳过空桶，但设置上限避免长时间阻塞\n        while(d->ht[0].table[d->rehashidx] == NULL) {\n            d->rehashidx++;\n            if (--empty_visits == 0) return 1;\n        }\n        de = d->ht[0].table[d->rehashidx];\n\n        // 将该桶的所有节点迁移到 ht[1]\n        while(de) {\n            uint64_t h;\n            nextde = de->next;\n            h = dictHashKey(d, de->key) & d->ht[1].sizemask;\n            de->next = d->ht[1].table[h];\n            d->ht[1].table[h] = de;\n            d->ht[0].used--;\n            d->ht[1].used++;\n            de = nextde;\n        }\n        d->ht[0].table[d->rehashidx] = NULL;\n        d->rehashidx++;\n    }\n\n    // 检查是否全部迁移完成\n    if (d->ht[0].used == 0) {\n        zfree(d->ht[0].table);\n        d->ht[0] = d->ht[1];         // 关键：ht[0] 接管 ht[1]\n        _dictReset(&d->ht[1]);        // ht[1] 重置为空表\n        d->rehashidx = -1;            // 退出 rehash 状态\n        return 0; // rehash 完成\n    }\n    return 1; // rehash 未完成\n}\n```\n\n这段代码揭示了几个关键细节。首先，迁移的粒度是「桶」而不是「单个节点」——一个桶中的所有链表节点会在一次 dictRehash 调用中被全部迁移。其次，为了避免遇到大段连续空桶时循环太久，代码设置了 empty_visits 上限，超过就提前返回。最后，当 ht[0].used 降为 0 时（所有节点都迁到了 ht[1]），释放 ht[0] 的桶数组，把 ht[1] 整体赋值给 ht[0]，然后把 ht[1] 重置为空表——下次 rehash 时再分配新的 ht[1]。\n\n### rehash 期间的读写路由\n\n在 rehash 进行中，dict 中同时有两个活跃的哈希表，读写操作必须正确路由。规则很简单：查找操作先查 ht[0]，没找到再查 ht[1]；新增操作直接写入 ht[1]（因为写 ht[0] 没意义，那些桶迟早要迁移）；删除和更新操作在两个表中都查找，找到哪个就在哪个上操作。这个路由逻辑保证了 rehash 期间数据的完整性和一致性，对客户端完全透明。\n\n除了被动的「每次操作顺便迁移一步」，Redis 的 serverCron 定时函数中还有一个主动 rehash 机制：每次调用 dictRehashMilliseconds(d, 1)，在 1 毫秒的时间预算内尽量多迁移几个桶。这是为了防止在低流量时段，dict 长时间处于 rehash 状态占用双倍内存。\n\n## 第三步：体系化扩展延伸\n\n### Redis 7.0 的结构体变化\n\nRedis 7.0（准确说是 7.0-rc1，commit 由 antirez 的继任者 Oran Agra 主导）对 dict 做了一次重大重构。旧的 dictht 结构体被完全移除，dict 不再嵌套 `dictht ht[2]`，而是直接在 dict 中用平铺字段存储：\n\n```c\n// Redis 7.0+ src/dict.h\nstruct dict {\n    dictType *type;\n    dictEntry **ht_table[2];    // 直接存储两个桶数组指针\n    unsigned long ht_used[2];   // 两个表各自的 used 计数\n    long rehashidx;             // rehash 进度\n    int16_t pauserehash;        // rehash 暂停标志\n    signed char ht_size_exp[2]; // 桶数量的指数（size = 1 << exp）\n};\n```\n\n这次重构的核心变化是：取消了 dictht 这个中间层结构体，把 table、used、size 直接作为 dict 的字段。size 字段被压缩为 ht_size_exp（一个 signed char，用指数表示桶数量，比如 exp=16 表示 65536 个桶），因为桶数量始终是 2 的幂，存指数比存完整数值更省内存。sizemask 也不再需要显式存储，需要时直接用 `DICTHT_SIZE_MASK(exp)` 宏计算 `((1UL << exp) - 1)`。\n\n但核心设计没有任何改变——依然是两个桶数组指针 `ht_table[2]`、两个 used 计数 `ht_used[2]`，渐进式 rehash 的逻辑完全一样。这次重构省掉了 dictht 结构体的 padding 字节和额外的间接寻址，在有大量 dict 实例（比如几千万个 Hash 类型的键）的场景下，内存节省效果显著。\n\n### 与其他语言 hashmap 实现的对比\n\nJava 的 HashMap 在 JDK 8 中的 resize() 是一次性完成的：分配新的 Node[] 数组（大小翻倍），遍历旧数组的每个桶，把每个节点按 `hash & newCap` 的结果分成高位桶和低位桶两组，分别挂到新数组中。整个过程是 O(N) 的。Java 能接受这个开销是因为 HashMap 不是全局共享的并发服务——它是某个线程的局部数据结构，阻塞片刻不影响其他线程。ConcurrentHashMap 在 JDK 8 中用了更精巧的方案：多线程协作迁移（transfer），通过 ForwardingNode 标记已迁移的桶，其他线程遇到 ForwardingNode 时直接去新表查找或帮忙迁移。\n\nGo 的 map 在 Go 1.21 中也实现了渐进式迁移（称为 evacuation），但策略不同于 Redis。Go map 不需要第二个完整的哈希表，而是通过 `oldbuckets` 指针保留旧桶数组的引用，新桶数组由 `buckets` 指针指向。每次写操作触发 `growWork()`，迁移 1-2 个旧桶到新桶。概念上和 Redis 的双表设计是等价的——Go 也是同时持有新旧两个桶数组，只是没有抽象成一个 `ht[2]` 数组而已。\n\n### rehash 期间的内存开销\n\n渐进式 rehash 的代价是内存。在 rehash 期间，ht[0] 和 ht[1] 同时存在，桶数组占用的内存接近翻倍。准确地说，如果 ht[0] 有 N 个桶（每个桶是一个 8 字节的 dictEntry 指针），扩容到 2N 个桶的 ht[1]，那桶数组的内存开销从 8N 字节变为 8N + 16N = 24N 字节——是正常状态的 3 倍。不过键值对节点（dictEntry）本身不会复制，只是从 ht[0] 的链表上摘下来挂到 ht[1] 的链表上，所以节点本身不占额外内存。\n\n在生产环境中，如果一个 Redis 实例的键空间有 5000 万个键，桶数量大约是 2^26 = 67108864（约 6700 万），桶数组占用 6700 万 × 8 字节 ≈ 512MB。rehash 期间新桶数组大小为 2^27 = 1.34 亿，额外占用约 1GB。这意味着 rehash 期间桶数组的内存会从 512MB 飙升到 1.5GB，再加上可能同时触发的 BGSAVE fork 的 COW 内存开销，很容易导致内存告警甚至 OOM。因此生产环境中需要通过 maxmemory 和监控 `used_memory` 指标来预留足够的内存空间应对 rehash 峰值。你可以通过 `INFO memory` 和 `DEBUG HTSTATS 0` 命令来观察当前 dict 的状态：\n\n```\n127.0.0.1:6379> DEBUG HTSTATS 0\n[Dictionary HT]\nHash table 0 stats (main hash table):\n table size: 8388608\n number of elements: 5000000\n...\nHash table 1 stats (rehashing target):\n table size: 16777216\n number of elements: 1230000\n...\n```\n\n上面这个输出说明 rehash 正在进行中：ht[0] 还剩约 377 万个键没迁移，ht[1] 已经有 123 万个键了。\n\n### 为什么不用三个或更多的哈希表\n\n既然两个表能实现渐进式 rehash，那用三个或四个表能不能做更细粒度的迁移、减少内存峰值？理论上可以设想这样的方案：把迁移分成多个阶段，每个阶段只扩容一小步，用多个表承载中间状态。但这个方案在工程上有严重问题。\n\n第一是查找开销线性增长。rehash 期间每次读操作都要在所有活跃的表中查找。两个表意味着最坏情况查两次，三个表就要查三次。对于 Redis 这种每个命令都要做至少一次 dict 查找的系统，额外的哈希计算和链表遍历直接影响吞吐量。第二是代码复杂度爆炸。两个表的路由逻辑已经需要在 dictFind、dictAdd、dictDelete 等十几个函数中加分支判断，如果变成 N 个表，每个函数都要循环遍历所有表，而且 rehash 的进度管理变成一个状态机——某个表在往哪个表迁移、什么时候合并、中间某个表是否可以释放——复杂度远超收益。第三是内存节省并不显著。三表方案的核心假设是「小步扩容」（比如每次只扩容 1.5 倍而不是 2 倍），但哈希表的桶数量必须是 2 的幂（为了用位运算代替取模），所以最小的扩容步长就是翻倍，中间值没有意义。\n\nRedis 的双表方案是在「迁移开销」「查找性能」「代码复杂度」「内存开销」四个维度上取得的最佳平衡点。两个表就够了。\n\n### 面试高频追问与知识关联\n\n面试官在你答完「两个表是为了渐进式 rehash」之后，通常会继续追问几个方向。第一是「rehash 的触发条件」——负载因子 >= 1 且无后台持久化子进程时扩容，负载因子 >= 5 时强制扩容，负载因子 < 0.1 时收缩。之所以在有 BGSAVE 子进程时提高阈值到 5，是因为 fork 后父子进程共享内存页，此时 rehash 会大量修改指针导致 COW（Copy-On-Write，写时复制——操作系统在 fork 后让父子进程共享相同的物理内存页，只有当某个进程尝试写入时才真正复制那一页）页面复制量暴增，内存开销成倍增加。第二个追问方向是「dict 和 Redis 对象编码的关系」——Hash 类型在元素少于 hash-max-listpack-entries 时使用 listpack 编码，超过后转为 hashtable 编码（底层就是 dict）；Set 类型在元素都是整数且数量少时用 intset，否则也用 dict。第三个方向是关联 Redis Cluster——集群模式下每个节点维护了一个 `server.cluster->nodes` 字典和 `server.db[0].dict` 键空间字典，在大规模数据导入（如 redis-cli --pipe）时两个 dict 可能同时触发 rehash，内存峰值要叠加计算。\n\n理解 dict 双表设计是深入 Redis 内部机制的入门钥匙，它直接关联到 Redis 的单线程模型、内存管理策略和持久化机制的设计取舍。",
+      "keyPoints": [
+        "ht[0] 是正常读写使用的主哈希表，ht[1] 仅在 rehash 时分配并使用，平时 table 指针为 NULL、size 为 0，不占用桶数组内存",
+        "双表设计的根本目的是实现渐进式 rehash——将 O(N) 的全量数据迁移分摊到后续每一次 dict 操作中，避免单线程 Redis 因一次性 rehash 阻塞数百毫秒甚至数秒",
+        "rehash 期间每次增删改查操作会「顺便」迁移 ht[0] 中一个桶的所有节点到 ht[1]，同时 serverCron 定时函数每次花 1ms 主动迁移多个桶，防止低流量时 rehash 停滞",
+        "rehash 完成后执行指针切换：ht[0] = ht[1] 然后 ht[1] 重置为空表，整个过程只是结构体赋值，O(1) 完成",
+        "rehash 期间查找操作先查 ht[0] 再查 ht[1]，新增操作直接写入 ht[1]，保证数据完整性且迁移方向正确",
+        "rehash 期间同时维护两个桶数组，扩容场景下桶数组内存开销约为正常状态的 3 倍（旧表 N + 新表 2N），需要预留足够内存应对峰值",
+        "Redis 7.0 移除了 dictht 中间层结构体，改为 dict 内直接存储 ht_table[2]、ht_used[2]、ht_size_exp[2]，简化内存布局但核心双表设计不变",
+        "不使用三个或更多哈希表是因为每多一个表查找开销就线性增加、路由和状态管理的代码复杂度爆炸、且桶数量必须是 2 的幂导致无法实现小步扩容"
+      ],
+      "quiz": [
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz1",
+          "question": "在非 rehash 状态下，Redis dict 中 ht[1] 的状态是什么？",
+          "choices": [
+            {"id": "A", "text": "ht[1] 和 ht[0] 大小相同，作为 ht[0] 的备份副本"},
+            {"id": "B", "text": "ht[1].table 为 NULL，size 和 used 均为 0，不占用桶数组内存"},
+            {"id": "C", "text": "ht[1] 分配了桶数组但没有数据，预留给下一次 rehash 使用"},
+            {"id": "D", "text": "ht[1] 存储着上一次 rehash 前的旧数据快照，用于故障恢复"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "非 rehash 状态下 ht[1] 是完全空的——table 指针为 NULL、size 和 used 都是 0，不占用任何桶数组内存。ht[1] 仅在触发 rehash 时被 dictExpand 分配新桶数组。A 选项的「备份副本」是错误的，Redis 不会维护哈希表的冗余备份。C 选项的「预分配」也不对，Redis 采用惰性策略，只在需要时才分配 ht[1]。D 选项把 dict 的双表机制和持久化快照混淆了，dict 不承担任何故障恢复职责。"
+        },
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz2",
+          "question": "Redis dict 采用双哈希表设计的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "为了在 BGSAVE 做 fork 时，父子进程各用一个表避免竞争"},
+            {"id": "B", "text": "为了将哈希表的 rehash 操作分摊到每次字典操作中，避免一次性迁移阻塞主线程"},
+            {"id": "C", "text": "为了让读操作和写操作分别在不同的表上进行，实现读写分离"},
+            {"id": "D", "text": "为了在哈希冲突严重时，把溢出的节点存储到第二个表中"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "双表设计的核心目的是实现渐进式 rehash。Redis 是单线程模型，如果只有一个哈希表，rehash 时必须一次性把所有键值对迁移到新桶数组，这个 O(N) 操作会阻塞主线程。通过维护 ht[0] 和 ht[1] 两个表，Redis 可以把迁移工作分摊到后续的每一次增删改查操作中，每次只迁移一个桶。A 选项把 dict 机制和 fork/COW 混淆了，BGSAVE 的 COW 是操作系统层面的机制，与 dict 双表无关。C 选项的读写分离是集群架构层面的概念，dict 层面不区分读写表。D 选项描述的是开放地址法的溢出桶思路，Redis 用的是链地址法，冲突节点直接挂在同一个桶的链表上。"
+        },
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz3",
+          "question": "渐进式 rehash 过程中，dictRehash 每次迁移的粒度是什么？",
+          "choices": [
+            {"id": "A", "text": "每次迁移一个 dictEntry 节点"},
+            {"id": "B", "text": "每次迁移一个桶（bucket）中的所有链表节点"},
+            {"id": "C", "text": "每次迁移固定数量（默认 100 个）的 dictEntry 节点"},
+            {"id": "D", "text": "每次迁移整个 ht[0] 的 10% 数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "dictRehash 的迁移粒度是「桶」级别——每一步会把 ht[0].table[rehashidx] 这个桶中的所有链表节点全部迁移到 ht[1]，然后 rehashidx++。之所以选择桶而不是单个节点作为粒度，是因为迁移一个桶和迁移桶中的一个节点在开销上差距不大（定位桶本身的开销是主要部分），但以桶为粒度可以更快推进 rehashidx 的进度。A 选项粒度太细，会导致 rehash 进度极慢。C 选项的固定数量不存在于 Redis 源码中。D 选项的百分比迁移也不是 Redis 的实现方式，Redis 的 _dictRehashStep 每次调用默认 n=1，即一个桶。"
+        },
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz4",
+          "question": "在渐进式 rehash 期间，新插入的键值对应该写入哪个哈希表？",
+          "choices": [
+            {"id": "A", "text": "写入 ht[0]，因为 ht[0] 是主表"},
+            {"id": "B", "text": "根据键的哈希值决定写入 ht[0] 还是 ht[1]"},
+            {"id": "C", "text": "写入 ht[1]，保证 ht[0] 只减不增，最终变为空表"},
+            {"id": "D", "text": "同时写入 ht[0] 和 ht[1]，保证双写一致性"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "rehash 期间所有新增操作都直接写入 ht[1]。逻辑很直观：rehash 的目标是把 ht[0] 的所有数据搬到 ht[1]，如果还往 ht[0] 写新数据，那 ht[0] 永远清不空，rehash 永远完不成。通过「新增只写 ht[1]」这个规则，ht[0] 的 used 计数只减不增，rehash 一定能收敛。A 选项会导致 rehash 无法完成。B 选项的「按哈希值决定」混淆了 rehash 路由和正常哈希定位的概念。D 选项的双写会造成数据重复且浪费内存，Redis 不会这么做。"
+        },
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz5",
+          "question": "执行 DEBUG HTSTATS 0 看到 ht[0] 有 800 万元素、ht[1] 有 200 万元素，说明什么？",
+          "choices": [
+            {"id": "A", "text": "dict 处于渐进式 rehash 中途，已将约 200 万个键从 ht[0] 迁移到 ht[1]"},
+            {"id": "B", "text": "两个表是读写分离的，ht[0] 处理读请求，ht[1] 处理写请求"},
+            {"id": "C", "text": "ht[0] 存储热点数据，ht[1] 存储冷数据，这是 Redis 的冷热分离策略"},
+            {"id": "D", "text": "说明 dict 有异常，正常情况下只有 ht[0] 有数据"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "ht[0] 和 ht[1] 同时有数据是渐进式 rehash 正在进行的典型表现。rehash 从 ht[0] 向 ht[1] 逐桶迁移数据，200 万元素已经在 ht[1] 中意味着 rehash 进行了一部分，还剩 ht[0] 中的 800 万元素等待迁移。注意这 200 万不全是「迁移过去的」，其中也包含 rehash 开始后新写入的键。B 选项的读写分离在 dict 层面不存在。C 选项的冷热分离是存储引擎级别的概念（如 RocksDB 的 tiered storage），Redis dict 不做冷热区分。D 选项误判为异常——只要 rehashidx != -1，两个表同时有数据就是正常状态。"
+        },
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz6",
+          "question": "关于渐进式 rehash 期间的内存开销，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "键值对节点（dictEntry）会被复制一份到 ht[1]，总内存接近翻倍"},
+            {"id": "B", "text": "只有桶数组（指针数组）存在双倍开销，dictEntry 节点本身只是从 ht[0] 链表摘下挂到 ht[1] 链表上，不会复制"},
+            {"id": "C", "text": "Redis 使用 COW 机制共享两个表的内存，不存在额外内存开销"},
+            {"id": "D", "text": "rehash 期间 Redis 会自动将 maxmemory 临时翻倍以容纳两个表"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "rehash 期间的额外内存开销主要来自桶数组——ht[0] 的旧桶数组和 ht[1] 的新桶数组同时存在。如果 ht[0] 有 N 个桶，扩容后的 ht[1] 有 2N 个桶，桶数组总开销从 8N 字节变为 8N + 16N = 24N 字节。但 dictEntry 节点不会被复制——迁移操作是把节点从 ht[0] 的链表上摘下来直接挂到 ht[1] 的链表上，只修改 next 指针，不分配新内存。A 选项错误地认为节点会被复制。C 选项的 COW 是 fork 时操作系统层面的机制，与 dict 内部无关。D 选项的「自动翻倍 maxmemory」纯属虚构，Redis 不会自动调整 maxmemory。"
+        },
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz7",
+          "question": "与 Redis 的渐进式 rehash 不同，Java HashMap 的 resize() 采用什么策略？",
+          "choices": [
+            {"id": "A", "text": "也是渐进式的，每次 put 操作迁移一个桶，与 Redis 的策略完全相同"},
+            {"id": "B", "text": "一次性分配新数组并将所有 entry 迁移完成，是 O(N) 的阻塞操作"},
+            {"id": "C", "text": "使用三个数组做分阶段迁移，比 Redis 的双表方案更精细"},
+            {"id": "D", "text": "不做 rehash，桶数量在创建时固定，链表过长时转为红黑树"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Java 的 HashMap.resize() 在 JDK 8 中是一次性完成的：分配一个两倍大小的新 Node[] 数组，遍历旧数组的每个桶把所有节点重新分配到新数组中。这是 O(N) 的操作且在调用线程上同步执行。Java 能接受这个开销是因为 HashMap 是线程不安全的局部数据结构，阻塞调用线程不影响其他线程。Redis 不能这样做是因为 dict 是单线程全局服务的核心数据结构。A 选项错误，HashMap 没有渐进式 rehash。C 选项的三数组方案在 JDK 标准库中不存在。D 选项部分正确——JDK 8 确实会在链表长度 >= 8 时转红黑树，但 resize 扩容仍然会正常执行。"
+        },
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz8",
+          "question": "生产环境中一个 5000 万键的 Redis 实例触发了 rehash，同时 BGSAVE 正在进行，最可能出现什么问题？",
+          "choices": [
+            {"id": "A", "text": "BGSAVE 子进程会因为 rehash 导致的数据不一致而生成损坏的 RDB 文件"},
+            {"id": "B", "text": "rehash 修改大量指针触发 COW 页面复制，叠加 ht[1] 桶数组内存，可能导致内存超限甚至 OOM"},
+            {"id": "C", "text": "Redis 会自动暂停 rehash 直到 BGSAVE 完成，不会有任何额外影响"},
+            {"id": "D", "text": "BGSAVE 会被强制取消，Redis 日志中会出现 ERR Background save already in progress"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "BGSAVE 通过 fork 创建子进程，父子进程通过 COW 共享内存页。rehash 期间主进程频繁修改 dictEntry 的 next 指针和桶数组中的指针，每次修改都会触发 COW——操作系统复制被修改的 4KB 内存页。5000 万键的 dict 涉及大量内存页，COW 复制量巨大。再加上 ht[1] 新桶数组本身的内存（约 1GB），叠加后很容易超出 maxmemory 或物理内存上限。实际上 Redis 会在 BGSAVE 期间提高扩容阈值到负载因子 5 来延迟 rehash，但如果负载因子已经超过 5 则仍然会触发。A 选项错误，fork 的 COW 保证子进程看到的是 fork 瞬间的快照。C 选项部分正确——Redis 确实会推迟 rehash，但不是完全暂停（负载因子 >= 5 时仍会触发）。"
+        },
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz9",
+          "question": "Redis 7.0 对 dict 结构做了重构，下列哪项描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "移除了双哈希表设计，改用单表 + 溢出桶的方案，类似 Go map 的实现"},
+            {"id": "B", "text": "移除了 dictht 中间结构体，改为 dict 直接存储 ht_table[2]、ht_used[2]、ht_size_exp[2]，核心双表设计不变"},
+            {"id": "C", "text": "引入了第三个哈希表 ht[2] 用于存储 TTL 信息，支持更精细的过期淘汰"},
+            {"id": "D", "text": "将 dict 完全替换为 rax（radix tree）实现，不再使用哈希表"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 7.0 的 dict 重构移除了 dictht 这个中间层结构体，将 table、used、size 等字段直接平铺到 dict 结构体中。具体变化是：dictht ht[2] → dictEntry **ht_table[2] + unsigned long ht_used[2] + signed char ht_size_exp[2]。其中 size 字段被压缩为 ht_size_exp（用指数表示桶数量，因为桶数始终是 2 的幂），sizemask 不再显式存储而是按需计算。这次重构减少了间接寻址和结构体 padding 的内存开销，但渐进式 rehash 的双表核心逻辑完全没有改变。A 选项错误，双表设计保留了。C 选项虚构了 ht[2]。D 选项混淆了 dict 和 rax，rax 在 Redis 中用于 Stream 的 ID 索引，不是通用字典。"
+        },
+        {
+          "id": "redis-internal-dict-two-ht-q1-quiz10",
+          "question": "为什么 Redis 不使用三个或四个哈希表来实现更细粒度的渐进式 rehash？",
+          "choices": [
+            {"id": "A", "text": "因为 Redis 的 C 语言代码不支持动态数组，无法管理可变数量的哈希表"},
+            {"id": "B", "text": "因为多表会导致每次查找都要遍历所有活跃表，增加查找开销；且桶数量必须是 2 的幂导致无法小步扩容，额外的表并不能真正减少内存峰值"},
+            {"id": "C", "text": "因为三个以上的哈希表会导致 Redis 的 RDB 持久化文件格式不兼容"},
+            {"id": "D", "text": "因为 Redis 作者 antirez 在设计时就硬编码了 ht[2] 数组，后续维护者没有修改的动力"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "不使用更多哈希表有充分的工程理由。首先，rehash 期间每次读操作都要在所有活跃表中查找，每多一个表就多一次哈希计算和链表遍历，对 Redis 的吞吐量有直接影响。其次，哈希表的桶数量必须是 2 的幂（为了用位运算代替取模），所以最小的有意义扩容步长就是翻倍——用三个表做「半步扩容」在数学上不成立。再者，多表的路由和状态管理（哪个表往哪个表迁移、什么时候合并、中间表何时释放）会让代码复杂度爆炸。两个表已经是迁移灵活性与工程可维护性之间的最佳平衡。A 选项胡扯，C 语言完全可以用数组或指针管理任意数量的表。C 选项与 RDB 格式无关。D 选项把架构决策矮化为「没人改」，忽略了背后的工程权衡。"
+        }
+      ],
+      "references": [
+        "https://github.com/redis/redis/blob/7.2/src/dict.h",
+        "https://github.com/redis/redis/blob/7.2/src/dict.c",
+        "https://github.com/redis/redis/blob/6.2/src/dict.h",
+        "https://redis.io/docs/reference/internals/internals-dict/"
+      ]
+    }
+  ]
+}

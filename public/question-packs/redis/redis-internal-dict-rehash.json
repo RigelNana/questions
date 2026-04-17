@@ -1,0 +1,158 @@
+{
+  "id": "redis-internal-dict-rehash",
+  "name": "dict 的渐进式 rehash 过程详解",
+  "domain": "redis",
+  "description": "深入解析 Redis 底层字典 dict 的渐进式 rehash 机制：触发条件、迁移过程、读写策略与 Redis 7.0 结构演进",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-internal-dict-rehash-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["dict", "hashtable", "rehash", "渐进式rehash", "redis-internals", "data-structure"],
+      "title": "Redis 的 dict 是怎么做渐进式 rehash 的？",
+      "content": "Redis 里几乎所有的键值对查找最终都落到一个叫 dict 的数据结构上。你在 redis-cli 里敲的每一条 SET、GET、DEL，底层都是在操作一个 dict。Redis 的 db 本身就是一个 dict，过期键信息也存在另一个 dict 里，连 Hash 类型在元素超过阈值后编码从 listpack 切换为 hashtable 时，用的也是 dict。可以说 dict 是整个 Redis 的骨架。\n\n但 dict 面临一个所有哈希表都绕不过的问题：当元素越塞越多、哈希冲突越来越严重时，查询性能从 O(1) 退化到 O(N)，必须 rehash——把元素重新散列到一张更大的表里。传统做法是一次性把旧表所有元素搬到新表，但 Redis 是单线程模型，假如 dict 里有 2000 万个键，一次性 rehash 意味着主线程被阻塞几百毫秒甚至数秒，整个服务直接不可用。\n\n于是 Redis 设计了「渐进式 rehash」——把搬迁操作拆散到每一次对 dict 的增删改查中，每次只搬一个桶（bucket），把一个本来会阻塞主线程的 O(N) 大操作，分摊成了无数个 O(1) 的小操作。这是 Redis 能在单线程下支撑几十万 QPS 的关键设计之一。\n\n以下是 Redis 6.2 中 dict 的核心结构体定义（src/dict.h）：\n\n```c\ntypedef struct dict {\n    dictType *type;       // 类型特定的操作函数集（hash函数、键比较等）\n    void *privdata;       // 私有数据，传给 type 中的函数\n    dictht ht[2];         // 两张哈希表，ht[0] 日常使用，ht[1] rehash 时启用\n    long rehashidx;       // rehash 进度索引，-1 表示没有在 rehash\n    int16_t pauserehash;  // >0 时暂停 rehash（如有安全迭代器在运行）\n} dict;\n\ntypedef struct dictht {\n    dictEntry **table;    // 哈希桶数组，每个桶是一个 dictEntry 链表的头指针\n    unsigned long size;   // 桶数组的长度，总是 2 的幂\n    unsigned long sizemask; // size - 1，用于取模运算（hash & sizemask）\n    unsigned long used;   // 已存储的元素数量\n} dictht;\n```\n\n注意 `ht[2]` 这个设计——dict 始终持有两张哈希表。正常状态下只使用 `ht[0]`，`ht[1]` 的 table 指针为 NULL、size 为 0。当 rehash 开始时，Redis 为 `ht[1]` 分配一张新表（通常是 `ht[0].used * 2` 向上取整到最近的 2 的幂），然后把 `rehashidx` 从 -1 设为 0，标志着渐进式 rehash 正式开始。\n\n现在的问题是：rehash 什么时候触发？渐进式搬迁的具体过程是怎样的？rehash 期间读写操作怎么在两张表之间协调？收缩（shrink）的触发条件又是什么？Redis 7.0 对 dict 结构做了什么重构？这些细节才是面试官真正想听的。",
+      "answer": "## 第一步：dict 的基础概念与核心定位\n\n### dict 是什么\n\ndict（字典）是 Redis 中最核心的底层数据结构，本质上是一个基于链地址法（separate chaining）解决哈希冲突的哈希表实现。在 Redis 的源码中，dict 的定义在 src/dict.h，实现在 src/dict.c，总共大约 1200 行代码——相比 Redis 其他模块来说并不算长，但它的重要性怎么强调都不过分。\n\nRedis 的每一个数据库（默认 16 个，编号 db0-db15）在内部就是一个 `redisDb` 结构体，其中最关键的两个字段 `dict *dict`（存储所有键值对）和 `dict *expires`（存储所有设置了 TTL 的键及其过期时间）都是 dict。也就是说，你在 Redis 里做的每一次键值查找，无论是 GET、SET、DEL 还是 EXPIRE，最终都会走到 dict 的查找逻辑中。除此之外，Hash 类型在元素数量超过 `hash-max-listpack-entries`（默认 128）或单个元素大小超过 `hash-max-listpack-value`（默认 64 字节）时，编码会从 listpack 切换为 hashtable，这个 hashtable 底层也是 dict。Set 类型在元素超过 `set-max-intset-entries` 且元素不全是整数时，同样切换到 dict。Sorted Set 的底层实现之一 skiplist + dict 组合中的 dict 部分提供 O(1) 的成员查找。\n\n### dict 的内存布局与运行逻辑\n\ndict 的核心设计是持有两张哈希表 `ht[0]` 和 `ht[1]`。每张哈希表（dictht）是一个经典的桶数组（bucket array）结构：一个 `dictEntry **table` 指针指向一个数组，数组的每个元素是一个 `dictEntry *`，即链表的头指针。当你执行 `SET mykey myvalue` 时，Redis 先计算 `hash = dictHashKey(d, \"mykey\")`，再用 `idx = hash & ht[0].sizemask` 算出桶索引，然后在 `ht[0].table[idx]` 这条链表上查找或插入。\n\n为什么桶数组的大小（size）总是 2 的幂？因为这样 `hash % size` 可以优化成 `hash & (size - 1)`，用一条位与指令替代一条除法指令，在 x86 上除法指令的延迟是位与的 20-30 倍。sizemask 就是 `size - 1`，预先算好存在 dictht 结构体中，避免每次取模都做减法。\n\n正常状态下（`rehashidx == -1`），只有 `ht[0]` 在使用，`ht[1]` 的 table 为 NULL，size 和 used 都是 0。所有的增删改查操作都只操作 `ht[0]`。这个状态会持续到某个操作触发了 rehash 条件。\n\n## 第二步：渐进式 rehash 的完整机制\n\n### 为什么需要 rehash\n\n哈希表的性能取决于一个关键指标：负载因子（load factor），定义为 `used / size`，即已存储元素数量除以桶数组长度。当负载因子过高时，意味着每个桶上的链表平均长度增加，查找一个元素需要遍历更多的链表节点，时间复杂度从理想的 O(1) 退化到 O(N)。反过来，当负载因子过低时，意味着桶数组中大量桶是空的，浪费内存。rehash 就是通过调整桶数组的大小来让负载因子回到合理范围。\n\n### rehash 的触发条件\n\nRedis 的 dict 在两种情况下触发扩展（expand）rehash，具体逻辑在 `_dictExpandIfNeeded` 函数中：\n\n第一种情况是负载因子 >= 1 且当前没有子进程在执行 BGSAVE 或 BGREWRITEAOF。为什么子进程会影响 rehash 决策？因为 Redis 做 RDB 快照和 AOF 重写时会 fork 子进程，fork 之后父子进程共享内存页（COW，Copy-On-Write 机制），只有当父进程修改某一页时操作系统才会真正复制那一页。rehash 过程中会大量移动 dictEntry 节点，触发密集的内存页写入，导致 COW 复制大量页面，内存用量可能翻倍。因此在有子进程的情况下，Redis 会尽量避免 rehash，提高触发阈值。\n\n第二种情况是负载因子 >= 5，无论是否有子进程都强制触发。这是一个硬性安全阈值——负载因子 5 意味着平均每个桶挂了 5 个节点，链表查找已经严重退化，如果不 rehash，整个 Redis 的性能都会崩塌。这个阈值定义在 `dict.c` 中的 `dict_force_resize_ratio` 常量。\n\n对应的源码逻辑（Redis 6.2, src/dict.c）简化如下：\n\n```c\nstatic int _dictExpandIfNeeded(dict *d) {\n    // 如果正在 rehash，直接返回（不会嵌套触发）\n    if (dictIsRehashing(d)) return DICT_OK;\n\n    // 如果 ht[0] 是空的（size == 0），初始化为 4 个桶\n    if (d->ht[0].size == 0) return dictExpand(d, DICT_HT_INITIAL_SIZE);\n\n    // 核心判断逻辑：\n    // 条件 1: used >= size（负载因子 >= 1）且允许 resize（没有子进程）\n    // 条件 2: used / size >= 5（负载因子 >= 5，强制触发）\n    if (d->ht[0].used >= d->ht[0].size &&\n        (dict_can_resize ||\n         d->ht[0].used / d->ht[0].size > dict_force_resize_ratio))\n    {\n        return dictExpand(d, d->ht[0].used * 2);\n    }\n    return DICT_OK;\n}\n```\n\n`dictExpand` 做的事情是：计算大于等于 `d->ht[0].used * 2` 的最小 2 的幂作为新表大小，为 `ht[1]` 分配这个大小的桶数组，然后把 `rehashidx` 设为 0。此时渐进式 rehash 正式开始，但注意——此时还没有任何元素被移动，真正的搬迁发生在后续的每一次操作中。\n\n### 渐进式搬迁的核心过程\n\n渐进式 rehash 的核心思想是：不一次性搬完所有元素，而是把搬迁操作嵌入到每一次对 dict 的增删改查操作中。每次操作执行时，顺便将 `ht[0]` 中 `rehashidx` 指向的桶里所有节点迁移到 `ht[1]` 中，然后 `rehashidx` 加一，指向下一个桶。这个逻辑在 `dictRehash` 函数中实现：\n\n```c\nint dictRehash(dict *d, int n) {\n    int empty_visits = n * 10;  // 最多访问的空桶数，防止连续空桶导致操作耗时太长\n    if (!dictIsRehashing(d)) return 0;\n\n    while (n-- && d->ht[0].used != 0) {\n        dictEntry *de, *nextde;\n\n        assert(d->ht[0].size > (unsigned long)d->rehashidx);\n\n        // 跳过空桶，但有上限\n        while (d->ht[0].table[d->rehashidx] == NULL) {\n            d->rehashidx++;\n            if (--empty_visits == 0) return 1;\n        }\n\n        // 获取当前桶的链表头\n        de = d->ht[0].table[d->rehashidx];\n\n        // 将该桶上所有节点逐个迁移到 ht[1]\n        while (de) {\n            uint64_t h;\n            nextde = de->next;\n            // 用 ht[1] 的 sizemask 重新计算桶索引\n            h = dictHashKey(d, de->key) & d->ht[1].sizemask;\n            de->next = d->ht[1].table[h];\n            d->ht[1].table[h] = de;  // 头插法\n            d->ht[0].used--;\n            d->ht[1].used++;\n            de = nextde;\n        }\n        d->ht[0].table[d->rehashidx] = NULL;  // 旧桶清空\n        d->rehashidx++;\n    }\n\n    // 检查 ht[0] 是否已经全部迁移完毕\n    if (d->ht[0].used == 0) {\n        zfree(d->ht[0].table);     // 释放旧表\n        d->ht[0] = d->ht[1];      // ht[1] 变成新的 ht[0]\n        _dictReset(&d->ht[1]);     // 重置 ht[1]\n        d->rehashidx = -1;         // 标记 rehash 结束\n        return 0;                  // 返回 0 表示 rehash 完成\n    }\n    return 1;  // 返回 1 表示还有数据没迁完\n}\n```\n\n这段代码有几个值得注意的细节。首先是 `empty_visits` 机制：哈希表中可能存在大量连续的空桶，如果不设上限，跳过空桶的循环可能消耗过多时间。`n * 10` 这个上限保证了即使遇到大片空桶，单次 rehash 步骤的耗时也是有界的。其次是迁移使用头插法（新节点插到链表头部），这是 O(1) 操作，保证了单次迁移的常数时间开销。最后，当 `ht[0].used` 降为 0 时，旧表被释放，`ht[1]` 整体赋值给 `ht[0]`，`ht[1]` 被重置，`rehashidx` 回到 -1，整个 rehash 过程结束。\n\n### rehash 期间的读写策略\n\n在渐进式 rehash 进行中（`rehashidx != -1`），dict 同时持有两张有效的哈希表，这时候增删改查操作需要同时考虑两张表：\n\n**查找（dictFind）：** 先在 `ht[0]` 中查找，如果没找到再去 `ht[1]` 中查找。这是因为 rehash 是从 `rehashidx` 开始往后逐桶迁移的，`rehashidx` 之前的桶已经被清空，元素都在 `ht[1]` 里；`rehashidx` 及之后的桶还没迁移，元素仍在 `ht[0]` 里。查找时先查 `ht[0]`，找不到再查 `ht[1]`，能保证无论元素在哪张表中都不会遗漏。\n\n**插入（dictAddRaw）：** 新元素只插入到 `ht[1]`，绝不插入 `ht[0]`。这个策略保证了 `ht[0]` 的元素数量只减不增，rehash 一定能结束。如果新元素还往 `ht[0]` 插，那 `ht[0]` 可能永远迁不完。\n\n**删除（dictGenericDelete）和更新：** 在两张表中查找目标元素，在哪张表找到就在哪张表操作。\n\n每次执行 dictAddRaw、dictGenericDelete、dictFind、dictGetRandomKey 等操作时，如果 dict 正在 rehash，函数内部都会调用一次 `_dictRehashStep(d)`，这个函数就是调用 `dictRehash(d, 1)` ——搬迁一个桶。这就是「渐进」的含义：每次用户操作顺便搬一个桶，把 O(N) 的大工程拆散到用户操作的时间线上。\n\n### 定时辅助 rehash：dictRehashMilliseconds\n\n只靠用户操作来驱动 rehash 有一个问题：如果 Redis 的访问量很低（比如凌晨低谷期），可能很长时间都没有足够的操作来完成 rehash，导致两张表长期共存，浪费内存。为了解决这个问题，Redis 的 serverCron 定时任务（默认每 100 毫秒执行一次）会调用 `dictRehashMilliseconds` 函数，在限定时间内（默认 1 毫秒）集中执行尽可能多的 rehash 步骤：\n\n```c\nint dictRehashMilliseconds(dict *d, int ms) {\n    long long start = timeInMilliseconds();\n    int rehashes = 0;\n\n    while (dictRehash(d, 100)) {  // 每批迁移 100 个桶\n        rehashes += 100;\n        if (timeInMilliseconds() - start > ms) break;\n    }\n    return rehashes;\n}\n```\n\n这个函数每次调用 `dictRehash(d, 100)` 批量迁移 100 个桶，然后检查是否超时。1 毫秒的时间限制保证了定时辅助 rehash 不会阻塞主线程太久，同时又能在低访问量时段有效推进 rehash 进度。在 Redis 的 `databasesCron` 函数中，serverCron 会遍历所有数据库，对正在 rehash 的 dict 调用 `dictRehashMilliseconds(d, 1)`。\n\n这两种驱动方式——操作驱动的单步 rehash 和定时驱动的批量 rehash——配合工作，保证了 rehash 既不会阻塞主线程，又能在合理时间内完成。\n\n### 收缩（shrink）rehash\n\n除了扩展，dict 还支持收缩操作。当大量键被删除后，如果桶数组太大而实际元素很少，会浪费内存。Redis 在 `htNeedsResize` 函数中检查：如果负载因子低于 0.1（即 `used * 100 / size < HASHTABLE_MIN_FILL`，其中 `HASHTABLE_MIN_FILL` 定义为 10），就触发收缩。收缩的目标大小是大于等于当前 used 的最小 2 的幂。\n\n收缩的过程和扩展完全一样——分配一张更小的 `ht[1]`，然后渐进式地把 `ht[0]` 的元素迁移过去。唯一的区别是新表比旧表小，而不是大。收缩同样受 BGSAVE/BGREWRITEAOF 的影响，在有子进程时不会触发收缩，避免 COW 导致内存暴涨。\n\n收缩检查在 `databasesCron` 中执行，每次 serverCron 周期会检查一个数据库的 dict 和 expires dict 是否需要收缩。你可以在 redis-cli 中用 `DEBUG CHANGE-REPL-ID` 之后执行 `INFO keyspace` 观察到收缩的效果：批量删除大量键后，Redis 不会立即释放哈希表内存，而是在后续的 serverCron 检测到负载因子低于 0.1 后启动收缩 rehash，逐步释放多余的桶数组内存。\n\n## 第三步：进阶特性与面试扩展\n\n### Redis 7.0 的 dict 结构重构\n\nRedis 7.0（准确说是从 unstable 分支的 commit 中由 Oran Agra 主导的重构）对 dict 的内部结构做了一次重大调整。最显著的变化是取消了独立的 `dictht` 结构体，把 `ht[0]` 和 `ht[1]` 的字段直接内联到 `dict` 结构体中：\n\n```c\n// Redis 7.0+ 的 dict 结构（src/dict.h）\ntypedef struct dict {\n    dictType *type;\n    dictEntry **ht_table[2];     // 直接持有两张桶数组指针，取代了 dictht\n    unsigned long ht_used[2];    // 两张表各自的元素数量\n    long rehashidx;              // rehash 进度，-1 表示未在 rehash\n    int16_t pauserehash;         // 暂停 rehash 计数器\n    signed char ht_size_exp[2];  // 桶数组大小的指数（size = 1 << exp）\n} dict;\n```\n\n对比 Redis 6.x 的结构，变化有三点。第一，`dictht` 结构体被消除，不再有 `ht[0].table`、`ht[0].size`，而是变成了 `ht_table[0]`、`ht_size_exp[0]`。第二，size 和 sizemask 字段被替换成了 `ht_size_exp`（一个 signed char），通过 `1 << ht_size_exp[i]` 计算出实际大小，节省了内存。第三，`privdata` 字段被移除了，类型特定的私有数据改为在 dictType 中通过函数参数传递。\n\n这次重构的目的是减少 dict 结构体本身的内存占用。在 Redis 6.x 中，一个 dict 结构体包含两个 dictht（每个 dictht 有 4 个字段共 32 字节），加上 type、privdata、rehashidx、pauserehash，总共大约 96 字节。Redis 7.0 重构后，dict 结构体缩减到大约 48 字节。考虑到 Redis 中有大量 dict 实例（每个 Hash 类型值在 hashtable 编码下就是一个 dict），这个优化在实例层面能节省可观的内存。不过，渐进式 rehash 的核心算法——两张表、逐桶迁移、操作驱动加定时辅助——完全没有变化，只是访问字段的方式从 `d->ht[0].table` 变成了 `d->ht_table[0]`。\n\n### 常见坑点与避坑指南\n\n在生产环境中，渐进式 rehash 最容易引发问题的场景有几个。第一个是 BGSAVE 期间大量写入导致负载因子飙到 5 以上时强制 rehash：此时 fork 出的子进程仍在运行，COW 会导致内存用量急剧上升。如果 Redis 实例的 maxmemory 设置得比较紧，可能触发 OOM killer 或 eviction。监控 `INFO memory` 中的 `mem_fragmentation_ratio` 和 `used_memory_rss` 可以提前发现这个问题。\n\n第二个坑是 rehash 期间的迭代器行为。Redis 的 dict 有两种迭代器：安全迭代器（safe iterator）和不安全迭代器（unsafe iterator）。安全迭代器在创建时会将 `pauserehash` 加一，暂停渐进式 rehash，保证迭代期间元素不会被迁移到另一张表导致遗漏或重复。KEYS、SCAN、HSCAN 等命令都使用迭代器。特别是 SCAN 命令使用了一种叫 reverse binary iteration 的游标算法，即使在 rehash 期间也能保证不遗漏元素且尽量少重复，这也是面试的高频考点。\n\n第三个坑是大量键同时过期时的连锁反应。Redis 的主动过期清理（activeExpireCycle）会批量删除过期键，导致 expires dict 的负载因子骤降，触发收缩 rehash。如果同时主 dict 又在扩展 rehash，两个 dict 同时 rehash 会加大内存抖动。生产中建议用 `EXPIREAT` 给过期时间加随机偏移量，避免大量键同时过期。\n\n### 生产环境最佳实践\n\n从运维角度看，可以通过 `INFO stats` 的 `rehash_in_progress` 字段（Redis 7.4+）或者通过 `DEBUG HTSTATS <db>` 命令来观察 rehash 状态。在 Redis 6.x 中可以通过 `OBJECT HELP` 和观察 `used_memory` 的变化趋势来间接判断。如果你发现 rehash 长时间不结束（比如一个 2000 万键的实例 rehash 了几个小时），通常是因为写入量太低导致操作驱动的 rehash 步进不够，加上 serverCron 每次只给 1 毫秒不够用。此时可以考虑在低峰期通过 SCAN 命令主动遍历键空间来加速 rehash（每次 SCAN 会触发一次 rehash step）。\n\n`hash-max-listpack-entries` 和 `hash-max-listpack-value` 的设置也会间接影响 dict 的 rehash 行为。这两个参数决定了 Hash 类型何时从 listpack 转为 hashtable（dict），如果设置得太低，大量 Hash 类型值会转为 dict，增加 rehash 压力；如果设置得太高，listpack 本身的 O(N) 查找又会成为瓶颈。默认的 128 和 64 是经过 benchmark 验证的合理折中。\n\n### 面试高频考点\n\n面试官问「渐进式 rehash」时，通常会从几个角度追问。第一个是「为什么不一次性 rehash」——答 Redis 单线程模型，一次性 O(N) 操作会阻塞所有请求。第二个是「rehash 期间插入新元素到哪张表」——答只插 `ht[1]`，保证 `ht[0]` 只减不增。第三个是「渐进式 rehash 会不会导致某些操作变慢」——答会，rehash 期间查找要查两张表，最坏情况下 dictFind 的比较次数翻倍，但因为每次搬迁一个桶的开销是 O(链表长度)，单次操作的额外开销仍然是常数级的。第四个是「如果 Redis 一直没有操作，rehash 什么时候完成」——答 serverCron 的 `databasesCron` 会以 1ms/次 的节奏推进 rehash，即使没有用户操作，rehash 也能缓慢但持续地推进。第五个是「dict 的负载因子为什么不像 Java HashMap 那样用 0.75」——答 Redis 在没有子进程时阈值是 1，已经比 Java 的 0.75 更宽松了，这是因为 Redis 的 dict 使用链地址法而非开放寻址法，负载因子大于 1 时仍能正常工作，只是链表变长了；而 Java HashMap 在 JDK 8 之后链表长度超过 8 会转红黑树，所以用 0.75 来控制冲突。",
+      "keyPoints": [
+        "dict 始终持有 ht[0] 和 ht[1] 两张哈希表，正常状态下只用 ht[0]，rehash 时 ht[1] 作为迁移目标表，rehashidx 从 -1 变为 0 标志 rehash 开始",
+        "扩展 rehash 的触发条件有两个：负载因子 >= 1 且没有 BGSAVE/BGREWRITEAOF 子进程时触发，或者负载因子 >= 5 时无条件强制触发以防止性能严重退化",
+        "渐进式 rehash 每次增删改查操作顺便迁移 ht[0] 中 rehashidx 指向的一个桶的所有节点到 ht[1]，把 O(N) 的整体搬迁分摊成无数个 O(1) 的小操作",
+        "rehash 期间查找操作先查 ht[0] 再查 ht[1] 保证不遗漏，插入操作只往 ht[1] 写入以保证 ht[0] 元素只减不增、rehash 一定能结束",
+        "serverCron 通过 dictRehashMilliseconds 以每次 1ms 的时间限制批量推进 rehash，解决低访问量时段 rehash 进度停滞的问题",
+        "收缩 rehash 在负载因子低于 0.1 时触发，目标大小为大于等于 used 的最小 2 的幂，同样使用渐进式迁移且受子进程影响",
+        "dictRehash 函数有 empty_visits 机制（n * 10）限制跳过空桶的数量，防止连续空桶导致单次操作耗时过长",
+        "Redis 7.0 取消了 dictht 结构体将字段内联到 dict 中，用 ht_size_exp 代替 size/sizemask，dict 内存占用从约 96 字节降到约 48 字节，但渐进式 rehash 算法本身未变"
+      ],
+      "quiz": [
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz1",
+          "question": "Redis 的 dict 在正常状态下（未在 rehash），哈希表 ht[1] 的状态是什么？",
+          "choices": [
+            {"id": "A", "text": "ht[1] 是 ht[0] 的只读副本，用于并发读取"},
+            {"id": "B", "text": "ht[1] 的 table 为 NULL，size 和 used 均为 0，不占用桶数组内存"},
+            {"id": "C", "text": "ht[1] 预分配了与 ht[0] 相同大小的桶数组，随时准备接收数据"},
+            {"id": "D", "text": "ht[1] 存储的是已删除但未释放的元素，用于延迟回收"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在没有进行 rehash 的正常状态下，dict 只使用 ht[0] 来存储所有元素，ht[1] 处于完全空闲状态：其 table 指针为 NULL，size 和 used 都是 0，不分配任何桶数组内存。只有当 rehash 被触发时，Redis 才会为 ht[1] 分配新的桶数组。A 选项描述的是主从复制的概念而非 dict 的设计。C 选项的「预分配」不存在——如果预分配就白白浪费了一倍内存。D 选项纯属虚构，Redis 的 dict 没有延迟回收机制，删除操作是立即释放 dictEntry 的。"
+        },
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz2",
+          "question": "dict 扩展 rehash 的触发条件中，为什么在有 BGSAVE 子进程时会提高触发阈值？",
+          "choices": [
+            {"id": "A", "text": "因为 BGSAVE 子进程会锁住 dict 防止写入，rehash 需要写入所以不能执行"},
+            {"id": "B", "text": "因为 fork 后父子进程共享内存页（COW），rehash 大量移动元素会触发密集的页复制导致内存暴涨"},
+            {"id": "C", "text": "因为 BGSAVE 本身就在做 rehash，不需要主线程再做一次"},
+            {"id": "D", "text": "因为 BGSAVE 需要读取一致性快照，rehash 会改变元素位置导致快照数据不一致"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 做 BGSAVE 时 fork 子进程，父子进程通过操作系统的 COW（Copy-On-Write）机制共享内存页面，只有父进程修改某页时才会触发真正的物理复制。渐进式 rehash 过程中需要大量移动 dictEntry 节点、修改桶数组指针，这会触发密集的 COW 页面复制，可能导致内存用量接近翻倍。因此 Redis 在有子进程时将扩展阈值从负载因子 1 提高到 5，尽量减少 rehash 导致的 COW 开销。A 选项错误，BGSAVE 子进程是 fork 出来的独立进程，不会锁住父进程的 dict。C 选项完全错误，BGSAVE 做的是 RDB 序列化而非 rehash。D 选项混淆了概念，子进程拿到的是 fork 瞬间的内存快照，之后父进程的修改不影响子进程。"
+        },
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz3",
+          "question": "在渐进式 rehash 过程中，dictRehash 函数每次被调用时具体做了什么？",
+          "choices": [
+            {"id": "A", "text": "随机选取 ht[0] 中的一个非空桶，将其所有节点迁移到 ht[1]"},
+            {"id": "B", "text": "从 rehashidx 指向的桶开始，将该桶的所有节点迁移到 ht[1]，然后 rehashidx 加一"},
+            {"id": "C", "text": "遍历 ht[0] 所有桶，每个桶迁移一个节点到 ht[1]"},
+            {"id": "D", "text": "将 ht[0] 中链表最长的桶整体搬到 ht[1]，优先解决冲突最严重的桶"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "dictRehash 的迁移是严格顺序的：从 rehashidx 指向的桶开始，将该桶链表上的所有节点逐个重新计算在 ht[1] 中的桶索引并迁移过去（使用头插法），然后将 rehashidx 加一指向下一个桶。如果 rehashidx 指向的是空桶，就跳过继续向后找非空桶，但跳过空桶有 empty_visits 上限（n * 10）防止耗时过长。A 选项的「随机选取」不正确，rehash 是顺序扫描的。C 选项的「每个桶迁移一个节点」不对，是一个桶整体迁移所有节点。D 选项的「链表最长的桶」优先策略不存在，顺序迁移的实现更简单且开销可预测。"
+        },
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz4",
+          "question": "dictRehash 函数中 empty_visits 机制的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "限制单次 rehash 迁移的元素总数，防止一个大桶上链表过长导致阻塞"},
+            {"id": "B", "text": "记录已访问的空桶数量并定期触发内存碎片整理"},
+            {"id": "C", "text": "限制跳过空桶的次数上限（n * 10），防止连续大量空桶导致单次操作耗时过长"},
+            {"id": "D", "text": "统计空桶比例，当空桶超过 90% 时自动触发收缩 rehash"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "哈希表中可能存在大量连续的空桶，尤其是在收缩 rehash 或者哈希分布不均匀的情况下。dictRehash 在迁移前需要跳过空桶找到非空桶，如果不设限制，可能要跳过成千上万个空桶才能找到一个有数据的桶，导致这次 rehash step 耗时远超预期。empty_visits 的值为 n * 10（n 是要求迁移的桶数），当跳过的空桶数达到这个上限时就停止本次 rehash，把剩余工作留给下一次操作。A 选项描述的是限制元素数量而非空桶数量，不正确。B 选项的内存碎片整理和 D 选项的收缩触发都与 empty_visits 无关。"
+        },
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz5",
+          "question": "一个 Redis 实例有 1000 万个键，ht[0] 的桶数组大小为 8388608（2^23），当前没有子进程在运行。触发扩展 rehash 后 ht[1] 的桶数组大小最可能是多少？",
+          "choices": [
+            {"id": "A", "text": "10000000，直接等于 used 的值"},
+            {"id": "B", "text": "33554432（2^25），即大于等于 used * 2 的最小 2 的幂"},
+            {"id": "C", "text": "20000000（used * 2），直接翻倍不取整"},
+            {"id": "D", "text": "67108864（2^26），分配 used * 4 以减少后续 rehash 频率"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "dictExpand 的逻辑是：传入 d->ht[0].used * 2 作为目标大小，然后由 _dictNextPower 函数计算大于等于该值的最小 2 的幂。当前 used = 10000000，used * 2 = 20000000，大于等于 20000000 的最小 2 的幂是 2^25 = 33554432。但 B 选项描述的规则「大于等于 used * 2 的最小 2 的幂」本身是完全正确的（题目中 2^24 = 16777216 的数值计算有误，实际应为 2^25）。核心考点是新表大小必须是 2 的幂——A 和 C 直接给出非 2 的幂的数值所以直接排除，D 的 4 倍扩容策略不是 Redis 的设计。"
+        },
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz6",
+          "question": "rehash 期间执行 SET 插入一个新键，这个键会被存储在哪里？",
+          "choices": [
+            {"id": "A", "text": "根据 hash 值存入 ht[0] 或 ht[1]，哪个桶冲突少就存哪个"},
+            {"id": "B", "text": "先存入 ht[0]，等 rehash 推进到该桶时再自动迁移到 ht[1]"},
+            {"id": "C", "text": "只存入 ht[1]，保证 ht[0] 的元素只减不增以确保 rehash 一定能结束"},
+            {"id": "D", "text": "同时存入 ht[0] 和 ht[1] 两份以保证查找性能"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是渐进式 rehash 设计中最重要的不变量之一：rehash 期间所有新插入的元素只写入 ht[1]，绝不写入 ht[0]。这个策略保证了 ht[0] 的 used 计数只减不增（只有迁移导致的减少，没有插入导致的增加），从而保证 rehash 一定能结束——最终 ht[0].used 会降到 0，此时旧表被释放，ht[1] 升级为新的 ht[0]。如果像 B 选项那样还往 ht[0] 插入，理论上如果插入速度大于迁移速度，ht[0] 永远清不空，rehash 就永远结束不了。A 选项的「哪个冲突少存哪个」策略实现过于复杂且同样无法保证 rehash 结束。D 选项存两份会导致数据不一致问题。"
+        },
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz7",
+          "question": "与一次性 rehash 相比，渐进式 rehash 的主要代价（tradeoff）是什么？",
+          "choices": [
+            {"id": "A", "text": "rehash 期间查找需要检查两张表，且长期占用两份桶数组内存直到迁移完成"},
+            {"id": "B", "text": "rehash 期间完全无法执行写入操作，只支持只读请求"},
+            {"id": "C", "text": "迁移过程中元素的哈希值会被重新计算两次，增加了 CPU 开销"},
+            {"id": "D", "text": "渐进式 rehash 需要额外的后台线程来执行，占用了 CPU 核心"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "渐进式 rehash 的本质是用「空间换时间平滑度」。在 rehash 期间，dict 同时持有 ht[0] 和 ht[1] 两张桶数组，内存开销暂时增加。同时 dictFind 需要先查 ht[0] 再查 ht[1]（最坏情况下比较次数翻倍），dictAdd 等操作除了自身逻辑外还要执行一步 rehash，每次操作都有额外的常数开销。这些就是用渐进策略替代一次性 rehash 的代价——但这些代价远小于一次性 rehash 导致的数百毫秒主线程阻塞。B 选项完全错误，rehash 期间读写操作都正常执行。C 选项中哈希值在迁移时只计算一次，不存在计算两次的问题。D 选项错误，渐进式 rehash 在主线程中执行，不需要后台线程。"
+        },
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz8",
+          "question": "一个 Redis 实例在凌晨低谷期几乎没有请求，但 dict 仍在 rehash 中。此时 rehash 的推进依赖什么机制？",
+          "choices": [
+            {"id": "A", "text": "Redis 会自动生成虚拟请求来驱动 rehash 推进"},
+            {"id": "B", "text": "serverCron 定时任务中的 databasesCron 调用 dictRehashMilliseconds，以 1ms/次 的节奏批量推进"},
+            {"id": "C", "text": "后台 I/O 线程（bio thread）在空闲时接管 rehash 任务"},
+            {"id": "D", "text": "没有机制，必须等有请求进来才能继续推进，rehash 会一直挂起"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 的渐进式 rehash 有两种驱动方式。第一种是操作驱动：每次 dictFind、dictAdd、dictDelete 等操作内部调用 _dictRehashStep 迁移一个桶。第二种是定时驱动：serverCron（默认 10Hz，即 100ms 一次）中的 databasesCron 函数会遍历数据库，对正在 rehash 的 dict 调用 dictRehashMilliseconds(d, 1)，在 1 毫秒时间窗口内批量迁移多个桶。即使没有用户请求，定时驱动也能缓慢但持续地推进 rehash。A 选项的「虚拟请求」不存在。C 选项的 bio 线程只处理 close file、AOF fsync、lazy free 三类任务，不参与 rehash。D 选项忽略了 serverCron 的定时推进机制。"
+        },
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz9",
+          "question": "在渐进式 rehash 过程中使用 SCAN 命令遍历键空间，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "SCAN 会等待 rehash 完全结束后才返回结果，可能导致客户端超时"},
+            {"id": "B", "text": "SCAN 使用 reverse binary iteration 算法同时遍历两张表，保证不遗漏但可能有少量重复"},
+            {"id": "C", "text": "SCAN 只遍历 ht[0]，ht[1] 中的元素会被完全跳过直到 rehash 结束"},
+            {"id": "D", "text": "SCAN 会暂停 rehash 直到遍历完成，然后恢复 rehash"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "SCAN 命令在 rehash 期间需要同时处理两张表中的数据。Redis 使用了一种叫 reverse binary iteration（反向二进制迭代）的游标算法，这种算法在哈希表大小发生变化时（正好是 rehash 的场景）仍能保证不遗漏任何元素。具体做法是：SCAN 会先遍历较小的那张表中游标指向的桶，然后遍历较大那张表中所有在 rehash 后会落到同一个小表桶中的桶。这个算法的保证是不遗漏但可能有少量重复元素（文档明确说明了这一点）。A 选项错误，SCAN 不会阻塞等待 rehash。C 选项错误，SCAN 会遍历两张表。D 选项描述的是安全迭代器的行为（暂停 rehash），但 SCAN 并不使用安全迭代器，它使用的是基于游标的特殊遍历方式。"
+        },
+        {
+          "id": "redis-internal-dict-rehash-q1-quiz10",
+          "question": "线上 Redis 实例的 INFO memory 显示 used_memory 在几分钟内突然翻倍，但 dbsize 没有明显变化。排查后发现正好在做 BGSAVE，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "BGSAVE 的 RDB 文件临时缓存在内存中导致内存翻倍"},
+            {"id": "B", "text": "BGSAVE fork 的子进程复制了全部内存空间导致内存翻倍"},
+            {"id": "C", "text": "BGSAVE 期间负载因子超过 5 触发了强制 rehash，rehash 分配了新的桶数组，加上 COW 页面复制导致内存暴涨"},
+            {"id": "D", "text": "BGSAVE 会自动触发 AOF 重写，两个子进程同时运行导致内存不足"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个典型的生产问题。BGSAVE 期间 Redis 将 rehash 阈值从 1 提升到 5，但如果此时写入量很大导致负载因子超过 5，仍会强制触发 rehash。rehash 需要为 ht[1] 分配一个通常是 ht[0] 两倍大小的桶数组，这本身就是额外内存开销。更严重的是，rehash 过程中大量移动 dictEntry 节点会触发密集的 COW 页面复制——fork 后父子进程共享内存页，父进程每修改一页，操作系统就复制一页给子进程。两者叠加导致 used_memory_rss 急剧上升。A 选项错误，RDB 文件直接写磁盘不缓存在内存中。B 选项不准确，fork 使用 COW 不会立即复制全部内存，是后续修改触发的。D 选项中 BGSAVE 不会自动触发 AOF 重写。"
+        }
+      ],
+      "references": [
+        "https://github.com/redis/redis/blob/7.2/src/dict.h",
+        "https://github.com/redis/redis/blob/7.2/src/dict.c",
+        "https://github.com/redis/redis/blob/6.2/src/dict.h",
+        "https://redis.io/docs/latest/develop/reference/internals/",
+        "http://redisbook.com/preview/dict/incremental_rehashing.html"
+      ]
+    }
+  ]
+}
