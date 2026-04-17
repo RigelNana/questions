@@ -1,0 +1,157 @@
+{
+  "id": "redis-mt-io-threads",
+  "name": "Redis 6.0 多线程 I/O 机制详解",
+  "domain": "redis",
+  "description": "深入解析 Redis 6.0 引入的多线程 I/O 的设计动机、工作流程、同步机制、配置方法与性能提升",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-mt-io-threads-q1",
+      "domain": "redis",
+      "type": "concept",
+      "difficulty": 2,
+      "tags": ["多线程IO", "io-threads", "io-threads-do-reads", "网络读写", "Redis6.0", "redis-multithreading"],
+      "title": "Redis 6.0 引入的多线程 I/O 具体做了什么？",
+      "content": "## 面试场景\n\n面试官问你「Redis 不是单线程的吗？那 6.0 的多线程是怎么回事？」这道题在中高级面试中出现的频率非常高，因为它直接检验你对 Redis 线程模型的理解深度。大部分候选人的回答停留在「Redis 6.0 加了多线程来处理网络 I/O」这一句话，然后就说不下去了。面试官一追问「多线程怎么分配任务的？线程之间用什么同步？为什么默认不开？配置几个线程合适？」，就暴露了理解上的空白。\n\n要回答好这道题，需要先理解 Redis 在 6.0 之前面临的真正性能瓶颈在哪里。我们用 `redis-benchmark` 在一台 8 核的 Linux 服务器上对 Redis 5.0 做一次压测：\n\n```bash\n$ redis-benchmark -t set,get -n 2000000 -c 200 -d 512 -q\nSET: 135890.34 requests per second, p50=0.735 msec\nGET: 141043.72 requests per second, p50=0.703 msec\n```\n\n13-14 万 QPS，看起来很快了。但如果你用 `perf top` 看一下 Redis 进程的 CPU 热点，会发现一个有趣的现象：\n\n```\n  22.31%  redis-server  [.] readQueryFromClient\n  18.74%  redis-server  [.] writeToClient\n  11.23%  redis-server  [.] epollwait\n   9.45%  redis-server  [.] addReplyToBuffer\n   6.82%  libc          [.] __read\n   5.19%  libc          [.] __write\n   4.37%  redis-server  [.] processCommand\n   ...\n```\n\n`readQueryFromClient` 和 `writeToClient` 两个网络 I/O 函数加起来占了 CPU 时间的 41%，而真正的命令执行函数 `processCommand` 只占了 4.37%。换句话说，Redis 主线程的时间大部分花在了「从 socket 读数据」和「往 socket 写数据」上，而不是执行命令本身。这就是 Redis 6.0 引入多线程 I/O 的核心动机——把网络读写这个瓶颈分摊到多个线程上。\n\n但问题来了：网络 I/O 多线程化之后，命令执行怎么办？多线程并发执行命令不需要加锁吗？如果只是 I/O 线程化但命令还是单线程，线程之间的同步怎么做？为什么默认只开了写的多线程而读的多线程要手动打开？这些问题环环相扣，让我们来一层层拆解。",
+      "answer": "## 第一步：Redis 多线程 I/O 的核心主体概念\n\n### Redis 的网络通信模型回顾\n\nRedis 是一个基于内存的键值存储系统，所有数据操作都在内存中完成，通过 TCP 协议对外提供服务。一个完整的客户端请求在 Redis 内部经历四个阶段：网络读取（从 socket 读取客户端发来的原始字节流）→ 命令解析（将字节流按 RESP 协议解析为具体的 Redis 命令）→ 命令执行（在内存数据结构上完成实际的读写操作）→ 网络写入（将执行结果序列化后写回 socket）。在 Redis 6.0 之前，这四个阶段全部在主线程的事件循环中串行完成。主线程通过 `epoll_wait`（Linux）或 `kqueue`（macOS）监听所有客户端连接上的事件，有数据到达就读取并处理，处理完就写回。\n\n这个模型在绝大多数场景下表现出色——单线程的 Redis 在一台普通 4 核服务器上轻松跑到 10 万+ QPS。但随着云原生时代机器核数越来越多（16 核、32 核、64 核已经是标配），以及业务对吞吐量的要求越来越高，单线程模型的天花板开始成为实际问题。关键在于：命令执行本身极快（一次 `GET` 就是一次哈希表查找，纳秒级），但网络读写涉及系统调用（`read(2)` / `write(2)`），每次系统调用需要用户态到内核态的切换，加上数据从内核缓冲区到用户缓冲区的拷贝，开销远大于内存操作本身。当并发连接数上千、value 体积较大时，网络 I/O 在主线程 CPU 时间中的占比可以超过 50%。\n\n在 6.0 之前，应对这个瓶颈的标准做法是部署多个 Redis 实例——一台 8 核机器上起 4-8 个 Redis 进程，通过 Redis Cluster 或客户端分片来分摊流量。这确实有效，但管理复杂度直线上升：每个实例独立的内存空间、独立的持久化策略、独立的监控告警，运维成本不是线性增长而是指数级增长。Redis 6.0 的多线程 I/O 就是为了在单实例内解决网络 I/O 瓶颈，让一个 Redis 实例能充分利用多核 CPU 的网络处理能力。\n\n### 核心设计原则：I/O 线程化，非命令线程化\n\nRedis 6.0 多线程 I/O 的设计哲学可以用一句话概括：**把网络读写交给多个线程并行处理，但命令执行仍然严格在主线程串行完成**。这是一个「I/O 线程化」方案，而非「命令线程化」方案。命令执行保持单线程意味着不需要给 Redis 的任何内部数据结构加锁——哈希表不需要锁、跳表不需要锁、过期字典不需要锁、渐进式 rehash 不需要锁。这保留了 Redis 单线程模型的全部优势：无锁、无竞态条件、无死锁、命令天然原子性。\n\n## 第二步：多线程 I/O 的完整工作流程\n\n### 阶段一：连接接受与任务分配\n\n当一个新客户端通过 TCP 连接到 Redis 时，连接的 `accept` 始终由主线程完成——这一点没有变化。主线程在事件循环中收到新连接事件后，创建对应的 `client` 结构体并注册到 `epoll` 中。当下一轮事件循环检测到某些客户端 socket 上有数据可读时，主线程不再自己去逐个读取，而是把这些待读取的客户端收集到一个全局列表 `clients_pending_read` 中，然后按轮询（round-robin）的方式分配给各个 I/O 线程。分配策略非常简单：第 0 个客户端给线程 0（主线程自己），第 1 个给线程 1，第 2 个给线程 2，依次循环。源码中这段分配逻辑在 `networking.c` 的 `handleClientsWithPendingReadsUsingThreads()` 函数里：\n\n```c\n// Redis 7.2 src/networking.c（简化）\nint item_id = 0;\nlistRewind(server.clients_pending_read, &li);\nwhile ((ln = listNext(&li))) {\n    client *c = listNodeValue(ln);\n    int target_id = item_id % server.io_threads_num;\n    listAddNodeTail(io_threads_list[target_id], c);\n    item_id++;\n}\n```\n\n### 阶段二：I/O 线程并行读取\n\n分配完毕后，主线程通过设置原子变量 `io_threads_pending[id]` 来「唤醒」I/O 线程。每个 I/O 线程看到自己的 pending 计数不为零后，开始从分配给自己的客户端列表中逐一执行读操作：调用 `readQueryFromClient()` 从 socket 读取数据到 `client->querybuf`（查询缓冲区），然后调用 `processInputBuffer()` 按照 RESP 协议解析出命令参数。注意，I/O 线程只做「读取 + 解析」，解析出来的命令被挂在 `client->cmd` 上但**不执行**。当一个 I/O 线程处理完自己列表中所有客户端后，将 `io_threads_pending[id]` 置为 0 表示完成。\n\n### 阶段三：主线程串行执行命令\n\n主线程在分发完读任务后，自己也处理分配给线程 0（即自己）的那份客户端。处理完后，主线程开始忙等待（busy-wait）所有其他 I/O 线程完成：\n\n```c\n// Redis 7.2 src/networking.c（简化）\nwhile (1) {\n    unsigned long pending = 0;\n    for (int j = 1; j < server.io_threads_num; j++)\n        pending += getIOPending(j);  // 读取原子变量 io_threads_pending[j]\n    if (pending == 0) break;\n}\n```\n\n一旦所有 I/O 线程完成读取，主线程遍历 `clients_pending_read` 列表，对每个客户端调用 `processCommandAndResetClient()` 串行执行命令。这里是整个流程中的关键同步点——主线程确保所有 I/O 线程都已经完成读取后，才独占地执行命令，不存在任何并发修改数据结构的可能性。\n\n### 阶段四：I/O 线程并行写回\n\n命令执行完毕后，每个客户端的响应数据被写入 `client->buf` 或 `client->reply` 链表。主线程再次把这些有待发送响应的客户端按轮询分配给各 I/O 线程，设置 `io_threads_pending[id]`，I/O 线程并行将数据通过 `writeToClient()` 写回各自负责的客户端 socket。写完后同样将 pending 置为 0。主线程再次忙等待所有写操作完成，然后进入下一轮事件循环。\n\n整个流程可以用一张时序图概括：\n\n```\n主线程:  [accept] → [收集待读客户端] → [分发给IO线程] → [等待读完成]\n                                                              ↓\nIO线程1: ─────────── [read+parse client A,D,G] ──────────→ [done]\nIO线程2: ─────────── [read+parse client B,E,H] ──────────→ [done]\nIO线程3: ─────────── [read+parse client C,F,I] ──────────→ [done]\n                                                              ↓\n主线程:  [串行执行所有命令 A→B→C→D→E→F→G→H→I] → [分发写任务] → [等待写完成]\n                                                                    ↓\nIO线程1: ─────────── [write response A,D,G] ──────────────→ [done]\nIO线程2: ─────────── [write response B,E,H] ──────────────→ [done]\nIO线程3: ─────────── [write response C,F,I] ──────────────→ [done]\n                                                                    ↓\n主线程:  [下一轮事件循环] ──→\n```\n\n### 线程同步机制：原子变量 + 自旋等待\n\nRedis 的 I/O 线程同步完全不使用 `pthread_mutex` 或条件变量，而是使用 C11 原子操作（`_Atomic`）配合自旋等待（busy-waiting / spin-wait）。每个 I/O 线程在空闲时自旋检查 `io_threads_pending[id]` 是否不为零：\n\n```c\n// I/O 线程主循环（简化）\nvoid *IOThreadMain(void *myid) {\n    long id = (long)myid;\n    while (1) {\n        // 自旋等待，直到主线程分配任务\n        while (getIOPending(id) == 0) {\n            // 可选：usleep(1) 或 sched_yield()\n        }\n        // 处理分配给自己的客户端列表\n        listIter li;\n        listRewind(io_threads_list[id], &li);\n        while ((ln = listNext(&li))) {\n            client *c = listNodeValue(ln);\n            if (io_threads_op == IO_THREADS_OP_WRITE)\n                writeToClient(c, 0);\n            else if (io_threads_op == IO_THREADS_OP_READ)\n                readQueryFromClient(c->conn);\n        }\n        // 完成，清零 pending\n        setIOPending(id, 0);\n    }\n}\n```\n\n为什么不用 mutex？因为 mutex 的 lock/unlock 涉及系统调用（`futex`），每次大约 25-100 纳秒，且在有竞争时可能导致线程被内核挂起再唤醒，延迟可达微秒级。而原子变量的自旋检查只是一条 CPU 指令（`load`），成本几乎为零。代价是自旋期间会空转 CPU 核心，但 Redis 的设计假设是 I/O 线程空闲时间很短（高负载时几乎总有任务可做），自旋的代价可接受。\n\n## 第三步：体系化扩展\n\n### 配置方法与最佳实践\n\n多线程 I/O 默认是关闭的，需要在 `redis.conf` 中手动开启。关键的两个配置项：\n\n```bash\n# redis.conf\nio-threads 4              # I/O 线程总数（包含主线程），实际额外启动 3 个线程\nio-threads-do-reads yes   # 开启读取多线程，默认 no（只有写入多线程生效）\n```\n\n`io-threads` 的值包含主线程自身。设为 4 表示主线程 + 3 个额外 I/O 线程，一共 4 个线程在做网络读写。Redis 官方建议：4 核 CPU 设为 2-3，8 核 CPU 设为 6，超过 8 个 I/O 线程几乎不会有额外收益，反而可能因为线程调度开销导致性能下降。\n\n一个容易踩的坑是 `io-threads-do-reads` 默认为 `no`。也就是说，即使你配了 `io-threads 4`，默认情况下只有写回阶段是多线程的，读取阶段仍然在主线程串行完成。Redis 作者 antirez 在 6.0 发布说明中解释过原因：在他的基准测试中，写回阶段的 CPU 占比通常大于读取阶段，所以只开写多线程就能获得大部分收益，而读多线程在某些边缘场景下反而可能引入不稳定性。不过在实际生产中，如果你的场景是大量客户端发送大体积请求（比如批量 `MSET` 大量 key），开启 `io-threads-do-reads yes` 会有明显提升。\n\n配置完成后可以通过 `INFO server` 确认 I/O 线程数：\n\n```bash\n127.0.0.1:6379> CONFIG GET io-threads\n1) \"io-threads\"\n2) \"4\"\n127.0.0.1:6379> CONFIG GET io-threads-do-reads\n1) \"io-threads-do-reads\"\n2) \"yes\"\n```\n\n### 性能提升的实际数据\n\nRedis 官方在 6.0 发布时给出的 benchmark 数据显示，在 512 字节 value、200 个并发连接的场景下，开启 4 个 I/O 线程可以将 `GET` 吞吐量从约 13 万 QPS 提升到约 25 万 QPS，接近翻倍。但这个数字高度依赖于具体场景：value 越小（比如只有几十字节），命令执行占比更低、网络 I/O 占比更高，多线程的加速效果越明显；value 越大或者命令本身就很重（如 `LRANGE` 返回上千个元素），命令执行时间占主导，I/O 多线程能分摊的部分有限。\n\n下面是一组实际对比，在同一台 8 核服务器上用 `redis-benchmark` 测试 Redis 7.2：\n\n```bash\n# io-threads 1（默认，等同于不开多线程）\n$ redis-benchmark -t set,get -n 3000000 -c 200 -d 512 -q\nSET: 138712.58 requests per second, p50=0.711 msec\nGET: 142653.35 requests per second, p50=0.695 msec\n\n# io-threads 4, io-threads-do-reads yes\n$ redis-benchmark -t set,get -n 3000000 -c 200 -d 512 -q\nSET: 247301.10 requests per second, p50=0.391 msec\nGET: 261438.92 requests per second, p50=0.367 msec\n```\n\n从 13.8 万到 24.7 万（SET），从 14.2 万到 26.1 万（GET），吞吐量提升约 80%，P50 延迟也从 0.7ms 降到了 0.37-0.39ms。\n\n### 局限性与不适用场景\n\n多线程 I/O 并非银弹，有几个重要的局限性需要了解。首先，它对 CPU 密集型命令帮助不大。如果你的 Redis 实例大量使用 Lua 脚本（`EVAL` / `EVALSHA`）、大 key 操作（对包含百万元素的 Sorted Set 做 `ZRANGEBYSCORE`）、或者频繁触发渐进式 rehash，瓶颈在命令执行阶段而非网络 I/O，多线程 I/O 分摊不了这部分负载。\n\n其次，在集群模式下，每个节点本身已经只承担一部分 key 的流量，单节点的网络 I/O 压力相对分散，多线程的边际收益可能不如预期。实际上，很多使用 Redis Cluster 的团队反馈，开启 I/O 多线程后 QPS 提升只有 30-50%，远达不到单实例场景下的翻倍效果。\n\n第三，自旋等待是一种以 CPU 换时延的策略。如果 Redis 的负载不高（比如 QPS 只有几千），I/O 线程大部分时间在空转自旋，白白消耗 CPU 核心。低负载场景下不建议开启多线程。\n\n最后一个常见误解：I/O 多线程不能用 `CONFIG SET` 在线热修改线程数。`io-threads` 参数只在 Redis 启动时读取，运行中修改无效，必须重启实例才能生效。\n\n### 与其他方案的对比\n\n很多人拿 Redis 的 I/O 多线程和 Memcached 的多线程做比较。Memcached 从设计之初就是完全的多线程模型——主线程 accept 连接，worker 线程池处理请求，命令执行也是多线程并发的，通过 CAS 和全局 cache_lock 保护共享数据。Memcached 能这样做是因为它只支持简单的 `get` / `set` / `delete`，数据结构就是一个哈希表加一个 LRU 链表，锁竞争的表面积很小。Redis 的数据结构复杂得多——字典的渐进式 rehash、跳表的并发插入、Stream 的消费者组管理——如果命令执行也多线程化，锁设计的复杂度和潜在 bug 数量会暴增。Redis 团队选择只做 I/O 线程化，是一个在收益和复杂度之间非常精准的权衡。\n\n另外值得一提的是 KeyDB，它是 Redis 的一个 fork，走了完全不同的路线：命令执行也是多线程的，通过细粒度锁来保护并发操作。KeyDB 的 benchmark 数据确实比 Redis 好看，但它的代码复杂度和潜在的并发 bug 风险也显著更高。Redis 7.0+ 的官方路线图更倾向于通过 `io-threads` + 多实例部署来横向扩展，而非走 KeyDB 的全面多线程路线。\n\n### 面试高频追问与知识关联\n\n面试中围绕这个话题最常见的追问路线有三条。第一条是「I/O 线程之间怎么保证不操作同一个 client」——答案是每个 client 在一轮事件循环中只被分配给一个 I/O 线程，不存在两个线程同时操作同一个 client 的情况，因此不需要 per-client 锁。第二条是「如果一个 I/O 线程分到的客户端比其他线程多怎么办」——round-robin 分配策略在统计意义上是均匀的，但确实可能出现短暂的不均衡，这被认为是可接受的代价。第三条是「自旋等待会不会浪费 CPU」——会的，所以 Redis 在负载较低时会自动退回到单线程模式（当 `clients_pending_read` 列表长度小于 `io-threads * 2` 时跳过多线程分发）。\n\n这个知识点与 Redis 线程模型的其他几个核心话题紧密关联：理解 I/O 多线程的前提是理解 Redis 的事件循环和 `epoll` 机制，而理解它的设计动机则需要知道 Redis 为什么选择单线程模型。在面试中如果能把「单线程 → I/O 多路复用 → 6.0 I/O 多线程 → BIO 后台线程」这四层线程模型一气呵成地讲清楚，基本上能给面试官留下非常深刻的印象。",
+      "keyPoints": [
+        "Redis 6.0 多线程 I/O 只将网络数据的 read/write 系统调用分配给多个线程并行执行，命令的解析和执行仍然严格在主线程串行完成，因此不需要对任何内部数据结构加锁",
+        "完整工作流程分为四个同步阶段：主线程收集待读客户端并轮询分配给 I/O 线程 → I/O 线程并行读取+解析 → 主线程串行执行所有命令 → I/O 线程并行写回响应，每个阶段之间通过忙等待屏障同步",
+        "线程同步使用 C11 原子变量 io_threads_pending[id] + 自旋等待（busy-wait），不使用 pthread_mutex 或条件变量，避免 futex 系统调用的开销",
+        "io-threads 的值包含主线程自身（设为 4 表示主线程 + 3 个额外 I/O 线程），官方建议 4 核设 2-3、8 核设 6，不建议超过 8",
+        "io-threads-do-reads 默认为 no，即默认只有写回阶段是多线程的，读取多线程需要手动开启，因为写回阶段通常 CPU 占比更大",
+        "在 512 字节 value、200 并发连接场景下开启 4 个 I/O 线程，吞吐量可从约 14 万 QPS 提升到约 25 万 QPS，P50 延迟从 0.7ms 降至 0.37ms",
+        "不适用于 CPU 密集型命令（Lua 脚本、大 key 操作）和低负载场景；io-threads 参数不支持在线热修改，必须重启实例生效",
+        "当 clients_pending_read 列表长度小于 io-threads × 2 时 Redis 自动跳过多线程分发退回单线程模式，避免低负载下的 CPU 空转浪费"
+      ],
+      "quiz": [
+        {
+          "id": "redis-mt-io-threads-q1-quiz1",
+          "question": "Redis 6.0 引入的多线程 I/O，「多线程」具体负责什么工作？",
+          "choices": [
+            { "id": "A", "text": "多线程负责并行执行 Redis 命令，一个线程执行 GET，另一个线程同时执行 SET" },
+            { "id": "B", "text": "多线程负责网络数据的读取（read + 解析）和写回（write），命令执行仍在主线程串行完成" },
+            { "id": "C", "text": "多线程负责 RDB 持久化和 AOF 重写，与网络 I/O 无关" },
+            { "id": "D", "text": "多线程负责管理客户端连接的建立和断开，即并行 accept 和 close" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 6.0 的多线程 I/O 严格限定在网络层面：I/O 线程只负责从 socket 读取数据、将数据解析为命令（但不执行）、以及将命令执行结果写回 socket。命令的实际执行始终在主线程中串行完成，因此不需要对 Redis 的任何内部数据结构加锁。选项 A 描述的是「命令线程化」，这正是 Redis 明确拒绝的方案。选项 C 描述的是 BIO 后台线程和 fork 子进程的工作，与 I/O 多线程无关。选项 D 也不对，accept 连接始终由主线程完成。"
+        },
+        {
+          "id": "redis-mt-io-threads-q1-quiz2",
+          "question": "Redis 6.0 引入多线程 I/O 的核心动机是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 的内存操作太慢，需要多线程并行执行命令来加速" },
+            { "id": "B", "text": "Redis 需要多线程来支持事务的并发隔离" },
+            { "id": "C", "text": "网络 I/O 的 read/write 系统调用在高并发下成为主要的 CPU 瓶颈，命令执行本身只占很小比例" },
+            { "id": "D", "text": "Redis 5.0 的单线程无法支持超过 1000 个并发连接" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "通过 `perf top` 分析可以发现，Redis 主线程的 CPU 时间中 readQueryFromClient 和 writeToClient 两个网络 I/O 函数占比超过 40%，而真正的命令执行函数 processCommand 只占约 4%。瓶颈在网络 I/O 的系统调用上，不在命令执行上。选项 A 完全反了——内存操作在纳秒级，根本不是瓶颈。选项 B 混淆了多线程 I/O 与并发控制的概念。选项 D 也是错误的，单线程配合 epoll 可以轻松管理数万个并发连接，连接数从来不是 Redis 单线程的瓶颈。"
+        },
+        {
+          "id": "redis-mt-io-threads-q1-quiz3",
+          "question": "在多线程 I/O 模式下，主线程和 I/O 线程之间的同步机制是什么？",
+          "choices": [
+            { "id": "A", "text": "使用 pthread_mutex 互斥锁保护共享的客户端列表" },
+            { "id": "B", "text": "使用 C11 原子变量 io_threads_pending[id] 配合自旋等待（busy-wait），不使用任何 mutex" },
+            { "id": "C", "text": "使用 pthread_cond 条件变量进行线程间的信号通知" },
+            { "id": "D", "text": "使用 Linux 的 eventfd 文件描述符进行线程间通信" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 的 I/O 线程同步完全基于原子变量和自旋等待。主线程将任务分发后设置 io_threads_pending[id] 为对应客户端数量，I/O 线程检测到 pending 不为零后开始工作，完成后将其置零。主线程则循环检查所有 I/O 线程的 pending 是否都归零来判断是否全部完成。这种自旋等待避免了 mutex 的 futex 系统调用开销（每次 25-100ns），也避免了条件变量可能导致的线程挂起和唤醒延迟。代价是空闲时会占用 CPU 核心自旋，但 Redis 在低负载时会自动退回单线程模式来规避这个问题。"
+        },
+        {
+          "id": "redis-mt-io-threads-q1-quiz4",
+          "question": "以下 redis.conf 配置中，实际额外启动了几个 I/O 线程？\n\n```\nio-threads 4\nio-threads-do-reads yes\n```",
+          "choices": [
+            { "id": "A", "text": "4 个额外线程，加上主线程共 5 个" },
+            { "id": "B", "text": "3 个额外线程，因为 io-threads 的值包含主线程自身" },
+            { "id": "C", "text": "8 个额外线程，因为 io-threads-do-reads 会让读和写各启动 4 个线程" },
+            { "id": "D", "text": "4 个额外读线程 + 4 个额外写线程，共 8 个" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`io-threads` 参数的值包含主线程自身在内。设为 4 意味着主线程作为线程 0 参与 I/O 工作，另外额外启动线程 1、2、3，一共 4 个线程处理网络读写。`io-threads-do-reads yes` 只是开启了读取阶段的多线程，不会额外创建新线程——读和写使用的是同一组 I/O 线程，只是在不同阶段切换操作类型（通过全局变量 `io_threads_op` 控制是 IO_THREADS_OP_READ 还是 IO_THREADS_OP_WRITE）。选项 A 的理解错误在于没意识到主线程被计入总数。选项 C 和 D 完全误解了线程复用机制。"
+        },
+        {
+          "id": "redis-mt-io-threads-q1-quiz5",
+          "question": "下面的 redis-benchmark 输出对比说明了什么？\n\n```\n# io-threads 1\nSET: 138712 req/s, p50=0.711ms\n# io-threads 4 + io-threads-do-reads yes\nSET: 247301 req/s, p50=0.391ms\n```",
+          "choices": [
+            { "id": "A", "text": "开启多线程后命令执行速度变快了近一倍" },
+            { "id": "B", "text": "开启多线程后网络 I/O 并行化使得吞吐量提升约 78%、P50 延迟降低约 45%，但命令执行速度本身并未改变" },
+            { "id": "C", "text": "开启多线程后 Redis 使用了 4 倍的内存，用空间换取了速度提升" },
+            { "id": "D", "text": "这个提升完全来自 CPU 缓存命中率的提高，与网络 I/O 无关" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "从 138712 到 247301 QPS 提升约 78%（接近翻倍），P50 延迟从 0.711ms 降至 0.391ms 降低约 45%。这个提升完全来自网络 I/O 阶段的并行化——多个线程同时从不同 socket 读取数据和写回响应，减少了主线程在 read/write 系统调用上的串行等待时间。命令执行本身仍在主线程串行完成，速度没有变化。选项 A 的表述有误导性，不是「命令执行变快」而是「网络 I/O 吞吐提升」。选项 C 完全无关，多线程 I/O 几乎不增加内存使用。选项 D 也不对，核心收益来自 I/O 并行化。"
+        },
+        {
+          "id": "redis-mt-io-threads-q1-quiz6",
+          "question": "关于 io-threads-do-reads 这个配置，以下哪个说法是正确的？",
+          "choices": [
+            { "id": "A", "text": "默认为 yes，读和写都是多线程的" },
+            { "id": "B", "text": "默认为 no，即只有写回阶段是多线程的，读取多线程需要手动开启" },
+            { "id": "C", "text": "设为 yes 后 Redis 会额外创建一组专门的读线程" },
+            { "id": "D", "text": "这个配置在 Redis 7.0 中已被移除，读多线程变成了强制开启" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`io-threads-do-reads` 默认为 `no`，这意味着即使你配置了 `io-threads 4`，默认也只有写回阶段使用多线程，读取阶段仍然在主线程串行完成。Redis 作者 antirez 解释过原因：在大多数 benchmark 场景中，写回阶段在主线程 CPU 时间中的占比大于读取阶段，所以只开写多线程就能获得大部分收益。设为 yes 后不会创建额外线程，读和写使用的是同一组 I/O 线程，只是增加了读阶段的多线程分发逻辑。截至 Redis 7.2，这个配置仍然存在且默认仍为 no。"
+        },
+        {
+          "id": "redis-mt-io-threads-q1-quiz7",
+          "question": "Redis 的 I/O 多线程与 Memcached 的多线程模型相比，本质区别是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 只做 I/O 线程化，命令执行保持单线程无锁；Memcached 是命令执行也多线程，需要用锁保护共享数据结构" },
+            { "id": "B", "text": "Redis 用了更先进的锁技术，所以命令执行可以多线程且无竞争" },
+            { "id": "C", "text": "两者完全一样，都是命令执行多线程化" },
+            { "id": "D", "text": "Memcached 是单线程的，Redis 6.0 才是真正的多线程方案" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是两种截然不同的多线程策略。Redis 6.0 的多线程只覆盖网络 I/O 层面，命令执行严格单线程，因此不需要对内部数据结构加任何锁。Memcached 从一开始就是完全的多线程模型：主线程 accept 连接，worker 线程池同时处理请求和执行命令，需要 CAS 和 cache_lock 来保护共享的哈希表和 LRU 链表。Memcached 能这样做是因为它只支持简单的 key-value 操作，锁的粒度和冲突概率都较小。Redis 的数据结构远比 Memcached 复杂，如果命令执行也多线程化，锁设计的难度会急剧上升。选项 D 完全搞反了，Memcached 一直都是多线程的。"
+        },
+        {
+          "id": "redis-mt-io-threads-q1-quiz8",
+          "question": "在生产环境中，以下哪种场景开启 Redis I/O 多线程的收益最大？",
+          "choices": [
+            { "id": "A", "text": "QPS 只有几百，key 和 value 都很小的低流量缓存" },
+            { "id": "B", "text": "大量使用 EVAL 执行复杂 Lua 脚本的计算密集型场景" },
+            { "id": "C", "text": "高并发、大量客户端连接、value 体积在几百字节的典型缓存读写场景" },
+            { "id": "D", "text": "每天只在凌晨执行一次 BGSAVE 的冷备份实例" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "I/O 多线程的收益取决于网络 I/O 在总 CPU 时间中的占比。高并发（大量客户端连接意味着大量 read/write 系统调用）、中等体积的 value（几百字节让网络 I/O 有足够工作量但不至于命令执行太重）是最理想的场景。选项 A 是低负载场景，I/O 线程大部分时间在自旋空转浪费 CPU，Redis 自身也会在负载低时跳过多线程分发。选项 B 的瓶颈在 Lua 脚本的命令执行阶段，网络 I/O 不是瓶颈，多线程帮不上忙。选项 D 几乎没有网络流量，完全没有开启多线程的必要。"
+        },
+        {
+          "id": "redis-mt-io-threads-q1-quiz9",
+          "question": "关于 Redis I/O 多线程的在线修改，以下说法正确的是？",
+          "choices": [
+            { "id": "A", "text": "可以通过 CONFIG SET io-threads 8 在线增加 I/O 线程数" },
+            { "id": "B", "text": "io-threads 参数只在 Redis 启动时读取，运行中修改需要重启实例才能生效" },
+            { "id": "C", "text": "可以用 CONFIG REWRITE 热更新 io-threads，无需重启" },
+            { "id": "D", "text": "io-threads 支持在线从 4 调整到 1 来临时关闭多线程" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`io-threads` 是一个启动时参数（startup-only parameter），Redis 在启动时根据这个值创建 I/O 线程，之后无法在线修改。即使通过 `CONFIG SET io-threads 8` 修改了内存中的配置值，也不会有任何效果——因为线程已经创建好了，Redis 不会在运行时动态增减线程。要改变 I/O 线程数，唯一的办法是修改 redis.conf 后重启实例。这是一个生产运维中的重要注意事项：如果发现当前 io-threads 数量不合适，需要安排一次重启窗口，而不能像 maxmemory 那样在线热调。"
+        },
+        {
+          "id": "redis-mt-io-threads-q1-quiz10",
+          "question": "当 Redis 检测到 clients_pending_read 列表长度小于 io-threads × 2 时会怎么做？",
+          "choices": [
+            { "id": "A", "text": "报错并拒绝新的客户端连接" },
+            { "id": "B", "text": "自动将多余的 I/O 线程销毁以节省内存" },
+            { "id": "C", "text": "跳过多线程分发，由主线程直接串行处理这些客户端的读取，避免低负载下的 CPU 空转浪费" },
+            { "id": "D", "text": "将 I/O 线程切换为执行 AOF fsync 和 lazy-free 等后台任务" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 Redis 的一个精巧优化。自旋等待的 I/O 线程即使没有任务也会持续占用 CPU 核心空转。如果待处理的客户端数量太少（小于 io-threads × 2），多线程分发的开销反而大于收益——分发任务、设置原子变量、等待线程完成这些协调成本在任务量很小时变得不划算。所以 Redis 在这种情况下会跳过整个多线程分发流程，由主线程直接串行处理所有待读客户端。I/O 线程不会被销毁，它们仍在自旋等待下一轮任务，只是这一轮没有被激活。选项 D 完全错误，I/O 线程和 BIO 线程是独立的线程组，职责不可互换。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/config-file/",
+        "https://github.com/redis/redis/blob/7.2/src/networking.c",
+        "https://raw.githubusercontent.com/redis/redis/7.2/redis.conf",
+        "https://github.com/redis/redis/blob/7.2/src/server.h"
+      ]
+    }
+  ]
+}

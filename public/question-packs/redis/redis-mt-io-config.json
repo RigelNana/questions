@@ -1,0 +1,163 @@
+{
+  "id": "redis-mt-io-config",
+  "name": "io-threads 和 io-threads-do-reads 配置详解",
+  "domain": "redis",
+  "description": "深入讲解 Redis 6.0 多线程 IO 的两个核心配置项：io-threads 线程数设置与 io-threads-do-reads 读多线程开关，涵盖取值建议、验证方法与生产调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-mt-io-config-q1",
+      "domain": "redis",
+      "type": "env-config",
+      "difficulty": 2,
+      "tags": [
+        "io-threads",
+        "io-threads-do-reads",
+        "多线程配置",
+        "线程数调优",
+        "Redis6.0",
+        "redis-multithreading"
+      ],
+      "title": "Redis 6.0 的 io-threads 和 io-threads-do-reads 该怎么配？",
+      "content": "你的团队有一个 Redis 6.2 单实例，跑在一台 8 核 16GB 的云主机上，主要承载用户会话缓存和热点商品数据。业务是典型的「大量小 value 的 GET/SET」场景，单个 value 平均 200 字节。最近运维反馈：这个实例的 QPS 已经到了 12 万，但 CPU 使用率只有 35% 左右——`top` 看到 redis-server 进程吃了一个核的 100%，剩下 7 个核基本空闲。网络带宽只用了 40%，延迟 P99 在 0.8ms，还算健康，但业务侧预计双十一流量会翻倍到 25 万 QPS。\n\n你的同事建议开启 Redis 的多线程 IO 来提升吞吐量，给你发了一段配置：\n\n```conf\n# redis.conf - 多线程 IO 配置\nio-threads 4\nio-threads-do-reads yes\n```\n\n你看了之后有几个疑问：`io-threads 4` 是创建 4 个额外的线程还是总共 4 个？`io-threads-do-reads` 默认为什么是 `no`？在 8 核机器上线程数设成 4 够不够？这个配置能在运行时用 `CONFIG SET` 动态修改吗，还是必须重启？\n\n更关键的是：开启多线程 IO 后，Redis 的「单线程执行命令」特性还在吗？会不会引入并发安全问题？你决定在灰度环境先测试一把。\n\n以下是你灰度环境测试前后的 `redis-benchmark` 对比数据：\n\n```\n# 开启前（io-threads 1，默认单线程）\n$ redis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 1000000 -c 200 -d 200 --threads 4\nSET: 128,205.13 requests per second\nGET: 131,752.30 requests per second\n\n# 开启后（io-threads 4, io-threads-do-reads yes）\n$ redis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 1000000 -c 200 -d 200 --threads 4\nSET: 215,982.72 requests per second\nGET: 228,310.50 requests per second\n```\n\n吞吐量提升了接近 70%。但你还想搞清楚这背后的配置细节——线程数应该怎么选、什么场景不该开、有没有什么坑。这道题就来把 `io-threads` 和 `io-threads-do-reads` 这两个配置项彻底讲透。",
+      "answer": "## Redis 多线程 IO 模型基础\n\n要讲清楚 `io-threads` 和 `io-threads-do-reads` 这两个配置，得先理解 Redis 6.0 引入多线程 IO 的背景和它的工作边界。\n\nRedis 一直以「单线程」著称，但这里说的单线程特指「命令执行是单线程的」——所有的 `SET`、`GET`、`LPUSH` 等数据操作都在主线程里串行完成，不需要加锁，天然线程安全。但一个完整的客户端请求处理，其实包含三个阶段：从 socket 读取数据（read）、解析并执行命令（process）、把响应写回 socket（write）。在 Redis 6.0 之前，这三个阶段全部由主线程一个人干。当 QPS 上到十几万的时候，瓶颈往往不在命令执行本身——Redis 内存操作极快，一次 GET 可能只要几百纳秒——而是在 socket 的读写和协议解析上。尤其是 `write` 阶段，当响应体较大或客户端连接数很多时，主线程花在网络 IO 上的时间占比可以超过 60%。\n\nRedis 6.0 的多线程 IO 就是为了解决这个问题：把网络读写这种「CPU 密集但无状态」的工作分摊给多个 IO 线程，而命令执行仍然留在主线程。这个设计非常关键——它保留了 Redis 最核心的单线程执行模型，不引入任何锁，同时利用多核加速网络吞吐。\n\n具体流程是这样的：主线程通过 epoll 收到一批就绪的客户端连接后，把这些连接按轮询方式分配给 IO 线程。IO 线程并行地执行 socket read + 协议解析（如果开了 `io-threads-do-reads`）或者 socket write（默认就会分摊写操作）。等所有 IO 线程完成后，主线程再串行地执行命令，然后把响应结果再分配给 IO 线程去写回客户端。整个过程中，IO 线程之间以及 IO 线程与主线程之间通过自旋等待（busy-waiting）同步，没有用 mutex 或条件变量，所以同步开销极小。\n\n## io-threads 配置详解\n\n`io-threads` 控制的是 IO 线程的总数，**这个数字包含主线程自身**。所以 `io-threads 4` 的含义是：1 个主线程 + 3 个额外的 IO 线程，总共 4 个线程参与网络读写。这是一个非常容易搞错的点，很多人以为 `io-threads 4` 会创建 4 个额外线程，实际上只多了 3 个。\n\n来看它的核心参数规格：\n\n```conf\n# 语法\nio-threads <N>\n\n# 默认值：1（等同于不开启多线程 IO，所有工作都在主线程完成）\nio-threads 1\n\n# 取值范围：1 ~ 128\n# 但实际上，官方明确建议不要超过 8\n# 源码中的硬限制定义在 server.h：\n#   #define IO_THREADS_MAX_NUM 128\n```\n\n`io-threads` 设为 1 的时候，Redis 完全退化为传统的单线程模式，不会创建任何额外线程。这也是默认行为——Redis 的设计哲学是「不需要多线程的场景就别开」。\n\n一个关键的运维约束：**`io-threads` 只能在 `redis.conf` 配置文件中设置，不支持 `CONFIG SET` 动态修改**。因为 IO 线程是在 Redis 启动时 `initThreadedIO()` 里创建的 pthread，线程数在启动后就固定了。要修改线程数，必须改配置文件然后重启 Redis。这一点在生产环境的变更管理中必须注意——不能像调 `maxmemory` 那样在线热更新。\n\n### 线程数选择建议\n\n线程数不是越多越好。Redis 的 IO 线程通过自旋等待来同步，线程太多会导致自旋开销增大，反而拖慢性能。官方在 `redis.conf` 的注释里给出了明确建议：\n\n```conf\n# 官方建议（redis.conf 原文注释）：\n# If you have a four cores boxes, try to use 2 or 3 I/O threads.\n# If you have a 8 cores, try to use 6 I/O threads.\n# 总结：\n#   4 核机器 → io-threads 2~3\n#   8 核机器 → io-threads 4~6\n#   不建议超过 8，即使你有 64 核\n```\n\n为什么不建议超过 8？有两个原因。第一，IO 线程间的同步用的是自旋等待（主线程在一个 while 循环里不断检查各 IO 线程的待处理计数是否归零），线程越多，自旋轮询的次数越多，CPU 空转的浪费就越大。第二，Redis 需要给操作系统内核、BIO 后台线程（负责 close fd、fsync、lazyfree 等）预留 CPU 核心。如果 IO 线程把所有核心都占满了，BIO 线程和系统进程得不到调度，反而会引发延迟毛刺。官方建议至少预留 1~2 个核给系统和 BIO 线程。\n\n以题目中的 8 核机器为例，`io-threads 4` 是一个合理的起点：1 个主线程 + 3 个 IO 线程占用 4 个核，剩余 4 个核给系统、BIO 线程、以及可能的监控 agent。如果实测下来吞吐还有余量，可以尝试调到 5 或 6，但不要超过 6。\n\n## io-threads-do-reads 配置详解\n\n`io-threads-do-reads` 控制 IO 线程是否参与读操作（即从 socket 读取数据并解析 RESP 协议）。\n\n```conf\n# 语法\nio-threads-do-reads yes|no\n\n# 默认值：no\nio-threads-do-reads no\n```\n\n默认为 `no` 意味着：即使你开了 `io-threads 4`，IO 线程也只负责写操作（把响应数据写回客户端 socket），读操作（从 socket 读数据、解析命令）仍然由主线程独自完成。只有显式设为 `yes`，IO 线程才会同时分担读和写。\n\n为什么默认关闭？Redis 官方在源码注释中说得很直白：\n\n```c\n// networking.c 中的注释：\n// Reading from the client is not normally threaded since usually\n// the overhead is small compared to the overhead of writing\n// the reply to the client.\n```\n\n简单说，Redis 认为在大多数场景下，写操作（发响应）的开销远大于读操作（收请求），因为响应通常比请求大得多。比如一个 `LRANGE key 0 999` 请求只有几十字节，但响应可能是几十 KB。在这种读写不对称的场景下，只把写操作多线程化就已经能获得大部分收益，开启读多线程的边际提升不大。\n\n但在实际生产中，如果你的场景是大量小 value 的 GET/SET——请求和响应体积差不多大——开启 `io-threads-do-reads yes` 通常能额外带来 10%~20% 的吞吐提升。题目中的基准测试数据（GET 从 13.1 万提升到 22.8 万）就是两个配置同时开启后的效果。这个提升在高并发小包场景下非常可观。\n\n## 配置验证方法\n\n配置改完重启后，怎么确认多线程 IO 确实生效了？有两种验证方式。\n\n第一种是用 `INFO server` 检查：\n\n```bash\n$ redis-cli INFO server | grep io_threads\nio_threads_active:0\n```\n\n注意这里 `io_threads_active` 显示 0 不代表配置没生效。Redis 的 IO 线程是按需激活的——只有当待处理的客户端数量超过阈值（当前 IO 线程数 × 2）时，才会真正启用多线程分发。在低负载时，Redis 会退回单线程模式以避免不必要的线程同步开销。所以验证时需要在有并发压力的情况下观察这个值。\n\n第二种更直接——用 `ps` 查看 Redis 进程的线程：\n\n```bash\n$ ps -T -p $(pidof redis-server) | head -10\n  PID   SPID TTY          TIME CMD\n 1234   1234 ?        00:05:32 redis-server\n 1234   1235 ?        00:00:03 io_thd_1\n 1234   1236 ?        00:00:03 io_thd_2\n 1234   1237 ?        00:00:02 io_thd_3\n 1234   1238 ?        00:00:00 bio_close_file\n 1234   1239 ?        00:00:01 bio_aof_fsync\n 1234   1240 ?        00:00:00 bio_lazy_free\n```\n\n如果你配置了 `io-threads 4`，应该能看到 3 个 `io_thd_*` 线程（加上主线程共 4 个）。旁边还能看到 3 个 `bio_*` 线程——这些是 Redis 一直就有的后台线程，跟 6.0 的 IO 线程不是一回事。\n\n## 什么场景该开、什么场景别开\n\n开启多线程 IO 的前提条件其实很明确：单实例 QPS 已经超过 10 万左右，且 CPU 只有一个核跑满而其他核空闲，网络带宽还有余量但吞吐量上不去。符合这三个条件，说明瓶颈在单线程的网络 IO 处理能力上，开多线程 IO 能有效缓解。典型场景就是大量小 value 的 GET/SET、高并发的 Session 缓存、热 key 读取等。\n\n反过来，以下场景不建议开启。第一种是 QPS 本身不高——如果单线程就能轻松应付，多线程只会增加线程管理的开销和运维复杂度。第二种是 CPU 密集型命令占比高的场景，比如大量 Lua 脚本执行、`SORT` 大集合、`KEYS *` 全库扫描、大 key 的序列化——这些命令的瓶颈在命令执行阶段，而命令执行始终是单线程的，IO 多线程帮不上忙。第三种是已经通过 Redis Cluster 或多实例分摊了负载——水平扩展比单机优化更有效，也更容易线性扩容。\n\n## 注意事项与兼容性\n\n有几个生产环境中必须注意的坑。首先，`io-threads` 不支持动态修改这一点前面已经说了，改配置必须重启，所以在做变更时要走正常的重启流程（如果是 Sentinel 或 Cluster 架构，先切主再重启从）。\n\n其次是 Cluster 模式的兼容性。`io-threads` 在 Cluster 模式下完全可以使用，每个节点独立配置自己的线程数。不过需要注意 Cluster Bus（节点间通信）的流量也会走 IO 线程，如果集群节点很多（比如 100+），节点间的 gossip 通信会占用部分 IO 线程的处理能力。\n\n第三个是 TLS 兼容性。Redis 6.0 同时引入了 TLS 支持。TLS 的加密解密是 CPU 密集型操作，恰好可以受益于 IO 线程——在开启 TLS 的场景下，多线程 IO 的性能提升比非 TLS 场景更显著，实测可以达到 2~3 倍。如果你的 Redis 开了 TLS，强烈建议同时开启 `io-threads`。\n\n## Benchmark 验证方法\n\n在灰度环境调优时，建议用以下方法做对比测试：\n\n```bash\n# 第一步：baseline 测试（io-threads 1，默认单线程）\nredis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 1000000 \\\n  -c 200 -d 200 --threads 4 -q\n\n# 第二步：修改 redis.conf，设置 io-threads 4 + io-threads-do-reads yes\n# 重启 Redis\n\n# 第三步：相同参数再跑一次\nredis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 1000000 \\\n  -c 200 -d 200 --threads 4 -q\n\n# 第四步：对比两次的 requests per second\n# 典型结果：小 value 场景下提升 50%~100%\n```\n\n注意 `redis-benchmark` 的 `--threads` 参数（Redis 6.0+ 支持）是客户端侧的多线程，跟服务端的 `io-threads` 是两回事。客户端也要多线程才能产生足够的压力，否则单线程客户端可能先成为瓶颈，导致你测出来的数据偏低。`-c 200` 的并发连接数也很重要——IO 线程是在连接数较多时才有优势，如果只开 10 个连接，多线程 IO 可能根本不会被激活。\n\n最后一个实战建议：调优时先只开 `io-threads`（不开 `do-reads`），测一轮数据；然后再加上 `io-threads-do-reads yes`，再测一轮。这样你能清楚地看到读多线程带来的增量收益，心里有数后再决定生产环境是否同时开启。",
+      "keyPoints": [
+        "io-threads N 中的 N 包含主线程本身，所以 io-threads 4 = 主线程 + 3 个额外 IO 线程，而不是额外创建 4 个线程",
+        "io-threads 默认值为 1（不开启多线程 IO），取值范围 1~128，但官方建议不超过 8，4 核建议 2~3，8 核建议 4~6",
+        "io-threads 只能在 redis.conf 中配置，不支持 CONFIG SET 动态修改，修改后必须重启 Redis 才能生效",
+        "io-threads-do-reads 默认 no，即 IO 线程默认只分担写操作，读操作仍由主线程处理，因为大多数场景下写的开销远大于读",
+        "开启 io-threads-do-reads yes 后在小 value 的 GET/SET 场景下通常额外提升 10%~20% 吞吐，读写体积接近时收益更明显",
+        "IO 线程只负责网络读写和协议解析，命令执行始终在主线程串行完成，不引入并发安全问题，保留了 Redis 单线程执行模型的核心优势",
+        "IO 线程通过自旋等待（busy-waiting）同步而非 mutex，线程数过多会增加自旋空转开销，同时需要预留 1~2 个核给系统和 BIO 线程",
+        "验证 IO 线程配置是否生效可以用 ps -T 查看 io_thd_* 线程数量，或在有压力时通过 INFO server 的 io_threads_active 指标确认"
+      ],
+      "quiz": [
+        {
+          "id": "redis-mt-io-config-q1-quiz1",
+          "question": "配置 io-threads 4 后，Redis 实际会创建几个额外的 IO 线程？",
+          "choices": [
+            { "id": "A", "text": "4 个额外 IO 线程，加上主线程共 5 个" },
+            { "id": "B", "text": "3 个额外 IO 线程，加上主线程共 4 个" },
+            { "id": "C", "text": "4 个额外 IO 线程，主线程不参与 IO" },
+            { "id": "D", "text": "3 个额外 IO 线程，主线程不参与 IO，由这 3 个线程全权负责" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "io-threads 的值包含主线程自身。设为 4 表示总共 4 个线程参与网络 IO：1 个主线程 + 3 个通过 pthread_create 创建的额外 IO 线程。这是一个非常容易搞错的细节——源码中 initThreadedIO() 的循环是从 1 开始到 io-threads-1，跳过了索引 0（主线程）。A 选项是最常见的误解，把 N 当成了额外线程数；C 和 D 都错误地认为主线程不参与 IO，实际上主线程既参与 IO 分发，也负责命令执行。"
+        },
+        {
+          "id": "redis-mt-io-config-q1-quiz2",
+          "question": "io-threads 的默认值是多少？设为默认值时 Redis 的行为是什么？",
+          "choices": [
+            { "id": "A", "text": "默认值 0，表示自动检测 CPU 核心数并创建对应数量的 IO 线程" },
+            { "id": "B", "text": "默认值 1，表示不开启多线程 IO，所有网络读写都由主线程完成" },
+            { "id": "C", "text": "默认值 4，Redis 6.0 开始自动启用 4 线程 IO" },
+            { "id": "D", "text": "默认值 1，但 Redis 会在检测到高负载时自动增加线程数" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "io-threads 默认值是 1，这意味着 Redis 完全以传统单线程模式运行，不会创建任何额外的 IO 线程。Redis 的设计哲学是保守的——多线程 IO 需要管理员显式开启，不会自动检测 CPU 或自动调整。A 选项描述的自动检测机制在 Redis 中不存在；C 选项完全不符合 Redis 的默认行为；D 选项描述的自动扩线程能力也不存在，io-threads 一旦在启动时确定就固定不变，运行时不会动态调整。"
+        },
+        {
+          "id": "redis-mt-io-config-q1-quiz3",
+          "question": "开启多线程 IO 后，Redis 的命令执行模型发生了什么变化？",
+          "choices": [
+            { "id": "A", "text": "命令执行也变成多线程了，不同客户端的命令会在不同 IO 线程中并行执行" },
+            { "id": "B", "text": "命令执行仍然是单线程的，IO 线程只负责网络读写和协议解析，所有命令在主线程串行执行" },
+            { "id": "C", "text": "读命令（GET）在 IO 线程中执行，写命令（SET）在主线程中执行" },
+            { "id": "D", "text": "命令执行变成多线程了，但通过全局锁保证线程安全" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Redis 6.0 多线程 IO 设计中最核心的一点：IO 线程只负责 socket 读写（recvfrom/sendto）和 RESP 协议解析，命令的实际执行（查找 key、修改数据结构、生成响应）始终在主线程中串行完成。这样 Redis 的数据操作完全不需要加锁，保留了单线程模型最大的优势——无锁无竞争。A 选项是最常见的误解，认为多线程 IO 就是多线程执行命令；C 选项按读写类型区分执行线程不符合实际；D 选项描述的全局锁方案恰恰是 Redis 要避免的设计。"
+        },
+        {
+          "id": "redis-mt-io-config-q1-quiz4",
+          "question": "IO 线程之间以及 IO 线程与主线程之间使用什么同步机制？",
+          "choices": [
+            { "id": "A", "text": "pthread_mutex 互斥锁 + pthread_cond 条件变量" },
+            { "id": "B", "text": "自旋等待（busy-waiting），主线程轮询检查各 IO 线程的待处理计数是否归零" },
+            { "id": "C", "text": "无锁队列（lock-free queue）+ CAS 原子操作" },
+            { "id": "D", "text": "Linux eventfd + epoll 通知机制" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 的 IO 线程同步机制非常简单粗暴——自旋等待。主线程把任务分配给各 IO 线程后，就进入一个 while 循环，不断检查每个 IO 线程的 io_threads_pending[id] 计数器是否归零（表示该线程处理完了）。IO 线程处理完后也会自旋等待主线程分配下一批任务。这种设计的好处是延迟极低（无上下文切换开销），代价是 CPU 空转。这也是为什么线程数不能太多的原因——线程越多，自旋轮询的 CPU 浪费越大。A、C、D 描述的都是更复杂的同步机制，Redis 出于延迟考虑没有采用。"
+        },
+        {
+          "id": "redis-mt-io-config-q1-quiz5",
+          "question": "在配置了 io-threads 4 的 Redis 实例上执行 ps -T 查看线程，预期会看到多少个 io_thd_* 线程？",
+          "choices": [
+            { "id": "A", "text": "4 个 io_thd_* 线程" },
+            { "id": "B", "text": "3 个 io_thd_* 线程" },
+            { "id": "C", "text": "4 个 io_thd_* 线程 + 3 个 bio_* 线程" },
+            { "id": "D", "text": "3 个 io_thd_* 线程，但只在高负载时才出现" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "io-threads 4 中，主线程本身算 1 个，额外创建 3 个 IO 线程，所以 ps -T 会看到 3 个名为 io_thd_1、io_thd_2、io_thd_3 的线程。主线程显示为 redis-server，不会出现在 io_thd_* 的命名中。A 选项多算了一个，这是把主线程也当成了额外创建的线程；C 选项线程数不对，虽然 bio_* 线程确实存在（bio_close_file、bio_aof_fsync、bio_lazy_free 共 3 个），但 io_thd 数量应该是 3 不是 4；D 选项错误地认为线程是按需创建的，实际上 IO 线程在启动时就全部创建好了，不会动态增减。"
+        },
+        {
+          "id": "redis-mt-io-config-q1-quiz6",
+          "question": "以下关于 io-threads 的说法，哪个是错误的？",
+          "choices": [
+            { "id": "A", "text": "可以通过 CONFIG SET io-threads 8 在运行时动态增加 IO 线程数" },
+            { "id": "B", "text": "io-threads 只能在 redis.conf 中设置，修改后需要重启 Redis" },
+            { "id": "C", "text": "io-threads 取值范围是 1~128，但建议不超过 8" },
+            { "id": "D", "text": "io-threads 设为 1 时等同于不开启多线程 IO" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "io-threads 不支持 CONFIG SET 动态修改，这是一个运维中容易犯的错误。IO 线程是在 Redis 启动时通过 initThreadedIO() 函数创建的 pthread，线程数在进程生命周期内固定不变。如果你在 redis-cli 中执行 CONFIG SET io-threads 8，Redis 会返回错误。要修改线程数，唯一的方法是修改 redis.conf 然后重启。B、C、D 的描述都是正确的——只能在配置文件中设置、范围 1~128（建议不超过 8）、设为 1 等同于不开启。"
+        },
+        {
+          "id": "redis-mt-io-config-q1-quiz7",
+          "question": "io-threads-do-reads 默认为 no 的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "因为读操作涉及数据修改，多线程读会导致并发安全问题" },
+            { "id": "B", "text": "因为大多数场景下响应体比请求体大得多，写操作的 IO 开销更高，只多线程化写就能获得大部分收益" },
+            { "id": "C", "text": "因为读多线程在 Redis 6.0 中有已知的 bug，官方建议不要开启" },
+            { "id": "D", "text": "因为读操作必须在 epoll 事件触发后才能执行，无法被分配给 IO 线程" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 官方在源码注释中明确解释：在大多数场景下，读操作（接收客户端请求）的开销相比写操作（发送响应给客户端）要小得多，因为响应通常比请求大。例如 LRANGE 返回大量数据、MGET 返回多个 value，响应体可能是请求体的数十倍。所以仅多线程化写操作就能获得绝大部分性能提升，读多线程的边际收益不大。A 选项的逻辑不对，IO 线程的「读」是读 socket 和解析协议，不涉及数据修改；C 选项不符合事实，io-threads-do-reads 是正式功能；D 选项的技术描述也不正确。"
+        },
+        {
+          "id": "redis-mt-io-config-q1-quiz8",
+          "question": "以下哪个场景最适合开启 Redis 多线程 IO？",
+          "choices": [
+            { "id": "A", "text": "QPS 2 万，主要执行复杂 Lua 脚本，平均每个脚本执行 5ms" },
+            { "id": "B", "text": "QPS 15 万，大量小 value GET/SET（平均 200 字节），CPU 单核跑满其余空闲" },
+            { "id": "C", "text": "QPS 5 万，已通过 3 个 Redis 实例分摊负载，单实例不到 2 万 QPS" },
+            { "id": "D", "text": "QPS 3 万，大量 SORT 和 ZUNIONSTORE 操作，key 平均包含 10 万元素" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "多线程 IO 的适用场景有三个特征：单实例 QPS 超过 10 万且还在增长、主要是小 value 的简单命令（GET/SET/INCR 等）、CPU 单核跑满但其余核空闲。B 选项完美匹配这三个条件。A 选项的瓶颈在 Lua 脚本的执行时间而非网络 IO，多线程 IO 帮不上忙；C 选项已经通过多实例分摊了负载，单实例 QPS 不高，没必要开；D 选项的瓶颈在 CPU 密集型命令（SORT 大集合、ZUNIONSTORE），命令执行始终是单线程的，IO 多线程无法加速命令执行阶段。"
+        },
+        {
+          "id": "redis-mt-io-config-q1-quiz9",
+          "question": "在开启了 TLS 的 Redis 实例上，多线程 IO 的性能提升通常会怎样？",
+          "choices": [
+            { "id": "A", "text": "TLS 与 IO 线程不兼容，开启 TLS 后 io-threads 配置会被忽略" },
+            { "id": "B", "text": "提升比非 TLS 场景更显著，可达 2~3 倍，因为 TLS 加解密是 CPU 密集操作，可以被 IO 线程分摊" },
+            { "id": "C", "text": "提升与非 TLS 场景完全一样，TLS 在独立线程中处理，不走 IO 线程" },
+            { "id": "D", "text": "性能反而会下降，因为 IO 线程和 TLS 线程会争抢 CPU 资源" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "TLS 的加密和解密操作（如 AES-GCM、ChaCha20）是 CPU 密集型任务，在非多线程模式下全部由主线程处理，会显著降低吞吐量。开启 io-threads 后，TLS 的握手和数据加解密可以被 IO 线程分摊，因此性能提升比普通非 TLS 场景更加明显，实测可以达到 2~3 倍。A 选项不对，Redis 6.0 同时引入了 TLS 和多线程 IO，两者完全兼容；C 选项不对，TLS 处理不是在独立线程中，而是嵌入在 IO 线程的读写流程中；D 选项的场景只在线程数配置过多时才可能出现。"
+        },
+        {
+          "id": "redis-mt-io-config-q1-quiz10",
+          "question": "你在 8 核机器上配置了 io-threads 12，启动后发现 Redis 吞吐量反而比 io-threads 6 时低。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "io-threads 12 超过了 128 的硬限制，Redis 自动降级为单线程" },
+            { "id": "B", "text": "12 个线程超过了 8 核 CPU 的核心数，线程间的自旋等待竞争 CPU 时间片，且系统和 BIO 线程被饥饿" },
+            { "id": "C", "text": "io-threads 最大只能设为 8，超过 8 Redis 会拒绝启动" },
+            { "id": "D", "text": "线程数超过核心数后，Redis 会自动关闭 io-threads-do-reads 以节省 CPU" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "12 没有超过 128 的硬限制，Redis 可以正常启动。但 12 个线程运行在 8 核 CPU 上意味着至少 4 个线程需要共享核心。Redis IO 线程使用自旋等待（while 循环忙轮询），自旋线程会独占 CPU 核心——当线程数超过核心数时，多个自旋线程争抢同一个核心，导致频繁的上下文切换和 CPU 空转。更严重的是，操作系统内核、BIO 后台线程（close fd、fsync、lazyfree）都可能被饥饿，导致延迟毛刺甚至 AOF fsync 延迟告警。A、C 描述的硬限制行为不正确；D 的自动关闭机制不存在。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/config-file/",
+        "https://github.com/redis/redis/blob/7.2/src/networking.c",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/"
+      ]
+    }
+  ]
+}
