@@ -1,0 +1,284 @@
+{
+  "id": "redis-repl-full-sync",
+  "name": "全量复制的触发条件与执行过程",
+  "domain": "redis",
+  "description": "深入解析 Redis 主从复制中全量复制的四种触发条件、PSYNC 协议的六步执行流程、每一步的性能开销，以及无盘复制与生产环境避坑策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-repl-full-sync-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": [
+        "全量复制",
+        "PSYNC",
+        "BGSAVE",
+        "RDB传输",
+        "replication buffer",
+        "首次同步",
+        "redis-replication"
+      ],
+      "title": "Redis 全量复制是怎么触发的？执行过程是什么样的？",
+      "content": "面试中问到「Redis 主从复制怎么做全量同步的」，多数候选人的回答是「Replica 连上来之后 Master 做一次 BGSAVE，把 RDB 文件传过去」。这个回答不能说错，但只是冰山一角。面试官真正想考察的是：什么条件下 Redis 会触发全量复制而不是增量复制？PSYNC 协议的交互细节是什么？Master 在发送 RDB 期间新产生的写命令怎么处理？这整个过程对 Master 的 CPU、内存、磁盘和网络分别有多大压力？\n\nRedis 的主从复制（Replication）是实现高可用和读写分离的基础机制。当你执行 `REPLICAOF 10.0.1.1 6379`（Redis 5.0 之前叫 `SLAVEOF`）时，当前实例会成为目标 Master 的 Replica，开始数据同步。同步分为两种模式：全量复制（Full Resynchronization）和部分复制（Partial Resynchronization）。全量复制意味着 Master 要把自己的全部数据完整传给 Replica，开销巨大；部分复制则只传断线期间缺失的增量命令，轻量很多。Redis 2.8 引入了 PSYNC 协议来支持部分复制，但在很多场景下全量复制仍然不可避免。\n\n理解全量复制的触发条件和执行过程，是掌握 Redis 主从复制的关键。下面是一个典型场景：你有一个 8GB 数据的 Master 节点，当一个新 Replica 第一次连接上来时，通过 `INFO replication` 可以观察到完整的同步过程：\n\n```bash\n# Master 端观察\n127.0.0.1:6379> INFO replication\n# Replication\nrole:master\nconnected_slaves:1\nslave0:ip=10.0.1.2,port=6379,state=send_bulk,offset=0,lag=0\nmaster_replid:a3f7d8e9b1c2d4e5f6a7b8c9d0e1f2a3b4c5d6e7\nmaster_repl_offset:284756\nrepl_backlog_active:1\nrepl_backlog_size:1048576\nrepl_backlog_first_byte_offset:1\nrepl_backlog_histlen:284756\n```\n\n注意 `state=send_bulk` 这个状态，说明 Master 正在向 Replica 发送 RDB 数据。这就是一次全量复制正在进行中。如果 `repl_backlog_histlen` 还不够大，断线重连后你会频繁看到全量复制而不是部分复制——这是线上最容易踩的坑之一。\n\n那么问题来了：全量复制到底在什么条件下会被触发？PSYNC 协议的交互过程具体是怎样的？每一步的性能开销有多大？如何通过配置避免不必要的全量复制？",
+      "answer": "## Redis 主从复制基础\n\nRedis 的主从复制是一种异步的、单向的数据同步机制：数据从 Master 流向 Replica，Replica 不能反向写入 Master。这个机制的设计目标有三个——第一是实现数据冗余，Master 挂了可以从 Replica 恢复；第二是实现读写分离，读请求分散到多个 Replica 上降低 Master 的压力；第三是作为高可用的基础，Sentinel 和 Cluster 的故障转移都依赖主从复制。\n\n建立主从关系非常简单，在 Replica 端执行 `REPLICAOF <master-ip> <master-port>` 即可。Redis 5.0 之前这个命令叫 `SLAVEOF`，5.0 之后改名但旧名仍然兼容。你也可以在配置文件里写 `replicaof 10.0.1.1 6379` 让 Replica 启动时自动连接 Master。如果 Master 设置了密码，Replica 端需要配置 `masterauth <password>`。\n\n```bash\n# Replica 端建立主从关系\n127.0.0.1:6380> REPLICAOF 10.0.1.1 6379\nOK\n\n# 检查复制状态\n127.0.0.1:6380> INFO replication\n# Replication\nrole:slave\nmaster_host:10.0.1.1\nmaster_port:6379\nmaster_link_status:up\nmaster_last_io_seconds_ago:1\nmaster_sync_in_progress:0\nslave_repl_offset:284756\nmaster_replid:a3f7d8e9b1c2d4e5f6a7b8c9d0e1f2a3b4c5d6e7\n```\n\n一旦主从关系建立，Master 的每一条写命令都会异步传播到所有 Replica。这里的「异步」是关键——Master 执行完写命令后立即返回客户端成功，不等 Replica 确认。这意味着如果 Master 在传播命令之前宕机，那些命令会丢失。Redis 在设计上选择了性能优先于强一致性。\n\n主从复制的同步分两种模式。全量复制（Full Resynchronization）是 Master 把完整的 RDB 快照发给 Replica，适用于首次连接或增量数据已丢失的场景。部分复制（Partial Resynchronization）是 Master 只发送 Replica 缺失的那部分增量命令，依赖 replication backlog（复制积压缓冲区）来实现。Redis 2.8 引入的 PSYNC 协议使这两种模式可以动态切换。\n\n## 全量复制的四种触发条件\n\n理解全量复制什么时候会被触发，是避免不必要的性能开销的前提。全量复制在以下四种条件下发生。\n\n**第一种：Replica 首次连接 Master。** 当一个 Replica 第一次连接到 Master 时，它没有任何历史复制信息。Replica 发送的 PSYNC 命令参数是 `PSYNC ? -1`，其中 `?` 表示不知道 Master 的 Replication ID，`-1` 表示没有复制偏移量。Master 收到这样的 PSYNC 后，知道这是一个全新的 Replica，只能做全量复制。这是最常见也是最容易理解的触发场景。\n\n**第二种：Replication backlog 不够用。** Replica 断线重连后，会带着上次的 Replication ID 和 offset 发送 `PSYNC <replid> <offset>`，请求从断点处继续增量同步。Master 收到后会检查：这个 offset 是否还在 replication backlog 的范围内？Replication backlog 是 Master 端的一个环形缓冲区，默认大小 1MB（`repl-backlog-size` 参数控制），它保存了最近一段时间的写命令流。如果 Replica 断线期间的写入量超过了 backlog 的容量，那么 Replica 需要的那部分历史数据已经被覆盖了，Master 无法做部分复制，只能退回全量复制。这是生产环境中最容易踩坑的场景——默认 1MB 的 backlog 在写入量稍大的场景下几秒钟就会被写满。\n\n**第三种：Replication ID 不匹配。** 每个 Master 都有一个唯一的 Replication ID（40 字节的十六进制字符串），Replica 在同步时会记住这个 ID。如果发生了故障转移——比如 Sentinel 把一个 Replica 提升为新 Master——新 Master 会生成一个新的 Replication ID。当其他 Replica 重新连接到新 Master 时，它们携带的是旧 Master 的 Replication ID，与新 Master 不匹配。不过 Redis 4.0 做了一个优化：新 Master 会把旧 Master 的 Replication ID 保存为 `master_replid2`，如果 Replica 的 replid 匹配 `master_replid2` 且 offset 在 backlog 范围内，仍然可以做部分复制。只有 replid 和 replid2 都不匹配时，才会触发全量复制。\n\n**第四种：手动触发或特殊操作。** 执行 `DEBUG RELOAD` 会让 Redis 重新加载 RDB 文件并重建数据集，这个过程会导致 Replication ID 变化，连接的 Replica 需要重新做全量复制。另外在 Redis 7.0 之前，执行 `CONFIG SET` 修改某些关键参数（如 `databases`）也可能导致类似的情况。\n\n## 全量复制的六步执行过程\n\n全量复制的执行是一个精确编排的六步流程，每一步都有明确的职责和性能开销。\n\n**Step 1：Replica 发送 PSYNC 命令。** Replica 连接到 Master 后，先完成身份验证（如果配置了 `masterauth`），然后发送 `PSYNC <replid> <offset>`。如果是首次连接，发送的是 `PSYNC ? -1`。这一步本身几乎没有开销，就是一个普通的 TCP 请求。在 Redis 源码 `src/replication.c` 中，Replica 端的逻辑在 `slaveTryPartialResynchronization()` 函数中。\n\n**Step 2：Master 回复 +FULLRESYNC。** Master 收到 PSYNC 后，判断是否能做部分复制。如果不能（上述四种条件之一），Master 回复 `+FULLRESYNC <replid> <offset>`，其中 `replid` 是 Master 当前的 Replication ID，`offset` 是当前的复制偏移量。Replica 收到后保存这两个值，准备接收全量数据。从这一刻起，Master 开始将所有新的写命令存入这个 Replica 对应的 replication buffer（也叫 client output buffer），等 RDB 传输完毕后再发送这些增量命令。\n\n```\n# PSYNC 协议交互示意\nReplica → Master:  PSYNC ? -1\nMaster → Replica:  +FULLRESYNC a3f7d8e9b1c2d4e5f6a7b8c9d0e1f2a3b4c5d6e7 284756\n```\n\n**Step 3：Master 执行 BGSAVE 生成 RDB。** Master 调用 `rdbSaveBackground()` fork 一个子进程来生成 RDB 快照。这一步的开销在前面的 BGSAVE fork 专题中已经详细分析过：fork 本身需要复制页表，阻塞主线程 20–50ms（10GB 数据量级）；子进程遍历所有数据序列化到磁盘，耗时取决于数据量和磁盘速度。有一个重要的优化：如果 Master 此刻已经有一个 BGSAVE 在进行中（比如刚好自动触发了持久化），Redis 会复用这个正在进行的 BGSAVE，不会重复 fork。具体来说，如果正在进行的 BGSAVE 开始时间早于 Replica 的连接时间，RDB 会包含 Replica 连接之前的数据，之后的增量通过 replication buffer 补齐，所以复用是安全的。\n\n**Step 4：Master 将 RDB 发送给 Replica。** BGSAVE 完成后，Master 通过 TCP 连接将 RDB 文件发送给 Replica。在默认的 disk-backed 模式下，RDB 先写到磁盘上的 `dump.rdb`，然后从磁盘读取再通过网络发送。网络传输的耗时取决于 RDB 文件大小和网络带宽。一个实际的估算：假设 Redis 有 10GB 数据，RDB 文件经过 LZF 压缩后大约 3–4GB，在千兆网卡（约 110MB/s 实际吞吐）下传输需要 27–36 秒；即使是万兆网卡（约 1.1GB/s）也需要 3–4 秒。在 RDB 传输期间，Master 的所有写命令会持续写入这个 Replica 对应的 replication buffer。\n\n```bash\n# 传输期间 Master 端的状态\n127.0.0.1:6379> INFO replication\nslave0:ip=10.0.1.2,port=6379,state=send_bulk,offset=0,lag=3\n```\n\n**Step 5：Replica 清空旧数据并加载 RDB。** Replica 收到完整的 RDB 文件后，先 `flushall` 清空自己的所有旧数据（如果有的话），然后调用 `rdbLoad()` 加载 RDB。加载 RDB 是一个 CPU 密集型操作——需要反序列化每个 key-value、重建内部数据结构（dict、skiplist、ziplist 等）。**在加载期间 Replica 无法响应任何读请求**，这一点对读写分离架构有重要影响。加载耗时取决于数据量，经验值大约是 10GB 数据需要 15–25 秒。如果 Replica 配置了 `replica-lazy-flush yes`（Redis 6.0+），清空旧数据的操作会在后台异步完成，减少阻塞时间。\n\n**Step 6：Master 发送 replication buffer 中的增量命令。** RDB 加载完成后，Replica 的数据状态是 BGSAVE 开始那一刻的快照。但从 BGSAVE 开始到 Replica 加载完 RDB 的这段时间里，Master 可能又执行了大量写命令。这些命令都被暂存在 replication buffer 中。现在 Master 把 buffer 中的命令逐条发送给 Replica，Replica 执行这些命令后，数据就追上了 Master 的最新状态。之后 Master 的每一条写命令都会实时传播给 Replica，进入正常的增量复制阶段。\n\n## 每一步的性能开销分析\n\n全量复制对 Master 和 Replica 都有显著的性能影响，逐步分析如下。\n\nBGSAVE 的 fork 开销已经在前面讨论过，核心是页表复制导致的主线程阻塞。每 GB 内存约 2–5ms 的 fork 时间，20GB 实例就是 40–100ms。除了阻塞之外，fork 后 COW（Copy-On-Write，写时复制）机制会导致额外的内存消耗——BGSAVE 期间父进程每修改一个 4KB 内存页都要复制一份。如果 BGSAVE 持续 5 秒，期间有 20% 的页被修改，那峰值内存会增加 20%。\n\nRDB 传输的网络开销是最显眼的瓶颈。实际生产中的带宽计算：10GB 数据的 RDB 文件约 3–4GB（LZF 压缩后），千兆网卡理论带宽 125MB/s、实际吞吐约 110MB/s，传输耗时约 30–36 秒。如果同时有多个 Replica 触发全量复制，Master 要并行发送多份 RDB，网络带宽可能被打满，影响正常的客户端读写。\n\nReplication buffer 的内存开销经常被忽略。从 BGSAVE 开始到 Replica 加载完 RDB，Master 的所有写命令都缓存在这个 buffer 中。如果 Master 写入 QPS 很高（比如每秒 5 万次写入，平均每条命令 200 字节），30 秒的全量复制期间 buffer 就会积累 5万 × 200B × 30s ≈ 286MB。这个 buffer 受 `client-output-buffer-limit slave` 参数控制，默认配置是 `256mb 64mb 60`——意思是 buffer 超过 256MB 立即断开连接，或者超过 64MB 持续 60 秒也断开。一旦断开，Replica 需要重新发起全量复制，形成恶性循环。\n\n```bash\n# 默认的 Replica 输出缓冲区限制\nclient-output-buffer-limit slave 256mb 64mb 60\n# 含义：硬限制 256MB / 软限制 64MB 持续 60 秒\n```\n\nReplica 端加载 RDB 期间完全阻塞，无法服务读请求。如果你的架构依赖 Replica 提供读能力，全量复制期间这个 Replica 就是不可用的。加载一个 10GB 的 RDB 通常需要 15–25 秒，在这段时间内打到这个 Replica 的读请求要么超时，要么被客户端路由到其他 Replica。\n\n## 无盘复制（Diskless Replication）\n\n默认模式下，BGSAVE 生成的 RDB 先写到 Master 的磁盘上，然后再从磁盘读取通过网络发送给 Replica。如果 Master 的磁盘是慢速 HDD 或者磁盘 IO 已经很繁忙，写 RDB 本身就成了瓶颈。Redis 2.8.18 引入了无盘复制（Diskless Replication），通过 `repl-diskless-sync yes` 启用。\n\n无盘复制的工作方式是：Master fork 子进程后，子进程不把 RDB 写到磁盘，而是直接将序列化后的 RDB 数据流通过 socket 发送给 Replica。这省去了「写磁盘 → 读磁盘」的 IO 开销，在磁盘慢、网络快的场景下效果显著。但它有一个限制：传统的 disk-backed 模式下，RDB 写完磁盘后可以同时发给多个 Replica；无盘模式下，RDB 数据流是一次性的，如果有 3 个 Replica 同时需要全量复制，要么并行发送（3 个子进程），要么排队等待。\n\nRedis 为无盘复制设计了一个 `repl-diskless-sync-delay` 参数（默认 5 秒）。当第一个 Replica 请求全量复制时，Master 不会立即开始，而是等待这个延迟时间，看看是否有更多 Replica 也需要全量复制。等待结束后，Master fork 一个子进程同时向所有等待中的 Replica 发送 RDB 数据流。这个设计在多 Replica 场景下可以避免多次 fork 的开销。\n\n```bash\n# 启用无盘复制\nrepl-diskless-sync yes\n# 等待 5 秒收集更多需要全量复制的 Replica\nrepl-diskless-sync-delay 5\n```\n\nRedis 7.0 进一步引入了 `repl-diskless-load` 参数，控制 Replica 端是否也使用无盘模式加载 RDB。设置为 `swapdb` 时，Replica 会在后台加载新 RDB 到一个临时 db 中，加载完成后原子性地切换，这样加载期间 Replica 仍然可以用旧数据服务读请求。\n\n## 关键配置参数汇总\n\n理解以下几个参数，是调优全量复制行为的基础。`repl-backlog-size` 控制 replication backlog 的大小，默认 1MB，这个值在生产环境中通常需要大幅增加。估算公式是：`backlog_size = master_write_qps × avg_cmd_size × max_disconnect_seconds`。如果 Master 的写入 QPS 是 1 万、平均命令大小 200 字节、允许的最大断线时间是 60 秒，那 backlog 至少需要 10000 × 200 × 60 = 114MB，实践中建议再留 2–3 倍余量，设置为 256MB 到 512MB。`repl-timeout` 控制复制超时时间，默认 60 秒。如果全量复制的 RDB 传输时间可能超过 60 秒（大数据量实例在千兆网络下很容易超过），需要调大这个值，否则传输过程中 Replica 会因超时断开连接，然后重连再次触发全量复制。`client-output-buffer-limit slave` 控制 replication buffer 的大小限制，前面已经分析过。如果你的 Master 写入量大、全量复制耗时长，需要把这个值调大以避免传输中途被断开。\n\n## 危险场景与避坑策略\n\n**频繁全量复制的恶性循环。** 这是最常见的生产事故场景。如果 `repl-backlog-size` 太小，Replica 稍微断线几秒就会发现 offset 已经不在 backlog 范围内，被迫全量复制。全量复制本身又需要几十秒，期间 replication buffer 持续膨胀，如果超过 `client-output-buffer-limit` 就会被断开，断开后又重连，又触发全量复制——形成一个无限循环。监控 `INFO replication` 中的 `master_sync_in_progress` 和 `INFO stats` 中的 `sync_full` 计数器，如果 `sync_full` 持续增长，说明全量复制在反复发生。\n\n```bash\n# 监控全量复制次数\n127.0.0.1:6379> INFO stats\nsync_full:15\nsync_partial_ok:328\nsync_partial_err:12\n# sync_partial_err 表示部分复制失败退化为全量复制的次数\n```\n\n**多 Replica 同时触发全量复制。** 当 Master 重启或发生故障转移后，所有 Replica 可能同时重连并触发全量复制。Master 要同时为多个 Replica 做 BGSAVE 和 RDB 传输，CPU（fork 和序列化）、内存（多个 replication buffer）、网络（多路 RDB 传输）同时承压。生产中的缓解策略包括：让 Replica 分批重连（staggered reconnection）、使用无盘复制的 delay 机制让一次 fork 服务多个 Replica、在 Replica 之间建立级联复制（Replica of Replica）减轻 Master 压力。\n\n**大数据量实例全量复制耗时过长。** 一个 30GB 的 Redis 实例，BGSAVE 生成 RDB 可能耗时 20–30 秒，千兆网络传输 RDB 可能耗时 80–100 秒，Replica 加载 RDB 又需要 30–40 秒，整个全量复制过程超过 2 分钟。这期间 replication buffer 可能已经超过限制被断开。解决方案是控制单实例大小在 10–15GB 以内，超出使用 Redis Cluster 分片。\n\n避免不必要全量复制的核心策略：第一，将 `repl-backlog-size` 设置为足够大的值（至少 256MB，写入量大的场景设到 512MB 甚至 1GB）；第二，确保网络稳定，减少 Replica 断线的频率；第三，监控 `master_repl_offset` 和 `slave_repl_offset` 的差值，差值持续增大说明 Replica 在掉队；第四，如果经常出现 `sync_partial_err`，检查 backlog 大小是否匹配你的写入量和允许的断线时间。",
+      "keyPoints": [
+        "全量复制有四种触发条件：Replica 首次连接（PSYNC ? -1）、断线重连后 offset 不在 backlog 范围内、Replication ID 不匹配（如故障转移后）、以及 DEBUG RELOAD 等手动操作",
+        "PSYNC 协议的六步流程：发送 PSYNC → 回复 +FULLRESYNC → BGSAVE 生成 RDB → 传输 RDB（期间写命令存入 replication buffer）→ Replica 清空旧数据加载 RDB → 发送 buffer 中的增量命令",
+        "repl-backlog-size 默认仅 1MB，生产环境必须根据写入 QPS 和允许的断线时间大幅增加，公式为 write_qps × avg_cmd_size × max_disconnect_seconds",
+        "全量复制期间 Master 的 replication buffer 持续膨胀，超过 client-output-buffer-limit slave 限制会断开连接，可能导致全量复制的恶性循环",
+        "无盘复制（repl-diskless-sync）让 Master 跳过「写磁盘→读磁盘」的 IO 开销，适用于磁盘慢但网络快的场景，Redis 2.8.18+ 支持",
+        "Replica 加载 RDB 期间完全阻塞无法服务读请求，10GB 数据加载约需 15-25 秒，对读写分离架构有直接可用性影响",
+        "Redis 4.0 引入 replid2 机制：故障转移后新 Master 保存旧 Master 的 Replication ID，使 Replica 在 offset 满足条件时仍可做部分复制而非全量复制",
+        "repl-diskless-sync-delay 参数让 Master 等待一段时间收集更多需要全量复制的 Replica，一次 fork 同时服务多个 Replica，减少重复 fork 的开销"
+      ],
+      "quiz": [
+        {
+          "id": "redis-repl-full-sync-q1-quiz1",
+          "question": "Replica 第一次连接到 Master 时，发送的 PSYNC 命令参数是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "PSYNC ? -1，表示没有历史复制信息，请求全量复制"
+            },
+            {
+              "id": "B",
+              "text": "PSYNC 0 0，表示从偏移量 0 开始同步"
+            },
+            {
+              "id": "C",
+              "text": "PSYNC FULLRESYNC，直接告诉 Master 做全量复制"
+            },
+            {
+              "id": "D",
+              "text": "SYNC，使用旧版协议请求全量同步"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "首次连接的 Replica 没有任何历史复制信息，不知道 Master 的 Replication ID 也没有 offset，所以发送 `PSYNC ? -1`，其中 `?` 表示未知 replid、`-1` 表示没有 offset。Master 收到后会回复 `+FULLRESYNC <replid> <offset>` 触发全量复制。B 选项的 `PSYNC 0 0` 格式不正确，replid 应该是 40 字节的十六进制字符串而不是数字。C 选项编造了不存在的协议格式。D 选项的 `SYNC` 是 Redis 2.8 之前的旧协议，不支持部分复制，现代版本使用 PSYNC。"
+        },
+        {
+          "id": "redis-repl-full-sync-q1-quiz2",
+          "question": "以下哪种场景不会触发全量复制？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Replica 断线 10 秒后重连，offset 仍在 replication backlog 范围内"
+            },
+            {
+              "id": "B",
+              "text": "Replica 首次连接到 Master"
+            },
+            {
+              "id": "C",
+              "text": "故障转移后 Replica 携带的 replid 与新 Master 的 replid 和 replid2 都不匹配"
+            },
+            {
+              "id": "D",
+              "text": "Replica 断线重连后 offset 已被 replication backlog 覆盖"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "当 Replica 断线重连时，如果携带的 Replication ID 匹配 Master 的 replid 或 replid2，且 offset 仍然在 replication backlog 的范围内，Master 就可以执行部分复制——只发送断线期间缺失的增量命令，不需要全量复制。这正是 PSYNC 协议相对于旧版 SYNC 协议的核心改进。B 选项首次连接必然触发全量复制，C 选项 replid 都不匹配说明数据源已完全改变，D 选项 offset 被覆盖意味着缺失的数据无法从 backlog 中找到，这三种都会触发全量复制。"
+        },
+        {
+          "id": "redis-repl-full-sync-q1-quiz3",
+          "question": "全量复制的第四步中，Master 在发送 RDB 给 Replica 期间，新产生的写命令被存放在哪里？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "存放在 replication backlog 中，等 RDB 传输完后从 backlog 重放"
+            },
+            {
+              "id": "B",
+              "text": "存放在该 Replica 对应的 replication buffer（client output buffer）中"
+            },
+            {
+              "id": "C",
+              "text": "追加到正在传输的 RDB 文件末尾一起发送"
+            },
+            {
+              "id": "D",
+              "text": "直接丢弃，等 RDB 加载完成后 Replica 再通过 PSYNC 获取缺失命令"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "全量复制期间，Master 将新产生的写命令存入该 Replica 对应的 replication buffer（即 client output buffer 中 slave 类型的缓冲区）。RDB 传输完成且 Replica 加载完毕后，Master 再把 buffer 中积累的增量命令发送过去。A 选项的 replication backlog 是用于部分复制的全局环形缓冲区，和 per-Replica 的 replication buffer 是两个不同的东西。C 选项描述的「追加到 RDB 文件末尾」并不是 Redis 的实现方式，RDB 和增量命令是分阶段发送的。D 选项的「直接丢弃」会导致数据不一致。"
+        },
+        {
+          "id": "redis-repl-full-sync-q1-quiz4",
+          "question": "Master 在执行 BGSAVE 生成 RDB 时，如果已经有一个 BGSAVE 在进行中，Redis 会怎么做？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "终止正在进行的 BGSAVE，重新 fork 一个新的子进程生成 RDB"
+            },
+            {
+              "id": "B",
+              "text": "复用正在进行的 BGSAVE，不重复 fork，等其完成后直接使用生成的 RDB"
+            },
+            {
+              "id": "C",
+              "text": "拒绝新的全量复制请求，让 Replica 稍后重试"
+            },
+            {
+              "id": "D",
+              "text": "同时启动两个 BGSAVE 子进程并行生成 RDB"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 内部通过 `hasActiveChildProcess()` 检查是否已有子进程在运行。如果已经有 BGSAVE 在进行中，Redis 不会重复 fork，而是复用当前正在进行的 BGSAVE。复用是安全的：正在进行的 BGSAVE 生成的 RDB 是 fork 那一刻的快照，之后的写命令已经被存入 replication buffer，Replica 加载完 RDB 后再接收 buffer 中的增量即可追上最新状态。A 选项的终止再重新 fork 会浪费已经进行的工作。C 选项拒绝请求会导致复制失败。D 选项同时运行两个 BGSAVE 子进程在 Redis 中不被允许，因为两个子进程同时 COW 会导致内存暴增。"
+        },
+        {
+          "id": "redis-repl-full-sync-q1-quiz5",
+          "question": "在 INFO replication 输出中看到 slave0 的 state 为 send_bulk，这意味着什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Replica 正在向 Master 发送批量写入命令"
+            },
+            {
+              "id": "B",
+              "text": "Master 正在向该 Replica 传输 RDB 数据，全量复制正在进行"
+            },
+            {
+              "id": "C",
+              "text": "Master 正在向该 Replica 发送 replication buffer 中的增量命令"
+            },
+            {
+              "id": "D",
+              "text": "Replica 已完成数据加载，处于正常增量同步状态"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 `INFO replication` 输出的 slave 状态中，`send_bulk` 明确表示 Master 正在向该 Replica 发送 RDB 数据，即全量复制的第四步正在进行。其他常见状态包括：`wait_bgsave_start`（等待 BGSAVE 开始）、`wait_bgsave_end`（BGSAVE 进行中，等待完成）、`online`（正常增量复制中）。A 选项颠倒了数据流方向，主从复制中数据是从 Master 流向 Replica。C 选项描述的是 RDB 传输完成后的下一个阶段。D 选项对应的状态应该是 `online` 而不是 `send_bulk`。"
+        },
+        {
+          "id": "redis-repl-full-sync-q1-quiz6",
+          "question": "生产环境中 repl-backlog-size 默认 1MB，一个写入 QPS 为 1 万、平均命令 200 字节的 Master，backlog 大约多久会被写满？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "大约 0.5 秒就会写满，Replica 断线超过 0.5 秒就会触发全量复制"
+            },
+            {
+              "id": "B",
+              "text": "大约 5 秒会写满，Replica 断线超过 5 秒就会触发全量复制"
+            },
+            {
+              "id": "C",
+              "text": "大约 50 秒会写满，对大多数断线场景来说足够了"
+            },
+            {
+              "id": "D",
+              "text": "backlog 是环形缓冲区不会写满，旧数据会被自动覆盖所以没有影响"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "计算过程：写入速率 = 10000 QPS × 200B = 2MB/s，1MB 的 backlog 在约 0.5 秒后就被写满。backlog 虽然是环形缓冲区，旧数据会被覆盖不会导致 OOM，但一旦 Replica 需要的 offset 已经被覆盖，部分复制就不可能了，只能退回全量复制。这就是为什么默认 1MB 在生产环境中严重不足的原因。按这个写入量，如果允许 Replica 最多断线 60 秒还能部分复制，backlog 至少需要 2MB/s × 60s = 120MB。D 选项的理解有误，虽然 backlog 不会撑爆内存，但被覆盖的历史数据就找不回来了。"
+        },
+        {
+          "id": "redis-repl-full-sync-q1-quiz7",
+          "question": "关于无盘复制（Diskless Replication）和传统 disk-backed 复制，以下哪个说法是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "无盘复制不需要 fork 子进程，完全消除了 fork 的阻塞开销"
+            },
+            {
+              "id": "B",
+              "text": "无盘复制跳过磁盘 IO，Master 的子进程直接通过 socket 将 RDB 数据流发送给 Replica"
+            },
+            {
+              "id": "C",
+              "text": "无盘复制是 Redis 6.0 引入的新特性，之前的版本不支持"
+            },
+            {
+              "id": "D",
+              "text": "无盘复制适用于磁盘快但网络慢的场景，可以减少网络传输量"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "无盘复制的核心改变是省去了「RDB 写磁盘 → 从磁盘读取 → 网络发送」中间的磁盘 IO 环节。Master 仍然需要 fork 子进程来遍历和序列化数据（不会阻塞主线程处理请求），但子进程直接把序列化后的数据通过 socket 发给 Replica，不落盘。A 选项说不需要 fork 是错误的，无盘复制只是不写磁盘，fork 仍然需要。C 选项版本信息错误，无盘复制是 Redis 2.8.18 引入的（`repl-diskless-sync` 配置项）。D 选项颠倒了适用场景，无盘复制适用于磁盘慢但网络快的场景，因为它绕过了磁盘 IO。"
+        },
+        {
+          "id": "redis-repl-full-sync-q1-quiz8",
+          "question": "一个 Master 有 10GB 数据，3 个 Replica 同时因网络抖动断线重连并都需要全量复制。以下哪个策略最能缓解 Master 的压力？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "增大 repl-backlog-size 避免全量复制，但此时已经来不及了"
+            },
+            {
+              "id": "B",
+              "text": "启用无盘复制并设置 repl-diskless-sync-delay，让一次 fork 同时服务 3 个 Replica"
+            },
+            {
+              "id": "C",
+              "text": "立即手动执行 BGSAVE 生成 RDB，让 3 个 Replica 分别下载文件"
+            },
+            {
+              "id": "D",
+              "text": "将 3 个 Replica 全部断开，一个个依次重连以错开全量复制时间"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "启用无盘复制（`repl-diskless-sync yes`）配合 `repl-diskless-sync-delay`（默认 5 秒），Master 会等待 delay 时间后统一 fork 一个子进程，同时向所有等待中的 Replica 发送 RDB 数据流。这样只需要一次 fork、一次序列化，就能服务 3 个 Replica，大幅降低 CPU 和内存开销。A 选项分析正确但已经是事后诸葛亮，全量复制已经触发了。C 选项手动 BGSAVE 不会改变 Redis 内部的复制流程，且 Replica 不是通过「下载文件」来获取 RDB 的。D 选项的手动操作在自动化运维中不现实，且逐个全量复制的总耗时更长。"
+        },
+        {
+          "id": "redis-repl-full-sync-q1-quiz9",
+          "question": "Redis 4.0 引入的 replid2 机制解决了什么问题？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "让 Replica 可以同时连接两个 Master 实现双向复制"
+            },
+            {
+              "id": "B",
+              "text": "故障转移后，新 Master 保存旧 Master 的 Replication ID，使 Replica 在 offset 满足条件时仍可做部分复制"
+            },
+            {
+              "id": "C",
+              "text": "用于 Redis Cluster 中跨 slot 的数据迁移验证"
+            },
+            {
+              "id": "D",
+              "text": "支持 Replica 在多个 Master 之间切换时保留已同步的数据"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 Redis 4.0 之前，故障转移后新 Master 会生成全新的 Replication ID，所有 Replica 重连时发现 replid 不匹配，都必须做全量复制，开销巨大。Redis 4.0 引入 replid2 机制：当一个 Replica 被提升为 Master 时，它将旧 Master 的 Replication ID 保存为 `master_replid2`，同时记录切换时的 offset。当其他 Replica 重连时，如果它们携带的 replid 匹配新 Master 的 replid2，且 offset 在 backlog 范围内，就可以做部分复制。A 选项描述的双向复制在 Redis 中不存在。C 选项与 Cluster slot 迁移无关。D 选项描述的多 Master 切换场景不是 replid2 设计的目标。"
+        },
+        {
+          "id": "redis-repl-full-sync-q1-quiz10",
+          "question": "全量复制过程中，Replica 端加载 RDB 时出现了什么状况？运维应如何应对？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Replica 可以正常服务读请求但不能写入，不需要特殊处理"
+            },
+            {
+              "id": "B",
+              "text": "Replica 完全阻塞无法响应任何请求，客户端应路由到其他可用 Replica"
+            },
+            {
+              "id": "C",
+              "text": "Replica 会拒绝连接但已连接的客户端不受影响"
+            },
+            {
+              "id": "D",
+              "text": "Replica 自动进入只读降级模式，返回缓存的旧数据"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Replica 在加载 RDB 期间处于完全阻塞状态，无法响应任何客户端请求——既不能读也不能写。这是因为 `rdbLoad()` 是在主线程中同步执行的，需要反序列化全部数据并重建内存中的数据结构（dict、skiplist 等），整个过程不可中断。10GB 数据的加载通常需要 15–25 秒。在读写分离架构中，客户端必须能感知到 Replica 的不可用状态（通过超时或 Sentinel 通知），并将读请求路由到其他可用的 Replica。Redis 7.0 的 `repl-diskless-load swapdb` 选项可以缓解这个问题，它在后台加载新数据，加载完成前用旧数据继续服务。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/replication/",
+        "https://github.com/redis/redis/blob/7.2/src/replication.c",
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/internals/replication/"
+      ]
+    }
+  ]
+}

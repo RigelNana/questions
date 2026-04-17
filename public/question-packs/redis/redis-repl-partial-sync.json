@@ -1,0 +1,157 @@
+{
+  "id": "redis-repl-partial-sync",
+  "name": "部分复制的原理与 repl-backlog 的作用",
+  "domain": "redis",
+  "description": "深入讲解 Redis 部分复制（Partial Resynchronization）的触发条件、repl-backlog 环形缓冲区的工作原理、PSYNC/PSYNC2 协议演进及生产环境 backlog 调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-repl-partial-sync-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["部分复制", "repl-backlog", "PSYNC", "offset", "增量同步", "环形缓冲区", "replid", "redis-replication"],
+      "title": "说说 Redis 部分复制的原理，以及 repl-backlog 是怎么工作的",
+      "content": "## 面试场景\n\n面试官已经跟你聊过了 Redis 主从复制的全量同步流程——Replica 发送 `PSYNC ? -1`、Master 执行 BGSAVE 生成 RDB、传输 RDB、补发 replication buffer 中的增量命令。你回答得不错，面试官点点头，然后接着问：「如果 Replica 只是短暂断线了 2 秒就重连了，Redis 还会走全量复制吗？」\n\n这个问题的答案取决于你对部分复制（Partial Resynchronization）机制的理解深度。大部分候选人知道「Redis 2.8 之后支持部分复制」，但追问下去就说不清了：部分复制是怎么判断能不能做的？repl-backlog 到底是个什么数据结构？环形缓冲区写满之后怎么办？offset 是怎么计算的？PSYNC2 相比 PSYNC 改进了什么？生产环境 repl-backlog-size 应该设多大？\n\n我们先来看一段真实的 `INFO replication` 输出，这是一个生产环境中 Master 节点的复制状态：\n\n```bash\n127.0.0.1:6379> INFO replication\n# Replication\nrole:master\nconnected_slaves:3\nslave0:ip=10.0.1.11,port=6379,state=online,offset=892347156,lag=0\nslave1:ip=10.0.1.12,port=6379,state=online,offset=892347156,lag=0\nslave2:ip=10.0.1.13,port=6379,state=online,offset=892346980,lag=1\nmaster_failover_state:no-failover\nmaster_replid:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0\nmaster_replid2:0000000000000000000000000000000000000000\nmaster_repl_offset:892347156\nsecond_repl_offset:-1\nrepl_backlog_active:1\nrepl_backlog_size:268435456\nrepl_backlog_first_byte_offset:623911701\nrepl_backlog_histlen:268435456\n```\n\n这里面有几个关键数字。`repl_backlog_size` 是 268435456 字节也就是 256MB，`repl_backlog_histlen` 也是 268435456 说明 backlog 已经被写满了——这意味着它正在以环形的方式覆盖旧数据。`repl_backlog_first_byte_offset` 是 623911701，表示 backlog 中最旧的数据对应的偏移量；而 `master_repl_offset` 是 892347156，表示 Master 当前的写入位置。那么如果一个 Replica 断线后带着 `offset=620000000` 重连，Master 能做部分复制吗？如果带着 `offset=700000000` 呢？\n\n要回答这些问题，你需要彻底理解部分复制的判断逻辑、repl-backlog 环形缓冲区的数据结构和偏移量计算方式，以及 PSYNC 协议的交互流程。",
+      "answer": "## 第一步：Redis 主从复制中的部分复制——全局认知\n\n### 从全量复制的痛点说起\n\n要理解部分复制的价值，得先回顾一下全量复制的代价。一个 Redis 实例存了 8GB 数据，它的 Replica 因为网络抖动断开了 3 秒又重连上来。在 Redis 2.8 之前，不管你断线 3 秒还是 3 小时，结果都一样——Master 执行 BGSAVE 生成 8GB 的 RDB 文件，通过网络发给 Replica，Replica 清空所有数据再加载这个 RDB。在千兆网络下光传输 RDB 就要 60 多秒，加上 fork、序列化、加载的时间，整个同步过程可能要两三分钟。而这 3 秒钟 Replica 实际错过的数据可能只有几百 KB。\n\n这个问题在 Redis 早期版本中非常头疼。网络抖动在生产环境中是家常便饭，特别是跨机房部署的场景，TCP 连接偶尔断一下很正常。如果每次短暂断线都要全量复制，Master 的 CPU（fork 开销）、磁盘 I/O（写 RDB）、网络带宽（传 RDB）都会被反复消耗，Replica 在加载 RDB 期间还无法对外提供读服务。多个 Replica 同时断线重连时甚至会触发所谓的「复制风暴」，直接把 Master 拖垮。\n\nRedis 2.8（2013 年发布）引入了 PSYNC 命令和部分复制机制，正是为了解决这个问题。核心思路非常直观：Master 在内存中维护一个缓冲区，记录最近传播给 Replica 的写命令。当 Replica 断线重连时，如果它错过的数据还在这个缓冲区里，Master 就只把缺失的那部分命令补发过去，不需要重新生成和传输 RDB。这就是部分复制（Partial Resynchronization），也叫增量同步。\n\n### PSYNC 命令的基础协议\n\n部分复制的入口是 `PSYNC` 命令。Replica 在连接（或重连）Master 时，会发送 `PSYNC <replid> <offset>` 这个命令。其中 `replid` 是 Replica 记住的 Master 的 Replication ID（一个 40 字符的十六进制字符串），`offset` 是 Replica 自己当前的复制偏移量。Master 收到后会根据这两个参数判断走全量复制还是部分复制：\n\n```bash\n# 场景一：Replica 第一次连接，不知道 Master 的 replid\nPSYNC ? -1\n# Master 回复：走全量复制\n+FULLRESYNC a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 0\n\n# 场景二：Replica 断线重连，带上之前记住的 replid 和 offset\nPSYNC a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 892340000\n# Master 回复：可以部分复制\n+CONTINUE a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0\n# 然后 Master 发送 offset 892340000 到 892347156 之间的写命令\n```\n\n如果 Master 判断无法进行部分复制（replid 不匹配或 offset 已超出 backlog 范围），它会回复 `+FULLRESYNC`，回退到全量复制流程。\n\n## 第二步：部分复制的核心机制深度解析\n\n### 部分复制的三大支柱\n\n部分复制能够工作，依赖三个关键组件的协同配合：Replication ID（replid）、Replication Offset 和 Replication Backlog。我们逐一拆解。\n\n**Replication ID（replid）** 是一个 40 字符的随机十六进制字符串，用来唯一标识一段复制历史中的数据集。每个 Redis 实例启动时都会生成一个新的 replid。当 Replica 完成与 Master 的全量同步后，Replica 会将自己的 replid 设置为 Master 的 replid——从此两者共享同一个 replid，表示它们在同一条复制链上。Replica 断线重连时发送这个 replid，Master 比对后确认「这个 Replica 之前确实是我的从节点」，才有可能做部分复制。如果 replid 不匹配，说明 Replica 可能连错了 Master，或者中间发生过故障转移导致 replid 发生了变化，此时只能全量复制。\n\n**Replication Offset（复制偏移量）** 是一个单调递增的字节计数器。Master 每向 Replica 传播一条写命令（以 RESP 协议格式编码），就把该命令的字节数累加到 `master_repl_offset` 上。Replica 每接收并执行一条写命令，也把对应的字节数累加到自己的 `slave_repl_offset` 上。如果两个 offset 相等，说明 Replica 的数据和 Master 完全一致；如果 Replica 的 offset 落后，差值就是 Replica 尚未同步的数据量（字节数）。Replica 还会定期（默认每秒一次）通过 `REPLCONF ACK <offset>` 命令将自己的 offset 上报给 Master，Master 据此判断每个 Replica 的同步进度。\n\n**Replication Backlog（复制积压缓冲区）** 就是那个让部分复制成为可能的核心数据结构。它是 Master 端维护的一块固定大小的内存区域，本质上是一个环形缓冲区（circular buffer）。Master 每向 Replica 传播一条写命令时，同时也会把这条命令写入 backlog。backlog 记录了最近一段时间内 Master 传播出去的所有写命令。当 Replica 断线重连时，Master 根据 Replica 上报的 offset 去 backlog 中查找——如果该 offset 之后的数据还在 backlog 中，就把这段数据发给 Replica；如果已经被覆盖了，就只能走全量复制。\n\n### 环形缓冲区的工作原理\n\n理解 repl-backlog 的关键在于理解环形缓冲区这个数据结构。所谓环形缓冲区，就是在一块固定大小的连续内存上，用两个指针（写入位置和起始位置）来管理数据的读写。当写指针到达内存末尾时，不是申请新内存，而是回到起始位置继续写——就像一个圆环一样循环使用。\n\n用一个具体的例子来说明。假设 `repl-backlog-size` 设置为 1MB（1048576 字节），当前 Master 的复制偏移量 `master_repl_offset` 是 5000000。backlog 中记录了从偏移量 3951425 到 5000000 的数据（总共 1048575 字节，几乎写满了）。此时的内存布局可以用 ASCII 图表示：\n\n```\nrepl-backlog 环形缓冲区（1MB）\n┌──────────────────────────────────────────┐\n│                                          │\n│  ┌─────────────┬──────────────────────┐  │\n│  │ 旧数据(被覆盖) │ 有效数据区域          │  │\n│  └─────────────┴──────────────────────┘  │\n│  ↑ write_ptr                             │\n│                                          │\n│  first_byte_offset = 3951425             │\n│  master_repl_offset = 5000000            │\n│  histlen = 1048576 (已满)                │\n└──────────────────────────────────────────┘\n\nReplica A: slave_repl_offset = 4800000  → 在有效范围内 → 部分复制 ✓\nReplica B: slave_repl_offset = 3500000  → 已被覆盖    → 全量复制 ✗\n```\n\n判断逻辑非常清晰：如果 `slave_repl_offset >= repl_backlog_first_byte_offset` 并且 `slave_repl_offset <= master_repl_offset`，说明 Replica 需要的数据还在 backlog 中，可以做部分复制。否则，数据已被环形覆盖，只能全量复制。Master 在源码中的判断逻辑（`server.c` 中的 `masterTryPartialResynchronization` 函数）大致如下：\n\n```c\n// 伪代码：Master 判断是否可以部分复制\nif (slave_replid == server.replid || slave_replid == server.replid2) {\n    if (slave_offset >= server.repl_backlog_first_byte_offset &&\n        slave_offset <= server.master_repl_offset) {\n        // 可以部分复制：从 backlog 中发送 slave_offset 到 master_repl_offset 的数据\n        reply \"+CONTINUE\";\n        sendBacklogData(slave_offset, server.master_repl_offset);\n    } else {\n        // offset 超出 backlog 范围，全量复制\n        reply \"+FULLRESYNC\";\n        startFullResync();\n    }\n} else {\n    // replid 不匹配，全量复制\n    reply \"+FULLRESYNC\";\n    startFullResync();\n}\n```\n\n这里还有一个细节值得注意：backlog 在 Master 上是全局唯一的，所有 Replica 共享同一个 backlog。这跟每个 Replica 独立的 replication buffer（client output buffer）不同。backlog 的内容是已经传播出去的写命令的历史记录，而 replication buffer 是正在传输中但 Replica 尚未接收的命令队列。\n\n### 部分复制的完整触发流程\n\n现在把整个流程串起来。假设一个 Replica 与 Master 正常同步中（offset 持续追平），然后因为网络抖动断线了 5 秒：\n\n```\n时间线：\nt=0    Replica 正常同步中，slave_offset = master_offset = 892340000\nt=1    网络断开，Replica 检测到连接丢失\n       Master 继续接收写命令，offset 继续增长\n       新的写命令同时写入 backlog\nt=2    master_offset = 892341200（新增 1200 字节的写命令）\nt=3    master_offset = 892342500\nt=4    master_offset = 892343800\nt=5    master_offset = 892345000\n       Replica 重新建立 TCP 连接\nt=6    Replica 发送: PSYNC a1b2c3d4...（replid） 892340000（offset）\n       Master 检查:\n         1. replid 匹配 ✓\n         2. offset 892340000 >= first_byte_offset 623911701 ✓\n         3. offset 892340000 <= master_offset 892345000 ✓\n       Master 回复: +CONTINUE a1b2c3d4...\n       Master 从 backlog 中取出 offset 892340000 到 892345000 的 5000 字节数据\n       发送给 Replica\nt=7    Replica 执行收到的 5000 字节写命令\n       slave_offset 追平到 892345000\n       恢复正常增量同步\n```\n\n整个部分复制过程只传输了 5000 字节，而如果走全量复制，可能要传输 8GB 的 RDB 文件。这就是部分复制的巨大价值。\n\n### repl-backlog-size 的计算与调优\n\n默认的 `repl-backlog-size` 是 1MB，这在绝大多数生产环境中都太小了。计算合理的 backlog 大小的公式是：\n\n```\nbacklog_size = 断线时间（秒）× 每秒写入量（字节）× 安全系数（通常取 2）\n```\n\n怎么知道你的 Redis 实例每秒写入多少字节？用 `INFO stats` 查看 `instantaneous_output_kbps` 字段：\n\n```bash\n127.0.0.1:6379> INFO stats\n# Stats\n...\ninstantaneous_input_kbps:2.43\ninstantaneous_output_kbps:156.78\n...\n```\n\n这里 `instantaneous_output_kbps` 是 156.78 KB/s，表示 Master 当前每秒向外输出约 156KB 的数据（包括向 Replica 传播的写命令和回复客户端的数据）。更精确的方式是观察一段时间内 `master_repl_offset` 的增长速率：\n\n```bash\n# 间隔 60 秒取两次 master_repl_offset 做差\n$ redis-cli INFO replication | grep master_repl_offset\nmaster_repl_offset:892340000\n\n# 60 秒后\n$ redis-cli INFO replication | grep master_repl_offset\nmaster_repl_offset:892940000\n\n# 每秒写入量 = (892940000 - 892340000) / 60 = 10000 字节/秒 ≈ 10 KB/s\n```\n\n假设你的 Redis 实例每秒写入 10KB，你希望 Replica 断线 5 分钟（300 秒）内重连仍能部分复制，那么 backlog 需要：`10KB × 300 × 2 = 6MB`。但实际生产中，网络抖动、主从切换、Replica 重启等场景可能导致更长的断线时间。我的建议是按照保守策略来配置：\n\n```bash\n# redis.conf 中配置 repl-backlog-size\n# 低写入场景（写入 < 50KB/s）：至少 256MB\nrepl-backlog-size 256mb\n\n# 高写入场景（写入 > 200KB/s）：512MB 到 1GB\nrepl-backlog-size 512mb\n\n# 超高写入场景（写入 > 1MB/s）：1GB 甚至更大\nrepl-backlog-size 1gb\n```\n\n256MB 的内存在今天的服务器上根本不算什么，但它能让 Replica 在断线好几分钟后仍然走部分复制。这个性价比极高。另外还有一个 `repl-backlog-ttl` 参数（默认 3600 秒），它控制的是当所有 Replica 都断开连接后，Master 保留 backlog 的时间。超过这个时间，backlog 会被释放以节省内存。如果你预期 Replica 可能会长时间断开然后重连，可以适当调大这个值，或者设置为 0 表示永不释放。\n\n## 第三步：PSYNC2、监控实践与体系化延伸\n\n### PSYNC2 协议（Redis 4.0+）的关键改进\n\nPSYNC 协议在 Redis 2.8 引入后解决了短暂断线的问题，但有一个场景它处理不好——Sentinel 故障转移。当 Master 宕机后 Sentinel 将一个 Replica 提升为新 Master 时，新 Master 会生成一个新的 replid。此时其他 Replica 尝试连接新 Master 并发送旧的 replid，新 Master 发现 replid 不匹配，只能让它们全量复制。这在大数据量场景下非常痛苦：Master 宕机已经够紧急了，还要等所有 Replica 全量同步完才能恢复服务。\n\nRedis 4.0 引入了 PSYNC2 协议来解决这个问题。核心改进是引入了第二个 Replication ID——`replid2`。当一个 Replica 被提升为新 Master 时（执行 `REPLICAOF NO ONE`），它会做两件事：生成一个新的 replid 作为 `master_replid`，同时把旧 Master 的 replid 保存为 `master_replid2`，并在 `second_repl_offset` 中记录切换时的偏移量。\n\n这样一来，其他 Replica 用旧的 replid 连接新 Master 发送 PSYNC 时，新 Master 会同时检查 `master_replid` 和 `master_replid2`。如果 Replica 的 replid 与 `replid2` 匹配，并且 offset 在 backlog 范围内且小于等于 `second_repl_offset`，新 Master 就知道「这个 Replica 之前也是旧 Master 的从节点，它的数据跟我切换前的数据是一致的」，可以安全地做部分复制。\n\n用时间线来说明：\n\n```\n故障转移前：\n  Master(replid=AAA, offset=1000000)\n    ├── Replica-A(replid=AAA, offset=999500)\n    ├── Replica-B(replid=AAA, offset=999800)\n    └── Replica-C(replid=AAA, offset=999900)\n\nMaster 宕机，Sentinel 选举 Replica-C 为新 Master：\n  新 Master（原 Replica-C）执行 REPLICAOF NO ONE:\n    master_replid  = BBB（新生成）\n    master_replid2 = AAA（保存旧 Master 的 replid）\n    second_repl_offset = 999900（切换时的 offset）\n\nReplica-A 重连到新 Master:\n  发送: PSYNC AAA 999500\n  新 Master 检查: AAA == replid2 ✓, 999500 在 backlog 中 ✓, 999500 <= 999900 ✓\n  回复: +CONTINUE BBB   ← 注意这里返回新的 replid\n  发送 offset 999500 到当前 offset 之间的命令\n  Replica-A 更新自己的 replid 为 BBB\n\nReplica-B 重连到新 Master:\n  发送: PSYNC AAA 999800\n  同样可以部分复制 ✓\n```\n\n注意 `+CONTINUE` 回复中会携带新的 replid（BBB），Replica 收到后会更新自己的 replid。从这个时刻起，所有 Replica 都使用新的 replid BBB，复制链恢复正常。\n\n### INFO replication 中 backlog 相关字段的完整解读\n\n在生产环境中监控部分复制的健康状态，`INFO replication` 是最核心的工具。下面逐一解释 backlog 相关的字段：\n\n```bash\n127.0.0.1:6379> INFO replication\n# Replication\nrole:master\nconnected_slaves:3\nslave0:ip=10.0.1.11,port=6379,state=online,offset=892347156,lag=0\nslave1:ip=10.0.1.12,port=6379,state=online,offset=892347156,lag=0\nslave2:ip=10.0.1.13,port=6379,state=online,offset=892346980,lag=1\nmaster_replid:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0\nmaster_replid2:0000000000000000000000000000000000000000\nmaster_repl_offset:892347156\nsecond_repl_offset:-1\nrepl_backlog_active:1\nrepl_backlog_size:268435456\nrepl_backlog_first_byte_offset:623911701\nrepl_backlog_histlen:268435456\n```\n\n`master_replid` 是当前复制数据集的唯一标识。`master_replid2` 在没有发生过故障转移时是全零；如果显示一个有意义的值，说明这个 Master 曾经是别人的 Replica（比如经历过 Sentinel 故障转移后被提升的）。`second_repl_offset` 是与 replid2 配对的偏移量，`-1` 表示未使用。\n\n`repl_backlog_active` 为 1 表示 backlog 处于活跃状态（有 Replica 连接过）。`repl_backlog_size` 是配置的 backlog 总大小。`repl_backlog_first_byte_offset` 是 backlog 中当前保存的最旧数据对应的偏移量——任何 offset 小于这个值的 Replica 都无法做部分复制。`repl_backlog_histlen` 是 backlog 中当前有效数据的字节数。当 `histlen == repl_backlog_size` 时说明 backlog 已经写满，旧数据正在被覆盖。\n\n据此可以计算 backlog 的「可回溯窗口」：Replica 最多可以落后 `master_repl_offset - repl_backlog_first_byte_offset` 这么多字节。在上面的例子中就是 `892347156 - 623911701 = 268435455` 字节，约等于 256MB（恰好等于 backlog 大小，因为已经写满了）。\n\n### 生产环境的监控与告警策略\n\n监控部分复制的健康状态，我在生产中通常关注三个指标：\n\n第一个是复制延迟（replication lag）。通过计算 `master_repl_offset - slave_repl_offset` 得到每个 Replica 的字节级延迟。正常情况下这个差值应该很小（几百字节以内），如果持续增长到几 MB 甚至几十 MB，说明 Replica 的处理速度跟不上 Master 的写入速度，需要排查 Replica 的 CPU、内存或网络瓶颈。可以用以下 Prometheus 规则采集和告警：\n\n```yaml\n# prometheus alerting rule\n- alert: RedisReplicationLagHigh\n  expr: redis_master_repl_offset - on(instance) group_right redis_slave_repl_offset > 10485760\n  for: 3m\n  labels:\n    severity: warning\n  annotations:\n    summary: \"Redis replication lag > 10MB for 3 minutes\"\n```\n\n第二个是 backlog 使用率。`repl_backlog_histlen / repl_backlog_size` 表示 backlog 的使用比例。如果长期维持在 100%（即 `histlen == size`），说明 backlog 一直是满的，旧数据不断被覆盖。这本身不是问题（backlog 写满是正常的），但需要确保 backlog 足够大，使得 Replica 短暂断线后仍在可回溯范围内。\n\n第三个是全量复制的发生频率。通过 `INFO stats` 中的 `sync_full`（全量复制次数）和 `sync_partial_ok`（部分复制成功次数）来跟踪。如果 `sync_full` 频繁增长，说明部分复制经常失败，最常见的原因就是 `repl-backlog-size` 太小。\n\n```bash\n127.0.0.1:6379> INFO stats\n...\nsync_full:3\nsync_partial_ok:47\nsync_partial_err:2\n...\n```\n\n这里 `sync_partial_err` 是 2，表示有 2 次 Replica 尝试部分复制但失败了（回退到全量复制）。如果这个数字在你部署后持续增长，应该立即调大 backlog。\n\n### 常见踩坑场景与避坑指南\n\n第一个坑是 Master 重启后 replid 变化。Redis 进程重启后会生成新的 replid，导致所有 Replica 的 replid 都不匹配，必须全量复制。Redis 4.0 的 PSYNC2 协议通过 replid2 机制缓解了 Sentinel 故障转移场景，但对于 Master 冷重启（比如机器意外重启后 Redis 从 RDB 恢复），replid 仍然会变化。因此生产环境中应尽量避免直接重启 Master，而是通过故障转移的方式来做维护：先让 Sentinel 将一个 Replica 提升为新 Master，然后安全重启旧 Master 并让它作为 Replica 加入集群。\n\n第二个坑是 `repl-backlog-ttl` 导致 backlog 被释放。当所有 Replica 都断开后，Master 会在 `repl-backlog-ttl`（默认 3600 秒）后释放 backlog 内存。如果此后有 Replica 重连，因为 backlog 已经不存在了，只能全量复制。在 Sentinel 或 Cluster 架构中，Replica 断开通常意味着故障，恢复时间可能超过一小时。建议在这类场景下将 `repl-backlog-ttl` 设置为 0（永不释放）。\n\n第三个坑是混淆 repl-backlog 和 replication buffer。backlog 是全局唯一的环形缓冲区，用于断线重连时的部分复制；replication buffer（client output buffer）是每个 Replica 连接独立的输出缓冲区，用于全量复制期间暂存增量命令。两者的配置参数完全不同——backlog 用 `repl-backlog-size`，replication buffer 用 `client-output-buffer-limit replica`。面试中把这两者搞混是很常见的扣分点。\n\n### 面试高频考点与知识体系脉络\n\n部分复制在面试中通常会围绕几个维度考察。第一是流程层面：「Replica 断线重连后发生了什么」——你需要清晰地讲出 PSYNC 命令、replid 匹配、offset 校验、backlog 查找这一整套流程。第二是数据结构层面：「repl-backlog 是什么结构、怎么工作的」——环形缓冲区、固定大小、first_byte_offset 和 master_repl_offset 的关系。第三是调优层面：「生产环境怎么配置 backlog」——计算公式、监控指标、常见的全量复制触发原因和解决办法。第四是协议演进层面：「PSYNC 和 PSYNC2 有什么区别」——replid2 机制、故障转移后的增量同步优化。\n\n从知识体系来看，部分复制向上承接全量复制的基础流程（你需要先搞清楚全量复制才能理解为什么需要部分复制），向下关联 Sentinel 的故障转移流程（PSYNC2 的 replid2 机制直接影响故障转移后的同步效率）和 Redis Cluster 的复制机制。横向来看，repl-backlog 的环形缓冲区设计思想在很多中间件中都能看到——Kafka 的 Log Segment 虽然不是环形但也是类似的「保留一段历史供消费者追赶」的思路，MySQL 的 binlog 也是类似的机制。理解了这个模式，很多分布式系统的复制机制你都能举一反三。",
+      "keyPoints": [
+        "Redis 2.8 之前 Replica 断线重连只能全量复制，2.8 引入 PSYNC 命令和 repl-backlog 实现部分复制，仅传输 Replica 缺失的写命令而非整个 RDB",
+        "部分复制依赖三个组件协同工作：Replication ID（replid）标识复制数据集、Replication Offset 标识同步位置的字节计数器、Replication Backlog 存储最近写命令的环形缓冲区",
+        "repl-backlog 是 Master 端全局唯一的环形缓冲区（默认 1MB），写满后从头覆盖旧数据，Replica 的 offset 如果落在 first_byte_offset 到 master_repl_offset 之间才能部分复制",
+        "Replica 断线重连时发送 PSYNC <replid> <offset>，Master 同时检查 replid 匹配和 offset 在 backlog 范围内，两个条件都满足回复 +CONTINUE 做部分复制，否则回退 +FULLRESYNC",
+        "repl-backlog-size 的计算公式是「断线秒数 × 每秒写入字节数 × 2」，可通过 INFO stats 的 instantaneous_output_kbps 或 master_repl_offset 增长速率来测算写入量",
+        "Redis 4.0 的 PSYNC2 协议引入 replid2 机制，Replica 被提升为新 Master 时保存旧 replid 为 replid2，使得其他 Replica 在故障转移后仍可部分复制而非全量复制",
+        "生产环境 repl-backlog-size 建议至少 256MB，监控 sync_full / sync_partial_ok / sync_partial_err 指标判断部分复制是否正常，频繁全量复制时应增大 backlog",
+        "repl-backlog 和 replication buffer（client output buffer）是两个不同概念：前者是全局共享的环形缓冲区用于断线重连时部分复制，后者是每个 Replica 独立的输出缓冲区用于全量复制期间暂存增量命令"
+      ],
+      "quiz": [
+        {
+          "id": "redis-repl-partial-sync-q1-quiz1",
+          "question": "Redis 从哪个版本开始支持部分复制（Partial Resynchronization）？",
+          "choices": [
+            { "id": "A", "text": "Redis 2.6，与 Lua 脚本同一版本引入" },
+            { "id": "B", "text": "Redis 2.8，引入 PSYNC 命令实现部分复制" },
+            { "id": "C", "text": "Redis 3.0，与 Redis Cluster 同一版本引入" },
+            { "id": "D", "text": "Redis 4.0，与 PSYNC2 协议同时引入" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 2.8（2013 年发布）引入了 PSYNC 命令，首次支持部分复制，让 Replica 断线重连时可以只同步缺失的写命令而不用全量复制。选项 A 的 Redis 2.6 确实引入了 Lua 脚本支持，但那时复制还只有 SYNC 命令，不支持部分复制。选项 C 的 Redis 3.0 引入了 Redis Cluster，但部分复制在 2.8 就有了。选项 D 是常见的混淆点——Redis 4.0 引入的 PSYNC2 是对部分复制的改进（增加 replid2 支持故障转移后的增量同步），而不是部分复制本身的首次引入。"
+        },
+        {
+          "id": "redis-repl-partial-sync-q1-quiz2",
+          "question": "Replica 断线重连时发送 PSYNC 命令，Master 判断可以部分复制需要同时满足哪些条件？",
+          "choices": [
+            { "id": "A", "text": "只需要 replid 匹配即可，offset 不影响判断" },
+            { "id": "B", "text": "replid 匹配且 Replica 的 offset 在 repl-backlog 的有效范围内" },
+            { "id": "C", "text": "只需要 offset 在 repl-backlog 范围内，replid 不影响判断" },
+            { "id": "D", "text": "replid 匹配、offset 在 backlog 范围内、且 Replica 断线时间小于 repl-backlog-ttl" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Master 判断是否可以部分复制需要两个条件同时满足：第一，Replica 发送的 replid 必须与 Master 当前的 master_replid 或 master_replid2 匹配，确认 Replica 之前确实在同一条复制链上；第二，Replica 请求的 offset 必须在 backlog 的有效范围内（>= first_byte_offset 且 <= master_repl_offset）。选项 A 忽略了 offset 校验，即使 replid 匹配但 offset 已被覆盖也无法部分复制。选项 C 忽略了 replid 校验，Replica 连错了 Master 也会尝试部分复制显然不安全。选项 D 的 repl-backlog-ttl 控制的是所有 Replica 断开后 backlog 的保留时间，不参与部分复制的判断逻辑。"
+        },
+        {
+          "id": "redis-repl-partial-sync-q1-quiz3",
+          "question": "repl-backlog 在 Redis 中的数据结构本质是什么？",
+          "choices": [
+            { "id": "A", "text": "链表结构，每个节点存储一条写命令" },
+            { "id": "B", "text": "固定大小的环形缓冲区（circular buffer），写满后从头覆盖" },
+            { "id": "C", "text": "类似 AOF 的追加文件，写到磁盘上" },
+            { "id": "D", "text": "动态增长的内存区域，空间不足时自动扩容" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "repl-backlog 是一个固定大小的环形缓冲区，分配在内存中，大小由 repl-backlog-size 配置决定（默认 1MB）。写入数据到达末尾后会从头开始覆盖旧数据——这正是环形缓冲区的核心特性。选项 A 的链表结构虽然也能存储命令历史，但 Redis 选择环形缓冲区是因为它内存固定、无碎片、按 offset 随机访问效率高。选项 C 完全错误，backlog 存在内存中而非磁盘上，这也是它为什么不能无限大的原因。选项 D 的「动态扩容」不符合实际——backlog 的大小在配置后就固定了，不会自动增长，这也是为什么 repl-backlog-size 需要合理规划的原因。"
+        },
+        {
+          "id": "redis-repl-partial-sync-q1-quiz4",
+          "question": "repl-backlog 是 Master 上全局唯一的还是每个 Replica 独立一份？",
+          "choices": [
+            { "id": "A", "text": "每个 Replica 连接独立维护一份 backlog，互不影响" },
+            { "id": "B", "text": "Master 上全局唯一，所有 Replica 共享同一个 backlog" },
+            { "id": "C", "text": "取决于配置，可以选择共享或独立模式" },
+            { "id": "D", "text": "每个 Replica 在自己本地维护 backlog，Master 不存储" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "repl-backlog 在 Master 端是全局唯一的，所有 Replica 共享这一个 backlog。Master 每传播一条写命令，只需要往这一个 backlog 中写入一次，而不是给每个 Replica 各写一份。这个设计既节省内存又简化了实现。需要注意的是，repl-backlog 和每个 Replica 独立的 replication buffer（client output buffer）是完全不同的东西——后者是每个 Replica 连接独立的输出缓冲区，用于全量复制期间暂存 Master 还未发送给该 Replica 的命令。面试中混淆这两者是常见的扣分点。选项 D 更是本末倒置，backlog 由 Master 维护而非 Replica。"
+        },
+        {
+          "id": "redis-repl-partial-sync-q1-quiz5",
+          "question": "以下 INFO replication 输出中，一个带着 offset=600000000 的 Replica 重连，能否部分复制？\nrepl_backlog_size:268435456\nrepl_backlog_first_byte_offset:623911701\nmaster_repl_offset:892347156",
+          "choices": [
+            { "id": "A", "text": "可以，因为 600000000 < 892347156" },
+            { "id": "B", "text": "不可以，因为 600000000 < 623911701，该 offset 对应的数据已被 backlog 覆盖" },
+            { "id": "C", "text": "可以，因为 backlog 大小 268MB 足够大" },
+            { "id": "D", "text": "不确定，需要看 repl_backlog_histlen 才能判断" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "判断 Replica 能否部分复制的关键是其 offset 是否在 backlog 的有效数据范围内，即 offset 必须 >= repl_backlog_first_byte_offset 且 <= master_repl_offset。这里 Replica 的 offset 是 600000000，而 backlog 中最旧数据的偏移量 first_byte_offset 是 623911701。600000000 < 623911701，说明 Replica 需要的数据已经被环形缓冲区覆盖了，无法部分复制，只能走全量复制。选项 A 只比较了 offset 和 master_repl_offset 的大小关系，忽略了 first_byte_offset 这个下界。选项 C 的 backlog 大小只决定能保存多少历史数据，具体能不能回溯要看 first_byte_offset。"
+        },
+        {
+          "id": "redis-repl-partial-sync-q1-quiz6",
+          "question": "以下哪个关于 repl-backlog-size 默认值和调优的说法是错误的？",
+          "choices": [
+            { "id": "A", "text": "默认值是 1MB，对大多数生产环境来说太小了" },
+            { "id": "B", "text": "计算公式：断线秒数 × 每秒写入字节数 × 安全系数 2" },
+            { "id": "C", "text": "设置过大会导致 Master 的 fork 子进程变慢，影响 BGSAVE 性能" },
+            { "id": "D", "text": "生产环境建议至少设置 256MB，高写入场景可以设到 512MB-1GB" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "选项 C 是错误的说法。repl-backlog 是一块固定大小的内存缓冲区，它的大小不会影响 fork 子进程的速度。fork 的耗时取决于 Redis 进程的整体内存页表大小，而不是 backlog 的大小——backlog 在总内存中的占比通常很小。把 backlog 从 1MB 调到 256MB 对 BGSAVE 的 fork 性能几乎没有影响。选项 A 正确，1MB 的默认值在生产环境中确实太小。选项 B 的计算公式是业界通用的 backlog 大小估算方法。选项 D 的建议也是合理的——256MB 的内存成本很低但能大幅减少不必要的全量复制。"
+        },
+        {
+          "id": "redis-repl-partial-sync-q1-quiz7",
+          "question": "PSYNC2（Redis 4.0+）相比 PSYNC（Redis 2.8）的核心改进是什么？",
+          "choices": [
+            { "id": "A", "text": "将 backlog 从内存移到磁盘，支持更大的积压缓冲区" },
+            { "id": "B", "text": "引入 replid2 机制，使 Sentinel 故障转移后其他 Replica 仍可部分复制" },
+            { "id": "C", "text": "支持多个 Replica 并行接收 backlog 数据，提升同步吞吐量" },
+            { "id": "D", "text": "引入压缩传输，减少部分复制的网络带宽占用" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "PSYNC2 的核心改进是引入了第二个 Replication ID（replid2）。在 Sentinel 故障转移场景中，当一个 Replica 被提升为新 Master 时，它会生成新的 replid 作为 master_replid，同时把旧 Master 的 replid 保存为 master_replid2。其他 Replica 用旧 replid 连接新 Master 时，新 Master 检查 replid2 匹配就可以做部分复制，避免了所有 Replica 在故障转移后被迫全量复制的问题。选项 A 不正确，backlog 始终在内存中。选项 C 描述的并行机制不是 PSYNC2 的改进内容，backlog 本就是共享的。选项 D 的压缩传输也不存在于 PSYNC2 的改进中。"
+        },
+        {
+          "id": "redis-repl-partial-sync-q1-quiz8",
+          "question": "生产环境中，你发现 INFO stats 的 sync_full 指标在一周内从 3 增长到 15，sync_partial_err 从 0 增长到 12。最可能的原因和解决办法是什么？",
+          "choices": [
+            { "id": "A", "text": "Replica 数量太多导致 Master CPU 负载过高，应减少 Replica 数量" },
+            { "id": "B", "text": "repl-backlog-size 太小，Replica 短暂断线后 offset 就被覆盖了，应增大 repl-backlog-size" },
+            { "id": "C", "text": "网络带宽不足导致 RDB 传输超时，应升级网络" },
+            { "id": "D", "text": "Master 频繁重启导致 replid 变化，应排查 Master 崩溃原因" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "sync_partial_err 从 0 增长到 12 意味着 Replica 尝试了 12 次部分复制但都失败了（回退到全量复制）。部分复制失败最常见的原因就是 Replica 请求的 offset 已经被 backlog 覆盖了——换句话说 repl-backlog-size 太小，容不下 Replica 断线期间 Master 产生的写命令量。解决办法是增大 repl-backlog-size，按照「断线时间 × 每秒写入量 × 2」的公式计算合理大小。选项 A 的 CPU 负载不会导致 sync_partial_err 增长。选项 D 如果 Master 频繁重启，sync_partial_err 理论上也可能增长（replid 不匹配），但一周 12 次更可能是 backlog 不够大而非 Master 崩溃——后者会有更明显的监控告警。"
+        },
+        {
+          "id": "redis-repl-partial-sync-q1-quiz9",
+          "question": "当所有 Replica 都断开连接后，Master 的 repl-backlog 会怎样处理？",
+          "choices": [
+            { "id": "A", "text": "立即释放 backlog 内存" },
+            { "id": "B", "text": "永久保留 backlog，直到 Master 重启" },
+            { "id": "C", "text": "等待 repl-backlog-ttl（默认 3600 秒）后释放 backlog 内存" },
+            { "id": "D", "text": "将 backlog 数据持久化到 AOF 文件中" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "当所有 Replica 都断开后，Master 不会立即释放 backlog，而是等待 repl-backlog-ttl 配置的超时时间（默认 3600 秒即 1 小时）。这样设计是为了给 Replica 一个重连的窗口——如果 Replica 在 TTL 内重连，backlog 还在，仍然有机会做部分复制。超过 TTL 后 backlog 会被释放以节省内存。选项 A 的「立即释放」会让短暂断开的 Replica 失去部分复制的机会。选项 B 的「永久保留」会浪费内存，除非手动设置 repl-backlog-ttl 为 0 才是永不释放。选项 D 完全不存在，backlog 的数据不会写入 AOF，它只存在于内存中。"
+        },
+        {
+          "id": "redis-repl-partial-sync-q1-quiz10",
+          "question": "Sentinel 故障转移后，新 Master 的 INFO replication 中 master_replid2 显示了一个非全零的值。这说明什么？",
+          "choices": [
+            { "id": "A", "text": "新 Master 正在等待旧 Master 恢复，replid2 是临时占位符" },
+            { "id": "B", "text": "说明这个 Master 之前是 Replica，经历了故障转移后被提升，replid2 保存了旧 Master 的 replid 以支持其他 Replica 部分复制" },
+            { "id": "C", "text": "说明 Master 同时维护两个独立的数据集，replid2 标识第二个数据集" },
+            { "id": "D", "text": "说明 backlog 溢出了，replid2 是溢出后生成的备用标识符" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "master_replid2 是 PSYNC2 协议的核心字段。当一个 Replica 被 Sentinel 提升为新 Master（执行 REPLICAOF NO ONE）时，它会生成新的 replid 作为 master_replid，同时把旧 Master 的 replid 保存为 master_replid2，对应的 second_repl_offset 记录切换时的偏移量。这样其他 Replica 用旧的 replid 连接新 Master 时，新 Master 检查 replid2 匹配就可以做部分复制。如果 master_replid2 显示非全零值，就说明这个节点经历过故障转移。选项 A 完全不正确，replid2 不是临时占位符。选项 C 的「两个数据集」是对 replid2 的误解。选项 D 的「backlog 溢出」与 replid2 没有任何关系。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/replication/",
+        "https://redis.io/docs/latest/commands/psync/",
+        "https://github.com/redis/redis/blob/7.2/src/replication.c",
+        "https://redis.io/docs/latest/commands/info/"
+      ]
+    }
+  ]
+}

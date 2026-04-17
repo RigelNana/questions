@@ -1,0 +1,156 @@
+{
+  "id": "redis-repl-backlog-size",
+  "name": "复制积压缓冲区应该设置多大",
+  "domain": "redis",
+  "description": "深入讲解 Redis repl-backlog-size 的调优公式、测量方法、监控指标与生产环境最佳实践，避免因 Backlog 过小引发不必要的全量复制",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-repl-backlog-size-q1",
+      "domain": "redis",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["repl-backlog-size", "复制积压缓冲区", "增量复制", "全量复制", "调优公式", "repl-backlog-ttl", "redis-replication"],
+      "title": "复制积压缓冲区应该设置多大",
+      "content": "## 调优场景\n\n你负责一组 Redis 主从集群，Master 承载电商平台的核心缓存写入，高峰期写入 QPS 大约 12000，平均每条写命令经过 RESP 序列化后约 400 字节。某天凌晨网络抖动了大约 45 秒，三个 Replica 全部断线重连。你查看 Master 日志发现：\n\n```\n12876:M 03 Jan 2024 02:15:33.482 * Replica 10.0.2.11:6380 asks for synchronization\n12876:M 03 Jan 2024 02:15:33.483 * Partial resynchronization not accepted: Replication backlog tail offset 894203712 > required offset 889127436\n12876:M 03 Jan 2024 02:15:33.483 * Starting BGSAVE for SYNC with target: disk\n12876:M 03 Jan 2024 02:15:33.519 * Background saving started by pid 12891\n```\n\n日志中「Partial resynchronization not accepted」说明增量复制失败了——Replica 请求的 offset 对应的数据已经被 Backlog 环形缓冲区覆盖掉了。于是 Master 不得不启动 BGSAVE 做全量复制。这个 Master 的数据量有 18GB，BGSAVE fork 耗时 380ms（期间所有请求阻塞），生成 RDB 文件大约 6.2GB 花了 47 秒，通过千兆内网传输给三个 Replica 又各花了约 55 秒。三个 Replica 在加载 RDB 期间完全无法服务读请求，读侧 P99 延迟从 1.2ms 飙到超时。\n\n你当前的配置是这样的：\n\n```bash\n# redis.conf（问题配置）\nrepl-backlog-size 1mb          # 默认值！\nrepl-backlog-ttl 3600\nclient-output-buffer-limit replica 256mb 64mb 60\n```\n\n1MB 的 Backlog 在每秒写入约 4.6MB（12000 × 400B）的场景下，不到 0.22 秒就会被完全覆盖。换句话说，Replica 断线超过 0.22 秒就只能走全量复制——这在生产环境几乎等于「永远全量复制」。\n\n你需要回答：repl-backlog-size 应该怎么算、怎么测量写入速率、怎么监控 Backlog 的使用情况，以及 repl-backlog-ttl 该设多少？",
+      "answer": "## 复制积压缓冲区基础回顾\n\nReplication Backlog（复制积压缓冲区）是 Redis Master 端维护的一个全局环形缓冲区（ring buffer），它的唯一职责就是支持 Replica 断线重连后的增量复制（Partial Resynchronization）。理解 Backlog 之前，得先搞清楚 Redis 主从复制中全量复制和增量复制的触发条件。当 Replica 首次连接 Master 或者断线时间过长导致 Backlog 中已经没有它需要的数据时，就只能走全量复制——Master fork 子进程生成 RDB 快照，通过网络传给 Replica，Replica 清空自己的数据库然后加载这个 RDB。而增量复制则轻量得多：Master 只需要从 Backlog 中找到 Replica 断线前的 offset 位置，把之后的写命令重新发一遍就行。\n\nBacklog 本质上是一块固定大小的内存区域，Master 把每一条传播给 Replica 的写命令按照 RESP 协议格式追加写入这个缓冲区。因为是环形结构，当写到末尾时会回绕到开头覆盖最早的数据。Redis 用 `master_repl_offset` 这个全局递增的偏移量来标记当前写到哪里了，用 `repl_backlog_first_byte_offset` 标记 Backlog 中最早那个字节对应的 offset。只要 Replica 请求的 offset 落在 `[first_byte_offset, master_repl_offset]` 这个区间内，就能做增量复制；否则就必须全量复制。\n\n默认值 `repl-backlog-size 1mb`（1048576 字节）是 Redis 出于保守考虑设置的，适合开发环境或极低写入量的场景。但在任何有实际业务流量的生产环境中，1MB 几乎肯定是不够的。\n\n## 调优公式与计算方法\n\n确定合理的 Backlog 大小，核心公式只有一行：\n\n```\nbacklog_size = disconnect_time × write_size_per_second × safety_factor\n```\n\n这三个参数分别代表：`disconnect_time` 是你预估的 Replica 最长断线时间（秒），需要考虑网络抖动、故障转移切换耗时、Replica 重启加载时间等因素；`write_size_per_second` 是 Master 每秒写入 Backlog 的字节量；`safety_factor` 是安全系数，通常取 2，用来应对写入量波动和突发流量。\n\n### 如何准确测量 write_size_per_second\n\n很多人第一反应是看 `INFO stats` 里的 `instantaneous_output_kbps`，但这个指标包含了所有客户端的输出流量（读响应、复制流量、Pub/Sub 消息等），并不等于写入 Backlog 的速率。更准确的方法是直接观察 `master_repl_offset` 在一段时间内的变化量。这个 offset 精确反映了写入 Backlog 的累计字节数，因为每条写命令传播到 Replica 时都会递增这个值。\n\n实际操作非常简单，在 Master 上执行两次 `INFO replication`，记录时间和 offset：\n\n```bash\n# 时刻 T1\n127.0.0.1:6379> INFO replication\nmaster_repl_offset:523847291\n\n# 等待 60 秒后再次执行\n127.0.0.1:6379> INFO replication\nmaster_repl_offset:812634507\n\n# 计算写入速率\n# (812634507 - 523847291) / 60 = 4,813,120 字节/秒 ≈ 4.59 MB/s\n```\n\n建议在业务高峰期采样多次取最大值，因为你要确保的是「最坏情况下 Backlog 也够用」。我们在生产中通常用一个简单的 shell 脚本做持续采样：\n\n```bash\n#!/bin/bash\n# monitor_repl_rate.sh — 每 10 秒采样一次 Master 复制写入速率\nREDIS_CLI=\"redis-cli -h 10.0.1.100 -p 6379\"\nPREV=$($REDIS_CLI INFO replication | grep master_repl_offset | cut -d: -f2 | tr -d '\\r')\nwhile true; do\n    sleep 10\n    CURR=$($REDIS_CLI INFO replication | grep master_repl_offset | cut -d: -f2 | tr -d '\\r')\n    RATE=$(( (CURR - PREV) / 10 ))\n    echo \"$(date '+%H:%M:%S') write_rate: ${RATE} bytes/sec ($(( RATE / 1048576 )) MB/s)\"\n    PREV=$CURR\ndone\n```\n\n跑一天之后你会得到完整的写入速率曲线，取峰值来做计算。\n\n### 实际计算示例\n\n回到场景中的数据：每秒写入约 4.6MB，假设最长断线时间为 60 秒（考虑 Sentinel 故障转移的 30 秒超时加上网络恢复的余量），安全系数取 2：\n\n```\nbacklog_size = 60s × 4.6MB/s × 2 = 552MB\n```\n\n向上取整到 600MB 是个合理的配置值。在 redis.conf 中这样写：\n\n```bash\n# redis.conf（优化后）\nrepl-backlog-size 600mb\n```\n\n如果你的场景中 Sentinel 的 `down-after-milliseconds` 设为 30000（30 秒），加上 failover 的选举和切换时间通常在 10-15 秒，那么 disconnect_time 取 60 秒是比较保守的。如果你跑的是 Redis Cluster 且节点较多，故障转移可能更快一些，但留出余量总是对的。\n\n## repl-backlog-ttl 配置\n\n`repl-backlog-ttl` 控制的是当所有 Replica 都断开连接之后，Master 保留 Backlog 内存多久才释放。默认值是 3600 秒（1 小时）。设为 0 表示永不释放。\n\n这个参数的意义在于：如果所有 Replica 都断开了（比如你在做运维操作依次重启所有 Replica），Master 不会立即释放 Backlog 的内存。只要在 TTL 时间内有 Replica 重新连上来，仍然可以尝试增量复制。生产环境建议保持默认值 3600 或者更大。如果你的 Backlog 设了 600MB，这 600MB 内存在没有 Replica 的情况下会保留 1 小时，这点内存开销完全可以接受。\n\n```bash\n# 推荐配置\nrepl-backlog-ttl 3600    # 保持默认，或按运维需求增大\n# repl-backlog-ttl 0     # 永不释放，适合 Replica 可能长时间断开的场景\n```\n\n## INFO replication 监控指标详解\n\n判断 Backlog 是否够用，不能靠猜，要靠监控。`INFO replication` 输出中与 Backlog 直接相关的有四个字段：\n\n```bash\n127.0.0.1:6379> INFO replication\n# ... 省略其他字段 ...\nrepl_backlog_active:1\nrepl_backlog_size:629145600\nrepl_backlog_first_byte_offset:18294037521\nrepl_backlog_histlen:629145600\n```\n\n`repl_backlog_active` 为 1 表示 Backlog 已启用（有 Replica 连接过或在 TTL 内）。`repl_backlog_size` 是你配置的总大小，这里是 600MB。`repl_backlog_first_byte_offset` 是 Backlog 中最早那个字节对应的全局 offset——Replica 请求的 offset 如果小于这个值，增量复制就不可能了。`repl_backlog_histlen` 是 Backlog 中当前有效数据的长度，当 Backlog 被写满一圈后，histlen 就等于 backlog_size。\n\n判断某个 Replica 能否做增量复制的逻辑是：如果 `slave_repl_offset < repl_backlog_first_byte_offset`，那这个 Replica 必须全量复制，因为它需要的数据已经被覆盖了。你可以据此设置监控告警：\n\n```python\n# Prometheus + redis_exporter 告警规则示例\n# 当 Backlog 使用率超过 80% 且有 Replica lag 较大时预警\n- alert: RedisReplBacklogNearFull\n  expr: redis_replication_backlog_histlen / redis_replication_backlog_bytes > 0.8\n  for: 5m\n  labels:\n    severity: warning\n  annotations:\n    summary: \"Redis Backlog 使用率超过 80%\"\n    description: \"实例 {{ $labels.instance }} 的复制积压缓冲区使用率 {{ $value | humanizePercentage }}，存在 Replica 断线后触发全量复制的风险\"\n```\n\n当 `histlen / backlog_size` 持续保持在接近 100% 且你观察到 Replica 偶尔触发全量复制，说明 Backlog 的大小需要上调了。\n\n## 生产环境最佳实践\n\n首先，任何生产环境都不应该保留默认的 1MB。即使你的写入量很低（比如每秒只有几十 KB），1MB 也只能支撑十几秒的断线窗口，而一次网络抖动或 Sentinel 故障转移很容易超过这个时间。我的建议是：起步不低于 256MB。如果你的写入量在每秒 1MB 以上，直接上 512MB 到 1GB。Backlog 是 Master 端全局唯一的一块内存（不管你有几个 Replica，只有一份 Backlog），相比一次全量复制带来的 fork 阻塞、网络带宽消耗、Replica 不可用时间，这点内存开销非常值得。\n\n其次，配合告警机制形成闭环。把 Backlog 使用率、Replica 的 offset lag、以及全量复制事件（日志关键字 `BGSAVE for SYNC`）都纳入监控。当 Backlog 使用率持续超过 80% 时就应该主动扩容，不要等到 Replica 真的触发全量复制才处理。\n\n最后一个容易忽略的点：`repl-backlog-size` 可以通过 `CONFIG SET` 在运行时动态修改而不需要重启 Redis。所以即使你发现 Backlog 设小了，也不需要做维护窗口，直接在线调大就行：\n\n```bash\n127.0.0.1:6379> CONFIG SET repl-backlog-size 629145600\nOK\n127.0.0.1:6379> CONFIG REWRITE\nOK\n```\n\n注意 `CONFIG SET` 修改后一定要跟一个 `CONFIG REWRITE` 把变更持久化到 redis.conf，否则 Redis 重启后会回到旧配置。",
+      "keyPoints": [
+        "Replication Backlog 是 Master 端的全局环形缓冲区，不管挂多少个 Replica 只有一份，默认 1MB 在生产环境几乎肯定不够用",
+        "调优公式：backlog_size = 最长断线时间 × 每秒写入字节数 × 安全系数（通常取 2），三个参数缺一不可",
+        "测量每秒写入量最准确的方法是采样 master_repl_offset 在固定时间段内的差值，而非依赖 instantaneous_output_kbps",
+        "判断增量复制是否可行的条件：slave_repl_offset ≥ repl_backlog_first_byte_offset，否则必须全量复制",
+        "repl-backlog-ttl 控制所有 Replica 断开后 Backlog 内存的保留时间，默认 3600 秒，设为 0 表示永不释放",
+        "repl-backlog-size 可以通过 CONFIG SET 在线动态修改无需重启，但必须跟 CONFIG REWRITE 持久化到配置文件",
+        "生产环境建议最低 256MB 起步，高写入场景（>1MB/s）推荐 512MB-1GB，配合 Backlog 使用率 >80% 的告警机制形成闭环"
+      ],
+      "quiz": [
+        {
+          "id": "redis-repl-backlog-size-q1-quiz1",
+          "question": "关于 Replication Backlog 的基本属性，以下哪项描述是正确的？",
+          "choices": [
+            { "id": "A", "text": "每个 Replica 在 Master 端都有一个独立的 Backlog 副本" },
+            { "id": "B", "text": "Backlog 是 Master 端全局唯一的环形缓冲区，所有 Replica 共享同一份" },
+            { "id": "C", "text": "Backlog 存储在 Replica 端，用于缓存从 Master 接收到的命令" },
+            { "id": "D", "text": "Backlog 是磁盘上的日志文件，断电后仍可用于增量复制" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Replication Backlog 是 Master 端维护的一块全局唯一的环形缓冲区（ring buffer），无论有多少个 Replica 连接到 Master，都共享这同一份 Backlog。Master 把每一条写命令按 RESP 协议格式追加写入 Backlog，当缓冲区写满后新数据会从头覆盖旧数据。选项 A 混淆了 Backlog 和 replication buffer（后者才是每个 Replica 独立的），选项 C 把存储位置搞反了，选项 D 错在 Backlog 完全存在于内存中而非磁盘上，Redis 重启后 Backlog 数据就没了。"
+        },
+        {
+          "id": "redis-repl-backlog-size-q1-quiz2",
+          "question": "Redis 默认的 repl-backlog-size 是多少？这个默认值在生产环境中通常存在什么问题？",
+          "choices": [
+            { "id": "A", "text": "默认 64MB，对大多数生产场景已经够用" },
+            { "id": "B", "text": "默认 1MB，在高写入场景下可能几秒甚至不到 1 秒就被写满，Replica 断线后几乎必定触发全量复制" },
+            { "id": "C", "text": "默认 16MB，只在超高写入量（>100MB/s）场景下才需要调整" },
+            { "id": "D", "text": "没有默认值，必须手动配置否则主从复制无法启动" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 的 repl-backlog-size 默认值是 1MB（1048576 字节）。这个值在任何有实际业务流量的生产环境中都太小了。举个例子，如果每秒写入量是 5MB，那 1MB 的 Backlog 在 0.2 秒内就会被完全覆盖，Replica 断线超过 0.2 秒就必须做全量复制。即使写入量较低（比如每秒 50KB），1MB 也只能支撑约 20 秒的断线窗口，而一次 Sentinel 故障转移的耗时很容易超过 20 秒。选项 A 和 C 给出了错误的默认值。选项 D 也不对，Redis 有默认值且不配置也能正常运行，只是默认值在生产中不够用。"
+        },
+        {
+          "id": "redis-repl-backlog-size-q1-quiz3",
+          "question": "计算 repl-backlog-size 的核心公式中，安全系数（safety_factor）通常取多少？它的作用是什么？",
+          "choices": [
+            { "id": "A", "text": "取 1.1，用于补偿网络传输中的协议头开销" },
+            { "id": "B", "text": "取 2，用于应对写入量波动、突发流量以及测量误差" },
+            { "id": "C", "text": "取 10，因为 Redis 内部会对命令做压缩存储，实际占用是原始大小的 1/10" },
+            { "id": "D", "text": "不需要安全系数，直接用 disconnect_time × write_size_per_second 即可" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "调优公式 backlog_size = disconnect_time × write_size_per_second × safety_factor 中，安全系数通常取 2。这个系数的存在是为了应对多种不确定性：首先，write_size_per_second 通常是用高峰期的峰值来计算的，但实际可能存在比采样峰值更高的瞬时写入突发；其次，disconnect_time 也可能因为极端网络故障或复杂的故障转移流程而超出预估；最后，采样方法本身也存在一定误差。选项 A 的 1.1 太小，几乎没有缓冲余量。选项 C 的 10 倍太夸张，且 Redis 的 Backlog 存储的是原始 RESP 格式命令，不做压缩。选项 D 完全不留余量，在实际场景中很容易踩到边界。"
+        },
+        {
+          "id": "redis-repl-backlog-size-q1-quiz4",
+          "question": "测量 Master 每秒写入 Backlog 的速率，以下哪种方法最准确？",
+          "choices": [
+            { "id": "A", "text": "查看 INFO stats 中的 instantaneous_input_kbps 指标" },
+            { "id": "B", "text": "统计 INFO stats 中 total_commands_processed 的增长量乘以平均命令大小" },
+            { "id": "C", "text": "在固定时间间隔内采样 INFO replication 中 master_repl_offset 的差值再除以时间" },
+            { "id": "D", "text": "查看 INFO stats 中的 instantaneous_output_kbps 指标" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "master_repl_offset 是 Master 写入 Backlog 的累计字节偏移量，每当一条写命令被传播到复制流中，这个值就精确递增对应的字节数。通过在两个时间点采样 offset 值并计算差值除以时间间隔，就能得到这段时间内的精确写入速率。选项 A 的 instantaneous_input_kbps 反映的是所有客户端向 Redis 发送请求的入站流量，包含了大量读命令的请求体，与 Backlog 写入量无关。选项 B 的问题在于 total_commands_processed 包含了读命令，而只有写命令才会进入 Backlog，且「平均命令大小」本身就很难准确估算。选项 D 的 instantaneous_output_kbps 包含所有客户端的出站流量（读响应、复制流、Pub/Sub 等），同样不能准确反映 Backlog 的写入速率。"
+        },
+        {
+          "id": "redis-repl-backlog-size-q1-quiz5",
+          "question": "以下是一段 INFO replication 的输出，据此判断 Replica 请求 offset 为 18293800000 时能否做增量复制：\n\nrepl_backlog_active:1\nrepl_backlog_size:629145600\nrepl_backlog_first_byte_offset:18294037521\nrepl_backlog_histlen:629145600",
+          "choices": [
+            { "id": "A", "text": "可以增量复制，因为 histlen 等于 backlog_size 说明 Backlog 数据完整" },
+            { "id": "B", "text": "不能增量复制，因为请求的 offset 18293800000 小于 first_byte_offset 18294037521，数据已被覆盖" },
+            { "id": "C", "text": "可以增量复制，因为请求的 offset 和 first_byte_offset 只差 237521 字节，在 600MB Backlog 范围内" },
+            { "id": "D", "text": "无法判断，还需要知道 master_repl_offset 的值" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "增量复制能否成功的核心判断条件是：Replica 请求的 offset 必须大于等于 repl_backlog_first_byte_offset。在这个例子中，Replica 请求的 offset 是 18293800000，而 Backlog 中最早的数据对应的 offset 是 18294037521。18293800000 < 18294037521，说明 Replica 需要的那部分数据（从 18293800000 到 18294037521 这 237521 字节）已经被新数据覆盖掉了，Backlog 中不再有这些内容。选项 A 混淆了「Backlog 是否写满」和「Replica 需要的数据是否还在」这两个概念。选项 C 虽然注意到了差值不大，但方向搞反了——offset 小于 first_byte_offset 就是不行，差多少都不行。选项 D 不对，判断只需要比较 slave_offset 和 first_byte_offset。"
+        },
+        {
+          "id": "redis-repl-backlog-size-q1-quiz6",
+          "question": "某团队把 repl-backlog-size 从 1MB 调到 512MB 后，发现 Redis 重启后又变回了 1MB，最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "CONFIG SET 修改后没有执行 CONFIG REWRITE，Redis 重启后加载的还是旧配置文件" },
+            { "id": "B", "text": "512MB 超过了 repl-backlog-size 的最大限制，Redis 自动回退到默认值" },
+            { "id": "C", "text": "需要同时重启所有 Replica 才能让新的 Backlog 大小生效" },
+            { "id": "D", "text": "Redis 版本低于 5.0，不支持在线修改 repl-backlog-size" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个非常常见的运维失误。通过 CONFIG SET repl-backlog-size 629145600 可以在运行时动态修改 Backlog 大小且立即生效，但这个修改只影响当前运行的 Redis 进程的内存中的配置。如果不紧跟一个 CONFIG REWRITE 命令将变更持久化写回 redis.conf 文件，那么 Redis 重启后会重新从 redis.conf 加载配置，Backlog 大小就会回到文件中的旧值（通常是默认的 1MB）。选项 B 不对，repl-backlog-size 没有硬性上限，只要 Master 内存足够就行。选项 C 也不对，Backlog 是 Master 端的配置，与 Replica 无关。选项 D 不准确，CONFIG SET 对 repl-backlog-size 的支持在很早的版本就有了。"
+        },
+        {
+          "id": "redis-repl-backlog-size-q1-quiz7",
+          "question": "repl-backlog-size 和 client-output-buffer-limit replica 都与复制相关，它们的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "两者功能相同，repl-backlog-size 是旧版名称，client-output-buffer-limit replica 是新版名称" },
+            { "id": "B", "text": "Backlog 是全局唯一的环形缓冲用于增量复制，client-output-buffer 是每个 Replica 连接独立的缓冲区用于实时传输和全量复制期间的增量暂存" },
+            { "id": "C", "text": "Backlog 存在于 Replica 端，client-output-buffer 存在于 Master 端" },
+            { "id": "D", "text": "Backlog 用于全量复制时的 RDB 传输，client-output-buffer 用于增量复制" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这两个缓冲区容易混淆但职责完全不同。Replication Backlog 是 Master 端全局唯一的环形缓冲区，不管有多少 Replica 只有一份，它的作用是在 Replica 断线重连时提供增量复制的数据源。而 client-output-buffer-limit replica 配置的是 Master 为每个 Replica 连接维护的独立输出缓冲区——当 Master 在做全量复制期间（BGSAVE + 传输 RDB），新产生的写命令会暂存到这个 per-connection 的 buffer 中；同时日常的命令传播也经过这个 buffer。如果这个 buffer 超过硬限制（默认 256MB），Master 会断开 Replica 连接。选项 A 完全错误，两者是不同的机制。选项 C 把 Backlog 的位置搞反了。选项 D 把两者的职责对调了。"
+        },
+        {
+          "id": "redis-repl-backlog-size-q1-quiz8",
+          "question": "生产环境中 Master 每秒写入约 8MB，Sentinel 配置 down-after-milliseconds 为 30000（30秒），故障转移通常需要额外 15 秒，使用安全系数 2，repl-backlog-size 应该设置为多少？",
+          "choices": [
+            { "id": "A", "text": "约 240MB（30 × 8 × 1）" },
+            { "id": "B", "text": "约 480MB（30 × 8 × 2）" },
+            { "id": "C", "text": "约 720MB（(30+15) × 8 × 2）" },
+            { "id": "D", "text": "约 960MB（(30+15) × 8 × 2 + 额外 240MB 保底）" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "正确的计算需要考虑完整的断线时间，而不仅仅是 Sentinel 的探测超时。Sentinel 的 down-after-milliseconds 是 30 秒，这意味着 Sentinel 判定 Master 下线需要大约 30 秒。之后还有 leader 选举、投票、执行 failover 的过程，题目给出通常需要额外 15 秒。所以 disconnect_time 应该取 30 + 15 = 45 秒。代入公式：45 × 8MB/s × 2 = 720MB。选项 A 只计算了 Sentinel 探测超时且没有安全系数。选项 B 虽然有安全系数但 disconnect_time 只用了 30 秒，没有考虑故障转移本身的耗时。选项 D 在公式之外又加了额外缓冲，虽然更保守但不符合标准公式的计算结果，且显得过于随意。"
+        },
+        {
+          "id": "redis-repl-backlog-size-q1-quiz9",
+          "question": "repl-backlog-ttl 设为 0 意味着什么？在什么场景下适合这样配置？",
+          "choices": [
+            { "id": "A", "text": "所有 Replica 断开后立即释放 Backlog 内存，适合内存紧张的环境" },
+            { "id": "B", "text": "禁用 Backlog 功能，所有重连都走全量复制" },
+            { "id": "C", "text": "所有 Replica 断开后永不释放 Backlog 内存，适合 Replica 可能长时间断开后重连的场景" },
+            { "id": "D", "text": "Backlog 的 TTL 与 key 的 TTL 联动，设为 0 表示 Backlog 中的数据不过期" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "repl-backlog-ttl 控制的是当所有 Replica 都断开连接之后，Master 保留 Backlog 内存的时间。默认 3600 秒意味着所有 Replica 断开 1 小时后才释放。设为 0 表示永不释放——即使没有任何 Replica 连接，Master 也始终保留 Backlog。这在某些运维场景下很有用：比如你需要依次重启所有 Replica 做版本升级，中间可能有几个小时没有 Replica 在线，设为 0 可以确保 Replica 重连后仍然能尝试增量复制。选项 A 理解完全相反了，想要「立即释放」应该设为 1（最小正值）。选项 B 错在 TTL 只影响 Backlog 的生命周期，不会禁用 Backlog 功能。选项 D 把 key TTL 和 Backlog TTL 混为一谈了。"
+        },
+        {
+          "id": "redis-repl-backlog-size-q1-quiz10",
+          "question": "某 Redis 实例 INFO replication 显示 repl_backlog_histlen 持续等于 repl_backlog_size 且 Replica 经常触发全量复制，但 Master 日志中没有 OOM 或内存不足的报错。以下哪种排查方向最合理？",
+          "choices": [
+            { "id": "A", "text": "Backlog 大小不够，histlen 等于 backlog_size 说明已被写满一圈以上，应增大 repl-backlog-size" },
+            { "id": "B", "text": "histlen 等于 backlog_size 说明 Backlog 完全空闲没有被使用过，应该检查 Replica 是否真的在同步" },
+            { "id": "C", "text": "需要立即重启 Master 以释放被 Backlog 占用的内存碎片" },
+            { "id": "D", "text": "应该减小 repl-backlog-size 以减少内存使用，全量复制触发的原因是 Replica 网络带宽不足" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "当 repl_backlog_histlen 持续等于 repl_backlog_size 时，说明 Backlog 已经被写满至少一圈了——环形缓冲区中的旧数据在不断被新数据覆盖。这本身不一定是问题（稳定运行的系统在写满后 histlen 就一直等于 backlog_size），但如果同时观察到 Replica 经常触发全量复制，就说明 Replica 断线时请求的 offset 所对应的数据已经被覆盖掉了。解决方案是增大 repl-backlog-size，让 Backlog 能容纳更长时间窗口内的写命令。选项 B 完全搞反了，histlen 等于 backlog_size 说明 Backlog 一直在被积极写入。选项 C 没有道理，Backlog 是连续内存区域不会产生碎片问题。选项 D 方向错误，减小 Backlog 只会让全量复制更频繁。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/replication/",
+        "https://redis.io/docs/latest/commands/info/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/config/",
+        "https://github.com/redis/redis/blob/7.2/src/replication.c"
+      ]
+    }
+  ]
+}
