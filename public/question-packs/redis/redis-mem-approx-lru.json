@@ -1,0 +1,157 @@
+{
+  "id": "redis-mem-approx-lru",
+  "name": "Redis 近似 LRU 算法与标准 LRU 的区别",
+  "domain": "redis",
+  "description": "深入剖析 Redis 为什么不用标准 LRU、近似 LRU 的采样淘汰机制、eviction pool 优化、24 位 lru 字段与 LRU 时钟的工作原理",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-mem-approx-lru-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["近似LRU", "采样淘汰", "eviction pool", "maxmemory-samples", "redisObject", "redis-memory"],
+      "title": "Redis 的近似 LRU 算法与标准 LRU 有什么不同",
+      "content": "## 面试场景\n\n面试官问你：「Redis 的内存淘汰策略里有 allkeys-lru，这个 LRU 跟教科书上的 LRU 是一回事吗？」你回答说 Redis 用的是近似 LRU。面试官追问：「为什么不用标准 LRU？近似 LRU 具体是怎么实现的？精度够用吗？」\n\n这组追问能一层层地暴露你对 Redis 内存淘汰机制的理解深度。很多人知道标准 LRU 用双向链表加哈希表实现，也知道 Redis 没有采用这种方式，但说不清楚 Redis 到底做了什么替代方案。更深一层——Redis 3.0 引入的 eviction pool 优化是怎么把近似精度从「勉强能用」提升到「几乎等价于理论最优 LRU」的，能讲清楚这一点的候选人寥寥无几。\n\n我们先来看一个实际场景。假设你有一个 Redis 实例配置了 `maxmemory 4gb` 和 `maxmemory-policy allkeys-lru`，当内存即将触顶时，Redis 需要决定淘汰哪个 key。用 `OBJECT IDLETIME` 命令可以查看任意 key 的空闲时间：\n\n```bash\n127.0.0.1:6379> SET user:1001 '{\"name\":\"alice\"}'\nOK\n127.0.0.1:6379> SET user:1002 '{\"name\":\"bob\"}'\nOK\n# 等待 30 秒后\n127.0.0.1:6379> GET user:1001\n\"{\\\"name\\\":\\\"alice\\\"}\"\n# 再等待 10 秒\n127.0.0.1:6379> OBJECT IDLETIME user:1001\n(integer) 10\n127.0.0.1:6379> OBJECT IDLETIME user:1002\n(integer) 40\n```\n\n`user:1002` 已经 40 秒没被访问过了，而 `user:1001` 只空闲了 10 秒——如果需要淘汰，`user:1002` 更应该被优先清除。问题是：Redis 是怎么用一种比标准 LRU 省内存得多的方式做到这个判断的？这背后涉及 redisObject 的 24 位 lru 字段、随机采样策略、以及 eviction pool 的候选池机制。",
+      "answer": "## 第一步：LRU 算法基础——从教科书到现实\n\n### 什么是 LRU\n\nLRU 的全称是 Least Recently Used（最近最少使用），是一种经典的缓存淘汰策略。它的核心思想很直觉：当缓存空间满了需要腾位置时，把最久没有被访问过的那个数据淘汰掉。这个策略背后的假设是「如果一个数据最近被访问过，那它短期内再次被访问的概率更高」，在大部分业务场景下这个假设成立，所以 LRU 是最常用的缓存淘汰策略之一。\n\n### 标准 LRU 的经典实现\n\n教科书上实现 LRU 的标准方式是「双向链表 + 哈希表」的组合。哈希表（HashMap）用来做 O(1) 的 key 查找，双向链表用来维护所有 key 的访问时间顺序——最近访问过的节点放在链表头部，最久没访问的自然沉到链表尾部。每次访问一个 key 时，先通过哈希表 O(1) 定位到它在链表中的节点，然后把这个节点从当前位置摘出来移动到链表头部（这就是所谓的「移到头部」操作）。淘汰时直接从链表尾部删除节点就行，也是 O(1)。整个方案的时间复杂度非常漂亮——查找、访问更新、淘汰全是 O(1)。\n\n这套方案在 LeetCode 第 146 题（LRU Cache）里是标准答案，很多人在面试中也背得滚瓜烂熟。但它有一个在教科书里不太被强调的问题：内存开销。双向链表的每个节点需要一个 `prev` 指针和一个 `next` 指针来维护链表结构。在 64 位系统上，每个指针占 8 字节，两个就是 16 字节。如果你的缓存里有 100 万个 key，光是链表指针就要额外占用 100万 × 16 字节 = 16MB。这还没算哈希表本身为每个节点额外存储的指针和元数据。对于一个只有几千个元素的内存缓存来说，这点开销无所谓；但对于 Redis 这种动辄管理数千万甚至上亿 key 的系统来说，这笔帐就不能不算了。\n\n除了内存开销，标准 LRU 链表还有一个隐性的性能问题：缓存局部性（cache locality）很差。双向链表的节点在堆内存中是散落分布的，每次「移到头部」操作都需要修改最多 6 个指针（被移动节点的前后节点、链表头节点的前后指针），而这些指针指向的内存地址大概率不在同一个 CPU 缓存行（cache line）里。在高并发场景下，大量的 cache miss 会显著拖慢性能。\n\n## 第二步：Redis 近似 LRU 的设计与实现\n\n### Redis 为什么放弃标准 LRU\n\n理解了标准 LRU 的代价之后，Redis 放弃它的理由就很清楚了。Redis 的设计哲学一直是「用最少的内存做最多的事」。antirez（Redis 的作者 Salvatore Sanfilippo）在 Redis 3.0 的 release notes 里明确说过，为每个 key 维护一个双向链表节点的内存开销是不可接受的。假设一个 Redis 实例有 1000 万个 key，标准 LRU 的链表指针开销就是 1000万 × 16 字节 = 160MB——这 160MB 什么有用数据都没存，纯粹是数据结构的「税」。更何况 Redis 的 key 数量经常到达亿级别，开销会线性膨胀。\n\n所以 Redis 选择了一条完全不同的路：不维护全局的访问顺序链表，而是用一种基于随机采样的近似 LRU 算法。这个方案的核心思想是「不追求精确淘汰最旧的那个 key，而是通过随机采样找到一个足够旧的 key 来淘汰」。这种近似方案牺牲了一点精度，但换来了巨大的内存节省。\n\n### redisObject 的 24 位 lru 字段\n\nRedis 中每个 value 对象都由一个 `redisObject` 结构体来承载。这个结构体的定义在 `src/server.h` 中（Redis 7.x 版本）：\n\n```c\ntypedef struct redisObject {\n    unsigned type:4;       // 数据类型：string/list/set/zset/hash\n    unsigned encoding:4;   // 编码方式：int/embstr/raw/ziplist/...\n    unsigned lru:LRU_BITS; // LRU_BITS = 24，记录最后访问时间\n    int refcount;          // 引用计数\n    void *ptr;             // 指向底层数据结构的指针\n} robj;\n```\n\n注意 `lru` 字段只有 24 位。Redis 用这 24 位来记录该对象最后一次被访问的时间戳。但 24 位能表示的最大值是 2^24 - 1 = 16777215，如果直接存 Unix 时间戳的秒数，只能覆盖约 194 天（16777215 秒 ÷ 86400 秒/天 ≈ 194.18 天）。所以 Redis 存的是 Unix 时间戳取低 24 位后的值——本质上是一个会每 194 天回绕（wrap around）一次的时钟。\n\n每次一个 key 被访问（GET、SET、INCR 等命令），Redis 都会更新它的 `lru` 字段为当前的 LRU 时钟值。这个更新操作的开销极低——只是给一个 24 位字段赋值，相比标准 LRU 的「链表节点移动」轻量了几个数量级。更重要的是，这 24 位 lru 字段和 type、encoding 一起被塞进了 `redisObject` 结构体开头的 4 字节里（通过位域 bit field 实现），不需要任何额外的内存分配。对比标准 LRU 每个 key 额外 16 字节的指针开销，Redis 的方案是零额外内存开销——lru 字段本身就是 redisObject 的组成部分。\n\n### LRU 时钟：避免频繁的系统调用\n\n你可能会问：每次访问 key 都要更新 lru 字段，那岂不是每次都要调用 `time()` 系统调用来获取当前时间？在高 QPS 场景下（比如每秒 10 万次读写），每次 `time()` 虽然很快但积少成多也是一笔开销。\n\nRedis 对此做了优化：维护一个全局的 LRU 时钟 `server.lruclock`，在 `serverCron` 定时任务中定期更新。更新频率由 `LRU_CLOCK_RESOLUTION` 宏定义控制，在 Redis 源码中这个值是 1000（毫秒），也就是每 1000 毫秒更新一次。实际上 `serverCron` 默认每 100ms 执行一次（由 `server.hz` 控制，默认值 10），所以 `server.lruclock` 大约每 100ms 刷新一次。这样所有对 key 的访问在同一个 100ms 窗口内看到的 LRU 时钟值都是相同的——避免了每次访问都做系统调用，用一次全局的时间读取服务所有请求。源码中获取 LRU 时钟的函数是 `getLRUClock()`，位于 `src/evict.c`：\n\n```c\n/* Return the LRU clock, based on the clock resolution. */\nunsigned int getLRUClock(void) {\n    return (mstime()/LRU_CLOCK_RESOLUTION) & LRU_CLOCK_MAX;\n}\n```\n\n其中 `LRU_CLOCK_MAX` 的值是 `(1<<LRU_BITS)-1`，即 16777215，确保结果不会超过 24 位。\n\n### 采样淘汰：maxmemory-samples 参数\n\n当 Redis 检测到 `used_memory` 即将达到 `maxmemory` 限制时，需要淘汰一些 key 来腾出空间。此时 Redis 不是遍历所有 key 找出 lru 最小（最久没访问）的那个——遍历百万级 key 本身就会阻塞主线程——而是采用随机采样的策略。\n\n具体过程是：Redis 从当前数据库中随机选取 `maxmemory-samples` 个 key（默认值是 5），比较它们的 lru 字段，淘汰其中空闲时间最长（lru 值最旧）的那个 key。这就是所谓的「近似 LRU」——不保证淘汰的是全局最旧的 key，但保证在被采样到的那几个 key 中是最旧的。你可以在 `redis.conf` 中配置这个参数：\n\n```bash\n# redis.conf\nmaxmemory-samples 5   # 每轮淘汰时随机采样 5 个 key，默认值\n```\n\n这里的「空闲时间」是怎么算的？Redis 用当前 LRU 时钟值减去 key 的 lru 字段值来估算。由于 lru 字段是 24 位的循环时钟，存在回绕问题。Redis 通过比较差值来处理：如果当前时钟值 >= key 的 lru 值，空闲时间 = 当前值 - lru 值；如果当前时钟值 < key 的 lru 值（说明中间发生了一次 194 天的回绕），空闲时间 = 当前值 + (LRU_CLOCK_MAX - lru 值)。源码中 `estimateObjectIdleTime()` 函数（`src/evict.c`）处理了这个逻辑。\n\n### Redis 3.0 的 eviction pool 优化\n\n早期版本（Redis 2.x）的近似 LRU 精度确实比较粗糙——每轮只从 5 个随机采样中选最旧的一个淘汰，淘汰完就把本轮的采样结果丢弃了。下一轮淘汰又重新采样 5 个 key，完全不记得上一轮采样到但没被淘汰的那些「比较旧」的 key。这导致很多相对较旧的 key 被采样到后又被放过了，近似精度与理论最优 LRU 有明显差距。\n\nRedis 3.0 引入了 eviction pool（淘汰候选池）来解决这个问题。eviction pool 是一个大小固定为 `EVPOOL_SIZE`（硬编码为 16）的数组，里面的元素按空闲时间从小到大排序。每轮淘汰时，Redis 先随机采样 `maxmemory-samples` 个 key，然后把这些 key 逐个跟 pool 里已有的候选进行比较——只有空闲时间比 pool 中当前最小值还要大的 key 才能入池。如果 pool 已满（16 个位置都占满了），新入池的 key 会挤掉空闲时间最短的那个。淘汰时从 pool 的尾部（空闲时间最长的位置）取出候选 key 进行删除。\n\n这个优化的精妙之处在于：eviction pool 具有「记忆效应」。每一轮采样到的旧 key，即使没有在当轮被淘汰，也会留在 pool 里参与后续轮次的竞争。随着采样轮次的累积，pool 里逐渐汇聚了全局范围内空闲时间较长的 key，最终淘汰的候选质量越来越接近理论最优 LRU。\n\n相关源码在 `src/evict.c` 的 `evictionPoolPopulate()` 函数中，核心结构体定义如下：\n\n```c\n#define EVPOOL_SIZE 16\n#define EVPOOL_CACHED_SDS_SIZE 255\n\nstruct evictionPoolEntry {\n    unsigned long long idle;  // 空闲时间（越大越应该被淘汰）\n    sds key;                  // key 名称\n    sds cached;               // 用于避免重复 SDS 分配的缓存\n    int dbid;                 // 所属数据库编号\n};\n```\n\n### maxmemory-samples 对精度的影响\n\nRedis 官方文档中有一张经典的对比图（出自 antirez 的博客），展示了不同 `maxmemory-samples` 值下近似 LRU 的淘汰精度。图中浅灰色区域是理论最优 LRU 会淘汰的 key，绿色点是 Redis 近似 LRU 实际淘汰的 key。实验结论非常清晰：当 `maxmemory-samples=5` 时（默认值），近似 LRU 已经能覆盖绝大部分理论最优 LRU 应该淘汰的 key，精度相当高；当 `maxmemory-samples=10` 时，淘汰结果与理论最优 LRU 几乎完全重合，差异微乎其微。\n\n在实际生产环境中，默认值 5 对绝大多数场景已经足够好。把 samples 从 5 调到 10，精度提升非常有限，但每轮淘汰的采样成本翻了一倍。除非你对淘汰精度有极端要求（比如某些 key 的价值差异巨大，不能容忍任何一次「误淘汰」），否则没有必要调大这个值。反过来，如果你把 samples 调到 3 甚至 2 以降低采样开销，精度下降会比较明显——不推荐。\n\n## 第三步：进阶知识与生产实践\n\n### 24 位 lru 字段的溢出处理\n\n前面提到 24 位 lru 字段大约 194 天回绕一次。这带来一个问题：如果一个 key 恰好在 194 天前被访问过，它的 lru 值可能跟一个刚刚被访问的 key 算出来的值相同或非常接近，导致 Redis 误判它是「最近才访问的」。在实际生产中，这种情况极其罕见——一个 key 如果 194 天没被访问过，它几乎肯定已经被 TTL 过期或者被前几轮的淘汰清理掉了。但如果你的 Redis 实例中确实有大量永不过期、长期不被访问的 key，194 天的回绕周期是一个需要知道的边界条件。\n\nRedis 在 `estimateObjectIdleTime()` 中处理回绕的方式也很简单粗暴：如果当前时钟值小于 key 的 lru 值，就认为中间发生了一次回绕，用 `(LRU_CLOCK_MAX - lru) + now` 来计算空闲时间。但如果实际已经回绕了两次以上（超过 388 天没被访问），这个计算结果就不准了。不过正如前面所说，这在实际场景中几乎不会成为问题。\n\n### OBJECT IDLETIME 命令的特殊行为\n\n`OBJECT IDLETIME <key>` 命令可以查看一个 key 的空闲时间（单位是秒），这在调试淘汰行为时非常有用。但有一个容易踩坑的细节：这个命令本身不会更新 key 的 lru 字段。也就是说，你执行 `OBJECT IDLETIME mykey` 后，mykey 的空闲时间不会被重置为 0。这是 Redis 有意为之——如果查看空闲时间也算一次「访问」，那这个命令本身就会干扰你想观察的行为，变得没有意义了。\n\n```bash\n127.0.0.1:6379> SET testkey \"hello\"\nOK\n# 等待 60 秒\n127.0.0.1:6379> OBJECT IDLETIME testkey\n(integer) 60\n127.0.0.1:6379> OBJECT IDLETIME testkey\n(integer) 60    # 仍然是 60 秒左右，没有被重置\n127.0.0.1:6379> GET testkey\n\"hello\"\n127.0.0.1:6379> OBJECT IDLETIME testkey\n(integer) 0     # GET 访问后 lru 被更新，空闲时间重置\n```\n\n同样不更新 lru 字段的还有 `OBJECT ENCODING`、`OBJECT REFCOUNT`、`OBJECT HELP` 等 OBJECT 子命令，以及 `DEBUG OBJECT`。但 `OBJECT FREQ`（用于 LFU 策略时查看访问频率）也不更新。\n\n### LRU vs LFU：Redis 4.0 引入的替代方案\n\nRedis 4.0 引入了 LFU（Least Frequently Used，最不经常使用）策略作为 LRU 的补充。LFU 复用了 redisObject 中同一个 24 位字段，但把这 24 位拆分成两部分：高 16 位存储上次访问时间（分钟级精度，约 45 天回绕），低 8 位存储一个对数化的访问频率计数器（Morris counter，最大值 255）。在 `maxmemory-policy` 设置为 `allkeys-lfu` 或 `volatile-lfu` 时启用。LFU 策略更适合有明确热点模式的场景——比如 20% 的 key 承担了 80% 的访问量。但 LRU 仍然是最通用的选择，因为它不需要预热期就能工作，而 LFU 的计数器需要积累一段时间的访问数据才能准确反映热度。\n\n### 生产环境的淘汰策略建议\n\n如果你把 Redis 当纯缓存用（所有数据都可以从后端数据库重建），推荐 `allkeys-lru`——它对所有 key 一视同仁，不需要 key 设置了过期时间才能被淘汰。如果你的 Redis 中混合了缓存数据和业务数据（比如 session、计数器），用 `volatile-lru` 更安全——它只在设了过期时间的 key 中执行淘汰，没有设过期时间的 key 不会被波及。\n\n在监控层面，`INFO stats` 中的 `evicted_keys` 指标记录了自 Redis 启动以来被淘汰的 key 总数。如果这个数字在持续快速增长，说明你的内存不够用了——要么扩容，要么审视业务侧是否在往 Redis 里塞了不该缓存的数据。配合 `INFO memory` 中的 `used_memory` 和 `maxmemory` 的比值来设置告警，是生产环境的基本操作。\n\n```bash\n127.0.0.1:6379> INFO stats\n# Stats\n...\nevicted_keys:284751      # 已淘汰 28 万个 key\nkeyspace_hits:89234567\nkeyspace_misses:1234567\n...\n```\n\n如果 `evicted_keys` 增长很快同时 `keyspace_misses`（缓存未命中次数）也在涨，说明淘汰行为已经影响到了缓存命中率，这时候单纯调大 `maxmemory-samples` 帮助不大——根本问题是内存不够了，需要从容量规划的角度去解决。",
+      "keyPoints": [
+        "标准 LRU 用双向链表 + 哈希表实现，每个 key 需要 prev/next 两个指针共 16 字节额外开销，百万级 key 场景下内存浪费严重且链表操作缓存局部性差",
+        "Redis 近似 LRU 在 redisObject 中用 24 位 lru 字段记录最后访问时间（Unix 秒时间戳取低 24 位），零额外内存开销，约 194 天回绕一次",
+        "淘汰时 Redis 不遍历所有 key，而是随机采样 maxmemory-samples（默认 5）个 key，比较 lru 字段后淘汰其中空闲时间最长的一个",
+        "Redis 3.0 引入 eviction pool（大小 16 的候选池），每轮采样的 key 与池中已有候选比较，只有空闲时间更长的才能入池，具有跨轮次的记忆效应，显著提升近似精度",
+        "maxmemory-samples=5 时近似 LRU 已非常接近理论最优 LRU，samples=10 时几乎无差别，默认值 5 是精度与性能的最佳平衡点",
+        "server.lruclock 是全局 LRU 时钟，约每 100ms 更新一次，所有 key 访问共享同一个时钟值，避免了每次访问都调用 time() 系统调用",
+        "OBJECT IDLETIME 命令查看 key 空闲时间但不会更新 lru 字段，这是 Redis 的有意设计，避免观测行为本身干扰淘汰判断",
+        "Redis 4.0 引入的 LFU 策略复用同一个 24 位字段（高 16 位时间 + 低 8 位对数计数器），适合明确热点模式的场景，但 LRU 仍是最通用的默认选择"
+      ],
+      "quiz": [
+        {
+          "id": "redis-mem-approx-lru-q1-quiz1",
+          "question": "标准 LRU 算法使用什么数据结构实现，时间复杂度如何？",
+          "choices": [
+            { "id": "A", "text": "双向链表 + 哈希表，查找和淘汰均为 O(1)" },
+            { "id": "B", "text": "最小堆 + 哈希表，查找 O(1) 淘汰 O(log n)" },
+            { "id": "C", "text": "单向链表 + 哈希表，查找 O(1) 淘汰 O(n)" },
+            { "id": "D", "text": "红黑树 + 哈希表，查找和淘汰均为 O(log n)" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "标准 LRU 的经典实现是双向链表加哈希表的组合。哈希表提供 O(1) 的 key 查找，双向链表维护访问顺序——每次访问把节点移到头部，淘汰时从尾部删除，都是 O(1) 操作。B 选项的最小堆方案虽然理论上可行但删除和更新操作是 O(log n)，不是 LRU 的标准实现。C 选项的单向链表无法做到 O(1) 的节点移动——因为你需要修改前驱节点的 next 指针，但单向链表找前驱需要遍历。D 选项的红黑树适合有序集合场景，不是 LRU 的标准选择。"
+        },
+        {
+          "id": "redis-mem-approx-lru-q1-quiz2",
+          "question": "Redis 为什么不使用标准 LRU 算法？核心原因是什么？",
+          "choices": [
+            { "id": "A", "text": "标准 LRU 的时间复杂度太高，Redis 的单线程模型无法承受" },
+            { "id": "B", "text": "每个 key 需要额外的 prev/next 双指针（16 字节/key），百万级 key 下内存开销不可接受" },
+            { "id": "C", "text": "标准 LRU 需要多线程并发操作链表，与 Redis 单线程架构冲突" },
+            { "id": "D", "text": "标准 LRU 无法处理带过期时间的 key，不适合 Redis 的业务场景" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 放弃标准 LRU 的核心原因是内存开销。双向链表的每个节点需要 prev 和 next 两个 8 字节指针，共 16 字节/key。如果 Redis 管理 1000 万个 key，仅链表指针就需要 160MB——这些内存不存储任何业务数据，纯粹是数据结构的「税」。A 选项说法有误，标准 LRU 的时间复杂度是 O(1)，并不慢。C 选项的多线程说法是错的——标准 LRU 不要求多线程。D 选项也不准确——标准 LRU 完全可以跟过期机制配合使用，两者是独立的。此外链表操作的缓存局部性差也是一个次要原因。"
+        },
+        {
+          "id": "redis-mem-approx-lru-q1-quiz3",
+          "question": "Redis 的 redisObject 中 lru 字段占多少位，大约多少天会发生一次回绕？",
+          "choices": [
+            { "id": "A", "text": "32 位，约 136 年回绕一次" },
+            { "id": "B", "text": "24 位，约 194 天回绕一次" },
+            { "id": "C", "text": "16 位，约 18 小时回绕一次" },
+            { "id": "D", "text": "24 位，约 24 天回绕一次" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "redisObject 的 lru 字段由 LRU_BITS 宏定义，值为 24 位。24 位能表示的最大值是 2^24 - 1 = 16777215，存储的是 Unix 秒时间戳取低 24 位的值，所以约 16777215 秒 ÷ 86400 秒/天 ≈ 194.18 天回绕一次。A 选项的 32 位是常见的 Unix 时间戳位宽，但 Redis 为了节省内存只用了 24 位。C 选项的 16 位太小了，不是 Redis 的实际设计。D 选项的 24 天是算错了——可能把单位搞混了。Redis 之所以选择 24 位而不是更多，是因为 redisObject 中 type(4 位) + encoding(4 位) + lru(24 位) 刚好组成 32 位（4 字节），紧凑利用了内存空间。"
+        },
+        {
+          "id": "redis-mem-approx-lru-q1-quiz4",
+          "question": "Redis 近似 LRU 淘汰时的采样过程是怎样的？",
+          "choices": [
+            { "id": "A", "text": "遍历所有 key 的 lru 字段，找出全局最旧的 key 淘汰" },
+            { "id": "B", "text": "维护一个按 lru 排序的有序集合，直接从尾部弹出最旧的 key" },
+            { "id": "C", "text": "随机采样 maxmemory-samples 个 key，比较 lru 字段后淘汰其中最旧的" },
+            { "id": "D", "text": "按 key 的哈希值分桶，每桶淘汰一个最旧的 key" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 近似 LRU 的核心机制就是随机采样。每次需要淘汰 key 时，Redis 从键空间中随机选取 maxmemory-samples 个 key（默认 5 个），比较它们的 lru 字段值来计算空闲时间，淘汰其中空闲时间最长的那个。A 选项描述的全量遍历在百万级 key 的场景下会严重阻塞 Redis 主线程，Redis 绝不会这么做。B 选项等于实现了一个精确 LRU 的变种，需要额外的有序数据结构维护成本，正是 Redis 想避免的。D 选项的分桶策略在 Redis 中不存在。随机采样的精妙之处在于开销极低（只取几个随机 key），但配合 eviction pool 后精度非常高。"
+        },
+        {
+          "id": "redis-mem-approx-lru-q1-quiz5",
+          "question": "观察以下 Redis 命令输出，关于 OBJECT IDLETIME 的行为判断正确的是？\n\n```\n127.0.0.1:6379> SET mykey \"value\"\nOK\n# 等待 120 秒\n127.0.0.1:6379> OBJECT IDLETIME mykey\n(integer) 120\n127.0.0.1:6379> OBJECT IDLETIME mykey\n(integer) 120\n```",
+          "choices": [
+            { "id": "A", "text": "第二次 IDLETIME 应该返回 0，因为第一次 IDLETIME 已经「访问」了 mykey" },
+            { "id": "B", "text": "两次都返回 120 是正确的，因为 OBJECT IDLETIME 不会更新 key 的 lru 字段" },
+            { "id": "C", "text": "两次返回相同值说明 LRU 时钟出了问题，正常应该有 1-2 秒差异" },
+            { "id": "D", "text": "OBJECT IDLETIME 返回的是毫秒级精度，120 表示 120 毫秒" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "OBJECT IDLETIME 命令本身不会更新 key 的 lru 字段——这是 Redis 的有意设计。如果查看空闲时间也算一次「访问」，那这个命令就会干扰你正在观测的行为，变得没有实用价值。所以连续两次执行 OBJECT IDLETIME，结果只会因为时间流逝而略有增加，不会被重置为 0。A 选项是最常见的误解——以为任何触及 key 的操作都会更新 lru，但 OBJECT 系列子命令是例外。C 选项说 LRU 时钟有问题不对，时间差异取决于两次命令之间的间隔。D 选项的单位也是错的，OBJECT IDLETIME 返回的是秒，不是毫秒。"
+        },
+        {
+          "id": "redis-mem-approx-lru-q1-quiz6",
+          "question": "以下关于 Redis 近似 LRU 的说法，哪一个是常见的错误认知？",
+          "choices": [
+            { "id": "A", "text": "maxmemory-samples 默认值是 5，对大多数场景来说精度已经足够" },
+            { "id": "B", "text": "Redis 的 LRU 时钟 server.lruclock 大约每 100ms 更新一次，避免频繁系统调用" },
+            { "id": "C", "text": "近似 LRU 每次淘汰都需要扫描全部 key 的 lru 字段来找出最旧的候选" },
+            { "id": "D", "text": "eviction pool 会跨轮次保留采样到的旧 key，积累后提升淘汰精度" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "C 选项是错误认知。Redis 近似 LRU 的核心就是不扫描全部 key——那样做在百万级 key 的场景下会严重阻塞主线程。Redis 只随机采样 maxmemory-samples（默认 5）个 key 进行比较，配合 eviction pool 的跨轮次记忆效应来逼近理论最优。很多人误以为「近似」只是精度上的妥协，但实际上连扫描方式都完全不同于标准 LRU。A 选项正确——Redis 官方对比图显示 samples=5 时精度已很高。B 选项正确——server.lruclock 的更新频率由 serverCron 控制。D 选项也正确——eviction pool 正是 Redis 3.0 的关键优化。"
+        },
+        {
+          "id": "redis-mem-approx-lru-q1-quiz7",
+          "question": "Redis 3.0 引入的 eviction pool 相比 2.x 版本的简单采样淘汰，核心改进是什么？",
+          "choices": [
+            { "id": "A", "text": "把 maxmemory-samples 默认值从 3 提高到了 10" },
+            { "id": "B", "text": "维护一个大小为 16 的候选池，跨轮次积累空闲时间较长的 key，提升淘汰精度" },
+            { "id": "C", "text": "改用了双向链表实现精确 LRU，不再是近似算法" },
+            { "id": "D", "text": "引入了多线程并行采样，提高了淘汰吞吐量" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "eviction pool 的核心改进是引入了一个大小固定为 EVPOOL_SIZE=16 的候选池，按空闲时间从小到大排序。每轮采样的 key 会与池中已有候选比较，只有空闲时间更长的才能入池。关键创新在于「记忆效应」——上一轮采样到但没被淘汰的旧 key 会留在池中参与后续竞争，随着轮次积累，池中汇聚的都是全局范围内较旧的 key。A 选项不准确，maxmemory-samples 在 3.0 中默认值仍然是 5（2.x 也是 5）。C 选项完全错误——Redis 从未切换回精确 LRU。D 选项的多线程采样在 Redis 中不存在——淘汰逻辑运行在主线程中。"
+        },
+        {
+          "id": "redis-mem-approx-lru-q1-quiz8",
+          "question": "生产环境中 Redis 实例的 evicted_keys 指标持续快速增长，同时 keyspace_misses 也在上升，最可能的根因和解决思路是什么？",
+          "choices": [
+            { "id": "A", "text": "maxmemory-samples 设置太小导致淘汰精度不够，应调大到 20" },
+            { "id": "B", "text": "内存容量不足，淘汰过于频繁导致缓存命中率下降，需要扩容或减少缓存数据量" },
+            { "id": "C", "text": "LRU 时钟回绕导致新旧 key 判断错误，应重启 Redis 重置时钟" },
+            { "id": "D", "text": "eviction pool 满了导致新的旧 key 无法入池，应修改源码增大 EVPOOL_SIZE" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "evicted_keys 持续增长说明 Redis 在不断淘汰数据来腾出空间，keyspace_misses 上升说明被淘汰的数据又被业务方请求了但没命中——这是经典的「缓存颠簸」现象，根因是内存容量不够。解决方案是扩容（加内存或加节点）或者审视业务侧是否缓存了不该缓存的数据。A 选项中调大 maxmemory-samples 只能提升「淘汰谁更精准」，但不能解决「内存不够」的根本问题。C 选项的 LRU 时钟回绕在绝大多数场景下不会导致这种现象。D 选项中 EVPOOL_SIZE 是 16 的固定值，实际上已经够用，增大它对精度提升微乎其微。"
+        },
+        {
+          "id": "redis-mem-approx-lru-q1-quiz9",
+          "question": "关于 Redis 4.0 引入的 LFU 策略与 LRU 策略的关系，以下哪个说法是正确的？",
+          "choices": [
+            { "id": "A", "text": "LFU 策略使用了 redisObject 中一个额外的 32 位字段来记录访问频率" },
+            { "id": "B", "text": "LFU 复用了 redisObject 中同一个 24 位字段，高 16 位存时间、低 8 位存对数化频率计数器" },
+            { "id": "C", "text": "开启 LFU 后 Redis 会同时维护 LRU 和 LFU 两套数据，内存开销翻倍" },
+            { "id": "D", "text": "LFU 完全取代了 LRU，Redis 4.0 之后不再支持 LRU 策略" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 4.0 的 LFU 策略非常巧妙地复用了 redisObject 中原有的 24 位 lru 字段，没有增加任何额外内存。具体做法是把 24 位拆成两部分：高 16 位存储上次访问时间（分钟级精度，约 45 天回绕），低 8 位存储一个对数化的访问频率计数器（Morris counter，最大值 255）。A 选项说额外的 32 位字段是错误的——Redis 的设计哲学是极致节约内存，不会为 LFU 增加新字段。C 选项说同时维护两套数据也不对，LRU 和 LFU 共用同一个字段，不能同时启用。D 选项说 LRU 被取代更不准确——LRU 至今仍是 Redis 最常用的淘汰策略。"
+        },
+        {
+          "id": "redis-mem-approx-lru-q1-quiz10",
+          "question": "如果一个 Redis 实例中存在大量永不过期、且超过 200 天未被访问的 key，24 位 lru 字段的回绕可能导致什么问题？如何排查？",
+          "choices": [
+            { "id": "A", "text": "这些 key 的空闲时间计算会溢出导致 Redis 崩溃，需要升级到 64 位 lru 字段" },
+            { "id": "B", "text": "回绕可能让这些极旧 key 的 lru 值与新 key 接近，导致它们被误判为「最近访问过」而逃过淘汰；可通过 OBJECT IDLETIME 抽查异常 key" },
+            { "id": "C", "text": "不会有任何影响，Redis 的回绕处理完全精确，无论多久不访问都能正确计算" },
+            { "id": "D", "text": "超过 194 天不被访问的 key 会被 Redis 自动删除，不存在回绕问题" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "24 位 lru 字段约 194 天回绕一次。如果一个 key 超过 194 天未被访问，它的 lru 值在经过一次完整回绕后可能与刚被访问的 key 的 lru 值非常接近，导致 Redis 在采样比较时误判该 key 是「最近刚访问过的」，从而在淘汰决策中把它跳过。这种情况在实际生产中极其罕见——绝大多数 key 要么有 TTL 过期，要么在 194 天内会被淘汰或访问。A 选项说会导致崩溃是夸大了——Redis 的溢出处理不会导致进程异常。C 选项说完全精确是错的——超过一个回绕周期后计算会失准。D 选项说自动删除也不对——Redis 不会因为 key 太久没访问就自动删除它。排查方式是用 OBJECT IDLETIME 抽样检查可疑 key 的空闲时间。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/develop/reference/eviction/",
+        "https://github.com/redis/redis/blob/7.2/src/evict.c",
+        "https://github.com/redis/redis/blob/7.2/src/server.h",
+        "http://antirez.com/news/109"
+      ]
+    }
+  ]
+}

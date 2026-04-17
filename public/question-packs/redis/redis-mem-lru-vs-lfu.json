@@ -1,0 +1,157 @@
+{
+  "id": "redis-mem-lru-vs-lfu",
+  "name": "LRU 与 LFU 淘汰算法在 Redis 中的实现区别",
+  "domain": "redis",
+  "description": "深入对比 Redis 中近似 LRU 和 LFU 淘汰算法的底层实现、数据结构复用、关键配置参数、缓存污染问题及生产选型建议",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-mem-lru-vs-lfu-q1",
+      "domain": "redis",
+      "type": "comparison",
+      "difficulty": 3,
+      "tags": ["LRU", "LFU", "近似算法", "maxmemory-samples", "淘汰策略", "频率衰减", "redis-memory"],
+      "title": "说说 Redis 里 LRU 和 LFU 淘汰算法的实现有什么区别",
+      "content": "## 面试场景\n\n面试官问你：「Redis 的淘汰策略里有 allkeys-lru 和 allkeys-lfu，你能讲讲这两种算法在 Redis 里具体是怎么实现的吗？」你回答说 LRU 按最近访问时间淘汰，LFU 按访问频率淘汰。面试官继续追问：「Redis 的 LRU 是经典的双向链表+哈希表实现吗？如果不是，它怎么做到近似 LRU 的？LFU 的频率计数器只有 8 位，怎么表示几百万次访问？为什么新 key 的计数器初始值是 5 而不是 0？频率衰减是怎么工作的？」\n\n这些追问一层比一层深，能答到底层实现的人并不多。很多人以为 Redis 的 LRU 就是标准的链表实现，不知道 Redis 为了节省内存做了多大的妥协；也有人知道 LFU 按频率淘汰，但说不清楚 `lfu-log-factor` 和 `lfu-decay-time` 到底控制的是什么。\n\n我们先看一个 Redis 实例的淘汰配置和运行状态：\n\n```bash\n127.0.0.1:6379> CONFIG GET maxmemory-policy\n1) \"maxmemory-policy\"\n2) \"allkeys-lfu\"\n\n127.0.0.1:6379> CONFIG GET maxmemory-samples\n1) \"maxmemory-samples\"\n2) \"5\"\n\n127.0.0.1:6379> CONFIG GET lfu-log-factor\n1) \"lfu-log-factor\"\n2) \"10\"\n\n127.0.0.1:6379> CONFIG GET lfu-decay-time\n1) \"lfu-decay-time\"\n2) \"1\"\n\n127.0.0.1:6379> SET hotkey \"value\"\nOK\n127.0.0.1:6379> GET hotkey\n\"value\"\n127.0.0.1:6379> OBJECT FREQ hotkey\n(integer) 1\n127.0.0.1:6379> OBJECT IDLETIME hotkey\n(error) ERR object idletime is not allowed when maxmemory-policy is LFU based.\n```\n\n注意最后一条命令：当淘汰策略是 LFU 系列时，`OBJECT IDLETIME` 命令直接报错了。这是因为 LRU 和 LFU 复用了 `redisObject` 中同一个 24 位字段，同一时刻只能表示一种语义。这个底层细节就是理解两种算法差异的关键入口。\n\n这道题要从 Redis 的 `redisObject` 结构出发，把近似 LRU 的采样机制、LFU 的对数计数器和频率衰减、以及两者的实际淘汰效果差异讲透。",
+      "answer": "## 第一步：Redis 内存淘汰机制的全局认知\n\n### 为什么 Redis 需要淘汰算法\n\nRedis 是纯内存数据库，所有数据都驻留在内存中。当你通过 `maxmemory` 配置了内存使用上限后，随着数据不断写入，总有一天 `used_memory` 会逼近这个上限。此时 Redis 必须做出决策：是拒绝新的写入请求，还是主动淘汰一部分旧数据来腾出空间？这个决策就由 `maxmemory-policy` 控制。\n\nRedis 7.0 提供了 8 种淘汰策略，其中与本题直接相关的有四种：`allkeys-lru`（在所有 key 中用 LRU 算法淘汰）、`volatile-lru`（只在设了过期时间的 key 中用 LRU 淘汰）、`allkeys-lfu`（在所有 key 中用 LFU 算法淘汰）、`volatile-lfu`（只在设了过期时间的 key 中用 LFU 淘汰）。LRU 是 Least Recently Used 的缩写，核心思想是「最近没被访问过的数据最可能不再需要」；LFU 是 Least Frequently Used 的缩写，核心思想是「访问频率最低的数据最可能不再需要」。\n\n理解这两种算法的实现差异，需要从 Redis 的底层数据结构 `redisObject` 开始说起。Redis 中每一个 value 都被封装成一个 `redisObject` 结构体（在 `server.h` 中定义），它长这样：\n\n```c\n// Redis 7.0 源码 src/server.h\ntypedef struct redisObject {\n    unsigned type:4;       // 数据类型：string/list/set/zset/hash\n    unsigned encoding:4;   // 编码方式：int/embstr/raw/ziplist/...\n    unsigned lru:24;       // LRU 时间戳 或 LFU 数据（取决于淘汰策略）\n    int refcount;          // 引用计数\n    void *ptr;             // 指向实际数据的指针\n} robj;\n```\n\n关键是那个 `lru` 字段——只有 24 位（3 个字节）。Redis 为每个 key 只花了 3 个字节来记录淘汰相关的元数据，这个极致的空间压缩决定了 Redis 不可能使用经典的 LRU/LFU 算法，而必须走近似路线。\n\n## 第二步：经典 LRU 与 Redis 近似 LRU 的实现对比\n\n### 经典 LRU 为什么不适合 Redis\n\n教科书上的 LRU 算法是用一个双向链表加一个哈希表来实现的：哈希表提供 O(1) 的 key 查找能力，双向链表维护访问时间顺序——每次访问一个 key 就把它移到链表头部，淘汰时直接取链表尾部的元素即可。这个方案时间复杂度完美（查找、插入、淘汰都是 O(1)），但有一个致命的问题：内存开销。\n\n一个双向链表节点需要两个指针（prev 和 next），在 64 位系统上就是 16 个字节。一个生产环境的 Redis 实例可能有上亿个 key，光链表节点的指针就要消耗 1.6GB 内存。再加上哈希表中的额外指针，总开销可能达到数 GB——这对于一个以内存效率著称的系统来说完全不可接受。而且每次读写操作都要移动链表节点，在高并发场景下会成为严重的性能瓶颈。所以 Redis 的作者 antirez 从一开始就放弃了经典 LRU，转而实现了一种内存友好的近似 LRU 算法。\n\n### Redis 近似 LRU 的实现\n\nRedis 的近似 LRU 非常巧妙：不维护全局的链表，而是利用 `redisObject.lru` 这个 24 位字段来存储每个 key 的最后一次访问时间戳。这个时间戳不是完整的 Unix 时间戳（那需要 32 或 64 位），而是一个秒级精度的时钟值对 2^24 取模的结果。2^24 秒大约是 194 天，也就是说这个时钟每 194 天循环一次。Redis 内部维护了一个全局的 LRU 时钟 `server.lruclock`，默认每 100 毫秒更新一次（由 `LRU_CLOCK_RESOLUTION` 常量控制，默认值是 1000 毫秒，即秒级精度）。每当一个 key 被读取或写入时，Redis 会把当前的 `server.lruclock` 值写入该 key 的 `redisObject.lru` 字段。\n\n关键来了：淘汰的时候 Redis 并不会遍历所有 key 来找 `lru` 值最小的那个（那等于做了一次全局排序），而是采用随机采样策略。当需要淘汰数据时，Redis 随机选取 `maxmemory-samples` 个 key（默认 5 个），计算每个 key 的空闲时间（当前时钟减去该 key 的 `lru` 值），然后淘汰空闲时间最长的那个。这个算法的精度取决于采样数量——样本越多，越接近真正的 LRU 行为，但每次淘汰的 CPU 开销也越大。\n\nRedis 3.0 做了一个重要的优化：引入了淘汰候选池（eviction pool）。在 3.0 之前，每次淘汰都是独立的采样——随机选 5 个 key，淘汰最差的那个，然后这 5 个 key 的信息就丢弃了。3.0 开始，Redis 维护了一个大小为 16 的候选池（`EVPOOL_SIZE = 16`），每次采样后会把新采样到的 key 与候选池中已有的 key 合并，保留空闲时间最长的那些。这样随着时间推移，候选池中积累了历史采样中的「最差候选者」，淘汰精度大幅提升。antirez 在他的博客中做过可视化测试，`maxmemory-samples=10` 配合候选池后，近似 LRU 的淘汰效果已经非常接近真正的 LRU 了。你可以在 `src/evict.c` 的 `evictionPoolPopulate()` 函数中看到这个实现。\n\n```bash\n# 查看和调整采样数量\n127.0.0.1:6379> CONFIG GET maxmemory-samples\n1) \"maxmemory-samples\"\n2) \"5\"\n\n# 提高精度：设为 10，CPU 开销增加约一倍但淘汰更准确\n127.0.0.1:6379> CONFIG SET maxmemory-samples 10\nOK\n```\n\n### LRU 的核心缺陷：缓存污染\n\n近似 LRU 在大多数缓存场景下表现不错，但它有一个根本性的缺陷——缓存污染（cache pollution）。假设你的 Redis 里存了 100 万个热 key（每秒被访问数十次），突然有一批冷数据被批量读取了一次（比如一个全表扫描或者一次数据导出），这些冷 key 虽然只被访问了一次，但它们获得了一个非常新的 `lru` 时间戳。在 LRU 算法看来，「刚刚被访问过」等于「最近被使用了」，这些冷 key 短时间内不会被淘汰。反而是那些真正的热 key 如果有一小段时间没被访问，可能被当作淘汰候选者。这就导致了缓存命中率在批量扫描后出现断崖式下降，恢复时间取决于冷 key 的 `lru` 时间戳何时变得足够旧。\n\n这正是 Redis 4.0 引入 LFU 算法的核心动机。\n\n## 第三步：Redis LFU 的实现——对数计数器与频率衰减\n\n### 24 位字段的语义变化\n\nLFU 算法在 Redis 4.0 中引入（由 antirez 在 2017 年实现），它复用了 `redisObject` 中同一个 24 位 `lru` 字段，但赋予了完全不同的含义。在 LFU 模式下，这 24 位被拆分为两部分：高 16 位存储 `ldt`（Last Decrement Time，上次衰减时间），低 8 位存储 `logc`（Logarithmic Counter，对数计数器）。\n\n```\n|<--------- 24 bits --------->|\n|   16 bits ldt  |  8 bits logc|\n|  上次衰减时间   |  对数频率计数  |\n```\n\n`ldt` 记录的是上次对 `logc` 进行衰减操作的时间戳，精度是分钟级（当前 Unix 时间戳的分钟数对 2^16 取模，约 45.5 天循环一次）。`logc` 是一个 0-255 的对数计数器，用来近似表示这个 key 的访问频率。为什么是「对数」计数器？因为 8 位最大只能表示 255，如果每次访问加 1，一个热 key 很快就会溢出。对数计数允许用 255 这个值来近似表达百万级甚至更高的访问频率。\n\n### 对数计数器 logc 的增长逻辑\n\n`logc` 的增长不是简单的「每次访问加 1」，而是一个概率递增机制：counter 值越大，每次访问时成功加 1 的概率越低。具体的增长逻辑在 `src/evict.c` 的 `LFULogIncr()` 函数中：\n\n```c\n// Redis 7.0 源码 src/evict.c — 简化版\nuint8_t LFULogIncr(uint8_t counter) {\n    if (counter == 255) return 255;  // 已经到上限，不再增长\n    double r = (double)rand() / RAND_MAX;  // 生成 0-1 的随机数\n    double baseval = counter - LFU_INIT_VAL;  // LFU_INIT_VAL = 5\n    if (baseval < 0) baseval = 0;\n    // p 是本次访问成功加 1 的概率\n    double p = 1.0 / (baseval * server.lfu_log_factor + 1);\n    if (r < p) counter++;\n    return counter;\n}\n```\n\n这段代码的核心逻辑是：计算一个概率 `p = 1 / (baseval * lfu_log_factor + 1)`，其中 `baseval` 是当前 counter 值减去初始值 5，`lfu_log_factor` 是配置参数（默认 10）。然后生成一个随机数 `r`，只有 `r < p` 时 counter 才加 1。\n\n举个具体的例子：当一个 key 的 `logc` 为 5（初始值，`baseval = 0`）时，`p = 1 / (0 * 10 + 1) = 1.0`，即 100% 的概率加 1——前几次访问几乎每次都会增加 counter。当 `logc` 增长到 10 时（`baseval = 5`），`p = 1 / (5 * 10 + 1) ≈ 0.0196`，约 2% 的概率加 1——大约需要 50 次访问才能让 counter 从 10 增到 11。当 `logc` 达到 100 时，`p = 1 / (95 * 10 + 1) ≈ 0.00105`，约千分之一的概率加 1——需要大约 1000 次访问才能增加 1。\n\n`lfu-log-factor` 越大，counter 增长越慢。Redis 官方文档给出了不同 `lfu-log-factor` 值下 counter 达到饱和（255）所需的访问次数：factor=0 时约 100 万次访问就能到 255，factor=10（默认值）时需要约 1000 万次，factor=100 时需要约 1 亿次。对于大多数互联网应用，默认值 10 已经能很好地区分热 key 和冷 key。\n\n### 新 key 的初始值为什么是 5\n\n新创建的 key 的 `logc` 初始值是 `LFU_INIT_VAL = 5`，而不是 0。这是一个精心设计的细节。如果初始值是 0，新 key 一创建就会成为 LFU 淘汰的首选目标（因为频率最低），很可能在第一次被访问之前就被淘汰了。初始值设为 5 给了新 key 一个「生存窗口」——它有足够的时间被访问几次，让 counter 涨上去，而不至于一出生就被杀掉。这个思路和 MySQL InnoDB 的 LRU 链表把新页插入到 5/8 位置而不是头部是类似的——都是为了给新数据一个公平的观察期。\n\n### 频率衰减机制\n\n如果只有增长没有衰减，那些曾经非常热但已经冷下来的 key 的 counter 会一直维持在高位，永远不会被淘汰——这是纯 LFU 算法的经典问题。Redis 通过 `ldt`（Last Decrement Time）和 `lfu-decay-time` 配置来实现频率衰减。\n\n衰减逻辑在 `LFUDecrAndReturn()` 函数中，每次访问一个 key 时，Redis 会先检查是否需要衰减。衰减的计算方式是：用当前时间（分钟）减去 `ldt`，得到距离上次衰减过去了多少分钟，然后除以 `lfu-decay-time`（默认 1 分钟），得到需要衰减的量。比如一个 key 的 `logc` 是 50，距离上次衰减已经过去了 10 分钟，`lfu-decay-time` 是 1，那么 `logc` 会被减去 10，变成 40。衰减之后再执行 `LFULogIncr()` 的增长逻辑。\n\n```bash\n# 查看和调整衰减参数\n127.0.0.1:6379> CONFIG GET lfu-decay-time\n1) \"lfu-decay-time\"\n2) \"1\"    # 每 1 分钟 logc 衰减 1\n\n# 如果你的业务有明显的日级别冷热周期（比如白天热晚上冷），\n# 可以适当增大 lfu-decay-time，让衰减更平滑\n127.0.0.1:6379> CONFIG SET lfu-decay-time 5\nOK\n```\n\n如果 `lfu-decay-time` 设为 0，则衰减功能被完全禁用——每次访问时都不会对 `logc` 做衰减，只做增长。这在极少数需要永久记住历史热度的场景下可能有用，但绝大部分场景下不推荐。\n\n### LFU 如何解决缓存污染\n\n回到前面 LRU 的缓存污染问题：一批冷 key 被批量扫描了一次。在 LFU 模式下，这些冷 key 每个只被访问了一次。由于 `logc` 初始值是 5，一次访问后 counter 大概率从 5 变成 6（因为 `baseval = 0`，p = 1.0）。而真正的热 key 经过长期高频访问，counter 可能在 50-100 甚至更高的范围。即使热 key 有一小段时间没被访问导致 counter 衰减了一些，它仍然远高于那些 counter 只有 6 的冷 key。所以 LFU 在淘汰时会优先淘汰这些偶尔被访问一次的冷 key，而不是真正的热 key。缓存命中率不会因为一次批量扫描而出现断崖式下降。\n\n## 第四步：实用诊断命令与选型建议\n\n### OBJECT 命令查看 key 的淘汰元数据\n\nRedis 提供了两个 OBJECT 子命令来查看 key 的淘汰相关信息。当淘汰策略是 LRU 系列时，用 `OBJECT IDLETIME <key>` 查看 key 的空闲时间（秒）；当淘汰策略是 LFU 系列时，用 `OBJECT FREQ <key>` 查看 key 的 logc 值。注意这两个命令是互斥的——LRU 模式下 `OBJECT FREQ` 返回的值无意义，LFU 模式下 `OBJECT IDLETIME` 会直接报错。\n\n```bash\n# LFU 模式下查看 key 的频率计数\n127.0.0.1:6379> SET mykey \"hello\"\nOK\n127.0.0.1:6379> OBJECT FREQ mykey\n(integer) 5     # 新 key，初始值 LFU_INIT_VAL = 5\n\n# 多次访问后再查看\n127.0.0.1:6379> GET mykey\n127.0.0.1:6379> GET mykey\n127.0.0.1:6379> GET mykey\n127.0.0.1:6379> OBJECT FREQ mykey\n(integer) 8     # 3 次访问后 counter 从 5 涨到约 8\n\n# LRU 模式下查看 key 的空闲时间\n# （需要先切换淘汰策略为 LRU）\n127.0.0.1:6379> CONFIG SET maxmemory-policy allkeys-lru\nOK\n127.0.0.1:6379> SET anotherkey \"world\"\nOK\n# 等待 10 秒后\n127.0.0.1:6379> OBJECT IDLETIME anotherkey\n(integer) 10    # 10 秒未被访问\n```\n\n### 生产环境选型建议\n\n在大多数缓存场景下，`allkeys-lfu` 优于 `allkeys-lru`。原因很简单：真实的访问模式几乎总是存在热点——少量的 key 承载了大部分的流量。LFU 天然地保护高频访问的热 key，而 LRU 只看最后一次访问时间，容易被偶发的冷数据访问干扰。Redis 官方文档也推荐在纯缓存场景下优先考虑 LFU 策略。\n\n但 LFU 也不是银弹。如果你的业务访问模式变化很快（比如新闻热点场景，今天的热 key 明天就冷了），需要仔细调整 `lfu-decay-time`——设得太大会导致旧热 key 的 counter 衰减太慢，占着位置不被淘汰；设得太小又可能让正常的热 key 因为短暂的访问波动而被淘汰。默认的 `lfu-decay-time=1` 在大部分场景下是合理的起点。\n\n`maxmemory-samples` 这个参数对 LRU 和 LFU 都生效——它控制每次淘汰时的采样数量。默认值 5 是性能和精度的平衡点，生产环境中如果 CPU 余量充足，建议调到 10。antirez 的测试表明 samples=10 时近似算法的淘汰效果已经接近理想状态，继续增大带来的精度提升微乎其微，但 CPU 开销持续增长。\n\n最后给一个配置模板供参考：\n\n```bash\n# 生产环境推荐的 LFU 淘汰配置\nmaxmemory 8gb\nmaxmemory-policy allkeys-lfu\nmaxmemory-samples 10\nlfu-log-factor 10\nlfu-decay-time 1\n```",
+      "keyPoints": [
+        "经典 LRU 使用双向链表+哈希表实现 O(1) 淘汰，但每个节点需要 16 字节指针开销，亿级 key 量下额外内存达数 GB，Redis 因此放弃经典方案改用近似 LRU",
+        "Redis 近似 LRU 利用 redisObject 中 24 位 lru 字段存储秒级精度的最后访问时钟，淘汰时随机采样 maxmemory-samples 个 key 并淘汰其中最旧的，每个 key 只多花 3 字节",
+        "Redis 3.0 引入大小为 16 的淘汰候选池（eviction pool），保留历史采样中最优的淘汰候选者，使得 maxmemory-samples=10 时近似 LRU 的效果已非常接近理想 LRU",
+        "LFU 复用同一个 24 位字段但语义不同：高 16 位 ldt 记录上次衰减时间（分钟级），低 8 位 logc 是对数计数器（0-255），用概率递增机制近似表达百万级访问频率",
+        "logc 的增长概率公式为 p = 1/(baseval × lfu-log-factor + 1)，counter 越大增长越难；默认 lfu-log-factor=10 时，counter 达到 255 需约 1000 万次访问",
+        "新 key 的 logc 初始值为 LFU_INIT_VAL=5 而非 0，给新数据一个生存窗口避免刚创建就被淘汰，类似 InnoDB LRU 链表将新页插入 5/8 位置的思路",
+        "频率衰减根据 ldt 与当前时间的差值除以 lfu-decay-time（默认 1 分钟）来减少 logc，确保历史热 key 在冷却后能被正常淘汰",
+        "LRU 的核心缺陷是缓存污染——批量扫描的冷 key 获得较新时间戳后短期内不被淘汰，LFU 基于频率判断不受偶发访问干扰，生产缓存场景下 allkeys-lfu 通常优于 allkeys-lru"
+      ],
+      "quiz": [
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz1",
+          "question": "Redis 为什么没有采用经典的双向链表+哈希表来实现 LRU 算法？",
+          "choices": [
+            { "id": "A", "text": "因为双向链表的插入删除时间复杂度是 O(n)，性能不够" },
+            { "id": "B", "text": "因为每个链表节点需要额外的前后指针，亿级 key 下内存开销达数 GB，不符合 Redis 的内存效率目标" },
+            { "id": "C", "text": "因为经典 LRU 无法区分访问频率，所以 Redis 直接跳过了 LRU" },
+            { "id": "D", "text": "因为 Redis 是单线程的，维护链表会导致严重的锁竞争" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "经典 LRU 用双向链表+哈希表确实可以做到 O(1) 的查找和淘汰，时间复杂度没有问题，所以 A 选项关于 O(n) 的说法是错的。真正的原因是内存开销——每个双向链表节点的 prev 和 next 指针在 64 位系统上各占 8 字节共 16 字节，当 key 数量达到上亿级别时仅指针开销就超过 1.6GB，这对以内存效率著称的 Redis 不可接受。Redis 选择用 redisObject 中的 24 位字段（仅 3 字节）记录时间戳来做近似 LRU。C 选项混淆了 LRU 和 LFU 的区别，Redis 确实实现了 LRU。D 选项关于锁竞争也不对，单线程模型不存在锁竞争问题。"
+        },
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz2",
+          "question": "Redis 近似 LRU 中，redisObject 的 24 位 lru 字段记录的是什么？",
+          "choices": [
+            { "id": "A", "text": "该 key 在全局 LRU 链表中的位置索引" },
+            { "id": "B", "text": "该 key 的累计访问次数" },
+            { "id": "C", "text": "该 key 最后一次被访问时的 LRU 时钟值，秒级精度，约 194 天循环一次" },
+            { "id": "D", "text": "该 key 距离上次访问已经过去的秒数" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 近似 LRU 中，24 位 lru 字段存储的是 key 最后一次被访问时的全局 LRU 时钟值（server.lruclock）。这个时钟是当前 Unix 时间戳对 2^24 取模得到的，精度是秒级（由 LRU_CLOCK_RESOLUTION 控制），2^24 秒约为 194 天所以会循环。A 选项是经典 LRU 中链表位置的概念，Redis 没有全局 LRU 链表。B 选项描述的是访问次数，那是 LFU 的思路。D 选项描述的是空闲时间，这个值是淘汰时动态计算的（当前时钟减去 lru 字段值），不是直接存储在字段中的。"
+        },
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz3",
+          "question": "Redis 在执行 LRU 淘汰时的采样流程是怎样的？",
+          "choices": [
+            { "id": "A", "text": "遍历所有 key 找到 lru 值最小的那个进行淘汰" },
+            { "id": "B", "text": "随机采样 maxmemory-samples 个 key，淘汰其中 lru 时间戳最旧的，并利用淘汰候选池保留历史最优候选" },
+            { "id": "C", "text": "按 key 的创建时间排序，淘汰最早创建的 key" },
+            { "id": "D", "text": "将所有 key 分成若干桶，每个桶维护一个小顶堆，淘汰堆顶元素" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 近似 LRU 的核心是随机采样。每次需要淘汰时，Redis 随机选取 maxmemory-samples（默认 5）个 key，计算它们的空闲时间（当前 LRU 时钟减去 key 的 lru 字段值），淘汰空闲时间最长的。Redis 3.0 还引入了大小为 16 的淘汰候选池，将新采样的 key 与池中已有的 key 合并保留最差的候选者，大幅提升了精度。A 选项的全量遍历在亿级 key 下性能不可接受。C 选项按创建时间淘汰是 FIFO 策略，不是 LRU。D 选项的桶+小顶堆结构在 Redis 中不存在。"
+        },
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz4",
+          "question": "在 LFU 模式下，redisObject 的 24 位 lru 字段如何划分？",
+          "choices": [
+            { "id": "A", "text": "全部 24 位用于存储访问频率计数器" },
+            { "id": "B", "text": "高 16 位存储 ldt（上次衰减时间，分钟级），低 8 位存储 logc（对数计数器，0-255）" },
+            { "id": "C", "text": "高 8 位存储 logc（对数计数器），低 16 位存储 ldt（上次衰减时间）" },
+            { "id": "D", "text": "高 12 位存储最后访问时间，低 12 位存储访问频率" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "LFU 模式复用 redisObject 中同一个 24 位字段，但语义完全不同。高 16 位存储 ldt（Last Decrement Time，上次衰减时间），精度是分钟级，当前 Unix 时间的分钟数对 2^16 取模（约 45.5 天循环一次）。低 8 位存储 logc（Logarithmic Counter，对数计数器），范围 0-255，用概率递增的方式近似表达访问频率。A 选项忽略了衰减时间的存储需求——没有 ldt 就无法做频率衰减。C 选项把高低位搞反了。D 选项的 12+12 划分方式在 Redis 中不存在。"
+        },
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz5",
+          "question": "一个 Redis 实例配置了 allkeys-lfu，某 key 的 OBJECT FREQ 返回 5。以下哪个判断最准确？",
+          "choices": [
+            { "id": "A", "text": "这个 key 被访问了恰好 5 次" },
+            { "id": "B", "text": "这个 key 可能是刚创建的，因为 LFU_INIT_VAL 初始值就是 5" },
+            { "id": "C", "text": "这个 key 的访问频率排在所有 key 的前 5%" },
+            { "id": "D", "text": "这个 key 在最近 5 分钟内有过访问" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "OBJECT FREQ 返回的是 logc 的值，而 Redis 中新创建 key 的 logc 初始值就是 LFU_INIT_VAL=5。所以当你看到 OBJECT FREQ 返回 5 时，最可能的情况是这个 key 刚创建还没有被访问过（或者虽然被访问过几次但 logc 经过衰减又回到了 5 附近）。A 选项把 logc 当成了线性计数器，但 logc 是对数计数器，值 5 并不意味着恰好 5 次访问。C 选项的百分位排名概念在 Redis 的 LFU 实现中不存在。D 选项把频率计数器和时间混淆了。"
+        },
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz6",
+          "question": "关于 LFU 中 logc 的增长机制，以下哪个说法是错误的？",
+          "choices": [
+            { "id": "A", "text": "counter 值越大，每次访问成功加 1 的概率越低" },
+            { "id": "B", "text": "lfu-log-factor 越大，counter 增长越慢，区分高频和超高频 key 的能力越强" },
+            { "id": "C", "text": "当 counter 达到 255 时会自动溢出归零重新计数" },
+            { "id": "D", "text": "增长概率公式为 p = 1/(baseval × lfu-log-factor + 1)，其中 baseval = counter - 5" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "C 选项是错误的说法。当 logc 达到 255（uint8 的最大值）时，LFULogIncr() 函数直接返回 255，不再增长也不会溢出归零。这是源码中的硬编码逻辑：`if (counter == 255) return 255;`。如果溢出归零，一个超级热 key 的 counter 会突然变成 0 从而被淘汰，这显然是不可接受的。A 和 D 选项准确描述了概率递增的核心逻辑。B 选项也正确——lfu-log-factor 越大，分母越大，增长概率越低，counter 达到同一个值需要更多次访问，这有助于区分不同级别的高频 key。"
+        },
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz7",
+          "question": "LRU 算法的「缓存污染」问题是指什么？LFU 是如何避免的？",
+          "choices": [
+            { "id": "A", "text": "缓存污染指数据写入时发生哈希冲突，LFU 通过更好的哈希函数避免" },
+            { "id": "B", "text": "缓存污染指偶尔被访问的冷 key 获得新时间戳后短期内不被淘汰挤占热 key 空间，LFU 因为基于频率判断所以偶尔一次访问不会显著提高 logc" },
+            { "id": "C", "text": "缓存污染指缓存数据与数据库不一致，LFU 通过更频繁的缓存刷新避免" },
+            { "id": "D", "text": "缓存污染指内存碎片过多导致有效空间不足，LFU 通过主动碎片整理解决" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "缓存污染是 LRU 算法的经典问题。LRU 只看最后一次访问时间，当一批冷 key 被偶尔扫描了一次（比如全表查询或数据导出），这些冷 key 会获得非常新的 lru 时间戳，在 LRU 看来它们「最近被用过」，短时间内不会被淘汰。真正的热 key 如果有一小段时间没被访问，反而可能被淘汰，导致缓存命中率断崖下降。LFU 基于访问频率判断，冷 key 即使被访问一次，logc 也只从 5 涨到 6 左右，远低于真正热 key 的 counter 值（可能 50-100+），所以冷 key 仍然是优先淘汰的目标。A 说的是哈希冲突、C 说的是数据一致性、D 说的是碎片，都与缓存污染无关。"
+        },
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz8",
+          "question": "一个新闻推荐服务使用 Redis 做缓存，热点新闻生命周期很短（通常几小时内从热到冷），需要快速淘汰过时热点。以下哪个配置组合最合适？",
+          "choices": [
+            { "id": "A", "text": "allkeys-lru，maxmemory-samples 5" },
+            { "id": "B", "text": "allkeys-lfu，lfu-decay-time 0，lfu-log-factor 100" },
+            { "id": "C", "text": "allkeys-lfu，lfu-decay-time 1，lfu-log-factor 10，maxmemory-samples 10" },
+            { "id": "D", "text": "volatile-ttl，为每个 key 设置精确的 TTL" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "新闻推荐场景的特点是热点变化快，需要淘汰策略既能保护当前热 key 又能让过时热 key 快速被淘汰。C 选项使用 allkeys-lfu 基于频率保护真正的热 key，lfu-decay-time=1 保证每分钟 logc 衰减 1，几小时后过时热 key 的 counter 会降到较低水平被正常淘汰，maxmemory-samples=10 提高淘汰精度。A 选项用 LRU 可以工作但容易受缓存污染影响。B 选项的 lfu-decay-time=0 禁用了衰减，过时热 key 的 counter 不会下降永远不被淘汰，这恰好是最糟糕的选择。D 选项要求为每个 key 设置精确 TTL 在动态热点场景下不现实，且 volatile-ttl 只淘汰有 TTL 的 key。"
+        },
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz9",
+          "question": "当 Redis 的 maxmemory-policy 设为 LFU 系列策略时，执行 OBJECT IDLETIME 命令会怎样？",
+          "choices": [
+            { "id": "A", "text": "正常返回 key 的空闲时间（秒），不受淘汰策略影响" },
+            { "id": "B", "text": "返回 0，因为 LFU 不跟踪空闲时间" },
+            { "id": "C", "text": "返回 logc 的值而不是空闲时间" },
+            { "id": "D", "text": "直接报错，因为 LRU 和 LFU 复用同一个 24 位字段，LFU 模式下该字段存储的不是时间戳" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "LRU 和 LFU 复用 redisObject 中同一个 24 位 lru 字段。在 LRU 模式下这个字段存储的是最后访问时间戳，OBJECT IDLETIME 通过当前时钟减去这个值来计算空闲时间。但在 LFU 模式下，同一个字段被拆成了 16 位 ldt 和 8 位 logc，语义完全不同。Redis 在源码中做了明确检查：如果当前策略是 LFU 系列，执行 OBJECT IDLETIME 会直接返回错误 `ERR object idletime is not allowed when maxmemory-policy is LFU based`。同理，LRU 模式下 OBJECT FREQ 也没有意义。A、B、C 选项都基于「命令可以正常执行」的假设，但实际上 Redis 会拒绝这个命令。"
+        },
+        {
+          "id": "redis-mem-lru-vs-lfu-q1-quiz10",
+          "question": "Redis 3.0 引入的淘汰候选池（eviction pool）解决了什么问题？",
+          "choices": [
+            { "id": "A", "text": "解决了 LFU 对数计数器溢出的问题" },
+            { "id": "B", "text": "解决了 LRU 时钟 194 天循环导致的精度问题" },
+            { "id": "C", "text": "解决了每次独立采样信息丢失的问题，通过保留历史采样中的最优淘汰候选来提高近似 LRU 的精度" },
+            { "id": "D", "text": "解决了多线程并发淘汰时的竞态条件问题" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "在 Redis 3.0 之前，每次淘汰时随机采样 maxmemory-samples 个 key，淘汰最差的那个，然后采样信息就丢弃了。这意味着之前采样到但没被淘汰的「次差候选者」的信息被浪费了。Redis 3.0 引入了大小为 16 的淘汰候选池（EVPOOL_SIZE=16），每次采样后把新 key 与池中已有的 key 合并，保留空闲时间最长的那些。随着多次采样的积累，候选池中聚集了全局范围内相当优质的淘汰候选者，大幅提升了精度。A 选项说的 LFU 是 4.0 才引入的，与 3.0 的候选池无关。B 选项的时钟循环问题与候选池无关。D 选项涉及多线程，但 Redis 是单线程处理命令的。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/develop/reference/eviction/",
+        "https://github.com/redis/redis/blob/7.0/src/evict.c",
+        "https://github.com/redis/redis/blob/7.0/src/server.h",
+        "http://antirez.com/news/109"
+      ]
+    }
+  ]
+}
