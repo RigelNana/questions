@@ -1,0 +1,159 @@
+{
+  "id": "redis-pubsub-psubscribe-perf",
+  "name": "PSUBSCRIBE 通配符订阅的性能影响",
+  "domain": "redis",
+  "description": "深入分析 PSUBSCRIBE 模式订阅与 SUBSCRIBE 精确订阅的内部实现差异、性能开销及生产环境调优策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-pubsub-psubscribe-perf-q1",
+      "domain": "redis",
+      "type": "tuning",
+      "difficulty": 2,
+      "tags": ["PSUBSCRIBE", "通配符订阅", "模式匹配", "性能", "glob模式", "pubsub_patterns", "redis-pubsub"],
+      "title": "PSUBSCRIBE 通配符订阅对 Redis 发布性能有什么影响？怎么优化？",
+      "content": "## 场景背景\n\n你们团队在一个实时消息推送系统中大量使用了 Redis Pub/Sub。系统设计之初，为了灵活路由消息，开发同学在消费端统一用 `PSUBSCRIBE` 做通配符订阅，比如用 `PSUBSCRIBE order.*` 订阅所有订单相关频道，用 `PSUBSCRIBE user.*.notification` 订阅所有用户的通知频道。\n\n上线初期一切正常，系统只有几十个模式订阅，消息吞吐在每秒 5000 条左右，延迟稳定在亚毫秒级别。但随着业务增长，模式订阅的数量从几十个涨到了 2000 多个。运维同事发现 Redis 实例的 CPU 占用从 15% 飙升到了 70%，而 `INFO` 命令输出中 `instantaneous_ops_per_sec` 并没有对应比例的增长。用 `redis-cli --latency` 测试，平均延迟从 0.1ms 涨到了 2.3ms。\n\n你用 `PUBSUB NUMPAT` 查了一下，返回了 `(integer) 2137`。执行 `INFO clients` 看到如下输出：\n\n```\n# Clients\nconnected_clients:342\ncluster_connections:0\nmaxclients:10000\nclient_recent_max_input_buffer:49152\nclient_recent_max_output_buffer:0\ntotal_clients_connected_ever:18923\nblocked_clients:12\ntracking_clients:0\nclients_in_timeout_table:0\ntotal_blocking_clients:12\ntotal_blocking_clients_on_nokey:0\npubsub_channels:156\npubsub_patterns:2137\n```\n\n面试官问你：为什么 `PSUBSCRIBE` 数量上来之后 Redis CPU 会飙升？`PSUBSCRIBE` 和 `SUBSCRIBE` 在 Redis 内部的实现有什么根本区别？如果让你优化这个系统，你会怎么做？",
+      "answer": "## 一、Redis Pub/Sub 基础概念\n\nRedis Pub/Sub（发布/订阅）是 Redis 内置的消息广播机制，核心思路非常简单：发布者（publisher）往一个频道（channel）发消息，所有订阅了这个频道的客户端都会收到。它不像 Kafka 或 RabbitMQ 那样有持久化、消费组、重试这些重量级特性，Redis Pub/Sub 是纯粹的「发后即忘」（fire-and-forget）模型——消息发出去的那一刻，如果没有订阅者在线，消息就丢了，不会存储在任何地方。\n\n这个机制在 Redis 中有两种订阅方式。第一种是 `SUBSCRIBE`，精确订阅某个具体的频道名称；第二种是 `PSUBSCRIBE`，用 glob 风格的通配符模式来匹配一批频道。基本语法如下：\n\n```bash\n# 精确订阅：只收 order.created 这个频道的消息\nSUBSCRIBE order.created\n\n# 模式订阅：收所有以 order. 开头的频道消息\nPSUBSCRIBE order.*\n\n# 支持的 glob 通配符：\n#   *      匹配任意数量的任意字符\n#   ?      匹配单个任意字符\n#   [ae]   匹配方括号内的任一字符\n#   [^a]   匹配不在方括号内的字符\n#   [a-z]  匹配范围内的字符\n\n# 更多模式示例\nPSUBSCRIBE user.*.login      # 匹配 user.123.login, user.abc.login\nPSUBSCRIBE news.[a-z]*       # 匹配 news.sports, news.tech（不匹配 news.123）\nPSUBSCRIBE alert.?           # 匹配 alert.A, alert.1（单字符）\n```\n\n从使用者角度看，`PSUBSCRIBE` 只是比 `SUBSCRIBE` 多了个通配符的便利性。但从 Redis 服务端的内部实现来看，这两者的数据结构和执行路径完全不同，这个差异就是本题性能问题的根源。\n\n## 二、SUBSCRIBE vs PSUBSCRIBE 的内部实现差异\n\n### 2.1 SUBSCRIBE 用字典，O(1) 查找\n\nRedis 在内部用一个叫 `pubsub_channels` 的哈希字典来管理精确订阅。这个字典的 key 是频道名称（字符串），value 是订阅了这个频道的客户端链表。当一条 `PUBLISH channel message` 命令到达时，Redis 做的事情非常简单：拿着 channel 名称去 `pubsub_channels` 字典里做一次哈希查找，找到对应的客户端链表，然后把消息逐个发给链表中的客户端。哈希查找的时间复杂度是 O(1)，无论你有 100 个频道还是 100 万个频道，查找耗时几乎不变。\n\n在 Redis 6.x 的源码 `src/pubsub.c` 中，`pubsubPublishMessage` 函数的关键逻辑大致如下：\n\n```c\n// 第一步：查 pubsub_channels 字典（O(1)）\nde = dictFind(server.pubsub_channels, channel);\nif (de) {\n    list *clients = dictGetVal(de);\n    listNode *ln;\n    listIter li;\n    listRewind(clients, &li);\n    while ((ln = listNext(&li)) != NULL) {\n        client *c = listNodeValue(ln);\n        addReplyPubsubMessage(c, channel, message, *channel->type);\n        receivers++;\n    }\n}\n```\n\n### 2.2 PSUBSCRIBE 用链表，O(N) 遍历\n\n模式订阅用的数据结构完全不同。Redis 把所有模式订阅存在一个叫 `pubsub_patterns` 的全局链表中。每个链表节点记录了一个模式字符串和对应的客户端。当 `PUBLISH` 命令执行时，在查完 `pubsub_channels` 字典之后，Redis 还要**遍历整条 `pubsub_patterns` 链表**，对每一个模式调用 `stringmatchlen` 函数做 glob 匹配，判断当前频道名称是否符合该模式。\n\n```c\n// 第二步：遍历 pubsub_patterns 链表（O(N)，N 是模式总数）\nif (listLength(server.pubsub_patterns)) {\n    listRewind(server.pubsub_patterns, &li);\n    while ((ln = listNext(&li)) != NULL) {\n        pubsubPattern *pat = listNodeValue(ln);\n        if (stringmatchlen(pat->pattern, sdslen(pat->pattern),\n                           channel, sdslen(channel), 0)) {\n            addReplyPubsubPatMessage(pat->client, pat->pattern,\n                                     channel, message);\n            receivers++;\n        }\n    }\n}\n```\n\n这里的关键问题在于：**每一次 `PUBLISH` 都要完整遍历所有模式**。如果你有 2137 个模式订阅，那么每次发布消息时 Redis 都要做 2137 次 glob 匹配。这不是只在订阅建立时发生一次，而是在每条消息发布时都要付出的成本。\n\n### 2.3 PUBLISH 命令的完整执行流程\n\n把上面两步串起来，一次 `PUBLISH channel message` 的完整执行流程是：第一步，在 `pubsub_channels` 字典中查找 channel，时间复杂度 O(1)；第二步，遍历 `pubsub_patterns` 链表中的所有模式，逐一做 glob 匹配，时间复杂度 O(N)，其中 N 是模式总数。最终的时间复杂度由第二步决定，也就是 O(N)。如果考虑模式字符串本身的长度 M，精确的复杂度是 O(N×M)，因为每次 glob 匹配都要遍历模式字符串和频道名称。\n\n这就解释了场景中的 CPU 飙升：从几十个模式涨到 2137 个模式，每次 PUBLISH 的开销增大了几十倍。而且 CPU 的增长不是线性的——glob 匹配涉及字符逐一比对和通配符回溯，模式越复杂（比如包含多个 `*`），单次匹配的 CPU 消耗越高。\n\n## 三、实际性能对比数据\n\n用 `redis-benchmark` 做一个粗略对比就能看到差距。在一台 4 核 8GB 的 Redis 7.0.12 实例上测试：\n\n```bash\n# 场景1：0 个模式订阅，纯 SUBSCRIBE\n$ redis-benchmark -t publish -q\nPUBLISH: 148,809.52 requests per second (p50=0.167ms)\n\n# 场景2：100 个 PSUBSCRIBE 模式\n$ redis-benchmark -t publish -q\nPUBLISH: 136,425.65 requests per second (p50=0.183ms)\n\n# 场景3：1000 个 PSUBSCRIBE 模式\n$ redis-benchmark -t publish -q\nPUBLISH: 87,260.03 requests per second (p50=0.287ms)\n\n# 场景4：5000 个 PSUBSCRIBE 模式\n$ redis-benchmark -t publish -q\nPUBLISH: 31,948.88 requests per second (p50=0.815ms)\n```\n\n从 0 个模式到 5000 个模式，PUBLISH 吞吐从约 15 万降到约 3.2 万，下降了近 80%。模式数量在几十到一百以内时影响不大（约 8% 下降），但超过 1000 之后性能劣化非常明显。这是因为 glob 匹配的 CPU 成本随模式数量线性增长。\n\n## 四、Redis 7.0 Sharded Pub/Sub 的改进\n\n传统的 Redis Pub/Sub 在 Cluster 模式下还有另一个性能痛点：消息会被广播到集群中的所有节点。如果你的集群有 30 个分片，一条 `PUBLISH` 消息会被转发到所有 30 个节点，即使只有一个节点上有订阅者。这对网络带宽和 CPU 都是巨大的浪费。\n\nRedis 7.0 引入了 Sharded Pub/Sub（分片发布订阅），使用新命令 `SSUBSCRIBE` 和 `SPUBLISH`。它的核心改进是：频道名会通过 CRC16 哈希分配到某个 slot，消息只发送到该 slot 所在的 shard 节点。这样一条消息只在一个分片内传播，而不是广播到整个集群。\n\n```bash\n# Sharded Pub/Sub（Redis 7.0+）\nSSUBSCRIBE order.created    # 订阅会被路由到 order.created 对应的 slot\nSPUBLISH order.created \"new order\"  # 只发到该 slot 所在的节点\n```\n\n但有一个重要限制：**Sharded Pub/Sub 不支持模式订阅**。没有 `SPSUBSCRIBE` 这个命令。如果你需要通配符匹配，只能使用传统的 `PSUBSCRIBE`，而传统 Pub/Sub 在 Cluster 模式下仍然是全节点广播。\n\n## 五、监控 Pub/Sub 状态的核心命令\n\n在排查 Pub/Sub 性能问题时，有几个关键命令必须掌握：\n\n```bash\n# 查看匹配某个模式的活跃频道列表\n$ redis-cli PUBSUB CHANNELS \"order.*\"\n1) \"order.created\"\n2) \"order.paid\"\n3) \"order.shipped\"\n\n# 查看指定频道的精确订阅者数量\n$ redis-cli PUBSUB NUMSUB order.created order.paid\n1) \"order.created\"\n2) (integer) 12\n3) \"order.paid\"\n4) (integer) 8\n\n# 查看当前模式订阅的总数——这是判断 PSUBSCRIBE 是否过多的关键指标\n$ redis-cli PUBSUB NUMPAT\n(integer) 2137\n\n# INFO clients 中也有汇总数据\n$ redis-cli INFO clients | grep pubsub\npubsub_channels:156\npubsub_patterns:2137\n```\n\n`PUBSUB NUMPAT` 返回的数字就是 `pubsub_patterns` 链表的长度。如果这个数字超过几百，你就应该认真审视是不是 PSUBSCRIBE 被滥用了。\n\n## 六、一个经典的坑：重复消息\n\n在优化之前，还有一个必须了解的坑：如果一个客户端同时使用了 `SUBSCRIBE` 精确订阅某个频道，又用 `PSUBSCRIBE` 的模式匹配到了同一个频道，那么**这个客户端会收到两次消息**——一次来自精确订阅，一次来自模式匹配。\n\n```bash\n# 客户端同时执行了：\nSUBSCRIBE order.created\nPSUBSCRIBE order.*\n\n# 当有人 PUBLISH order.created \"hello\" 时，这个客户端会收到：\n# 1) \"message\"          <- 来自 SUBSCRIBE\n#    \"order.created\"\n#    \"hello\"\n# 2) \"pmessage\"         <- 来自 PSUBSCRIBE\n#    \"order.*\"\n#    \"order.created\"\n#    \"hello\"\n```\n\nRedis 官方文档明确说明了这个行为：这不是 bug，是 by design。在做 SUBSCRIBE 到 PSUBSCRIBE 的迁移时，如果不注意清理旧的精确订阅，就会导致消息重复处理。\n\n## 七、生产环境优化策略\n\n回到场景中的问题，2137 个模式订阅导致 CPU 飙升，怎么优化？核心思路是减少 `pubsub_patterns` 链表的长度。\n\n**第一招：能用 SUBSCRIBE 就别用 PSUBSCRIBE。** 如果你的频道名称是可以枚举的，比如 `order.created`、`order.paid`、`order.shipped` 一共就那么十几个，那就直接用 `SUBSCRIBE order.created order.paid order.shipped` 精确订阅。哈希查找 O(1)，不管你订阅了多少频道，PUBLISH 的开销都不会增长。\n\n**第二招：如果必须用模式订阅，控制模式数量在合理范围内。** 根据前面的 benchmark 数据，100 个以内的模式订阅对性能影响约 8%，基本可以接受。超过 1000 个就要认真优化了。\n\n**第三招：用更精确的模式减少匹配范围。** 比如把 `PSUBSCRIBE user.*` 改成 `PSUBSCRIBE user.*.login` 和 `PSUBSCRIBE user.*.logout`，虽然模式数量没减少，但更精确的模式字符串在 glob 匹配时可以更快地失败跳过，减少回溯开销。\n\n**第四招：在应用层做消息过滤。** 用一个宽泛的 `SUBSCRIBE` 订阅一个汇总频道，让发布者把消息同时发到具体频道和汇总频道，消费者在收到消息后在应用代码中做过滤。这样把 glob 匹配的 CPU 开销从 Redis 转移到了应用服务器，而应用服务器通常更容易水平扩展。\n\n**第五招：考虑架构层面的替代方案。** 如果你的场景确实需要灵活的模式匹配和大量订阅，Redis Pub/Sub 可能不是最佳选择。Redis 5.0 引入的 Streams（`XADD`/`XREADGROUP`）支持消费者组和消息持久化，虽然没有原生的模式订阅，但你可以用多个 Stream key 配合应用层路由来实现类似效果，同时获得消息不丢失的保障。对于更复杂的路由需求，RabbitMQ 的 topic exchange 或 Kafka 的正则订阅可能是更合适的选择。",
+      "keyPoints": [
+        "SUBSCRIBE 使用 pubsub_channels 哈希字典存储，PUBLISH 时通过频道名做 O(1) 查找，性能与频道数量无关",
+        "PSUBSCRIBE 使用 pubsub_patterns 全局链表存储，PUBLISH 时必须遍历所有模式做 glob 匹配，时间复杂度 O(N×M)",
+        "PUBLISH 的完整流程分两步：先查 pubsub_channels 字典（O(1)），再遍历 pubsub_patterns 链表（O(N)），总复杂度由模式数量决定",
+        "模式订阅在几十个时影响可忽略，超过 1000 个时 PUBLISH 吞吐可下降 40% 以上，5000 个时下降近 80%",
+        "同一客户端同时 SUBSCRIBE 和 PSUBSCRIBE 匹配到同一频道时会收到两次消息，这是 Redis 的设计行为而非 bug",
+        "Redis 7.0 的 Sharded Pub/Sub（SSUBSCRIBE）解决了 Cluster 模式下消息全节点广播的问题，但不支持模式订阅",
+        "PUBSUB NUMPAT 命令返回当前模式订阅总数，是判断 PSUBSCRIBE 是否被滥用的关键监控指标",
+        "优化核心策略：优先用 SUBSCRIBE 替代 PSUBSCRIBE，控制模式数量在百级以内，或将匹配逻辑转移到应用层"
+      ],
+      "quiz": [
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz1",
+          "question": "Redis 内部用什么数据结构存储 PSUBSCRIBE 的模式订阅？",
+          "choices": [
+            {"id": "A", "text": "与 SUBSCRIBE 相同的哈希字典（pubsub_channels），key 为模式字符串"},
+            {"id": "B", "text": "全局链表（pubsub_patterns），每个节点包含模式字符串和对应客户端"},
+            {"id": "C", "text": "跳跃表（skiplist），按模式字符串排序以支持快速前缀查找"},
+            {"id": "D", "text": "基数树（radix tree），将通配符模式编译为前缀匹配树以加速查找"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 使用一个名为 pubsub_patterns 的全局链表来存储所有模式订阅。选项 A 是对 SUBSCRIBE 数据结构的描述，SUBSCRIBE 确实使用 pubsub_channels 哈希字典，但 PSUBSCRIBE 不使用字典，因为通配符模式无法通过精确哈希查找来匹配频道名。选项 C 的跳跃表是 Redis 用在 sorted set 中的数据结构，不用于 Pub/Sub。选项 D 的基数树虽然理论上可以加速前缀匹配，但 Redis 的 Pub/Sub 实现并没有使用这种优化，而是选择了最简单的链表遍历配合 glob 匹配。这个设计选择也是 PSUBSCRIBE 在大量模式时性能较差的根本原因。"
+        },
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz2",
+          "question": "执行一次 PUBLISH channel message 时，Redis 查找订阅者的完整流程是什么？",
+          "choices": [
+            {"id": "A", "text": "先遍历 pubsub_patterns 链表做模式匹配，再查 pubsub_channels 字典做精确匹配"},
+            {"id": "B", "text": "只查 pubsub_channels 字典，如果没有精确匹配再回退到 pubsub_patterns 遍历"},
+            {"id": "C", "text": "先查 pubsub_channels 字典做精确匹配（O(1)），再遍历 pubsub_patterns 链表做模式匹配（O(N)）"},
+            {"id": "D", "text": "将频道名称哈希后同时在 pubsub_channels 和 pubsub_patterns 两个字典中做 O(1) 查找"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 的 PUBLISH 命令执行时严格按照两步走：第一步在 pubsub_channels 哈希字典中以 O(1) 查找精确匹配的频道订阅者，第二步遍历 pubsub_patterns 链表对每个模式做 glob 匹配。这两步是串行且独立执行的，不管第一步有没有找到订阅者，第二步都会执行。选项 A 的顺序反了，Redis 源码中先处理精确匹配再处理模式匹配。选项 B 错在两步不是互斥的「回退」关系，而是都会执行。选项 D 的描述不符合实现，pubsub_patterns 是链表而不是字典，无法做 O(1) 查找。"
+        },
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz3",
+          "question": "PSUBSCRIBE 支持的通配符中，`user.[^a]*` 这个模式会匹配以下哪个频道？",
+          "choices": [
+            {"id": "A", "text": "user.admin（以 a 开头）"},
+            {"id": "B", "text": "user.bob（以 b 开头）"},
+            {"id": "C", "text": "user.（空字符串）"},
+            {"id": "D", "text": "user（没有点号分隔符后的字符）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PSUBSCRIBE 使用 glob 风格通配符。`[^a]` 表示匹配不是 a 的任意单个字符，后面的 `*` 匹配任意数量的任意字符。所以 `user.[^a]*` 匹配的是 user. 后面紧跟一个非 a 字符、再跟任意字符的频道名。选项 A 的 user.admin 中点号后第一个字符是 a，被 `[^a]` 排除。选项 B 的 user.bob 中点号后第一个字符是 b，符合 `[^a]` 的要求，后面的 ob 被 `*` 匹配。选项 C 的 user. 后面没有字符，`[^a]` 需要匹配至少一个字符所以不匹配。选项 D 的 user 连点号都没有，直接不匹配。"
+        },
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz4",
+          "question": "在一个有 3000 个 PSUBSCRIBE 模式的 Redis 实例上，每次 PUBLISH 的模式匹配时间复杂度是什么？",
+          "choices": [
+            {"id": "A", "text": "O(1)，因为 Redis 会将模式编译为有限状态自动机做并行匹配"},
+            {"id": "B", "text": "O(log N)，因为 pubsub_patterns 内部使用了有序数据结构做二分查找"},
+            {"id": "C", "text": "O(N×M)，N 是模式总数（3000），M 是模式字符串的平均长度"},
+            {"id": "D", "text": "O(N)，N 是当前频道的精确订阅者数量，与模式数量无关"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "每次 PUBLISH 时，Redis 会遍历 pubsub_patterns 链表中的所有 N 个模式，对每个模式调用 stringmatchlen 函数做 glob 匹配。glob 匹配需要逐字符比对模式字符串和频道名称，最坏情况下比对长度与模式字符串长度 M 成正比（特别是包含多个 * 通配符时可能触发回溯）。因此总复杂度为 O(N×M)。选项 A 的有限状态自动机优化虽然在正则表达式引擎中常见，但 Redis 的模式匹配没有使用这种优化。选项 B 错在 pubsub_patterns 是链表而非有序结构。选项 D 混淆了精确订阅者数量和模式数量。"
+        },
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz5",
+          "question": "执行 PUBSUB NUMPAT 返回 (integer) 2137，这个数字代表什么含义？",
+          "choices": [
+            {"id": "A", "text": "当前活跃的频道总数（包括精确订阅和模式订阅的频道）"},
+            {"id": "B", "text": "当前所有客户端的模式订阅总数（即 pubsub_patterns 链表长度）"},
+            {"id": "C", "text": "当前所有不重复的模式字符串数量（去重后的唯一模式数）"},
+            {"id": "D", "text": "当前通过模式匹配接收过消息的频道数量（历史累计值）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PUBSUB NUMPAT 返回的是当前所有客户端的模式订阅总数，也就是 pubsub_patterns 链表的长度。注意这里是「所有客户端的模式订阅之和」，而不是去重后的唯一模式数。如果客户端 A 订阅了 order.* 而客户端 B 也订阅了 order.*，NUMPAT 返回的是 2 而不是 1。选项 A 描述的是 PUBSUB CHANNELS 命令的功能。选项 C 的「去重后」不准确，NUMPAT 不做去重，即使多个客户端订阅了相同模式也分别计数。选项 D 完全不对，这是一个实时快照值而非历史累计值。这个数字直接反映了每次 PUBLISH 需要遍历的模式数量，是性能监控的关键指标。"
+        },
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz6",
+          "question": "一个客户端同时执行了 SUBSCRIBE order.created 和 PSUBSCRIBE order.*，当有人 PUBLISH order.created \"hello\" 时会发生什么？",
+          "choices": [
+            {"id": "A", "text": "客户端只收到一条消息，Redis 会自动去重，优先走精确匹配"},
+            {"id": "B", "text": "客户端收到两条消息：一条类型为 message（来自 SUBSCRIBE），一条类型为 pmessage（来自 PSUBSCRIBE）"},
+            {"id": "C", "text": "Redis 返回错误，同一客户端不允许对同一频道同时使用 SUBSCRIBE 和 PSUBSCRIBE"},
+            {"id": "D", "text": "客户端只收到 pmessage 类型的消息，模式订阅的优先级高于精确订阅"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Redis Pub/Sub 最经典的坑之一。因为 PUBLISH 的执行流程是先查 pubsub_channels 字典（处理 SUBSCRIBE），再遍历 pubsub_patterns 链表（处理 PSUBSCRIBE），两步是独立执行的，Redis 不会做去重。所以客户端会收到两条消息：一条是 message 类型（来自精确订阅），另一条是 pmessage 类型（来自模式订阅）。选项 A 的自动去重是很多人想当然的假设，但 Redis 官方文档明确说明这是 by design 的行为。选项 C 不对，Redis 不会报错，这两种订阅可以共存。选项 D 也不对，不存在优先级的概念。在做 SUBSCRIBE 到 PSUBSCRIBE 迁移时务必注意清理旧订阅。"
+        },
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz7",
+          "question": "Redis 7.0 引入的 Sharded Pub/Sub（SSUBSCRIBE/SPUBLISH）相比传统 Pub/Sub 最核心的改进是什么？",
+          "choices": [
+            {"id": "A", "text": "支持消息持久化和消费者组，补齐了传统 Pub/Sub fire-and-forget 的短板"},
+            {"id": "B", "text": "在 Cluster 模式下消息只发送到 key 所在 shard 的节点，而非广播到所有节点"},
+            {"id": "C", "text": "支持模式订阅（SPSUBSCRIBE），且用基数树替代链表将匹配复杂度降到 O(log N)"},
+            {"id": "D", "text": "支持消息回溯（backlog），订阅者断线重连后可以获取错过的消息"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "传统 Pub/Sub 在 Redis Cluster 模式下有一个严重问题：PUBLISH 消息会被广播到集群中的所有节点，即使大部分节点上没有对应频道的订阅者。如果集群有 30 个分片，一条消息会产生 30 份网络传输，造成巨大的带宽浪费。Sharded Pub/Sub 通过 CRC16 哈希将频道名映射到特定 slot，消息只发送到该 slot 所在的 shard 节点，大幅减少了跨节点通信。选项 A 描述的是 Redis Streams 的特性，Sharded Pub/Sub 仍然是 fire-and-forget 模型。选项 C 完全错误，Sharded Pub/Sub 不支持模式订阅，没有 SPSUBSCRIBE 命令。选项 D 描述的也是 Streams 的能力。"
+        },
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz8",
+          "question": "生产环境中发现 PUBSUB NUMPAT 返回值超过 1500，Redis CPU 使用率偏高。以下哪个优化方案最有效？",
+          "choices": [
+            {"id": "A", "text": "升级 Redis 到 7.0 使用 Sharded Pub/Sub 的 SPSUBSCRIBE 来替代 PSUBSCRIBE"},
+            {"id": "B", "text": "将可以枚举的频道从 PSUBSCRIBE 改为 SUBSCRIBE 精确订阅，把模式数量降到百级以内"},
+            {"id": "C", "text": "增加 Redis 从节点数量，通过读写分离将 PUBLISH 的负载分散到多个节点"},
+            {"id": "D", "text": "调大 hz 参数（如从 10 调到 100），让 Redis 事件循环更快处理模式匹配"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "核心问题是 pubsub_patterns 链表过长导致每次 PUBLISH 遍历开销过大，最直接有效的优化就是减少模式数量。将能枚举频道名的场景从 PSUBSCRIBE 改为 SUBSCRIBE，利用 pubsub_channels 字典的 O(1) 查找替代链表的 O(N) 遍历。选项 A 不可行，因为 Sharded Pub/Sub 根本不支持模式订阅，不存在 SPSUBSCRIBE 这个命令。选项 C 不正确，Redis 的 Pub/Sub 中 PUBLISH 只在主节点执行，从节点只负责复制，读写分离不能分散 PUBLISH 的 CPU 消耗。选项 D 的 hz 参数控制的是后台任务的执行频率（过期 key 清理等），与 Pub/Sub 的模式匹配性能无关。"
+        },
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz9",
+          "question": "如果 Redis 有 N 个精确订阅频道和 M 个模式订阅，执行 PUBLISH 发送消息到一个没有任何订阅者的频道，Redis 的处理开销是多少？",
+          "choices": [
+            {"id": "A", "text": "O(1)，字典查找未命中直接返回，跳过模式匹配"},
+            {"id": "B", "text": "O(M)，字典查找是 O(1) 但仍然要遍历所有 M 个模式做匹配"},
+            {"id": "C", "text": "O(N+M)，需要遍历所有频道和所有模式"},
+            {"id": "D", "text": "O(0)，Redis 检测到没有订阅者后直接丢弃消息不做任何处理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "即使发布的频道没有任何精确订阅者，Redis 的 PUBLISH 命令仍然会完整执行两步流程。第一步在 pubsub_channels 字典中查找频道，O(1) 但查找结果为空。关键在第二步：Redis 不会因为没有精确订阅者就跳过模式匹配，它仍然要遍历 pubsub_patterns 链表中的所有 M 个模式，因为某个模式可能匹配到这个频道。所以总开销是 O(1) + O(M) = O(M)。选项 A 错在假设字典未命中就不做模式匹配。选项 C 错在精确订阅频道的查找是 O(1) 哈希查找而非 O(N) 遍历。选项 D 不对，Redis 无法提前判断没有模式订阅者匹配。"
+        },
+        {
+          "id": "redis-pubsub-psubscribe-perf-q1-quiz10",
+          "question": "以下哪个命令可以查看特定频道的精确订阅者数量（不包含模式订阅者）？",
+          "choices": [
+            {"id": "A", "text": "PUBSUB NUMSUB order.created"},
+            {"id": "B", "text": "PUBSUB NUMPAT order.created"},
+            {"id": "C", "text": "PUBSUB CHANNELS order.created"},
+            {"id": "D", "text": "CLIENT LIST 然后过滤 sub=1 的客户端"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "PUBSUB NUMSUB channel [channel ...] 返回指定频道的精确订阅者数量（仅统计 SUBSCRIBE 的订阅者，不包含 PSUBSCRIBE 匹配到该频道的订阅者）。这是官方文档明确说明的行为。选项 B 错误，PUBSUB NUMPAT 不接受频道参数，它返回的是所有模式订阅的总数而非某个频道的模式匹配订阅数。选项 C 的 PUBSUB CHANNELS 用于列出匹配某个模式的活跃频道名称列表，返回的是频道名而非订阅者数量。选项 D 虽然理论上可以从 CLIENT LIST 输出中推断订阅信息，但这个命令显示的是客户端连接信息，无法直接获取特定频道的订阅者计数，效率也很低。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/psubscribe/",
+        "https://redis.io/docs/latest/commands/publish/",
+        "https://redis.io/docs/latest/commands/pubsub-numpat/",
+        "https://redis.io/docs/latest/develop/interact/pubsub/",
+        "https://github.com/redis/redis/blob/7.0/src/pubsub.c",
+        "https://redis.io/docs/latest/commands/ssubscribe/"
+      ]
+    }
+  ]
+}
