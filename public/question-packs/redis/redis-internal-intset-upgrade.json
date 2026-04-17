@@ -1,0 +1,157 @@
+{
+  "id": "redis-internal-intset-upgrade",
+  "name": "intset 的升级（upgrade）机制",
+  "domain": "redis",
+  "description": "深入解析 Redis intset 整数集合的编码升级触发条件、从后向前搬移策略及不可逆设计",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-internal-intset-upgrade-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["intset", "整数集合", "upgrade", "encoding", "redis-internals", "data-structure", "Set"],
+      "title": "intset 的升级（upgrade）机制是怎样的",
+      "content": "Redis 的 Set 类型在面试中经常被问到底层实现，大部分人能回答出「hashtable」，但如果面试官追问「当 Set 里全是整数且元素不多时，底层用的是什么」，能答出 intset 的人就少了一半。能进一步说清楚 intset 的 upgrade 机制的，十个人里可能只有一两个。\n\n我们先看一个实际的例子。在 Redis 7.2 环境下执行以下操作：\n\n```bash\n127.0.0.1:6379> SADD nums 1 5 10 100\n(integer) 4\n127.0.0.1:6379> OBJECT ENCODING nums\n\"intset\"\n127.0.0.1:6379> OBJECT HELP\n# 可以看到 ENCODING 返回底层数据结构编码\n\n# 现在加入一个超过 16 位整数范围的值\n127.0.0.1:6379> SADD nums 40000\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING nums\n\"intset\"   # 仍然是 intset，因为 40000 在 int16 范围内？\n\n# 不对，int16 最大值是 32767，40000 已经超了\n# 那为什么还是 intset？因为 intset 做了 upgrade！\n# 编码从 INTSET_ENC_INT16 升级到了 INTSET_ENC_INT32\n\n# 继续加入一个超大整数\n127.0.0.1:6379> SADD nums 4294967296\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING nums\n\"intset\"   # 仍然是 intset，编码再次升级到 INTSET_ENC_INT64\n\n# 加入一个字符串，intset 就不能用了\n127.0.0.1:6379> SADD nums hello\n(integer) 1\n127.0.0.1:6379> OBJECT ENCODING nums\n\"hashtable\"  # 包含非整数元素，转为 hashtable\n```\n\n从这个例子可以看出，intset 有一种自动「升级」的能力：当新加入的整数超出当前编码的表示范围时，它会把整个集合的编码提升到更高级别，而不是直接转为 hashtable。这个升级过程是怎么实现的？为什么要从后向前搬移元素？升级之后能不能降级回去？这些就是今天要深入的问题。\n\n理解 intset 的 upgrade 机制，不仅是面试高频考点，也是理解 Redis 如何在「内存效率」和「操作灵活性」之间做权衡的一个绝佳案例。",
+      "answer": "## intset 的基础定义与核心定位\n\nintset（整数集合）是 Redis 专门为 Set 数据类型设计的一种底层数据结构，用于存储全部由整数组成的小型集合。它的定义在 Redis 源码的 `src/intset.h` 中，结构非常简洁：\n\n```c\ntypedef struct intset {\n    uint32_t encoding;  // 编码方式：决定每个整数占多少字节\n    uint32_t length;    // 集合中的元素数量\n    int8_t contents[];  // 柔性数组：实际存储整数的连续内存块\n} intset;\n```\n\n这个结构只有三个字段。`encoding` 表示当前集合中所有整数使用的统一编码格式，`length` 记录元素个数，`contents` 是一个柔性数组（flexible array member），是实际存放整数值的连续内存区域。注意 `contents` 声明为 `int8_t[]`，但这只是一个占位声明——实际存储时每个元素可能占 2 字节、4 字节或 8 字节，取决于 `encoding` 的值。\n\nintset 的核心价值在于极致的内存效率。如果用 hashtable 存储 5 个小整数，每个 entry 需要 dictEntry 指针链（key 指针 + value 指针 + next 指针共 24 字节）加上 redisObject 包装（16 字节），仅元数据开销就远超数据本身。而 intset 把所有整数紧密排列在一块连续内存中，5 个 int16 整数只需要 `4 + 4 + 5×2 = 18` 字节，内存效率差了一个数量级。\n\nintset 支持三种编码，对应三种整数宽度：`INTSET_ENC_INT16`（每个元素 2 字节，范围 -32768 到 32767）、`INTSET_ENC_INT32`（每个元素 4 字节，范围约 ±21 亿）、`INTSET_ENC_INT64`（每个元素 8 字节，范围约 ±9.2×10¹⁸）。新创建的 intset 默认使用最小的 `INTSET_ENC_INT16` 编码，只有在需要时才会升级。\n\n还有一个关键特性：intset 中的元素是有序排列的（从小到大），这意味着查找操作可以用二分查找（binary search），时间复杂度为 O(log N)，而不是 O(N) 的线性扫描。这在 `SISMEMBER` 命令判断元素是否存在时非常重要。\n\n## upgrade 机制的完整流程\n\n现在进入核心问题：当新插入的整数超出当前编码范围时，upgrade 是怎么执行的？\n\n### 触发条件\n\n升级的触发条件非常明确：当调用 `intsetAdd()` 插入新元素时，Redis 会先用 `_intsetValueEncoding()` 函数判断这个新值需要什么级别的编码。如果新值需要的编码级别高于当前 intset 的 `encoding`，就会调用 `intsetUpgradeAndAdd()` 执行升级。\n\n举个例子，假设当前 intset 的编码是 `INTSET_ENC_INT16`，里面存了 `[1, 5, 10, 100]` 四个元素，每个占 2 字节，contents 总共 8 字节。现在要插入 `40000`，这个值超出了 int16 的最大值 32767，需要 `INTSET_ENC_INT32` 才能表示。于是触发 upgrade。\n\n### 升级的详细步骤\n\n整个升级过程在 `intsetUpgradeAndAdd()` 函数中完成（源码位于 `src/intset.c`），分为三个关键步骤：\n\n**第一步：扩展内存空间。** Redis 调用 `zrealloc()` 将 contents 的内存大小从 `旧元素数量 × 旧编码宽度` 扩展到 `(旧元素数量 + 1) × 新编码宽度`。在上面的例子中，从 `4 × 2 = 8` 字节扩展到 `5 × 4 = 20` 字节。这一步只是把内存空间扩大了，原有的数据还在 contents 的开头部分，但它们仍然按旧的 2 字节格式排列。\n\n**第二步：从后向前逐个搬移元素到新位置。** 这是整个 upgrade 中最精妙的部分。Redis 从最后一个元素开始，按旧编码读出它的值，然后按新编码写入到它在新数组中应该在的位置。具体来说：\n\n```\n升级前 contents 内存布局（INTSET_ENC_INT16，每元素 2 字节）：\n偏移:  [0-1]  [2-3]  [4-5]  [6-7]\n值:      1      5     10    100\n\n扩展后内存（已 realloc 到 20 字节，但数据还在旧位置）：\n偏移:  [0-1]  [2-3]  [4-5]  [6-7]  [8-19 是新分配的空间]\n值:      1      5     10    100     (未初始化)\n\n从后向前搬移（每元素变为 4 字节）：\n第1轮: 读 contents[3]（偏移6-7）= 100，写入新位置 contents[3]（偏移12-15）= 100\n第2轮: 读 contents[2]（偏移4-5）= 10， 写入新位置 contents[2]（偏移8-11）= 10\n第3轮: 读 contents[1]（偏移2-3）= 5，  写入新位置 contents[1]（偏移4-7）= 5\n第4轮: 读 contents[0]（偏移0-1）= 1，  写入新位置 contents[0]（偏移0-3）= 1\n\n搬移完成后：\n偏移:  [0-3]  [4-7]  [8-11]  [12-15]  [16-19]\n值:      1      5      10     100      (留给新元素)\n```\n\n**为什么必须从后向前搬移？** 因为新编码宽度比旧编码大，如果从前向前搬移，写入新位置时会覆盖还没搬走的旧数据。以上面的例子为例：如果先处理 `contents[0]`，把值 `1` 从偏移 0-1 写入偏移 0-3，那偏移 2-3 上原来存储的 `5` 就被覆盖了。而从后向前搬移时，旧数据都在 contents 的前部（低地址），新数据写入到后部（高地址），高位置的搬移不会影响低位置尚未读取的旧数据。\n\n这个从后向前的策略和 C 语言标准库 `memmove()` 处理内存重叠拷贝时的逻辑是一样的思路：当目标地址高于源地址时，从后往前拷贝就能避免覆盖。\n\n**第三步：插入新元素并更新元数据。** 搬移完成后，把触发升级的那个新元素放到正确的位置。这里有一个巧妙的优化：因为触发升级的新值必然超出旧编码的范围，它要么是一个非常大的正数（大于旧编码最大值），要么是一个非常小的负数（小于旧编码最小值）。所以新元素要么放在数组末尾，要么放在数组开头——不需要做二分查找来确定插入位置。源码中的逻辑是：如果新值大于 0，就放末尾；如果新值小于 0，就放开头（同时需要把刚搬完的所有元素再整体后移一位）。最后更新 `encoding` 为新编码，`length` 加 1。\n\n## 升级不可逆与相关设计考量\n\n### 不支持降级（downgrade）\n\n一个面试中常被追问的点是：如果升级后的 intset 中，那个导致升级的大整数被 `SREM` 删掉了，intset 会不会降回更小的编码？答案是不会。intset 的升级是不可逆的，Redis 不会做 downgrade 操作。\n\n原因是实际权衡的结果。降级操作需要遍历整个集合来检查剩余元素的值域范围，确认能不能安全降级，然后再做一次全量的元素搬移（这次是从前向后，因为编码变小了），这个操作的 CPU 成本是 O(N)。而维持高编码只是多占了一些内存，在 intset 元素数量较少的前提下（通常不超过 512 个），这点额外内存开销是可以接受的。Redis 的设计哲学一贯是用少量内存换取操作简单性和性能确定性。\n\n### intset 转 hashtable 的阈值\n\n当 Set 中的元素全是整数时使用 intset，但这有一个数量上限。`set-max-intset-entries` 配置项（默认值 512）控制了这个阈值。当 intset 的元素数量超过这个值时，Redis 会将底层编码从 intset 转换为 hashtable。这个转换同样是不可逆的。\n\n在 Redis 7.2 中可以通过 `CONFIG GET set-max-intset-entries` 查看当前值。如果你的业务场景中 Set 存储的全是小整数且元素数量固定在千级别以下，可以适当调大这个阈值来继续享受 intset 的内存优势。但要注意 intset 的插入和删除涉及 `memmove` 整体搬移元素，O(N) 的写入成本在元素数量超过几千之后会变得不可忽略。\n\n### 二分查找与有序性\n\n前面提到 intset 中的元素是有序的。每次 `intsetAdd()` 插入新元素时，Redis 会先通过二分查找（`intsetSearch()` 函数）定位插入位置，然后用 `memmove` 把该位置之后的所有元素整体后移一格，再把新元素写入空出来的位置。这保证了 intset 始终有序。查找一个元素是否存在（`SISMEMBER`）的时间复杂度是 O(log N)，但插入和删除的时间复杂度是 O(N)（因为需要搬移元素）。\n\n### 面试中的关联知识\n\nintset 的 upgrade 机制体现了 Redis 数据结构设计中「按需升级、避免浪费」的思路，这种思路在 Redis 中随处可见：SDS 的动态扩容与预分配、ziplist/listpack 的变长编码、zset 在小数据量时用 listpack 而大数据量时切换为 skiplist+dict。面试官问 intset upgrade 时，通常还会顺带考察你对 Redis 编码转换整体策略的理解。能把 intset 的 upgrade 和 Redis 其他数据结构的编码演进串联起来讲，会让你的回答更有体系感。",
+      "keyPoints": [
+        "intset 由 encoding（编码类型）、length（元素数量）和 contents（有序整数柔性数组）三个字段组成，所有元素紧密排列在连续内存中",
+        "intset 支持 INTSET_ENC_INT16（2 字节）、INTSET_ENC_INT32（4 字节）、INTSET_ENC_INT64（8 字节）三种编码，新集合默认从最小编码开始",
+        "当新插入的整数超出当前编码表示范围时触发 upgrade，流程为：realloc 扩展内存 → 从后向前逐个搬移旧元素到新位置 → 插入新元素 → 更新 encoding 和 length",
+        "从后向前搬移是为了避免新编码宽度大于旧编码时，前向写入覆盖尚未读取的旧数据，原理类似 memmove 处理内存重叠拷贝",
+        "升级操作不可逆，即使删除了触发升级的大整数，intset 也不会降级回更小的编码，这是用少量内存换取操作简单性的设计取舍",
+        "intset 内部元素始终有序排列，查找使用二分查找时间复杂度 O(log N)，但插入和删除需要 memmove 搬移元素，复杂度为 O(N)",
+        "set-max-intset-entries 配置（默认 512）控制 intset 转 hashtable 的元素数量阈值，超过此值后不可逆地转为 hashtable 编码",
+        "触发升级的新元素必然超出旧编码范围，因此它一定位于有序数组的首位或末位，无需二分查找确定插入位置"
+      ],
+      "quiz": [
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz1",
+          "question": "intset 结构体中 contents 字段的声明类型是 int8_t[]，这意味着什么？",
+          "choices": [
+            {"id": "A", "text": "contents 中每个元素固定占 1 字节，只能存储 -128 到 127 的整数"},
+            {"id": "B", "text": "int8_t[] 只是柔性数组的占位声明，实际每个元素的字节宽度由 encoding 字段决定"},
+            {"id": "C", "text": "contents 使用变长编码，小整数用 1 字节，大整数用 8 字节，类似 UTF-8"},
+            {"id": "D", "text": "contents 存储的是整数的字符串表示，每个字符占 1 字节"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "intset 的 contents 声明为 int8_t[] 是 C 语言柔性数组成员（flexible array member）的写法，它本身不决定元素的实际存储宽度。真正决定每个元素占多少字节的是 encoding 字段：INTSET_ENC_INT16 时每个元素占 2 字节，INTSET_ENC_INT32 时占 4 字节，INTSET_ENC_INT64 时占 8 字节。读写元素时 Redis 会根据 encoding 计算偏移量——例如读第 i 个元素的偏移是 i × encoding_width。A 选项把声明类型当成了实际存储宽度。C 选项描述的变长编码是 ziplist 的做法，intset 中同一个集合内所有元素编码宽度是统一的。D 选项描述的是 SDS 字符串的存储方式。"
+        },
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz2",
+          "question": "intset 支持的三种编码 INTSET_ENC_INT16、INTSET_ENC_INT32、INTSET_ENC_INT64 分别对应每个元素占多少字节？",
+          "choices": [
+            {"id": "A", "text": "1 字节、2 字节、4 字节"},
+            {"id": "B", "text": "2 字节、4 字节、8 字节"},
+            {"id": "C", "text": "2 字节、4 字节、16 字节"},
+            {"id": "D", "text": "4 字节、8 字节、16 字节"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这三种编码的命名直接反映了位宽：INT16 是 16 位即 2 字节（范围 -32768 到 32767），INT32 是 32 位即 4 字节（范围约 ±21 亿），INT64 是 64 位即 8 字节（范围约 ±9.2×10¹⁸）。新建的 intset 默认使用 INT16 编码，只有当加入的整数超出当前编码范围时才会触发升级。A 选项把 INT16 对应成了 1 字节（那是 int8 的宽度）。C 和 D 选项中的 16 字节不对应任何标准整数类型，Redis 没有 128 位整数的编码。注意 encoding 字段本身是 uint32_t，存的是 sizeof(int16_t)=2、sizeof(int32_t)=4、sizeof(int64_t)=8 这样的值。"
+        },
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz3",
+          "question": "当一个 INTSET_ENC_INT16 编码的 intset 中插入值 40000 时，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "插入失败并返回错误，因为 40000 超出了 int16 的范围"},
+            {"id": "B", "text": "intset 直接转换为 hashtable 编码来容纳这个大整数"},
+            {"id": "C", "text": "intset 执行 upgrade，将编码从 INT16 升级到 INT32，所有元素都按 4 字节重新存储"},
+            {"id": "D", "text": "40000 单独使用 4 字节存储，其他元素保持 2 字节不变"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "int16 的最大值是 32767，40000 超出了这个范围但在 int32 范围内（最大约 21 亿），因此 Redis 会触发 intset 的 upgrade 操作。升级过程是先用 realloc 扩展内存，然后从后向前把每个旧元素从 2 字节位置搬移到 4 字节位置，最后插入新元素并将 encoding 更新为 INTSET_ENC_INT32。注意升级后所有元素都统一使用 INT32 编码——intset 不支持混合编码，同一个 intset 内所有元素的编码宽度必须一致。A 选项错在 intset 不会拒绝合法整数。B 选项错在编码超范围触发的是 upgrade 而非转 hashtable。D 选项描述的混合编码方式 intset 不支持。"
+        },
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz4",
+          "question": "upgrade 过程中为什么必须从后向前搬移元素，而不是从前向后？",
+          "choices": [
+            {"id": "A", "text": "从后向前搬移可以保持元素的有序性，从前向后会打乱排列顺序"},
+            {"id": "B", "text": "从后向前效率更高，因为 CPU 缓存预取对逆序访问有优化"},
+            {"id": "C", "text": "新编码宽度大于旧编码，从前向后写入新位置时会覆盖尚未读取的后续旧数据，从后向前则不会"},
+            {"id": "D", "text": "Redis 的内存分配器要求从高地址向低地址填充数据"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 upgrade 机制中最核心的设计点。升级时新编码宽度大于旧编码（例如从 2 字节升到 4 字节），新旧数据共用同一块 realloc 后的内存区域。如果从前向后处理，把 contents[0] 从旧偏移 0-1 写入新偏移 0-3 时，偏移 2-3 上的旧数据（即 contents[1] 的原始值）就被覆盖了。从后向前搬移则安全：先处理最后一个元素，它的新位置在内存高地址区域（realloc 新分配的部分），不会影响低地址区域中尚未处理的旧数据。这和 C 标准库 memmove 处理重叠内存拷贝时当 dst > src 时采用逆向拷贝是同一个原理。A 选项错在搬移方向不影响有序性。B 选项的 CPU 缓存说法没有根据。"
+        },
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz5",
+          "question": "以下 Redis CLI 操作后，OBJECT ENCODING 的输出结果是什么？\n\n```\nSADD myset 1 2 3\nSADD myset 2147483648\nSREM myset 2147483648\nOBJECT ENCODING myset\n```",
+          "choices": [
+            {"id": "A", "text": "intset（编码降级回 INT16，因为删除大整数后剩余元素都在 int16 范围内）"},
+            {"id": "B", "text": "intset（编码仍然是 INT64，因为 intset 不支持降级）"},
+            {"id": "C", "text": "intset（编码仍然是 INT32，因为 intset 不支持降级）"},
+            {"id": "D", "text": "hashtable（删除操作触发了编码转换）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "2147483648 等于 2³¹，刚好比 int32 有符号最大值 2147483647（即 2³¹-1）大 1，因此超出了 INTSET_ENC_INT32 的表示范围，插入时会触发编码从 INT16 直接升级到 INT64。随后 SREM 删除了这个大整数，但 intset 的升级是不可逆的——Redis 源码中没有 downgrade 操作，所以编码永远停留在 INT64，即使剩余的 1、2、3 完全可以用 INT16 表示。这是 Redis 用少量额外内存换取操作简单性的设计选择。A 选项错在 intset 根本不存在降级机制。C 选项的 INT32 不对，因为 2147483648 超出了 int32 范围，必须用 INT64。D 选项错在 SREM 不会触发 intset 到 hashtable 的编码转换。"
+        },
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz6",
+          "question": "关于 intset 的 upgrade 操作，以下哪种理解是常见的错误认知？",
+          "choices": [
+            {"id": "A", "text": "upgrade 后所有元素统一使用新编码，不存在同一 intset 中混合多种编码的情况"},
+            {"id": "B", "text": "upgrade 操作的时间复杂度是 O(N)，因为需要逐个搬移所有已有元素"},
+            {"id": "C", "text": "当集合中所有大整数都被删除后，intset 会自动执行 downgrade 降回更小的编码以节省内存"},
+            {"id": "D", "text": "触发 upgrade 的新元素一定位于有序数组的首位或末位，因为它超出了当前编码的表示范围"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是关于 intset 最常见的误解。很多人以为 Redis 既然能升级就也能降级，实际上 intset 的 upgrade 是不可逆的——Redis 源码中根本没有实现 downgrade 函数。这是一个有意为之的设计取舍：降级需要遍历整个集合检查所有元素的值域范围，确认没有超出低级编码范围的元素后再做全量搬移，这个 O(N) 的操作在每次 SREM 时都可能触发，代价太高。而 intset 通常只有几百个元素，多出的内存（例如从 int16 升到 int32 每个元素多 2 字节，512 个元素也才多 1KB）完全可以接受。A、B、D 三个选项都是正确的描述。"
+        },
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz7",
+          "question": "intset 和 hashtable 作为 Set 的底层编码，在查找元素（SISMEMBER）时的时间复杂度分别是？",
+          "choices": [
+            {"id": "A", "text": "intset 是 O(N) 线性扫描，hashtable 是 O(1) 哈希查找"},
+            {"id": "B", "text": "intset 是 O(log N) 二分查找，hashtable 是 O(1) 哈希查找"},
+            {"id": "C", "text": "intset 是 O(1) 直接索引，hashtable 也是 O(1) 哈希查找"},
+            {"id": "D", "text": "intset 是 O(log N) 二分查找，hashtable 是 O(log N) 红黑树查找"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "intset 的元素始终保持从小到大有序排列，每次插入时都会用二分查找定位位置再插入。因此 SISMEMBER 操作在 intset 编码下使用二分查找，时间复杂度为 O(log N)。而 hashtable 编码使用哈希表，查找的平均时间复杂度为 O(1)。A 选项的 O(N) 线性扫描低估了 intset 的效率——如果 intset 无序才需要线性扫描，但 intset 的有序性保证了可以用二分。C 选项的 O(1) 直接索引只有固定宽度数组且按下标访问时才成立，而 SISMEMBER 是按值查找不是按下标。D 选项中 Redis 的 hashtable 用的是链式哈希表（dict）而非红黑树。"
+        },
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz8",
+          "question": "生产环境中，一个 Set 存储了 600 个小整数（全部在 int16 范围内），它的底层编码是什么？",
+          "choices": [
+            {"id": "A", "text": "intset（INTSET_ENC_INT16），因为所有元素都是小整数"},
+            {"id": "B", "text": "hashtable，因为元素数量 600 超过了 set-max-intset-entries 的默认值 512"},
+            {"id": "C", "text": "listpack，因为 Redis 7.0+ 对 Set 也使用 listpack 编码"},
+            {"id": "D", "text": "ziplist，因为元素数量不多且都是整数"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "虽然所有 600 个元素都是小整数，完全在 int16 范围内，但 set-max-intset-entries 的默认值是 512。当 Set 的元素数量超过这个阈值后，Redis 会将底层编码从 intset 不可逆地转换为 hashtable，即便所有元素都是整数也不例外。这是因为 intset 的插入和删除操作涉及 memmove 整体搬移元素，时间复杂度为 O(N)，元素数量过多时性能会显著下降。如果你确定业务场景中 Set 元素数量会超过 512 但都是整数且写入不频繁，可以通过 CONFIG SET set-max-intset-entries 1000 调大阈值。C 选项中 Set 类型不使用 listpack，listpack 用于 Hash 和 ZSet 的小数据量编码。D 选项中 Set 从未使用过 ziplist 编码。"
+        },
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz9",
+          "question": "一个 INTSET_ENC_INT32 编码的 intset 包含 [10, 200, 50000]，现在插入 -5000000000（负 50 亿），upgrade 后新元素会被放在什么位置？",
+          "choices": [
+            {"id": "A", "text": "放在数组末尾，因为新插入的元素总是追加到最后"},
+            {"id": "B", "text": "通过二分查找确定插入位置，放在 10 前面"},
+            {"id": "C", "text": "放在数组开头（下标 0），因为触发升级的负数一定比所有现有元素都小"},
+            {"id": "D", "text": "放在数组中间，位于 200 和 50000 之间"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 intsetUpgradeAndAdd 中一个精妙的优化。触发 upgrade 的新值必然超出当前编码的表示范围，所以它要么是一个超大的正数（大于当前编码的最大值），要么是一个超小的负数（小于当前编码的最小值）。int32 的范围是 -2147483648 到 2147483647，-5000000000 远小于下限，所以它一定比 intset 中所有现有元素都小，必定放在数组开头。源码中判断逻辑很简洁：如果新值小于 0 就放开头（prepend 模式），否则放末尾。这样就不需要对新元素做二分查找，因为它的位置是确定的。B 选项中的二分查找只在普通插入（不触发 upgrade）时使用。A 选项忽略了负数触发升级的情况。"
+        },
+        {
+          "id": "redis-internal-intset-upgrade-q1-quiz10",
+          "question": "如果需要调试确认一个 Set 的 intset 编码级别（INT16/INT32/INT64），以下哪种方式可行？",
+          "choices": [
+            {"id": "A", "text": "使用 OBJECT ENCODING key 命令，它会返回具体的编码级别如 intset-int32"},
+            {"id": "B", "text": "使用 DEBUG OBJECT key 查看 serializedlength，结合元素数量推算编码宽度"},
+            {"id": "C", "text": "使用 OBJECT FREQ key 命令查看编码频率信息"},
+            {"id": "D", "text": "使用 TYPE key 命令，它会返回编码细节"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "OBJECT ENCODING 只会返回 \"intset\" 这个字符串，不会进一步区分 INT16、INT32 还是 INT64——Redis 的 OBJECT ENCODING 输出粒度到数据结构级别，不到编码子类型级别。要推算具体的编码级别，可以用 DEBUG OBJECT key 查看 serializedlength（序列化长度），然后用公式反推：intset 的序列化大小约等于 4（encoding）+ 4（length）+ length × encoding_width。如果你知道 SCARD 返回的元素数量是 N，serializedlength 约为 8 + N × W，解出 W 就知道是 2（INT16）、4（INT32）还是 8（INT64）。C 选项的 OBJECT FREQ 用于 LFU 淘汰策略的访问频率统计，与编码无关。D 选项的 TYPE 只返回 \"set\"，不涉及底层实现细节。实际上还可以通过 RDB 转储工具（如 redis-rdb-tools）直接解析 intset 的 encoding 字段来确认。"
+        }
+      ],
+      "references": [
+        "https://github.com/redis/redis/blob/7.2/src/intset.h",
+        "https://github.com/redis/redis/blob/7.2/src/intset.c",
+        "https://redis.io/docs/latest/develop/reference/internals/encodings/",
+        "https://redis.io/docs/latest/develop/data-types/sets/"
+      ]
+    }
+  ]
+}
