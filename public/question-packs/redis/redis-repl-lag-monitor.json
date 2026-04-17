@@ -1,0 +1,155 @@
+{
+  "id": "redis-repl-lag-monitor",
+  "name": "主从复制延迟如何监控与优化",
+  "domain": "redis",
+  "description": "深入讲解 Redis 主从复制延迟的定义、监控方法（INFO replication / offset 差值 / lag 字段）、延迟成因分析与优化措施，以及读写分离场景下处理 stale read 的实战策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-repl-lag-monitor-q1",
+      "domain": "redis",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["复制延迟", "监控", "INFO replication", "lag", "offset差值", "读写分离", "redis-replication"],
+      "title": "主从复制延迟如何监控与优化",
+      "content": "## 故障场景\n\n你们团队负责一个电商平台的商品详情服务，采用 Redis 一主两从的读写分离架构：所有写入走 Master（10.0.1.100:6379），读请求由两个 Replica（10.0.1.101:6380、10.0.1.102:6380）分担。上线运行一直平稳，直到最近两周用户投诉明显增多——有人下单修改了收货地址，刷新页面看到的还是旧地址；运营后台更新了商品价格，前端详情页过了好几秒才生效。客服反馈这些「数据不一致」的工单从每天 2-3 起涨到了每天 30 多起。\n\n你登录 Master 执行 `INFO replication`，看到这样的输出：\n\n```\n# Replication\nrole:master\nconnected_slaves:2\nslave0:ip=10.0.1.101,port=6380,state=online,offset=8734029156,lag=3\nslave1:ip=10.0.1.102,port=6380,state=online,offset=8733847892,lag=7\nmaster_failover_state:no-failover\nmaster_replid:a]3f7d8e2b1c4a5690f8e7d6c5b4a3928170e6f5d4\nmaster_replid2:0000000000000000000000000000000000000000\nmaster_repl_offset:8734210438\nsecond_repl_offset:-1\nrepl_backlog_active:1\nrepl_backlog_size:268435456\nrepl_backlog_first_byte_offset:8465774983\nrepl_backlog_histlen:268435456\n```\n\nslave1 的 lag 达到 7 秒，offset 与 Master 差了 `8734210438 - 8733847892 = 362546` 字节（约 354KB）。而两周前你的截图里两个 Replica 的 lag 都是 0 或 1，offset 差值不超过几千字节。\n\n同时你注意到 Grafana 上 `redis_connected_slaves` 一直是 2（没有断线重连），但 `redis_replication_offset_diff` 指标在过去两周呈锯齿状波动，峰值超过 500KB。\n\n你需要回答：如何系统性地监控 Redis 主从复制延迟？lag 字段和 offset 差值分别代表什么、在什么场景下该看哪个？延迟为什么会从正常恶化到当前水平？有哪些排查方向和优化手段？",
+      "answer": "## Redis 主从复制基础\n\nRedis 主从复制（Replication）是 Redis 高可用架构的基石。简单来说，Master 节点负责处理所有写操作，然后把这些写命令异步传播给一个或多个 Replica 节点，Replica 重放这些命令来保持数据与 Master 一致。这个机制的核心目的有两个：一是做数据冗余，Master 挂了还有 Replica 的数据可以顶上去（配合 Sentinel 或 Cluster 做自动故障转移）；二是做读写分离，把读流量分摊到 Replica 上来提升整体吞吐。\n\n在 Redis 7.0 中执行 `REPLICAOF` 命令（旧版叫 `SLAVEOF`）就可以建立复制关系。第一次连接时 Replica 会触发一次全量复制——Master 做 BGSAVE 生成 RDB 文件发给 Replica，Replica 加载 RDB 后开始接收增量命令。之后在连接正常的情况下，Master 每执行一条写命令就会通过 replication stream（复制流）实时推送给 Replica。这里要注意一个关键词：「异步」。Redis 的复制是异步的，Master 执行完写命令并返回客户端成功之后，才会把命令发到 Replica 的输出缓冲区。这意味着 Master 返回 OK 的那一刻，Replica 不一定已经收到或执行了这条命令。这个时间差就是我们说的「复制延迟」（replication lag）。\n\n复制延迟在大多数场景下是毫秒级别的，你甚至感觉不到它的存在。但当延迟增大到秒级时，问题就来了：读写分离架构中读 Replica 的客户端会读到旧数据（stale read）。场景中用户改了收货地址再刷新页面，如果刷新请求被路由到一个延迟 7 秒的 Replica，自然看到的还是旧地址。这不是 Bug，而是异步复制的固有特性——你必须正视它、监控它、在合理范围内优化它。\n\n## 监控复制延迟的核心方法\n\n### INFO replication：最直接的诊断入口\n\n`INFO replication` 是排查复制问题的第一站。在 Master 端执行这个命令，输出中最重要的是每个 Replica 的 `slave0`、`slave1` 行以及 `master_repl_offset` 这个全局 offset。我们逐个拆解：\n\n```bash\nslave0:ip=10.0.1.101,port=6380,state=online,offset=8734029156,lag=3\nslave1:ip=10.0.1.102,port=6380,state=online,offset=8733847892,lag=7\nmaster_repl_offset:8734210438\n```\n\n`state=online` 表示 Replica 处于正常复制状态，如果你看到 `state=wait_bgsave` 或 `state=send_bulk` 说明正在全量复制，`state=loading` 说明 Replica 正在加载 RDB 文件。`offset` 是 Replica 最后一次报告的已处理偏移量——Master 通过 Replica 定期发送的 `REPLCONF ACK <offset>` 命令来更新这个值。`lag` 字段表示 Master 距离上一次收到这个 Replica 的 ACK 过了多少秒。Replica 默认每秒发送一次 ACK（由 `repl-ping-replica-period` 控制，默认 10 秒是心跳间隔，但 ACK 频率是每秒一次），所以正常情况下 lag 应该是 0 或 1。\n\n### offset 差值 vs lag：两个维度衡量延迟\n\n这是很多人搞混的地方，而面试中经常被追问。offset 差值和 lag 虽然都反映复制延迟，但衡量的维度完全不同。\n\n**offset 差值**（`master_repl_offset - slave_offset`）反映的是 Master 和 Replica 之间的「数据量差距」，单位是字节。场景中 slave1 的 offset 差值是 362546 字节（约 354KB），这意味着 Master 已经写入但 slave1 还没处理的数据有 354KB。offset 差值的精度是字节级的，每一条写命令都会精确体现在 offset 的变化上。在高写入场景下，即使延迟只有几十毫秒，offset 差值也可能达到几十甚至几百 KB，因为每秒写入的数据量本身就很大。\n\n**lag**（秒数）反映的是「时间差距」——Master 距离上一次收到 Replica 的 ACK 过了多久。lag 的精度是秒级的，因为 Replica 每秒才发一次 ACK。lag=3 表示 3 秒前收到了最后一次 ACK，但这个 3 秒不完全等于「数据落后了 3 秒」——Replica 可能 2.8 秒前刚发了 ACK 但还没到下一个周期，也可能 ACK 在网络上延迟了。lag 是一个粗粒度但直观的指标。\n\n在什么场景下看哪个？如果你的 Master 写入量很大（比如每秒 5MB 以上），offset 差值更有意义，因为即使 lag=1，354KB 的 offset 差值也说明 Replica 在消化写入上存在压力。反过来，如果写入量很低但 lag 异常大（比如 lag=15 但 offset 差值只有几 KB），说明问题出在网络或 Replica 的 ACK 响应上而不是数据处理跟不上。生产中建议两个指标都监控，但设置告警阈值时，lag 通常用于快速判断是否有问题（比如 lag > 5 就告警），offset 差值用于精确量化问题严重程度。\n\n### Prometheus + redis_exporter 持续监控\n\n手动执行 `INFO replication` 只能看到瞬时状态，生产环境必须上持续监控。`redis_exporter`（oliver006/redis_exporter）会自动采集复制相关指标并暴露给 Prometheus，核心指标包括：\n\n```yaml\n# Master 端当前 offset\nredis_master_repl_offset{instance=\"10.0.1.100:6379\"} 8734210438\n\n# 每个 Replica 的 offset 和 lag\nredis_connected_slave_offset_bytes{instance=\"10.0.1.100:6379\",slave_ip=\"10.0.1.101\",slave_port=\"6380\"} 8734029156\nredis_connected_slave_lag_seconds{instance=\"10.0.1.100:6379\",slave_ip=\"10.0.1.101\",slave_port=\"6380\"} 3\n```\n\n基于这些指标，一个实用的 Grafana + Prometheus 告警规则如下：\n\n```yaml\ngroups:\n  - name: redis-replication\n    rules:\n      - alert: RedisReplicaLagHigh\n        expr: redis_connected_slave_lag_seconds > 5\n        for: 1m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"Replica {{ $labels.slave_ip }}:{{ $labels.slave_port }} lag {{ $value }}s\"\n\n      - alert: RedisReplicaOffsetDriftLarge\n        expr: redis_master_repl_offset - on(instance) group_right redis_connected_slave_offset_bytes > 1048576\n        for: 2m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"Replica offset 落后 Master 超过 1MB\"\n```\n\n`redis-cli --stat` 也是一个快速观察工具，它每秒刷新一次输出，可以看到 keys 数量、内存使用等变化趋势，虽然不直接显示复制 lag，但能辅助判断 Master 的写入压力。\n\n## 延迟恶化的常见原因排查\n\n场景中延迟从 lag=0~1 恶化到 lag=3~7，说明两周内环境发生了变化。以下是按排查优先级排列的常见原因：\n\n**网络层问题**是第一个排查方向。Master 和 Replica 之间的网络延迟增大或带宽不足都会导致复制命令传输变慢。用 `redis-cli --latency -h 10.0.1.101 -p 6380` 可以测量网络往返延迟，正常同机房应该在 0.1-0.5ms 以内。如果发现延迟到了几十毫秒，检查是否有跨机房部署、网络拥塞或带宽打满的情况。\n\n**Master 写入量突增**是第二个方向。两周前上了新功能或跑了批量任务导致写入 QPS 翻倍，Replica 消化命令的速度跟不上了。通过采样 `master_repl_offset` 在 60 秒内的差值可以算出当前写入速率，和两周前的监控数据做对比就能确认。\n\n**Replica 端的慢操作**是最容易被忽略的原因。Redis 是单线程执行命令的，如果有人在 Replica 上跑了 `KEYS *`、`SORT` 大集合、或者对一个几百 MB 的大 key 做序列化，主线程就会被阻塞几秒，这期间复制流积压的命令只能排队等着。用 `SLOWLOG GET 10` 在 Replica 上查看是否有耗时超过 10ms 的慢查询。\n\n**Replica 正在做全量复制也会产生延迟**。如果 Replica 刚经历了断线重连并触发了全量复制，在加载 RDB 的过程中它是不处理复制流中的增量命令的，这段时间 offset 差值会持续增大。查看 Replica 日志中是否有 `MASTER <-> REPLICA sync started` 的记录。\n\n**系统层面的资源瓶颈**也要排查：CPU 被其他进程占用导致 Redis 得不到足够的 CPU 时间片、磁盘 I/O 高导致 AOF fsync 阻塞主线程、内存不足触发 swap 导致访问延迟从纳秒级退化到毫秒级。用 `top`、`iostat -x 1`、`vmstat 1` 分别检查 CPU、磁盘和内存 swap 状况。\n\n## 优化措施\n\n定位到原因之后，优化可以从四个层面着手。\n\n网络层面，确保 Master 和 Replica 部署在同一个机房甚至同一个机架，网络 RTT 控制在 0.5ms 以内。如果因为容灾需要跨机房部署，至少保证一个 Replica 在本机房以承接低延迟的读请求。\n\n配置层面，有几个关键参数值得调优。`repl-backlog-size` 要根据写入速率和可接受的断线时间来设置（公式：写入速率 × 最长断线时间 × 2），场景中 256MB 的 Backlog 已经是调过的。`client-output-buffer-limit replica` 控制每个 Replica 的输出缓冲区上限——如果 Replica 消费太慢导致缓冲区超限，Master 会直接断开这个 Replica 的连接，触发全量复制，所以不能设得太小。推荐配置：\n\n```bash\n# redis.conf\nclient-output-buffer-limit replica 512mb 128mb 60\n# 含义：硬限制 512MB（超过直接断开）、软限制 128MB 持续 60 秒（超过断开）\n```\n\n架构层面，减少级联复制层级是关键。Redis 支持 A → B → C 的链式复制（B 既是 A 的 Replica 也是 C 的 Master），每多一层级延迟就会叠加。生产中建议所有 Replica 直接挂在 Master 下面，但 Replica 数量也不宜过多（一般不超过 3-5 个），因为每个 Replica 都需要 Master 维护独立的输出缓冲区。\n\n应用层面，严禁在 Replica 上执行耗时操作。有些团队喜欢在 Replica 上跑数据分析查询或备份操作，这会阻塞 Replica 的主线程导致复制命令积压。可以用 `rename-command KEYS \"\"` 在 Replica 配置中禁掉高危命令。\n\n## min-replicas-to-write 与 min-replicas-max-lag\n\nRedis 提供了一对配置来保障写入安全性，防止在 Replica 全部延迟过大或断线时 Master 仍然接受写入导致数据丢失：\n\n```bash\n# redis.conf\nmin-replicas-to-write 1\nmin-replicas-max-lag 10\n```\n\n这两行配置的含义是：Master 至少需要 1 个 Replica 的 lag 不超过 10 秒时才接受写入。如果所有 Replica 的 lag 都超过 10 秒或者 connected_slaves 为 0，Master 会拒绝所有写命令并返回 `(error) NOREPLICAS` 错误。这是一个粗粒度的安全阀：它不能消除复制延迟，但能确保 Master 不会在「没有可用 Replica」的情况下继续写入，避免故障转移时丢失大量数据。\n\n需要注意的是，这个机制判断的是 lag（秒数）而不是 offset 差值。所以一个 lag=9 但 offset 差值 5MB 的 Replica 仍然被认为「合格」。在高写入场景下，你可能需要把 `min-replicas-max-lag` 设得更小（比如 5 秒）来获得更强的保障。\n\n## 读写分离场景下处理延迟的策略\n\n即使做了上述所有优化，异步复制的延迟仍然不可能完全消除——Redis 官方文档明确说了「Redis replication is asynchronous by nature」。那在读写分离架构中如何处理这个问题？\n\n第一种策略是「写后读走 Master」（write-then-read-from-master）。客户端在执行写操作后的短时间窗口内（比如 3 秒），把紧接着的读请求也路由到 Master 而不是 Replica。这样用户修改地址后立刻刷新页面就能看到最新数据。实现方式可以在客户端 SDK 中维护一个「最近写入 key」的本地缓存，带上 TTL，读请求时先检查 key 是否在缓存中，在的话就走 Master。\n\n第二种策略是版本号或时间戳校验。写入时在数据中附带一个版本号，读取时客户端带上期望的最小版本号。如果从 Replica 读到的版本号低于期望值，要么重试读 Master，要么告知用户「数据同步中」。这种方式实现稍复杂但更精确。\n\n第三种也是最简单的策略：关键业务不走 Replica。对于像订单状态、账户余额、库存数量这类对一致性要求极高的数据，所有读写都走 Master。只有商品详情、推荐列表这类能容忍短暂不一致的数据才放到 Replica 读取。这种分流策略可以在应用层或代理层（如 Redis Proxy）实现，虽然 Replica 分担的读流量少了一些，但换来了数据一致性的确定性保障。\n\n回到场景中的问题，lag 从 0~1 恶化到 3~7，第一步应该用 `SLOWLOG GET` 检查 Replica 上是否有慢查询，第二步比对两周前后的 `master_repl_offset` 变化速率看写入量是否增大了，第三步用 `redis-cli --latency` 排除网络问题。找到根因之后对症下药，同时在应用层对关键数据路径加上「写后读走 Master」的兜底策略，从根本上消除用户能感知到的 stale read。",
+      "keyPoints": [
+        "Redis 主从复制是异步的，Master 返回客户端成功时 Replica 不一定已执行该命令，这个时间差就是复制延迟",
+        "INFO replication 中 lag 字段是秒级精度，表示 Master 距离上次收到 Replica ACK 的时间差；offset 差值是字节级精度，反映未同步的数据量大小",
+        "高写入场景下 offset 差值比 lag 更有参考价值——lag=1 但 offset 差 500KB 说明 Replica 在消化写入上有压力",
+        "延迟恶化常见原因包括网络延迟增大、Master 写入量突增、Replica 端执行慢查询阻塞主线程、全量复制期间 RDB 加载、以及系统层面 CPU 不足或内存 swap",
+        "min-replicas-to-write 和 min-replicas-max-lag 配合使用可以在所有 Replica 延迟过大时拒绝写入，防止故障转移时丢失大量数据",
+        "读写分离中处理 stale read 的三种策略：写后读走 Master、版本号/时间戳校验、关键业务始终走 Master",
+        "Prometheus + redis_exporter 持续监控 redis_connected_slave_lag_seconds 和 offset 差值指标，设置 lag > 5s 的告警阈值形成闭环"
+      ],
+      "quiz": [
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz1",
+          "question": "关于 Redis 主从复制的基本特性，以下哪项描述是正确的？",
+          "choices": [
+            { "id": "A", "text": "Redis 主从复制是同步的，Master 会等 Replica 确认后才返回客户端成功" },
+            { "id": "B", "text": "Redis 主从复制是异步的，Master 执行完写命令并返回客户端后才将命令传播给 Replica" },
+            { "id": "C", "text": "Redis 主从复制是半同步的，至少一个 Replica 确认后才返回客户端" },
+            { "id": "D", "text": "Redis 主从复制是异步的，但通过 WAIT 命令可以将其改为永久同步模式" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 主从复制本质上是异步的（asynchronous），Master 执行完写命令并返回客户端 OK 之后，才通过复制流将命令推送给 Replica。这意味着 Master 返回成功的那一刻，Replica 不一定已经收到或执行了该命令。选项 A 把 Redis 复制说成同步是错误的。选项 C 描述的是类似 MySQL 半同步复制的机制，Redis 原生不支持。选项 D 中 WAIT 命令确实可以阻塞等待指定数量的 Replica 确认，但它是针对单次调用的阻塞等待而非永久改变复制模式，不使用 WAIT 时仍然是异步复制。"
+        },
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz2",
+          "question": "在 Master 端执行 INFO replication 看到 slave0 的 lag=5，这个数字的含义是什么？",
+          "choices": [
+            { "id": "A", "text": "该 Replica 的数据落后 Master 5 秒的写入量" },
+            { "id": "B", "text": "该 Replica 最后一次发送 REPLCONF ACK 距今已过去 5 秒" },
+            { "id": "C", "text": "该 Replica 的网络往返延迟（RTT）为 5 秒" },
+            { "id": "D", "text": "该 Replica 有 5 个命令还未执行完毕" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "INFO replication 输出中 slave 行的 lag 字段表示 Master 距离上一次收到该 Replica 的 REPLCONF ACK 命令过去了多少秒。Replica 默认每秒向 Master 发送一次 REPLCONF ACK <offset> 来报告自己的处理进度，所以正常情况下 lag 应该是 0 或 1。lag=5 说明 Master 已经 5 秒没收到这个 Replica 的 ACK 了，可能是网络延迟、Replica 主线程被阻塞等原因。选项 A 把 lag 等同于数据延迟时间不够精确，因为 lag 只反映 ACK 间隔而非精确的数据延迟。选项 C 混淆了 lag 和 RTT。选项 D 的「命令数」说法完全没有依据。"
+        },
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz3",
+          "question": "Master 的 master_repl_offset 为 9000000，某 Replica 的 offset 为 8500000，这个 offset 差值反映了什么？",
+          "choices": [
+            { "id": "A", "text": "Replica 落后 Master 500000 条命令" },
+            { "id": "B", "text": "Replica 落后 Master 500000 字节的复制数据，即 Master 已写入但 Replica 尚未处理的数据量" },
+            { "id": "C", "text": "Replica 的内存使用比 Master 少 500000 字节" },
+            { "id": "D", "text": "Replica 的 RDB 文件比 Master 小 500000 字节" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "master_repl_offset 是 Master 写入复制流的累计字节偏移量，每传播一条写命令（RESP 序列化后）就会增加对应的字节数。Replica 的 offset 是它已处理到的偏移量。两者的差值（9000000 - 8500000 = 500000）代表 Master 已经写入但 Replica 尚未消化的数据量，单位是字节而不是命令条数。选项 A 错在把字节当成了命令数——不同命令的 RESP 序列化大小不同，500000 字节可能是几百条大命令也可能是几万条小命令。选项 C 和 D 混淆了 repl_offset 与内存/磁盘大小的概念，offset 只与复制流数据量有关。"
+        },
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz4",
+          "question": "在高写入量（每秒 10MB）的场景下，Replica 的 lag=1 但 offset 差值达到了 800KB，以下哪个判断最合理？",
+          "choices": [
+            { "id": "A", "text": "lag=1 说明复制完全正常，800KB 的 offset 差值可以忽略" },
+            { "id": "B", "text": "800KB 的 offset 差值在每秒 10MB 写入下仅代表约 80ms 的延迟，属于正常范围" },
+            { "id": "C", "text": "lag 和 offset 差值矛盾了，说明监控数据有误需要重新采集" },
+            { "id": "D", "text": "应该只关注 lag 值，offset 差值在任何场景下都不重要" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "在每秒写入 10MB 的场景下，800KB 的 offset 差值意味着 Replica 落后 Master 约 800KB / 10MB ≈ 80ms 的数据量，这完全在正常范围内。lag=1 也印证了 Replica 在 1 秒内发过 ACK，两个指标是一致的。这道题的关键点在于：offset 差值必须结合写入速率来解读。同样是 800KB 的 offset 差值，在每秒写 10MB 的场景下只有 80ms 延迟，但在每秒写 100KB 的场景下就意味着 8 秒的延迟了。选项 A 虽然结论类似但忽略了 offset 差值的分析价值。选项 C 不理解两个指标可以共存。选项 D 完全否定 offset 差值的作用是错误的。"
+        },
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz5",
+          "question": "你在 Master 上执行 INFO replication 看到某 Replica 的 state=online, lag=15, offset 差值约 2MB。结合以下 Replica 端的 SLOWLOG 输出，最可能的延迟原因是什么？\n\n```\n127.0.0.1:6380> SLOWLOG GET 3\n1) 1) (integer) 127\n   2) (integer) 1704268800\n   3) (integer) 4523187\n   4) 1) \"KEYS\"\n      2) \"session:*\"\n```",
+          "choices": [
+            { "id": "A", "text": "Master 写入量过大导致 Replica 消化不了" },
+            { "id": "B", "text": "Replica 上执行了耗时 4.5 秒的 KEYS 命令阻塞了主线程，导致复制命令积压" },
+            { "id": "C", "text": "网络带宽不足导致复制命令传输缓慢" },
+            { "id": "D", "text": "Replica 正在执行全量复制加载 RDB 文件" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SLOWLOG 输出显示 Replica 上执行了一条 `KEYS session:*` 命令，耗时 4523187 微秒（约 4.5 秒）。Redis 是单线程处理命令的，这 4.5 秒内 Replica 的主线程完全被 KEYS 命令占据，无法处理复制流中的写命令。这就解释了为什么 lag 达到 15 秒——如果 KEYS 命令反复被执行，每次阻塞几秒，复制延迟自然会持续恶化。offset 差值只有 2MB 也和这个判断一致：不是写入量大，而是 Replica 间歇性被阻塞。选项 A 不太可能，因为 2MB 的 offset 差值在正常写入场景下并不大。选项 C 和 D 都没有直接证据支持。"
+        },
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz6",
+          "question": "关于在 Replica 上执行读请求可能遇到的问题，以下哪种说法是错误的？",
+          "choices": [
+            { "id": "A", "text": "读写分离架构中，从 Replica 读取可能读到旧数据（stale read），这是异步复制的固有特性" },
+            { "id": "B", "text": "可以通过配置 replica-read-only no 让 Replica 接受写入来解决 stale read 问题" },
+            { "id": "C", "text": "写后读走 Master 策略可以避免用户刚写入的数据在 Replica 上读不到" },
+            { "id": "D", "text": "关键业务数据（如订单状态、账户余额）建议始终走 Master 读写以保证一致性" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 是错误的。将 `replica-read-only` 设为 no 允许直接向 Replica 写数据，但这完全不能解决 stale read 问题。直接写 Replica 的数据不会同步到 Master，也不会传播到其他 Replica，反而会造成数据不一致——下次全量复制时这些直接写入的数据还会被覆盖。stale read 的根源是异步复制延迟，不是 Replica 不能写入。选项 A 正确描述了异步复制的固有特性。选项 C 的写后读走 Master 是业界常用的应对策略。选项 D 对关键业务不走 Replica 的建议也是生产环境的最佳实践。"
+        },
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz7",
+          "question": "offset 差值和 lag 这两个指标在监控中的侧重点分别是什么？",
+          "choices": [
+            { "id": "A", "text": "offset 差值侧重字节级数据量差距，lag 侧重秒级时间差距；高写入场景下 offset 差值更有诊断价值" },
+            { "id": "B", "text": "两者完全等价，只是单位不同（字节 vs 秒），可以互相换算" },
+            { "id": "C", "text": "offset 差值反映网络延迟，lag 反映 Replica 的处理能力差距" },
+            { "id": "D", "text": "lag 精度更高因为它由 Master 精确测量，offset 差值误差较大" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "offset 差值和 lag 是两个不同维度的指标。offset 差值（master_repl_offset - slave_offset）以字节为单位衡量 Master 和 Replica 之间的数据量差距，精度是字节级的，每条写命令都会体现。lag 以秒为单位衡量 Master 距离上一次收到 Replica ACK 的时间，精度是秒级的（因为 Replica 每秒发一次 ACK）。在高写入场景下，即使 lag=1（看似正常），offset 差值可能已经很大了，此时 offset 差值更能反映真实的复制压力。选项 B 说两者等价是错误的——它们的维度和精度都不同，不能简单换算。选项 C 对两者含义的解释都不准确。选项 D 恰好说反了，lag 的秒级精度反而比 offset 差值的字节级精度更粗。"
+        },
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz8",
+          "question": "生产环境中 min-replicas-to-write 1 和 min-replicas-max-lag 10 同时配置后，当所有 Replica 的 lag 都超过 10 秒时会发生什么？",
+          "choices": [
+            { "id": "A", "text": "Master 会自动降级为只读模式，拒绝所有写命令并返回 NOREPLICAS 错误" },
+            { "id": "B", "text": "Master 会自动触发全量复制来加速 Replica 同步" },
+            { "id": "C", "text": "Master 仍然正常接受写入，但会在日志中记录警告" },
+            { "id": "D", "text": "Master 会主动断开所有 Replica 的连接然后重新建立复制" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "当配置了 `min-replicas-to-write 1` 和 `min-replicas-max-lag 10` 时，Master 要求至少有 1 个 Replica 的 lag 不超过 10 秒才接受写入。如果所有 Replica 的 lag 都超过了 10 秒（或者没有任何已连接的 Replica），Master 会拒绝所有写命令并返回 `(error) NOREPLICAS Not enough good replicas to write` 错误。这是一个安全机制，防止 Master 在所有 Replica 都严重落后的情况下继续写入——否则一旦 Master 宕机做故障转移，那些还没同步到 Replica 的数据就全丢了。选项 B 和 D 描述的行为 Redis 都不会自动执行。选项 C 说仍然正常写入，恰好与这个安全机制的目的相反。"
+        },
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz9",
+          "question": "在 Redis 的链式复制（A → B → C）架构中，关于复制延迟的说法哪项是正确的？",
+          "choices": [
+            { "id": "A", "text": "链式复制不会增加延迟，因为每一层都是异步传播，总延迟等于最慢那一层" },
+            { "id": "B", "text": "每多一层级联复制延迟会叠加，C 节点的数据延迟至少是 B 节点延迟加上 B→C 的传播延迟" },
+            { "id": "C", "text": "Redis 不支持链式复制，Replica 只能直接连 Master" },
+            { "id": "D", "text": "链式复制中间节点 B 会缓存命令做批量发送，因此 C 的延迟反而比直连 Master 更低" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 支持链式复制（也叫级联复制），即 Replica B 可以同时作为 C 的 Master。但每多一层级联，复制延迟是叠加的。Master A 写入的命令先传到 B，B 处理完再传给 C。如果 A→B 的延迟是 1 秒，B→C 的延迟也是 1 秒，那 C 相对于 A 的数据延迟至少是 2 秒。在 B 端如果遇到慢查询阻塞或网络波动，C 的延迟会更大。因此生产环境中建议减少级联层级，尽量让所有 Replica 直接挂在 Master 下面。选项 A 认为延迟不叠加是错误的。选项 C 否认链式复制的存在也不对。选项 D 所说的「缓存批量发送更低延迟」没有依据，中间层只会增加而非减少延迟。"
+        },
+        {
+          "id": "redis-repl-lag-monitor-q1-quiz10",
+          "question": "某 Redis 主从集群中 Replica 的 lag 突然从 0 跳到 30 秒以上且 offset 不再增长，但 Master 端 connected_slaves 仍为 2 且 state=online。以下哪种排查方向最可能找到根因？",
+          "choices": [
+            { "id": "A", "text": "检查 Master 的写入 QPS 是否突增，因为 offset 不增长说明 Master 没有新数据写入" },
+            { "id": "B", "text": "检查 Replica 是否正在做 RDB 持久化或 AOF 重写，导致主线程被 fork 阻塞或磁盘 I/O 拖慢了命令执行" },
+            { "id": "C", "text": "检查 Replica 是否内存不足触发了 swap，用 vmstat 看 si/so 列是否有大量换入换出，因为内存 swap 会使 Redis 响应延迟从微秒级退化到毫秒级" },
+            { "id": "D", "text": "重启 Replica 是最快的解决方案，因为 lag=30 说明复制已经不可恢复" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "lag 从 0 跳到 30 秒以上且 Replica 的 offset 不再增长，说明 Replica 的主线程几乎完全停滞了——它既不处理复制命令也不发送 ACK。在 state 仍然是 online 的情况下（说明 TCP 连接没断），最可能的原因是 Replica 的系统资源出了严重问题。内存不足触发 swap 是非常典型的场景：Linux 将 Redis 的内存页交换到磁盘后，Redis 的每次内存访问都要等磁盘 I/O，延迟从纳秒级退化到毫秒甚至秒级，表现就是进程看似在运行但几乎不做事。用 `vmstat 1` 观察 si/so 列或 `redis-cli INFO memory` 查看 `used_memory_rss` 与物理内存的关系可以确认。选项 B 也值得排查但 fork 阻塞通常只持续几百毫秒到几秒，不太可能导致 30 秒的持续停滞。选项 D 重启不解决根因，而且 lag=30 不代表不可恢复。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/replication/",
+        "https://redis.io/docs/latest/commands/info/",
+        "https://github.com/oliver006/redis_exporter"
+      ]
+    }
+  ]
+}
