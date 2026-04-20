@@ -1,0 +1,156 @@
+{
+  "id": "redis-mget-mset-cluster",
+  "name": "MGET/MSET 在 Cluster 模式下的限制与替代方案",
+  "domain": "redis",
+  "description": "Redis Cluster 下 MGET/MSET 的 CROSSSLOT 限制与多种替代方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-mget-mset-cluster-q1",
+      "domain": "redis",
+      "type": "requirement",
+      "difficulty": 2,
+      "tags": ["Redis", "Cluster", "MGET", "MSET", "hash tag"],
+      "title": "MGET/MSET 在 Cluster 模式下的限制与替代方案",
+      "content": "## 面试场景\n\n你的服务原先跑在 Redis 6.2 单机实例上，由于业务增长内存到达了 32GB 瓶颈，团队决定迁移到三主三从的 Redis 7.0 Cluster。上线第一天，监控就告警了——批量用户信息加载接口的错误率从 0% 飙升到 100%。你翻开 Kibana 看到如下日志：\n\n```\n2024-11-05 10:02:17.342 ERROR [user-service] redis.go:128\n  redis: CROSSSLOT Keys in request don't hash to the same slot\n  cmd=MGET keys=[user:info:10001, user:info:10002, user:info:10003, ...(共 50 个)]\n```\n\n业务场景很典型：前端展示用户列表页时，需要一次性拉取 50 个用户的缓存信息。单机时代用一条 MGET 搞定，延迟只有 0.3ms。现在 Cluster 模式下这条 MGET 直接报错了。你用 redis-cli 手动验证：\n\n```bash\n10.0.3.11:6379> CLUSTER KEYSLOT user:info:10001\n(integer) 8914\n10.0.3.11:6379> CLUSTER KEYSLOT user:info:10002\n(integer) 11763\n10.0.3.11:6379> CLUSTER KEYSLOT user:info:10003\n(integer) 14612\n10.0.3.11:6379> MGET user:info:10001 user:info:10002 user:info:10003\n(error) CROSSSLOT Keys in request don't hash to the same slot\n```\n\n50 个 key 散落在不同的 slot 上，一条 MGET 根本过不去。类似地，你发现缓存预热脚本里的 MSET 也全部失败了。负责写缓存预热的同事问你：「有没有办法在不改变 key 命名的前提下实现和 MGET 一样的批量读取效果？如果要改 key 命名，代价有多大？」\n\n另一位同事在技术群里贴了一段 go-redis 代码说：「我试了一下，go-redis 的 ClusterClient.MGet() 居然直接能用，也没报错，这是什么原理？」与此同时运维同事问你：「我在网上看到可以用 Hash Tag 把 key 聚合到同一个 slot，但这样会不会导致某个节点内存爆掉？」\n\n请从 MGET/MSET 的底层执行路径出发，分析 CROSSSLOT 限制的原因，对比 Hash Tag 方案与客户端并行 Pipeline 方案的适用场景和性能差异，并给出生产级的迁移建议。",
+      "answer": "## 第一步：核心主体概念基础详解\n\n### MGET/MSET 的本质与 Cluster Slot 路由\n\nMGET 和 MSET 是 Redis 提供的批量读写命令。MGET 接受任意数量的 key 作为参数，一次性返回这些 key 对应的 value（不存在的返回 nil）；MSET 则一次性设置多组 key-value 对，保证操作的原子性——要么全部设置成功，要么全部不执行。在单机 Redis 中，这两个命令的执行路径非常简单：遍历内部哈希表 dict，逐一查找或写入，所有操作在同一个进程的同一块内存空间中完成，开销极低。一条 MGET 50 个 key 在单机上通常只需 0.2~0.5ms。\n\nRedis Cluster（3.0 版本引入，当前生产主流为 7.0+）的数据分片模型基于 16384 个 hash slot。每个 key 通过 `CRC16(key) % 16384` 被映射到一个确定的 slot 编号，而集群中的每个 Master 节点负责一部分 slot 的数据。例如三个 Master 的典型分配是 Master-A 管 slot 0~5460、Master-B 管 slot 5461~10922、Master-C 管 slot 10923~16383。当客户端发送一条命令时，smart client（如 go-redis、lettuce）会根据 key 的 slot 编号将命令路由到正确的节点执行。\n\n关键矛盾在于：**MGET/MSET 是多 key 命令，但 Cluster 的命令执行模型是单节点的**。一个 Redis 节点接收到 MGET 后，它只能访问自己持有的 slot 数据，无法替客户端去其他节点取值。因此 Redis 源码中在 `processCommand()` 函数里做了一个前置检查——如果传入的多个 key 的 slot 编号不完全一致，直接返回 `(error) CROSSSLOT Keys in request don't hash to the same slot`，命令被拒绝执行。\n\n### 为什么判定粒度是 Slot 而非 Node\n\n一个容易产生误解的点是：即使多个 key 碰巧落在同一个节点管辖的不同 slot 上，依然会报 CROSSSLOT。Redis 的校验逻辑是对所有 key 计算 slot 编号后判断是否全部相等，完全不考虑 slot-to-node 的映射关系。这个设计的原因是 Cluster 的 resharding（重分片）随时可能发生——今天 slot 100 和 slot 200 在同一个节点上，明天 resharding 之后可能就不在了。如果按 node 粒度放行，resharding 后同样的命令可能在某些时刻成功某些时刻失败，行为不确定，这比一律拒绝更危险。\n\n## 第二步：题目核心问题精准深度解答\n\n### 方案一：Hash Tag 强制路由\n\nRedis Cluster 的 Hash Tag 机制允许你用花括号 `{}` 标记 key 中参与 slot 计算的子串。只有第一对花括号之间的内容会被送入 CRC16 运算。例如 `{user}:info:10001` 和 `{user}:info:10002`，slot 计算只看 `user` 这四个字符，于是所有带 `{user}` 前缀的 key 必然落入 slot 5474（`CRC16(\"user\") % 16384 = 5474`）。\n\n```bash\n10.0.3.11:6379> CLUSTER KEYSLOT {user}:info:10001\n(integer) 5474\n10.0.3.11:6379> CLUSTER KEYSLOT {user}:info:10002\n(integer) 5474\n10.0.3.11:6379> MGET {user}:info:10001 {user}:info:10002 {user}:info:10003\n1) \"Alice\"\n2) \"Bob\"\n3) \"Charlie\"\n```\n\n但 Hash Tag 有一个致命副作用：**数据倾斜**。如果你的 50 万用户全部用 `{user}` 作为 tag，50 万个 key 全部堆积在 slot 5474 所在的那一个 Master 上——这个节点的内存可能占集群总量的 80%，QPS 也集中于此，Cluster 的水平扩展形同虚设。正确的 Hash Tag 用法是按「需要一起操作的最小数据集」来选择 tag 内容。比如你需要原子性地同时读取某个用户的 profile、session、preference 三个 key，可以用用户 ID 作为 tag：`{10001}:profile`、`{10001}:session`、`{10001}:pref`。同一用户的数据聚合在同一 slot，不同用户自然分散。\n\n**适用场景**：需要对固定一组 key 执行原子性的多 key 操作（如 Lua 脚本、MULTI/EXEC 事务），且这组 key 的数量有限且可枚举。不适合用于「任意 N 个 key 的批量查询」场景。\n\n### 方案二：客户端并行 Pipeline\n\n对于「一次读取 50 个不相关用户的缓存」这种场景，改 key 命名既不现实也不合理——你不可能把 50 万个用户全部 Hash Tag 到一个 slot。正确的做法是在客户端层面把这 50 个 key 按 slot 分组，对每个 slot（节点）分别发送一个子 MGET 或 Pipeline 命令，最后在客户端合并结果。\n\ngo-redis v9 的 `ClusterClient.MGet()` 正是这样实现的。源码路径 `redis/cluster.go` 中的核心逻辑是：首先对传入的所有 key 调用 `Slot()` 函数计算 slot 编号，然后按 slot 对应的节点进行分组，接着用 `ForEachShard` 风格的并行 goroutine 对每个节点发送子请求（可能是 Pipeline 打包多条 GET 或一条子 MGET），所有 goroutine 完成后按原始 key 顺序组装 `[]interface{}` 返回。调用方代码和单机模式完全一样：\n\n```go\nrdb := redis.NewClusterClient(&redis.ClusterOptions{\n    Addrs: []string{\"10.0.3.11:6379\", \"10.0.3.12:6379\", \"10.0.3.13:6379\"},\n})\n// 内部自动分组、并行发送、合并结果\nvals, err := rdb.MGet(ctx, \"user:info:10001\", \"user:info:10002\", \"user:info:10003\").Result()\n// vals = [\"Alice\", \"Bob\", \"Charlie\"], err = nil\n```\n\n性能特征：从 RTT（Round Trip Time）来看，由于并行发送，总耗时约等于**最慢的那个节点的响应时间**，而不是 N 个节点的延迟之和。假设集群有 3 个 Master、50 个 key 均匀分布，那么每个节点大约接到 16~17 个 key 的子 MGET，三个子请求并行完成后合并，总延迟约 0.3~0.5ms（和单机 MGET 相当），代价是占用了 3 条连接而非 1 条。\n\n### 方案三：Lua 脚本（配合 Hash Tag）\n\n如果你需要的不只是批量读取而是「读-计算-写」的原子操作（比如读取多个 key 的值做比较然后写入结果），那 Pipeline 分组不够用了——Pipeline 不保证原子性。此时 Lua 脚本是正确选择，但前提是所有 KEYS 必须在同一个 slot。\n\n```bash\n# 原子性读取用户余额和冻结金额并判断是否可扣款\nEVAL \"local bal = tonumber(redis.call('GET', KEYS[1])) \\\n       local frozen = tonumber(redis.call('GET', KEYS[2])) \\\n       if bal - frozen >= tonumber(ARGV[1]) then \\\n         redis.call('DECRBY', KEYS[1], ARGV[1]) \\\n         return 1 \\\n       end \\\n       return 0\" 2 {10001}:balance {10001}:frozen 100\n```\n\n### 性能对比总结\n\n三种方案的性能画像：Hash Tag MGET 只需 1 次 RTT、1 条连接，延迟最低（0.2ms 级），但要求改 key 命名且有数据倾斜风险。客户端并行 Pipeline 需要 1 次 RTT（并行）但消耗 N 条连接（N = 涉及的节点数），延迟取决于最慢节点（0.3~0.5ms），无需改 key 命名，是最通用的方案。逐条 GET 循环则是 N 次串行 RTT（N = key 数量），延迟为 N × 单次 RTT（50 个 key 约 5~15ms），只有在客户端库不支持自动分组时才会退化到这种方式。\n\n## 第三步：体系化扩展延伸\n\n### go-redis ForEachShard 与 Pipeline 的关系\n\ngo-redis 提供了 `ForEachShard` 方法让你对集群中的每个 Master 节点执行自定义操作。在内部实现中，`ClusterClient.MGet()` 并不直接调用 `ForEachShard`，而是使用一个更精细的 `cmdsInfo` 路由表按 slot 分组——但思想是类似的。如果你有自定义的批量操作逻辑，可以手动使用 `ForEachShard` 配合 Pipeline 实现：\n\n```go\nerr := rdb.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {\n    pipe := shard.Pipeline()\n    // 往 pipe 中塞入属于该 shard 的命令\n    _, err := pipe.Exec(ctx)\n    return err\n})\n```\n\n### Hash Tag 的陷阱与监控\n\n生产环境使用 Hash Tag 后，必须监控 slot 级别的 key 分布。Redis 7.0 提供了 `CLUSTER SLOT-STATS` 命令（实验性），可以看到每个 slot 的 key 数量和内存占用。如果某个 slot 的 key 数量远超平均值（比如 10 倍以上），说明 Hash Tag 使用不当导致了热点。此外还可以用 `redis-cli --cluster info` 查看各节点的 key 分布是否均匀。一旦发现倾斜，需要重新设计 Hash Tag 方案或拆分过大的 tag 分组。\n\n### MSET 的额外考量\n\nMSET 比 MGET 多了一层复杂性：MSET 在 Redis 中是原子性的——50 个 key-value 对要么全部设置成功，要么全部不执行。客户端分组发送虽然解决了 CROSSSLOT 的问题，但打破了原子性。如果前两个节点的子 MSET 成功了、第三个节点失败了，你已经有部分数据写入了。对于缓存预热这类幂等场景这不是问题（重试即可），但对于需要强一致性的写入场景，你只能用 Hash Tag + 单节点 MSET 或 Lua 脚本来保证原子性。",
+      "keyPoints": [
+        "MGET/MSET 在 Redis Cluster 下受到 CROSSSLOT 限制的根因是：命令只能在单个节点执行，而 CRC16(key) % 16384 的 slot 路由可能将多个 key 分散到不同节点上",
+        "CROSSSLOT 的判定粒度是 slot 而非 node——即使两个 key 碰巧在同一节点管辖的不同 slot 上也会被拒绝，这是为了避免 resharding 后行为不确定",
+        "Hash Tag 通过 {tag} 语法让 Redis 只用花括号内的子串计算 slot，适合需要原子性多 key 操作的固定 key 分组，但滥用会导致数据倾斜和单节点热点",
+        "客户端并行 Pipeline 是最通用的替代方案：按 slot 分组、并行发送子请求、合并结果，go-redis ClusterClient.MGet() 内部已自动实现此逻辑",
+        "性能对比：Hash Tag MGET 是 1 RTT/1 连接（最快但需改 key），并行 Pipeline 是 1 RTT/N 连接（通用），逐条 GET 是 N RTT（最慢应避免）",
+        "MSET 的客户端分组打破了原子性保证——部分节点成功部分失败时需要业务层处理幂等重试，强一致写入场景必须用 Hash Tag 保证单 slot 执行",
+        "Lua 脚本和 MULTI/EXEC 事务在 Cluster 中同样受 slot 约束，所有 KEYS 必须映射到同一 slot，适合「读-计算-写」原子操作场景配合 Hash Tag 使用"
+      ],
+      "quiz": [
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz1",
+          "question": "在 Redis 7.0 Cluster 中执行 `MGET user:info:10001 user:info:10002` 返回 CROSSSLOT 错误，根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "MGET 命令在 Redis 7.0 中已经被废弃，Cluster 不再支持该命令"},
+            {"id": "B", "text": "两个 key 经 CRC16 哈希后落在不同 slot，而单个节点无法跨节点取数据，命令在协议层直接被拒绝"},
+            {"id": "C", "text": "Cluster 模式下所有读命令都必须发送到 Replica 节点才能执行"},
+            {"id": "D", "text": "MGET 只支持最多 1 个 key 参数，传入多个 key 会触发参数校验错误"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CROSSSLOT 错误的本质是 Redis Cluster 的分片架构限制。每个 key 通过 CRC16(key) % 16384 计算出 slot 编号，不同 slot 可能分布在不同节点上。当一条 MGET 包含多个不同 slot 的 key 时，接收命令的节点无法替客户端去其他节点获取数据，因此在 processCommand 阶段直接返回 CROSSSLOT 错误。A 选项错误，MGET 在 Redis 7.0 中仍然完全可用，只要所有 key 在同一 slot 内就能正常执行。C 选项错误，读命令可以发送到 Master 节点。D 选项错误，MGET 设计上就是接受多个 key 参数的批量命令。"
+        },
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz2",
+          "question": "假设 Cluster 中 slot 100 和 slot 200 都分配在 Master-A 节点上，对这两个 slot 的 key 执行 MGET 会怎样？",
+          "choices": [
+            {"id": "A", "text": "正常执行并返回结果，因为两个 key 物理上在同一个节点的内存中"},
+            {"id": "B", "text": "仍然返回 CROSSSLOT 错误，因为判定粒度是 slot 而非 node"},
+            {"id": "C", "text": "返回 MOVED 重定向到另一个节点"},
+            {"id": "D", "text": "执行成功但有 warning 日志提示 slot 不一致"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个高频误区。Redis Cluster 在执行多 key 命令时，检查的是所有 key 的 slot 编号是否完全相等，而不考虑这些 slot 当前分配在哪个节点上。即使 slot 100 和 slot 200 碰巧都归 Master-A 管理，`MGET key_in_slot100 key_in_slot200` 仍然返回 CROSSSLOT。设计上这么做的原因是 resharding 随时可能发生——今天在同一节点的两个 slot，明天可能被迁移到不同节点，如果按 node 粒度放行会导致行为不确定。A 选项的「同节点就行」是错误的认知，C 选项的 MOVED 只在 key 确实不在当前节点时触发，D 选项的 warning 机制不存在。"
+        },
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz3",
+          "question": "使用 Hash Tag 将 key 改为 `{user}:info:10001` 后 MGET 可以正常工作，其原理是什么？",
+          "choices": [
+            {"id": "A", "text": "花括号告诉 Redis 跳过 slot 检查，允许跨 slot 操作"},
+            {"id": "B", "text": "花括号内的内容 user 是 slot 计算的唯一输入，所有 {user}:xxx 形式的 key 映射到同一个 slot"},
+            {"id": "C", "text": "Hash Tag 会在客户端自动为 key 添加统一前缀从而绕过服务端检查"},
+            {"id": "D", "text": "Hash Tag 让 Redis 将所有带花括号的 key 存储在 slot 0 上"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Hash Tag 是 Redis Cluster 协议层面的机制。当 key 中包含花括号 {} 时，CRC16 哈希只对第一对花括号之间的子串进行计算。`{user}:info:10001` 和 `{user}:info:10002` 参与哈希的都是字符串「user」，CRC16(\"user\") % 16384 产生相同的 slot 编号（5474），因此这些 key 必然落在同一个 slot 上，MGET 校验通过。A 选项错误，Hash Tag 不会跳过任何检查，只是改变了哈希输入使 slot 一致。C 选项错误，Hash Tag 是服务端的解析规则而非客户端行为。D 选项错误，slot 由 CRC16 计算结果决定，不是固定为 0。"
+        },
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz4",
+          "question": "一个系统有 200 万用户，如果所有用户缓存 key 都改为 `{user}:info:xxx` 格式，最主要的风险是什么？",
+          "choices": [
+            {"id": "A", "text": "CRC16 算法会因为输入都是 user 而产生哈希碰撞导致数据丢失"},
+            {"id": "B", "text": "200 万个 key 全部集中在 slot 5474 对应的单个 Master 上，造成严重的数据倾斜和节点热点，Cluster 水平扩展能力失效"},
+            {"id": "C", "text": "花括号字符会占用额外内存，200 万个 key 的内存开销增加 50% 以上"},
+            {"id": "D", "text": "所有 key 在同一 slot 会导致 AOF 文件无法正常重写"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Hash Tag 最致命的副作用。当 200 万个 key 共享 `{user}` 作为 Hash Tag 时，CRC16(\"user\") 的值固定不变，200 万个 key 全部映射到 slot 5474，该 slot 所在的 Master 节点将承载几乎全部数据和请求压力，其他节点空闲，Cluster 的分片优势完全丧失。正确做法是按用户 ID 做 tag（如 `{10001}:info`），让不同用户分散到不同 slot。A 选项错误，CRC16 输入相同只是 slot 相同不会丢数据。C 选项错误，花括号只是两个字节的 ASCII 字符，内存增加可忽略。D 选项错误，AOF 重写和 slot 分布无关。"
+        },
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz5",
+          "question": "go-redis v9 的 ClusterClient.MGet() 在传入不同 slot 的 key 时能正常返回结果，其内部实现机制是什么？",
+          "choices": [
+            {"id": "A", "text": "go-redis 向服务端发送特殊的 CLUSTER MGET 命令绕过 CROSSSLOT 检查"},
+            {"id": "B", "text": "go-redis 对所有 key 自动添加相同的 Hash Tag 后发送"},
+            {"id": "C", "text": "go-redis 先按 slot 对 key 分组，对每个涉及的节点并行发送子 MGET，最后按原始顺序合并结果返回"},
+            {"id": "D", "text": "go-redis 逐个发送 GET 命令并串行等待返回，模拟 MGET 的效果"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "go-redis 作为 smart client，在 Cluster 模式下对 MGet 做了透明的分组并行处理。源码逻辑是：先对每个 key 调用 CRC16 计算 slot 编号，按目标节点分组形成多个子命令集合，然后使用 goroutine 并行向各节点发送子 MGET（或 Pipeline GET），所有节点响应后按调用方传入的原始 key 顺序组装结果 slice 返回。整个过程对使用者透明，代码写法和单机模式一样。A 选项错误，不存在 CLUSTER MGET 命令。B 选项错误，自动加 Hash Tag 会改变 key 名导致数据错乱。D 选项错误，逐个串行 GET 的延迟是 N 倍 RTT，go-redis 不会这样实现。"
+        },
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz6",
+          "question": "以下三种批量读取方案的性能排序（从快到慢）正确的是？",
+          "choices": [
+            {"id": "A", "text": "逐条 GET 循环 > 客户端并行 Pipeline > Hash Tag MGET"},
+            {"id": "B", "text": "Hash Tag MGET (1 RTT/1 连接) > 客户端并行 Pipeline (1 RTT/N 连接) > 逐条 GET 循环 (N RTT)"},
+            {"id": "C", "text": "客户端并行 Pipeline > Hash Tag MGET > 逐条 GET 循环"},
+            {"id": "D", "text": "三种方案延迟完全相同，仅连接数不同"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "性能从快到慢的正确排序是：Hash Tag MGET 最快，因为只需要 1 次 RTT 和 1 条连接，命令在单个节点内完成，延迟约 0.2ms；客户端并行 Pipeline 次之，虽然理论上也是 1 次 RTT（并行发送），但涉及 N 条连接的建立/复用开销和结果合并，延迟约 0.3~0.5ms，取决于最慢的节点；逐条 GET 循环最慢，是 N 次串行 RTT 累加，50 个 key 的延迟约 5~15ms。A 选项的排序完全颠倒。C 选项把并行 Pipeline 排在 Hash Tag MGET 前面不正确，Hash Tag 方案少了多连接协调的开销。D 选项错误，三者延迟差异显著。"
+        },
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz7",
+          "question": "关于 MSET 在 Cluster 下使用客户端分组方案，以下哪项描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "客户端分组发送的 MSET 仍然保持原子性，要么全部成功要么全部失败"},
+            {"id": "B", "text": "分组后每个子 MSET 在各自节点上是原子的，但跨节点的整体操作不再保证原子性，部分节点可能成功部分失败"},
+            {"id": "C", "text": "MSET 在 Cluster 中即使只操作一个 key 也无法执行"},
+            {"id": "D", "text": "客户端分组后 Redis 会自动启动分布式事务保证全局原子性"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 MSET 客户端分组方案的核心代价。单机 Redis 的 MSET 是原子性的——50 个 key-value 全部设置成功或全部不执行。但客户端分组后，假设 50 个 key 分散到 3 个节点，实际执行的是 3 条独立的子 MSET。如果节点 A 和 B 的子 MSET 成功而节点 C 失败，已经有部分数据写入了。对于缓存预热等幂等场景可以接受（失败重试即可），但需要强一致的写入场景必须用 Hash Tag 保证所有 key 在同一 slot 然后执行原生 MSET。A 选项错误，分组打破了全局原子性。C 选项错误，单 key 的 MSET 完全正常。D 选项错误，Redis Cluster 不支持分布式事务。"
+        },
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz8",
+          "question": "以下哪种 Hash Tag 设计方案最适合「同一用户的多个属性需要一起 MGET」的场景？",
+          "choices": [
+            {"id": "A", "text": "所有 key 统一用 {cache} 作为 tag：{cache}:user:10001:name、{cache}:user:10001:email"},
+            {"id": "B", "text": "用用户 ID 作为 tag：{10001}:name、{10001}:email、{10001}:avatar"},
+            {"id": "C", "text": "用字段名作为 tag：{name}:user:10001、{email}:user:10001"},
+            {"id": "D", "text": "不使用 Hash Tag，用 SCAN 命令实现批量读取"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确的 Hash Tag 设计应该按「需要一起操作的业务实体」来选择 tag 内容。用用户 ID 作为 tag（如 `{10001}:name`、`{10001}:email`），同一用户的所有属性 key 落入同一 slot，可以用 MGET 一起读取；不同用户（{10002}、{10003}...）的数据自然分散到不同 slot，保证负载均匀。A 选项用统一的 {cache} 会导致所有 key 堆积到一个 slot，严重倾斜。C 选项用字段名做 tag，同一用户的 name 和 email 在不同 slot，无法一起 MGET，违背了设计初衷。D 选项的 SCAN 是遍历命令，不适合精确的批量 key 读取。"
+        },
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz9",
+          "question": "一段 Lua 脚本需要在 Cluster 中原子性地读取余额和冻结金额再扣款，以下哪种调用方式是正确的？",
+          "choices": [
+            {"id": "A", "text": "EVAL script 2 user:10001:balance user:10001:frozen 100"},
+            {"id": "B", "text": "EVAL script 2 {10001}:balance {10001}:frozen 100"},
+            {"id": "C", "text": "EVAL script 0（不传 KEYS，在脚本内部硬编码 key 名）"},
+            {"id": "D", "text": "分两次 EVAL 分别操作 balance 和 frozen，用应用层事务保证一致性"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Lua 脚本在 Cluster 中的核心约束是：KEYS 数组中所有 key 必须映射到同一个 slot，否则 EVAL 执行前就会返回 CROSSSLOT 错误。选项 B 使用 `{10001}` 作为 Hash Tag，`{10001}:balance` 和 `{10001}:frozen` 的 slot 由字符串「10001」决定，必然相同，脚本可以正常执行。A 选项中 `user:10001:balance` 和 `user:10001:frozen` 没有 Hash Tag，CRC16 对整个 key 字符串计算，两者大概率落在不同 slot 导致 CROSSSLOT。C 选项在脚本内硬编码 key 名虽然技术上可执行但 Redis 官方强烈不推荐，且 Cluster 节点无法正确路由该脚本。D 选项拆分两次执行打破了原子性，失去了 Lua 脚本的意义。"
+        },
+        {
+          "id": "redis-mget-mset-cluster-q1-quiz10",
+          "question": "从单机 Redis 迁移到 Cluster 后，以下哪个操作不需要修改就能正常工作？",
+          "choices": [
+            {"id": "A", "text": "MSET session:abc value1 session:def value2 session:ghi value3"},
+            {"id": "B", "text": "GET user:info:10001"},
+            {"id": "C", "text": "EVAL 脚本操作 order:1001 和 inventory:2001 两个不同 slot 的 key"},
+            {"id": "D", "text": "SELECT 2 切换到 2 号数据库后执行 SET"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "单 key 命令（如 GET、SET、HGET 等）在迁移到 Cluster 后完全不需要修改。smart client 会自动根据 key 的 slot 编号将命令路由到正确的节点，对调用方透明。A 选项的 MSET 涉及 3 个不同命名模式的 key（session:abc/def/ghi），CRC16 计算后大概率落在不同 slot，会触发 CROSSSLOT 错误。C 选项的 Lua 脚本操作两个不同 slot 的 key 也会被拒绝。D 选项的 SELECT 命令在 Cluster 模式下直接报错——Cluster 只支持 db 0，不允许切换数据库。只有 B 选项的单 key GET 是无需任何修改就能在 Cluster 中正常工作的。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/mget/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/",
+        "https://redis.io/docs/latest/commands/cluster-keyslot/",
+        "https://github.com/redis/go-redis/blob/v9.5.1/osscluster.go"
+      ]
+    }
+  ]
+}

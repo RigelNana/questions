@@ -1,0 +1,156 @@
+{
+  "id": "redis-pipeline-batch-size",
+  "name": "Pipeline 一次发送多少条命令合适",
+  "domain": "redis",
+  "description": "Redis Pipeline 最佳批量大小的选择依据与性能调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-pipeline-batch-size-q1",
+      "domain": "redis",
+      "type": "tuning",
+      "difficulty": 2,
+      "tags": ["Redis", "Pipeline", "批量大小", "性能调优", "内存"],
+      "title": "Pipeline 一次发送多少条命令合适",
+      "content": "你的团队在一个用户画像系统中使用 Redis 存储用户标签数据，每次页面加载需要批量查询 2000-5000 个 key 的值。后端使用 Go 语言的 go-redis v9 客户端，部署在同机房的 Kubernetes 集群中，RTT 约为 0.3ms。初期开发时，有人直接把所有命令塞进一个 Pipeline 一次性发送，上线后一切正常。但随着业务增长，单次查询量从 5000 涨到了 50000 个 key，某天凌晨收到 Redis 内存告警，INFO memory 显示 used_memory_rss 突然飙升了 800MB，同时部分客户端收到了断连错误。排查日志后发现是 client-output-buffer-limit 被触发导致连接被 Redis 强制关闭。\n\n你的同事说「Pipeline 不是越大越好吗，为什么 5 万条命令的 Pipeline 会出问题」。另一个同事建议改成每批 10 条，但这样 RTT 开销又回来了。以下是你用 redis-benchmark 做的一组对比测试（Redis 7.2，value 大小 100 bytes，本地 loopback）：\n\n```bash\nredis-benchmark -t get -n 100000 -P 1 -q\n# GET: 54612.07 requests per second\n\nredis-benchmark -t get -n 100000 -P 10 -q\n# GET: 215982.72 requests per second\n\nredis-benchmark -t get -n 100000 -P 100 -q\n# GET: 462962.96 requests per second\n\nredis-benchmark -t get -n 100000 -P 1000 -q\n# GET: 483091.79 requests per second\n\nredis-benchmark -t get -n 100000 -P 10000 -q\n# GET: 491159.14 requests per second\n```\n\n从数据上看，batch 从 1 到 100 时吞吐量提升了 8.5 倍，但从 100 到 10000 只多了不到 6%。问题来了：Pipeline 每批发送多少条命令是最优的？这个「最优」取决于哪些因素？如何在吞吐量和内存安全之间找到平衡点？",
+      "answer": "## 第一步：Pipeline 批量执行的核心概念与机制\n\nRedis Pipeline 是客户端侧的批量命令发送优化技术，其本质是将多条命令在客户端内存中缓冲后一次性写入 TCP 连接，然后一次性读取所有响应，从而把 N 次网络往返（RTT）压缩为 1 次。Pipeline 在 Redis 2.0 时代就已经是官方推荐的性能优化手段，到 Redis 7.2 版本依然是高吞吐场景下最基础的武器。\n\n理解 Pipeline 批量大小的选择，首先要搞清楚 Pipeline 执行过程中内存是怎么流动的。当客户端发出一个包含 N 条命令的 Pipeline 时，服务端会依次执行这 N 条命令，并将每条命令的响应写入该客户端连接对应的输出缓冲区（output buffer）。在客户端完整读取所有响应之前，这些响应数据一直驻留在 Redis 进程的内存中。这意味着 Pipeline 越大，服务端需要暂存的响应数据就越多。这是整个批量大小问题的根源。\n\n从客户端视角来看，Pipeline 的基本使用模式是固定的：先调用 Pipeline 方法获取一个管道对象，往管道中追加命令，最后调用 Exec 触发批量发送。以 go-redis v9 为例：\n\n```go\npipe := rdb.Pipeline()\nfor i := 0; i < batchSize; i++ {\n    pipe.Get(ctx, fmt.Sprintf(\"key:%d\", i))\n}\ncmds, err := pipe.Exec(ctx)\n```\n\n这段代码中 batchSize 的取值直接决定了服务端输出缓冲区的峰值大小、主线程被单个客户端连续占用的时间、以及出错时需要重试的命令数量。\n\n## 第二步：最佳批量大小的分析与选择\n\n回到 benchmark 数据来做量化分析。batch=1 时吞吐 54K ops/s，batch=10 时 216K，batch=100 时 463K，batch=1000 时 483K，batch=10000 时 491K。从 1 到 100 是陡峭的增长曲线，从 100 往后迅速进入平台期。这个收益递减的拐点通常出现在 100-500 的区间，具体位置取决于 RTT 和 value 大小。\n\n为什么会有收益递减？因为 Pipeline 消除的是 RTT 等待时间，而不是数据传输时间或命令处理时间。当 batch 从 1 增长到 100 时，RTT 等待从总耗时的 99% 降到了几乎可以忽略的比例，此时瓶颈已经转移到了 Redis 的命令处理速度和 TCP 传输带宽上。继续增大 batch 已经没有更多的 RTT 可以消除了。\n\n但过大的 batch 带来的代价是实实在在的。第一个代价是服务端输出缓冲区膨胀。假设你发送一个包含 100000 条 GET 命令的 Pipeline，每条响应（包含 100 字节的 value 加上 RESP 协议开销）约 120 字节，那么 Redis 需要为这一个客户端连接暂存 100000 × 120 = 12MB 的输出缓冲区数据。如果同时有 10 个客户端都在做类似的大 Pipeline 操作，服务端瞬间就多了 120MB 的内存开销。在 Redis 7.x 中，普通客户端的 `client-output-buffer-limit` 默认配置是 `normal 0 0 0`（即不限制），这意味着大 Pipeline 可以无限制地撑大输出缓冲区，直到触发 maxmemory 逐出或者 OOM。\n\n第二个代价是主线程阻塞时间。Redis 的命令执行是单线程的（即使 Redis 6.0+ 开启了 io-threads，命令执行仍然在主线程上串行进行），一个 50000 条命令的 Pipeline 会让主线程连续忙碌约 25-50ms（按每条命令 0.5-1μs 估算），期间其他客户端的命令全部在排队。对于 P99 延迟敏感的在线服务来说，这是不可接受的。\n\n第三个代价是失败重试成本。Pipeline 不是原子操作，如果执行到一半时网络断开或客户端超时，你需要判断哪些命令执行成功了、哪些没有。batch 越大，这个判断和重试的逻辑就越复杂。\n\n综合这些因素，生产环境中 Pipeline 的最佳批量大小通常在 **100-1000** 这个范围内。具体取值需要根据三个变量调整：value 大小越大则 batch 应该越小（因为输出缓冲区按字节计算），网络延迟越高则 batch 可以适当增大（因为每次 RTT 的代价更高），并发 Pipeline 数量越多则单个 batch 应该越小（避免多个大 Pipeline 同时撑大内存）。\n\n一个经过验证的起始策略是：value 在 100 字节以内时用 500 条每批，100 字节到 1KB 时用 200 条每批，1KB 以上时用 50-100 条每批。\n\n## 第三步：生产环境的分片执行与自适应调优\n\n在实际业务中，当你需要处理的总命令数远超单批上限时，标准做法是将命令切分成多个批次串行或并行执行。以下是 Go 语言中一个生产级的分片 Pipeline 实现：\n\n```go\nfunc PipelineChunked(ctx context.Context, rdb *redis.Client, keys []string, batchSize int) ([]string, error) {\n    results := make([]string, len(keys))\n    for i := 0; i < len(keys); i += batchSize {\n        end := i + batchSize\n        if end > len(keys) {\n            end = len(keys)\n        }\n        chunk := keys[i:end]\n        cmds, err := rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {\n            for _, key := range chunk {\n                pipe.Get(ctx, key)\n            }\n            return nil\n        })\n        if err != nil && err != redis.Nil {\n            return nil, fmt.Errorf(\"pipeline chunk [%d:%d] failed: %w\", i, end, err)\n        }\n        for j, cmd := range cmds {\n            val, _ := cmd.(*redis.StringCmd).Result()\n            results[i+j] = val\n        }\n    }\n    return results, nil\n}\n```\n\n这段代码把 50000 个 key 切成若干个 batchSize 大小的批次依次执行，每批之间释放服务端输出缓冲区，内存使用始终可控。\n\n更进阶的做法是自适应批量大小。通过监控 Redis 的 `INFO clients` 中的 `client_recent_max_output_buffer` 指标和 `INFO memory` 中的 `used_memory_rss`，你可以在运行时动态调整 batch 大小：当输出缓冲区峰值超过阈值时自动减小 batch，当内存充裕且延迟允许时适当增大 batch。\n\n用 redis-benchmark 的 `-P` 参数快速验证不同 batch 大小在你的环境下的表现是调优的第一步。但 benchmark 数据只能反映理想条件下的吞吐极限，真正的生产决策还要考虑并发客户端数量、value 大小分布的长尾效应、以及 Redis 实例的 maxmemory 余量。一个稳妥的做法是从 200 条每批开始，通过 Prometheus 监控 pipeline 延迟的 P99 和 Redis 内存变化趋势，再逐步调整到最优值。",
+      "keyPoints": [
+        "Pipeline 的收益递减拐点通常在 batch=100-500 区间，从 1 到 100 可获得 8-10 倍吞吐提升，之后增大 batch 的边际收益不到 5%",
+        "服务端输出缓冲区是限制 Pipeline 大小的核心约束：N 条命令的响应全部暂存在 Redis 进程内存中直到客户端读取完毕，大 Pipeline 可导致内存飙升甚至触发 OOM",
+        "Redis 主线程串行执行命令，一个 50000 条命令的大 Pipeline 会连续占用主线程 25-50ms，导致其他客户端请求排队延迟升高",
+        "最佳 batch 大小取决于三个变量：value 大小（越大 batch 越小）、网络延迟（越高 batch 越大收益越明显）、并发 Pipeline 数量（越多单个 batch 应越小）",
+        "生产环境推荐起始值：value≤100B 用 500 条/批，100B-1KB 用 200 条/批，>1KB 用 50-100 条/批，再根据监控数据微调",
+        "分片执行模式是处理大量命令的标准做法：将 N 条命令切成 N/batchSize 个小 Pipeline 串行执行，每批之间释放服务端输出缓冲区",
+        "client-output-buffer-limit 在 Redis 7.x 中对普通客户端默认不限制，意味着大 Pipeline 可以无限撑大内存，需要应用层自己控制批量大小",
+        "通过 INFO clients 的 client_recent_max_output_buffer 和 INFO memory 的 used_memory_rss 指标可以在运行时实现自适应批量调整"
+      ],
+      "quiz": [
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz1",
+          "question": "根据 benchmark 数据，Pipeline batch 从 100 增大到 10000 时吞吐量提升了约多少？",
+          "choices": [
+            {"id": "A", "text": "约 6%，从 463K 到 491K ops/s"},
+            {"id": "B", "text": "约 100%，吞吐量翻倍"},
+            {"id": "C", "text": "约 50%，因为批量越大吞吐越高是线性关系"},
+            {"id": "D", "text": "约 0%，超过 100 之后完全没有提升"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确答案是 A。从 benchmark 数据来看，batch=100 时吞吐为 463K ops/s，batch=10000 时为 491K ops/s，提升约 6%。这就是典型的收益递减现象：当 batch=100 时 RTT 等待已经从总耗时中被充分消除，瓶颈已转移到命令处理速度和网络带宽上。B 选项错误，100 倍的 batch 增长只换来 6% 的吞吐提升而非翻倍。C 选项错误，Pipeline 吞吐与 batch 大小不是线性关系而是对数关系，很快就会饱和。D 选项过于绝对，虽然提升很小但并非完全为零。"
+        },
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz2",
+          "question": "当一个包含 100000 条 GET 命令（每条响应约 120 字节）的 Pipeline 在执行时，Redis 服务端需要暂存多大的输出缓冲区？",
+          "choices": [
+            {"id": "A", "text": "约 12MB，因为 100000 × 120 字节 = 12MB 的响应数据需要等客户端读取"},
+            {"id": "B", "text": "约 120 字节，因为 Redis 每处理完一条就立即发送给客户端"},
+            {"id": "C", "text": "约 1.2MB，因为 Redis 内部会压缩输出缓冲区数据"},
+            {"id": "D", "text": "约 100MB，因为 Redis 还需要存储命令本身的副本"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确答案是 A。Redis 在执行 Pipeline 中的命令时，会将所有响应写入该客户端连接对应的输出缓冲区，直到客户端完整读取。100000 条响应 × 120 字节 ≈ 12MB。B 选项错误，Redis 并不是逐条发送响应的——在 Pipeline 模式下，TCP 的发送节奏由内核控制，而 Redis 会持续将响应写入缓冲区，在客户端读取之前这些数据占用 Redis 进程内存。C 选项错误，Redis 输出缓冲区存储的是原始 RESP 格式数据，不会做应用层压缩。D 选项错误，命令在执行后即被释放，输出缓冲区只保存响应不保存命令副本。"
+        },
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz3",
+          "question": "为什么 Pipeline batch 从 1 到 100 提升巨大（8.5 倍），但从 100 到 10000 几乎无提升？",
+          "choices": [
+            {"id": "A", "text": "因为 Redis 对超过 100 条的 Pipeline 会自动限速"},
+            {"id": "B", "text": "因为 batch=100 时 RTT 等待已从瓶颈中被充分消除，此后瓶颈转移到命令处理速度和网络带宽"},
+            {"id": "C", "text": "因为 TCP 单个数据包最大只能承载 100 条命令"},
+            {"id": "D", "text": "因为 Redis 内部有 Pipeline 队列长度上限为 100"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。Pipeline 的优化目标是消除 RTT 等待时间，当 batch=100 时每批只需 1 次 RTT 来传输 100 条命令的数据，RTT 占总耗时的比例已经非常小（约 1%），此时吞吐瓶颈已经是 Redis 的命令处理速度（单线程约 50 万 cmd/s 的上限）和 TCP 带宽。继续增大 batch 消除不了已经不存在的瓶颈。A 选项错误，Redis 没有对 Pipeline 大小做服务端限速。C 选项错误，TCP 是流式协议，一个 Pipeline 可以跨越多个 TCP 数据包。D 选项错误，Redis 对 Pipeline 没有内部队列长度上限。"
+        },
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz4",
+          "question": "一个 50000 条命令的大 Pipeline 对 Redis 主线程的影响是什么？",
+          "choices": [
+            {"id": "A", "text": "没有影响，因为 Redis 6.0+ 的 io-threads 会将 Pipeline 命令分配到多个线程并行执行"},
+            {"id": "B", "text": "主线程会连续执行约 25-50ms，期间所有其他客户端的请求都在排队等待"},
+            {"id": "C", "text": "Redis 会自动将大 Pipeline 拆分成小批次交替执行，避免阻塞其他客户端"},
+            {"id": "D", "text": "大 Pipeline 会触发 Redis 的 slowlog 记录并自动终止执行"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。Redis 的命令执行始终在主线程上串行进行，即使 Redis 6.0+ 开启了 io-threads（IO 多线程），那也只是将网络读写操作并行化，命令的实际执行仍由主线程单独完成。50000 条简单命令按每条 0.5-1μs 估算，主线程会连续忙碌 25-50ms。A 选项错误，io-threads 负责的是读取请求和写回响应的 IO 工作而非命令执行。C 选项错误，Redis 不会主动拆分 Pipeline，它只是从输入缓冲区中逐条读取并执行。D 选项错误，slowlog 记录的是单条命令的执行时间，不是整个 Pipeline 的总时间。"
+        },
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz5",
+          "question": "某服务同时有 20 个 goroutine 各自执行一个 batch=5000、value 平均 500 字节的 Pipeline，此时 Redis 输出缓冲区峰值大约是多少？",
+          "choices": [
+            {"id": "A", "text": "约 50MB，因为 20 × 5000 × 500B ≈ 50MB"},
+            {"id": "B", "text": "约 5MB，因为 Redis 对所有客户端共享一个输出缓冲区"},
+            {"id": "C", "text": "约 500KB，因为 Redis 会压缩缓冲区中的 bulk string 数据"},
+            {"id": "D", "text": "约 50MB 但只有一个客户端占用，其他 19 个排队"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确答案是 A。Redis 为每个客户端连接维护独立的输出缓冲区。20 个并发连接各自的 Pipeline 产生的响应独立存储：每个连接 5000 条 × （500B value + 约 20B RESP 开销）≈ 2.6MB，20 个连接总计约 52MB，近似 50MB。B 选项错误，Redis 的输出缓冲区是 per-connection 的而非全局共享。C 选项错误，Redis 不会对输出缓冲区做压缩。D 选项错误，20 个连接的 Pipeline 命令虽然在主线程上串行执行，但各自的输出缓冲区会同时存在于内存中，不存在排队释放的情况。"
+        },
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz6",
+          "question": "以下哪种做法在生产环境中最容易引发问题？",
+          "choices": [
+            {"id": "A", "text": "将 100 万个 key 的删除操作放进一个 Pipeline 一次性发送"},
+            {"id": "B", "text": "将 100 万个 key 切分成 1000 个 batch 各 1000 条依次执行"},
+            {"id": "C", "text": "根据 value 大小动态调整每批 Pipeline 的命令数量"},
+            {"id": "D", "text": "使用 redis-benchmark -P 参数测试不同 batch 大小的吞吐量"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确答案是 A。将 100 万条命令放进单个 Pipeline 是生产环境中最危险的做法。首先服务端输出缓冲区会膨胀到数百 MB 甚至 GB 级别，极易触发 OOM 或 client-output-buffer-limit 强制断连。其次主线程会被连续占用数百毫秒到数秒，所有其他客户端完全被阻塞。再者如果网络中断，100 万条命令的重试逻辑极其复杂。B 选项是标准的分片执行模式，安全可控。C 选项是进阶的自适应策略。D 选项是调优前的正常测试步骤。"
+        },
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz7",
+          "question": "在网络延迟从 0.3ms 增加到 5ms 的跨机房场景下，Pipeline batch 大小应该如何调整？",
+          "choices": [
+            {"id": "A", "text": "应该减小 batch，因为高延迟网络中大包容易丢失"},
+            {"id": "B", "text": "应该适当增大 batch，因为每次 RTT 代价更高，增大 batch 能更充分地分摊单次 RTT 成本"},
+            {"id": "C", "text": "不需要调整，batch 大小只与 value 大小相关，与网络延迟无关"},
+            {"id": "D", "text": "应该完全放弃 Pipeline 改用 MGET/MSET，因为 Pipeline 在高延迟网络中无效"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。网络延迟越高，单次 RTT 的成本越大，因此增大 batch 能让每条命令分摊到的 RTT 成本更低。在 0.3ms RTT 下 batch=100 每条命令分摊 0.003ms 的 RTT，而在 5ms RTT 下 batch=100 每条命令分摊 0.05ms，如果只用 batch=10 则每条分摊 0.5ms，差距很大。A 选项错误，TCP 是可靠传输协议，大包不会「容易丢失」，即使底层 IP 包分片了 TCP 也会保证可靠交付。C 选项错误，RTT 是决定 Pipeline 收益的关键因素之一。D 选项错误，Pipeline 在高延迟网络中收益反而更大。"
+        },
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz8",
+          "question": "在 Redis Cluster 模式下执行 Pipeline 时，关于 batch 大小还需要额外考虑什么因素？",
+          "choices": [
+            {"id": "A", "text": "Cluster 模式完全不支持 Pipeline，必须逐条发送命令"},
+            {"id": "B", "text": "客户端需要按 slot 分组后向不同节点分别发送 Pipeline，每个节点收到的实际 batch 大小会小于总命令数"},
+            {"id": "C", "text": "Cluster 模式下 Pipeline 的 batch 上限被硬编码为 16384（等于 slot 数量）"},
+            {"id": "D", "text": "Cluster 模式下所有 Pipeline 命令会被自动路由到 master 节点统一执行"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。在 Redis Cluster 中，16384 个 slot 分布在不同节点上，客户端（如 go-redis 的 ClusterClient）会根据每条命令涉及的 key 计算 CRC16 确定 slot，然后按目标节点分组形成多个子 Pipeline 分别发送。假设你的 1000 条命令均匀分布在 3 个节点上，每个节点实际收到约 333 条命令的 Pipeline。A 选项错误，主流客户端库都支持在 Cluster 模式下使用 Pipeline。C 选项错误，没有这样的硬编码限制。D 选项错误，命令是按 key 的 slot 路由到负责该 slot 的节点，而非全部发到一个节点。"
+        },
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz9",
+          "question": "Redis 7.x 默认配置中，对普通客户端（normal）的 client-output-buffer-limit 设置是什么？",
+          "choices": [
+            {"id": "A", "text": "normal 256mb 64mb 60，即硬限制 256MB 或 60 秒内超过 64MB 触发断连"},
+            {"id": "B", "text": "normal 0 0 0，即不限制普通客户端的输出缓冲区大小"},
+            {"id": "C", "text": "normal 32mb 8mb 30，即硬限制 32MB 或 30 秒内超过 8MB 触发断连"},
+            {"id": "D", "text": "normal 1gb 0 0，即硬限制 1GB 但不设软限制"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。Redis 7.x 的默认配置中，对普通客户端（normal class）的 client-output-buffer-limit 设置为 `normal 0 0 0`，三个 0 分别代表硬限制、软限制、软限制时间窗口全部为 0 即不做任何限制。这意味着如果应用层不主动控制 Pipeline 大小，一个巨大的 Pipeline 可以无限撑大输出缓冲区直到 Redis 内存耗尽。A 选项是 replica 客户端的默认配置。C 选项是某些云 Redis 服务商的自定义限制，不是 Redis 开源版默认值。D 选项是虚构的配置。"
+        },
+        {
+          "id": "redis-pipeline-batch-size-q1-quiz10",
+          "question": "如何在运行时监控 Pipeline 大小是否合理，应该观察哪个关键指标？",
+          "choices": [
+            {"id": "A", "text": "观察 INFO stats 中的 total_commands_processed，该值越大说明 Pipeline 越高效"},
+            {"id": "B", "text": "观察 INFO clients 中的 client_recent_max_output_buffer，该值持续增大说明 Pipeline batch 可能过大"},
+            {"id": "C", "text": "观察 INFO server 中的 hz 配置值，hz 越高说明 Pipeline 处理越快"},
+            {"id": "D", "text": "观察 INFO keyspace 中的 keys 数量变化，keys 增长快说明 Pipeline 在高效写入"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确答案是 B。`client_recent_max_output_buffer` 记录了最近一段时间内所有客户端连接中输出缓冲区的峰值大小，这是判断 Pipeline batch 是否过大的最直接指标。如果这个值持续增长或经常达到数十 MB，说明存在过大的 Pipeline 导致输出缓冲区膨胀，需要减小 batch 大小。A 选项中的 total_commands_processed 只反映命令总量不反映缓冲区压力。C 选项中的 hz 是 Redis 后台任务的执行频率，与 Pipeline 性能无直接关系。D 选项中的 keys 数量反映的是数据规模而非 Pipeline 执行状态。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/develop/use/pipelining/",
+        "https://redis.io/docs/latest/commands/client-no-evict/",
+        "https://github.com/redis/go-redis"
+      ]
+    }
+  ]
+}
