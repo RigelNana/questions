@@ -1,0 +1,157 @@
+{
+  "id": "db-reduce-lock-contention",
+  "name": "通过业务设计减少锁冲突",
+  "domain": "database",
+  "description": "从业务层面系统性降低 MySQL InnoDB 锁冲突的设计策略与实战方法",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q069",
+      "domain": "database",
+      "type": "open-ended",
+      "difficulty": 4,
+      "tags": ["MySQL", "InnoDB", "锁冲突", "业务设计", "并发优化", "热点行", "队列化"],
+      "title": "如何通过业务设计减少锁冲突？",
+      "content": "在高并发系统中，数据库锁冲突（Lock Contention）是制约吞吐量的核心瓶颈之一。所谓锁冲突，是指多个事务同时竞争同一把锁资源，导致部分事务必须排队等待，系统的并行度退化为串行执行。InnoDB 存储引擎使用行级锁作为默认的并发控制手段，理论上比表级锁具备更高的并发能力，但在实际业务中，一旦出现「热点行」——即大量事务集中修改同一条或少数几条记录——行级锁就会形成严重的排队效应。\n\n举一个真实的生产场景：某电商平台的商品库存表结构如下：\n\n```sql\nCREATE TABLE inventory (\n  id BIGINT PRIMARY KEY,\n  sku_id BIGINT NOT NULL,\n  stock INT NOT NULL DEFAULT 0,\n  version INT NOT NULL DEFAULT 0,\n  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\n  INDEX idx_sku (sku_id)\n) ENGINE=InnoDB;\n```\n\n在日常流量下，库存扣减的 SQL 很简单：`UPDATE inventory SET stock = stock - 1 WHERE sku_id = ? AND stock > 0`。这条语句会对 sku_id 对应的那一行加排他锁（X Lock），在每秒几百次请求时毫无压力。然而当促销活动来临，同一个 SKU 的扣减请求瞬间飙升至每秒 5000 次，所有事务都排队等同一把行锁，数据库监控显示 `Innodb_row_lock_current_waits` 飙到 200 以上，`Innodb_row_lock_time_avg` 从 0.5ms 涨到 80ms，大量请求开始超时。\n\n此时 DBA 告诉你：「数据库层面能做的优化空间已经很有限了，索引没问题，innodb_lock_wait_timeout 调小只会增加失败率，问题的根源在于业务设计让所有流量都打到了同一行上。」\n\n面试官的问题是：如果让你从业务设计层面系统性地解决这个锁冲突问题，你会怎么做？请给出一个完整的策略体系，不局限于库存扣减这一个场景，而是归纳出通用的方法论。",
+      "answer": "## 锁冲突的本质：并发退化为串行\n\n要从业务设计层面解决锁冲突，首先要理解 InnoDB 行锁的基本工作机制。InnoDB 的行锁是通过索引记录上的锁结构（lock_rec_t）实现的，当一个事务执行 `UPDATE ... WHERE id = 100` 时，它会在 id=100 这条索引记录上设置一个排他锁（X Lock）。其他事务如果也想修改这同一行，就必须等待前一个事务提交或回滚后释放锁。这个等待的过程就是锁冲突的直接表现。\n\n在 MySQL 8.0 中，你可以通过 `performance_schema.data_locks` 表实时观察锁的持有情况，也可以通过 `SHOW ENGINE INNODB STATUS` 的 `TRANSACTIONS` 段看到等待链。当 `Innodb_row_lock_current_waits` 持续大于 0，或者 `Innodb_row_lock_time_avg` 超过 10ms，就意味着锁冲突已经严重影响了系统吞吐。\n\n理解了锁冲突的底层机制之后，解决思路就变得清晰了：要么减少每个事务持锁的时间，要么减少竞争同一把锁的事务数量，要么彻底避免锁。以下是一个从浅到深的完整策略体系。\n\n## 策略一：缩短锁持有时间\n\n锁冲突的严重程度不仅取决于并发量，还取决于每个事务持锁的时长。假设每个事务持锁 5ms，那每秒理论上只有 200 个事务能串行通过这把锁；如果把持锁时间压缩到 1ms，同样的锁就能承载 1000 TPS。\n\n最直接的优化是「短事务原则」：将事务中不需要数据库操作的逻辑移到事务外部。一个典型的反面案例是在事务中调用外部 RPC：\n\n```sql\nBEGIN;\nUPDATE inventory SET stock = stock - 1 WHERE sku_id = 1001 AND stock > 0;\n-- 调用物流系统创建发货单（RPC 耗时 50-200ms）\nINSERT INTO shipment_orders (...) VALUES (...);\nCOMMIT;\n```\n\n这个事务在 RPC 期间一直持有 inventory 表那一行的 X Lock，相当于把网络延迟直接转化为锁等待时间。正确的做法是把 RPC 调用移到事务外部，事务内只做纯数据库操作：先在事务内完成库存扣减和订单记录的写入，提交事务释放锁之后，再异步调用物流系统。如果 RPC 失败，通过补偿机制处理。\n\n另一个常见的坑是「锁的获取顺序不对」。如果一个事务需要修改 A 表和 B 表的数据，应该把竞争最激烈的那把锁放到最后获取。因为锁是在事务提交时才释放的，越晚获取意味着持有时间越短。在库存场景中，应该先插入订单详情等低竞争操作，最后再执行库存扣减。\n\n## 策略二：降低锁粒度——分桶计数器模式\n\n缩短持锁时间能缓解问题，但当并发量继续攀升，单行锁的瓶颈是物理硬限。一条记录上的 X Lock 在任何时刻只能被一个事务持有，这是无法突破的。解决思路是：把一把锁拆成多把锁。\n\n分桶计数器（Bucket Counter）是处理热点行的经典模式。以库存为例，一个 SKU 的总库存 1000 件，不再存储为一行，而是拆分为 8 个桶：\n\n```sql\nCREATE TABLE inventory_bucket (\n  id BIGINT PRIMARY KEY,\n  sku_id BIGINT NOT NULL,\n  bucket_id TINYINT NOT NULL,  -- 0~7\n  stock INT NOT NULL DEFAULT 0,\n  UNIQUE KEY uk_sku_bucket (sku_id, bucket_id)\n) ENGINE=InnoDB;\n\n-- 初始化：每个桶分配 125 件库存\nINSERT INTO inventory_bucket (sku_id, bucket_id, stock) VALUES\n(1001, 0, 125), (1001, 1, 125), (1001, 2, 125), (1001, 3, 125),\n(1001, 4, 125), (1001, 5, 125), (1001, 6, 125), (1001, 7, 125);\n```\n\n扣减时，应用层通过 `hash(request_id) % 8` 或随机选择一个桶进行扣减：`UPDATE inventory_bucket SET stock = stock - 1 WHERE sku_id = 1001 AND bucket_id = ? AND stock > 0`。这样原来的单行竞争就被分散到 8 行上，理论并发能力直接提升 8 倍。\n\n分桶模式的挑战在于「桶间库存不均匀」。当某个桶扣为零但其他桶仍有余量时，需要一个再平衡机制。实际生产中通常采用两级策略：扣减失败时先尝试相邻桶，如果多个桶连续失败再触发后台的库存再平衡任务。美团在其技术博客中公开过类似方案，8 桶配置下能将单 SKU 的扣减吞吐从 800 TPS 提升到 5000+ TPS。\n\n## 策略三：避免不必要的锁\n\n不是所有并发读写都需要悲观锁。乐观锁（Optimistic Locking）通过版本号机制将锁冲突的检测推迟到提交阶段，在冲突率较低的场景下能显著提升吞吐。\n\n```sql\n-- 乐观锁扣减：先读后写\nSELECT stock, version FROM inventory WHERE sku_id = 1001;\n-- 应用层判断 stock > 0\nUPDATE inventory SET stock = stock - 1, version = version + 1\n  WHERE sku_id = 1001 AND version = @old_version;\n-- 影响行数为 0 则重试\n```\n\n乐观锁的本质是用「重试」替代「等待」。在冲突率低于 20% 时，乐观锁的吞吐通常优于悲观锁，因为事务不需要在锁上排队。但当冲突率超过 50%，大量事务重试反而会放大压力，此时悲观锁加队列化是更好的选择。\n\n另一个避免锁的手段是「读写分离」。将查询流量路由到只读副本，主库只承担写操作。在库存场景中，用户浏览商品页时看到的库存数可以从 Redis 缓存或只读副本读取（允许短暂的数据延迟），只有在实际下单时才访问主库。这样主库的锁竞争只来自写事务，不会被大量读请求干扰。\n\n## 策略四：队列化串行处理\n\n当热点行的并发度极高（比如秒杀场景每秒数万请求），即使分桶也不够用时，最终极的方案是在数据库之前加一层队列，将并发请求序列化后批量写入。\n\n具体实现方式：用 Redis List 或 Kafka 作为缓冲队列，应用层收到扣减请求后不直接写数据库，而是将请求推入队列并立即返回「排队中」状态。后端有一个消费者按固定频率（比如每 50ms）从队列中批量取出请求，合并为一条 SQL 执行：\n\n```sql\n-- 消费者每 50ms 批量处理一次，假设取出 200 条扣减请求\nUPDATE inventory SET stock = stock - 200 WHERE sku_id = 1001 AND stock >= 200;\n```\n\n这种模式将原来的 200 次加锁/释放锁合并为 1 次，数据库层面看到的是平稳的低频更新而非高频锁竞争。代价是引入了异步模型：用户下单后不能立即得到「扣减成功」的确认，需要通过轮询或 WebSocket 回调通知结果。\n\n在 2023 年淘宝双十一的技术分享中提到，核心库存扣减链路正是采用了「内存预扣 + 队列落库」的两阶段模型。Redis 原子操作 `DECRBY` 做第一层扣减（微秒级响应），扣减成功后异步写入消息队列，消费者批量更新 MySQL。这样 MySQL 的锁竞争压力降低了两个数量级。\n\n## 策略五：Schema 设计层面的优化\n\n表结构设计本身也会影响锁的范围。InnoDB 的行锁实际上是加在索引记录上的，如果一个事务需要同时修改多张表，就会持有多把锁，增加死锁风险和锁等待链的长度。适度反范式化（Denormalization）可以减少多表联合更新的需求。\n\n比如在订单系统中，如果每次下单都需要先更新 `inventory` 表的库存，再更新 `sku_stats` 表的销量，再更新 `shop_stats` 表的店铺总销量，那一个事务就会跨三张表加锁。更好的设计是：`sku_stats` 和 `shop_stats` 的更新通过异步消息驱动，不放在订单事务中。核心事务只做库存扣减和订单创建，其他统计类更新走最终一致性。\n\n## 扩展：生产环境的监控与决策\n\n在生产环境中，锁冲突的监控指标至关重要。MySQL 8.0 推荐关注以下几个关键指标：`performance_schema.events_waits_summary_global_by_event_name` 中 `wait/synch/mutex/innodb` 相关条目的 `SUM_TIMER_WAIT`，`Innodb_row_lock_waits`（累计锁等待次数），`Innodb_row_lock_time`（累计锁等待时间），以及 `information_schema.INNODB_TRX` 中长事务的数量。当 `Innodb_row_lock_time_avg` 超过 20ms 或 `Innodb_row_lock_waits` 的增长速率超过 100/s 时，就需要介入分析了。\n\n什么时候应该接受锁冲突而不是重新设计？答案是：当冲突率低、影响范围小、重新设计的成本远大于收益时。一个每天只有 3 次锁等待的管理后台接口，没有必要为它引入分桶或队列化。工程决策永远是在「系统复杂度」和「性能收益」之间取平衡。在秒杀、抢购、热门直播打赏这类场景下，锁冲突是必须正面解决的问题；而在普通 CRUD 业务中，合理的短事务加良好的索引设计通常就足够了。",
+      "keyPoints": [
+        "事务中应把非数据库操作（RPC、文件IO）移到事务外部，将高竞争行的锁获取放到事务最后执行，最大化压缩持锁时间",
+        "分桶计数器模式将单行热点拆为 N 行（通常 8-16 桶），通过 hash 分散写请求，并发能力线性提升 N 倍",
+        "乐观锁用 version 字段将冲突检测推迟到提交阶段，适合冲突率低于 20% 的场景，超过 50% 时应切换为悲观锁加队列",
+        "队列化模式通过 Redis/Kafka 缓冲请求并批量合并写入数据库，将高频锁竞争转化为低频批量更新",
+        "内存预扣加异步落库的两阶段模型是秒杀场景的最终方案，Redis DECRBY 微秒级响应后异步写 MySQL",
+        "反范式化设计将统计类更新从核心事务中剥离，通过异步消息走最终一致性，避免单事务跨多表加锁",
+        "监控 Innodb_row_lock_time_avg 超过 20ms 或 Innodb_row_lock_waits 增速超过 100/s 时应介入分析锁冲突",
+        "工程决策需在系统复杂度与性能收益间取平衡，低频低影响场景无需为锁冲突引入额外架构复杂度"
+      ],
+      "quiz": [
+        {
+          "id": "db-q069-quiz-01",
+          "question": "InnoDB 行锁的实现机制是什么？",
+          "choices": [
+            {"id": "A", "text": "锁加在索引记录上，通过索引条件定位到具体的行记录进行加锁"},
+            {"id": "B", "text": "锁加在数据页上，同一页内的所有行共享一把锁"},
+            {"id": "C", "text": "锁加在表的元数据上，通过表级锁降级为行锁"},
+            {"id": "D", "text": "锁加在 redo log 上，通过日志序列号控制并发"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "InnoDB 的行锁是通过在索引记录上设置锁结构来实现的。当 SQL 通过索引条件定位到具体行时，锁就加在那条索引记录上。这也是为什么如果 UPDATE 语句没有走索引，InnoDB 会退化为对所有扫描到的索引记录加锁（表现类似表锁）。B 选项描述的是页级锁（如旧版 BDB 引擎），C 选项混淆了表锁和行锁的层级关系，D 选项中 redo log 是崩溃恢复机制，与并发控制无关。"
+        },
+        {
+          "id": "db-q069-quiz-02",
+          "question": "「热点行」导致锁冲突时，系统吞吐量下降的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "排他锁的互斥性使得同一行的写操作只能串行执行，并发事务退化为排队等待"},
+            {"id": "B", "text": "MySQL 检测到锁冲突后会自动降低 CPU 频率以保护磁盘"},
+            {"id": "C", "text": "InnoDB 缓冲池在锁冲突时会将热点页从内存换出到磁盘"},
+            {"id": "D", "text": "锁冲突导致 binlog 写入变为同步模式从而增加了磁盘延迟"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "锁冲突导致吞吐下降的根本原因是并发退化为串行。排他锁（X Lock）在任何时刻只能被一个事务持有，其他事务必须排队等待锁释放。假设每个事务持锁 5ms，那这一行每秒最多只能处理 200 个事务，无论你有多少数据库连接。B 选项完全是编造的机制，MySQL 没有这种保护行为。C 选项中缓冲池的页淘汰与锁机制无关。D 选项中 binlog 的 sync 模式由 sync_binlog 参数控制，与行锁冲突无直接关系。"
+        },
+        {
+          "id": "db-q069-quiz-03",
+          "question": "分桶计数器模式中，将库存拆为 8 个桶后理论并发能力的变化是什么？",
+          "choices": [
+            {"id": "A", "text": "并发能力提升约 8 倍，因为锁竞争被分散到 8 个独立的行记录上"},
+            {"id": "B", "text": "并发能力提升约 64 倍，因为 8 个桶之间可以形成流水线"},
+            {"id": "C", "text": "并发能力不变，因为总库存量没有变化"},
+            {"id": "D", "text": "并发能力提升约 2 倍，因为 InnoDB 内部会将相邻桶合并加锁"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "分桶的核心原理是将单点锁竞争分散为多点并行。8 个桶对应 8 条不同的索引记录，各自有独立的行锁，因此可以有 8 个事务同时执行扣减而互不阻塞，理论并发能力线性提升 8 倍。B 选项的「流水线」概念在行锁场景中不存在，64 倍没有依据。C 选项忽略了并发能力与锁粒度的关系。D 选项中 InnoDB 不会合并不同行的锁，每行锁是独立管理的。"
+        },
+        {
+          "id": "db-q069-quiz-04",
+          "question": "在分桶模式下，某个桶库存扣为零但其他桶仍有余量时，正确的处理方式是什么？",
+          "choices": [
+            {"id": "A", "text": "扣减失败时尝试相邻桶，多桶连续失败再触发后台库存再平衡任务"},
+            {"id": "B", "text": "立即返回库存不足，让用户刷新页面重试"},
+            {"id": "C", "text": "使用分布式锁锁住所有桶进行全局重新分配"},
+            {"id": "D", "text": "将所有桶合并为一行计算总库存后再拆分"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "生产中常用的策略是「就近溢出 + 异步再平衡」。当 hash 到的目标桶扣减失败时，先尝试相邻的一两个桶（低成本的即时补偿），如果连续多个桶都失败，再触发异步的再平衡任务将其他桶的库存匀过来。B 选项会导致明明有库存却误报缺货，用户体验极差。C 选项用分布式锁锁住所有桶就又回到了单点瓶颈，违背了分桶的初衷。D 选项的合并操作在高并发下成本极高且会引入新的锁竞争。"
+        },
+        {
+          "id": "db-q069-quiz-05",
+          "question": "以下 MySQL 状态变量中，哪个最能直接反映当前系统的行锁冲突严重程度？",
+          "choices": [
+            {"id": "A", "text": "Innodb_row_lock_current_waits 表示当前正在等待行锁的事务数量"},
+            {"id": "B", "text": "Innodb_buffer_pool_reads 表示磁盘读取次数反映锁等待"},
+            {"id": "C", "text": "Threads_running 表示活跃线程数等同于锁冲突数"},
+            {"id": "D", "text": "Handler_read_rnd_next 表示全表扫描次数即锁冲突次数"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Innodb_row_lock_current_waits 直接表示此刻正在等待行锁释放的事务数量，是判断锁冲突严重程度最直接的实时指标。配合 Innodb_row_lock_time_avg（平均等待时间）可以量化锁冲突的影响。B 选项的 buffer_pool_reads 反映的是缓冲池未命中导致的磁盘 IO，与锁无关。C 选项的 Threads_running 是活跃线程数，高值可能是各种原因导致，不特定于锁冲突。D 选项的 Handler_read_rnd_next 反映全表扫描的行数，是查询优化相关指标。"
+        },
+        {
+          "id": "db-q069-quiz-06",
+          "question": "以下哪种做法会显著增加锁持有时间，是典型的反模式？",
+          "choices": [
+            {"id": "A", "text": "在数据库事务中间调用外部 RPC 接口，RPC 耗时期间一直持有行锁"},
+            {"id": "B", "text": "在事务开始前先从 Redis 读取缓存数据做业务校验"},
+            {"id": "C", "text": "使用 INSERT ... ON DUPLICATE KEY UPDATE 代替先查后改"},
+            {"id": "D", "text": "将 autocommit 设为 ON 让单条 SQL 自动提交"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在事务中调用外部 RPC 是锁持有时间过长的经典反模式。RPC 的网络延迟通常在 10-200ms 甚至更高，这段时间内事务一直占着行锁不释放，相当于把网络抖动直接转化为锁等待时间。B 选项在事务开始前做校验完全不影响锁持有时间，反而是正确的做法。C 选项的 upsert 语法减少了一次 SELECT 的锁获取，是优化手段。D 选项让每条 SQL 独立提交，持锁时间最短。"
+        },
+        {
+          "id": "db-q069-quiz-07",
+          "question": "乐观锁与悲观锁在锁冲突场景下的性能交叉点大约在什么冲突率？",
+          "choices": [
+            {"id": "A", "text": "冲突率约 20%-30% 是临界点，低于此值乐观锁优，高于此值悲观锁加队列更优"},
+            {"id": "B", "text": "无论冲突率多高乐观锁都优于悲观锁因为避免了锁等待"},
+            {"id": "C", "text": "冲突率约 1% 时乐观锁就开始劣于悲观锁因为 version 字段有额外开销"},
+            {"id": "D", "text": "两者性能完全相同因为底层都是通过 InnoDB 的 X Lock 实现"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "乐观锁用重试替代等待。当冲突率低时，大部分事务一次就能成功，省去了锁等待开销。但当冲突率升高，重试次数增加，每次重试都是一次完整的事务执行（SELECT + UPDATE + 发现 version 不匹配 + 回滚 + 重新来），反而比排队等待消耗更多资源。业界经验值是 20%-30% 的冲突率是交叉点。B 选项忽略了重试风暴的问题。C 选项中 version 字段的存储开销微乎其微。D 选项错误，乐观锁的 UPDATE 虽然也会短暂获取 X Lock，但持锁时间远短于悲观锁的整个事务周期。"
+        },
+        {
+          "id": "db-q069-quiz-08",
+          "question": "秒杀场景下「内存预扣 + 队列落库」模型中，Redis DECRBY 的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "在数据库之前做原子扣减充当第一道过滤，只有扣减成功的请求才进入后续流程"},
+            {"id": "B", "text": "替代 MySQL 做最终的库存持久化存储"},
+            {"id": "C", "text": "仅用于统计访问量，不参与库存扣减逻辑"},
+            {"id": "D", "text": "用于分布式锁的实现，确保只有一个进程能执行扣减"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在两阶段模型中，Redis DECRBY 是第一层漏斗。它利用 Redis 单线程的原子性在微秒级完成扣减判断，将绝大部分无效请求（库存已扣完）直接拒绝在数据库之前。只有 DECRBY 返回值大于等于 0 的请求才会进入消息队列等待落库。这样 MySQL 面对的写压力从每秒数万降低到实际库存数量级（比如 1000 件商品最多 1000 次写入）。B 选项错误，Redis 不做持久化存储，MySQL 才是最终一致的数据源。C 选项低估了 DECRBY 的核心作用。D 选项混淆了原子操作与分布式锁。"
+        },
+        {
+          "id": "db-q069-quiz-09",
+          "question": "一个事务需要同时更新 inventory 表和 order_detail 表，为减少热点行的锁等待时间，正确的操作顺序是什么？",
+          "choices": [
+            {"id": "A", "text": "先插入 order_detail（低竞争），最后更新 inventory（高竞争），让热点锁持有时间最短"},
+            {"id": "B", "text": "先更新 inventory（高竞争），再插入 order_detail（低竞争），优先获取难拿的锁"},
+            {"id": "C", "text": "两张表的操作顺序不影响锁持有时间，因为锁都是事务提交时才释放"},
+            {"id": "D", "text": "应该把两张表的操作放在不同事务中分别提交以完全消除锁冲突"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "由于 InnoDB 的锁在事务提交时统一释放，所以越晚获取的锁持有时间越短。将竞争激烈的 inventory 行锁放到事务最后获取，意味着从获取到释放之间只有一个 COMMIT 的开销（通常 < 1ms），而不是等待 order_detail 插入完成的时间。C 选项的说法虽然「锁都是提交时释放」是对的，但忽略了「持有时间 = 获取时刻到提交时刻」这个关键关系。B 选项会让热点锁多持有一段 order_detail 操作的时间。D 选项拆分事务会破坏数据一致性。"
+        },
+        {
+          "id": "db-q069-quiz-10",
+          "question": "在什么场景下应该接受锁冲突而非引入分桶或队列化等复杂设计？",
+          "choices": [
+            {"id": "A", "text": "冲突频率低且影响范围小时，如日均仅数次锁等待的后台管理接口，引入复杂度的成本大于收益"},
+            {"id": "B", "text": "任何存在锁冲突的场景都必须立即优化，因为锁等待是不可接受的性能损耗"},
+            {"id": "C", "text": "只有 DBA 明确要求优化时才需要处理锁冲突，开发者不应主动关注"},
+            {"id": "D", "text": "只有锁等待超过 innodb_lock_wait_timeout 导致报错时才需要处理"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "工程决策的核心是成本收益分析。分桶模式引入了桶间平衡的复杂度，队列化引入了异步模型和最终一致性的复杂度。如果一个接口每天只有少量锁等待、用户无感知、不影响核心链路，那引入这些机制的开发和维护成本远大于偶尔几毫秒的锁等待。B 选项是过度工程的典型思维。C 选项将性能责任完全推给 DBA 不合理，业务设计是开发者的职责。D 选项的标准太低，等到超时报错时用户体验早已严重受损。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-performance-schema-data-locks.html",
+        "https://tech.meituan.com/2018/11/15/java-lock-optimization.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-deadlock-detection.html"
+      ]
+    }
+  ]
+}
