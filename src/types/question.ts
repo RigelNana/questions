@@ -67,7 +67,7 @@ export interface QuestionEntry {
   answer: string;
   keyPoints: string[];
   quiz: QuizQuestion[];
-  references?: string[];
+  references?: (string | { title: string; url: string })[];
   relatedQuestions?: string[];
 }
 

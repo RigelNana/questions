@@ -236,11 +236,15 @@ export function QuestionDetail() {
                 <div className="mt-5 pt-4 border-t border-[var(--color-notion-border)]">
                   <h4 className="text-xs font-medium text-[var(--color-notion-text-secondary)] mb-2">参考资料</h4>
                   <ul className="text-xs text-[var(--color-notion-accent)] space-y-1">
-                    {question.references.map((ref, i) => (
-                      <li key={i}>
-                        <a href={ref} target="_blank" rel="noopener noreferrer" className="hover:underline">{ref}</a>
-                      </li>
-                    ))}
+                    {question.references.map((ref, i) => {
+                      const url = typeof ref === 'string' ? ref : ref.url;
+                      const label = typeof ref === 'string' ? ref : ref.title;
+                      return (
+                        <li key={i}>
+                          <a href={url} target="_blank" rel="noopener noreferrer" className="hover:underline">{label}</a>
+                        </li>
+                      );
+                    })}
                   </ul>
                 </div>
               )}
