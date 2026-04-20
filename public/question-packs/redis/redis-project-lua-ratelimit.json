@@ -1,0 +1,157 @@
+{
+  "id": "redis-project-lua-ratelimit",
+  "name": "用 Lua 脚本实现 Redis 原子限流器",
+  "domain": "redis",
+  "description": "从竞态条件 bug 出发，深入讲解 Redis Lua 脚本的原子性保证、EVAL/EVALSHA 机制，并实现生产可用的固定窗口、滑动窗口和令牌桶三种 Lua 限流脚本",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-project-lua-ratelimit-q1",
+      "domain": "redis",
+      "type": "project",
+      "difficulty": 4,
+      "tags": ["Redis", "Lua脚本", "限流", "原子操作", "EVALSHA", "项目实战"],
+      "title": "用 Lua 脚本实现 Redis 原子限流器",
+      "content": "## 项目场景\n\n你们团队的 API 网关使用 Redis 做分布式限流，一位同事写了以下限流中间件的伪代码，已经跑在线上三个月了：\n\n```python\ndef check_rate_limit(user_id, limit=100, window=60):\n    key = f\"ratelimit:{user_id}\"\n    current = redis.get(key)          # 步骤 1：读取当前计数\n    if current is None:\n        redis.set(key, 1, ex=window)  # 首次请求，初始化计数器\n        return True\n    if int(current) >= limit:         # 步骤 2：判断是否超限\n        return False\n    redis.incr(key)                   # 步骤 3：计数器加一\n    return True\n```\n\n上周大促期间，监控显示某个用户在 60 秒窗口内实际通过了 217 次请求，远超 100 次的限制。运维排查发现，该用户的客户端使用了 50 个并发连接同时发起请求。你的 leader 把这个 bug 分配给你修复，同时要求你给出一份生产可用的 Lua 限流脚本方案。\n\n面试官的追问路线：这段代码的竞态条件具体发生在哪两步之间？为什么用 Redis 事务（MULTI/EXEC）不能完美解决？Lua 脚本在 Redis 中的原子性是如何保证的？请分别用 Lua 脚本实现固定窗口、滑动窗口和令牌桶三种限流算法，并解释在 Redis Cluster 环境下如何确保脚本正确执行。EVALSHA 相比 EVAL 的性能优势具体体现在哪里？如果 Lua 脚本执行时间超过 `lua-time-limit`（默认 5 秒）会发生什么？",
+      "answer": "## 第一步：Redis Lua 脚本基础\n\n### Lua 脚本在 Redis 中的定位\n\nRedis 从 2.6.0 版本开始内嵌了一个 Lua 5.1 解释器（注意不是 LuaJIT，是标准 Lua 5.1，这意味着没有 JIT 编译加速）。Lua 脚本在 Redis 中的核心价值是提供了一种在服务端原子执行多条命令的机制——脚本一旦开始执行，Redis 的单线程事件循环不会在中途去处理其他客户端的命令，整个脚本的执行对外表现为一个不可分割的原子操作。这跟 Redis 事务（MULTI/EXEC）有本质区别：事务只保证命令的批量提交和隔离性（不被其他客户端命令插入），但事务内的命令无法根据前一条命令的结果来决定后续逻辑，而 Lua 脚本可以。\n\n### EVAL 命令的语法与参数传递\n\n执行 Lua 脚本的基础命令是 `EVAL`，完整语法为 `EVAL script numkeys key [key ...] arg [arg ...]`。`script` 是 Lua 源代码字符串，`numkeys` 声明后面有多少个参数是 key（剩下的是 arg）。在 Lua 脚本内部，通过 `KEYS[1]`、`KEYS[2]` 访问传入的 Redis key，通过 `ARGV[1]`、`ARGV[2]` 访问其他参数。Redis 强制要求所有被操作的 key 必须通过 KEYS 数组传入而非硬编码在脚本中，这是为了 Redis Cluster 能正确将命令路由到对应的 hash slot——Cluster 模式会检查所有 KEYS 是否落在同一个 slot。举个最简单的例子：\n\n```\nEVAL \"return redis.call('SET', KEYS[1], ARGV[1])\" 1 mykey myvalue\n```\n\n这条命令等价于 `SET mykey myvalue`，但它演示了 EVAL 的基本结构：`1` 表示有一个 key 参数，`mykey` 是 KEYS[1]，`myvalue` 是 ARGV[1]。\n\n### redis.call 与 redis.pcall 的区别\n\n在 Lua 脚本中调用 Redis 命令有两种方式。`redis.call(cmd, ...)` 在命令执行失败时（比如对 String 类型的 key 执行 LPUSH）会直接抛出 Lua 错误，中断脚本执行并将错误返回给客户端。`redis.pcall(cmd, ...)` 则是「protected call」，命令失败时不会中断脚本，而是返回一个包含错误信息的 Lua table，你可以在脚本中自行处理这个错误。生产中绝大多数场景用 `redis.call` 就够了——如果 Redis 命令失败说明逻辑有 bug 或数据类型不匹配，让它直接报错暴露问题比默默吞掉更安全。只有在你明确需要「尝试执行，失败了走另一个分支」的场景才用 `redis.pcall`。\n\n### EVALSHA 与 SCRIPT LOAD 缓存机制\n\n每次用 `EVAL` 发送完整的 Lua 源代码到 Redis 是有带宽开销的。一个生产级限流脚本可能有 30-50 行代码（约 1-2KB），在 QPS 10000 的场景下每秒传输 10-20MB 的脚本文本纯属浪费。Redis 提供了脚本缓存机制来解决这个问题：首先用 `SCRIPT LOAD script` 将脚本上传到 Redis，Redis 会计算脚本的 SHA1 哈希值并缓存编译后的字节码，然后返回这个 SHA1 值（40 字符的十六进制字符串）。之后就可以用 `EVALSHA sha1 numkeys key [key ...] arg [arg ...]` 来执行缓存的脚本，只需要传 40 字节的 SHA1 而不是整个脚本源代码。\n\n在实际工程中的最佳实践是：应用启动时用 `SCRIPT LOAD` 注册所有 Lua 脚本并记住 SHA1 值，运行时统一用 `EVALSHA` 调用。如果遇到 `NOSCRIPT` 错误（说明 Redis 重启或执行了 `SCRIPT FLUSH` 导致缓存丢失），客户端自动 fallback 到 `EVAL` 重新执行并让 Redis 重新缓存。go-redis 客户端的 `redis.NewScript()` 就是这个逻辑的封装——它内部先尝试 EVALSHA，失败了自动 fallback 到 EVAL。\n\n## 第二步：Lua 限流器深度解答\n\n### 竞态条件分析\n\n回到题目中的伪代码，竞态条件发生在步骤 1（GET 读取当前计数）和步骤 3（INCR 增加计数）之间。设想两个并发请求 A 和 B 几乎同时到达，此时 key 的计数值为 99（距离限额 100 只差 1 个名额）。请求 A 执行 GET 拿到 99，判断 99 < 100 允许通过；在 A 还没执行 INCR 之前，请求 B 也执行 GET 同样拿到 99，也判断通过；然后 A 和 B 先后执行 INCR，计数变成 101。这就是经典的 TOCTOU（Time-of-check to time-of-use）竞态——检查条件和使用结果之间存在时间间隙，其他操作可以插入改变状态。\n\n50 个并发连接的场景下，这个间隙被极大放大。假设计数在 50 时，50 个连接几乎同时执行 GET 都拿到 50，全部判断通过，全部执行 INCR，计数直接飙到 100。接下来又一轮 50 个并发在计数 100 时到达——虽然此时判断为超限会拒绝，但中间已经多放了很多请求。217 次通过而非 100 次就是这样来的。\n\n有人可能想用 `MULTI/EXEC` 事务来解决。但 Redis 事务的问题是：`MULTI` 开启事务后所有命令进入队列，只有 `EXEC` 时才执行，在队列阶段你无法获取命令的返回值来做条件判断。也就是说你没法在事务里写「如果 GET 的结果小于阈值则 INCR，否则不 INCR」这种条件逻辑。`WATCH` + `MULTI/EXEC` 的乐观锁方案虽然可以检测冲突并重试，但在高并发下重试率极高（50 个连接竞争同一个 key，每次 EXEC 只有一个成功其余 49 个都要重试），性能完全不可接受。\n\n### 固定窗口 Lua 脚本\n\n固定窗口的核心是把 INCR 和 EXPIRE 合并为一个原子操作，同时在同一个脚本内完成「判断是否超限」和「增加计数」，彻底消除 TOCTOU 间隙：\n\n```lua\n-- 固定窗口限流 Lua 脚本\n-- KEYS[1]: 限流 key，如 ratelimit:{user_id}:{window_timestamp}\n-- ARGV[1]: 限流阈值，如 100\n-- ARGV[2]: 窗口过期时间（秒），如 60\n-- 返回值：0 = 放行，1 = 限流；第二个值为当前计数\n\nlocal key = KEYS[1]\nlocal limit = tonumber(ARGV[1])\nlocal window = tonumber(ARGV[2])\n\n-- 原子递增并获取当前值\nlocal current = redis.call('INCR', key)\n\n-- 如果是该窗口的第一个请求（INCR 后值为 1），设置过期时间\nif current == 1 then\n    redis.call('EXPIRE', key, window)\nend\n\n-- 判断是否超过限流阈值\nif current > limit then\n    return {1, current}  -- 限流\nend\n\nreturn {0, current}  -- 放行\n```\n\n这个脚本的精妙之处在于「先 INCR 后判断」而非「先判断后 INCR」。传统思路是先 GET 看有没有超，再 INCR 增加——但在 Lua 脚本中我们可以直接 INCR（如果 key 不存在 Redis 会自动创建并从 0 开始），然后检查递增后的值是否超过阈值。如果超了就返回限流（计数虽然多加了 1 但无所谓，因为这个 key 会过期清理）；如果没超就放行。这样只需要一次 INCR 调用，比「GET + 判断 + INCR」少一次 Redis 命令执行。\n\n`current == 1` 的判断用于解决首次请求的 TTL 设置问题。如果不在 INCR 返回 1 时设置 EXPIRE，key 会永远存在，窗口永不重置。为什么不用 `redis.call('SET', key, 1, 'EX', window, 'NX')` 然后 `INCR`？因为 SET NX 在 key 已存在时不操作，但它不能跟 INCR 形成正确的原子序列。\n\n调用示例（Go + go-redis/v9）：\n\n```go\nvar fixedWindowScript = redis.NewScript(`\n    local current = redis.call('INCR', KEYS[1])\n    if current == 1 then\n        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))\n    end\n    if current > tonumber(ARGV[1]) then\n        return {1, current}\n    end\n    return {0, current}\n`)\n\nfunc FixedWindowLimit(ctx context.Context, rdb *redis.Client, userID string, limit int64, windowSec int64) (bool, error) {\n    // key 中嵌入窗口起始时间戳，确保每个窗口独立\n    windowStart := time.Now().Unix() / windowSec * windowSec\n    key := fmt.Sprintf(\"ratelimit:%s:%d\", userID, windowStart)\n    result, err := fixedWindowScript.Run(ctx, rdb, []string{key}, limit, windowSec).Int64Slice()\n    if err != nil {\n        return true, err // Redis 故障时默认放行，由降级策略兜底\n    }\n    return result[0] == 0, nil\n}\n```\n\n### 滑动窗口 Lua 脚本\n\n滑动窗口使用 Sorted Set（跳表 + 哈希表实现的有序集合），以请求时间戳作为 score，在每次请求时原子地完成「清理过期记录 → 计数 → 判断 → 写入」四步：\n\n```lua\n-- 滑动窗口限流 Lua 脚本\n-- KEYS[1]: 限流 key，如 ratelimit:sliding:{user_id}\n-- ARGV[1]: 当前时间戳（微秒，用微秒避免同一毫秒内多个请求的 member 冲突）\n-- ARGV[2]: 窗口大小（微秒），如 60000000 表示 60 秒\n-- ARGV[3]: 限流阈值，如 100\n-- ARGV[4]: 请求唯一标识，如 timestamp:random（确保 member 唯一）\n-- 返回值：0 = 放行，1 = 限流；第二个值为当前窗口内请求数\n\nlocal key = KEYS[1]\nlocal now = tonumber(ARGV[1])\nlocal window = tonumber(ARGV[2])\nlocal limit = tonumber(ARGV[3])\nlocal member = ARGV[4]\n\n-- 移除滑动窗口之外的所有过期记录\nlocal window_start = now - window\nredis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)\n\n-- 获取当前窗口内的请求总数\nlocal count = redis.call('ZCARD', key)\n\n-- 如果已达到阈值，直接拒绝（不写入 ZADD，节省内存）\nif count >= limit then\n    return {1, count}\nend\n\n-- 未超限，记录本次请求\nredis.call('ZADD', key, now, member)\n\n-- 设置 key 的过期时间略大于窗口，防止冷用户的 key 长期占用内存\nredis.call('PEXPIRE', key, window / 1000 + 1000)\n\nreturn {0, count + 1}\n```\n\n这个脚本有几个生产细节值得注意。第一，member 必须全局唯一——如果两个请求使用相同的 member，ZADD 会覆盖而非新增，导致计数少算。我们用「微秒时间戳 + 4 位随机数」组合确保唯一性，比用 UUID 节省内存（UUID 36 字节 vs 我们的方案约 18 字节）。第二，`ZREMRANGEBYSCORE` 放在计数之前，确保每次统计的都是有效窗口内的数据。第三，被限流的请求不执行 ZADD——这既节省内存也让 ZCARD 的结果更准确，只统计真正放行的请求。\n\n滑动窗口的 PEXPIRE 设置为 `window / 1000 + 1000`（窗口毫秒数加 1 秒余量），这样即使用户停止请求后 key 也能自动清理。如果不设置过期时间，一个不再活跃的用户的 Sorted Set 会一直占用内存直到 Redis 内存淘汰策略回收它。\n\n### 令牌桶 Lua 脚本\n\n令牌桶使用 Hash 结构存储桶状态，核心思想是「惰性填充」——不需要后台进程定时加令牌，而是每次请求时根据时间差一次性计算并补充应得的令牌数：\n\n```lua\n-- 令牌桶限流 Lua 脚本\n-- KEYS[1]: 令牌桶 key，如 ratelimit:token:{user_id}\n-- ARGV[1]: 桶容量（最大令牌数），如 150\n-- ARGV[2]: 令牌填充速率（每秒填充数），如 100\n-- ARGV[3]: 当前时间戳（毫秒）\n-- ARGV[4]: 本次请求消耗令牌数，通常为 1\n-- 返回值：{是否放行(0/1), 剩余令牌数, 若被限流则下次可用的等待毫秒数}\n\nlocal key = KEYS[1]\nlocal capacity = tonumber(ARGV[1])\nlocal fill_rate = tonumber(ARGV[2])\nlocal now = tonumber(ARGV[3])\nlocal requested = tonumber(ARGV[4])\n\n-- 读取桶的当前状态\nlocal bucket_info = redis.call('HMGET', key, 'tokens', 'last_ts')\nlocal tokens = tonumber(bucket_info[1])\nlocal last_ts = tonumber(bucket_info[2])\n\n-- 首次访问初始化：桶满状态\nif tokens == nil then\n    tokens = capacity\n    last_ts = now\nend\n\n-- 计算自上次访问以来应补充的令牌数（惰性填充）\nlocal elapsed_ms = math.max(0, now - last_ts)\nlocal refill = math.floor(elapsed_ms * fill_rate / 1000)\n\nif refill > 0 then\n    tokens = math.min(capacity, tokens + refill)\n    last_ts = now\nend\n\n-- 判断令牌是否充足\nif tokens >= requested then\n    tokens = tokens - requested\n    redis.call('HMSET', key, 'tokens', tokens, 'last_ts', last_ts)\n    redis.call('PEXPIRE', key, math.ceil(capacity / fill_rate * 1000) + 3000)\n    return {0, tokens, 0}\nend\n\n-- 令牌不足，计算需要等待多少毫秒才能获得足够令牌\nlocal deficit = requested - tokens\nlocal wait_ms = math.ceil(deficit * 1000 / fill_rate)\nredis.call('HMSET', key, 'tokens', tokens, 'last_ts', last_ts)\nredis.call('PEXPIRE', key, math.ceil(capacity / fill_rate * 1000) + 3000)\nreturn {1, tokens, wait_ms}\n```\n\n这个脚本的返回值设计特别实用——第三个值 `wait_ms` 告诉客户端还需要等多久才有令牌可用，客户端可以据此设置 `Retry-After` 响应头（HTTP 429 Too Many Requests 的标准用法），比简单返回「被限流了」更友好。\n\nPEXPIRE 的值设为「桶从空到满所需的毫秒数 + 3 秒余量」，即 `capacity / fill_rate * 1000 + 3000`。如果桶容量 150、速率 100/s，那就是 1500ms + 3000ms = 4500ms。这样如果一个用户连续 4.5 秒没有请求，key 自动过期清理内存；下次请求到来时重新初始化为满桶，相当于一次「宽恕」，这在业务上通常是合理的。\n\n调用示例（Go + go-redis/v9）：\n\n```go\nvar tokenBucketScript = redis.NewScript(tokenBucketLua)\n\nfunc TokenBucketLimit(ctx context.Context, rdb *redis.Client, userID string, capacity, rate int64) (allowed bool, remaining int64, retryAfterMs int64, err error) {\n    key := fmt.Sprintf(\"ratelimit:token:%s\", userID)\n    nowMs := time.Now().UnixMilli()\n    result, err := tokenBucketScript.Run(ctx, rdb, []string{key}, capacity, rate, nowMs, 1).Int64Slice()\n    if err != nil {\n        return true, 0, 0, err\n    }\n    return result[0] == 0, result[1], result[2], nil\n}\n```\n\n### 三种脚本的选型指南\n\n固定窗口脚本最简单（4 行核心逻辑），适合对精度要求不高的粗粒度限流，比如「全局 QPS 不超过 10000」这种场景——临界突发问题在高阈值下影响相对小。滑动窗口精确度最高但内存随请求量线性增长，适合阈值较低的用户级限流（每分钟 60 次，Sorted Set 最多 60 条记录）。令牌桶内存恒定（一个 Hash 两个字段约 100 字节）且天然支持突发流量，适合高 QPS 全局限流。我们的生产方案是混合使用：全局限流用令牌桶，用户级限流用滑动窗口。\n\n## 第三步：扩展——Lua 脚本的限制与生产最佳实践\n\n### 非确定性命令的限制\n\nRedis 在主从复制时需要保证 Lua 脚本在从节点上回放能得到相同结果，因此 Redis 3.2 之前禁止在 Lua 脚本中调用 `TIME`、`RANDOMKEY` 等非确定性命令——这些命令每次调用结果都不同，如果脚本依赖它们的返回值做逻辑分支，主从回放会不一致。这就是为什么我们的限流脚本都是通过 ARGV 传入当前时间戳而不是在脚本里调用 `redis.call('TIME')`。Redis 3.2 引入了「效果复制」（effects replication）模式，即复制脚本产生的写命令序列而非脚本本身，此模式下可以调用 TIME 等命令。Redis 7.0+ 默认使用效果复制，但为了向后兼容性和跨版本可移植性，最佳实践仍然是从客户端传入时间戳。\n\n### Redis 7.0 Functions 替代 EVAL\n\nRedis 7.0 引入了 Functions 功能（`FUNCTION LOAD`、`FCALL` 命令），它是 EVAL/EVALSHA 的进化版。核心区别有三点：第一，Functions 有显式的名称和库的概念，通过名称调用（`FCALL my_ratelimit 1 key arg`）而非 SHA1，代码可读性和管理性更好；第二，Functions 持久化在 RDB/AOF 中，Redis 重启后自动加载，不需要客户端重新 SCRIPT LOAD；第三，Functions 支持声明 flags（如 `no-writes` 标记只读脚本），Redis 可以据此做优化比如在只读副本上执行。如果你的 Redis 版本 ≥ 7.0 且无需兼容旧版本，推荐用 Functions 替代 EVAL/EVALSHA。\n\n一个 Functions 版本的固定窗口限流注册示例：\n\n```\nFUNCTION LOAD \"#!lua name=ratelimit_lib\\nredis.register_function('fixed_window', function(keys, args)\\n  local current = redis.call('INCR', keys[1])\\n  if current == 1 then redis.call('EXPIRE', keys[1], tonumber(args[2])) end\\n  if current > tonumber(args[1]) then return {1, current} end\\n  return {0, current}\\nend)\"\n```\n\n### lua-time-limit 与脚本超时处理\n\nRedis 配置项 `lua-time-limit` 默认值为 5000（毫秒），但这不是一个「硬超时」——达到 5 秒后 Redis 不会自动终止脚本，而是开始接受其他客户端的命令但只响应 `SCRIPT KILL` 和 `SHUTDOWN NOSAVE` 两条命令，其他所有命令都返回 BUSY 错误：`BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE`。\n\n`SCRIPT KILL` 只能杀死尚未执行任何写操作的脚本——如果脚本已经执行了 SET/INCR 等写命令，`SCRIPT KILL` 会失败（因为杀掉写了一半的脚本会导致数据不一致），此时只能用 `SHUTDOWN NOSAVE` 强制关闭 Redis 进程（不保存数据）。这是一个非常危险的操作，生产中必须通过代码 review 和压测确保 Lua 脚本的执行时间在毫秒级。\n\n我们的限流脚本执行时间通常在 0.05-0.2ms（固定窗口最快，滑动窗口在 ZREMRANGEBYSCORE 清理大量过期记录时稍慢），远低于 5 秒阈值。但有个隐蔽的坑：如果滑动窗口的 Sorted Set 因为某种 bug（比如 PEXPIRE 没设置导致记录永不过期）积累了数十万条记录，一次 `ZREMRANGEBYSCORE` 清理可能耗时数秒，触发 lua-time-limit。防御方案是在脚本中加一个安全检查：如果 ZCARD 超过合理阈值（比如 limit 的 2 倍），直接 DEL 整个 key 重新开始，避免慢操作阻塞。\n\n### EVALSHA 缓存最佳实践\n\n在生产环境中使用 EVALSHA 需要注意几个问题。第一，Redis Cluster 的每个分片是独立进程，SCRIPT LOAD 只在当前连接的分片上缓存脚本——如果你的限流 key 分布在不同 slot（不同分片），需要确保每个分片都加载了脚本。go-redis 的 ClusterClient 在执行 `NewScript().Run()` 时会自动处理这个问题：它根据 KEYS 路由到正确分片，如果 EVALSHA 返回 NOSCRIPT 则自动 fallback 到 EVAL 并触发缓存。第二，`SCRIPT FLUSH` 命令会清空所有缓存的脚本，生产中严禁手动执行。第三，Redis 重启后所有脚本缓存丢失（缓存只在内存中，不持久化——这也是 Redis 7.0 Functions 要解决的问题之一），应用需要能优雅 fallback。\n\n性能数据：在我们的 Redis 7.2 集群上实测，一个 30 行的限流 Lua 脚本，EVAL 传输 + 编译 + 执行的总耗时约 0.25ms，而 EVALSHA（已缓存）的耗时约 0.08ms——差距主要在网络传输（脚本源码约 800 字节 vs SHA1 的 40 字节）和省去了 Lua 编译步骤。在 QPS 1 万的限流场景下，EVALSHA 每秒节省约 7.6MB 的网络带宽（(800-40) bytes × 10000），这在高吞吐系统中是不可忽略的优化。\n\n### Redis Cluster 中的注意事项\n\n在 Redis Cluster 模式下执行 Lua 脚本有一个硬性约束：脚本中操作的所有 key 必须落在同一个 hash slot 内，否则 Redis 会返回 `CROSSSLOT` 错误。对于限流场景，每个限流 key 本身就是独立的（一个用户对应一个 key），所以天然满足单 slot 约束。但如果你想在一个脚本里同时操作用户级限流 key 和全局限流 key（比如 `ratelimit:user:10086` 和 `ratelimit:global`），这两个 key 大概率不在同一个 slot——此时需要使用 Hash Tag 机制：把 key 设计为 `ratelimit:{api}:user:10086` 和 `ratelimit:{api}:global`，Redis Cluster 只对 `{}` 内的内容计算 hash，两个 key 都基于 `api` 计算 slot 从而落在同一分片。但这种设计需要注意热点问题——高频 API 的所有限流请求都打到同一分片，可能形成热点。\n\n### 面试高频考点总结\n\n面试官考 Lua 脚本限流通常有三层追问深度：第一层是基础——为什么 GET + INCR 有竞态，为什么 Lua 脚本能解决（单线程原子执行），能正确回答这层说明你理解了 Redis 的执行模型。第二层是实现——能手写出至少一种完整的限流 Lua 脚本，解释每一步的设计意图（为什么先 INCR 后判断、为什么 current == 1 时设 EXPIRE、为什么被限流时不 ZADD），这层考察你是否真正在生产中写过和调试过 Lua 脚本。第三层是工程——EVALSHA 缓存机制、Cluster 下的 CROSSSLOT 限制、lua-time-limit 超时处理、Redis 7.0 Functions 的优势，这层区分「用过」和「深入理解」的工程师。能走到第三层基本上 Redis Lua 脚本这个话题就拿满分了。",
+      "keyPoints": [
+        "Redis Lua 脚本的原子性来自 Redis 单线程事件循环——脚本执行期间不会被其他客户端命令中断，彻底消除 GET + INCR 之间的 TOCTOU 竞态条件",
+        "EVALSHA 通过 SHA1 引用已缓存的脚本字节码，省去每次传输源代码的带宽开销和重复编译耗时，QPS 万级场景下每秒可节省数 MB 网络流量",
+        "固定窗口脚本的核心技巧是「先 INCR 后判断」配合 current == 1 时设置 EXPIRE，将计数和过期设置合为原子操作避免 key 永不过期的风险",
+        "滑动窗口脚本用 ZADD + ZREMRANGEBYSCORE + ZCARD 在 Sorted Set 上原子完成「清理过期 → 计数 → 判断 → 写入」，精确度最高但内存随请求量线性增长",
+        "令牌桶脚本通过 Hash 存储 tokens 和 last_ts 两个字段实现「惰性填充」——每次请求时根据时间差一次性补充令牌，内存开销恒定约 100 字节",
+        "Redis Cluster 模式下 Lua 脚本操作的所有 KEYS 必须在同一 hash slot，否则报 CROSSSLOT 错误，可用 Hash Tag（{tag}）机制强制路由到同一分片",
+        "lua-time-limit 默认 5 秒不是硬超时而是触发 BUSY 保护模式，已有写操作的脚本不可被 SCRIPT KILL 只能 SHUTDOWN NOSAVE 强杀，生产中必须确保脚本执行在毫秒级",
+        "Redis 7.0 Functions（FUNCTION LOAD + FCALL）是 EVAL/EVALSHA 的演进，支持命名调用、RDB/AOF 持久化和 flags 声明，新项目推荐使用"
+      ],
+      "quiz": [
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz1",
+          "question": "题目中伪代码的竞态条件具体发生在哪两步之间？",
+          "choices": [
+            {"id": "A", "text": "GET 读取当前计数与 INCR 增加计数之间，其他请求可以插入读取到相同的旧值"},
+            {"id": "B", "text": "SET 初始化计数器与后续 GET 之间，key 可能被其他请求覆盖"},
+            {"id": "C", "text": "INCR 与 EXPIRE 之间，key 可能在设置过期前被其他请求删除"},
+            {"id": "D", "text": "两次连续请求的 GET 之间，Redis 可能发生主从切换导致数据丢失"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "经典的 TOCTOU 竞态发生在 GET（检查当前计数是否超限）和 INCR（增加计数）之间。在这个时间间隙内，其他并发请求可以同样执行 GET 拿到相同的旧值，都判断为未超限，然后各自执行 INCR。50 个并发连接同时 GET 到值为 99，全部判断 99 < 100 通过，全部 INCR 后计数变为 149。B 选项描述的不是限流场景的典型竞态。C 选项混淆了问题——题目中的 bug 在 GET 和 INCR 之间而非 INCR 和 EXPIRE 之间。D 选项描述的是高可用问题而非并发竞态。"
+        },
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz2",
+          "question": "为什么 Redis 事务（MULTI/EXEC）不能完美解决这个限流竞态问题？",
+          "choices": [
+            {"id": "A", "text": "MULTI/EXEC 事务内的命令在 EXEC 前全部入队，无法获取中间命令的返回值做条件判断"},
+            {"id": "B", "text": "Redis 事务不支持 INCR 和 EXPIRE 两条命令同时执行"},
+            {"id": "C", "text": "Redis 事务在集群模式下完全不可用"},
+            {"id": "D", "text": "Redis 事务没有原子性保证，MULTI 和 EXEC 之间可以被其他命令插入"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 事务的核心限制是命令入队后无法获取返回值做条件分支。在 MULTI 开启事务后，所有命令（包括 GET）都只是放入队列返回 QUEUED，直到 EXEC 时才批量执行。这意味着你无法在事务内实现「如果 GET 返回值 < 100 则 INCR，否则不操作」这种条件逻辑。B 选项错误，事务完全支持多条命令组合。C 选项错误，集群模式下事务对同一 slot 的 key 仍然可用。D 选项错误，MULTI/EXEC 保证命令批量执行期间不被其他客户端命令插入（隔离性）。WATCH + MULTI 可以实现乐观锁但高并发下重试率极高，性能不可接受。"
+        },
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz3",
+          "question": "Redis Lua 脚本原子性的底层保证机制是什么？",
+          "choices": [
+            {"id": "A", "text": "Redis 使用单线程事件循环执行命令，Lua 脚本执行期间不会切换去处理其他客户端请求"},
+            {"id": "B", "text": "Redis 对 Lua 脚本自动加了分布式锁，其他节点在脚本执行期间不能写入"},
+            {"id": "C", "text": "Lua 脚本被编译为 Redis 内部事务（MULTI/EXEC），利用事务的原子性保证"},
+            {"id": "D", "text": "Redis 使用 MVCC 机制为每个 Lua 脚本创建数据快照，脚本看到一致性视图"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 的核心命令处理是单线程模型（Redis 6.0 引入的 IO 多线程只负责网络读写，命令执行仍是单线程）。Lua 脚本一旦开始执行，Redis 的事件循环不会在脚本中途去 dequeue 并处理其他客户端的命令，整个脚本对外表现为一个不可分割的操作。B 选项错误，单实例 Redis 不需要分布式锁，原子性由单线程执行保证。C 选项错误，Lua 脚本不是事务的语法糖，它比事务强大在于支持条件分支和循环。D 选项描述的是 MySQL InnoDB 的机制，Redis 没有 MVCC。"
+        },
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz4",
+          "question": "固定窗口 Lua 脚本中为什么选择「先 INCR 后判断」而非「先 GET 判断后 INCR」？",
+          "choices": [
+            {"id": "A", "text": "INCR 对不存在的 key 自动初始化为 0 再加 1，省去了 GET 是否存在的判断和 SET 初始化步骤，脚本更简洁且少一次 Redis 命令调用"},
+            {"id": "B", "text": "先 INCR 后判断可以让超限请求也被计入统计，便于后续分析被拒绝的请求量"},
+            {"id": "C", "text": "GET 命令在 Lua 脚本中不可用，只能用 INCR 获取当前值"},
+            {"id": "D", "text": "先 INCR 后判断可以避免 EXPIRE 设置失败的问题"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 的 INCR 命令对不存在的 key 会自动执行 SET key 0 再 INCR 返回 1，这个特性让我们可以跳过「检查 key 是否存在 → 不存在则 SET 初始化 → 存在则 GET 当前值」的分支逻辑，直接一条 INCR 搞定所有情况。返回值为 1 说明是首次请求需要设置 EXPIRE，大于 limit 说明超限。整个脚本只需要 INCR + 条件 EXPIRE 两次 Redis 命令调用（脚本内部调用），比 GET + 条件判断 + INCR 少一次。B 选项虽然是附带效果但不是设计原因。C 选项完全错误，Lua 脚本中 GET 正常可用。"
+        },
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz5",
+          "question": "在滑动窗口 Lua 脚本中，如果 PEXPIRE 没有被正确设置（比如那行代码被误删），长期运行后会出现什么现象？",
+          "choices": [
+            {"id": "A", "text": "不活跃用户的 Sorted Set key 永远不会被清理，Redis 内存持续增长直到触发 maxmemory 淘汰或 OOM"},
+            {"id": "B", "text": "限流功能失效，所有请求都能通过"},
+            {"id": "C", "text": "Redis 会自动清理空的 Sorted Set，不会有内存问题"},
+            {"id": "D", "text": "脚本执行会报错导致所有请求被拒绝"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "如果不设置 PEXPIRE，当用户停止活跃后其 Sorted Set key 会永远留在 Redis 内存中。虽然下次该用户请求时 ZREMRANGEBYSCORE 会清理过期记录，但如果用户再也不来（流失用户、一次性用户），这些 key 就成了内存垃圾。百万级用户场景下，大量僵尸 key 会逐渐耗尽内存。B 选项错误，PEXPIRE 只影响 key 的生命周期不影响限流逻辑。C 选项错误，Redis 不会自动清理仍有 member 的 Sorted Set（ZREMRANGEBYSCORE 只在有请求时才触发）。D 选项错误，缺少 PEXPIRE 不会导致脚本报错。"
+        },
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz6",
+          "question": "以下哪个做法在 Redis Lua 脚本中是错误的？",
+          "choices": [
+            {"id": "A", "text": "在脚本中调用 redis.call('TIME') 获取服务器时间作为限流时间戳"},
+            {"id": "B", "text": "使用 KEYS[1] 和 ARGV[1] 分别传递 Redis key 和参数值"},
+            {"id": "C", "text": "在脚本中使用 if/else 条件分支决定执行 INCR 还是直接返回"},
+            {"id": "D", "text": "使用 redis.pcall 包裹可能失败的命令并在脚本中处理错误"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在 Redis 3.2 之前的「脚本复制」模式下，TIME 是非确定性命令（每次调用结果不同），在从节点回放脚本时会得到不同的时间值导致主从数据不一致，因此被禁止调用。虽然 Redis 3.2+ 的效果复制模式和 Redis 7.0+ 默认解除了这个限制，但为了跨版本兼容性和可移植性，最佳实践仍然是通过 ARGV 从客户端传入时间戳。B、C、D 都是 Lua 脚本中的正确用法：KEYS/ARGV 是标准参数传递方式，条件分支是 Lua 脚本相比事务的核心优势，redis.pcall 是合法的错误处理机制。"
+        },
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz7",
+          "question": "EVALSHA 相比 EVAL 的核心优势体现在哪里？",
+          "choices": [
+            {"id": "A", "text": "省去每次传输完整脚本源代码的网络带宽开销和重复 Lua 编译耗时，只需传输 40 字节的 SHA1 哈希值"},
+            {"id": "B", "text": "EVALSHA 执行的脚本有更高的权限，可以调用 EVAL 不能调用的命令"},
+            {"id": "C", "text": "EVALSHA 支持异步执行，不阻塞 Redis 主线程"},
+            {"id": "D", "text": "EVALSHA 会自动将脚本持久化到 RDB 文件中，Redis 重启后无需重新加载"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "EVALSHA 的优势纯粹在于网络和编译层面的性能优化。SCRIPT LOAD 预先上传脚本并缓存编译后的字节码，之后 EVALSHA 只需传 40 字节 SHA1（而非数百到数千字节的源代码）即可执行已缓存的字节码，跳过了编译步骤。在 QPS 万级场景下，这个带宽节省是显著的。B 选项错误，EVAL 和 EVALSHA 执行的脚本权限完全相同。C 选项错误，两者都在 Redis 主线程同步执行。D 选项错误，EVALSHA 的缓存只在内存中，Redis 重启后丢失（Redis 7.0 Functions 才解决了持久化问题）。"
+        },
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz8",
+          "question": "在 Redis Cluster 模式下执行 Lua 限流脚本时，如果需要在一个脚本中同时操作用户限流 key 和全局限流 key，正确的做法是什么？",
+          "choices": [
+            {"id": "A", "text": "使用 Hash Tag 机制（如 {api}:user:10086 和 {api}:global）使两个 key 落在同一个 hash slot"},
+            {"id": "B", "text": "在脚本中使用 redis.call('CLUSTER', 'KEYSLOT', key) 手动路由到正确节点"},
+            {"id": "C", "text": "Cluster 模式下 Lua 脚本可以跨 slot 操作多个 key，无需特殊处理"},
+            {"id": "D", "text": "先用 MULTI/EXEC 事务包裹 EVAL，事务会自动处理跨 slot 路由"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 要求 Lua 脚本中 KEYS 数组的所有 key 必须在同一个 hash slot 内，否则返回 CROSSSLOT 错误。Hash Tag 机制是官方推荐的解决方案：Redis Cluster 计算 hash slot 时只取 key 中第一个 {} 内的内容，因此 {api}:user:10086 和 {api}:global 都基于字符串 api 计算 slot，保证落在同一分片。B 选项错误，CLUSTER KEYSLOT 是信息查询命令不能改变路由行为。C 选项是最常见的误解，Cluster 模式下跨 slot 的 Lua 脚本会直接报错。D 选项错误，事务也有同样的 CROSSSLOT 限制。"
+        },
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz9",
+          "question": "当 Lua 脚本执行时间超过 lua-time-limit（默认 5 秒）后会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Redis 不会自动终止脚本，而是进入 BUSY 保护模式：其他客户端只能执行 SCRIPT KILL 或 SHUTDOWN NOSAVE，其余命令返回 BUSY 错误"},
+            {"id": "B", "text": "Redis 自动终止脚本并回滚所有已执行的写操作，返回超时错误给客户端"},
+            {"id": "C", "text": "Redis 将脚本切换到后台线程继续执行，主线程恢复处理其他命令"},
+            {"id": "D", "text": "Redis 触发 RDB 快照保存当前状态，然后强制终止脚本"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "lua-time-limit 是一个「软超时」而非硬超时。超过这个时间后 Redis 开始拒绝其他客户端的正常命令（返回 BUSY 错误），但脚本本身继续执行。管理员可以用 SCRIPT KILL 终止尚未执行写操作的脚本；如果脚本已经有写操作，SCRIPT KILL 会失败（因为终止写了一半的脚本会导致数据不一致），此时只能用 SHUTDOWN NOSAVE 强杀进程。B 选项错误，Redis 没有事务回滚机制（这是 Redis 的设计哲学）。C 选项错误，Lua 脚本始终在主线程执行。D 选项完全虚构。"
+        },
+        {
+          "id": "redis-project-lua-ratelimit-q1-quiz10",
+          "question": "Redis 7.0 引入的 Functions 相比传统 EVAL/EVALSHA 有什么关键改进？",
+          "choices": [
+            {"id": "A", "text": "Functions 支持命名调用、持久化到 RDB/AOF（重启自动加载）、以及声明 flags 标记脚本特性"},
+            {"id": "B", "text": "Functions 使用 LuaJIT 替代标准 Lua 5.1，执行速度提升 10 倍以上"},
+            {"id": "C", "text": "Functions 支持异步执行和协程，可以在不阻塞主线程的情况下运行复杂逻辑"},
+            {"id": "D", "text": "Functions 移除了 KEYS 必须在同一 slot 的限制，支持跨分片原子操作"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 7.0 Functions 的三大改进：第一，通过 FUNCTION LOAD 注册后用名称调用（FCALL my_func），比 40 字符 SHA1 更具可读性和可管理性；第二，Functions 随 RDB/AOF 持久化，Redis 重启后自动加载，无需客户端重新 SCRIPT LOAD；第三，支持声明 flags（如 no-writes 标记只读函数），Redis 可据此在只读副本上执行或做其他优化。B 选项错误，Redis 7.0 仍然使用标准 Lua 5.1 解释器。C 选项错误，Functions 仍然在主线程同步执行。D 选项错误，CROSSSLOT 限制是 Cluster 架构的根本约束，Functions 无法绕过。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/interact/programmability/eval-intro/",
+        "https://redis.io/docs/interact/programmability/functions-intro/",
+        "https://redis.io/commands/evalsha/",
+        "https://redis.io/commands/script-load/"
+      ]
+    }
+  ]
+}
