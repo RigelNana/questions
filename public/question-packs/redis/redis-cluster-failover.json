@@ -1,0 +1,156 @@
+{
+  "id": "redis-cluster-failover",
+  "name": "Cluster 故障检测与 Failover",
+  "domain": "redis",
+  "description": "Redis Cluster 节点故障检测（PFAIL/FAIL）与自动主从切换的完整流程",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-cluster-failover-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 4,
+      "tags": ["Redis", "Cluster", "Failover", "PFAIL", "FAIL", "故障检测"],
+      "title": "Cluster 节点故障检测与自动 failover 过程",
+      "content": "## 面试场景\n\n你们的电商平台用了一套 6 主 6 从的 Redis Cluster（Redis 7.2.4），承载商品详情页缓存和购物车数据，高峰期集群整体 QPS 约 18 万。周五晚上 21:47，运维监控突然告警：节点 `10.0.3.17:6379`（Master，负责 slot 5461-10922）所在的物理机出现了硬件故障，网络直接断了。你在监控大盘上看到了一连串事件：21:47:15 开始出现超时报错，21:47:32 日志里出现了 PFAIL 标记，21:47:38 集群完成了故障转移，`10.0.3.18:6379`（原来的 Replica）晋升为新的 Master。中间有大约 23 秒的窗口期，这段时间内打到 slot 5461-10922 的请求全部收到了 `CLUSTERDOWN` 或者客户端超时。\n\n你在故障转移完成后用 `CLUSTER NODES` 拉了一下集群状态：\n\n```\na1b2c3d4... 10.0.3.18:6379@16379 master - 0 1709925698000 7 connected 5461-10922\nf5e6d7c8... 10.0.3.17:6379@16379 master,fail - 1709925652000 1709925648000 2 disconnected\n...\n```\n\n注意那行 `master,fail` 和 `disconnected` 的状态——这就是故障检测流程走完的最终结果。而 `10.0.3.18` 那行的 configEpoch 从原来的 2 变成了 7，说明发生了一次 epoch 跳变。\n\n老板在复盘会上问了三个问题：第一，23 秒的故障窗口能不能压缩到 5 秒以内？第二，为什么从网络断开到集群反应过来用了将近 17 秒（21:47:15 到 21:47:32）？第三，如果我们要做一次计划内的主从切换（比如给机器升级内核），有没有办法做到零数据丢失的切换？\n\n面试官问你：「详细讲讲 Redis Cluster 的节点故障检测和自动 failover 的完整过程，包括 PFAIL、FAIL 的判定机制、Replica 是怎么选举上位的、以及手动 failover 和自动 failover 有什么区别。」\n\n这道题的关键不是背出 PFAIL 和 FAIL 的定义，而是你能不能把从「一个节点网络断了」到「新 Master 开始服务」的完整链条上的每一个环节、每一个时间开销都讲清楚——包括 cluster-node-timeout 怎么影响检测速度、Gossip 怎么传播 PFAIL 投票、Replica 选举为什么像 Raft、configEpoch 在里面扮演什么角色。只有把这些细节理清楚，你才能在生产环境中做出正确的参数调优决策。",
+      "answer": "## 第一步：Redis Cluster 故障检测与 Failover 的核心概念基础\n\n### Redis Cluster 是什么，为什么故障检测至关重要\n\nRedis Cluster 是 Redis 官方从 3.0 版本开始提供的分布式方案，它把 16384 个 hash slot 分散到多个 Master 节点上，每个 Master 可以挂载一个或多个 Replica 做数据冗余。客户端根据 key 的 CRC16 哈希值定位到对应的 slot，再路由到负责该 slot 的 Master 节点。整个架构是去中心化的——没有类似 ZooKeeper 或 etcd 的外部协调组件，所有节点通过 Gossip 协议互相交换状态信息。\n\n这种去中心化设计带来了一个根本性的挑战：当某个 Master 节点挂了，谁来判定它「确实挂了」而不是「网络抖了一下」？判定之后谁来发起切换？切换的过程中怎么保证不会出现两个 Master 同时服务同一组 slot（脑裂）？这就是故障检测和 failover 机制要解决的核心问题。\n\n理解这套机制之前，先记住一个关键配置：`cluster-node-timeout`，默认值 15000 毫秒。这个参数是整个故障检测流程的「时间基准」——PFAIL 判定、FAIL 投票、Replica 选举延迟全部以它为锚点。几乎所有关于 failover 速度的调优都围绕这个参数展开。\n\n### 最基础的运行逻辑\n\n故障检测和 failover 的完整流程可以分为四个阶段：主观下线（PFAIL）标记 → 客观下线（FAIL）确认 → Replica 选举 → 新 Master 接管 slot。每个阶段都有明确的触发条件和时间开销，环环相扣。下面我们一个阶段一个阶段地拆解。\n\n## 第二步：PFAIL → FAIL → Replica 选举的完整流程深度解析\n\n### 第一阶段：PFAIL——主观下线\n\n集群中的每个节点都在 `clusterCron()` 函数中（每 100ms 执行一次）维护着与其他所有节点的心跳状态。当节点 A 给节点 B 发了 PING 之后，如果在 `cluster-node-timeout` 时间内没有收到 B 的 PONG 回复，A 就会在本地把 B 标记为 PFAIL（Possible Failure，可能故障）。注意这个判定是单方面的——只代表「从 A 的视角看 B 不可达」，A 不会立刻对 B 采取任何行动。这就像你给朋友发微信他没回，你心里想「他可能在忙」，但你不会直接跑去他家踹门。\n\n为什么不能只靠一个节点的判断就触发 failover？因为网络是不可靠的。A 到 B 的链路可能恰好有问题（比如交换机某个端口抖动），但集群中其他 80% 的节点跟 B 通信完全正常。如果仅凭 A 的一面之词就把 B 踢掉触发切换，那就是误判——白白做了一次不必要的主从切换，导致几秒到十几秒的服务中断。所以 Redis Cluster 设计了「多数派投票」机制，只有超过半数的 Master 节点都认为 B 有问题，才升级为真正的故障确认。\n\nPFAIL 标记会附带在后续的 PING/PONG Gossip 消息中传播给其他节点。当节点 C 收到节点 A 的 PING 消息，发现消息体里带着「B 被 A 标记为 PFAIL」的信息，C 就会把这条投票记录下来。这些 PFAIL 投票有时效性——只有在最近 `cluster-node-timeout * 2` 时间窗口内收到的投票才有效，过期的会被丢弃。\n\n### 第二阶段：FAIL——客观下线\n\n当某个节点（假设是节点 D）收集到了足够多的 PFAIL 投票——具体来说是超过集群中 Master 节点总数的一半（包括 D 自己如果它也标记了 B 为 PFAIL 的话），D 就会把 B 的状态从 PFAIL 升级为 FAIL。在源码 `src/cluster.c` 的 `markNodeAsFailingIfNeeded()` 函数中，判定条件非常清晰：\n\n```c\n// 统计在 cluster-node-timeout * 2 窗口内标记 B 为 PFAIL 或 FAIL 的 Master 数量\n// 如果 >= (server.cluster->size / 2) + 1，则标记为 FAIL\nint needed_quorum = (server.cluster->size / 2) + 1;\nif (failures >= needed_quorum) {\n    node->flags &= ~CLUSTER_NODE_PFAIL;\n    node->flags |= CLUSTER_NODE_FAIL;\n    node->fail_time = mstime();\n    // 广播 FAIL 消息\n    clusterSendFail(node->name);\n}\n```\n\nFAIL 判定完成后，D 会立刻向集群中所有已知节点广播一条 FAIL 消息（`CLUSTERMSG_TYPE_FAIL`）。这是 Redis Cluster Gossip 协议中唯一走全量广播的消息类型——因为故障确认是时间敏感的，不能等 Gossip 的随机传播慢慢扩散。广播确保所有节点几乎同时知道 B 已经被判定为 FAIL。\n\n这里有一个关键细节：只有 Master 节点的 PFAIL 投票才算数，Replica 的投票不参与计数。这是因为 Replica 不负责 slot 管理，让它们参与投票会引入不必要的复杂性。但 Replica 可以接收和转发 PFAIL 信息——它们在 Gossip 传播链路中仍然起作用。\n\n另一个重要的时间窗口是 PFAIL 投票的有效期。假设 `cluster-node-timeout` 是 15 秒，那么投票窗口是 30 秒。如果网络断断续续，某些 Master 先后在不同时间标记了 B 为 PFAIL，但因为间隔太长导致早期投票过期了，那就永远凑不够多数派，FAIL 判定就不会触发。这种情况在跨机房部署（不推荐但有人这么干）时偶尔会遇到。\n\n### 第三阶段：Replica 选举——类 Raft 的投票机制\n\n当 B 的某个 Replica（假设是 R1）收到 FAIL 广播或者通过 Gossip 得知自己的 Master 已经被标记为 FAIL，R1 就会启动选举流程来争夺晋升为新 Master 的机会。这个选举过程借鉴了 Raft 协议的思想，但做了简化。\n\n首先是选举延迟。R1 不会立刻发起选举，而是等待一个计算出来的延迟时间：\n\n```\ndelay = 500ms + random(0, 500ms) + REPLICA_RANK * 1000ms\n```\n\n其中 `REPLICA_RANK` 是根据 Replica 的复制偏移量（replication offset）排序得到的排名——数据越新的 Replica rank 越小（rank 0 是数据最新的），延迟也就越短。这个设计的目的是让数据最新的 Replica 优先发起选举，尽量减少数据丢失。500ms 的固定延迟是给 FAIL 消息广播留时间，确保所有 Master 都已经知道故障发生了。随机延迟是为了避免多个相同 rank 的 Replica 同时发起选举导致的投票分裂（跟 Raft 的随机选举超时是一个思路）。\n\nR1 在延迟时间到达后，会把集群的 `currentEpoch` 加 1，然后向所有 Master 节点发送 `FAILOVER_AUTH_REQUEST` 消息。这里 `currentEpoch` 相当于 Raft 里的 term——每次选举递增，用来标识选举轮次。\n\n收到请求的 Master 节点会做以下检查：如果它在当前 epoch 中还没投过票、请求者确实是一个已 FAIL 的 Master 的 Replica、并且请求者的 Master 确实负责着有效的 slot，就回复一个 `FAILOVER_AUTH_ACK` 投票。每个 Master 在每个 epoch 中只能投一票——这又是 Raft 的经典规则，防止同一轮选举选出两个 Master。同时还有一个时间保护：两次投票之间至少间隔 `cluster-node-timeout * 2`，避免在短时间内频繁响应多次选举请求。\n\nR1 如果收集到了超过半数 Master 的 `FAILOVER_AUTH_ACK`，就赢得选举。它会执行以下动作：把自己的 `configEpoch` 设为选举时使用的 epoch 值（这就是为什么题目场景中 configEpoch 从 2 跳到了 7——中间集群经历了多次 epoch 递增），把自己标记为 Master，接管原 Master 负责的所有 slot，然后通过 PING/PONG 消息广播自己的新状态和新的 slot 映射。其他节点收到带有更高 configEpoch 的 slot 声明后，会更新自己的路由表。\n\n如果第一轮选举因为投票分裂（多个 Replica 同时发起、票被分散）而没有人拿到多数票，所有参与的 Replica 会等待一段时间后重新发起选举，并使用更高的 currentEpoch。这个过程通常在 1-2 轮内收敛。\n\n### 第四阶段：新 Master 接管与客户端路由更新\n\n新 Master 接管 slot 后，客户端的路由表仍然指向旧 Master。当客户端把请求发到集群中任意一个节点时，该节点发现 slot 的负责人已经变了，会返回 `MOVED` 重定向响应，把客户端导向新 Master。主流的 Redis 客户端库（如 Jedis、Lettuce、go-redis/v9）在收到 `MOVED` 后会自动刷新本地的 slot 映射缓存。这个过程通常在几百毫秒内完成，但在高 QPS 场景下这几百毫秒可能意味着上千个请求需要重定向。\n\n### 时间线总结\n\n回到题目场景，23 秒的故障窗口拆解如下：`cluster-node-timeout`（15 秒）用于 PFAIL 判定，Gossip 传播 PFAIL 投票到多数派确认 FAIL 约 2-5 秒，Replica 选举延迟 + 投票约 1-2 秒，slot 接管和客户端路由更新约 1 秒。如果把 `cluster-node-timeout` 调到 5000ms，PFAIL 判定缩短到 5 秒，总时间可以压到 8-10 秒左右。要压到 5 秒以内，需要同时调低 timeout 并且接受更高的误判风险，或者使用更激进的客户端探测策略。\n\n## 第三步：手动 Failover、Replica 迁移与生产实践\n\n### 手动 Failover：CLUSTER FAILOVER 三种模式\n\n在计划内维护场景（比如给机器升级内核、更换硬件），你不会想依赖自动 failover 那十几秒的中断。Redis 提供了 `CLUSTER FAILOVER` 命令，在 Replica 上执行，可以触发一次优雅的主从切换。\n\n**普通模式**（`CLUSTER FAILOVER`，不带参数）是最安全的。执行后 Replica 会先通知 Master「我要接管你了」，Master 收到后停止接受新的写请求，等待 Replica 的复制偏移量追上自己（即 Replica 已经同步了 Master 的所有数据），然后 Replica 才发起选举并晋升。这个过程保证了零数据丢失——老板在复盘会上问的第三个问题就应该用这种方式。整个切换耗时通常在 1-3 秒，取决于 Replica 追赶数据的速度。切换期间客户端可能收到短暂的 `READONLY` 错误或连接重置，但不会丢数据。\n\n**FORCE 模式**（`CLUSTER FAILOVER FORCE`）跳过了「等待 Replica 数据追赶」的步骤，直接发起选举。适用于 Master 已经不可达但集群中多数 Master 仍然在线的场景。因为 Master 没来得及把最后一批写操作复制给 Replica，可能会丢失少量数据（取决于复制延迟，通常是最近几百毫秒的写入）。但选举流程仍然走正常的多数派投票，保证了集群共识。\n\n**TAKEOVER 模式**（`CLUSTER FAILOVER TAKEOVER`）是最激进的——它连多数派投票都跳过了，Replica 直接自行晋升为 Master 并声明自己负责对应的 slot。这种模式用在集群已经「崩了大半」（多数 Master 不可达，无法凑够投票多数派）的极端场景，或者跨数据中心灾难恢复时只剩下远端 Replica 可用的情况。TAKEOVER 会强制递增 configEpoch 为一个足够大的值来覆盖其他节点的声明，但因为没有经过共识确认，如果旧 Master 后来又活过来了且有部分节点仍然认它，可能出现短暂的脑裂。所以 TAKEOVER 是最后手段，生产环境要慎用。\n\n### Replica 迁移与 cluster-migration-barrier\n\n考虑这样一个场景：集群中 Master A 有两个 Replica（R1、R2），Master B 只有一个 Replica（R3）。如果 R3 挂了，然后 B 也挂了，B 就没有 Replica 可以接替——即使 A 那边有「富余」的 Replica。为了解决这个问题，Redis Cluster 实现了 Replica 迁移（Replica Migration）：当某个 Master 变成「孤儿」（没有 Replica）时，其他拥有多于 `cluster-migration-barrier`（默认值 1）个 Replica 的 Master 会自动把多余的 Replica 迁移过去。\n\n`cluster-migration-barrier` 的值表示「一个 Master 至少需要保留多少个 Replica 后才愿意把多余的迁移出去」。默认值 1 意味着每个 Master 保留至少 1 个 Replica，多余的才可能被迁移。如果你设成 2，那只有拥有 3 个以上 Replica 的 Master 才会贡献 Replica——更保守但更安全。生产环境中，如果你的集群规模不大（6-12 个 Master），建议每个 Master 至少配 2 个 Replica，把 `cluster-migration-barrier` 设为 1，这样即使一个 Replica 挂了还有一个兜底。\n\n### Failover 期间 in-flight 请求的命运\n\n在 PFAIL 到 FAIL 确认的这段时间里，客户端发给故障 Master 的请求会怎样？这取决于客户端的实现和 `cluster-require-full-coverage` 配置（默认 yes）。\n\n当 `cluster-require-full-coverage` 为 yes（默认值）时，只要有一组 slot 没有节点负责（故障 Master 还没被替换），整个集群就会进入 `cluster_state:fail` 状态，所有节点对所有请求返回 `CLUSTERDOWN The cluster is down`。这是非常保守的策略——一个 Master 挂了会导致整个集群不可用。在 Redis 7.0+ 中可以通过 `cluster-allow-reads-when-down yes` 允许集群在 down 状态下继续处理读请求，但写请求仍然被拒绝。\n\n如果把 `cluster-require-full-coverage` 设为 no，那么只有打到故障 slot 范围的请求会失败，其他 slot 的读写不受影响。生产环境中，大部分团队会设成 no——你不会希望因为一个 Master 挂了就把整个集群锁死。\n\n故障 Master 上正在执行中的 Lua 脚本或事务（MULTI/EXEC）会直接中断，客户端收到连接断开的错误。这些操作不会被 Replica 继续执行——Replica 只复制已完成的写操作，未完成的事务不在复制流中。\n\n### 生产环境监控与调优建议\n\n监控 failover 事件需要关注几个关键指标。第一是 `cluster_state`，正常应该是 `ok`，变成 `fail` 说明有 slot 未被覆盖。第二是 `CLUSTER NODES` 输出中的 `pfail` 和 `fail` 标记——如果频繁出现 `pfail` 然后又消失，说明网络环境不稳定或者 `cluster-node-timeout` 设得太小。第三是 Redis 日志中的关键字：`FAIL` 标记事件会输出 `Marking node xxx as failing`，Replica 选举会输出 `Start of election` 和 `Failover election won`，新 Master 接管会输出 `Setting secondary replication ID`。建议用 ELK 或 Loki 采集 Redis 日志并对这些关键字设告警。\n\n`cluster-node-timeout` 的调优经验：内网环境（RTT < 1ms）设 5000ms，故障窗口可以控制在 8-12 秒；云环境（跨可用区，RTT 1-3ms）设 10000-15000ms，给网络波动留余量。如果你发现调低 timeout 后 `pfail` 误报增多，说明当前网络条件不支持这个探测频率，需要适当调大。还有一个经常被忽略的参数是 `cluster-replica-validity-factor`，默认值 10，它决定了 Replica 与 Master 断开连接超过 `cluster-node-timeout * factor` 时间后就不再有资格参与选举。设成 0 表示任何 Replica 都有资格——在极端场景下可能选出一个数据严重落后的 Replica，但至少服务能恢复。这是一个可用性和数据安全之间的取舍。",
+      "keyPoints": [
+        "PFAIL 是主观下线标记，由单个节点在 cluster-node-timeout 内未收到 PONG 时设置，仅代表该节点视角的判断，不会触发任何切换动作",
+        "FAIL 是客观下线确认，需要超过半数 Master 节点在 cluster-node-timeout * 2 时间窗口内都报告了 PFAIL，确认后通过全量广播（非 Gossip 随机传播）通知所有节点",
+        "Replica 选举借鉴了 Raft 的 term 和投票机制：使用 currentEpoch 标识选举轮次，每个 Master 每轮只投一票，数据最新的 Replica 通过更短的选举延迟获得优先权",
+        "configEpoch 是解决 slot 归属冲突的版本号，新 Master 晋升时获得更高的 configEpoch 以覆盖旧 Master 的声明，保证集群路由最终收敛到一致状态",
+        "CLUSTER FAILOVER 的三种模式适用不同场景：普通模式保证零数据丢失用于计划维护，FORCE 跳过数据追赶用于 Master 已不可达，TAKEOVER 跳过投票共识用于多数 Master 不可达的极端灾难恢复",
+        "cluster-migration-barrier 控制 Replica 自动迁移策略，防止某个 Master 变成孤儿节点无人可替，默认值 1 表示每个 Master 至少保留一个 Replica 后才愿意贡献多余的",
+        "故障窗口的时间拆解为 cluster-node-timeout（PFAIL 判定）+ Gossip 投票传播（2-5 秒）+ 选举延迟与投票（1-2 秒）+ 客户端路由更新（约 1 秒），调低 timeout 能压缩窗口但增大误判风险",
+        "cluster-require-full-coverage 默认 yes 导致单个 Master 故障时整个集群拒绝服务，生产环境通常设为 no 以实现故障隔离，仅影响故障 slot 范围的请求"
+      ],
+      "quiz": [
+        {
+          "id": "redis-cluster-failover-q1-quiz1",
+          "question": "Redis Cluster 中 PFAIL（Possible Failure）标记的触发条件是什么？",
+          "choices": [
+            { "id": "A", "text": "节点 A 在 cluster-node-timeout 时间内未收到节点 B 的 PONG 回复，A 在本地将 B 标记为 PFAIL" },
+            { "id": "B", "text": "节点 A 连续三次 PING 节点 B 均超时后，将 B 标记为 PFAIL" },
+            { "id": "C", "text": "超过半数 Master 节点报告与节点 B 通信异常后，集群统一将 B 标记为 PFAIL" },
+            { "id": "D", "text": "节点 B 的 CPU 使用率超过 90% 持续 cluster-node-timeout 后自动将自身标记为 PFAIL" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "PFAIL 是一个纯粹的本地判断行为。节点 A 给节点 B 发 PING 后，如果在 cluster-node-timeout 时间内没收到 PONG，A 就在自己的节点状态表中将 B 标记为 PFAIL。这个标记只存在于 A 本地，不需要其他节点参与，也不会直接触发任何故障转移动作。选项 B 的「连续三次」是编造的，Redis 并没有重试计数机制，只看超时时间。选项 C 描述的实际上是 FAIL（客观下线）的判定条件，不是 PFAIL。选项 D 完全不存在——Redis 不会基于 CPU 使用率做故障判断，节点也不会自行标记自身为 PFAIL。"
+        },
+        {
+          "id": "redis-cluster-failover-q1-quiz2",
+          "question": "PFAIL 状态升级为 FAIL 状态需要满足的核心条件是什么？",
+          "choices": [
+            { "id": "A", "text": "集群中所有节点（包括 Replica）都将目标节点标记为 PFAIL" },
+            { "id": "B", "text": "集群中超过半数的 Master 节点在 cluster-node-timeout * 2 时间窗口内报告了目标节点的 PFAIL" },
+            { "id": "C", "text": "目标节点的 Replica 主动检测到 Master 不可达并向集群发起 FAIL 投票" },
+            { "id": "D", "text": "目标节点持续不可达超过 cluster-node-timeout * 3 后自动升级为 FAIL" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "FAIL 判定的核心逻辑在源码 markNodeAsFailingIfNeeded() 函数中：统计在最近 cluster-node-timeout * 2 时间窗口内标记目标节点为 PFAIL 或 FAIL 的 Master 数量，如果达到 (cluster_size / 2) + 1 即超过半数，就将目标节点升级为 FAIL 并向全集群广播 FAIL 消息。注意两个关键细节：第一，只有 Master 的投票才算数，Replica 的 PFAIL 报告不参与计数；第二，投票有时效性，超过 2 倍 timeout 的旧投票会被丢弃。选项 A 错在要求「所有节点」且包含 Replica——多数派 Master 即可。选项 C 错在由 Replica 发起，实际上 Replica 不参与 FAIL 判定投票。选项 D 纯属编造，没有 3 倍 timeout 自动升级的机制。"
+        },
+        {
+          "id": "redis-cluster-failover-q1-quiz3",
+          "question": "Redis Cluster 的 Replica 选举延迟公式 delay = 500ms + random(0, 500ms) + REPLICA_RANK * 1000ms 中，REPLICA_RANK 的排序依据是什么？",
+          "choices": [
+            { "id": "A", "text": "按 Replica 的启动时间排序，运行最久的 rank 为 0" },
+            { "id": "B", "text": "按 Replica 的节点 ID 字典序排序，ID 最小的 rank 为 0" },
+            { "id": "C", "text": "按 Replica 的复制偏移量（replication offset）从大到小排序，数据最新的 rank 为 0" },
+            { "id": "D", "text": "按 Replica 与 Master 的网络延迟排序，延迟最低的 rank 为 0" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "REPLICA_RANK 的排序依据是 Replica 的 replication offset——即 Replica 从 Master 复制了多少数据。offset 越大说明 Replica 的数据越新，rank 就越小（0 是最新的），选举延迟也就越短。这个设计的核心目的是让数据最新的 Replica 优先发起选举并赢得投票，最大程度减少故障转移后的数据丢失。选项 A 的「运行时间」跟数据完整性没有直接关系——一个刚重启但快速全量同步完的 Replica 可能比运行了一周但网络抖动过的 Replica 数据更新。选项 B 按 ID 排序没有实际意义。选项 D 的网络延迟不是 Redis 排序的依据，虽然延迟低间接意味着复制更及时，但 Redis 直接用 offset 做硬指标。"
+        },
+        {
+          "id": "redis-cluster-failover-q1-quiz4",
+          "question": "Redis Cluster 中 configEpoch 在故障转移过程中的核心作用是什么？",
+          "choices": [
+            { "id": "A", "text": "作为 slot 归属冲突的仲裁版本号——当多个节点声称负责同一 slot 时，configEpoch 更大的声明胜出" },
+            { "id": "B", "text": "记录集群自创建以来发生过多少次 failover，用于统计和审计" },
+            { "id": "C", "text": "控制 Gossip 消息的发送频率——configEpoch 越大，PING 发送间隔越短" },
+            { "id": "D", "text": "决定客户端的路由缓存过期时间——configEpoch 变化时客户端自动刷新" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "configEpoch 是 Redis Cluster 保证 slot 映射最终一致性的核心机制。每个 Master 节点都有自己的 configEpoch，当 Replica 通过选举晋升为新 Master 时会获得一个更高的 configEpoch。如果集群中出现两个节点对同一个 slot 的归属有分歧（比如旧 Master 网络分区后恢复），所有节点会以 configEpoch 更大的那个声明为准。这就保证了即使出现暂时的不一致，集群拓扑最终也能收敛。选项 B 把它当成计数器——configEpoch 不只是统计用的，它有实际的仲裁作用。选项 C 完全不相关，Gossip 频率由 cluster-node-timeout 控制。选项 D 混淆了服务端和客户端机制——客户端通过 MOVED 重定向刷新路由，不直接感知 configEpoch。"
+        },
+        {
+          "id": "redis-cluster-failover-q1-quiz5",
+          "question": "你在 CLUSTER NODES 输出中看到一个节点状态为 master,fail，另一个节点的 configEpoch 从 3 变成了 8。以下哪个解读是正确的？",
+          "choices": [
+            { "id": "A", "text": "configEpoch 从 3 到 8 说明发生了 5 次故障转移" },
+            { "id": "B", "text": "标记为 fail 的节点已经被集群永久删除，不会再恢复" },
+            { "id": "C", "text": "configEpoch 跳变说明有人手动执行了 CLUSTER RESET 重置了节点" },
+            { "id": "D", "text": "发生了故障转移，标记为 fail 的是旧 Master，configEpoch 跳变的是新晋升的 Master，中间 5 次 epoch 递增说明集群经历了多轮 epoch 变更" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "这是一个典型的故障转移后的输出状态。master,fail 表示该节点之前是 Master 但已被集群判定为客观下线（FAIL）。另一个节点 configEpoch 从 3 跳到 8，说明在选举过程中 currentEpoch 被递增了多次——这不一定代表发生了 5 次 failover，而是集群的全局 currentEpoch 可能在这段时间内因为其他事件（比如 slot 迁移、其他节点的选举）而递增过。选项 A 把 epoch 差值等同于 failover 次数是错误的。选项 B 不对——FAIL 标记不代表永久删除，如果该节点恢复上线，它会以 Replica 身份重新加入（旧 Master 发现自己的 slot 已被更高 configEpoch 的节点接管后会自动降为 Replica）。选项 C 的 CLUSTER RESET 会清除节点的所有集群元数据，不会只是改变 configEpoch。"
+        },
+        {
+          "id": "redis-cluster-failover-q1-quiz6",
+          "question": "一个常见的误区：把 cluster-node-timeout 从 15000ms 调到 2000ms 可以让故障转移在 3 秒内完成。这个做法的主要风险是什么？",
+          "choices": [
+            { "id": "A", "text": "timeout 小于 5000ms 时 Redis 会拒绝启动并报错" },
+            { "id": "B", "text": "timeout 太小会导致正常的网络延迟波动频繁触发 PFAIL 误判，可能引发不必要的故障转移或增大 Gossip 消息量" },
+            { "id": "C", "text": "timeout 太小会导致 Replica 来不及同步数据，新 Master 的数据一定为空" },
+            { "id": "D", "text": "timeout 太小会导致 configEpoch 溢出，集群进入不可用状态" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "cluster-node-timeout 同时影响 PFAIL 判定和 PING 补发频率（超过 timeout/2 未响应就补发）。调到 2000ms 意味着一个节点只要 2 秒没回 PONG 就被标记为 PFAIL，而正常的网络毛刺（GC pause、交换机重收敛、偶发丢包）经常能造成几百毫秒到 1-2 秒的延迟。这会导致 PFAIL 标记频繁出现又消失，虽然不一定每次都升级为 FAIL，但会显著增加 Gossip 消息量（因为补发 PING 的阈值也降到了 1 秒）。更危险的是，如果网络环境刚好在某个时刻抖了一下，多数 Master 可能同时标记某个健康节点为 PFAIL 并触发不必要的 failover。选项 A 不存在最低限制。选项 C 的「数据为空」完全不对。选项 D 的 epoch 溢出在 uint64 范围内基本不可能。"
+        },
+        {
+          "id": "redis-cluster-failover-q1-quiz7",
+          "question": "CLUSTER FAILOVER（普通模式）与自动 failover 的关键区别是什么？",
+          "choices": [
+            { "id": "A", "text": "普通模式 CLUSTER FAILOVER 会先让 Replica 追赶 Master 的数据然后优雅切换，保证零数据丢失；自动 failover 在 Master 已不可达的情况下直接选举，可能丢失最后未同步的写入" },
+            { "id": "B", "text": "CLUSTER FAILOVER 不需要多数派投票就能完成切换，而自动 failover 必须经过投票" },
+            { "id": "C", "text": "CLUSTER FAILOVER 只能在 Master 节点上执行，自动 failover 由 Replica 发起" },
+            { "id": "D", "text": "两者没有本质区别，CLUSTER FAILOVER 只是手动触发了一次自动 failover 的流程" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "普通模式 CLUSTER FAILOVER 的核心优势在于它是一个协调的（coordinated）切换过程。Replica 执行命令后先向 Master 发送一个暂停请求，Master 停止接受新写入，然后 Replica 等待自己的复制偏移量追上 Master 的偏移量（数据完全同步），之后才发起选举。因为 Master 在切换过程中配合停写，所以不会有数据丢失。而自动 failover 发生时 Master 已经不可达，Replica 的数据可能落后于 Master 最后的写入，这部分差异数据就会丢失。选项 B 不完全对——普通模式的 CLUSTER FAILOVER 仍然会走投票流程，只是因为 Master 配合所以投票基本秒过。选项 C 说反了，CLUSTER FAILOVER 必须在 Replica 上执行。选项 D 忽略了数据追赶这个关键差异。"
+        },
+        {
+          "id": "redis-cluster-failover-q1-quiz8",
+          "question": "生产环境中，cluster-require-full-coverage 设为默认的 yes 会导致什么问题？",
+          "choices": [
+            { "id": "A", "text": "集群启动时必须所有节点同时上线，否则无法接受请求" },
+            { "id": "B", "text": "任何 Replica 挂了都会导致集群不可用" },
+            { "id": "C", "text": "单个 Master 故障时，即使其他 slot 完全正常，整个集群也会进入 CLUSTERDOWN 状态拒绝所有读写请求" },
+            { "id": "D", "text": "slot 迁移过程中集群会短暂进入不可用状态" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "cluster-require-full-coverage 的默认值 yes 意味着只要有任何一组 slot 没有节点负责（比如某个 Master 挂了且 failover 尚未完成），集群就会把 cluster_state 设为 fail，所有节点对所有请求返回 CLUSTERDOWN 错误——不管请求打到的是哪个 slot。这是非常保守的策略，设计初衷是保证数据完整性（不允许客户端只拿到部分数据），但在生产环境中通常不可接受。大部分团队会设成 no，让故障影响范围仅限于不可用的 slot。选项 A 虽然有一定关系，但主要问题不是启动时而是运行时的故障场景。选项 B 不对——Replica 挂了不影响 slot 覆盖（Master 还在）。选项 D 描述的 slot 迁移中的短暂不可用跟这个参数关系不大。"
+        },
+        {
+          "id": "redis-cluster-failover-q1-quiz9",
+          "question": "在极端场景下，如果集群中超过半数的 Master 节点同时不可达，以下哪种操作可以让剩余的 Replica 强制接管 slot？",
+          "choices": [
+            { "id": "A", "text": "在 Replica 上执行 CLUSTER FAILOVER TAKEOVER，跳过多数派投票直接晋升为 Master" },
+            { "id": "B", "text": "在 Replica 上执行 CLUSTER FAILOVER FORCE，使用剩余节点的投票完成选举" },
+            { "id": "C", "text": "等待 cluster-node-timeout * 10 后系统自动把 Replica 提升为 Master" },
+            { "id": "D", "text": "重启所有剩余节点后执行 CLUSTER REBALANCE 自动恢复" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "当多数 Master 不可达时，正常的选举流程无法进行——因为无论是自动 failover 还是 FORCE 模式都需要超过半数 Master 的投票才能通过。这时唯一的办法是 TAKEOVER 模式：它完全跳过投票环节，Replica 直接将自己的 configEpoch 强制设为一个足够大的值并声明接管 slot。这是为极端灾难恢复场景设计的最后手段。选项 B 的 FORCE 模式仍然需要多数派投票，在半数以上 Master 不可达时同样无法完成。选项 C 纯属编造——Redis 没有自动超时提升机制，不满足多数派就永远不会自动选举。选项 D 的 CLUSTER REBALANCE 是 slot 迁移命令，不是故障恢复机制。注意 TAKEOVER 有脑裂风险，恢复后需要人工确认集群状态。"
+        },
+        {
+          "id": "redis-cluster-failover-q1-quiz10",
+          "question": "cluster-replica-validity-factor 参数设为 0 在故障转移场景下意味着什么？",
+          "choices": [
+            { "id": "A", "text": "禁用 Replica 选举功能，集群不会自动进行故障转移" },
+            { "id": "B", "text": "Replica 在故障转移后不保留任何旧数据，以空数据库状态启动" },
+            { "id": "C", "text": "Master 在判定 PFAIL 时不考虑 Replica 节点的心跳反馈" },
+            { "id": "D", "text": "任何 Replica 都有资格参与选举，即使它与旧 Master 断开连接已经很久、数据严重落后" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "cluster-replica-validity-factor 控制的是 Replica 参与选举的资格门槛。正常情况下，如果 Replica 与 Master 断开连接的时间超过 cluster-node-timeout * cluster-replica-validity-factor，这个 Replica 就被认为数据太旧、没有资格参与选举。默认值是 10，即断开超过 timeout * 10（默认 150 秒）的 Replica 会被排除。设为 0 时相当于禁用了这个校验——任何 Replica 无论断开了多久都可以参与选举。这在极端场景下能保证有人可以接替故障 Master（可用性优先），但代价是可能选出一个数据严重落后的 Replica，丢失大量写入（数据安全让步）。选项 A 说反了，0 是放宽限制而不是禁用功能。选项 B 和 C 跟这个参数毫无关系。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/",
+        "https://github.com/redis/redis/blob/7.2/src/cluster.c"
+      ]
+    }
+  ]
+}
