@@ -1,0 +1,151 @@
+{
+  "id": "redis-cache-avalanche-ttl-random",
+  "name": "缓存雪崩 TTL 随机化策略",
+  "domain": "redis",
+  "description": "通过 TTL 随机化防止缓存雪崩的实现方案与工程实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-cache-avalanche-ttl-random-q1",
+      "domain": "redis",
+      "type": "modification",
+      "difficulty": 2,
+      "tags": ["Redis", "缓存雪崩", "TTL", "随机化", "高可用"],
+      "title": "缓存雪崩的 TTL 随机化策略实现",
+      "content": "## 变更场景\n\n你所在的电商团队（5 人后端 + 2 人 SRE）维护着一套商品缓存系统，技术栈是 Go 1.22 + Redis 7.2 Cluster（3 主 3 从）+ MySQL 8.0。每天凌晨 3:00 有一个定时任务跑缓存预热，把次日参与活动的 15 万个商品详情批量灌入 Redis，写入代码是这样的：\n\n```go\nfunc warmUpProducts(ctx context.Context, rdb *redis.Client, products []Product) error {\n    pipe := rdb.Pipeline()\n    for _, p := range products {\n        data, _ := json.Marshal(p)\n        pipe.Set(ctx, fmt.Sprintf(\"product:%d\", p.ID), data, 30*time.Minute)\n    }\n    _, err := pipe.Exec(ctx)\n    return err\n}\n```\n\n系统上线后一直运行正常，缓存命中率稳定在 97% 以上。直到上周五公司搞了一次大促闪购活动——运营提前在凌晨 3:00 预热了 15 万商品缓存，活动 9:30 开始。然而 3:30 左右，也就是预热后恰好 30 分钟，Grafana 告警炸了：\n\n```\n[03:30:02] CRITICAL: Redis expired_keys 速率从 50/s 飙升到 8200/s\n[03:30:05] WARNING:  Redis P99 延迟 0.4ms → 35ms\n[03:30:08] CRITICAL: MySQL QPS 从 200 飙升到 9800，CPU 91%\n[03:30:12] CRITICAL: 商品详情接口 5xx 错误率 18.3%\n```\n\n虽然凌晨流量不大（约 500 QPS），但 15 万 key 同时过期后全部穿透到数据库，MySQL 还是扛不住了。SRE 紧急手动灌了一批缓存才恢复。复盘会上，架构师要求你用 TTL 随机化方案彻底修复这个问题。\n\n**你的任务**：修改上面的 `warmUpProducts` 函数，实现 TTL 随机化策略。具体要求包括：随机偏移量应该设多大？对于不同类型的数据（热点商品 vs 普通商品）TTL 策略是否应该不同？除了 TTL 随机化，还需要哪些配套措施来防止缓存雪崩再次发生？",
+      "answer": "## 第一步：缓存雪崩核心概念基础\n\n### 什么是缓存雪崩\n\n缓存雪崩（Cache Avalanche）是分布式系统中一个经典的高可用问题。它指的是在某一个时间窗口内，缓存层大面积失效，导致原本由缓存承接的请求全部穿透到后端数据库，瞬间压垮数据库的现象。之所以叫「雪崩」，是因为它和真实的雪崩一样具有连锁反应的特征——缓存失效只是第一张多米诺骨牌，后面紧跟着数据库过载、连接池耗尽、上游超时、用户重试放大流量，最终整条链路崩溃。\n\n缓存雪崩有两大典型诱因。第一种是缓存服务整体宕机（比如 Redis 实例挂了、网络分区了），整个缓存层不可用。第二种就是场景中遇到的情况——大量 key 被设置了相同的 TTL，在同一时刻集中过期。第二种在实际生产中更常见也更隐蔽，因为系统表面上运行正常，直到那个精确的过期时刻到来才突然爆发。\n\n理解缓存雪崩需要先搞清楚 Redis 的 TTL 机制。当你执行 `SET key value EX 1800` 时，Redis 在内部的 expires 字典中为这个 key 记录一个绝对过期时间戳（当前时间 + 1800 秒）。key 到期后并不会被立即删除，而是通过两种策略配合清理：惰性删除（访问时才检查是否过期）和定期删除（`activeExpireCycle()` 每秒执行 `hz` 次，默认 hz=10，每次随机采样 20 个 key 删除已过期的）。当大量 key 同时过期时，`activeExpireCycle()` 会发现采样中过期比例远超 25% 的阈值，反复循环采样，每次最多占用 25ms 的主线程时间——这就是 Redis 自身出现延迟抖动的原因。\n\n### TTL 随机化的核心思路\n\nTTL 随机化的原理非常朴素：在一个基准 TTL 上叠加一个随机偏移量（jitter），把原本在同一时刻过期的 key 分散到一个时间窗口内。比如原来 15 万个 key 全部在 T+1800s 这一个点过期，加了 `rand(0, 600)` 之后，过期时间就被均匀分布在 T+1800s 到 T+2400s 的 10 分钟窗口内。15 万个 key 分散在 600 秒里过期，平均每秒只有 250 个 key 到期，Redis 的 `activeExpireCycle()` 完全可以轻松消化，数据库也不会感受到明显的流量冲击。\n\n## 第二步：TTL 随机化的工程实现\n\n### 修改后的代码\n\n回到场景中的 `warmUpProducts` 函数，最直接的修改是这样的：\n\n```go\nimport (\n    \"math/rand/v2\"\n    \"time\"\n)\n\nconst (\n    baseTTL   = 30 * time.Minute  // 基准 TTL\n    jitterMax = 10 * time.Minute   // 最大随机偏移 10 分钟\n)\n\nfunc warmUpProducts(ctx context.Context, rdb *redis.Client, products []Product) error {\n    pipe := rdb.Pipeline()\n    for _, p := range products {\n        data, _ := json.Marshal(p)\n        // 每个 key 的 TTL = 30min + rand(0, 10min)\n        ttl := baseTTL + time.Duration(rand.IntN(int(jitterMax.Seconds())))*time.Second\n        pipe.Set(ctx, fmt.Sprintf(\"product:%d\", p.ID), data, ttl)\n    }\n    _, err := pipe.Exec(ctx)\n    return err\n}\n```\n\n这段代码把 15 万个 key 的过期时间从原来的精确 1800 秒，变成了 1800~2400 秒之间的均匀分布。每个 key 独立随机，互不影响。Go 1.22 的 `math/rand/v2` 默认使用 ChaCha8 随机数生成器，并发安全且不需要手动 seed，比老的 `math/rand` 更适合生产使用。\n\n### 随机偏移量该设多大\n\n这是一个需要根据实际情况计算的问题，不能拍脑袋。核心约束是：在随机窗口内，每秒过期的 key 数量不能超过系统的承受上限。我们来做一个简单的估算。\n\nRedis 层面，`activeExpireCycle()` 在 `hz=10` 的默认配置下，每秒执行 10 次，每次采样 20 个 key。如果过期比例低于 25%（也就是采样 20 个中不超过 5 个过期），单次采样就结束了，主线程几乎不受影响。反过来说，只要你能保证在任意 1 秒内过期的 key 数量占总 key 数的比例低于 25%，Redis 就不会触发反复循环采样。\n\n数据库层面约束通常更严格。假设你的 MySQL 在正常负载下承受 200 QPS，极限能扛 2000 QPS。如果缓存命中率从 97% 降到 0%，500 QPS 的总流量会全部打到数据库——这远超 2000 QPS 的极限（因为每个请求不止一条 SQL）。所以你需要确保在任意时刻，缓存失效率不会导致数据库 QPS 超标。\n\n回到 15 万 key 的场景：如果 jitter 设为 600 秒（10 分钟），平均每秒过期 250 个 key。考虑到并非所有过期 key 都会被立即访问，实际穿透到数据库的请求量取决于当前 QPS 和这些 key 的访问频率。凌晨 500 QPS 场景下 250 key/s 的过期速率不会有问题，但如果是白天高峰 5000 QPS，你可能需要把 jitter 加大到 1800 秒（30 分钟）甚至更长。一个实用的公式是：`jitter >= key总数 / (数据库可承受额外QPS × 缓存未命中时的DB查询放大系数)`。\n\n### 区分热点数据和冷数据的 TTL 策略\n\n不是所有商品都应该用同一套 TTL 策略。场景中 15 万商品里，真正的热点可能只有 Top 1000——大促首页推荐的爆款、秒杀商品。这些热点商品的缓存一旦失效，短时间内会有大量并发请求同时穿透到数据库（这其实是缓存击穿 Cache Breakdown 的问题，跟雪崩还不一样）。对于这类热点 key，更好的策略是「短 TTL + 后台异步刷新」：\n\n```go\nconst (\n    hotTTL       = 5 * time.Minute    // 热点商品基准 TTL 短一些\n    hotJitter    = 2 * time.Minute    // jitter 也短\n    coldTTL      = 30 * time.Minute   // 普通商品 TTL 长\n    coldJitter   = 10 * time.Minute   // jitter 大\n    refreshThreshold = 60 * time.Second // TTL 低于 60s 时触发异步刷新\n)\n\nfunc warmUpProducts(ctx context.Context, rdb *redis.Client, products []Product) error {\n    pipe := rdb.Pipeline()\n    for _, p := range products {\n        data, _ := json.Marshal(p)\n        var ttl time.Duration\n        if p.IsHot {\n            ttl = hotTTL + time.Duration(rand.IntN(int(hotJitter.Seconds())))*time.Second\n        } else {\n            ttl = coldTTL + time.Duration(rand.IntN(int(coldJitter.Seconds())))*time.Second\n        }\n        pipe.Set(ctx, fmt.Sprintf(\"product:%d\", p.ID), data, ttl)\n    }\n    _, err := pipe.Exec(ctx)\n    return err\n}\n\n// 读取时检查是否需要提前续期\nfunc GetProduct(ctx context.Context, rdb *redis.Client, id int64) (*Product, error) {\n    key := fmt.Sprintf(\"product:%d\", id)\n    data, err := rdb.Get(ctx, key).Bytes()\n    if err == redis.Nil {\n        return loadFromDBAndCache(ctx, rdb, id)\n    }\n    // 检查剩余 TTL，快过期时异步刷新\n    ttl, _ := rdb.TTL(ctx, key).Result()\n    if ttl > 0 && ttl < refreshThreshold {\n        go refreshCache(context.Background(), rdb, id) // 异步，不阻塞当前请求\n    }\n    var p Product\n    json.Unmarshal(data, &p)\n    return &p, nil\n}\n```\n\n热点 key 用短 TTL 的好处是数据新鲜度更高（大促期间库存和价格变动频繁），配合提前续期机制可以保证热点 key 几乎永远不会真正过期。冷数据用长 TTL + 大 jitter，减少回源频率的同时把过期时间充分分散。\n\n## 第三步：配套防雪崩措施与生产实践\n\n### 数据库层面的熔断与限流\n\nTTL 随机化只是第一道防线。即使做了随机化，极端情况下（比如 Redis 整个 Cluster 故障切换的几秒内）还是会有大量请求穿透到数据库。所以数据库前面必须有一层保护机制。在 Go 生态中，常用的做法是用 `golang.org/x/sync/singleflight` 来合并并发回源请求——同一个 key 同时有 100 个请求 miss，只让 1 个去查数据库，其余 99 个等结果共享：\n\n```go\nvar sfGroup singleflight.Group\n\nfunc loadFromDBAndCache(ctx context.Context, rdb *redis.Client, id int64) (*Product, error) {\n    key := fmt.Sprintf(\"product:%d\", id)\n    val, err, _ := sfGroup.Do(key, func() (interface{}, error) {\n        p, err := queryProductFromDB(ctx, id)\n        if err != nil {\n            return nil, err\n        }\n        data, _ := json.Marshal(p)\n        ttl := coldTTL + time.Duration(rand.IntN(int(coldJitter.Seconds())))*time.Second\n        rdb.Set(ctx, key, data, ttl)\n        return p, nil\n    })\n    if err != nil {\n        return nil, err\n    }\n    return val.(*Product), nil\n}\n```\n\n在 `singleflight` 之上，还应该在 HTTP 网关层面配置限流（比如 Sentinel 或自研的 token bucket），当数据库 QPS 超过阈值时直接返回降级数据或友好的错误提示，而不是放任所有请求继续冲击数据库。\n\n### 多级缓存架构\n\n对于日均千万级 PV 的商品详情页，单靠 Redis 一层缓存是不够的。成熟的方案是 L1 本地缓存 + L2 Redis 的两级结构。Go 里可以用 `github.com/dgraph-io/ristretto` 或 `github.com/allegro/bigcache` 做进程内缓存，TTL 设得比 Redis 短（比如 30 秒到 2 分钟）。当 Redis 出现大面积 miss 时，L1 缓存还能扛住一部分流量，给数据库一个缓冲期。\n\n### 监控告警：expired_keys 速率是早期预警信号\n\n在 Grafana 或 Prometheus 中配置 `expired_keys` 指标的速率告警至关重要。正常情况下，`expired_keys` 的增速应该是相对平稳的（取决于你的 key 过期分布）。如果某一时刻 `rate(expired_keys[1m])` 出现了陡峭的尖峰，说明有大量 key 在集中过期。你可以设置一个阈值，比如 `rate > 5000/s` 持续 30 秒就触发 P1 告警。配合 `expired_time_cap_reached_count` 一起监控——这个计数器反映 `activeExpireCycle()` 因超时被中断的次数，正常应该几乎为 0，如果在短时间内快速增长，说明过期清理已经成为主线程的瓶颈。\n\n```promql\n# Prometheus 告警规则示例\n- alert: RedisExpiredKeysSpike\n  expr: rate(redis_expired_keys_total[1m]) > 5000\n  for: 30s\n  labels:\n    severity: critical\n  annotations:\n    summary: \"Redis expired_keys 速率异常飙升，可能出现缓存雪崩\"\n```\n\n### 真实事故复盘：大促闪购的教训\n\n场景中这个事故其实是业内非常经典的反面案例。2019 年某头部电商在 618 大促中就遇到过几乎一模一样的问题：运营在活动前 30 分钟预热了全部商品缓存，TTL 统一设为 30 分钟。活动开始的瞬间，缓存恰好全部过期，叠加大促的流量洪峰，数据库直接被打挂，导致活动开场 3 分钟内用户全部看到「系统繁忙」。事后复盘的改进方案就是三板斧：TTL 随机化（base + rand）、singleflight 合并回源、数据库限流熔断。\n\n这个案例告诉我们一个重要的工程原则：缓存的 TTL 不应该是一个精确值，而应该是一个区间。只要你的代码里出现了 `EX 1800` 这种硬编码的固定 TTL，并且同一批次写入的 key 数量超过几千个，就应该条件反射地加上 jitter。这就像密码学里「永远不要用 ECB 模式」一样，是一个不需要思考就应该遵守的工程纪律。",
+      "keyPoints": [
+        "大量 key 设置相同 TTL 导致同时过期是缓存雪崩最常见的诱因，过期瞬间所有请求穿透到数据库可造成级联故障",
+        "TTL 随机化的核心公式是 baseTTL + rand(0, jitter)，jitter 的大小取决于 key 总数和数据库可承受的额外 QPS，15 万 key 建议 jitter 至少 600 秒",
+        "热点 key 应采用「短 TTL + 后台异步刷新」策略保证数据新鲜度且永不真正过期，冷数据用「长 TTL + 大 jitter」减少回源频率",
+        "singleflight 是 Go 中合并并发回源请求的标准方案，同一个 key 的 100 个并发 miss 只让 1 个请求查数据库，其余共享结果",
+        "expired_keys 速率和 expired_time_cap_reached_count 是监控缓存集中过期的两个关键 Redis 指标，前者反映过期速度，后者反映主线程阻塞程度",
+        "生产环境应使用 L1 本地缓存（如 ristretto）+ L2 Redis 的多级缓存架构，当 Redis 大面积 miss 时本地缓存可作为缓冲层保护数据库",
+        "缓存预热代码中出现固定 TTL 且批量写入 key 数量超过几千个时，必须条件反射地加上随机 jitter，这是不需要思考的工程纪律"
+      ],
+      "quiz": [
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz1",
+          "question": "TTL 随机化的核心目的是什么？",
+          "choices": [
+            {"id": "A", "text": "把大量 key 的过期时间从一个精确时间点分散到一个时间窗口内，避免同时过期"},
+            {"id": "B", "text": "让每个 key 的过期时间不可预测，防止恶意攻击者利用过期时机发起攻击"},
+            {"id": "C", "text": "减少 Redis 的内存占用，因为随机 TTL 会让部分 key 更早被释放"},
+            {"id": "D", "text": "提升 Redis 过期删除的效率，随机 TTL 可以让 activeExpireCycle 更快定位过期 key"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "TTL 随机化的唯一目的就是把过期时间打散，防止大量 key 在同一时刻失效导致缓存雪崩。选项 B 把这个问题往安全方向带了，TTL 随机化跟防攻击没有关系，它纯粹是一个可用性措施。选项 C 说「减少内存占用」是因果倒置——随机化可能让部分 key 更早过期也可能更晚过期，总的内存占用期望值没变。选项 D 也不对，activeExpireCycle 是随机采样的，TTL 是否随机不影响它的定位效率，影响的是采样到过期 key 的密度。"
+        },
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz2",
+          "question": "对于 15 万个 key 的批量缓存预热，baseTTL = 30min，以下哪个 jitter 范围最合理？",
+          "choices": [
+            {"id": "A", "text": "rand(0, 10) 秒——10 秒的偏移已经足够分散过期"},
+            {"id": "B", "text": "rand(0, 600) 秒——10 分钟窗口可以将每秒过期 key 数控制在 250 个左右"},
+            {"id": "C", "text": "rand(0, 86400) 秒——jitter 越大越安全，直接分散到 24 小时"},
+            {"id": "D", "text": "rand(-900, 900) 秒——用正负偏移可以让过期时间以 baseTTL 为中心对称分布"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "15 万 key 用 600 秒的 jitter，平均每秒过期约 250 个 key，Redis 的 activeExpireCycle 可以轻松消化，数据库也不会有明显冲击。选项 A 的 10 秒 jitter 远远不够——15 万 key 在 10 秒内过期等于每秒 1.5 万个，跟没加 jitter 差别不大。选项 C 的 24 小时 jitter 虽然分散效果极好，但会让大量 key 的实际 TTL 远超预期（最长接近 48 小时），严重影响数据新鲜度。选项 D 的负偏移会让部分 key 的 TTL 短于基准值 15 分钟，在业务上可能不可接受，而且 Redis 的 TTL 参数不能为负。"
+        },
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz3",
+          "question": "在 Go 1.22 中实现 TTL 随机化时，应该使用哪个包生成随机数？",
+          "choices": [
+            {"id": "A", "text": "crypto/rand——生产环境必须使用加密安全的随机数"},
+            {"id": "B", "text": "math/rand/v2——并发安全、不需要手动 seed，性能足够满足 TTL 随机化需求"},
+            {"id": "C", "text": "math/rand——经典标准库，全局 Rand 自动加锁保证并发安全"},
+            {"id": "D", "text": "time.Now().UnixNano() 取模——不需要引入随机数包，用时间戳就够了"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go 1.22 引入的 math/rand/v2 是当前推荐方案。它默认使用 ChaCha8 随机数生成器，并发安全且不需要手动 seed（老版本 math/rand 需要 rand.Seed 否则每次输出相同）。选项 A 的 crypto/rand 是加密级随机数，TTL 随机化不需要这么高的安全等级，crypto/rand 的性能也比 math/rand/v2 差一个数量级。选项 C 的 math/rand 在 Go 1.20 之前如果不手动 Seed 会输出固定序列，虽然 1.20+ 自动 seed 了，但 v2 是更现代的 API。选项 D 用时间戳取模在循环中会产生大量重复值（同一微秒内的调用结果完全相同），导致分散效果极差。"
+        },
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz4",
+          "question": "为什么热点 key 推荐使用「短 TTL + 后台异步刷新」而不是简单的大 TTL？",
+          "choices": [
+            {"id": "A", "text": "短 TTL 保证数据新鲜度，异步刷新在 key 快过期时提前续期，使热点 key 几乎永远不会真正过期"},
+            {"id": "B", "text": "短 TTL 可以节省 Redis 内存，异步刷新减少了同步 IO 的开销"},
+            {"id": "C", "text": "大 TTL 会导致 Redis 的 RDB 持久化文件过大，影响 fork 性能"},
+            {"id": "D", "text": "短 TTL 可以让 activeExpireCycle 更快回收内存，减少内存碎片"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "热点 key 在大促场景中数据变动频繁（价格调整、库存扣减），用短 TTL 可以保证用户看到的数据是相对新鲜的。同时通过异步刷新机制在 key 的 TTL 降到阈值以下时提前更新缓存，这样只要这个 key 有持续访问，它就永远不会真正过期导致穿透。选项 B 说「节省内存」和「减少同步 IO」都不是核心考量点，缓存 key 本身占的内存差异微乎其微。选项 C 把 TTL 和 RDB 持久化关联起来了，TTL 大小不影响 RDB 文件的生成。选项 D 中 activeExpireCycle 的效率跟 TTL 长短没有直接关系。"
+        },
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz5",
+          "question": "在 Grafana 监控面板中，以下哪个 Redis 指标最能提前预警缓存集中过期？",
+          "choices": [
+            {"id": "A", "text": "used_memory_rss 的突然下降"},
+            {"id": "B", "text": "rate(expired_keys_total[1m]) 出现陡峭的尖峰"},
+            {"id": "C", "text": "connected_clients 数量的持续增长"},
+            {"id": "D", "text": "keyspace_hits / (keyspace_hits + keyspace_misses) 缓存命中率的缓慢下降"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "expired_keys 的速率是缓存集中过期最直接的早期预警信号。正常情况下 expired_keys 的增速是平稳的，一旦出现尖峰就说明大量 key 正在同时过期。你可以设置告警规则如 rate > 5000/s 持续 30 秒触发 P1 告警。选项 A 的 used_memory_rss 下降是过期删除完成后的结果，不是预警信号，而且 jemalloc 不会立即归还内存所以 RSS 下降通常有延迟。选项 C 的连接数增长可能由多种原因引起，指向性不够明确。选项 D 的命中率缓慢下降反映的是渐进性问题，而缓存集中过期是突发事件，命中率会在极短时间内断崖式下跌而不是缓慢下降。"
+        },
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz6",
+          "question": "以下代码在循环中给 15 万 key 设置 TTL，哪种写法的随机化效果最差？",
+          "choices": [
+            {"id": "A", "text": "ttl = 1800 + rand.IntN(600)，每次循环独立生成随机数"},
+            {"id": "B", "text": "jitter := rand.IntN(600); for 循环中用 ttl = 1800 + jitter，循环外只生成一次随机数"},
+            {"id": "C", "text": "ttl = 1800 + (i % 600)，用循环下标取模代替随机数"},
+            {"id": "D", "text": "ttl = 1800 + rand.IntN(600) + (i % 60)，随机数加下标偏移"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 的致命问题是 jitter 在循环外只生成了一次，意味着所有 15 万个 key 共享同一个偏移量——它们依然会在同一时刻过期，等于 TTL 随机化完全失效。这是一个非常隐蔽的 bug，代码看起来有 jitter，实际跑起来跟硬编码 `EX 1800` 没区别。选项 A 是标准正确写法。选项 C 虽然不是真正的随机（是确定性的均匀分散），但至少把过期时间分布在了 600 秒的窗口内，效果远好于 B。选项 D 在随机数基础上又叠加了下标偏移，分散效果甚至更好。"
+        },
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz7",
+          "question": "缓存雪崩和缓存击穿（Cache Breakdown）的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "雪崩是大量 key 同时失效导致系统性穿透，击穿是单个热点 key 失效导致大量并发请求穿透到数据库"},
+            {"id": "B", "text": "雪崩发生在 Redis 集群中，击穿只发生在单机 Redis 上"},
+            {"id": "C", "text": "雪崩的原因是 Redis 宕机，击穿的原因是 key 过期"},
+            {"id": "D", "text": "雪崩影响所有用户，击穿只影响访问特定 key 的用户"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "缓存雪崩的关键词是「大面积」和「系统性」，它指的是大量 key 同时失效（或缓存层整体不可用）导致整个缓存层失去保护能力。缓存击穿的关键词是「热点」和「集中并发」，它指的是某一个高访问量的 key 过期后，大量并发请求同时穿透到数据库。两者的解决方案也不同：雪崩侧重 TTL 随机化和多级缓存，击穿侧重 singleflight 合并请求和互斥锁。选项 B 把问题跟部署模式绑定了，两者跟单机还是集群无关。选项 C 过于狭隘，雪崩不只是宕机导致的。选项 D 表面上有道理但不准确，雪崩时某些 key 可能没过期的用户不受影响。"
+        },
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz8",
+          "question": "大促期间商品缓存全部过期后，数据库被打满。在紧急恢复阶段，以下哪个措施应该最先执行？",
+          "choices": [
+            {"id": "A", "text": "立即重启数据库释放所有连接，让积压的请求自动重试"},
+            {"id": "B", "text": "在网关层开启限流或熔断降级，先止血控制住穿透到数据库的流量，再逐步恢复缓存"},
+            {"id": "C", "text": "把 Redis 的 hz 参数从 10 调到 100，加速过期 key 的清理"},
+            {"id": "D", "text": "手动用 SCAN + DEL 清理所有已过期但未被删除的 key"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "故障恢复的第一原则是「先止血再治本」。当数据库已经被打满时，最紧急的事情是控制住流量——在网关层开启限流或熔断，让超出阈值的请求直接返回降级响应（如「系统繁忙」），把数据库 QPS 压到可承受范围内。然后再逐步恢复缓存（分批预热或让请求自然回填）。选项 A 重启数据库会导致所有正在执行的事务回滚，积压的连接断开后大量客户端立即重连重试反而会形成更大的冲击。选项 C 调 hz 只能加速 Redis 端的过期清理，对解决数据库过载问题没有直接帮助。选项 D 去清理过期 key 更是南辕北辙，问题不是过期 key 占内存，而是过期后请求穿透。"
+        },
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz9",
+          "question": "使用 singleflight 合并回源请求时，如果唯一的那个回源请求查询数据库失败了，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "只有发起请求的 goroutine 收到错误，其他等待的 goroutine 会自动重试一次"},
+            {"id": "B", "text": "所有等待的 goroutine 都会收到相同的错误，需要在上层做重试或降级处理"},
+            {"id": "C", "text": "singleflight 会自动选择另一个等待中的 goroutine 重新发起请求"},
+            {"id": "D", "text": "singleflight 会缓存错误结果 5 秒，这期间的所有请求都直接返回缓存的错误"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "singleflight 的机制是：对同一个 key 的并发调用中只有第一个会真正执行函数，其他调用阻塞等待。当函数执行完毕（无论成功还是失败），所有等待者都会收到同一个返回值和错误。也就是说，如果回源失败了，100 个等待的 goroutine 都会拿到这个错误。这其实是 singleflight 的一个已知局限性：一次失败影响所有等待者。所以在业务层通常要配合降级逻辑（比如返回上一次的缓存数据或默认值）。选项 A 和 C 描述的自动重试和自动切换机制是不存在的。选项 D 描述的错误缓存机制也不是 singleflight 的行为，singleflight 不做任何缓存。"
+        },
+        {
+          "id": "redis-cache-avalanche-ttl-random-q1-quiz10",
+          "question": "Redis 7.4 引入的 active-expire-effort 参数（默认值 100，范围 1-500）的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "控制 activeExpireCycle 的采样数量和时间预算比例，值越大清理过期 key 的能力越强但 CPU 开销也越高"},
+            {"id": "B", "text": "设置过期 key 在被删除前的最大存活时间，值越大容忍度越高"},
+            {"id": "C", "text": "控制惰性删除（lazy expiration）的触发概率，值越大惰性删除越频繁"},
+            {"id": "D", "text": "设置 activeExpireCycle 的执行间隔（毫秒），值越大执行越不频繁"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "active-expire-effort 是 Redis 7.4 引入的精细化过期控制参数。它直接影响 activeExpireCycle() 每次执行时的采样 key 数量和允许占用的 CPU 时间上限。默认值 100 对应原始的采样配置，设为 200 大约等于采样数翻倍、时间预算翻倍。这比直接调高 hz 更精细——hz 影响的是 serverCron 整体执行频率，会波及到 AOF 刷盘、客户端超时检查等所有定期任务，而 active-expire-effort 只影响过期清理这一个环节。选项 B 描述的是一个不存在的概念。选项 C 搞混了定期删除和惰性删除，惰性删除是访问时触发的，没有概率控制。选项 D 把 effort 误解为了执行间隔。"
+        }
+      ],
+      "references": []
+    }
+  ]
+}

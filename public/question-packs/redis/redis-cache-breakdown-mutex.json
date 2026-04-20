@@ -1,0 +1,281 @@
+{
+  "id": "redis-cache-breakdown-mutex",
+  "name": "缓存击穿互斥锁方案",
+  "domain": "redis",
+  "description": "缓存击穿时使用互斥锁（Mutex Lock）防止数据库被打穿的实现细节与最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-cache-breakdown-mutex-q1",
+      "domain": "redis",
+      "type": "modification",
+      "difficulty": 3,
+      "tags": ["Redis", "缓存击穿", "互斥锁", "singleflight", "热点Key"],
+      "title": "缓存击穿时互斥锁（Mutex Lock）方案的实现细节",
+      "content": "面试官问「缓存击穿怎么处理」，大多数人能答出「加锁」两个字，但一追问 SET NX 的 TTL 设多少、拿不到锁的线程怎么办、锁持有者崩了怎么兜底，回答就开始含糊了。这道题不考「是否知道互斥锁」，而是考你能不能把它写成可以上线的代码。\n\n先把场景量化。一个电商首页的「今日爆款」商品详情缓存在 Redis 中，key 是 `product:hot:8888`，TTL 设置为 30 分钟。在 TTL 到期的那一瞬间，该商品正处于大促高峰期，QPS 大约在 10000 左右。Redis 返回 nil，10000 个 goroutine（或线程）几乎同时发现 cache miss，如果不做任何控制，它们会同时发起 `SELECT * FROM product WHERE id = 8888` 查询，MySQL 单实例在这种瞬时并发下大概率直接打满连接池甚至 OOM。这就是缓存击穿——一个热点 key 失效导致的数据库雪崩。\n\n互斥锁方案的思路是：10000 个请求争抢一把锁，只有一个请求获得锁去查数据库并回填缓存，其余 9999 个请求等一小段时间后重新去读缓存。Redis 提供了 `SET key value NX PX milliseconds` 这个原子命令，天然适合做分布式锁。拿到锁的那个请求负责查库、写缓存、释放锁；没拿到的请求 sleep 一段时间后重试读缓存。\n\n但这个方案的魔鬼全在细节里。锁的 TTL 应该设多少？如果查数据库比预期慢（比如遇到慢查询），锁在数据回填之前就过期了，第二批请求又会涌入数据库。如果锁持有者进程直接崩溃了，锁该怎么释放？没拿到锁的请求不断重试会不会造成「重试风暴」？有没有比 sleep-retry 更优雅的方案，比如 Go 的 `singleflight`？在更极端的场景下，是否应该放弃物理 TTL，改用「逻辑过期」让缓存永不真正失效？\n\n下面给出一段 Go 语言的互斥锁实现骨架，请分析其中的设计决策，指出潜在问题，并给出完整的生产级方案：\n\n```go\nfunc GetProductWithMutex(ctx context.Context, id int64) (*Product, error) {\n    key := fmt.Sprintf(\"product:hot:%d\", id)\n    lockKey := fmt.Sprintf(\"lock:product:hot:%d\", id)\n\n    // 1. 查缓存\n    val, err := rdb.Get(ctx, key).Result()\n    if err == nil {\n        return deserialize(val)\n    }\n\n    // 2. 尝试获取互斥锁\n    ok, err := rdb.SetNX(ctx, lockKey, \"1\", 3*time.Second).Result()\n    if err != nil {\n        return nil, err\n    }\n\n    if ok {\n        // 3. 拿到锁 → 查数据库 → 写缓存 → 释放锁\n        defer rdb.Del(ctx, lockKey)\n        product, err := db.QueryProduct(ctx, id)\n        if err != nil {\n            return nil, err\n        }\n        rdb.Set(ctx, key, serialize(product), 30*time.Minute)\n        return product, nil\n    }\n\n    // 4. 没拿到锁 → sleep 后重试\n    time.Sleep(50 * time.Millisecond)\n    return GetProductWithMutex(ctx, id)\n}\n```\n\n这段代码至少存在三个可以讨论的设计问题。请结合互斥锁方案的实现细节、singleflight 的进程内替代方案、以及逻辑过期的完全无锁方案，给出你的完整分析。",
+      "answer": "## 一、缓存击穿与互斥锁的核心概念\n\n### 1.1 缓存击穿的精确定义\n\n缓存击穿（Cache Breakdown / Hot Key Expiration）是指单个热点 key 在缓存中过期的那一刻，大量并发请求同时穿透到数据库的现象。它和缓存穿透（查询不存在的数据）以及缓存雪崩（大量 key 同时过期）是三个完全不同的问题。击穿的关键特征是「单点失效 + 高并发」——如果这个 key 不是热点（QPS 很低），即使过期了也不会造成问题；如果缓存没有过期，高并发请求全部被 Redis 挡住也不会有问题。只有两个条件同时满足才构成击穿。\n\n从数据库视角来看击穿的破坏力：假设 MySQL 连接池上限是 200，单次查询耗时 10ms，理论上数据库每秒最多处理 20000 个简单查询。但击穿时 10000 个请求在同一毫秒涌入，它们不是均匀分布在一秒内的，而是一个尖峰脉冲。MySQL 的 `Threads_running` 会瞬间飙到几千，远超 `max_connections`，后续的连接请求会收到 `Too many connections` 错误，甚至已经建立的连接也会因为 CPU 和 IO 争抢导致响应时间从 10ms 劣化到数秒。一个热点 key 的过期可以搞垮整个数据库实例，进而引发级联故障。\n\n### 1.2 互斥锁方案的核心思想\n\n互斥锁方案的本质是把 10000 个并发数据库查询收敛为 1 个。只有抢到锁的那个请求去数据库加载数据并回填缓存，其余请求要么等待重试要么返回兜底数据。这是一个典型的「leader election」模式——在所有竞争者中选出一个 leader 执行任务，其他 follower 等待 leader 的结果。\n\nRedis 的 `SET key value NX PX milliseconds` 命令是实现分布式互斥锁最常用的原语。NX（Not eXists）保证只有 key 不存在时才能设置成功，PX 设置毫秒级过期时间。这两个参数在同一条命令中原子执行，避免了先 SETNX 再 EXPIRE 的两步操作中间崩溃导致的死锁问题。Redis 2.6.12 开始支持这种一体化语法，生产环境不应该再用老式的 SETNX + EXPIRE 两条命令组合。\n\n## 二、互斥锁方案的实现深入剖析\n\n### 2.1 题目代码的三个问题\n\n题目给出的代码能跑，但存在三个值得讨论的设计缺陷。\n\n**第一个问题：锁的 TTL 与数据库查询耗时的赛跑。** 代码中锁的 TTL 是 3 秒，如果数据库查询因为慢查询、锁等待或者网络抖动超过 3 秒还没返回，锁就自动过期了。此时第二批请求发现锁已释放，又有一个请求拿到锁去查数据库，可能同时有多个请求在查同一条数据。更危险的情况是第一个请求最终完成后执行 `defer rdb.Del(ctx, lockKey)`，这会删掉第二个请求刚加的锁，导致保护彻底失效。解决方案有两种：一是用 Lua 脚本做「只删自己的锁」——SET 的时候 value 用一个随机 UUID，DEL 之前先比较 value 是否匹配；二是用 Redisson 风格的 watchdog 机制，后台线程每隔 TTL/3 自动续期。\n\n**第二个问题：无限递归重试。** 没拿到锁的请求 sleep 50ms 后递归调用自身。如果数据库查询很慢（比如 5 秒），每个请求最多重试 100 次（5000ms / 50ms），10000 个请求总共产生近百万次 Redis GET 操作，这本身就是一个不小的负载。更致命的是如果数据库彻底挂了，锁持有者查询失败、不写缓存、释放锁，下一个请求拿到锁再失败，循环往复——所有请求都在无限重试，Redis 被 GET 请求打满，goroutine 数量暴涨最终 OOM。正确的做法是设置最大重试次数（3-5 次），超过后返回降级数据或错误。\n\n**第三个问题：defer Del 的释放时机。** 代码用 `defer rdb.Del(ctx, lockKey)` 释放锁，这意味着即使数据库查询失败了也会释放锁。如果失败的原因是数据库暂时不可用，释放锁后下一个请求又会去查数据库，相当于重试风暴打向一个不可用的数据库。一种改进是在数据库查询失败时不释放锁，让锁自然过期（3 秒后），这等于给数据库一个 3 秒的喘息窗口。\n\n### 2.2 生产级互斥锁实现（Go）\n\n下面给出修复了上述三个问题的完整实现：\n\n```go\nfunc GetProductWithMutex(ctx context.Context, id int64) (*Product, error) {\n    key := fmt.Sprintf(\"product:hot:%d\", id)\n    lockKey := fmt.Sprintf(\"lock:product:hot:%d\", id)\n    lockValue := uuid.New().String()\n\n    // 1. 查缓存\n    val, err := rdb.Get(ctx, key).Result()\n    if err == nil {\n        return deserialize(val)\n    }\n\n    // 2. 尝试获取互斥锁（TTL 建议 DB 超时时间的 2-3 倍）\n    ok, err := rdb.SetNX(ctx, lockKey, lockValue, 10*time.Second).Result()\n    if err != nil {\n        return nil, err\n    }\n\n    if ok {\n        // 拿到锁 → 查数据库 → 写缓存\n        product, err := db.QueryProduct(ctx, id)\n        if err != nil {\n            // 查库失败：不主动释放锁，让 TTL 自然过期保护数据库\n            return nil, fmt.Errorf(\"db query failed, lock will expire in TTL: %w\", err)\n        }\n        rdb.Set(ctx, key, serialize(product), 30*time.Minute)\n        // 用 Lua 脚本安全释放锁：只删自己的锁\n        unlockScript := redis.NewScript(`\n            if redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n                return redis.call(\"DEL\", KEYS[1])\n            end\n            return 0\n        `)\n        unlockScript.Run(ctx, rdb, []string{lockKey}, lockValue)\n        return product, nil\n    }\n\n    // 3. 没拿到锁 → 有限次重试，带退避\n    for i := 0; i < 3; i++ {\n        time.Sleep(time.Duration(50*(i+1)) * time.Millisecond) // 50ms, 100ms, 150ms\n        val, err := rdb.Get(ctx, key).Result()\n        if err == nil {\n            return deserialize(val)\n        }\n    }\n    return nil, ErrCacheBreakdownRetryExhausted\n}\n```\n\n这段代码相比题目版本有三个关键改进：锁的 value 是唯一 UUID 配合 Lua 脚本做安全释放；查库失败时不释放锁让 TTL 兜底；重试次数有上限并且采用递增退避。\n\n### 2.3 singleflight：进程内的更优解\n\nGo 标准库扩展包 `golang.org/x/sync/singleflight` 提供了一种进程内的请求合并机制。多个 goroutine 用同一个 key 调用 `Do()` 方法时，只有第一个调用会真正执行函数，其余调用阻塞等待并共享第一个调用的结果。它和 Redis 互斥锁的区别在于：singleflight 是进程内的，不需要网络往返，延迟极低；但它只在单个进程内生效，如果你有 20 个 Pod，每个 Pod 内部合并后仍然有 20 个请求打到数据库。\n\n```go\nvar g singleflight.Group\n\nfunc GetProductWithSingleflight(ctx context.Context, id int64) (*Product, error) {\n    key := fmt.Sprintf(\"product:hot:%d\", id)\n\n    val, err := rdb.Get(ctx, key).Result()\n    if err == nil {\n        return deserialize(val)\n    }\n\n    // 用 singleflight 合并并发请求\n    result, err, _ := g.Do(key, func() (interface{}, error) {\n        product, err := db.QueryProduct(ctx, id)\n        if err != nil {\n            return nil, err\n        }\n        rdb.Set(ctx, key, serialize(product), 30*time.Minute)\n        return product, nil\n    })\n    if err != nil {\n        return nil, err\n    }\n    return result.(*Product), nil\n}\n```\n\n生产中最佳实践是 **singleflight + Redis 互斥锁双层防护**。singleflight 在进程内把 10000 个 goroutine 合并为 1 个，Redis 互斥锁在集群层面把 20 个 Pod 的请求合并为 1 个。最终只有 1 个请求到达数据库。\n\n## 三、逻辑过期方案与四种策略对比\n\n### 3.1 逻辑过期：永不真正失效\n\n逻辑过期方案的核心思想是缓存永远不设物理 TTL（或设一个极长的 TTL 如 7 天），而是在缓存的 value 中嵌入一个逻辑过期时间字段。每次读缓存时检查这个逻辑时间，如果已过期，当前请求返回这个「旧但可用」的数据，同时异步启动一个线程去刷新缓存。这样用户永远不会遇到 cache miss，代价是在逻辑过期到异步刷新完成之间的窗口内（通常几百毫秒到几秒），用户读到的是过期数据。\n\n```go\ntype CacheEntry struct {\n    Data      string `json:\"data\"`\n    ExpireAt  int64  `json:\"expire_at\"` // 逻辑过期时间戳（秒）\n}\n```\n\n这个方案的优势是完全避免了击穿——缓存永远有数据可返回，不存在 miss 的瞬间。劣势是数据一致性最差，而且所有 key 都必须预热（因为 cache miss 时没有兜底逻辑），适合首页推荐、热搜排行榜这类对实时性要求不高但绝不能打垮数据库的场景。\n\n### 3.2 四种方案横向对比\n\n| 维度 | 互斥锁 | singleflight | 逻辑过期 | 永不过期 + 主动更新 |\n|------|--------|--------------|----------|--------------------|\n| 一致性 | 强（实时查库） | 强（实时查库） | 弱（短暂旧数据） | 弱（依赖更新触发） |\n| 可用性 | 中（等锁可能超时） | 高（进程内无网络开销） | 高（永远有数据返回） | 高（永远有数据返回） |\n| 复杂度 | 高（锁续期、安全释放） | 低（标准库一行代码） | 中（需要异步刷新机制） | 中（需要监听变更事件） |\n| 适用规模 | 分布式集群 | 单进程 | 分布式集群 | 分布式集群 |\n| 数据库压力 | 最小（全局 1 次查询） | 中等（每个 Pod 1 次） | 最小（异步 1 次） | 最小（事件驱动） |\n| 典型场景 | 商品秒杀详情页 | 通用后端服务 | 首页推荐榜单 | 配置中心、字典数据 |\n\n### 3.3 生产踩坑：锁粒度与重试风暴\n\n锁的粒度必须是 per-key 的（`lock:product:hot:{id}`），而不是全局的（`lock:product`）。全局锁意味着商品 A 在加载的时候商品 B 的请求也被阻塞，严重降低系统吞吐。但 per-key 也有代价：如果你有 10000 个热点 key 同时过期（雪崩 + 击穿同时发生），Redis 里会出现 10000 把锁，需要确保 Redis 本身扛得住这些额外的 SET NX 操作。\n\n重试风暴是互斥锁方案最容易被忽视的风险。假设数据库查询需要 2 秒，每个请求 50ms 重试一次，那么在这 2 秒内每个请求会产生约 40 次 Redis GET。10000 个并发请求意味着 40 万次额外的 Redis 读操作。解决方案除了限制重试次数外，还可以用指数退避（50ms → 100ms → 200ms）减少重试密度，或者结合 singleflight 让进程内只有一个 goroutine 在重试。\n\n还有一个容易忽略的点：缓存回填后要不要通知等待中的请求？在互斥锁方案中，等待的请求是通过「sleep + 重新读缓存」来获知结果的，存在一定的延迟浪费。如果用 Go 的 channel 或 Java 的 CountDownLatch 在进程内做通知，可以在锁持有者写完缓存后立即唤醒同进程内的所有等待者，这其实就是手工实现了 singleflight 的语义。所以如果你用的是 Go，直接用 singleflight 比自己搞 channel 通知简洁得多。",
+      "keyPoints": [
+        "缓存击穿是单个热点 key 过期瞬间大量请求同时穿透到数据库的现象，与缓存穿透和缓存雪崩是三个不同的问题",
+        "互斥锁方案使用 Redis SET NX PX 原子命令实现分布式锁，确保只有一个请求查库回填，其余请求等待重试读取缓存",
+        "锁的 value 必须是唯一标识（UUID），释放时通过 Lua 脚本比对 value 后再删除，防止误删其他请求加的锁",
+        "锁的 TTL 应设为数据库查询超时时间的 2-3 倍，查库失败时不主动释放锁而让 TTL 自然过期以保护数据库",
+        "singleflight 是进程内的请求合并机制，与 Redis 互斥锁形成双层防护：进程内合并 + 集群级合并，最终只有 1 个请求到达数据库",
+        "逻辑过期方案在 value 中嵌入过期时间戳，缓存永不真正失效，读到过期数据时返回旧值并异步刷新，牺牲一致性换取可用性",
+        "锁粒度必须是 per-key 而非全局锁，否则不同 key 之间会产生不必要的互斥阻塞，严重降低系统吞吐量",
+        "重试风暴是互斥锁方案最大的隐患，需通过限制最大重试次数、指数退避以及 singleflight 合并来控制重试密度"
+      ],
+      "quiz": [
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz1",
+          "question": "缓存击穿与缓存穿透的核心区别是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "击穿是大量 key 同时过期，穿透是单个 key 过期"
+            },
+            {
+              "id": "B",
+              "text": "击穿是热点 key 过期导致并发打到数据库，穿透是查询不存在的数据绕过缓存直达数据库"
+            },
+            {
+              "id": "C",
+              "text": "击穿发生在 Redis 集群模式下，穿透发生在单机模式下"
+            },
+            {
+              "id": "D",
+              "text": "击穿是 Redis 宕机导致的，穿透是数据库宕机导致的"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "缓存击穿的关键特征是「单个热点 key 失效 + 高并发」，大量请求在 key 过期的瞬间同时穿透到数据库。缓存穿透是请求的数据在缓存和数据库中都不存在，每次请求都会穿透缓存直达数据库。A 选项描述的「大量 key 同时过期」其实是缓存雪崩的特征，不是击穿。C 和 D 选项将问题与 Redis 部署模式或组件宕机挂钩，完全偏离了击穿和穿透的定义。"
+        },
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz2",
+          "question": "使用 Redis SET NX PX 实现互斥锁时，为什么锁的 value 要设为唯一标识（如 UUID）而不是固定值？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "UUID 可以提高 SET NX 命令的执行速度"
+            },
+            {
+              "id": "B",
+              "text": "防止锁过期后当前持有者误删其他请求新加的锁，导致互斥保护失效"
+            },
+            {
+              "id": "C",
+              "text": "Redis 要求 SET NX 的 value 必须唯一，否则命令会失败"
+            },
+            {
+              "id": "D",
+              "text": "UUID 可以让 Redis 自动识别锁的所有者并在超时后通知持有者"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "考虑这个场景：请求 A 拿到锁后查数据库，但查询耗时超过了锁的 TTL，锁自动过期。此时请求 B 拿到了新锁。如果 A 最终完成后直接执行 DEL 操作且 value 是固定值，它会删掉 B 的锁，导致第三个请求也能加锁成功，互斥保护就形同虚设了。用 UUID 作为 value，释放锁时先用 Lua 脚本比对 value 是否匹配再删除，就能保证每个请求只能释放自己加的锁。Redis 本身并不要求 value 唯一，也没有自动通知机制。"
+        },
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz3",
+          "question": "互斥锁方案中，如果获取锁的请求在查询数据库时崩溃了，锁会怎样？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "锁会永远存在，导致死锁，所有后续请求都无法获取锁"
+            },
+            {
+              "id": "B",
+              "text": "Redis 会检测到持有者崩溃并自动释放锁"
+            },
+            {
+              "id": "C",
+              "text": "锁会在 SET NX PX 设置的 TTL 到期后自动过期，后续请求可以重新竞争锁"
+            },
+            {
+              "id": "D",
+              "text": "需要其他请求手动调用 DEL 命令释放这把锁"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这正是 SET NX PX 中 PX 参数的核心作用——为锁设置一个过期时间作为死锁保护。当锁持有者崩溃、网络分区或任何原因导致无法主动释放锁时，Redis 会在 TTL 到期后自动删除这个 key，其他请求就能重新竞争锁。Redis 本身没有检测客户端存活状态并主动释放锁的机制，这纯粹依赖 TTL 的被动过期。如果使用老式的 SETNX + EXPIRE 两步操作，持有者在 SETNX 之后 EXPIRE 之前崩溃就会导致真正的死锁，这也是为什么必须使用原子化的 SET NX PX 语法。"
+        },
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz4",
+          "question": "互斥锁的 TTL 设为 3 秒，但数据库查询因慢查询耗时 5 秒。这种情况下最可能发生什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Redis 会自动延长锁的过期时间，直到持有者释放"
+            },
+            {
+              "id": "B",
+              "text": "锁在查询完成前过期，其他请求再次争抢锁并发查询数据库，而且第一个请求完成后的 DEL 可能误删新锁"
+            },
+            {
+              "id": "C",
+              "text": "数据库会因为锁过期而自动取消当前查询"
+            },
+            {
+              "id": "D",
+              "text": "其他请求会一直等待直到第一个请求完成，不受锁的 TTL 影响"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 没有自动续期机制（除非你自己实现 watchdog 模式）。锁在 3 秒后过期，其他请求发现锁已释放，新的请求拿到锁后也去查数据库，造成多个请求并发查库。更危险的是第一个请求在 5 秒后完成时执行 DEL，如果 value 不是唯一标识，它会把第二个请求的锁删掉，第三批请求又涌入。解决方案是让 TTL 大于数据库查询的超时时间（通常设为超时时间的 2-3 倍），或者实现类似 Redisson 的 watchdog 自动续期机制，后台线程每隔 TTL/3 重置过期时间。"
+        },
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz5",
+          "question": "关于 Go 的 singleflight 与 Redis 互斥锁的关系，以下哪个描述最准确？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "singleflight 可以完全替代 Redis 互斥锁，因为它更轻量且无网络开销"
+            },
+            {
+              "id": "B",
+              "text": "singleflight 在进程内合并请求，Redis 互斥锁在集群层面合并请求，两者组合形成双层防护最终只有 1 个请求到达数据库"
+            },
+            {
+              "id": "C",
+              "text": "两者功能完全相同，只是一个用 Go 实现一个用 Redis 实现"
+            },
+            {
+              "id": "D",
+              "text": "singleflight 只适用于读操作，Redis 互斥锁只适用于写操作"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "singleflight 的作用域是单个进程，如果你有 20 个 Pod，每个 Pod 内通过 singleflight 合并后仍然有 20 个请求（每个 Pod 1 个）打到数据库。Redis 互斥锁是分布式的，能在整个集群范围内保证只有 1 个请求查库。最佳实践是两者结合：singleflight 作为第一层在进程内把成千上万的 goroutine 合并为 1 个，Redis 互斥锁作为第二层在集群范围内再把 20 个 Pod 的请求合并为 1 个。singleflight 并非只适用于读操作，它对任何需要去重的并发调用都有效。"
+        },
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz6",
+          "question": "逻辑过期方案中，缓存的 value 需要包含哪些额外信息？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Redis 节点的 IP 地址和端口号"
+            },
+            {
+              "id": "B",
+              "text": "一个逻辑过期时间戳，用于判断数据是否「逻辑上」已经过期"
+            },
+            {
+              "id": "C",
+              "text": "数据库查询的 SQL 语句，以便异步刷新时使用"
+            },
+            {
+              "id": "D",
+              "text": "上次访问该 key 的客户端 ID"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "逻辑过期方案的核心机制是缓存不设物理 TTL（或设一个极长的 TTL 如 7 天），在 value 中嵌入一个 `expire_at` 字段标记逻辑过期时间。每次读取时比较当前时间与 `expire_at`，如果已过期则返回当前的旧数据同时异步触发缓存刷新。这样缓存永远有数据返回，不会出现 cache miss 的击穿瞬间。不需要在 value 中存储 Redis 节点信息、SQL 语句或客户端 ID，这些信息与逻辑过期机制无关。"
+        },
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz7",
+          "question": "为什么互斥锁的粒度应该是 per-key（如 lock:product:hot:8888）而不是全局锁（如 lock:product）？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "per-key 锁可以减少 Redis 的内存占用"
+            },
+            {
+              "id": "B",
+              "text": "全局锁会导致不同 key 之间产生不必要的互斥阻塞，严重降低系统吞吐量"
+            },
+            {
+              "id": "C",
+              "text": "Redis 不支持对同一个锁 key 的并发 SET NX 操作"
+            },
+            {
+              "id": "D",
+              "text": "per-key 锁可以避免 Redis 集群模式下的 CROSSSLOT 错误"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "如果使用全局锁 `lock:product`，当商品 8888 正在加载时，商品 9999 的请求也会因为抢不到锁而被阻塞，尽管两者完全没有关系。这相当于把本可以并行处理的请求强制串行化了。per-key 锁 `lock:product:hot:8888` 只阻塞同一个商品的请求，不同商品之间互不影响。虽然 per-key 锁确实比全局锁多占一些内存（每个热点 key 一个锁），但相比于吞吐量的提升，这点内存开销完全可以接受。Redis 支持对同一个 key 的并发 SET NX——这正是互斥锁的竞争机制。"
+        },
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz8",
+          "question": "在互斥锁方案中，获取锁的请求查询数据库失败后，最佳的锁处理策略是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "立即释放锁，让下一个请求尽快重试查询数据库"
+            },
+            {
+              "id": "B",
+              "text": "不主动释放锁，让锁的 TTL 自然过期，给数据库一个喘息的时间窗口"
+            },
+            {
+              "id": "C",
+              "text": "将锁的 TTL 延长到 1 小时以上，彻底保护数据库"
+            },
+            {
+              "id": "D",
+              "text": "通知所有等待中的请求数据库不可用，让它们立即返回错误"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "如果查库失败后立即释放锁（A 选项），下一个拿到锁的请求又会去查数据库，如果数据库本身就不可用，就会形成「加锁→查库失败→释放锁→下一个加锁→查库失败」的循环，相当于对一个不可用的数据库持续发起重试风暴。不释放锁让 TTL 自然过期（比如 10 秒后），等于给数据库一个短暂的冷却窗口。C 选项把 TTL 设得太长会影响数据库恢复后的正常缓存重建速度。D 选项在分布式场景下跨进程通知所有等待者实现成本极高，单靠 Redis 锁做不到这一点。"
+        },
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz9",
+          "question": "为什么使用 Lua 脚本而不是先 GET 再 DEL 两条命令来释放锁？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Lua 脚本比两条 Redis 命令执行速度更快"
+            },
+            {
+              "id": "B",
+              "text": "GET 和 DEL 之间不是原子操作，可能在 GET 之后 DEL 之前锁过期并被其他请求重新获取，导致误删新锁"
+            },
+            {
+              "id": "C",
+              "text": "Redis 不支持在同一个连接上连续执行 GET 和 DEL 命令"
+            },
+            {
+              "id": "D",
+              "text": "Lua 脚本可以跨多个 Redis 节点执行，而普通命令不行"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「先 GET 检查 value → 再 DEL 删除」这两步操作之间不是原子的。假设请求 A 执行 GET 发现 value 匹配，准备执行 DEL，但在这两条命令之间，锁恰好因 TTL 过期被删除，请求 B 拿到了新锁。此时 A 的 DEL 就会误删 B 的锁。Lua 脚本在 Redis 中是原子执行的——在脚本执行期间不会有其他命令插入，所以 GET + 比对 + DEL 整个过程是安全的。Redis 完全支持在同一连接上连续执行命令，Lua 脚本也不能跨节点执行（在 Cluster 模式下受 hash slot 限制）。"
+        },
+        {
+          "id": "redis-cache-breakdown-mutex-q1-quiz10",
+          "question": "以下哪种方案组合最适合生产环境中「首页热点商品」的缓存击穿防护？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "仅使用 singleflight，不使用 Redis 互斥锁"
+            },
+            {
+              "id": "B",
+              "text": "仅使用逻辑过期方案，缓存永不失效"
+            },
+            {
+              "id": "C",
+              "text": "singleflight（进程内合并）+ Redis 互斥锁（集群级合并）双层防护"
+            },
+            {
+              "id": "D",
+              "text": "完全不做防护，依赖数据库连接池的排队机制自然限流"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "单独使用 singleflight（A 选项）只能在进程内合并请求，多个 Pod 仍然会各自发起一次数据库查询，在大规模集群中保护力度不够。逻辑过期方案（B 选项）虽然能完全避免击穿，但需要预热所有热点 key 且数据一致性较差，不适合价格等需要较高实时性的商品信息。D 选项是放弃防护，数据库连接池排队只能在连接池耗尽前起作用，10000 并发远超连接池容量，后续请求会直接报错。C 选项的双层防护是目前业界公认的最佳实践：singleflight 在每个 Pod 内部以零网络开销将海量 goroutine 合并为 1 个请求，Redis 互斥锁再在集群层面保证全局只有 1 个请求查库，兼顾了性能和一致性。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Redis SET command documentation",
+          "url": "https://redis.io/commands/set/"
+        },
+        {
+          "title": "Go singleflight package",
+          "url": "https://pkg.go.dev/golang.org/x/sync/singleflight"
+        }
+      ]
+    }
+  ]
+}
