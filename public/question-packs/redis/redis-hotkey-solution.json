@@ -1,0 +1,157 @@
+{
+  "id": "redis-hotkey-solution",
+  "name": "热 Key 解决方案",
+  "domain": "redis",
+  "description": "通过本地缓存和 Key 分散策略解决 Redis 热 Key 问题的方案与实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-hotkey-solution-q1",
+      "domain": "redis",
+      "type": "modification",
+      "difficulty": 2,
+      "tags": ["Redis", "热Key", "本地缓存", "Key分散", "负载均衡"],
+      "title": "热 key 的本地缓存 + key 分散方案",
+      "content": "## 场景背景\n\n你所在的团队维护一个商品详情服务，后端用 Go 编写，8 个实例部署在 Kubernetes 上，所有商品数据缓存在一个 Redis Cluster（6 主 6 从，Redis 7.0.11）中。平时系统运行平稳，Redis 单节点 QPS 大约在 3 万左右。\n\n某天运营上线了一个爆款促销活动，商品 `product:1001` 被推到首页 banner。活动开始 10 分钟后，监控告警开始疯狂报警。你打开 Grafana 看到以下现象：\n\n```\n[告警] redis-cluster-node-3 CPU 使用率 97.3%（阈值 80%）\n[告警] redis-cluster-node-3 QPS 突增至 12.8 万（基线 3 万）\n[告警] 商品详情接口 P99 延迟从 8ms 飙升至 320ms\n[告警] redis-cluster-node-3 连接数 4892（maxclients 10000）\n```\n\n其余 5 个主节点的 QPS 和 CPU 都没有明显变化，只有 node-3 一个节点负载爆炸。你快速用 `redis-cli --hotkeys` 确认了情况：\n\n```bash\n$ redis-cli -h redis-node-3 -p 6379 --hotkeys\n# Scanning the entire keyspace to find hot keys as reported by LFU.\n\n[00.00%] Hot key found so far with counter 255 --- product:1001\n[23.05%] Hot key found so far with counter 12  --- product:5523\n[58.41%] Hot key found so far with counter 8   --- product:3310\n\n-------- summary -------\nSampled 158432 keys in the keyspace!\nhot key found with counter: 255\tkeyname: product:1001\nhot key found with counter: 12\tkeyname: product:5523\nhot key found with counter: 8\tkeyname: product:3310\n```\n\n`product:1001` 的 LFU counter 已经打满 255，其他 key 最多才 12。这就是典型的热 key 问题——单个 key 的请求量集中打到它所在的那个 slot 对应的节点上，造成单点过载。\n\n面试官问你：**针对这种热 key 场景，你会怎么改造系统来解决？具体说说本地缓存和 key 分散这两种方案的实现思路、各自的优缺点，以及在生产环境中你会怎么把它们组合使用。**",
+      "answer": "## 第一步：热 Key 问题的核心概念基础\n\n### 什么是热 Key\n\n所谓热 Key（Hot Key），是指 Redis 中某个或某几个 key 在短时间内被极高频率地访问，导致这些 key 所在的 Redis 节点承受了远超其他节点的负载。在 Redis Cluster 架构下，每个 key 通过 CRC16 哈希被分配到 16384 个 slot 中的某一个，每个 slot 由一个特定的主节点负责。这意味着无论你的集群有多少个节点，对同一个 key 的所有请求最终都会落到同一个节点上——这就是热 key 的根本危险所在。\n\n热 Key 的产生通常有几种典型场景：电商大促时被推到首页的爆款商品、社交平台上突然爆火的热搜话题、秒杀活动中被抢购的商品库存计数器，以及明星出轨上热搜时对应的微博详情缓存。这些场景有一个共同特征：访问流量在极短时间内集中到了单一 key 上，而 Redis Cluster 的分片机制对此完全无能为力——它只能保证 key 在不同节点之间分布均匀，不能保证单个 key 的流量被分散。\n\n### 热 Key 的危害有多大\n\n一个 Redis 节点在普通硬件上的极限 QPS 大约在 8-12 万（取决于 value 大小和命令复杂度）。当热 key 的请求量超过这个阈值时，这个节点的 CPU 会被打满，命令队列开始积压，响应延迟从亚毫秒级飙升到几百毫秒。更糟糕的是，同一个节点上还有其他正常 key 的请求——这些无辜的请求也会被拖慢，产生「连带伤害」。如果客户端设置了较短的超时时间（比如 100ms），大量请求会超时重试，形成重试风暴，进一步加剧节点负载，最终可能导致该节点彻底不可用，触发 Cluster 的故障转移。\n\n### 怎么发现热 Key\n\n在讲解决方案之前，先说说怎么发现热 Key。Redis 4.0 之后提供了 `redis-cli --hotkeys` 命令，它基于 LFU 淘汰策略的 counter 来识别高频访问的 key（需要 `maxmemory-policy` 设置为 LFU 系列）。另外你可以通过 `MONITOR` 命令实时观察所有请求（但生产环境慎用，它本身会消耗大量资源），或者通过代理层（如 Twemproxy、Codis）在请求转发时做统计。大厂的做法通常是在客户端 SDK 层面做热 key 探测——每个实例统计本地的 key 访问频率，超过阈值的 key 上报到一个集中式的热 key 发现服务。\n\n## 第二步：两种核心解决方案的深度解析\n\n### 方案一：本地缓存（L1 Cache）\n\n本地缓存的核心思想非常直接：既然热 key 的问题是所有请求都打到同一个 Redis 节点，那就在应用实例的进程内存中缓存一份热 key 的值，让大部分读请求直接命中本地内存，根本不走网络到 Redis。\n\n在 Go 中实现本地缓存有几种常用选择。最轻量的是 `sync.Map`，它是标准库提供的并发安全 map，适合读多写少的场景——热 key 缓存恰好是这个特征。更专业的选择是 `bigcache` 或 `freecache` 这类专为高并发设计的本地缓存库，它们通过避免 GC 扫描（把数据序列化到 `[]byte` 中）来消除大量缓存条目对 Go GC 的影响。在 Java 生态中，Caffeine 是当之无愧的首选，它提供了基于 W-TinyLFU 的淘汰算法和异步刷新机制；Google Guava Cache 也是经典选择，但性能不如 Caffeine。\n\n下面是一个 Go 服务中本地缓存热 key 的典型实现：\n\n```go\npackage hotcache\n\nimport (\n\t\"context\"\n\t\"sync\"\n\t\"time\"\n\n\t\"github.com/redis/go-redis/v9\"\n)\n\n// HotKeyCache 热 key 本地缓存\ntype HotKeyCache struct {\n\tlocal    sync.Map          // 本地缓存: key -> *cacheEntry\n\trdb      *redis.ClusterClient\n\tlocalTTL time.Duration     // 本地缓存过期时间，通常 1-5 秒\n}\n\ntype cacheEntry struct {\n\tValue     string\n\tExpireAt  time.Time\n}\n\nfunc NewHotKeyCache(rdb *redis.ClusterClient, localTTL time.Duration) *HotKeyCache {\n\treturn &HotKeyCache{rdb: rdb, localTTL: localTTL}\n}\n\n// Get 先查本地缓存，未命中或过期则回源 Redis\nfunc (c *HotKeyCache) Get(ctx context.Context, key string) (string, error) {\n\t// 第一层：本地缓存查询，零网络开销\n\tif entry, ok := c.local.Load(key); ok {\n\t\te := entry.(*cacheEntry)\n\t\tif time.Now().Before(e.ExpireAt) {\n\t\t\treturn e.Value, nil // 本地命中，延迟 < 100ns\n\t\t}\n\t\tc.local.Delete(key) // 已过期，清除\n\t}\n\n\t// 第二层：回源 Redis\n\tval, err := c.rdb.Get(ctx, key).Result()\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\n\t// 写入本地缓存，TTL 设置为较短时间（如 2 秒）\n\tc.local.Store(key, &cacheEntry{\n\t\tValue:    val,\n\t\tExpireAt: time.Now().Add(c.localTTL),\n\t})\n\treturn val, nil\n}\n```\n\n本地缓存的核心优势是零网络延迟——一次本地内存读取的耗时在 100 纳秒以内，而一次 Redis 网络请求即使在同机房内也要 0.5-1 毫秒。当你有 8 个应用实例、本地缓存 TTL 设为 2 秒时，每个实例每 2 秒最多只会有一次请求穿透到 Redis，热 key 在 Redis 上的实际 QPS 从 12.8 万降到大约 4（8 个实例 ÷ 2 秒一次）。这个效果是立竿见影的。\n\n但本地缓存有两个核心挑战。第一是一致性问题：8 个实例各自维护一份本地缓存，当数据在 Redis 中被更新时，各实例的本地缓存不会同步失效。在 TTL 过期之前的这段时间窗口内，不同实例可能返回不同版本的数据。对于商品详情这种场景，2 秒的不一致通常可以接受；但对于库存、价格这类敏感数据就要谨慎。第二是内存压力：如果热 key 不止一个而是成千上万个，本地缓存会占用大量应用进程内存，可能触发 Go 的 GC 压力或 Java 的 Young GC 频率上升。所以本地缓存更适合「少量超级热 key」的场景，而不是对所有 key 都开启。\n\n### 方案二：Key 分散（Key Splitting / Sharding）\n\nKey 分散的核心思想是：把一个热 key 复制成 N 份，分散到不同的 Redis 节点上，读的时候随机挑一份读。这样原本集中在一个节点上的 12.8 万 QPS 就被均匀分散到 N 个节点上，每个节点只承受约 12.8 万/N 的 QPS。\n\n具体的做法是：把 `product:1001` 这个 key 拆成 `product:1001:shard0`、`product:1001:shard1`、……、`product:1001:shardN-1`，写入时同时写 N 份，读取时随机选一个后缀去读。由于 Redis Cluster 的 slot 分配是基于 key 名做 CRC16 哈希的，不同后缀的 key 大概率会被分配到不同的 slot 甚至不同的节点上，从而实现流量分散。\n\n```go\npackage hotshard\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"math/rand\"\n\t\"time\"\n\n\t\"github.com/redis/go-redis/v9\"\n)\n\nconst ShardCount = 8 // 分散到 8 个副本\n\ntype HotKeySharder struct {\n\trdb *redis.ClusterClient\n}\n\nfunc NewHotKeySharder(rdb *redis.ClusterClient) *HotKeySharder {\n\treturn &HotKeySharder{rdb: rdb}\n}\n\n// shardKey 生成带后缀的分散 key\nfunc shardKey(originalKey string, shardIdx int) string {\n\treturn fmt.Sprintf(\"%s:shard%d\", originalKey, shardIdx)\n}\n\n// SetHotKey 写入时同时写 N 份副本\nfunc (s *HotKeySharder) SetHotKey(ctx context.Context, key, value string, ttl time.Duration) error {\n\tpipe := s.rdb.Pipeline()\n\tfor i := 0; i < ShardCount; i++ {\n\t\tpipe.Set(ctx, shardKey(key, i), value, ttl)\n\t}\n\t_, err := pipe.Exec(ctx)\n\treturn err\n}\n\n// GetHotKey 读取时随机选一个副本\nfunc (s *HotKeySharder) GetHotKey(ctx context.Context, key string) (string, error) {\n\tidx := rand.Intn(ShardCount)\n\treturn s.rdb.Get(ctx, shardKey(key, idx)).Result()\n}\n```\n\nKey 分散的优势在于它完全在 Redis 层面解决问题，不依赖应用内存，也不存在多实例之间的一致性问题（所有实例读的都是 Redis 中的数据）。劣势同样明显：写入复杂度从 O(1) 变成了 O(N)——每次更新都要写 N 份，如果其中某几份写失败了，就会出现分片之间数据不一致的问题。更新操作不是原子性的，在更新过程中不同分片可能返回新旧两个版本的值。另外 N 份副本意味着 N 倍的内存占用。\n\n## 第三步：生产环境的组合方案与进阶实践\n\n### 组合使用：自动探测 → 本地缓存 → 回源降级\n\n在真实的生产环境中，最常见的做法是把本地缓存和热 key 自动探测结合起来，形成一个闭环：客户端 SDK 在每次请求时统计各 key 的访问频率，当某个 key 在滑动窗口内（比如 10 秒）的访问次数超过阈值（比如 1000 次）时，自动将其标记为热 key 并提升到本地缓存；本地缓存 TTL 过期后，如果该 key 仍然是热 key 就续期，否则降级回普通的 Redis 读取路径。这个模式的好处是完全自动化——运营推什么商品到首页、什么话题突然上热搜，系统都能自适应，不需要人工干预。\n\nKey 分散则更适合作为「提前已知会成为热 key」的场景的预案。比如你知道明天有大促，提前把主推商品的 key 做分散写入。或者在秒杀场景中，库存 key 天然就是热 key，一开始就用分散方案来设计。\n\n### Redis 7.0 的内置方案：Client-Side Caching\n\nRedis 6.0 引入、7.0 进一步完善的 `CLIENT TRACKING` 功能，本质上就是 Redis 官方提供的「服务端感知的本地缓存」方案。它的工作机制是：客户端通过 `CLIENT TRACKING ON` 开启追踪模式，之后每次 GET 一个 key，Redis 服务端会记录「这个客户端缓存了这个 key」。当这个 key 被其他客户端修改时，Redis 通过 invalidation message（失效通知）主动告诉缓存了该 key 的客户端「你的本地缓存过期了」。客户端收到通知后清除对应的本地缓存条目，下次请求就会重新从 Redis 读取最新值。\n\n```bash\n# 开启 Client-Side Caching（广播模式，追踪以 product: 开头的 key）\n127.0.0.1:6379> CLIENT TRACKING ON BCAST PREFIX product:\nOK\n\n# 当 product:1001 被修改时，所有追踪了这个前缀的客户端\n# 会收到一条 invalidation 消息：\n# 1) \"invalidate\"\n# 2) 1) \"product:1001\"\n```\n\n`CLIENT TRACKING` 有两种模式：默认模式和广播模式（BCAST）。默认模式会精确追踪每个客户端缓存了哪些 key，内存开销较大但通知精确；广播模式只按前缀匹配，任何以指定前缀开头的 key 被修改时通知所有订阅了该前缀的客户端——通知粒度粗一些但服务端内存开销小得多。Go 的 `go-redis/v9` 库从 v9.1.0 开始原生支持 Client-Side Caching（通过 `ClientSideCaching` 选项），Java 的 Lettuce 6.x 和 Jedis 5.x 也都提供了对应的 API。\n\n这个方案相比纯本地缓存的最大优势是一致性有保障——数据变更后 Redis 主动推送失效通知，本地缓存能在毫秒级别内失效，而不是等 TTL 自然过期。劣势是它依赖 Redis 服务端维护追踪表（tracking table），追踪大量 key 时会增加 Redis 的内存和 CPU 开销。Redis 7.0 默认的追踪表大小是 `tracking-table-max-keys = 0`（无限制），生产环境建议设一个合理上限。\n\n### 常见坑点\n\n本地缓存最容易踩的坑是缓存击穿叠加——当本地缓存 TTL 同时过期，所有实例在同一时刻一起回源 Redis，瞬间把热 key 的 QPS 打上去。解决方法是给 TTL 加一个随机抖动（jitter），比如 TTL 设为 `2s + rand(0, 500ms)`，让各实例的过期时间错开。另一个常见问题是在 Go 中使用 `sync.Map` 缓存大量 key 时，map 中的 `interface{}` 指针会被 GC 扫描。如果缓存条目超过几万个，建议换用 `bigcache`（它把数据存在 `[]byte` 切片中，GC 只看到一个大对象而不是几万个小对象，scan 时间从几十毫秒降到微秒级）。Key 分散方案最大的坑是写入失败处理——pipeline 写 8 个分片，如果其中 2 个失败了，你需要决定是重试还是回滚。实践中通常选择重试加最终一致，并在读端加上 fallback 逻辑（某个分片读不到就换一个分片读）。",
+      "keyPoints": [
+        "热 Key 的本质是 Redis Cluster 按 CRC16 哈希分配 slot，同一 key 的所有请求必然落到同一节点，无法通过增加节点来分散单 key 流量",
+        "本地缓存（L1 Cache）在应用进程内存中缓存热 key 值，一次内存读取约 100ns 而 Redis 网络请求约 0.5-1ms，8 个实例配合 2 秒 TTL 可将 Redis 热 key QPS 从 12.8 万降至约 4",
+        "Go 中轻量场景用 sync.Map，大量缓存条目用 bigcache/freecache 避免 GC 压力；Java 中首选 Caffeine（W-TinyLFU 淘汰算法），经典方案用 Guava Cache",
+        "本地缓存的核心代价是多实例间的一致性窗口——TTL 过期前各实例可能返回不同版本数据，对库存/价格等敏感字段需要额外处理",
+        "Key 分散将 product:1001 拆成 product:1001:shard0..shardN，读时随机选一个后缀，把 12.8 万 QPS 均分到 N 个节点上，但写入复杂度从 O(1) 变为 O(N) 且非原子",
+        "生产最佳模式是自动探测闭环：客户端 SDK 统计滑动窗口内 key 访问频率，超阈值自动提升到本地缓存，冷却后自动降级回 Redis 读取路径",
+        "Redis 7.0 的 CLIENT TRACKING（Client-Side Caching）通过服务端主动推送 invalidation 消息实现毫秒级本地缓存失效，比纯 TTL 方案一致性更强",
+        "本地缓存 TTL 需加随机 jitter 避免多实例同时过期引发集中回源，Go 中 sync.Map 缓存超过万级条目时应换用 bigcache 降低 GC 扫描开销"
+      ],
+      "quiz": [
+        {
+          "id": "redis-hotkey-solution-q1-quiz1",
+          "question": "在 Redis Cluster 中，热 Key 问题的根本原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 单线程模型无法利用多核 CPU 处理大量请求" },
+            { "id": "B", "text": "同一个 key 经 CRC16 哈希后固定分配到同一个 slot 和节点，无法通过增加节点分散单 key 流量" },
+            { "id": "C", "text": "Redis Cluster 的主从复制延迟导致读请求无法分流到从节点" },
+            { "id": "D", "text": "Redis 的 maxmemory 限制导致热 key 被频繁淘汰和重建" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "热 Key 的根本原因是 Redis Cluster 的分片机制决定了同一个 key 永远落在同一个 slot 上，而一个 slot 只由一个主节点负责。无论你把集群扩到多少个节点，对 product:1001 的所有请求都会打到它所在的那个节点。A 选项虽然 Redis 主线程是单线程，但这是影响单节点吞吐上限的因素而不是热 key 的根因，即使是多线程数据库也会有热 key 问题。C 选项中从节点确实可以分担读流量，但默认配置下客户端只读主节点，且即使开启 READONLY 也只是缓解而非根治。D 选项与热 key 的成因无关。"
+        },
+        {
+          "id": "redis-hotkey-solution-q1-quiz2",
+          "question": "使用本地缓存（L1 Cache）解决热 Key 问题时，最核心的收益是什么？",
+          "choices": [
+            { "id": "A", "text": "提升了数据的持久化安全性，即使 Redis 宕机数据也不会丢失" },
+            { "id": "B", "text": "消除了网络往返开销，将热 key 读取延迟从毫秒级降到纳秒级，同时让 Redis 节点的实际 QPS 降低数个数量级" },
+            { "id": "C", "text": "解决了 Redis Cluster 的 slot 分布不均匀问题" },
+            { "id": "D", "text": "实现了多个应用实例之间的缓存数据强一致性" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "本地缓存的核心价值在于绕过网络——一次进程内存读取约 100ns，而 Redis 请求即使在同机房也要 0.5-1ms，差了 4 个数量级。8 个实例配合 2 秒 TTL，热 key 在 Redis 上的实际 QPS 从十几万降到个位数。A 选项完全不对，本地缓存是易失的进程内存，跟持久化没有关系。C 选项也不对，本地缓存不改变 slot 分配。D 选项恰恰相反——本地缓存引入的是多实例之间的一致性窗口问题，各实例在 TTL 内可能返回不同版本数据。"
+        },
+        {
+          "id": "redis-hotkey-solution-q1-quiz3",
+          "question": "在 Go 中，对于热 key 本地缓存超过数万个条目的场景，为什么推荐用 bigcache 替代 sync.Map？",
+          "choices": [
+            { "id": "A", "text": "sync.Map 不是并发安全的，高并发下会 panic" },
+            { "id": "B", "text": "sync.Map 中的 interface{} 指针会被 GC 逐一扫描，大量条目导致 GC pause 飙升；bigcache 将数据序列化到 []byte 切片中，GC 只看到一个大对象" },
+            { "id": "C", "text": "bigcache 底层使用了 mmap 系统调用，直接操作物理内存比 sync.Map 快 10 倍" },
+            { "id": "D", "text": "sync.Map 不支持 TTL 过期功能，需要手动实现过期清理" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go 的 GC 在标记阶段需要扫描所有堆上的指针。sync.Map 内部用 interface{} 存储每个 entry，几万个 entry 就意味着几万个指针需要被 GC 扫描，scan 时间可能达几十毫秒。bigcache 的核心设计是把所有 value 序列化成 []byte 存到预分配的大切片中，GC 只需扫描这一个切片的 header（一个指针），scan 时间降到微秒级。A 选项不对，sync.Map 本身就是并发安全的，这是它的设计目的。C 选项不对，bigcache 没有使用 mmap，它就是普通的 Go 堆内存分配。D 选项虽然 sync.Map 确实没有内置 TTL，但这不是换用 bigcache 的主要原因，手动实现 TTL 并不复杂。"
+        },
+        {
+          "id": "redis-hotkey-solution-q1-quiz4",
+          "question": "Key 分散方案中，将 product:1001 拆成 product:1001:shard0 到 product:1001:shard7，读取时随机选一个后缀。这些分散 key 一定会落在不同 Redis 节点上吗？",
+          "choices": [
+            { "id": "A", "text": "一定会，Redis Cluster 保证不同 key 名分配到不同节点" },
+            { "id": "B", "text": "不一定，CRC16 哈希后不同 key 名可能落在同一个 slot，但概率上大部分会分散到不同节点" },
+            { "id": "C", "text": "只要使用了 hash tag（大括号语法），就一定会分散到不同节点" },
+            { "id": "D", "text": "一定会，因为 16384 个 slot 远大于分片数量，不会冲突" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis Cluster 用 CRC16(key) mod 16384 来决定 key 属于哪个 slot。不同的 key 名经过哈希后，可能碰巧映射到同一个 slot——这是哈希碰撞，概率虽低但完全有可能。8 个分散 key 在概率上大部分会落到不同 slot 进而分布在不同节点上，但没有绝对保证。A 和 D 选项都错在「一定」二字，哈希函数不保证不同输入映射到不同输出。C 选项恰好说反了——hash tag（如 {product:1001}:shard0）反而会让所有带相同 tag 的 key 落到同一个 slot，这正是 key 分散方案要避免使用 hash tag 的原因。"
+        },
+        {
+          "id": "redis-hotkey-solution-q1-quiz5",
+          "question": "运维同学执行 `redis-cli --hotkeys` 后发现某个 key 的 LFU counter 为 255，这说明什么？",
+          "choices": [
+            { "id": "A", "text": "这个 key 恰好被访问了 255 次" },
+            { "id": "B", "text": "这个 key 的 LFU 对数计数器已达到 8 位上限，实际访问次数可能达数百万级，是当前实例中访问频率最高的 key" },
+            { "id": "C", "text": "这个 key 的 TTL 还剩 255 秒" },
+            { "id": "D", "text": "这个 key 的 value 大小为 255 字节" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis LFU 使用 8 位对数计数器（logc），范围 0-255。它不是每次访问加 1 的线性计数器，而是采用概率递增机制——counter 越大每次访问成功加 1 的概率越低。默认 lfu-log-factor=10 时，counter 达到 255 需要大约 1000 万次访问。所以 counter=255 意味着这个 key 的访问频率极高，已经打到了计数器的上限，是毫无疑问的热 key。A 选项把对数计数器理解成了线性计数器，这是最常见的误解。C 和 D 选项与 LFU counter 的含义完全无关。"
+        },
+        {
+          "id": "redis-hotkey-solution-q1-quiz6",
+          "question": "本地缓存方案中，8 个应用实例的本地缓存 TTL 都设为固定的 2 秒，可能引发什么问题？",
+          "choices": [
+            { "id": "A", "text": "TTL 太短导致本地缓存命中率极低，完全无法起到保护作用" },
+            { "id": "B", "text": "所有实例的缓存可能在同一时刻过期，导致瞬间全部回源 Redis 形成集中请求洪峰" },
+            { "id": "C", "text": "2 秒 TTL 会导致 Redis 中的原始 key 也被删除" },
+            { "id": "D", "text": "本地缓存 TTL 与 Redis key TTL 不一致会导致程序崩溃" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是本地缓存最经典的坑之一：缓存击穿叠加。如果 8 个实例在几乎同一时刻启动或首次缓存了同一个热 key，那么它们的本地缓存会在大约同一时刻过期。TTL 一过期，8 个实例同时发现本地无缓存，全部回源 Redis，瞬间产生 8 倍的请求量。解决方案是给 TTL 加随机 jitter，比如设为 2s + rand(0, 500ms)，让各实例的过期时间错开。A 选项不对，2 秒 TTL 对于 QPS 上万的热 key 来说命中率非常高（2 秒内可能有数万次本地命中）。C 和 D 选项都是对缓存机制的误解，本地缓存的 TTL 与 Redis 中 key 的 TTL 是完全独立的。"
+        },
+        {
+          "id": "redis-hotkey-solution-q1-quiz7",
+          "question": "对比本地缓存和 Key 分散两种方案，以下哪项描述是正确的？",
+          "choices": [
+            { "id": "A", "text": "本地缓存方案的一致性更好，因为数据存在应用进程内存中不会有网络延迟" },
+            { "id": "B", "text": "Key 分散方案不增加 Redis 的内存占用，因为只是改变了 key 的名称" },
+            { "id": "C", "text": "本地缓存适合少量超热 key 的读场景，Key 分散适合可提前预知的热 key 且对一致性要求较高的场景" },
+            { "id": "D", "text": "Key 分散方案的写入复杂度与单 key 相同，只有读取逻辑需要修改" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "本地缓存的强项是极低延迟和对 Redis 节点的极致保护，但代价是多实例间的数据不一致窗口，适合读多写少的少量超热 key。Key 分散把负载分到多个 Redis 节点上，所有实例读的都是 Redis 数据，一致性比纯本地缓存好（虽然更新多副本时也有短暂窗口），适合可以提前预知的热 key 场景。A 选项恰好说反了，本地缓存的最大弱点就是一致性。B 选项不对，N 个副本意味着 N 倍的内存占用。D 选项也不对，Key 分散方案的写入需要同时写 N 份副本，复杂度从 O(1) 变成 O(N)。"
+        },
+        {
+          "id": "redis-hotkey-solution-q1-quiz8",
+          "question": "线上出现热 Key 告警后，你需要在不停机的情况下快速缓解。以下哪种操作最快速有效？",
+          "choices": [
+            { "id": "A", "text": "立即对 Redis Cluster 做扩容，增加 3 个主节点并迁移 slot" },
+            { "id": "B", "text": "在客户端配置中临时开启本地缓存并推送热 key 名单，让请求在进程内命中" },
+            { "id": "C", "text": "把热 Key 的 TTL 设为 1 秒加速过期，减少访问量" },
+            { "id": "D", "text": "关闭 Redis Cluster 的 readonly 模式，强制所有读走主节点" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "热 Key 告警是紧急事件，需要最短时间内缓解。在客户端 SDK 层推送热 key 名单开启本地缓存是最快的手段——通常几秒内就能生效，所有实例开始在本地命中热 key，Redis 节点压力立即下降。A 选项扩容 Redis Cluster 并迁移 slot 至少需要几十分钟，而且即使扩容了，同一个 key 还是落在同一个节点上，根本不解决问题。C 选项设短 TTL 反而会让 key 频繁过期，导致缓存击穿加剧。D 选项方向也不对，readonly 模式是让从节点分担读请求的机制，关闭它会让情况更糟。"
+        },
+        {
+          "id": "redis-hotkey-solution-q1-quiz9",
+          "question": "Redis 7.0 的 CLIENT TRACKING（Client-Side Caching）相比纯 TTL 本地缓存方案，最关键的优势是什么？",
+          "choices": [
+            { "id": "A", "text": "完全消除了网络通信，所有读写都在本地完成" },
+            { "id": "B", "text": "数据变更时 Redis 主动推送 invalidation 消息使本地缓存毫秒级失效，一致性远优于等待 TTL 自然过期" },
+            { "id": "C", "text": "Redis 服务端不需要额外的内存开销来维护追踪信息" },
+            { "id": "D", "text": "支持所有 Redis 命令包括事务和 Lua 脚本的本地缓存" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "CLIENT TRACKING 的核心价值在于服务端感知的缓存失效——当某个 key 被修改时，Redis 主动向所有缓存了该 key 的客户端发送 invalidation 消息，客户端立即清除本地缓存。这样一致性窗口从纯 TTL 方案的秒级缩短到毫秒级。A 选项不对，CLIENT TRACKING 仍然需要网络通信，只是把「每次读都走 Redis」变成了「读本地 + 变更时收通知」。C 选项说反了，Redis 需要维护一个 tracking table 来记录哪些客户端缓存了哪些 key，这是有额外内存开销的，生产环境建议设置 tracking-table-max-keys 上限。D 选项也不对，Client-Side Caching 主要针对只读场景。"
+        },
+        {
+          "id": "redis-hotkey-solution-q1-quiz10",
+          "question": "Key 分散方案在写入 8 个分片副本时使用了 Pipeline，如果其中 2 个分片写入失败了，生产环境中最合理的处理策略是什么？",
+          "choices": [
+            { "id": "A", "text": "立即回滚所有已写入的 6 个分片，保证数据完全一致" },
+            { "id": "B", "text": "对失败的 2 个分片重试写入，同时在读端增加 fallback 逻辑——某分片读不到就换一个分片读，接受短暂的最终一致" },
+            { "id": "C", "text": "忽略失败的分片，只要有一个分片写成功就算成功" },
+            { "id": "D", "text": "暂停所有写入操作，等运维人工确认后再恢复" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "在分布式环境中，对 8 个分散 key 做原子性写入成本极高（需要分布式事务），而热 key 场景对一致性的要求通常是最终一致即可。最实用的策略是对失败分片做有限次数的重试（比如最多重试 3 次），同时在读端加 fallback——如果随机选中的分片返回了 nil 或报错，就换一个分片重试。大部分情况下 6 个成功的分片已经能承担绝大部分读流量。A 选项的回滚操作在 Redis Cluster 中很难实现原子性，且回滚意味着成功写入的数据也被删了，反而造成更大的可用性问题。C 选项过于粗糙，可能导致 2/8 的请求持续命中空分片。D 选项在高并发场景下暂停写入是不可接受的。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/manual/client-side-caching/",
+        "https://redis.io/commands/client-tracking/",
+        "https://github.com/allegro/bigcache",
+        "https://github.com/ben-manes/caffeine"
+      ]
+    }
+  ]
+}
