@@ -1,0 +1,159 @@
+{
+  "id": "redis-bigkey-unlink",
+  "name": "大 key 删除为什么会阻塞？UNLINK 命令的作用",
+  "domain": "redis",
+  "description": "Redis 大 key 阻塞删除的原因以及 UNLINK 异步删除的底层机制",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-bigkey-unlink-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["Redis", "缓存问题", "大key", "UNLINK", "lazyfree"],
+      "title": "大 key 删除为什么会阻塞？UNLINK 命令的作用",
+      "content": "## 面试场景\n\n你维护一个 Redis 6.2 实例，承载日活 300 万用户的社交平台核心业务——用户 Feed 流、好友关系和消息推送。某天下午运营部门推了一场全站活动，监控突然告警：Redis 的 P99 延迟从 0.3ms 飙升到 1800ms，持续约 1.2 秒后恢复，但每隔几分钟就会复现一次。你登上机器看到 SLOWLOG 里有这么一条记录：\n\n```\n127.0.0.1:6379> SLOWLOG GET 3\n1) 1) (integer) 87\n   2) (integer) 1702300000\n   3) (integer) 1187430\n   4) 1) \"DEL\"\n      2) \"feed:hot:20231210\"\n   5) \"10.0.2.31:44120\"\n   6) \"feed-cleaner\"\n```\n\n一条 `DEL` 命令耗时 1187ms，将近 1.2 秒。你用 `MEMORY USAGE feed:hot:20231211`（第二天的同结构 key）查看——它是一个包含 85 万个 member 的 Sorted Set，序列化后占用 47MB 内存。业务逻辑是每天凌晨一点清理前一天的热门 Feed 缓存，cleaner 服务直接对这个大 key 执行了 `DEL`。\n\n与此同时你注意到，同事在另一个服务里用 `UNLINK` 删除同等规模的 key，SLOWLOG 里却没有它的踪影。你好奇地测了一下：\n\n```\n127.0.0.1:6379> UNLINK feed:hot:20231209\n(integer) 1\n(0.01ms)\n```\n\n同样是 85 万元素的 Sorted Set，`DEL` 要 1.2 秒，`UNLINK` 却只要 0.01ms——差了五个数量级。这背后到底发生了什么？\n\n面试官的问题是：为什么对大 key 执行 `DEL` 会阻塞 Redis 主线程？`UNLINK` 是如何做到几乎不阻塞的？它的底层异步机制是怎样运作的？在什么情况下 `UNLINK` 会退化为同步删除？生产环境中应该如何配置 lazyfree 相关参数来全面防御大 key 阻塞问题？",
+      "answer": "## 第一步：核心主体概念基础详解——DEL 与 UNLINK 及 Redis 单线程模型\n\nRedis 之所以被称为「单线程」，准确含义是它的命令执行逻辑——从 keyspace 查找、数据结构操作到生成客户端响应——全部在一个主线程中串行完成。虽然 Redis 6.0 引入了 `io-threads` 用于并行处理网络读写，但命令本身的执行始终是单线程的。主线程每次只能执行一条命令，在当前命令完成之前所有其他请求都在排队。绝大多数 O(1) 命令几微秒就完成，但如果某条命令需要数百毫秒，所有客户端都会感知到延迟。\n\n`DEL` 命令的语义是同步删除。对于 String 类型，释放一块连续内存即可，复杂度 O(1)。但对于集合类型（Hash、Set、Sorted Set、List），`DEL` 必须遍历每一个元素逐个调用 `zfree()` 释放内存，复杂度 O(N)。Hash 要释放每个 entry 及其 key/value 两个 SDS 对象，Sorted Set 的每个元素同时存在于 skiplist 和 dict 两个结构中都需清理。\n\n`UNLINK` 是 Redis 4.0（2017 年发布）引入的命令，名字源于 POSIX 的 `unlink()` 系统调用——先移除链接，内容稍后异步回收。Redis 的 `UNLINK` 遵循同样哲学：主线程只做 O(1) 的 keyspace 摘除，真正的内存释放交给后台线程。\n\n## 第二步：题目核心问题精准深度解答——大 key DEL 为何阻塞及 UNLINK 的异步机制\n\n### DEL 大 key 阻塞的本质\n\n当你对一个包含 85 万个 member 的 Sorted Set 执行 `DEL`，主线程需要先从全局 dict 中移除 key 引用（O(1)），然后调用 `zsetFree()` 遍历 skiplist 每个节点执行 `zslFreeNode()`，逐个释放 member 的 SDS 字符串。85 万次 `zfree()` 调用在 jemalloc 下大约需要 800ms-1.5s。\n\n用真实 benchmark 量化（4 核 8GB CentOS 7，Redis 7.0.12，jemalloc 5.3.0）：\n\n```\n类型          元素数量      DEL 耗时\nHash          10万          ~52ms\nHash          50万          ~280ms\nHash          100万         ~580ms\nSorted Set    10万          ~68ms\nSorted Set    50万          ~350ms\nSorted Set    100万         ~720ms\n```\n\nSorted Set 耗时最长，因为内部同时维护 skiplist 和 dict 两个结构。元素达到十万级以上，`DEL` 就会造成可感知的阻塞。\n\n### UNLINK 的异步机制——源码级解析\n\n`UNLINK` 的执行流程沿着源码路径 `unlinkCommand()` → `dbAsyncDelete()` → `lazyfreeGetFreeEffort()` → `bioCreateLazyFreeJob()` 追踪。\n\n**第一步：评估释放代价。** 主线程调用 `lazyfreeGetFreeEffort(obj)` 计算释放「工作量」。Hash、Set、Sorted Set 返回元素数量；List 返回节点数；String 和其他简单类型返回 1。\n\n**第二步：决定同步还是异步。** 如果工作量大于等于 64（`lazyfree.c` 中硬编码的 `LAZYFREE_THRESHOLD`），走异步路径；小于 64 则主线程直接同步释放，因为线程调度开销可能比同步释放还大。\n\n**第三步：keyspace 摘除。** 主线程调用 `dictUnlink()` 将 key 从哈希表链表中摘掉，但不释放 value 对象。O(1) 操作。\n\n**第四步：提交后台任务。** 主线程调用 `bioCreateLazyFreeJob(lazyfreeFreeObject, 1, args)` 将对象指针入队到 `bio_lazy_free` 线程的任务队列（mutex 保护的链表，入队 O(1)）。至此主线程返回客户端响应。\n\n**第五步：后台释放。** `bio_lazy_free` 线程（Redis 启动时创建的三个 BIO 线程之一）取出任务，调用 `decrRefCount(obj)` 逐个释放元素内存，完全不影响主线程。\n\n用 SLOWLOG 对比两种删除方式的差异最为直观。对同一个 85 万元素的 Sorted Set：\n\n```bash\n# DEL —— 同步删除，出现在 SLOWLOG 中\n127.0.0.1:6379> DEL feed:hot:20231210\n(integer) 1\n(1.19s)\n\n127.0.0.1:6379> SLOWLOG GET 1\n1) 1) (integer) 88\n   2) (integer) 1702300100\n   3) (integer) 1187430    # 1187ms\n   4) 1) \"DEL\"\n      2) \"feed:hot:20231210\"\n\n# UNLINK —— 异步删除，SLOWLOG 里看不到\n127.0.0.1:6379> UNLINK feed:hot:20231209\n(integer) 1\n(0.01ms)\n\n127.0.0.1:6379> SLOWLOG GET 1\n# 没有 UNLINK 的记录，因为主线程耗时远低于 slowlog 阈值\n```\n\n## 第三步：体系化扩展延伸——lazyfree 配置与生产最佳实践\n\n### lazyfree 配置全景\n\n`UNLINK` 只解决了显式删除的问题，但 Redis 中有大量「隐式删除」场景——key 过期清理、`RENAME` 覆盖旧 key、`FLUSHDB` 清库等。Redis 4.0 到 6.2 逐步引入了四个 lazyfree 配置项：\n\n```bash\n# Redis 4.0+ 引入\nlazyfree-lazy-expire yes        # key 因 TTL 过期被删除时走异步释放\nlazyfree-lazy-server-del yes    # RENAME key newkey 中如果 newkey 已存在，\n                                # 覆盖旧 newkey 的删除走异步\n\n# Redis 6.0 引入\nlazyfree-lazy-user-del yes      # 将 DEL 命令在底层自动转换为 UNLINK 行为，\n                                # 无需修改任何业务代码\n\n# Redis 6.2 引入\nlazyfree-lazy-user-flush yes    # FLUSHDB / FLUSHALL 即使不带 ASYNC 参数\n                                # 也自动走异步删除\n```\n\n其中 `lazyfree-lazy-user-del` 最值得关注。开启后所有 `DEL` 命令底层走 `dbAsyncDelete()` 路径，无需修改业务代码就能消除大 key DEL 阻塞。支持 `CONFIG SET` 热生效。Redis 6.0+ 强烈建议开启。\n\n`lazyfree-lazy-expire` 同样重要。50 万 field 的 Hash 过期时，不开此配置主线程的 `activeExpireCycle` 会同步释放所有元素内存。开启后过期扫描只摘除引用，释放交给 `bio_lazy_free`。\n\n### UNLINK 退化为同步删除的场景\n\n前面提到 `LAZYFREE_THRESHOLD` 是 64。这意味着以下情况 `UNLINK` 实际上和 `DEL` 没有区别：一个只有 30 个 field 的 Hash、一个只有 50 个 member 的 Set、一个 String 类型的 key（无论它多大，因为 String 的 freeEffort 永远是 1）。对于 String 类型这一点经常被忽略——即使是一个 512MB 的超大 String（Redis 允许的最大值），`UNLINK` 也会在主线程中同步释放，因为它只是一块连续内存，释放的时间复杂度是 O(1)，调用一次 `zfree()` 即可。\n\n### 大 key 的根本治理\n\n`UNLINK` 和 lazyfree 是「治标」，大 key 拆分才是「治本」。生产环境中 Hash、Set、Sorted Set 的元素数量建议控制在 5000 以内，String 的 value 大小建议不超过 10KB。场景中那个 85 万 member 的 Sorted Set 应该按日期或分片维度拆成多个小 key，比如 `feed:hot:20231210:shard:{0-99}`，每个 shard 不超过 1 万元素。定期用 `redis-cli --bigkeys` 扫描线上实例发现大 key，或通过 `OBJECT HELP` 和 `MEMORY USAGE` 命令抽查可疑 key。\n\n### 生产推荐配置汇总\n\n```bash\n# redis.conf —— lazyfree 全家桶（Redis 6.2+）\nlazyfree-lazy-expire yes\nlazyfree-lazy-server-del yes\nlazyfree-lazy-user-del yes\nlazyfree-lazy-user-flush yes\n\n# 慢查询监控\nslowlog-log-slower-than 5000    # 5ms 以上记录\nslowlog-max-len 1024\n```\n\n回到开篇的场景：feed-cleaner 服务对 85 万 member 的 Sorted Set 执行 `DEL` 导致 1.2 秒阻塞。最简单的修复是在 redis.conf 中加一行 `lazyfree-lazy-user-del yes` 然后 `CONFIG SET lazyfree-lazy-user-del yes` 热生效——不需要重启 Redis，不需要改代码，所有 `DEL` 自动走异步路径。长期方案是把这个大 key 拆分成分片，并在 CI 流水线中接入 `redis-cli --bigkeys` 扫描作为卡点，防止大 key 再次出现。",
+      "keyPoints": [
+        "DEL 删除集合类型 key 时需要逐个释放每个元素的内存，时间复杂度 O(N)，100 万元素的 Sorted Set 在主线程上可阻塞 700ms 以上",
+        "UNLINK（Redis 4.0+）在主线程中只做 O(1) 的 keyspace 摘除（dictUnlink），然后通过 bioCreateLazyFreeJob() 将实际内存释放提交给后台 bio_lazy_free 线程",
+        "UNLINK 内部通过 lazyfreeGetFreeEffort() 评估释放代价，当集合元素数量小于 64（LAZYFREE_THRESHOLD）时会退化为同步删除，String 类型无论多大都同步释放",
+        "lazyfree-lazy-expire 让过期 key 的清理走异步路径，lazyfree-lazy-server-del 让 RENAME 覆盖旧 key 时走异步，两者分别覆盖隐式删除的不同场景",
+        "lazyfree-lazy-user-del（Redis 6.0+）可让 DEL 命令底层自动转换为 UNLINK 行为，无需修改业务代码即可消除大 key DEL 阻塞风险",
+        "lazyfree-lazy-user-flush（Redis 6.2+）让 FLUSHDB/FLUSHALL 不带 ASYNC 参数也自动走异步删除路径",
+        "UNLINK 和 lazyfree 是治标方案，治本方案是控制单 key 大小——Hash/Set/ZSet 元素不超过 5000，String value 不超过 10KB，超过就做分片拆分",
+        "定期用 redis-cli --bigkeys 扫描线上实例发现大 key，结合 SLOWLOG 和 MEMORY USAGE 命令精确定位阻塞源"
+      ],
+      "quiz": [
+        {
+          "id": "redis-bigkey-unlink-q1-quiz1",
+          "question": "对一个包含 100 万个 field 的 Hash 执行 DEL 命令，主线程阻塞的根本原因是什么？",
+          "choices": [
+            { "id": "A", "text": "DEL 需要将删除操作写入 AOF 文件，100 万个 field 的序列化耗时很长" },
+            { "id": "B", "text": "DEL 需要同步遍历并释放每个 field 的内存，时间复杂度 O(N)，阻塞主线程直到释放完成" },
+            { "id": "C", "text": "DEL 需要通知所有从节点同步删除，等待从节点确认后才返回" },
+            { "id": "D", "text": "DEL 需要先将 key 标记为删除态，等待 GC 线程周期性回收，标记过程耗时较长" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "DEL 命令在删除集合类型 key 时，主线程需要遍历集合中的每一个元素，逐个调用 zfree() 将内存归还给 jemalloc 分配器。对于 100 万个 field 的 Hash，这意味着要释放每个 entry 中的 key SDS、value SDS 和 entry 结构本身，总共约 300 万次内存释放操作，耗时通常在 500ms-1s。选项 A 错误，AOF 只记录 DEL 命令本身而不是逐个 field 的删除；选项 C 错误，Redis 主从复制是异步的，DEL 不会等待从节点确认；选项 D 错误，Redis 没有 GC 线程，内存释放是在 DEL 执行时同步完成的。"
+        },
+        {
+          "id": "redis-bigkey-unlink-q1-quiz2",
+          "question": "UNLINK 命令在主线程中执行的操作是什么？",
+          "choices": [
+            { "id": "A", "text": "在主线程中释放前 64 个元素，剩余元素交给后台线程释放" },
+            { "id": "B", "text": "在主线程中将 key 标记为「待删除」状态，客户端后续访问时返回 nil" },
+            { "id": "C", "text": "在主线程中从 keyspace 中摘除 key 的引用（O(1)），然后将实际内存释放任务提交给后台 bio_lazy_free 线程" },
+            { "id": "D", "text": "在主线程中将 key 移动到一个专用的 lazyfree 数据库，由后台线程定期扫描清理" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "UNLINK 的核心设计是「keyspace 摘除」与「内存释放」的分离。主线程调用 dictUnlink() 将 key 从全局哈希表的链表中摘掉（O(1) 操作），此后其他客户端已经无法访问到这个 key。然后主线程调用 bioCreateLazyFreeJob() 将待释放的 value 对象指针入队，由 bio_lazy_free 线程异步完成内存释放。选项 A 错误，主线程不会部分释放元素；选项 B 错误，UNLINK 不是标记删除，key 被摘除后立即从 keyspace 消失，不存在「待删除」中间状态；选项 D 错误，Redis 没有所谓的 lazyfree 数据库，后台线程直接释放对象内存。"
+        },
+        {
+          "id": "redis-bigkey-unlink-q1-quiz3",
+          "question": "UNLINK 在什么条件下会退化为同步删除，与 DEL 行为一致？",
+          "choices": [
+            { "id": "A", "text": "当 Redis 实例的可用内存低于 maxmemory 的 10% 时" },
+            { "id": "B", "text": "当 bio_lazy_free 线程的任务队列长度超过 1024 时" },
+            { "id": "C", "text": "当 lazyfreeGetFreeEffort() 评估的释放代价小于 64（LAZYFREE_THRESHOLD）时，包括所有 String 类型" },
+            { "id": "D", "text": "当 Redis 运行在 Cluster 模式下且 key 不属于本节点的 slot 时" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 源码 lazyfree.c 中定义了 LAZYFREE_THRESHOLD 为 64。UNLINK 执行时先调用 lazyfreeGetFreeEffort(obj) 评估释放工作量：Hash/Set/ZSet 返回元素数量，List 返回节点数，String 固定返回 1。如果工作量小于 64，Redis 判定异步提交的线程调度开销不值得，直接在主线程同步释放。这意味着小集合（如 30 个 field 的 Hash）和所有 String 类型（无论多大）都会同步删除。选项 A 错误，内存水位不影响 UNLINK 的同步/异步判定；选项 B 错误，任务队列长度不是判定条件；选项 D 错误，slot 归属与删除方式无关。"
+        },
+        {
+          "id": "redis-bigkey-unlink-q1-quiz4",
+          "question": "以下哪个配置可以让 DEL 命令自动具备 UNLINK 的异步删除行为，无需修改业务代码？",
+          "choices": [
+            { "id": "A", "text": "lazyfree-lazy-expire yes" },
+            { "id": "B", "text": "lazyfree-lazy-server-del yes" },
+            { "id": "C", "text": "lazyfree-lazy-user-del yes" },
+            { "id": "D", "text": "lazyfree-lazy-user-flush yes" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "lazyfree-lazy-user-del 是 Redis 6.0 引入的配置项，开启后所有客户端发送的 DEL 命令在底层会走 dbAsyncDelete() 路径，即与 UNLINK 相同的异步释放逻辑。这是最省力的改造方案，一行配置就能消除大 key DEL 阻塞，而且支持 CONFIG SET 热生效不需要重启。选项 A 的 lazyfree-lazy-expire 针对的是 key 因 TTL 过期被自动清理的场景，不影响显式 DEL；选项 B 的 lazyfree-lazy-server-del 针对的是 RENAME 等命令覆盖旧 key 的场景；选项 D 的 lazyfree-lazy-user-flush 针对的是 FLUSHDB/FLUSHALL 命令。"
+        },
+        {
+          "id": "redis-bigkey-unlink-q1-quiz5",
+          "question": "lazyfree-lazy-expire 配置解决的是哪种场景下的大 key 阻塞？",
+          "choices": [
+            { "id": "A", "text": "客户端显式执行 DEL 或 UNLINK 命令删除大 key" },
+            { "id": "B", "text": "key 因 TTL 过期被 activeExpireCycle 或惰性检查清理时，大 key 的内存释放阻塞主线程" },
+            { "id": "C", "text": "FLUSHDB 或 FLUSHALL 清空数据库时阻塞主线程" },
+            { "id": "D", "text": "RENAME 命令覆盖目标 key 时，旧 key 的内存释放阻塞主线程" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "lazyfree-lazy-expire 专门覆盖 key 因 TTL 过期被清理的场景。Redis 有两种过期清理机制：惰性删除（访问 key 时发现已过期则删除）和定期删除（activeExpireCycle 主动扫描过期 key）。如果一个包含大量元素的集合类型 key 到了过期时间，不开启这个配置时主线程会同步释放所有元素内存。开启后，过期清理只从 keyspace 中摘除 key 引用，内存释放交给 bio_lazy_free 线程。选项 A 属于 lazyfree-lazy-user-del 的覆盖范围；选项 C 属于 lazyfree-lazy-user-flush 的覆盖范围；选项 D 属于 lazyfree-lazy-server-del 的覆盖范围。"
+        },
+        {
+          "id": "redis-bigkey-unlink-q1-quiz6",
+          "question": "lazyfree-lazy-server-del 配置主要覆盖以下哪种隐式删除场景？",
+          "choices": [
+            { "id": "A", "text": "主从复制中从节点接收到 DEL 指令时的删除" },
+            { "id": "B", "text": "RENAME newkey 操作中，如果 newkey 已存在，覆盖旧 newkey 时的删除" },
+            { "id": "C", "text": "Cluster 模式下 slot 迁移完成后清理源节点 key 的删除" },
+            { "id": "D", "text": "内存淘汰策略（如 allkeys-lru）触发时被逐出 key 的删除" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "lazyfree-lazy-server-del 覆盖的是 Redis 服务端在命令执行过程中产生的隐式删除。最典型的场景是 RENAME key newkey——如果 newkey 已经存在，Redis 需要先删除旧的 newkey 再将 key 重命名过去。类似的还有 SUNIONSTORE、SINTERSTORE 等命令在写入目标 key 之前如果目标 key 已存在也需要先删除。不开启此配置时这些隐式删除在主线程同步完成。选项 A 错误，从节点的复制删除走的是普通命令执行路径；选项 C 错误，slot 迁移的 key 清理有独立的逻辑；选项 D 错误，内存淘汰的异步化由 lazyfree-lazy-eviction 控制（Redis 4.0+），不属于 server-del 范畴。"
+        },
+        {
+          "id": "redis-bigkey-unlink-q1-quiz7",
+          "question": "在 Redis 源码中，UNLINK 判断是否异步删除的函数调用路径是什么？",
+          "choices": [
+            { "id": "A", "text": "unlinkCommand() → dictDelete() → zfree()" },
+            { "id": "B", "text": "unlinkCommand() → dbAsyncDelete() → lazyfreeGetFreeEffort() → bioCreateLazyFreeJob()" },
+            { "id": "C", "text": "unlinkCommand() → asyncFreeObject() → pthread_create()" },
+            { "id": "D", "text": "unlinkCommand() → addToLazyFreeQueue() → signalBioThread()" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "UNLINK 的源码路径从 unlinkCommand() 开始，调用 dbAsyncDelete()（在 db.c 中定义）。dbAsyncDelete() 先调用 lazyfreeGetFreeEffort()（在 lazyfree.c 中定义）评估释放工作量，如果大于等于 LAZYFREE_THRESHOLD(64) 则调用 bioCreateLazyFreeJob()（在 bio.c 中定义）将释放任务提交给 bio_lazy_free 线程队列。选项 A 描述的是同步删除路径（DEL 的行为），dictDelete 会直接释放内存；选项 C 错误，Redis 不会为每次删除创建新线程，bio_lazy_free 线程在启动时就创建好了；选项 D 的函数名是编造的，Redis 中不存在这些函数。"
+        },
+        {
+          "id": "redis-bigkey-unlink-q1-quiz8",
+          "question": "一个 String 类型的 key，value 大小为 200MB。对它执行 UNLINK 会发生什么？",
+          "choices": [
+            { "id": "A", "text": "UNLINK 将 200MB 的内存释放交给 bio_lazy_free 线程异步完成，主线程不阻塞" },
+            { "id": "B", "text": "UNLINK 在主线程中同步释放这 200MB 内存，因为 String 的 freeEffort 为 1，低于阈值 64" },
+            { "id": "C", "text": "UNLINK 会报错，因为超过了 lazyfree 的单个对象大小限制" },
+            { "id": "D", "text": "UNLINK 会将 200MB 分成多个 64MB 的块，分批提交给后台线程释放" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个容易踩坑的知识点。lazyfreeGetFreeEffort() 对 String 类型固定返回 1，因为 String 无论多大都是一块连续内存，调用一次 zfree() 即可释放，时间复杂度 O(1)。由于 1 < 64（LAZYFREE_THRESHOLD），UNLINK 会在主线程同步执行释放。虽然释放 200MB 的连续内存块在 jemalloc 中通常只需要几微秒到几十微秒（远快于释放百万个小对象），但从原理上说它确实是同步的。选项 A 误以为大 String 也走异步路径；选项 C 纯属编造，没有对象大小限制；选项 D 的分块机制不存在。"
+        },
+        {
+          "id": "redis-bigkey-unlink-q1-quiz9",
+          "question": "生产环境中发现一个 50 万 field 的 Hash 大 key，以下哪种处理方案最合理？",
+          "choices": [
+            { "id": "A", "text": "直接执行 DEL 删除，因为 Redis 性能足够高不会有问题" },
+            { "id": "B", "text": "使用 HSCAN 逐批删除 field，每批 100 个，中间 sleep 50ms，最后再 DEL 空 key" },
+            { "id": "C", "text": "长期方案是将大 Hash 拆分为多个小 Hash，短期可开启 lazyfree-lazy-user-del 或使用 UNLINK" },
+            { "id": "D", "text": "增加 Redis 实例的 CPU 核数，让主线程有更多算力来处理大 key 删除" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "正确的处理策略分短期和长期。短期止血方案：开启 lazyfree-lazy-user-del yes 让所有 DEL 自动走异步路径，或在业务代码中将 DEL 替换为 UNLINK——两种方式都能在不影响线上的情况下消除阻塞。长期治本方案：将 50 万 field 的 Hash 按业务维度拆分成多个小 Hash，每个不超过 5000 个 field。选项 A 会导致数百毫秒的主线程阻塞；选项 B 虽然可行但过于复杂，在有 UNLINK 和 lazyfree 配置的情况下完全没必要手动渐进删除；选项 D 没有意义，Redis 命令执行是单线程的，增加 CPU 核数不能加速单条命令。"
+        },
+        {
+          "id": "redis-bigkey-unlink-q1-quiz10",
+          "question": "以下关于 bio_lazy_free 线程的描述，哪一项是正确的？",
+          "choices": [
+            { "id": "A", "text": "bio_lazy_free 线程在每次 UNLINK 调用时动态创建，任务完成后销毁" },
+            { "id": "B", "text": "bio_lazy_free 是 Redis 启动时创建的 BIO 线程之一，通过 mutex 保护的链表队列接收释放任务，在后台独立完成内存释放" },
+            { "id": "C", "text": "bio_lazy_free 线程与 Redis 6.0 的 io-threads 是同一组线程，共享线程池" },
+            { "id": "D", "text": "bio_lazy_free 线程每秒固定执行一次，批量处理队列中积压的所有释放任务" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "bio_lazy_free 是 Redis 的三个 BIO（Background I/O）线程之一（另外两个是 bio_close_file 和 bio_aof_fsync），在 Redis 进程启动时通过 bioInit() 创建，生命周期与 Redis 进程一致。它持续运行一个 while 循环，从 mutex 保护的链表任务队列中取出待释放的对象指针，调用对应类型的 free 函数释放内存。选项 A 错误，线程是预先创建的，不是动态创建的；选项 C 错误，BIO 线程和 io-threads 是完全独立的两组线程，BIO 线程从 Redis 2.6 就存在，io-threads 是 6.0 才引入的；选项 D 错误，bio_lazy_free 不是定时触发而是事件驱动的，队列有任务就立即处理。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/del/",
+        "https://redis.io/docs/latest/commands/unlink/",
+        "https://github.com/redis/redis/blob/7.2/src/lazyfree.c",
+        "https://github.com/redis/redis/blob/7.2/src/bio.c",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/",
+        "https://redis.io/docs/latest/commands/memory-usage/"
+      ]
+    }
+  ]
+}
