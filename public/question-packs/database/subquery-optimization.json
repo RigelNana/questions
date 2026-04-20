@@ -1,0 +1,158 @@
+{
+  "id": "db-subquery-optimization",
+  "name": "子查询优化：半连接与物化",
+  "domain": "database",
+  "description": "深入剖析 MySQL 优化器对 IN/EXISTS 子查询的半连接改写与物化策略，涵盖 DuplicateWeedout、FirstMatch、LooseScan 等执行策略及其选择逻辑",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q093",
+      "domain": "database",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["MySQL", "子查询", "半连接", "物化", "Semijoin", "Materialization", "EXISTS", "IN"],
+      "title": "子查询优化：半连接与物化",
+      "content": "面试中问到「MySQL 子查询为什么慢」，大部分人的第一反应是「子查询会逐行执行，性能差」，然后给出一个「把子查询改写成 JOIN」的万能建议。这个回答在 MySQL 5.5 时代是对的，但在 MySQL 8.0 上已经过时了。现代 MySQL 优化器对子查询有一套完整的改写机制，如果你不理解这套机制，就可能做出「手动改写后性能反而更差」的错误决策。\n\n来看一个真实的生产场景。一张 orders 表有 500 万行，一张 vip_customers 表有 2 万行，你要找出「所有 VIP 客户的订单」：\n\n```sql\n-- 写法一：IN 子查询\nSELECT o.order_id, o.amount, o.order_date\nFROM orders o\nWHERE o.customer_id IN (\n  SELECT c.customer_id FROM vip_customers c WHERE c.level >= 3\n);\n\n-- 写法二：EXISTS 子查询\nSELECT o.order_id, o.amount, o.order_date\nFROM orders o\nWHERE EXISTS (\n  SELECT 1 FROM vip_customers c\n  WHERE c.customer_id = o.customer_id AND c.level >= 3\n);\n```\n\n在 MySQL 5.5 上，第一条 SQL 的 EXPLAIN 会显示 select_type 为 DEPENDENT SUBQUERY——优化器把非关联的 IN 子查询错误地当作关联子查询来执行，对 orders 表的每一行都执行一次子查询，500 万次子查询扫描直接把数据库打爆。但同样的 SQL 在 MySQL 8.0.36 上执行 EXPLAIN FORMAT=TREE，你会看到优化器将其改写为 semi-join，用 FirstMatch 或 Materialization 策略在毫秒级别完成。\n\n```\n-- MySQL 5.5 的 EXPLAIN 输出（灾难性的）\n+----+--------------------+-------+------+---------------+------+---------+------+---------+-------------+\n| id | select_type        | table | type | possible_keys | key  | key_len | ref  | rows    | Extra       |\n+----+--------------------+-------+------+---------------+------+---------+------+---------+-------------+\n|  1 | PRIMARY            | o     | ALL  | NULL          | NULL | NULL    | NULL | 5000000 | Using where |\n|  2 | DEPENDENT SUBQUERY | c     | ALL  | NULL          | NULL | NULL    | NULL |   20000 | Using where |\n+----+--------------------+-------+------+---------------+------+---------+------+---------+-------------+\n-- 外层 500 万行 × 子查询扫描 2 万行 = 1000 亿次比较！\n\n-- MySQL 8.0.36 的 EXPLAIN 输出（优化后）\n+----+-------------+-------+------+---------------------+---------+---------+-------------------+------+-------------+\n| id | select_type | table | type | possible_keys       | key     | key_len | ref               | rows | Extra       |\n+----+-------------+-------+------+---------------------+---------+---------+-------------------+------+-------------+\n|  1 | SIMPLE      | c     | ref  | idx_level           | idx_lvl | 4       | const             | 8500 | Using index |\n|  1 | SIMPLE      | o     | ref  | idx_customer_id     | idx_cid | 4       | c.customer_id     |   25 | FirstMatch  |\n+----+-------------+-------+------+---------------------+---------+---------+-------------------+------+-------------+\n-- select_type 变成 SIMPLE，子查询消失了！\n```\n\n这就是 MySQL 子查询优化的核心：优化器能够将 IN/EXISTS 子查询改写为半连接（Semi-join），然后在五种执行策略中选择代价最小的那一种。理解这套机制，是写出高效 SQL 和正确读懂 EXPLAIN 执行计划的关键。这道题考察的不只是「子查询慢不慢」的表面问题，而是你对 MySQL 优化器内部决策逻辑的掌握程度。",
+      "answer": "## 第一步：MySQL 子查询核心概念基础\n\n### 什么是子查询以及 MySQL 为什么需要优化它\n\n子查询（Subquery）是嵌套在另一条 SQL 内部的 SELECT 语句，可以出现在 WHERE、FROM、SELECT、HAVING 等子句中。子查询的核心价值在于它让 SQL 具备了「分步计算」的能力——先计算出一个中间结果，再基于这个结果做进一步的筛选或计算，全部在一条 SQL 中完成，而不需要应用层做多次数据库往返。\n\n按照与外层查询的依赖关系，子查询分为两类。非关联子查询（Non-correlated Subquery）不引用外层查询的任何列，可以独立执行并返回一个固定结果集，比如 `WHERE dept_id IN (SELECT dept_id FROM departments WHERE status = 'active')` 中的子查询就是非关联的。关联子查询（Correlated Subquery）引用了外层查询的列，必须对外层的每一行重新求值，比如 `WHERE EXISTS (SELECT 1 FROM departments d WHERE d.dept_id = e.dept_id)` 就是关联的。\n\n这两类子查询的「朴素执行模型」差异巨大。理想情况下，非关联子查询只需执行一次，拿到结果后外层逐行匹配即可；关联子查询在最坏情况下需要对外层每一行执行一次。假设外层有 N 行、子查询扫描 M 行，非关联子查询的理论代价是 O(N + M)，关联子查询的理论代价是 O(N × M)。\n\n但问题就出在「理想情况」三个字上。MySQL 在 5.5 及更早版本中，对 IN 子查询的处理存在一个臭名昭著的缺陷——即使子查询是非关联的，优化器也会将其转换为关联形式执行。这意味着一条 `WHERE id IN (SELECT id FROM t2)` 在语义上只需要执行一次子查询，但 MySQL 5.5 却会对外层的每一行都重新执行子查询。这就是为什么在 MySQL 5.5 时代「子查询一定要改写成 JOIN」成了铁律。\n\n### 子查询的基础用法与执行流程\n\n来看一个完整的可运行示例来建立直觉：\n\n```sql\n-- 建表和测试数据\nCREATE TABLE vip_customers (\n  customer_id INT PRIMARY KEY,\n  name VARCHAR(50),\n  level INT NOT NULL,\n  INDEX idx_level (level)\n);\n\nCREATE TABLE orders (\n  order_id INT PRIMARY KEY AUTO_INCREMENT,\n  customer_id INT NOT NULL,\n  amount DECIMAL(10,2),\n  order_date DATE,\n  INDEX idx_customer_id (customer_id)\n);\n\n-- 插入测试数据（简化）\nINSERT INTO vip_customers VALUES\n  (1001, '张三', 5), (1002, '李四', 3), (1003, '王五', 2), (1004, '赵六', 4);\n\nINSERT INTO orders VALUES\n  (1, 1001, 500.00, '2024-01-15'),\n  (2, 1001, 300.00, '2024-02-20'),\n  (3, 1002, 800.00, '2024-01-10'),\n  (4, 1005, 200.00, '2024-03-01'),  -- 非 VIP 客户\n  (5, 1003, 150.00, '2024-02-28');   -- level=2 不满足条件\n\n-- IN 子查询：找出 level >= 3 的 VIP 客户的所有订单\nSELECT o.order_id, o.amount\nFROM orders o\nWHERE o.customer_id IN (\n  SELECT c.customer_id FROM vip_customers c WHERE c.level >= 3\n);\n-- 结果：order_id 1,2,3（张三的两单 + 李四的一单）\n```\n\n从逻辑上理解，这条 SQL 的执行过程应该是：先执行子查询得到 `{1001, 1002, 1004}` 这个集合，然后扫描 orders 表逐行判断 customer_id 是否在集合中。MySQL 8.0 的优化器实际做的比这更聪明——它会把这个逻辑等价改写为一种特殊的 JOIN（半连接），让两个表通过索引高效匹配，而不是真的先物化一个集合再逐行扫描。\n\n## 第二步：半连接与物化——MySQL 子查询优化的核心机制\n\n### MySQL 5.5 的灾难：DEPENDENT SUBQUERY\n\n要理解 MySQL 5.6 引入的优化有多重要，先要理解 5.5 有多糟糕。在 MySQL 5.5 中，优化器处理 `WHERE x IN (SELECT y FROM t2 WHERE ...)` 的方式是将其内部转换为 `WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.y = outer.x AND ...)`。这个转换本身在语义上没问题，但问题是转换后子查询变成了关联子查询——它引用了 `outer.x`，必须对外层的每一行重新执行。\n\n对于一个外层 500 万行、子查询结果 2 万行的场景，MySQL 5.5 的实际执行是：扫描 orders 表 500 万行，每一行都执行一次子查询去 vip_customers 中查找匹配。即使子查询能走索引（每次 O(log M)），总代价也是 O(N × log M) = 5,000,000 × 14 ≈ 7000 万次索引查找。而理想方案只需要 O(N + M) = 502 万次操作。执行时间从几十毫秒膨胀到几十秒。\n\n在 EXPLAIN 中，这个问题的标志就是 select_type 列显示为 DEPENDENT SUBQUERY——即使你写的是非关联子查询，MySQL 5.5 也会把它标记为 DEPENDENT（依赖外层）。这是 MySQL 历史上最严重的优化器缺陷之一，直接导致了「MySQL 子查询性能差，必须改写为 JOIN」这条在整个行业流传了十几年的「最佳实践」。\n\n### MySQL 5.6 的转折：Semi-join 优化\n\nMySQL 5.6 引入了半连接（Semi-join）优化，彻底改变了 IN/EXISTS 子查询的执行方式。半连接的语义是「对于外层的每一行，只要在内层找到至少一个匹配就保留该行」——它不像普通 JOIN 那样对每个匹配都产出一行结果（可能产生重复），而是找到第一个匹配就停止。这恰好是 IN 和 EXISTS 的语义。\n\n优化器的改写过程是这样的：当遇到 `SELECT ... FROM t1 WHERE t1.x IN (SELECT t2.y FROM t2 WHERE ...)` 时，如果满足 semi-join 的适用条件（子查询不含 UNION、LIMIT、聚合等），优化器会将整个查询改写为一个特殊的内部表示——两个表的 semi-join。在 EXPLAIN 输出中最直观的变化是：select_type 从 DEPENDENT SUBQUERY 或 SUBQUERY 变成了 SIMPLE，子查询「消失」了，变成了一个普通的多表查询。\n\nMySQL 的 semi-join 实现提供了五种执行策略，优化器通过代价估算（Cost-Based Optimization）从中选择最优的一种：\n\n**FirstMatch 策略**：最直观的实现方式。优化器选择一个驱动表，对驱动表的每一行在另一个表中查找匹配，找到第一个匹配就立即跳到驱动表的下一行。EXPLAIN 的 Extra 列会出现 `FirstMatch(tbl_name)` 标记。这种策略本质上就是优化过的关联子查询——区别在于优化器可以自由选择哪个表做驱动表，而不是被迫用外层表驱动。当内层表很小且有索引时，选内层表做驱动表然后去外层表索引查找，效率远高于外层逐行驱动。\n\n**LooseScan 策略**：当子查询的关联列上有索引时，利用索引的有序性来去重。优化器扫描子查询表的索引，对于连续相同值只取第一条去和外层匹配。EXPLAIN 的 Extra 列显示 `LooseScan`。这种策略适合子查询表的关联列有大量重复值的场景——比如 orders 表的 customer_id 有很多重复，LooseScan 可以只对每个不同的 customer_id 值做一次外层匹配。\n\n**Materialization 策略（MaterializeLookup 和 MaterializeScan）**：将子查询执行一次，结果写入一张带哈希索引的内存临时表（物化表），然后外层查询通过哈希查找判断匹配。物化策略有两个变体：MaterializeLookup 是外层逐行驱动，对每一行通过哈希查找在物化表中判断是否匹配；MaterializeScan 是用物化表做驱动表，逐行扫描物化表后去外层索引查找。选择哪个变体取决于物化表和外层表的大小关系——物化表小就做驱动表（MaterializeScan），外层表小就用 Lookup。EXPLAIN 中会看到 `MATERIALIZED` 类型的临时表。\n\n**DuplicateWeedout 策略**：最通用但开销最大的策略。把 semi-join 当作普通 inner join 来执行（可能产生重复行），然后用一张临时表记录已经输出过的行的主键来去重。EXPLAIN 的 Extra 列显示 `Start temporary` 和 `End temporary` 标记。这种策略的优势是适用面广——当其他策略都不满足条件时（比如没有合适的索引），DuplicateWeedout 总是可以作为后备方案。代价是需要额外的临时表和去重操作。\n\n### 优化器如何选择策略\n\n优化器的选择逻辑基于代价模型（Cost Model）。每种策略的代价估算包括：驱动表扫描的 I/O 代价、索引查找次数、临时表的创建和查找开销、排序开销等。优化器会为每种可行策略计算总代价，选择代价最小的。\n\n影响策略选择的关键因素有四个。第一是索引可用性——子查询表和外层表上是否有关联列的索引直接决定了 FirstMatch 和 LooseScan 是否可行。第二是数据基数（Cardinality）——子查询结果的去重后行数影响物化表的大小，外层表的行数影响 Lookup 次数。第三是重复度——子查询关联列的重复程度影响 LooseScan 的效率。第四是内存限制——物化策略需要将子查询结果完整存入内存临时表（或溢出到磁盘），当结果集特别大时代价会急剧上升。\n\n在实际生产中，你可以用 EXPLAIN FORMAT=JSON 来查看优化器对每种策略的代价评估：\n\n```sql\nEXPLAIN FORMAT=JSON\nSELECT o.order_id FROM orders o\nWHERE o.customer_id IN (\n  SELECT c.customer_id FROM vip_customers c WHERE c.level >= 3\n);\n```\n\n在输出的 JSON 中搜索 `\"semijoin_strategy_choice\"` 字段，可以看到优化器评估过的所有策略及其代价值，这对排查「为什么优化器没选我期望的策略」非常有用。\n\n### EXPLAIN 中的标识变化\n\n识别 semi-join 优化是否生效的最直观标志是 EXPLAIN 输出中 select_type 列的值。如果 select_type 为 SIMPLE 且原来的子查询表出现在同一级的表列表中，说明优化器成功将子查询改写为 semi-join。如果仍然显示 DEPENDENT SUBQUERY 或 SUBQUERY，说明优化器未能改写，子查询仍在逐行执行。\n\nExtra 列的关键标记与策略的对应关系：`FirstMatch(tbl)` 对应 FirstMatch 策略，`LooseScan` 对应 LooseScan 策略，`Start temporary` / `End temporary` 对应 DuplicateWeedout 策略。物化策略则表现为 EXPLAIN 中多出一个 select_type 为 MATERIALIZED 的行，对应物化临时表的构建。\n\n## 第三步：进阶特性与生产实践\n\n### optimizer_switch 精细控制\n\nMySQL 通过 `optimizer_switch` 系统变量提供了对 semi-join 策略的精细控制。你可以在 session 级别开关特定策略来验证或强制特定行为：\n\n```sql\n-- 查看当前优化器开关状态\nSELECT @@optimizer_switch\\G\n\n-- 与 semi-join 相关的开关：\n-- semijoin=on                 总开关，关闭后所有 semi-join 策略失效\n-- materialization=on          控制物化策略\n-- firstmatch=on               控制 FirstMatch 策略\n-- loosescan=on                控制 LooseScan 策略\n-- duplicateweedout=on         控制 DuplicateWeedout 策略\n-- subquery_materialization_cost_based=on  物化的代价评估\n\n-- 示例：禁用 FirstMatch 强制走 Materialization\nSET optimizer_switch = 'firstmatch=off,loosescan=off,duplicateweedout=off';\n\nEXPLAIN FORMAT=TREE\nSELECT o.order_id FROM orders o\nWHERE o.customer_id IN (\n  SELECT c.customer_id FROM vip_customers c WHERE c.level >= 3\n);\n-- 此时优化器被迫选择 Materialization 策略\n\n-- 恢复默认设置\nSET optimizer_switch = 'firstmatch=on,loosescan=on,duplicateweedout=on';\n```\n\n这种手法在排查性能问题时非常有用——如果你怀疑优化器选择了错误的策略，可以逐一禁用策略来对比执行时间，确认哪种策略实际上最优。但不要在生产环境的全局配置中永久关闭任何策略，因为最优策略依赖具体查询和数据分布。\n\n### MySQL 8.0 的 Anti-join 优化\n\nMySQL 8.0.17 引入了 Anti-join 优化，解决了 NOT EXISTS 和 NOT IN 的性能问题。在此之前，`WHERE NOT EXISTS (...)` 只能以 Dependent Subquery 方式执行——对外层每一行执行一次子查询判断是否「不存在」匹配。8.0.17 之后，优化器可以将 NOT EXISTS 改写为 anti-join（一种特殊的 join 算法，保留在被驱动表中没有匹配的行），执行效率从 O(N × log M) 提升到 O(N + M)。\n\n对于 NOT IN，anti-join 优化有一个前提条件：子查询的 SELECT 列和外层的比较列都必须声明为 NOT NULL。如果列可能为 NULL，由于 SQL 三值逻辑的特殊性（任何值与 NULL 比较结果为 UNKNOWN），NOT IN 的语义无法等价转换为 anti-join。这也是为什么在表设计中对关联字段加 NOT NULL 约束不仅是数据完整性的要求，更是性能优化的前提。\n\n```sql\n-- 确认 anti-join 是否生效\nEXPLAIN FORMAT=TREE\nSELECT * FROM orders o\nWHERE NOT EXISTS (\n  SELECT 1 FROM vip_customers c WHERE c.customer_id = o.customer_id\n);\n-- 输出中出现 \"Nested loop antijoin\" 表示优化成功\n```\n\n### 派生表合并（Derived Table Merging）\n\n与子查询优化密切相关的还有 derived_merge 优化（MySQL 5.7 引入）。当子查询出现在 FROM 子句中形成派生表（Derived Table）时，旧版本 MySQL 会将其物化为临时表再与外层做 JOIN，而 derived_merge 优化可以将派生表「合并」到外层查询中，消除临时表。\n\n```sql\n-- 派生表写法\nSELECT * FROM (\n  SELECT customer_id, SUM(amount) AS total\n  FROM orders GROUP BY customer_id\n) AS sub\nWHERE sub.total > 1000;\n\n-- 如果没有 GROUP BY/DISTINCT/LIMIT 等阻止合并的结构，\n-- 简单的派生表会被优化器合并到外层：\nSELECT * FROM (\n  SELECT * FROM orders WHERE amount > 100\n) AS sub\nWHERE sub.order_date > '2024-01-01';\n-- 等价合并为：SELECT * FROM orders WHERE amount > 100 AND order_date > '2024-01-01'\n```\n\n控制这个行为的开关是 `optimizer_switch` 中的 `derived_merge=on|off`。当派生表包含聚合函数、DISTINCT、LIMIT、UNION 或窗口函数时，无法合并，必须物化。\n\n### CTE（WITH 子句）与子查询的优化差异\n\nMySQL 8.0 引入了 CTE（Common Table Expression，公用表表达式），语法使用 WITH 子句。在优化层面，CTE 与子查询有一个关键差异：非递归 CTE 默认被当作内联视图处理（与派生表相同规则），可以被 derived_merge 合并到外层。但在 MySQL 8.0.14 之前，CTE 总是被物化（即使可以合并），8.0.14 之后才支持 CTE 的合并优化。\n\n```sql\n-- CTE 写法\nWITH active_vip AS (\n  SELECT customer_id FROM vip_customers WHERE level >= 3\n)\nSELECT o.* FROM orders o\nWHERE o.customer_id IN (SELECT customer_id FROM active_vip);\n\n-- MySQL 8.0.14+ 优化器处理：\n-- 1. CTE 被内联展开\n-- 2. IN 子查询被改写为 semi-join\n-- 最终效果等同于直接写 IN 子查询的版本\n```\n\n需要注意的是，如果同一个 CTE 被引用了多次，MySQL 会将其物化为临时表避免重复计算。这是 CTE 相比内联子查询的一个优势场景——当你需要在一条 SQL 中多次引用同一个复杂子查询的结果时，CTE 只计算一次然后共享临时表，而写成内联子查询可能会被计算多次。\n\n### 生产环境实践与常见坑点\n\n第一个实践建议是不要盲目把子查询改写为 JOIN。在 MySQL 8.0 中，对于满足 semi-join 改写条件的 IN/EXISTS 子查询，优化器的处理已经足够智能。手动改写为 JOIN 后如果忘记加 DISTINCT，反而会引入重复行和额外的去重开销。正确做法是先用 EXPLAIN FORMAT=TREE 确认优化器的执行策略，只有当子查询确实无法被改写（显示为 DEPENDENT SUBQUERY）时才考虑手动改写。\n\n第二个坑是 optimizer_switch 的继承问题。在 MySQL 中，session 级别的 optimizer_switch 设置不会影响存储过程或触发器中的子查询——它们使用创建时的 global 设置。如果你在 session 中开启了某个优化但全局没开，可能会出现「手动执行很快但应用调用很慢」的诡异现象。\n\n第三个实践是统计信息的准确性直接影响策略选择。semi-join 的策略选择基于代价估算，而代价估算依赖表的统计信息（innodb_table_stats 和 innodb_index_stats）。如果统计信息过期（比如大批量导入数据后没有执行 ANALYZE TABLE），优化器可能基于错误的基数估算选择了次优策略。生产环境应该在大规模数据变更后主动执行 `ANALYZE TABLE` 更新统计信息。\n\n第四个高阶技巧是利用 optimizer hints 在 SQL 级别指定策略。MySQL 8.0.17 开始支持 `SEMIJOIN` 和 `NO_SEMIJOIN` hints：\n\n```sql\n-- 强制使用 Materialization 策略\nSELECT /*+ SEMIJOIN(@subq1 MATERIALIZATION) */ o.order_id\nFROM orders o\nWHERE o.customer_id IN (\n  SELECT /*+ QB_NAME(subq1) */ c.customer_id\n  FROM vip_customers c WHERE c.level >= 3\n);\n\n-- 禁止 semi-join 优化（退回到 Dependent Subquery，慎用！）\nSELECT /*+ NO_SEMIJOIN(@subq1) */ o.order_id\nFROM orders o\nWHERE o.customer_id IN (\n  SELECT /*+ QB_NAME(subq1) */ c.customer_id\n  FROM vip_customers c WHERE c.level >= 3\n);\n```\n\n这种方式比修改 optimizer_switch 更精确，只影响特定 SQL 而不影响 session 中其他查询的行为。在确认某条慢 SQL 因为策略选择不当而性能差时，hints 是最安全的干预手段。",
+      "keyPoints": [
+        "MySQL 5.5 对 IN 子查询的处理存在致命缺陷——将非关联子查询内部转换为关联形式执行（DEPENDENT SUBQUERY），导致执行次数从 1 次膨胀为外层行数次",
+        "MySQL 5.6 引入 semi-join 优化，将 IN/EXISTS 子查询改写为半连接（只需找到一个匹配就保留），EXPLAIN 中 select_type 从 DEPENDENT SUBQUERY 变为 SIMPLE 是优化生效的标志",
+        "Semi-join 提供五种执行策略：FirstMatch（找到首个匹配就跳下一行）、LooseScan（利用索引有序性对重复值去重）、MaterializeLookup/MaterializeScan（物化为哈希临时表）和 DuplicateWeedout（先 join 再用临时表去重）",
+        "物化策略（Materialization）的本质是将子查询执行一次，结果写入带唯一哈希索引的内存临时表，外层查找走 O(1) 的哈希查找，总代价 O(N+M) 远优于逐行执行的 O(N×logM)",
+        "优化器基于代价模型在五种策略中自动选择，关键影响因素包括索引可用性、数据基数（Cardinality）、关联列重复度和内存限制",
+        "optimizer_switch 中 semijoin、materialization、firstmatch、loosescan、duplicateweedout 五个开关可在 session 级别精细控制策略，但不要在全局永久关闭任何策略",
+        "MySQL 8.0.17 引入 Anti-join 优化让 NOT EXISTS 从逐行关联子查询提升为 O(N+M) 级别的反连接，但 NOT IN 的 anti-join 要求关联列声明为 NOT NULL",
+        "统计信息的准确性直接影响 semi-join 策略选择，大规模数据变更后需主动 ANALYZE TABLE 更新统计信息以避免优化器选择次优策略"
+      ],
+      "quiz": [
+        {
+          "id": "db-q093-quiz-01",
+          "question": "在 MySQL 5.5 中执行 WHERE id IN (SELECT id FROM t2) 时，即使子查询是非关联的，优化器实际会怎么处理？",
+          "choices": [
+            {"id": "A", "text": "将子查询执行一次后物化为临时表，外层通过哈希查找判断匹配"},
+            {"id": "B", "text": "内部将 IN 子查询转换为 EXISTS 关联子查询形式，对外层每一行都重新执行子查询"},
+            {"id": "C", "text": "自动改写为 semi-join 并选择 FirstMatch 策略执行"},
+            {"id": "D", "text": "将子查询结果缓存到 query cache 中，后续行直接从缓存读取"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MySQL 5.5 对 IN 子查询的处理有一个著名的缺陷：优化器会将 `WHERE x IN (SELECT y FROM t2)` 内部转换为 `WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.y = outer.x)` 的关联形式来执行。这导致 EXPLAIN 中 select_type 显示为 DEPENDENT SUBQUERY，即使原始子查询并不引用外层列。A 选项描述的物化策略是 MySQL 5.6+ 才引入的优化；C 选项的 semi-join 同样是 5.6 才有的；D 选项的 query cache 用于缓存完整 SQL 结果，不参与子查询内部执行。"
+        },
+        {
+          "id": "db-q093-quiz-02",
+          "question": "在 EXPLAIN 输出中，如何判断 MySQL 优化器成功将 IN 子查询改写为 semi-join？",
+          "choices": [
+            {"id": "A", "text": "select_type 列显示为 SUBQUERY，Extra 列显示 Using semijoin"},
+            {"id": "B", "text": "select_type 列变为 SIMPLE，子查询表出现在同一级的表列表中，Extra 列可能出现 FirstMatch 等标记"},
+            {"id": "C", "text": "select_type 列显示为 MATERIALIZED，type 列显示 semijoin"},
+            {"id": "D", "text": "id 列的值不变（都是 1），但 select_type 仍为 DEPENDENT SUBQUERY"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Semi-join 优化成功的最显著标志是 select_type 从 DEPENDENT SUBQUERY（或 SUBQUERY）变为 SIMPLE。这说明优化器已经将子查询「消除」了，把它合并到外层查询变成了一个普通的多表查询。Extra 列会根据具体策略显示不同标记：FirstMatch(tbl) 代表 FirstMatch 策略、LooseScan 代表松散扫描、Start temporary/End temporary 代表 DuplicateWeedout。A 选项中 Extra 不会直接显示 Using semijoin 这个字样；C 选项中 MATERIALIZED 只出现在物化临时表那一行而非主查询行；D 选项中 DEPENDENT SUBQUERY 恰恰说明优化没有成功。"
+        },
+        {
+          "id": "db-q093-quiz-03",
+          "question": "关于 Semi-join 的 LooseScan 策略，以下哪个描述最准确？",
+          "choices": [
+            {"id": "A", "text": "LooseScan 利用子查询关联列上索引的有序性，对连续相同值只取第一条去匹配外层，适合关联列重复度高的场景"},
+            {"id": "B", "text": "LooseScan 是对外层表做松散索引扫描，跳过重复的外层值来减少子查询执行次数"},
+            {"id": "C", "text": "LooseScan 对物化临时表做松散扫描，跳过哈希冲突的桶来提高查找效率"},
+            {"id": "D", "text": "LooseScan 是 DuplicateWeedout 的一种变体，用 loose index scan 代替临时表来去重"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "LooseScan 策略的核心思想是：如果子查询表的关联列上有索引，那么索引中相同值的记录是连续排列的。LooseScan 利用这一特性，对每组相同值只选取第一条记录去和外层表做匹配，等价于对子查询结果进行了去重，但不需要额外的临时表。这种策略在子查询关联列有大量重复值时效率特别高（比如 orders 表按 customer_id 做索引扫描，每个 customer_id 只取第一条）。B 选项错误地将 LooseScan 作用对象描述为外层表；C 选项混淆了物化表和索引扫描的概念；D 选项将 LooseScan 错误归类为 DuplicateWeedout 的变体，两者是完全独立的策略。"
+        },
+        {
+          "id": "db-q093-quiz-04",
+          "question": "MaterializeLookup 和 MaterializeScan 两种物化变体的选择依据是什么？",
+          "choices": [
+            {"id": "A", "text": "MaterializeLookup 用于 IN 子查询，MaterializeScan 用于 EXISTS 子查询"},
+            {"id": "B", "text": "MaterializeLookup 是外层逐行驱动通过哈希在物化表中查找，MaterializeScan 是用物化表做驱动表去外层索引查找，选择取决于哪个表更小"},
+            {"id": "C", "text": "MaterializeLookup 将物化表存在内存中，MaterializeScan 将物化表存在磁盘上"},
+            {"id": "D", "text": "MaterializeLookup 只物化去重后的结果，MaterializeScan 保留所有重复行"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "物化策略的两种变体反映了 Nested Loop Join 中「谁做驱动表」的经典问题。MaterializeLookup 以外层表为驱动表，对外层每一行通过物化表的哈希索引做 O(1) 查找，适合物化表较大但外层结果集较小的场景。MaterializeScan 以物化表为驱动表，扫描物化表的每一行然后通过外层表的索引查找匹配，适合物化表很小而外层表很大的场景。优化器通过比较两种方式的总代价来选择。A 选项错误地按子查询类型区分，实际两种变体都只用于 IN/EXISTS 被改写后的场景；C 选项错误描述存储位置差异，两者都优先使用内存临时表；D 选项错误，物化表总是自动去重的（带唯一索引）。"
+        },
+        {
+          "id": "db-q093-quiz-05",
+          "question": "以下 EXPLAIN Extra 列输出中，哪一组标记对应 DuplicateWeedout 策略？",
+          "choices": [
+            {"id": "A", "text": "Using index; FirstMatch(t1)"},
+            {"id": "B", "text": "Using temporary; Using filesort"},
+            {"id": "C", "text": "Start temporary; End temporary"},
+            {"id": "D", "text": "LooseScan; Using join buffer"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "DuplicateWeedout 策略在 EXPLAIN 中的标志性标记是 `Start temporary` 和 `End temporary`，分别出现在参与 semi-join 的第一个表和最后一个表的 Extra 列中。这对标记表示优化器在这几个表的 join 过程中使用了一张临时表来记录已经输出过的行主键，避免因 inner join 产生的重复行。A 选项是 FirstMatch 策略的标记；B 选项的 Using temporary + Using filesort 通常出现在 GROUP BY 或 ORDER BY 场景中，与 semi-join 无直接关系；D 选项混搭了 LooseScan 和 join buffer 两个不相关的标记。"
+        },
+        {
+          "id": "db-q093-quiz-06",
+          "question": "以下哪种情况会导致 MySQL 8.0 优化器无法对 IN 子查询进行 semi-join 改写？",
+          "choices": [
+            {"id": "A", "text": "子查询的 SELECT 列表中只有一列"},
+            {"id": "B", "text": "子查询中包含 UNION ALL 或 LIMIT 子句"},
+            {"id": "C", "text": "外层表和子查询表在同一个数据库中"},
+            {"id": "D", "text": "子查询的 WHERE 条件使用了 BETWEEN 范围查询"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MySQL 优化器对 semi-join 改写有严格的适用条件。当子查询中包含 UNION、UNION ALL、LIMIT、聚合函数（GROUP BY/HAVING/SUM/COUNT 等）、窗口函数、或者使用了 DISTINCT 时，优化器无法将其改写为 semi-join。这些结构使得子查询的语义无法简单等价于一个 semi-join 操作。此时 IN 子查询会退回到物化策略（不带 semi-join 的独立物化），EXISTS 子查询会退回到 Dependent Subquery。A 选项中 SELECT 列数不影响改写；C 选项中同库不同库不影响；D 选项的 BETWEEN 只是普通谓词条件，不影响 semi-join 改写。"
+        },
+        {
+          "id": "db-q093-quiz-07",
+          "question": "关于 MySQL 8.0.17 引入的 Anti-join 优化，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "Anti-join 将所有 NOT IN 子查询都能高效改写为反连接，无论列是否允许 NULL"},
+            {"id": "B", "text": "Anti-join 仅适用于 NOT EXISTS，对 NOT IN 完全无效"},
+            {"id": "C", "text": "Anti-join 对 NOT EXISTS 总是有效，对 NOT IN 则要求关联列声明为 NOT NULL 才能改写"},
+            {"id": "D", "text": "Anti-join 只是在 EXPLAIN 中的显示优化，实际执行仍然是 Dependent Subquery"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "MySQL 8.0.17 的 Anti-join 优化对 NOT EXISTS 是无条件适用的，因为 EXISTS 的语义是「是否存在匹配行」，不涉及值比较，NULL 不影响逻辑。但对 NOT IN 的 anti-join 改写有前提条件：子查询的 SELECT 列和外层的比较列都必须声明为 NOT NULL。原因是当子查询结果包含 NULL 时，`NOT IN (1, 2, NULL)` 因三值逻辑永远不为 TRUE，这个语义无法用 anti-join 表达。A 选项忽略了 NULL 约束要求；B 选项过于绝对，NOT IN 在列为 NOT NULL 时也能用 anti-join；D 选项错误，anti-join 是真正的执行优化而非显示优化。"
+        },
+        {
+          "id": "db-q093-quiz-08",
+          "question": "生产环境中一条 IN 子查询在大批量数据导入后突然变慢，EXPLAIN 显示优化器选择了 DuplicateWeedout 而非之前的 FirstMatch。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "数据导入导致表的统计信息过期，优化器基于错误的基数估算选择了次优策略，需要执行 ANALYZE TABLE 更新统计信息"},
+            {"id": "B", "text": "DuplicateWeedout 总是在数据量增大后被优化器优先选择，这是正常的自适应行为"},
+            {"id": "C", "text": "大批量导入使 buffer pool 被数据页占满，迫使优化器放弃需要内存的 FirstMatch"},
+            {"id": "D", "text": "数据导入时自动关闭了 firstmatch 开关，需要手动重新开启"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "MySQL 优化器的策略选择依赖 InnoDB 的统计信息（存储在 mysql.innodb_table_stats 和 innodb_index_stats 中），包括表的行数估算和索引的基数（Cardinality）。大批量数据导入后，如果没有触发自动统计信息更新（由 innodb_stats_auto_recalc 控制，默认开启但有延迟），优化器可能基于过期的统计信息做出错误决策。执行 `ANALYZE TABLE` 立即更新统计信息通常能解决问题。B 选项错误，策略选择基于代价而非数据量阈值；C 选项错误，FirstMatch 不需要额外内存临时表；D 选项错误，数据导入不会改变 optimizer_switch 设置。"
+        },
+        {
+          "id": "db-q093-quiz-09",
+          "question": "关于 MySQL 8.0 中 CTE（WITH 子句）与等价 IN 子查询的优化行为，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "CTE 在 MySQL 8.0 中始终被物化为临时表，即使只被引用一次也无法被内联展开"},
+            {"id": "B", "text": "MySQL 8.0.14+ 中非递归 CTE 可被合并到外层查询（derived_merge），被 IN 引用的 CTE 进一步可被改写为 semi-join，效果等同于直接写 IN 子查询"},
+            {"id": "C", "text": "CTE 被引用多次时每次都会重新计算，性能比重复写子查询更差"},
+            {"id": "D", "text": "CTE 的 WITH RECURSIVE 语法可以触发 semi-join 优化，比非递归 CTE 更高效"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MySQL 8.0.14 开始支持非递归 CTE 的 derived_merge 优化——如果 CTE 只被引用一次且不含阻止合并的结构（GROUP BY/DISTINCT/LIMIT/UNION/窗口函数），优化器会将 CTE 内联展开到外层查询中。当 CTE 出现在 IN 子查询中时，展开后的子查询继续适用 semi-join 改写规则，最终效果与直接写 IN 子查询完全一致。A 选项描述的是 8.0.14 之前的行为；C 选项错误，被引用多次的 CTE 会被物化一次然后共享临时表；D 选项错误，递归 CTE 由于需要迭代计算无法做 semi-join 改写。"
+        },
+        {
+          "id": "db-q093-quiz-10",
+          "question": "你在排查一条慢 SQL 时想确认优化器评估各种 semi-join 策略的代价值，应该使用哪个命令？",
+          "choices": [
+            {"id": "A", "text": "EXPLAIN FORMAT=TREE 可以显示每种备选策略的代价对比"},
+            {"id": "B", "text": "EXPLAIN FORMAT=JSON 中的 semijoin_strategy_choice 字段显示优化器评估过的所有策略及代价"},
+            {"id": "C", "text": "SHOW WARNINGS 在 EXPLAIN 之后会输出优化器的策略选择日志"},
+            {"id": "D", "text": "SET optimizer_trace = 'enabled=on' 后执行 SQL，再查询 INFORMATION_SCHEMA.OPTIMIZER_TRACE 获取完整的优化器决策过程"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "要查看优化器评估每种 semi-join 策略的详细代价值和决策过程，最完整的工具是 optimizer_trace。通过 `SET optimizer_trace = 'enabled=on'` 开启追踪后执行目标 SQL，再查询 `SELECT * FROM INFORMATION_SCHEMA.OPTIMIZER_TRACE`，可以看到优化器在 join_optimization 阶段对 FirstMatch、LooseScan、Materialization、DuplicateWeedout 逐一计算代价的完整记录，包括为什么排除某些策略。EXPLAIN FORMAT=TREE 只显示最终选中的执行计划；EXPLAIN FORMAT=JSON 中有部分代价信息但不含所有备选策略的对比；SHOW WARNINGS 配合 EXPLAIN 只能看到查询重写后的 SQL 文本而非策略代价。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/semijoins.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/subquery-materialization.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/switchable-optimizations.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/derived-table-optimization.html",
+        "https://dev.mysql.com/blog-archive/mysql-8-0-antijoin/"
+      ]
+    }
+  ]
+}
