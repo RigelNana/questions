@@ -1,0 +1,156 @@
+{
+  "id": "db-galera-cluster",
+  "name": "Galera Cluster 的特点与适用场景",
+  "domain": "database",
+  "description": "Galera Cluster同步多主复制的原理与适用场景",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q137",
+      "domain": "database",
+      "type": "purpose",
+      "difficulty": 3,
+      "tags": ["Galera", "多主复制", "高可用", "wsrep"],
+      "title": "Galera Cluster 的特点与适用场景",
+      "content": "在 MySQL 高可用方案的讨论中，Galera Cluster 是一个绕不开的话题。面试官问你「Galera Cluster 的特点与适用场景」，本质上是想考察你对同步多主复制方案的理解深度——你不仅要知道它是什么，还要能说清楚它内部的复制机制是怎么保证数据一致性的，以及在什么业务场景下应该用它、什么场景下绝对不该用。\n\nGalera Cluster 是基于 wsrep（Write Set Replication）API 实现的 MySQL/MariaDB 同步多主复制方案。它最核心的特征是所有节点都可以同时读写，且写入在所有节点之间是同步的——当一个事务在任意节点提交成功时，该事务的数据变更已经在集群中的所有节点上持久化。这与传统的 MySQL 异步主从复制形成了鲜明对比：异步复制中从库的数据可能落后主库几秒甚至几分钟，而 Galera 承诺的是「虚拟同步」——事务提交时 writeset 已经被所有节点接收并通过 certification 检查。\n\n但 Galera 不是万能的。它的同步复制机制意味着每一次写入都需要跨节点网络通信，写入延迟受集群中最慢节点的影响。在跨机房部署时，网络 RTT 直接叠加到事务提交时间上。此外，Galera 使用乐观并发控制——事务在本地执行，提交时才做冲突检测，如果两个节点同时修改同一行数据，其中一个事务会在 certification 阶段被回滚。这种设计决定了 Galera 天然不适合热点写入场景。\n\n真正有深度的回答需要涵盖三个层面：Galera 的复制流程（从本地 apply 到 writeset 广播、certification、commit 的完整链路），集群状态管理机制（IST 增量同步、SST 全量同步、gcache 环形缓冲），以及生产环境中的关键决策——什么时候选 Galera 而不是 MySQL Group Replication，怎么处理网络分区和脑裂，wsrep_slave_threads 怎么调。",
+      "answer": "## 一、Galera Cluster 核心概念基础\n\nGalera Cluster 是由 Codership 公司开发的 MySQL/MariaDB 同步多主复制插件，当前稳定版本为 Galera 4（对应 MySQL 8.0 / MariaDB 10.4+）。它通过 wsrep API 将 MySQL 的存储引擎层与复制层解耦，使得复制逻辑以插件形式嵌入数据库内核。Galera 的核心设计哲学是「certification-based replication」——基于认证的复制，这与传统的基于 binlog 位点的异步复制有本质区别。\n\n在传统 MySQL 主从架构中，主库将 binlog event 异步发送给从库，从库的 SQL thread 重放这些事件。这种模型的问题很明显：主库 crash 时未同步到从库的事务会丢失，从库可能读到过期数据。MySQL 5.7 引入的半同步复制（semi-sync）缓解了数据丢失问题，但本质上仍然是单主写入模型。\n\nGalera 的做法完全不同。集群中每个节点都是 Primary，都可以接收写入。当一个事务在节点 A 上执行时，InnoDB 正常处理读写操作，事务在本地 apply 所有变更。关键区别发生在 COMMIT 阶段：Galera 不是直接 commit，而是将事务产生的所有行级变更打包成一个 writeset，通过 Group Communication System（GCS）广播给集群中的所有节点。只有当所有节点都收到 writeset 并通过 certification 检查后，事务才会在发起节点真正 commit。\n\n以下是一个典型的 Galera 3 节点集群配置：\n\n```ini\n# /etc/mysql/conf.d/galera.cnf (Node 1)\n[mysqld]\nbinlog_format=ROW\ndefault_storage_engine=InnoDB\ninnodb_autoinc_lock_mode=2\ninnodb_flush_log_at_trx_commit=2\n\n# Galera Provider Configuration\nwsrep_on=ON\nwsrep_provider=/usr/lib/galera/libgalera_smm.so\nwsrep_cluster_name=\"prod_cluster\"\nwsrep_cluster_address=\"gcomm://192.168.1.101,192.168.1.102,192.168.1.103\"\nwsrep_node_address=\"192.168.1.101\"\nwsrep_node_name=\"node1\"\nwsrep_sst_method=mariabackup\nwsrep_slave_threads=4\n```\n\n注意 `innodb_autoinc_lock_mode=2` 是强制要求——Galera 需要 interleaved 模式来避免自增锁的跨节点死锁。`binlog_format=ROW` 也是强制的，因为 writeset 基于行级变更而非 SQL 语句。\n\n## 二、Galera 复制流程深度解析\n\nGalera 的复制流程分为四个阶段，理解这四个阶段是回答所有 Galera 相关问题的基础。\n\n第一阶段是本地执行（Local Apply）。事务在发起节点的 InnoDB 中正常执行，所有的行锁、MVCC 读取都和单机 MySQL 完全一致。此时事务对其他节点不可见。\n\n第二阶段是 Writeset 广播。当客户端发出 COMMIT 命令时，Galera 拦截这个 commit 请求，将事务修改的所有行（包括主键信息和修改前后的值）打包成 writeset，通过 GCS 层使用 TOI（Total Order Isolation）协议广播给所有节点。每个 writeset 会被分配一个全局唯一的、单调递增的 Global Transaction ID（GTID，格式为 `uuid:seqno`）。\n\n第三阶段是 Certification。每个节点收到 writeset 后，执行 certification 检查——本质上是乐观并发控制的验证阶段。节点检查 writeset 中涉及的行是否与本地正在执行的、尚未 certified 的其他事务存在写写冲突。如果没有冲突，certification 通过；如果存在冲突，后到的事务会被标记为失败。\n\n第四阶段是提交或回滚。Certification 通过后，事务在发起节点正式 commit，同时其他节点的 applier thread 异步 apply 该 writeset。如果 certification 失败，发起节点回滚事务并返回 deadlock error（错误码 1213）给客户端。\n\n通过 `SHOW STATUS` 可以观察这个过程：\n\n```sql\nmysql> SHOW STATUS LIKE 'wsrep%';\n+----------------------------+--------------------------------------+\n| Variable_name              | Value                                |\n+----------------------------+--------------------------------------+\n| wsrep_local_state_comment  | Synced                               |\n| wsrep_cluster_size         | 3                                    |\n| wsrep_cluster_status       | Primary                              |\n| wsrep_connected            | ON                                   |\n| wsrep_ready                | ON                                   |\n| wsrep_local_cert_failures  | 23                                   |\n| wsrep_local_bf_aborts      | 7                                    |\n| wsrep_flow_control_paused  | 0.000000                             |\n| wsrep_last_committed       | 458923                               |\n| wsrep_replicated_bytes     | 1847293                              |\n| wsrep_received             | 312847                               |\n| wsrep_apply_ooops          | 0                                    |\n| wsrep_cert_deps_distance   | 18.5                                 |\n+----------------------------+--------------------------------------+\n```\n\n其中 `wsrep_local_cert_failures` 是 certification 冲突次数，`wsrep_flow_control_paused` 是流控暂停占比（超过 0.1 就需要关注），`wsrep_cert_deps_distance` 反映并行 apply 的能力——值越大说明事务间依赖越少，可以更好地并行 apply。\n\n关于 IST 与 SST：当一个节点短暂离线后重新加入集群，它需要补齐落下的 writeset。如果落后的量在 gcache（一个环形缓冲区，默认 128MB）覆盖范围内，就执行 IST（Incremental State Transfer），直接从 donor 节点的 gcache 中获取缺失的 writeset 增量回放即可。如果落后太多超出 gcache 范围，就必须执行 SST（State Snapshot Transfer）——相当于做一次全量数据拷贝，通常使用 mariabackup 或 xtrabackup。SST 期间 donor 节点仍可服务请求，但会增加 IO 负载。生产环境建议将 gcache 大小设置为能覆盖节点维护窗口的写入量，通常 1-2GB。\n\n流控机制（Flow Control）是 Galera 保证节点间数据差距不过大的安全阀。当某个节点的 apply 队列（recv queue）超过 `gcs.fc_limit`（默认 16）时，该节点会向集群发送 FC_PAUSE 消息，请求所有节点暂停发送新的 writeset。这保证了慢节点不会被快节点甩开太多，但代价是整个集群的写入吞吐被拉低到最慢节点的 apply 速度。\n\n## 三、生产环境决策与进阶话题\n\nGalera 与 MySQL Group Replication（MGR）是当前最主流的两个 MySQL 多主方案，面试中经常要求对比。核心区别在于：MGR 是 MySQL 官方内置方案（5.7.17+ 引入），使用 Paxos 协议实现组通信，支持单主和多主两种模式；Galera 是第三方插件，使用自研的 GCS 协议，天生就是多主模式。在实际表现上，MGR 的单主模式稳定性更好（官方推荐），而 Galera 在真正的多主写入场景下更成熟——毕竟 Galera 从 2009 年就开始做多主复制，积累了十多年的生产经验。MGR 的多主模式在高并发冲突场景下的 certification 效率不如 Galera，且 MGR 要求集群最多 9 个节点，而 Galera 理论上无此限制（但生产中通常不超过 5 个）。\n\n网络延迟对 Galera 的影响是致命的。由于每次 commit 都需要等待 writeset 被所有节点接收，事务提交延迟 ≈ 本地执行时间 + 集群中最大 RTT。如果三个节点分布在同城三个机房，RTT 约 1-2ms，commit 开销可以接受。但如果跨城部署（RTT 20-50ms），每个写事务都要额外等待 20-50ms，对于高频小事务的 OLTP 场景来说是灾难性的。因此 Galera 的最佳部署模型是同城多 AZ、网络 RTT < 5ms。\n\n脑裂处理方面，Galera 使用 quorum 机制——集群要求多数节点存活才能继续服务（Primary Component）。三节点集群最多容忍一个节点故障。如果网络分区导致 2:1 分裂，多数派（2 个节点）继续服务，少数派（1 个节点）自动变为 Non-Primary 状态拒绝读写。但如果是 2 节点集群发生分区，两边各 1 个节点，没有多数派，整个集群会停止服务。这就是为什么生产环境至少需要 3 个节点。对于只有 2 个数据节点的场景，可以在第三个位置部署 garbd（Galera Arbitrator）——一个不存储数据、只参与投票的轻量进程，用于凑够奇数节点数：\n\n```bash\n# 启动 garbd 作为仲裁节点\ngarbd --group=\"prod_cluster\" \\\n      --address=\"gcomm://192.168.1.101,192.168.1.102\" \\\n      --donor=\"node1\" \\\n      --log=\"/var/log/garbd.log\" \\\n      --daemon\n```\n\n关于 `wsrep_slave_threads` 调优：这个参数控制每个节点用多少线程来 apply 收到的 writeset。默认值 1 意味着串行 apply，在写入密集场景下容易触发流控。建议设置为 CPU 核数的 2-4 倍，比如 8 核机器设为 16-32。但注意 Galera 的并行 apply 依赖事务间没有行级冲突——如果大量事务修改相同的行，提高 slave_threads 并不会带来并行度提升。\n\n最后说说什么场景不该用 Galera：第一，单行热点写入场景（比如秒杀库存扣减），大量事务修改同一行会导致 certification 冲突率飙升，有效吞吐急剧下降。第二，大事务场景，一个事务修改 10 万行数据会产生巨大的 writeset，广播和 certification 开销极大，还会长时间阻塞流控。第三，需要跨洲部署的全球化场景，网络延迟让同步复制变得不切实际。第四，需要 DDL 高并发的场景——Galera 的 DDL 使用 TOI 方式执行，DDL 期间整个集群会阻塞该表的所有 DML。",
+      "keyPoints": [
+        "Galera 是基于 wsrep API 的同步多主复制方案，所有节点可同时读写，事务提交时 writeset 已被所有节点接收并通过 certification 检查",
+        "复制流程四阶段：本地执行 → writeset 广播（GCS/TOI）→ certification 冲突检测 → commit 或 rollback，冲突事务返回 deadlock error 1213",
+        "IST 增量同步依赖 gcache 环形缓冲覆盖范围，超出则 SST 全量同步；生产建议 gcache 1-2GB 覆盖维护窗口写入量",
+        "流控机制（Flow Control）将整个集群写入吞吐限制为最慢节点的 apply 速度，wsrep_flow_control_paused > 0.1 需要立即排查",
+        "网络延迟直接叠加到事务提交时间，最佳部署模型是同城多 AZ、RTT < 5ms，跨城部署不适合高频 OLTP 写入",
+        "使用 quorum 机制处理脑裂，最少 3 节点；2 节点场景需部署 garbd 仲裁节点凑奇数投票",
+        "不适合热点单行写入、大事务（writeset 过大触发流控）、跨洲部署、频繁 DDL 场景",
+        "wsrep_slave_threads 建议设为 CPU 核数 2-4 倍以提升并行 apply 能力，但真正的并行度取决于 wsrep_cert_deps_distance"
+      ],
+      "quiz": [
+        {
+          "id": "db-q137-quiz-01",
+          "question": "Galera Cluster 的核心复制模型属于以下哪种？",
+          "choices": [
+            {"id": "A", "text": "基于 binlog 位点的异步复制，从库 SQL thread 重放 relay log"},
+            {"id": "B", "text": "基于 certification 的同步多主复制，事务提交时 writeset 广播并验证冲突"},
+            {"id": "C", "text": "基于 Raft 协议的单主复制，只有 leader 节点接受写入"},
+            {"id": "D", "text": "基于共享存储的多主方案，所有节点读写同一份物理数据文件"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Galera 的核心机制是 certification-based replication。事务在本地节点执行后，COMMIT 阶段将行级变更打包为 writeset，通过 GCS 广播到所有节点。每个节点独立执行 certification 检查——验证该 writeset 与本地并发事务是否存在写写冲突。只有所有节点 certification 通过，事务才真正 commit。选项 A 是传统 MySQL 异步主从的模型。选项 C 描述的更接近 MySQL Group Replication 的单主模式（虽然 MGR 用的是 Paxos 而非 Raft）。选项 D 是 Oracle RAC 那类共享存储方案，Galera 每个节点有独立的数据副本。"
+        },
+        {
+          "id": "db-q137-quiz-02",
+          "question": "Galera Cluster 中「虚拟同步」（virtually synchronous）的含义是什么？",
+          "choices": [
+            {"id": "A", "text": "事务 commit 返回客户端时，writeset 已被所有节点接收并通过 certification，但 apply 可能还在进行"},
+            {"id": "B", "text": "所有节点在同一物理时刻完成事务的 apply，数据在任何时刻完全一致"},
+            {"id": "C", "text": "写入是同步的但读取是异步的，从节点读到的数据可能有延迟"},
+            {"id": "D", "text": "使用 NTP 时钟同步保证所有节点在同一毫秒内 commit"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "「虚拟同步」是 Galera 的关键概念。事务 commit 成功返回给客户端时，保证的是：writeset 已经被集群所有节点接收，且通过了 certification 冲突检查。但其他节点实际 apply 这个 writeset（将数据写入 InnoDB 的过程）是异步进行的。这意味着在极短的时间窗口内（通常微秒级），其他节点可能还没有 apply 完毕。但由于 certification 已通过，这个事务不会再被回滚，数据最终一定会一致。选项 B 描述的是物理同步，Galera 达不到也不需要达到这个级别。选项 C 的描述不准确，Galera 节点间的数据差距通常在毫秒级。"
+        },
+        {
+          "id": "db-q137-quiz-03",
+          "question": "当 Galera 集群中两个节点同时修改同一行数据时，冲突如何解决？",
+          "choices": [
+            {"id": "A", "text": "使用全局锁，先获得锁的节点成功，后到的节点等待锁释放"},
+            {"id": "B", "text": "两个事务都成功，采用 last-write-wins 策略最终合并"},
+            {"id": "C", "text": "在 certification 阶段检测冲突，先获得全局 seqno 的事务成功，后到的事务被回滚并返回 deadlock error"},
+            {"id": "D", "text": "由一个协调者节点仲裁，决定哪个事务优先级更高"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Galera 使用乐观并发控制——事务在本地自由执行不加全局锁，直到 COMMIT 时才通过 certification 检测冲突。每个 writeset 被 GCS 分配一个全局唯一的单调递增 seqno，这个 seqno 决定了事务的全局顺序。当两个并发事务修改同一行时，先获得较小 seqno 的事务 certification 通过，后到的事务发现该行已被更高优先级的事务修改，certification 失败。失败的事务在发起节点被回滚，客户端收到 MySQL error 1213（Deadlock found when trying to get lock）。应用程序需要捕获这个错误并重试事务。选项 A 的全局锁模型是悲观并发控制，Galera 不使用。"
+        },
+        {
+          "id": "db-q137-quiz-04",
+          "question": "Galera 的 IST 和 SST 分别在什么场景下触发？",
+          "choices": [
+            {"id": "A", "text": "IST 用于节点短暂离线后追赶、缺失的 writeset 在 gcache 范围内；SST 用于缺失超出 gcache 范围或新节点首次加入"},
+            {"id": "B", "text": "IST 用于新节点加入集群；SST 用于节点重启后追赶数据"},
+            {"id": "C", "text": "IST 只传输索引数据；SST 传输完整的表数据和索引"},
+            {"id": "D", "text": "IST 在网络分区恢复后自动触发；SST 需要 DBA 手动执行"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "IST（Incremental State Transfer）是增量同步方式。当一个节点短暂离线（如滚动升级重启）后重新加入集群，它会告知 donor 节点自己最后 committed 的 seqno。如果 donor 的 gcache 中仍然保留了从该 seqno 到最新的所有 writeset，就通过 IST 将这些增量 writeset 发送过去回放即可，速度非常快。但如果节点离线时间过长，缺失的 writeset 已经被 gcache 淘汰（gcache 是环形缓冲区，空间满后覆盖旧数据），就必须执行 SST——将 donor 的完整数据快照通过 mariabackup/xtrabackup 传输给 joiner，等同于一次全量恢复。新节点首次加入也是 SST。选项 D 错误，SST 是自动触发的，不需要手动执行。"
+        },
+        {
+          "id": "db-q137-quiz-05",
+          "question": "以下 Galera 状态输出中，哪个指标最能反映集群存在性能问题？\n\nwsrep_local_cert_failures = 2\nwsrep_flow_control_paused = 0.35\nwsrep_cluster_size = 3\nwsrep_local_state_comment = Synced",
+          "choices": [
+            {"id": "A", "text": "wsrep_local_cert_failures = 2，说明有严重的写入冲突"},
+            {"id": "B", "text": "wsrep_flow_control_paused = 0.35，说明集群 35% 的时间被流控暂停，某个节点 apply 速度跟不上"},
+            {"id": "C", "text": "wsrep_cluster_size = 3，节点数太少导致性能不足"},
+            {"id": "D", "text": "wsrep_local_state_comment = Synced，表示节点正在同步中尚未就绪"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "wsrep_flow_control_paused 表示节点因流控（Flow Control）暂停写入的时间比例。0.35 意味着 35% 的时间集群的写入被暂停——这是非常严重的性能问题。通常这个值超过 0.1 就需要立即排查原因。常见原因包括：某个节点的磁盘 IO 性能差导致 apply 慢、wsrep_slave_threads 设置过低导致 apply 并行度不够、或者写入负载不均匀（大事务）。选项 A 的 cert_failures = 2 只是偶发冲突，在多主写入中很正常。选项 C 错误，3 节点是 Galera 的标准配置。选项 D 错误，Synced 恰恰表示节点状态正常、数据已同步完成。"
+        },
+        {
+          "id": "db-q137-quiz-06",
+          "question": "以下哪个配置错误会导致 Galera 集群无法正常工作？",
+          "choices": [
+            {"id": "A", "text": "设置 innodb_autoinc_lock_mode=1（连续模式而非 interleaved 模式）"},
+            {"id": "B", "text": "设置 wsrep_slave_threads=8 而非默认的 1"},
+            {"id": "C", "text": "设置 innodb_buffer_pool_size=4G 而非默认的 128M"},
+            {"id": "D", "text": "设置 wsrep_sst_method=mariabackup 而非 rsync"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Galera 强制要求 innodb_autoinc_lock_mode=2（interleaved 模式）。原因是在多主复制中，如果使用 lock_mode=1（连续模式），INSERT 语句会持有表级 AUTO-INC 锁直到语句结束。当两个节点同时执行 INSERT 时，自增值的分配无法在集群间正确协调，会导致主键冲突。interleaved 模式下每次分配自增值是独立的，不持有表锁，配合 Galera 的 wsrep_auto_increment_control 参数（自动为每个节点设置不同的 auto_increment_offset），可以保证多节点同时 INSERT 不冲突。选项 B、C、D 都是合法的性能或功能配置调整，不会导致集群故障。"
+        },
+        {
+          "id": "db-q137-quiz-07",
+          "question": "Galera Cluster 与 MySQL Group Replication（MGR）相比，以下哪个描述最准确？",
+          "choices": [
+            {"id": "A", "text": "MGR 是 MySQL 官方内置方案使用 Paxos 协议，多主稳定性不如 Galera 成熟；Galera 是第三方插件使用自研 GCS，多主复制经验超过十年"},
+            {"id": "B", "text": "MGR 性能在所有场景下都优于 Galera，因为是官方实现更贴近内核"},
+            {"id": "C", "text": "Galera 支持异步复制模式而 MGR 只支持同步复制"},
+            {"id": "D", "text": "两者完全等价，只是名字不同，底层实现一样"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "MySQL Group Replication 从 5.7.17 开始作为官方内置功能发布，使用 Paxos 变种协议实现组通信，支持单主模式（推荐）和多主模式。Galera 由 Codership 公司从 2009 年开始开发，作为第三方插件集成到 MariaDB（默认内置）和 Percona XtraDB Cluster 中。在多主写入场景下，Galera 有超过十年的生产验证经验，certification 机制更成熟稳定。MGR 的多主模式在高并发冲突场景下的表现不如 Galera，且 MGR 限制集群最多 9 个成员。选项 B 错误，MGR 并非所有场景都更快。选项 C 完全反了，Galera 只支持同步复制。选项 D 错误，两者底层实现完全不同。"
+        },
+        {
+          "id": "db-q137-quiz-08",
+          "question": "生产环境部署 3 节点 Galera 集群，节点分布在同城三个机房（RTT 约 1.5ms），以下哪个 wsrep_slave_threads 设置最合理？（节点配置为 16 核 64GB）",
+          "choices": [
+            {"id": "A", "text": "wsrep_slave_threads=1，保持默认值避免引入复杂性"},
+            {"id": "B", "text": "wsrep_slave_threads=32，设为 CPU 核数的 2 倍以充分利用并行 apply 能力"},
+            {"id": "C", "text": "wsrep_slave_threads=256，越大越好"},
+            {"id": "D", "text": "wsrep_slave_threads=0，禁用 apply 线程让主线程处理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "wsrep_slave_threads 控制每个节点用于 apply 接收到的 writeset 的线程数。对于 16 核机器，建议设置为 CPU 核数的 2-4 倍（32-64），因为 apply 操作涉及磁盘 IO 等待，线程数略多于 CPU 核数可以更好地利用 IO 等待时间。选项 A 的默认值 1 会导致串行 apply，在写入密集场景下容易触发 Flow Control，其他节点被迫暂停写入等待慢节点追赶。选项 C 的 256 过多，过多线程带来的上下文切换开销反而降低效率。选项 D 无效，wsrep_slave_threads 最小值为 1，设为 0 会被自动调整为 1。实际并行度还取决于 wsrep_cert_deps_distance 指标。"
+        },
+        {
+          "id": "db-q137-quiz-09",
+          "question": "一个 3 节点 Galera 集群发生网络分区，分裂为 A（1 个节点）和 B（2 个节点）两组。以下描述正确的是？",
+          "choices": [
+            {"id": "A", "text": "A 组和 B 组都继续正常服务读写，等网络恢复后自动合并数据"},
+            {"id": "B", "text": "B 组（多数派）继续服务，A 组自动进入 Non-Primary 状态拒绝所有读写请求"},
+            {"id": "C", "text": "两组都停止服务直到网络恢复，以绝对避免脑裂"},
+            {"id": "D", "text": "A 组自动关闭 MySQL 进程，B 组继续服务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Galera 使用 quorum 投票机制处理网络分区。集群需要超过半数（n/2 + 1）的节点存活才能形成 Primary Component 继续服务。3 节点集群中，B 组有 2 个节点超过半数，成为 Primary Component 正常服务读写。A 组只有 1 个节点不满足 quorum，自动进入 Non-Primary 状态——此时该节点的 wsrep_cluster_status 变为 non-Primary，wsrep_ready 变为 OFF，所有客户端查询都会收到「WSREP has not yet prepared node for application use」错误。A 组节点不会关闭 MySQL 进程，只是拒绝服务。网络恢复后 A 组节点通过 IST 或 SST 重新加入 B 组。"
+        },
+        {
+          "id": "db-q137-quiz-10",
+          "question": "线上 Galera 集群某节点频繁出现以下错误日志，最可能的原因是什么？\n\n[ERROR] WSREP: BF-BF conflict in: ... victim trx was 'Operating'",
+          "choices": [
+            {"id": "A", "text": "网络延迟过高导致 writeset 传输超时"},
+            {"id": "B", "text": "多个节点同时对相同行进行高频写入，certification 冲突频繁发生，本地事务被 brute-force abort"},
+            {"id": "C", "text": "磁盘空间不足导致 gcache 无法写入"},
+            {"id": "D", "text": "SSL 证书过期导致节点间认证失败"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "BF-BF conflict（Brute Force - Brute Force conflict）是 Galera 特有的错误，表示本地正在执行的事务与从其他节点接收到的 writeset 发生了行级冲突。在 Galera 中，远程 writeset 的 apply 具有更高优先级（brute force），会强制 abort 本地冲突的事务。当这个错误频繁出现时，说明应用程序设计存在热点写入问题——多个节点同时高频修改相同的行。解决方案包括：将热点行的写入路由到同一个节点（避免跨节点冲突）、在应用层增加冲突重试逻辑、或重新设计数据模型消除热点。选项 A 的网络超时会导致节点被踢出集群而非 BF conflict。选项 C 会导致不同的错误消息。"
+        }
+      ],
+      "references": [
+        {"title": "Galera Cluster Documentation - How Galera Works", "url": "https://galeracluster.com/library/documentation/tech-description-introduction.html"},
+        {"title": "MariaDB Galera Cluster - Getting Started", "url": "https://mariadb.com/kb/en/getting-started-with-mariadb-galera-cluster/"},
+        {"title": "Percona XtraDB Cluster 8.0 Documentation", "url": "https://docs.percona.com/percona-xtradb-cluster/8.0/"}
+      ]
+    }
+  ]
+}
