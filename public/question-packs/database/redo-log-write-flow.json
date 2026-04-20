@@ -1,0 +1,156 @@
+{
+  "id": "db-redo-log-write-flow",
+  "name": "Redo Log 的作用与写入流程",
+  "domain": "database",
+  "description": "InnoDB redo log 从 log buffer 到磁盘的完整写入链路、环形文件结构、LSN 追踪与 group commit 优化",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q078",
+      "domain": "database",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["MySQL", "InnoDB", "Redo Log", "WAL", "ib_logfile", "LSN", "innodb_log_buffer_size"],
+      "title": "Redo Log 的作用与写入流程",
+      "content": "面试官问「说说 InnoDB 的 redo log 是怎么写入的」，这道题看似基础，但很多人只能答到「先写 log buffer 再刷磁盘」就停住了。真正有深度的回答需要你把一条 redo log 记录从产生到最终持久化的完整链路讲清楚，包括中间经过了哪些缓冲层、刷盘时机由什么参数控制、redo log 文件本身是什么结构、空间是怎么循环复用的。\n\n我们从一个你一定遇到过的生产问题说起。某天线上 MySQL 实例的写入 TPS 突然从平稳的 3000 骤降到几百，DBA 通过 SHOW ENGINE INNODB STATUS 发现了这一行输出：\n\n```\nLog sequence number          18437265920\nLog flushed up to            18437265920\nPages flushed up to          16842753024\nLast checkpoint at           16842753024\nModified db pages            85621\n```\n\nLog sequence number 和 Last checkpoint at 之间的差值约 1.5GB，而这个实例的 redo log 总容量恰好也是 2GB。差值已经占了总容量的 75%，InnoDB 开始强制加速刷脏页来推进 checkpoint，腾出 redo log 空间。这就是典型的「redo log 写满」导致的性能抖动。\n\n要理解为什么会出现这种情况、怎么避免、出了之后怎么处理，你需要完整掌握 redo log 的写入流程和它背后的环形文件结构。这也是面试官通过这道题考察你的真实目标——不仅要知道 redo log「是什么」，更要知道它「怎么流动」以及「什么时候会出问题」。\n\n以下是一组你排查时会用到的关键命令：\n\n```sql\n-- 查看 redo log buffer 大小（内存中的日志缓冲区）\nSHOW VARIABLES LIKE 'innodb_log_buffer_size';  -- 默认 16MB\n\n-- 查看刷盘策略\nSHOW VARIABLES LIKE 'innodb_flush_log_at_trx_commit';  -- 0/1/2\n\n-- MySQL 8.0.30+ 查看 redo log 总容量\nSHOW VARIABLES LIKE 'innodb_redo_log_capacity';  -- 替代 innodb_log_file_size\n\n-- 旧版本查看文件配置\nSHOW VARIABLES LIKE 'innodb_log_file%';\n```\n\n这道题要求你能从 redo log 的基本概念讲起，逐步深入到写入流程的每个环节，再延伸到文件结构、LSN 追踪、空间复用、以及生产环境的容量调优。",
+      "answer": "## 一、Redo Log 基础：InnoDB 的崩溃恢复基石\n\nRedo log（重做日志）是 MySQL InnoDB 存储引擎实现崩溃恢复（crash recovery）的核心机制。它本质上是一种物理日志，记录的是数据页（data page，InnoDB 中默认 16KB 一页）在物理层面发生了什么变化。比如一条 UPDATE 语句执行后，redo log 记录的不是「把 id=5 的用户余额改成 300」这样的逻辑操作，而是「在表空间 ID=7、页号=1024、页内偏移=96 的位置写入 4 字节数据 0x0000012C」。这种粒度的物理记录让崩溃恢复时可以跳过 SQL 解析和执行计划生成，直接按字节覆盖写即可完成数据恢复，速度极快。\n\nRedo log 的存在是 WAL（Write-Ahead Logging，预写式日志）策略的直接体现。WAL 的核心规则只有一条：在修改数据页写入数据文件之前，描述该修改的日志记录必须先写入日志文件。换句话说，「日志先行，数据后写」。InnoDB 遵循 WAL 后，事务提交时只需要保证 redo log 落盘即可返回成功，而脏页（被修改但还没写回磁盘数据文件的内存页）可以由后台线程择机异步刷写。这套机制把事务提交的关键路径从「随机写若干个 16KB 数据页」变成了「顺序写几百字节日志」，性能提升是数量级的——传统 HDD 上随机写 IOPS 只有 150-300，而顺序写吞吐可以轻松达到 100MB/s 以上；即使 SSD 上，顺序写延迟也比随机写低一个数量级。\n\n## 二、Redo Log 的完整写入流程\n\n### 2.1 三层缓冲：从 log buffer 到磁盘\n\n一条 redo log 记录从产生到最终持久化，会经过三个层次的缓冲。第一层是 InnoDB 的 redo log buffer（日志缓冲区），这是 InnoDB 在用户空间维护的内存区域，大小由 innodb_log_buffer_size 参数控制，MySQL 8.0 默认为 16MB。当事务执行 DML（INSERT、UPDATE、DELETE）操作时，InnoDB 修改 Buffer Pool 中的数据页的同时，会在 redo log buffer 中生成对应的 redo log 记录。此时日志只存在于进程内存中，MySQL 进程一旦崩溃就全丢了。\n\n第二层是操作系统的 page cache（文件系统缓存）。当 InnoDB 调用 write() 系统调用将 log buffer 中的数据写入 redo log 文件时，数据实际上先进入了内核的 page cache。此时如果 MySQL 进程崩溃但操作系统还活着，这些数据不会丢失，因为内核会负责将 page cache 刷到磁盘。但如果是服务器断电或内核 panic，page cache 中的数据就没了。\n\n第三层才是真正的磁盘物理介质。只有调用 fsync()（或 fdatasync()）系统调用，操作系统才会保证把 page cache 中的数据真正写到磁盘的非易失性存储上。fsync 返回成功，才意味着 redo log 真正持久化了，即使服务器断电数据也不会丢失。\n\n### 2.2 innodb_flush_log_at_trx_commit 的三种模式\n\n这三层缓冲之间的刷写时机由 innodb_flush_log_at_trx_commit 参数精确控制，这是 InnoDB 最关键的持久性参数。\n\n设置为 1（默认值）时，每次事务 COMMIT 都执行 write() + fsync()，日志从 log buffer 直接刷到磁盘物理介质。这是最安全的配置，保证任何已提交事务在任何故障场景下都不丢失，代价是每次提交都要付出一次 fsync 的延迟（NVMe SSD 约 50-100μs，SATA SSD 约 200-500μs，HDD 约 3-10ms）。\n\n设置为 2 时，每次事务 COMMIT 执行 write() 但不执行 fsync()。日志从 log buffer 写入 OS page cache 就返回成功，fsync 由后台线程每秒执行一次。MySQL 进程崩溃不丢数据（page cache 还在），但服务器断电最多丢 1 秒。这是大多数互联网业务在非金融场景下的选择，性能比 =1 高约 30%-50%。\n\n设置为 0 时，事务 COMMIT 不做任何 I/O 操作，redo log 留在 log buffer 中，由后台线程每秒执行一次 write() + fsync()。MySQL 进程崩溃就可能丢 1 秒数据。这个配置性能最高但风险最大，极少在生产环境使用。\n\n### 2.3 Redo Log 记录的格式\n\nredo log 中每条记录的基本格式包含四个核心字段：type（日志类型，如 MLOG_REC_UPDATE_IN_PLACE 表示原地更新）、space ID（表空间编号，标识这条记录属于哪张表）、page number（页号，标识表空间中的哪一页）、以及 data（具体的修改数据，包含页内偏移和写入的字节内容）。除了这些核心字段，每条记录还有长度信息和校验值。多条 redo log 记录会被组织成 redo log block（512 字节对齐的块），每个 block 有 12 字节的 header 和 4 字节的 trailer，中间 496 字节存放实际的 log 记录数据。\n\n### 2.4 环形文件结构与空间复用\n\n在 MySQL 8.0.30 之前，redo log 由固定数量的文件组成，默认是 ib_logfile0 和 ib_logfile1 两个文件，大小由 innodb_log_file_size 指定（默认 48MB，生产环境通常设为 1-4GB）。这些文件逻辑上首尾相连形成一个环形缓冲区（circular buffer）。InnoDB 维护两个关键指针：write pos（当前写入位置，指示下一条 redo log 应该写到哪里）和 checkpoint（检查点位置，指示这个位置之前的所有 redo log 对应的脏页都已经刷盘，这些空间可以被安全覆盖）。write pos 顺时针追着 checkpoint 跑，两者之间的空间就是当前「活跃」的 redo log，包含了所有尚未完成 checkpoint 的日志。当 write pos 追上 checkpoint 时，意味着 redo log 空间耗尽，InnoDB 必须暂停写入，强制推进 checkpoint（即加速刷脏页），这就是文章开头那个 TPS 骤降场景的根本原因。\n\n### 2.5 LSN 追踪机制\n\nLSN（Log Sequence Number，日志序列号）是一个全局单调递增的 64 位整数，代表 redo log 的字节偏移量。每产生一条新的 redo log 记录，LSN 增加该记录的字节长度。InnoDB 内部通过几个关键 LSN 来追踪整个写入流水线的进度：当前最新产生的 LSN（对应 log buffer 中最新的记录）、log flushed up to LSN（已经通过 fsync 刷到磁盘的位置）、pages flushed up to LSN（对应脏页已刷盘的位置）、last checkpoint LSN（最近一次 checkpoint 记录的位置）。这四个 LSN 的大小关系始终是：log sequence number ≥ log flushed up to ≥ pages flushed up to ≥ last checkpoint。当前两者差距过大说明 fsync 跟不上日志产生速度，后两者差距过大说明脏页刷写跟不上，这些都是需要关注的性能指标。\n\n### 2.6 Group Commit 优化\n\n在 innodb_flush_log_at_trx_commit = 1 的配置下，如果每个事务提交都独立执行一次 fsync，高并发场景下 fsync 的次数会成为瓶颈。InnoDB 通过 group commit（组提交）机制来解决这个问题：当多个事务几乎同时到达提交阶段时，InnoDB 会让第一个到达的事务作为 leader，稍微等待片刻让更多事务加入同一批次，然后用一次 fsync 把这一批事务的 redo log 全部持久化。假设 100 个事务并发提交，原本需要 100 次 fsync（每次 100μs 就是 10ms），通过 group commit 可能只需要 2-3 次 fsync。在 MySQL 5.7+ 中，group commit 还扩展到了 binlog 层面，通过 binlog_group_commit_sync_delay（等待时间，微秒）和 binlog_group_commit_sync_no_delay_count（等待事务数）两个参数来调控攒批策略。\n\n## 三、MySQL 8.0.30+ 的动态 Redo Log 与生产调优\n\nMySQL 8.0.30 对 redo log 架构做了重大重构。新版本引入 innodb_redo_log_capacity 参数（默认 100MB）替代了原来的 innodb_log_file_size 和 innodb_log_files_in_group 组合。redo log 文件不再固定为 ib_logfile0/ib_logfile1，而是存储在数据目录的 #innodb_redo/ 子目录中，由 InnoDB 自动管理文件数量和单文件大小。更重要的是 innodb_redo_log_capacity 支持在线动态修改（SET GLOBAL innodb_redo_log_capacity = 4294967296），不需要重启实例，这在旧版本中是不可能的——修改 innodb_log_file_size 必须停机、删旧文件、重启。\n\n生产环境中 redo log 容量的设定需要权衡两个因素。容量太小（比如默认的 100MB），在写入密集的业务中 checkpoint 会被频繁触发，write pos 反复追上 checkpoint 导致用户线程阻塞，表现为周期性的延迟尖刺。监控上可以通过 Innodb_log_waits 状态变量来观察——如果这个值持续增长，说明 log buffer 空间不够用导致事务必须等待日志刷盘。容量太大（比如 16GB），崩溃恢复时需要重放的日志量大，恢复时间可能从几秒变成几分钟。一般的经验法则是将 redo log 容量设为能容纳高峰期 30-60 分钟写入量的大小。你可以通过对比间隔 1 小时的两次 Log sequence number 差值来估算写入速率，再据此设定容量。",
+      "keyPoints": [
+        "redo log 写入经过三层缓冲：InnoDB log buffer（用户态内存）→ OS page cache（内核态）→ 磁盘物理介质，innodb_flush_log_at_trx_commit 控制事务提交时刷到哪一层",
+        "innodb_flush_log_at_trx_commit=1 是唯一能在断电场景下保证零数据丢失的配置，=2 在 MySQL 进程崩溃时不丢数据但断电最多丢 1 秒，=0 任何崩溃都可能丢 1 秒",
+        "redo log 文件组成环形缓冲区，write pos 和 checkpoint 两个指针界定可用空间；write pos 追上 checkpoint 时 InnoDB 必须阻塞写入并强制刷脏页推进 checkpoint",
+        "每条 redo log 记录包含 space ID、page number、页内偏移和修改数据，这种物理日志格式让崩溃恢复只需按字节覆盖写入而无需重走 SQL 执行流程",
+        "LSN 是全局单调递增的字节偏移量，通过 log sequence number、log flushed up to、pages flushed up to、last checkpoint 四个 LSN 的差值可以判断写入流水线各阶段的压力",
+        "Group Commit 将多个并发事务的 fsync 合并为一次磁盘操作，是 innodb_flush_log_at_trx_commit=1 下高并发写入性能的关键保障",
+        "MySQL 8.0.30 引入 innodb_redo_log_capacity 支持在线动态调整 redo log 总容量，取代了旧版本需要停机修改的 innodb_log_file_size 配置",
+        "redo log 容量过小导致频繁 checkpoint 阻塞写入（观察 Innodb_log_waits 增长），过大导致崩溃恢复时间延长，生产环境建议设为高峰期 30-60 分钟写入量"
+      ],
+      "quiz": [
+        {
+          "id": "db-q078-quiz-01",
+          "question": "InnoDB 中 redo log 记录的内容是什么层面的信息？",
+          "choices": [
+            {"id": "A", "text": "物理层面，记录数据页的字节级修改（表空间 ID + 页号 + 偏移 + 数据）"},
+            {"id": "B", "text": "逻辑层面，记录执行的 SQL 语句原文"},
+            {"id": "C", "text": "逻辑层面，记录行级别的 before/after image"},
+            {"id": "D", "text": "物理层面，记录整个 16KB 数据页的完整快照"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "redo log 是物理日志，记录的粒度是「表空间 ID + 页号 + 页内偏移 + 修改的字节内容」，而不是 SQL 语句（那是 binlog 的 statement 格式）、也不是行级 before/after image（那是 undo log 和 binlog row 格式的职责）、更不是整页快照（那是 double write buffer 的做法）。物理日志的优势在于崩溃恢复时无需经过 SQL 解析和执行器，直接按字节位置覆盖即可完成恢复。"
+        },
+        {
+          "id": "db-q078-quiz-02",
+          "question": "WAL（Write-Ahead Logging）策略的核心规则是什么？",
+          "choices": [
+            {"id": "A", "text": "数据页修改写入数据文件之前，对应的 redo log 记录必须先持久化到日志文件"},
+            {"id": "B", "text": "所有写操作必须先经过 undo log 记录旧值，再写 redo log 记录新值"},
+            {"id": "C", "text": "事务提交前必须把所有脏页刷写到磁盘数据文件中"},
+            {"id": "D", "text": "binlog 和 redo log 必须同时写入磁盘后事务才能提交"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "WAL 的「Write-Ahead」含义是「日志先于数据写入」。规则是：对数据页的任何修改在写入数据文件（.ibd）之前，描述该修改的 redo log 必须先持久化到日志文件。B 选项混淆了 undo log 和 redo log 的关系，undo log 保证原子性而非 WAL 规则的一部分。C 选项恰恰是 WAL 要避免的——WAL 的价值就是让事务提交不必等待脏页刷盘。D 选项描述的是两阶段提交协议而非 WAL 本身。"
+        },
+        {
+          "id": "db-q078-quiz-03",
+          "question": "当 innodb_flush_log_at_trx_commit = 2 时，事务 COMMIT 的行为是？",
+          "choices": [
+            {"id": "A", "text": "redo log 从 log buffer 写入 OS page cache（write），但不立即 fsync，后台每秒 fsync 一次"},
+            {"id": "B", "text": "redo log 留在 log buffer 中不做任何 I/O，后台每秒 write + fsync 一次"},
+            {"id": "C", "text": "redo log 从 log buffer 直接 write + fsync 到磁盘物理介质"},
+            {"id": "D", "text": "redo log 写入 OS page cache 并立即 fsync，但不刷脏页"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "innodb_flush_log_at_trx_commit=2 的行为是 COMMIT 时执行 write() 把 log buffer 数据写入 OS page cache 就返回成功，fsync 交给后台线程每秒执行。这意味着 MySQL 进程崩溃不丢数据（page cache 还在内核中），但服务器断电 page cache 内容丢失，最多丢 1 秒。B 描述的是 =0 的行为，C 描述的是 =1 的行为，D 选项中的「立即 fsync」与 =2 的定义矛盾。"
+        },
+        {
+          "id": "db-q078-quiz-04",
+          "question": "redo log 的环形文件结构中，write pos 追上 checkpoint 时会发生什么？",
+          "choices": [
+            {"id": "A", "text": "InnoDB 阻塞用户写入，强制推进 checkpoint（刷脏页释放日志空间）"},
+            {"id": "B", "text": "InnoDB 自动创建新的 redo log 文件来扩展空间"},
+            {"id": "C", "text": "InnoDB 直接覆盖旧的 redo log 记录继续写入"},
+            {"id": "D", "text": "InnoDB 将溢出的 redo log 暂存到 undo tablespace 中"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "redo log 是固定大小的环形缓冲区，write pos 追上 checkpoint 意味着所有空间都被未完成 checkpoint 的日志占满了。此时 InnoDB 不能覆盖旧日志（因为对应的脏页可能还没刷盘，覆盖后崩溃就无法恢复），也不会自动扩展文件（旧版本不支持动态调整），唯一的选择是暂停接收新的写入，触发 sync flush 强制刷脏页推进 checkpoint 释放空间。这就是生产中 redo log 过小导致性能骤降的根本原因。"
+        },
+        {
+          "id": "db-q078-quiz-05",
+          "question": "在 SHOW ENGINE INNODB STATUS 输出中，Log sequence number 为 5000000，Last checkpoint at 为 3500000，redo log 总容量为 2MB（2097152 字节）。以下判断正确的是？",
+          "choices": [
+            {"id": "A", "text": "已使用 1500000 字节（约 71% 容量），接近触发 async flush 加速刷脏页的阈值"},
+            {"id": "B", "text": "已使用 1500000 字节（约 71% 容量），但离告警阈值还远不需要关注"},
+            {"id": "C", "text": "已使用 3500000 字节，redo log 已经写满需要立即扩容"},
+            {"id": "D", "text": "两个 LSN 的差值代表还剩 1500000 字节可用空间"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Log sequence number 减去 Last checkpoint at 得到 1500000 字节，这是当前活跃的（尚未 checkpoint 的）redo log 量。占总容量 2097152 字节的约 71%。InnoDB 在活跃日志占总容量约 75% 时触发 async flush（异步加速刷脏页），90% 以上触发 sync flush（阻塞用户线程）。71% 已经相当接近 75% 的 async flush 阈值，需要关注。B 选项低估了风险，C 选项把 checkpoint LSN 误解为已使用量，D 选项颠倒了差值的含义——差值是已用量而非剩余量。"
+        },
+        {
+          "id": "db-q078-quiz-06",
+          "question": "以下关于 innodb_log_buffer_size 的说法，哪个是错误的？",
+          "choices": [
+            {"id": "A", "text": "log buffer 过小会导致事务还没提交就被迫先将日志刷盘，增加不必要的 I/O"},
+            {"id": "B", "text": "log buffer 默认 16MB，对大多数 OLTP 场景足够，大事务（如批量 INSERT）可能需要调大"},
+            {"id": "C", "text": "log buffer 越大越好，设为 1GB 可以显著提升所有场景的写入性能"},
+            {"id": "D", "text": "当 log buffer 中未刷盘的日志量超过 buffer 的一半时，InnoDB 会触发后台写入"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "log buffer 并非越大越好。对于普通 OLTP 事务（每个事务产生几 KB 日志），16MB 的 buffer 绰绰有余，因为每次事务提交时（innodb_flush_log_at_trx_commit=1）日志就会被刷盘，buffer 随即释放。只有执行大事务（如一次性 INSERT 百万行）时 log buffer 才可能不够用。设为 1GB 白白浪费内存，对正常事务没有任何性能提升。A、B、D 描述都是正确的——InnoDB 确实会在 buffer 使用超过一半或事务未提交但 buffer 不够用时提前刷写。"
+        },
+        {
+          "id": "db-q078-quiz-07",
+          "question": "关于 redo log 与 binlog 的对比，以下哪项正确？",
+          "choices": [
+            {"id": "A", "text": "redo log 是环形覆盖写入、固定大小；binlog 是追加写入、不覆盖旧文件"},
+            {"id": "B", "text": "redo log 用于主从复制；binlog 用于崩溃恢复"},
+            {"id": "C", "text": "两者都是 InnoDB 存储引擎层面的日志"},
+            {"id": "D", "text": "binlog 是物理日志记录页变更；redo log 是逻辑日志记录 SQL 语句"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "redo log 由 InnoDB 引擎管理，采用环形文件结构循环覆盖写入，空间固定（通过 checkpoint 释放）。binlog 由 MySQL Server 层管理，每个文件写满后创建新文件（mysql-bin.000001、000002...），永不覆盖，可通过 expire_logs_days 控制保留时间。B 颠倒了两者的用途——redo log 用于崩溃恢复，binlog 用于主从复制和 PITR。C 错误——binlog 是 Server 层日志。D 完全颠倒了类型——redo log 才是物理日志，binlog 可以是 statement 或 row 格式的逻辑日志。"
+        },
+        {
+          "id": "db-q078-quiz-08",
+          "question": "生产环境中一个写入密集型 MySQL 实例经常出现周期性延迟尖刺，DBA 发现 Innodb_log_waits 状态变量持续增长。最可能的原因和解决方案是？",
+          "choices": [
+            {"id": "A", "text": "redo log 容量过小导致频繁触发 checkpoint 阻塞，应增大 innodb_redo_log_capacity"},
+            {"id": "B", "text": "Buffer Pool 命中率低导致大量磁盘读取，应增大 innodb_buffer_pool_size"},
+            {"id": "C", "text": "binlog 写入瓶颈导致事务提交排队，应将 sync_binlog 设为 0"},
+            {"id": "D", "text": "表锁竞争激烈导致事务串行执行，应优化 SQL 减少锁范围"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Innodb_log_waits 表示「因为 log buffer 不够用或 redo log 空间不足而等待的次数」。如果这个值持续增长且伴随周期性延迟尖刺，最常见的原因是 redo log 总容量太小，write pos 频繁追上 checkpoint 触发 sync flush 阻塞用户写入。解决方案是增大 redo log 容量（8.0.30+ 可在线 SET GLOBAL innodb_redo_log_capacity）。Buffer Pool 命中率低主要影响读性能而非写延迟尖刺，binlog 和表锁问题的表现形式与 Innodb_log_waits 增长无直接关联。"
+        },
+        {
+          "id": "db-q078-quiz-09",
+          "question": "MySQL 8.0.30 引入的 innodb_redo_log_capacity 相比旧版本 innodb_log_file_size 的关键改进是什么？",
+          "choices": [
+            {"id": "A", "text": "支持在线动态修改（SET GLOBAL）无需重启实例，且 InnoDB 自动管理文件数量和大小"},
+            {"id": "B", "text": "将 redo log 从环形结构改为了线性追加结构，彻底消除了 checkpoint 瓶颈"},
+            {"id": "C", "text": "把 redo log 存储从本地磁盘迁移到了共享存储，支持多实例共享"},
+            {"id": "D", "text": "引入了 redo log 压缩功能，相同容量可以存储 3-5 倍的日志记录"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "MySQL 8.0.30 的 innodb_redo_log_capacity 最重要的改进是支持在线动态调整——旧版本修改 innodb_log_file_size 必须停机、删除旧的 ib_logfile 文件、再重启实例，这在生产环境中代价极高。新版本通过 SET GLOBAL 即可生效，redo log 文件存储在 #innodb_redo/ 目录下由 InnoDB 自动管理。但底层仍然是环形复用结构（B 错误），仍然存储在本地（C 错误），也没有引入压缩功能（D 错误）。"
+        },
+        {
+          "id": "db-q078-quiz-10",
+          "question": "Group Commit 机制解决的核心问题是什么？",
+          "choices": [
+            {"id": "A", "text": "将多个并发事务的 fsync 合并为一次，减少 innodb_flush_log_at_trx_commit=1 时的 fsync 次数"},
+            {"id": "B", "text": "将多个事务的 redo log 压缩存储到同一个 log block 中节省空间"},
+            {"id": "C", "text": "让多个事务共享同一个 undo log segment 减少回滚段的空间占用"},
+            {"id": "D", "text": "将 redo log 和 binlog 的写入合并为一次 I/O 操作减少磁盘寻道"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Group Commit 的核心价值是减少 fsync 次数。在 innodb_flush_log_at_trx_commit=1 时每个事务提交都需要 fsync，而 fsync 的耗时是固定的（与数据量关系不大），如果 100 个并发事务各自 fsync 就是 100 次磁盘同步。Group Commit 让第一个到达提交点的事务作为 leader 等待一小段时间收集同批次事务，然后用一次 fsync 刷完所有人的日志。B 选项描述的不是 group commit 的职能。C 选项涉及 undo 段与 group commit 无关。D 选项虽然 redo/binlog 都有 group commit 机制，但它们是独立的 fsync 操作而非合并为一次 I/O。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-redo-log.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_flush_log_at_trx_commit",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-redo-log.html#innodb-redo-log-file-reconfigure"
+      ]
+    }
+  ]
+}
