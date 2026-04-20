@@ -1,0 +1,285 @@
+{
+  "id": "redis-binlog-cache-update",
+  "name": "基于 binlog 的缓存更新方案",
+  "domain": "redis",
+  "description": "通过 MySQL binlog + Canal/Debezium 实现缓存自动失效的架构方案与实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-binlog-cache-update-q1",
+      "domain": "redis",
+      "type": "concept",
+      "difficulty": 3,
+      "tags": ["Redis", "缓存一致性", "binlog", "Canal", "CDC", "最终一致性"],
+      "title": "基于 binlog 的缓存更新方案（Canal）",
+      "content": "在分布式系统中，缓存与数据库的一致性问题堪称「经典难题」。最常见的应用层做法是「先更新数据库，再删除缓存」或者配合延迟双删策略，但这些方案都有一个根本性盲区：它们只能管住从应用 ORM 发起的写操作。现实中的数据库写入远不止这一条路径——DBA 深夜跑的修数据脚本、数据迁移工具的批量导入、另一个微服务通过独立数据源的直连写入、甚至 ETL 流水线的反向回写——这些「旁路写入」完全绕过了应用层的缓存失效逻辑，缓存中的脏数据可能一直残留到 TTL 过期。\n\n换一个思路来思考这个问题：既然所有对 MySQL 的写操作——不管是应用代码、DBA 脚本还是第三方工具——最终都必须经过 binlog，那能不能直接监听 binlog 的变更事件来驱动缓存失效？答案是肯定的，这就是基于 CDC（Change Data Capture，变更数据捕获）的缓存更新方案。\n\nCanal 是阿里巴巴在 2012 年开源的一个中间件，最初用于解决阿里内部跨机房的数据同步问题。它的核心原理相当巧妙：将自己伪装成 MySQL 的一个 slave 节点，通过标准的 MySQL 主从复制协议订阅 binlog 事件流。拿到结构化的变更事件后，经由消息队列分发给下游消费者，由消费者执行缓存的删除或更新。这套方案的典型架构是：\n\n```\nMySQL Master\n    ↓  binlog replication protocol\nCanal Server（解析 binlog → 结构化事件）\n    ↓  Canal MQ Connector\nKafka / RocketMQ（消息缓冲与持久化）\n    ↓  Consumer Group\n缓存更新服务（delete / update Redis）\n    ↓\nRedis Cluster\n```\n\n请详细阐述这套方案的工作原理、Canal 的核心配置与部署要点、与应用层双写方案的对比优劣、消费端的幂等设计，以及生产环境中关于延迟、DDL 变更处理和高可用等需要注意的关键问题。如果了解 Debezium，也请做一下对比分析。",
+      "answer": "### Step 1: Core concept foundation\n\n要理解 binlog 缓存更新方案，首先需要搞清楚两个底层概念：MySQL binlog 的格式选择，以及 CDC 这个架构模式的核心洞察。\n\nMySQL 的 Binary Log（binlog）是数据库引擎层面的事务变更日志，记录了所有对数据产生修改的操作。binlog 有三种格式：STATEMENT 记录原始 SQL 语句，ROW 记录每一行数据变更前后的完整镜像（before image 和 after image），MIXED 由 MySQL 根据语句类型自行判断用哪种。在缓存更新场景中，**必须使用 ROW 格式**——原因很直接，STATEMENT 格式只告诉你「执行了一条 `UPDATE product SET price = 99.9 WHERE category_id = 5`」，你根本无法知道具体哪些行被影响了、它们的主键是什么，自然也就无法定位需要失效的缓存 key。而 ROW 格式会明确告诉你「id=1001 的这行数据，price 字段从 89.9 变成了 99.9」「id=1002 的这行数据，price 从 120.0 变成了 99.9」——这才是下游消费者精确定位缓存 key 所需要的信息粒度。MySQL 5.7.7 开始 ROW 已经是默认格式，MySQL 8.0 更是将其作为最佳实践推荐。需要注意的是 ROW 格式会显著增加 binlog 体积（一条 UPDATE 影响 1000 行就会产生 1000 条事件），生产中通常配合 `binlog_row_image=FULL` 确保前后镜像完整，同时合理设置 `expire_logs_days` 控制磁盘占用。\n\nCDC（Change Data Capture）是一个更宏观的架构模式，核心思想是「捕获数据源的变更事件并将其传播到下游系统」。数据库的事务日志天然就是变更事件的权威来源——对 MySQL 来说是 binlog，对 PostgreSQL 来说是 WAL（Write-Ahead Log），对 MongoDB 来说是 Oplog。CDC 的关键洞察在于一个非常强的不变量：**所有写操作都必须经过数据库事务日志**。监听日志就等于监听了全部写入路径，无论这个写操作来自应用 ORM、DBA 的命令行客户端、还是某个你完全不知道的第三方系统。这与应用层双写方案形成了本质区别——应用层的 Cache Aside 只能管住自己代码里那一条写入路径，对旁路写入完全无能为力。\n\n### Step 2: Deep dive into the specific question\n\n**Canal 的核心机制：伪装为 MySQL slave**\n\nCanal Server 的设计非常巧妙：它利用了 MySQL 主从复制协议这个现成的基础设施。MySQL 的主从复制本身就是 master 将 binlog 事件流推送给 slave 的过程，Canal 做的事情就是让 MySQL master 以为自己多了一个 slave。具体来说，Canal Server 启动后会向 MySQL master 发送 `COM_REGISTER_SLAVE` 命令注册自己的 server-id，然后通过 `COM_BINLOG_DUMP` 命令声明自己需要的 binlog 文件名和 position（或者 GTID），之后 MySQL master 就会像对待普通 slave 一样，持续推送 binlog 事件。Canal 的 binlog 解析器（EventParser）负责将原始的二进制事件流解析为结构化的 Java 对象，包括表名、操作类型（INSERT/UPDATE/DELETE）、变更前后的每一列数据。\n\n这种设计的好处是完全非侵入式：不需要在 MySQL 上安装任何插件，不需要修改业务表结构，不需要应用代码做任何改造，只需要给 Canal 一个具有复制权限的 MySQL 账号就行。\n\n**核心配置详解**\n\nCanal 的配置分两层：`canal.properties` 是全局配置，`instance.properties` 是实例级配置（一个 Canal Server 可以管理多个实例，每个实例对应一个 MySQL 数据源）。关键配置项包括：MySQL 连接地址 `canal.instance.master.address=192.168.1.100:3306`；连接凭据 `canal.instance.dbUsername` 和 `canal.instance.dbPassword`，这个账号需要 `REPLICATION SLAVE` 和 `REPLICATION CLIENT` 两个权限；库表订阅过滤 `canal.instance.filter.regex`，支持正则语法，例如 `mydb\\.product` 只订阅 mydb 库的 product 表，`mydb\\.order_.*` 订阅所有以 order_ 开头的分表；MQ 投递配置 `canal.mq.topic` 和 `canal.mq.dynamicTopic`，后者支持按库表名动态路由到不同 topic。从 Canal 1.1.4 版本开始，内置了 Kafka 和 RocketMQ 的直接投递能力，在 `canal.properties` 中设置 `canal.serverMode=kafka` 并配置 `kafka.bootstrap.servers` 即可，不再需要额外编写 Canal Client 代码。\n\n**消费端设计：删除缓存 vs 更新缓存**\n\n消费端拿到 binlog 事件后，面临一个关键选择：是删除对应的缓存 key（Cache Invalidation），还是直接用 binlog 中的数据更新缓存（Cache Refresh）？绝大多数生产场景推荐删除缓存。原因是现实中的缓存对象往往不是单表直接映射的——一个商品详情的缓存可能是 product 表 + sku 表 + inventory 表 + promotion 表四五张表 JOIN 出来的结果，你收到 product 表的一条 binlog 事件，根本无法构建出完整的缓存对象。删除缓存则简单得多：从 binlog 事件中提取主键值（比如 product_id=1001），按照缓存 key 的命名规则拼出 `product:detail:1001`，直接 `DEL` 即可。下次读请求触发 cache miss 时，业务代码会自动从数据库重建完整缓存。\n\n**消费端幂等性**\n\n消息队列的消费语义通常是 at-least-once，加上 Canal 在故障恢复时可能回溯消费 binlog，同一条变更事件被消费多次是完全可能的。对于删除缓存操作这几乎不是问题——Redis 的 `DEL` 命令对一个不存在的 key 返回 0 但不会报错，天然幂等。但如果你选择更新缓存，就必须引入版本控制机制来防止旧事件覆盖新数据。一种可靠做法是利用 binlog 事件自带的 GTID 或 binlog position 作为单调递增的版本号，消费者在写入 Redis 前用 Lua 脚本做原子性的「比较版本后写入」操作：只有当新事件的版本号大于 Redis 中当前值的版本号时才允许覆盖。\n\n### Step 3: Extended content\n\n**延迟分析：100ms 到 1s 的窗口期**\n\n延迟是 binlog 方案最常被挑战的点。端到端延迟由四段构成：MySQL 事务提交到 binlog 刷盘是同步的（可忽略）；Canal 从 master 拉取 binlog 事件通常是毫秒级（依赖网络和 Canal 的轮询间隔）；Canal 解析事件并投递到 Kafka/RocketMQ 大约 10-50ms；MQ 到消费者的端到端延迟取决于消费者拉取频率和消费速度，通常 50-500ms；消费者操作 Redis 几毫秒。综合下来，生产环境中 P99 延迟通常在 100ms 到 1s 之间。这意味着在这个窗口期内应用可能读到过期缓存。对于商品信息、用户资料、配置数据等场景，这个延迟完全可以接受。但对于库存扣减、余额变更这类要求强一致的场景，仍然需要在应用层配合「写后立即删缓存」或者「读时版本校验」策略，binlog 方案作为兜底而非唯一手段。\n\n**DDL 变更处理：容易被忽略的生产陷阱**\n\n当表结构发生变更（`ALTER TABLE` 增删字段、修改类型）时，Canal 的 binlog 解析器需要感知新的 schema 才能正确解析后续的 ROW 事件——因为 ROW 格式的 binlog 不携带列名信息，只有列值的有序序列，解析器必须知道当前的表结构才能做出正确的列名映射。Canal 通过「表结构缓存」机制处理这个问题：每次遇到 DDL 事件，Canal 会重新从 MySQL 拉取 `INFORMATION_SCHEMA` 并更新本地的 schema 缓存。但有一个边界场景——如果 Canal 在 DDL 事件产生之后、解析之前发生了重启，且重启后回溯消费的起点在 DDL 之前，它会用新的表结构去解析旧格式的 binlog 事件，导致列错位或解析异常。最佳实践是在 Canal 配置中开启 `tsdb`（Table Schema DataBase，`canal.instance.tsdb.enable=true`），将每次 DDL 变更时的表结构快照持久化到一个独立的 MySQL 库中。这样即使发生回溯消费，Canal 也能根据 binlog position 找到历史时刻的正确 schema。\n\n**Canal vs Debezium 选型**\n\nDebezium 是由 Red Hat 维护的开源 CDC 平台，目前是 CNCF 的孵化项目（截至 2024 年已进入 Debezium 2.x 系列）。与 Canal 的核心差异有几点：Debezium 基于 Kafka Connect 框架运行，天然与 Kafka 生态深度集成，部署时只需要配一个 JSON 格式的 Connector 配置文件提交给 Kafka Connect 集群即可，运维门槛低于 Canal 的独立进程管理模式；Debezium 支持 MySQL、PostgreSQL、MongoDB、SQL Server、Oracle、Cassandra 等十余种数据源，而 Canal 主要面向 MySQL 生态（也有限支持 MariaDB）；在 Kubernetes 环境下，Debezium 可以通过 Strimzi Operator 实现声明式的 CRD 部署和滚动升级，云原生体验明显优于 Canal 的传统 Java 进程部署。Canal 的优势在于经过了阿里巴巴内部大规模生产验证（官方宣称日处理数十亿条 binlog），对 MySQL 的兼容性和性能调优更加成熟，在国内技术生态中有更丰富的中文文档和社区支持。选型建议直白一点：技术栈以 MySQL + 国内中间件为主的团队优先 Canal，多数据源或云原生架构优先 Debezium。\n\n**什么时候 binlog 方案是杀鸡用牛刀？**\n\n引入 Canal/Debezium 意味着多一个需要运维的有状态中间件——Canal Server 需要持久化 binlog position，需要配置 ZooKeeper 做 HA 主备切换，需要监控消费延迟和 MQ 积压。如果你的系统只有单一应用写数据库，写入量不大（QPS < 200），且团队对中间件运维经验有限，那么应用层的「先写 DB 再删缓存 + TTL 兜底」甚至「延迟双删」就完全够用了。binlog 方案的核心价值点在于以下四个条件：多个服务或系统共享同一个数据库、存在不走应用代码的旁路写入、缓存一致性要求高但可以接受秒级延迟、团队有中间件运维能力。这四个条件满足得越多，binlog 方案的 ROI 就越高。",
+      "keyPoints": [
+        "Canal 的核心原理是伪装为 MySQL slave，通过标准主从复制协议（COM_REGISTER_SLAVE + COM_BINLOG_DUMP）拉取 binlog 事件流，完全非侵入式，不需要修改 MySQL 配置或安装插件",
+        "binlog 必须设置为 ROW 格式（MySQL 5.7.7+ 默认），STATEMENT 格式只记录 SQL 语句无法定位具体受影响的行和主键，无法精确映射到缓存 key",
+        "引入 Kafka 或 RocketMQ 作为 Canal 与消费者之间的缓冲层，解耦生产消费速率差异，并提供消息持久化和故障恢复时的重放能力",
+        "消费端推荐删除缓存而非更新缓存，因为实际缓存对象往往是多表 JOIN 的结果，单表 binlog 事件无法构建完整缓存对象",
+        "消费者必须实现幂等处理：删除缓存天然幂等（DEL 不存在的 key 无副作用），更新缓存则需要基于 GTID 或 binlog position 的版本号比较机制",
+        "binlog 方案的端到端延迟通常在 100ms-1s（P99），相比应用层双写的核心优势是能捕获所有写入路径包括 DBA 脚本和第三方系统的旁路写入",
+        "Canal 必须开启 tsdb 持久化表结构历史，否则在 DDL 变更后回溯消费时可能因 schema 不匹配导致解析异常",
+        "Debezium 基于 Kafka Connect 框架、支持多数据源、云原生运维体验优于 Canal，但 Canal 在 MySQL 生态的兼容性和国内社区支持方面更成熟"
+      ],
+      "quiz": [
+        {
+          "id": "redis-binlog-cache-update-q1-quiz1",
+          "question": "Canal 是通过什么机制从 MySQL 获取 binlog 事件的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "通过 JDBC 定期轮询 INFORMATION_SCHEMA 中的变更记录表"
+            },
+            {
+              "id": "B",
+              "text": "在 MySQL 上安装 UDF 插件，由插件在每次写入时主动推送事件"
+            },
+            {
+              "id": "C",
+              "text": "伪装为 MySQL slave 节点，通过主从复制协议订阅 binlog 事件流"
+            },
+            {
+              "id": "D",
+              "text": "通过文件系统的 inotify 机制监听 binlog 文件的变化并尾部读取"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Canal 的核心设计是将自己伪装为 MySQL 的一个 slave 节点。它向 MySQL master 发送 COM_REGISTER_SLAVE 命令注册 server-id，再通过 COM_BINLOG_DUMP 请求 binlog 事件流，MySQL master 会像对待真正的 slave 一样持续推送 binlog 事件。这种方式完全利用了 MySQL 已有的主从复制基础设施，不需要安装任何插件或对 MySQL 做侵入性改造。A 选项描述的轮询方式延迟高且无法获取完整的 ROW 事件细节；B 的 UDF 方案需要修改 MySQL 本身，违反非侵入原则；D 的 inotify 方式无法解析二进制格式的 binlog 内容，也无法处理跨文件轮转。"
+        },
+        {
+          "id": "redis-binlog-cache-update-q1-quiz2",
+          "question": "为什么 binlog 缓存更新方案要求 MySQL 的 binlog 格式必须是 ROW？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "ROW 格式的 binlog 体积最小，能减少 Canal 的网络传输压力"
+            },
+            {
+              "id": "B",
+              "text": "只有 ROW 格式才记录每行数据变更前后的完整镜像，能精确定位受影响的主键和字段值"
+            },
+            {
+              "id": "C",
+              "text": "STATEMENT 格式的 binlog 不支持主从复制协议，Canal 无法订阅"
+            },
+            {
+              "id": "D",
+              "text": "ROW 格式支持并行解析，STATEMENT 格式只能串行处理，性能差异明显"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ROW 格式的 binlog 会记录每一行被影响数据的变更前后完整镜像（before image 和 after image），包括主键值和每个字段的前后值。消费者需要这些信息来精确定位要失效的缓存 key。例如收到「id=1001，price 从 89.9 变为 99.9」就能精确删除 product:detail:1001 这个缓存。STATEMENT 格式只记录原始 SQL（如 UPDATE ... WHERE category_id=5），无法知道具体哪些行匹配了条件，自然无法映射到缓存 key。A 恰好说反了——ROW 格式体积通常大于 STATEMENT 格式。C 是错误的，STATEMENT 格式同样支持主从复制。D 的并行解析说法没有依据。"
+        },
+        {
+          "id": "redis-binlog-cache-update-q1-quiz3",
+          "question": "相比应用层「先更新数据库再删缓存」的 Cache Aside 方案，binlog 方案最核心的优势是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "binlog 方案的缓存失效延迟更低，通常在 1ms 以内"
+            },
+            {
+              "id": "B",
+              "text": "binlog 方案不需要消息队列，架构更简单"
+            },
+            {
+              "id": "C",
+              "text": "binlog 方案能捕获所有写入路径的变更（包括 DBA 脚本、第三方系统直连写入），不存在旁路写入盲区"
+            },
+            {
+              "id": "D",
+              "text": "binlog 方案直接保证了强一致性，缓存与数据库在任意时刻都完全一致"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "binlog 方案的核心优势在于它监听的是数据库的事务日志——所有写操作无论来源都必须经过 binlog，因此能捕获 DBA 手动修数据、数据迁移脚本、其他微服务直连数据库等所有写入路径的变更。应用层的 Cache Aside 只能管住自己代码里的写入逻辑，对旁路写入完全无感知。A 是错误的，binlog 方案的端到端延迟通常在 100ms-1s，反而比应用层直接删缓存更慢。B 也是错误的，生产级的 binlog 方案通常需要 Kafka/RocketMQ 作为消息缓冲层，架构复杂度更高。D 是错误的，binlog 方案提供的是最终一致性，不是强一致性。"
+        },
+        {
+          "id": "redis-binlog-cache-update-q1-quiz4",
+          "question": "在 binlog 缓存更新的架构中，Canal 和消费者之间引入消息队列（Kafka/RocketMQ）的主要目的是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "消息队列负责将 binlog 的二进制格式转换为 JSON 格式，便于消费者解析"
+            },
+            {
+              "id": "B",
+              "text": "解耦生产与消费的速率差异，提供消息持久化能力，支持故障恢复时的消息重放"
+            },
+            {
+              "id": "C",
+              "text": "消息队列能将 binlog 事件按主键哈希分片，实现缓存更新的并行处理"
+            },
+            {
+              "id": "D",
+              "text": "消息队列负责对 binlog 事件去重，确保消费者不会收到重复消息"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "引入消息队列的核心目的是在 Canal 和消费者之间建立缓冲层。首先，Canal 的 binlog 解析速度和消费者的处理速度可能存在显著差异，MQ 可以平滑这种速率差异，避免消费者处理不过来时反压到 Canal。其次，MQ 提供消息持久化，即使消费者短暂宕机，消息也不会丢失。第三，在故障恢复时消费者可以从上次的 offset 重新消费，支持消息重放。A 是错误的，binlog 到结构化事件的转换是 Canal Server 自身完成的。C 虽然是 MQ 可以做到的事情之一，但不是引入 MQ 的主要目的。D 也是错误的，Kafka/RocketMQ 的默认语义是 at-least-once，并不保证去重，幂等性由消费者自己负责。"
+        },
+        {
+          "id": "redis-binlog-cache-update-q1-quiz5",
+          "question": "消费 binlog 事件后，为什么通常推荐「删除缓存」而非「直接用 binlog 数据更新缓存」？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Redis 的 DEL 命令比 SET 命令性能高出一个数量级，删除操作对 Redis 的压力更小"
+            },
+            {
+              "id": "B",
+              "text": "缓存对象往往由多表 JOIN 构建，单表的 binlog 事件无法构建完整的缓存对象"
+            },
+            {
+              "id": "C",
+              "text": "binlog 事件不包含变更后的数据值，只包含主键和操作类型，无法用于更新缓存"
+            },
+            {
+              "id": "D",
+              "text": "删除缓存不需要消费者连接 Redis，只需要记录日志即可"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "实际生产中的缓存对象很少是某张表的一行数据的直接映射。一个典型的商品详情缓存可能包含 product 表的基本信息、sku 表的规格数据、inventory 表的库存数量、promotion 表的促销信息——这是多表 JOIN 的结果。当你收到 product 表的一条 binlog 事件时，只有 product 表这一张表的变更数据，无法构建出完整的缓存对象。删除缓存则简单可靠得多：提取主键拼出缓存 key，DEL 掉即可，下次读请求 cache miss 时由业务代码从数据库重建完整缓存。A 的说法没有根据，DEL 和 SET 都是 O(1) 操作。C 是错误的，ROW 格式的 binlog 确实包含变更后的完整数据。D 完全不合理。"
+        },
+        {
+          "id": "redis-binlog-cache-update-q1-quiz6",
+          "question": "Canal 的 MySQL 账号至少需要哪些权限才能正常订阅 binlog？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "SELECT 和 INSERT 权限即可"
+            },
+            {
+              "id": "B",
+              "text": "REPLICATION SLAVE 和 REPLICATION CLIENT 权限"
+            },
+            {
+              "id": "C",
+              "text": "ALL PRIVILEGES 全部权限"
+            },
+            {
+              "id": "D",
+              "text": "SUPER 权限和 FILE 权限"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Canal 通过 MySQL 主从复制协议获取 binlog，这需要两个专门的复制权限：REPLICATION SLAVE 允许账号连接到 master 并请求 binlog 事件流（COM_BINLOG_DUMP），REPLICATION CLIENT 允许账号执行 SHOW MASTER STATUS 和 SHOW BINARY LOGS 等命令来获取当前的 binlog 位点信息。这是最小权限原则的体现——不需要给 Canal 任何数据读写权限，它只需要能读 binlog 即可。如果开启了 tsdb 功能，还需要额外授予对 schema 元数据的 SELECT 权限。A 的 SELECT/INSERT 是普通数据操作权限，不涉及复制协议。C 给了过多权限，违反最小权限原则。D 的 SUPER 权限虽然包含复制能力但权限范围过大，FILE 权限与 binlog 订阅无关。"
+        },
+        {
+          "id": "redis-binlog-cache-update-q1-quiz7",
+          "question": "binlog 缓存更新方案的端到端延迟（从 MySQL 写入到 Redis 缓存被清除）在生产环境中的典型范围是？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "小于 1ms，基本等同于同步操作"
+            },
+            {
+              "id": "B",
+              "text": "100ms 到 1s（P99），取决于 Canal 解析速度和 MQ 消费延迟"
+            },
+            {
+              "id": "C",
+              "text": "5 秒到 30 秒，因为 Canal 采用批量拉取策略"
+            },
+            {
+              "id": "D",
+              "text": "1 分钟到 5 分钟，需要等待 binlog 文件轮转后才能读取"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "binlog 缓存更新的端到端延迟由几段构成：MySQL 事务提交到 binlog 刷盘是同步的（可忽略）；Canal 从 master 拉取 binlog 通常毫秒级；Canal 解析并投递到 MQ 约 10-50ms；MQ 到消费者的消费延迟约 50-500ms（取决于 consumer 拉取频率和处理速度）；消费者操作 Redis 几毫秒。综合下来 P99 延迟通常在 100ms 到 1s 范围内。对于大多数非强一致场景（商品信息、用户资料）这个延迟完全可接受。A 不现实，中间经过多个组件不可能亚毫秒级。C 和 D 严重高估了延迟，Canal 是近实时流式消费，不需要等待批量积累或文件轮转。"
+        },
+        {
+          "id": "redis-binlog-cache-update-q1-quiz8",
+          "question": "Canal 处理 MySQL DDL 变更（ALTER TABLE）时可能遇到什么问题？如何解决？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "DDL 会导致 Canal 自动断开连接，需要人工重启，解决方案是配置自动重连"
+            },
+            {
+              "id": "B",
+              "text": "Canal 回溯消费时可能用新的表结构解析旧格式 binlog 导致列错位，解决方案是开启 tsdb 持久化表结构历史"
+            },
+            {
+              "id": "C",
+              "text": "DDL 语句不会写入 binlog，Canal 完全感知不到表结构变更，需要手动通知"
+            },
+            {
+              "id": "D",
+              "text": "DDL 变更会使 ROW 格式自动切换为 STATEMENT 格式，Canal 无法解析"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ROW 格式的 binlog 不携带列名信息，只有列值的有序序列，Canal 的解析器必须知道当前表结构才能正确做列名映射。正常情况下 Canal 遇到 DDL 事件会重新拉取 INFORMATION_SCHEMA 更新 schema 缓存。但如果 Canal 在 DDL 事件之后重启并回溯消费到 DDL 之前的位点，它会用新的表结构去解析旧格式的 binlog 事件，导致列错位或解析异常。解决方案是开启 canal.instance.tsdb.enable=true，将每次 DDL 时的表结构快照持久化到独立数据库，回溯消费时能找到历史时刻的正确 schema。C 是错误的，DDL 确实会写入 binlog。D 没有根据，DDL 不影响 binlog 格式设置。"
+        },
+        {
+          "id": "redis-binlog-cache-update-q1-quiz9",
+          "question": "关于 Canal 和 Debezium 的对比，以下哪个说法是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Debezium 性能远高于 Canal，因为它使用 C++ 编写的 binlog 解析器"
+            },
+            {
+              "id": "B",
+              "text": "Canal 支持所有主流数据库（MySQL、PostgreSQL、MongoDB、Oracle），Debezium 只支持 MySQL"
+            },
+            {
+              "id": "C",
+              "text": "Debezium 基于 Kafka Connect 框架运行，支持多种数据源，在 Kubernetes 环境下可通过 Strimzi Operator 声明式部署"
+            },
+            {
+              "id": "D",
+              "text": "Canal 和 Debezium 功能完全相同，只是一个用 Java 一个用 Go 编写"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Debezium 由 Red Hat 维护，基于 Kafka Connect 框架运行，部署时只需提交一份 JSON 格式的 Connector 配置给 Kafka Connect 集群即可启动，运维门槛较低。它支持 MySQL、PostgreSQL、MongoDB、SQL Server、Oracle 等十余种数据源，在 K8s 环境下可通过 Strimzi Operator 实现声明式 CRD 部署和管理。Canal 主要面向 MySQL 生态，但在 MySQL 兼容性方面经过了阿里巴巴大规模生产验证，国内中文社区资源更丰富。A 是错误的，Debezium 也是 Java 编写的。B 说反了，Canal 主要支持 MySQL，Debezium 支持更多数据源。D 也不对，两者的架构设计和生态定位有明显差异。"
+        },
+        {
+          "id": "redis-binlog-cache-update-q1-quiz10",
+          "question": "以下哪种场景最适合引入 binlog 缓存更新方案，而非简单的应用层 Cache Aside？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "单体应用，写入 QPS 约 50，只有应用代码会修改数据库"
+            },
+            {
+              "id": "B",
+              "text": "多个微服务和 DBA 脚本共享同一数据库，缓存一致性要求高，团队有中间件运维能力"
+            },
+            {
+              "id": "C",
+              "text": "缓存的数据全部来自外部 API 调用，与本地数据库无关"
+            },
+            {
+              "id": "D",
+              "text": "需要缓存与数据库在任意时刻强一致，零延迟容忍"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "binlog 方案的核心价值在于捕获所有写入路径的变更。当多个微服务共享同一数据库、DBA 经常需要手动修数据、存在数据迁移脚本等旁路写入场景时，应用层的 Cache Aside 无法覆盖这些非应用代码的写入路径，binlog 方案才有明确的 ROI。同时团队需要有中间件运维能力来维护 Canal/Debezium + MQ 这套基础设施。A 描述的单体应用、低 QPS、单一写入路径场景，用 Cache Aside 加 TTL 兜底足矣，引入 Canal 属于杀鸡用牛刀。C 的场景数据不在本地数据库，binlog 方案无从谈起。D 的强一致零延迟要求是 binlog 方案无法满足的，它只提供最终一致性。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Canal GitHub 官方仓库",
+          "url": "https://github.com/alibaba/canal"
+        },
+        {
+          "title": "Debezium 官方文档",
+          "url": "https://debezium.io/documentation/"
+        },
+        {
+          "title": "MySQL Binary Log 官方文档",
+          "url": "https://dev.mysql.com/doc/refman/8.0/en/binary-log.html"
+        }
+      ]
+    }
+  ]
+}
