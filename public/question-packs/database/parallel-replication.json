@@ -1,0 +1,178 @@
+{
+  "id": "db-parallel-replication",
+  "name": "并行复制原理与配置",
+  "domain": "database",
+  "description": "MySQL 并行复制的三代演进、原理机制与生产配置",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q121",
+      "domain": "database",
+      "type": "env-config",
+      "difficulty": 3,
+      "tags": [
+        "MySQL",
+        "并行复制",
+        "Parallel Replication",
+        "主从复制",
+        "slave_parallel_workers",
+        "LOGICAL_CLOCK",
+        "WRITESET"
+      ],
+      "title": "并行复制(Parallel Replication)的原理与配置",
+      "content": "## 场景\n\n你们的 MySQL 8.0 主从复制集群最近出现了明显的从库延迟问题。监控显示 Seconds_Behind_Source 在业务高峰期持续维持在 30-60 秒。你用 SHOW REPLICA STATUS 观察发现 I/O thread 一切正常，relay log 的写入速度远快于 SQL thread 的回放速度。问题很明确：从库的 SQL thread 是单线程顺序回放事件的，它的回放吞吐根本跟不上主库多并发写入产生 binlog 的速度。\n\n一位资深 DBA 给你看了一段配置：\n\n```ini\n[mysqld]\nslave_parallel_type       = LOGICAL_CLOCK\nslave_parallel_workers    = 16\nslave_preserve_commit_order = ON\nbinlog_transaction_dependency_tracking = WRITESET\nbinlog_group_commit_sync_delay = 100\nbinlog_group_commit_sync_no_delay_count = 20\n```\n\n他说「开了并行复制之后从库延迟就能降到 1 秒以内」。你盯着这几行配置，有很多疑问：slave_parallel_type 的 LOGICAL_CLOCK 是什么含义？WRITESET 跟 LOGICAL_CLOCK 是什么关系？binlog_group_commit_sync_delay 为什么设置 100 微秒？workers 设 16 个够不够？\n\n你回忆起 MySQL 5.6 时代就有人提过并行复制，当时的方案是以 database 为粒度进行并行——如果你的业务只写一个库，那方案基本没用。到了 5.7 出现了基于 LOGICAL_CLOCK 的方案，8.0 又引入了 WRITESET。这三代方案到底是怎么演进的？每一代解决了上一代的什么痛点？\n\n### 思考\n\n请从 MySQL 从库单线程回放的历史瓶颈出发，完整梳理并行复制三代方案（DATABASE、LOGICAL_CLOCK、WRITESET）各自的原理、适用场景和局限性。然后结合上面的配置参数，解释每个参数的作用以及它们之间的协作关系。如果你能说清楚 WRITESET 如何突破 LOGICAL_CLOCK 对 binlog group commit 的依赖，你就真正理解了 MySQL 并行复制的精髓。",
+      "answer": "## 第一步：MySQL 并行复制的前世今生\n\nMySQL 的主从复制自 3.23 版本引入以来，从库端的回放一直是单线程模型——一个 SQL thread 按顺序逐条执行 relay log 中的事件。这种设计在主库写入量不大的时代完全够用，但随着业务规模增长，主库端可能有几十甚至上百个并发线程同时写入数据，binlog 的生产速率远超单个 SQL thread 的消费速率，从库延迟就成了不可避免的顽疾。\n\n举一个直观的数字：主库上 32 个并发连接每秒各提交 100 个事务，总写入速率是 3200 TPS；从库的 SQL thread 单线程回放，假设每个事务平均耗时 0.5ms，理论极限也只有 2000 TPS。主库写入超过从库回放能力，延迟就会持续累积，在业务高峰期 Seconds_Behind_Source 轻松飙到几十秒甚至几分钟。\n\n这个问题的根因很清晰：主库是并行写入的，但从库是串行回放的。解决方案也很自然：让从库也能并行回放。但难点在于如何判断哪些事务可以安全地并行执行而不会产生数据不一致。如果两个事务修改了同一行数据，它们的回放顺序必须与主库上的提交顺序一致；如果两个事务操作的数据完全不相关，它们完全可以同时回放。\n\nMySQL 在这个问题上经历了三代方案的演进，每一代都在「并行度」和「安全性」之间找到了更好的平衡点。\n\n## 第二步：三代方案的原理深度解析\n\n### 第一代：DATABASE 并行（MySQL 5.6）\n\nMySQL 5.6 是第一个支持多线程复制（Multi-Threaded Slave, MTS）的版本。它的并行粒度是数据库（schema）级别：从库启动多个 worker thread，每个 worker 负责回放一个数据库的事务。不同数据库的事务可以并行执行，同一个数据库内的事务仍然串行。\n\n配置方式很简单：\n\n```ini\nslave_parallel_workers = 8\nslave_parallel_type    = DATABASE\n```\n\n这个方案的优势是实现简单且绝对安全——同一个数据库内的事务顺序一定不会乱。但它的致命缺陷也很明显：绝大多数业务只有一个数据库。如果你的所有表都在 `app_db` 这一个 schema 里，那 8 个 worker 只有 1 个能工作，其余 7 个永远空闲。即便你有多个数据库，热点通常集中在其中一两个库上，并行效果依然有限。\n\n在实际生产中，DATABASE 并行只对分库场景有意义——比如按租户分了 16 个库的 SaaS 系统，这时每个库的事务可以分配到不同 worker 并行回放，效果显著。但对绝大多数单库应用，这个方案约等于没开。\n\n### 第二代：LOGICAL_CLOCK 并行（MySQL 5.7）\n\nMySQL 5.7 引入了真正革命性的方案——基于逻辑时钟（LOGICAL_CLOCK）的并行复制。它的核心思想来自一个重要的观察：在主库上，如果多个事务能在同一个 binlog group commit 中一起提交，说明它们在主库上的执行时间窗口有重叠，它们之间一定不存在锁冲突（否则不可能同时到达 commit 阶段）。既然主库上这些事务能并行执行，从库上也一定能安全地并行回放。\n\n具体实现上，MySQL 5.7 在每个事务的 binlog 事件中增加了两个标记：`last_committed` 和 `sequence_number`。`sequence_number` 是事务的全局递增序号；`last_committed` 表示该事务提交时，上一个已经提交的事务组的最大 `sequence_number`。如果两个事务的 `last_committed` 值相同，说明它们属于同一个 group commit 批次，可以并行回放。\n\n你可以用 mysqlbinlog 查看这些标记：\n\n```bash\nmysqlbinlog --no-defaults mysql-bin.000003 | grep last_committed\n# 输出示例：\n# last_committed=0  sequence_number=1\n# last_committed=0  sequence_number=2\n# last_committed=0  sequence_number=3\n# last_committed=3  sequence_number=4\n# last_committed=3  sequence_number=5\n```\n\n上面的输出中，sequence_number 1、2、3 的 last_committed 都是 0，说明它们属于同一个 group commit 批次，可以并行回放。sequence_number 4 和 5 的 last_committed 是 3，说明它们必须等 1-3 都回放完才能开始，但 4 和 5 之间可以并行。\n\n配置方式：\n\n```ini\nslave_parallel_type    = LOGICAL_CLOCK\nslave_parallel_workers = 16\nslave_preserve_commit_order = ON\n```\n\n`slave_preserve_commit_order = ON` 确保从库的事务提交顺序与主库一致，虽然回放可以并行，但最终的 commit 按照 sequence_number 顺序执行。这对于从库作为备选主库切换场景非常重要。\n\nLOGICAL_CLOCK 的并行度取决于主库 group commit 的批次大小。如果主库的并发写入很高，每个 group commit 批次自然包含很多事务，从库的并行度就高。但如果主库写入稀疏（比如每秒只有几十个事务），每个 group commit 批次可能只有 1-2 个事务，并行效果就不明显。\n\n为了人为增加 group commit 的批次大小，MySQL 5.7 提供了两个参数：\n\n```ini\nbinlog_group_commit_sync_delay         = 100    # 微秒，延迟提交等待更多事务加入\nbinlog_group_commit_sync_no_delay_count = 20     # 凑够 20 个事务就不再等待\n```\n\n`binlog_group_commit_sync_delay = 100` 表示主库在做 binlog fsync 之前额外等待 100 微秒，让更多并发事务有机会加入同一个 group commit 批次。`binlog_group_commit_sync_no_delay_count = 20` 表示如果已经凑够 20 个事务就立即提交，不必等满 100 微秒。这两个参数在主库端引入了微小的延迟（最多 0.1ms），但换来了从库显著更高的并行度。\n\n### 第三代：WRITESET 并行（MySQL 8.0）\n\nLOGICAL_CLOCK 的并行度受限于 group commit 批次——只有同一批次内的事务才能并行。如果两个事务修改的数据完全不相关但不在同一个 group commit 批次中（比如它们的提交时间差了几毫秒），LOGICAL_CLOCK 下它们就只能串行回放。这限制了进一步提升并行度的空间。\n\nMySQL 8.0 引入了 WRITESET 机制来突破这个限制。原理是：主库在事务提交时，对每个事务修改的行计算一个哈希值（基于主键或唯一键的值），形成该事务的 writeset。如果两个事务的 writeset 没有交集（即它们修改的行完全不同），即使它们不在同一个 group commit 批次内，从库也可以安全地并行回放。\n\n配置方式是在主库端设置：\n\n```ini\n# 主库配置\nbinlog_transaction_dependency_tracking = WRITESET\ntransaction_write_set_extraction       = XXHASH64\n```\n\n`binlog_transaction_dependency_tracking` 有三个可选值：COMMIT_ORDER（等同于 LOGICAL_CLOCK 行为）、WRITESET（基于行级依赖判断）、WRITESET_SESSION（在 WRITESET 基础上额外保证同一 session 内事务的顺序）。`transaction_write_set_extraction` 指定哈希算法，XXHASH64 是推荐值。\n\n开启 WRITESET 后，主库在写 binlog 时会根据 writeset 的交集关系重新计算每个事务的 `last_committed` 值。如果一个事务的 writeset 与之前若干事务都没有交集，它的 `last_committed` 会被设置为更早的值，这样从库在回放时就能识别出更多可并行的事务。\n\n从库端不需要额外配置，仍然使用 LOGICAL_CLOCK 模式读取 `last_committed` 和 `sequence_number`——WRITESET 是在主库端改变了这两个值的计算逻辑，从库端的并行调度算法不变。完整配置如下：\n\n```ini\n# 主库\nbinlog_transaction_dependency_tracking  = WRITESET\ntransaction_write_set_extraction        = XXHASH64\nbinlog_group_commit_sync_delay          = 100\nbinlog_group_commit_sync_no_delay_count = 20\n\n# 从库\nslave_parallel_type            = LOGICAL_CLOCK\nslave_parallel_workers         = 16\nslave_preserve_commit_order    = ON\nrelay_log_recovery             = ON\n```\n\n`relay_log_recovery = ON` 确保从库崩溃重启后自动丢弃未完成的 relay log 并从主库重新拉取，避免并行回放中断后 relay log 损坏导致数据不一致。\n\n## 第三步：生产调优与运维实践\n\n### Worker 数量的选择\n\n`slave_parallel_workers` 并不是越大越好。worker 之间的协调和 commit order 保持都有开销。经验法则是设置为主库平均并发写入线程数的 50%-100%。如果主库高峰期有 32 个活跃写入连接，从库设 16-32 个 worker 是合理的。设置过多（比如 128）反而会因为线程调度开销和锁竞争导致性能下降。可以从 8 开始逐步翻倍，观察 Seconds_Behind_Source 的变化找到最佳值。\n\n### 监控并行复制效果\n\nMySQL Performance Schema 提供了详细的复制监控表：\n\n```sql\n-- 查看每个 worker 的状态\nSELECT WORKER_ID, THREAD_ID, \n       LAST_APPLIED_TRANSACTION,\n       APPLYING_TRANSACTION,\n       LAST_APPLIED_TRANSACTION_END_APPLY_TIMESTAMP\nFROM performance_schema.replication_applier_status_by_worker;\n\n-- 查看协调器（coordinator）状态\nSELECT * FROM performance_schema.replication_applier_status_by_coordinator;\n\n-- 查看整体复制延迟\nSELECT * FROM performance_schema.replication_applier_status;\n```\n\n如果你发现大部分 worker 处于空闲状态而只有一两个 worker 在忙碌，说明并行度不够——可能是 group commit 批次太小，或者存在热点表导致大量事务的 writeset 有交集。\n\n### 常见陷阱\n\n第一个坑是大事务。如果一个事务修改了 100 万行数据，它的回放时间可能长达数十秒。在此期间，所有与它有 writeset 交集的后续事务都必须等待它完成，其他 worker 全部阻塞，并行复制退化为串行。解决方案是在业务端避免大事务——批量更新应拆分成每 1000-5000 行一个事务。\n\n第二个坑是 DDL 语句。ALTER TABLE、CREATE INDEX 等 DDL 会独占整个表的元数据锁，执行期间该表上的所有 DML 事务都无法并行。一条执行 5 分钟的 online DDL 会让并行复制在这 5 分钟内几乎无用。生产中建议使用 pt-online-schema-change 或 gh-ost 进行无锁 DDL。\n\n第三个坑是从库 crash 后的恢复。并行回放意味着 relay log 中的事务不一定按顺序完成，crash 时可能有部分事务回放到一半。`relay_log_recovery = ON` 的作用就是在重启时丢弃所有未完成的 relay log，让 I/O thread 从上次确认的位点重新拉取，避免数据空洞。但这也意味着重启后需要重新传输一部分 binlog，会有短暂的追赶期。\n\n### MariaDB 乐观并行复制对比\n\nMariaDB 10.1 引入了一种激进的乐观并行复制（Optimistic Parallel Replication）：它假设所有事务都可以并行回放，先乐观地并行执行，如果执行中检测到冲突（行锁等待），则回滚冲突事务并按顺序重试。这种方式在冲突率低的场景下并行度极高，不依赖 group commit 分组，但冲突率高时频繁回滚会造成性能抖动。MySQL 的 WRITESET 方案则是保守策略——只有确认无冲突的事务才会并行，不会出现回滚，性能更加稳定可预期。\n\n### 生产部署检查清单\n\n完整部署并行复制需要确认以下配置：主库端开启 WRITESET 追踪并设置合理的 group commit delay；从库端设置足够的 worker 数量、开启 commit order 保持和 relay log recovery；业务端避免大事务和长时间 DDL；监控端关注 P_S 复制表中各 worker 的负载均衡情况和 coordinator 的等待事件。当这些环节都到位后，一个高峰期主库 5000 TPS 的系统，从库延迟通常可以稳定控制在 1 秒以内。",
+      "keyPoints": [
+        "MySQL 从库单线程回放是复制延迟的根因，并行复制通过多 worker 并行执行 relay log 事务来提升回放吞吐量。",
+        "第一代 DATABASE 并行（5.6）以 schema 为粒度，仅对多库场景有效；单库业务下所有 worker 只有一个能工作。",
+        "第二代 LOGICAL_CLOCK（5.7）利用 binlog group commit 分组：同一批次提交的事务在主库无锁冲突，从库可安全并行回放。",
+        "binlog_group_commit_sync_delay 在主库端人为延迟 fsync 以凑更大的 commit 批次，牺牲微量主库延迟换取从库更高并行度。",
+        "第三代 WRITESET（8.0）在主库端对每个事务的修改行计算哈希，只要两个事务 writeset 无交集即可并行，突破了 group commit 批次的限制。",
+        "slave_preserve_commit_order = ON 保证从库事务提交顺序与主库一致，对主从切换场景至关重要。",
+        "大事务和 DDL 是并行复制的天敌——单个长事务会阻塞所有依赖它的 worker，导致并行退化为串行。",
+        "relay_log_recovery = ON 确保从库 crash 后丢弃未完成的 relay log 从主库重新拉取，避免并行回放中断造成的数据空洞。"
+      ],
+      "quiz": [
+        {
+          "id": "db-q121-quiz-01",
+          "question": "MySQL 5.6 的并行复制方案以什么粒度进行并行调度？",
+          "choices": [
+            {"id": "A", "text": "以表（table）为粒度，不同表的事务可以并行"},
+            {"id": "B", "text": "以数据库（schema）为粒度，不同库的事务可以并行"},
+            {"id": "C", "text": "以 binlog group commit 为粒度，同批次事务可以并行"},
+            {"id": "D", "text": "以行（row）为粒度，修改不同行的事务可以并行"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MySQL 5.6 的 slave_parallel_type=DATABASE 以数据库为粒度分配 worker，同一个 schema 内的事务仍然串行。这导致单库场景下并行复制几乎无效。"
+        },
+        {
+          "id": "db-q121-quiz-02",
+          "question": "LOGICAL_CLOCK 方案判断两个事务可以并行回放的依据是什么？",
+          "choices": [
+            {"id": "A", "text": "两个事务操作的表不同"},
+            {"id": "B", "text": "两个事务的 last_committed 值相同，属于同一个 binlog group commit 批次"},
+            {"id": "C", "text": "两个事务修改的行没有重叠"},
+            {"id": "D", "text": "两个事务来自同一个客户端连接"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "LOGICAL_CLOCK 的核心逻辑是：如果两个事务的 last_committed 相同，说明它们属于同一个 group commit 批次，在主库上能同时到达 commit 阶段意味着彼此无锁冲突，从库可以并行回放。"
+        },
+        {
+          "id": "db-q121-quiz-03",
+          "question": "binlog_group_commit_sync_delay 参数的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "延迟从库 SQL thread 的回放速度以减少锁冲突"},
+            {"id": "B", "text": "在主库 binlog fsync 前额外等待一段时间，让更多事务加入同一个 group commit 批次"},
+            {"id": "C", "text": "延迟从库 I/O thread 拉取 binlog 的频率以减少网络开销"},
+            {"id": "D", "text": "控制从库 worker 之间的调度间隔"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "该参数在主库端 binlog fsync 之前引入微秒级延迟，让更多并发事务有机会进入同一个 group commit 批次。批次越大，从库的 LOGICAL_CLOCK 并行度越高。"
+        },
+        {
+          "id": "db-q121-quiz-04",
+          "question": "WRITESET 相比 LOGICAL_CLOCK 的核心改进是什么？",
+          "choices": [
+            {"id": "A", "text": "支持从库跨数据库并行回放"},
+            {"id": "B", "text": "不再需要从库配置 slave_parallel_workers"},
+            {"id": "C", "text": "通过行级依赖追踪，让不在同一 group commit 批次但无数据冲突的事务也能并行"},
+            {"id": "D", "text": "将并行回放从从库迁移到主库执行"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "WRITESET 在主库端为每个事务计算修改行的哈希集合，如果两个事务的 writeset 无交集就标记为可并行，即使它们不在同一个 group commit 批次内。这突破了 LOGICAL_CLOCK 对 group commit 分组的依赖。"
+        },
+        {
+          "id": "db-q121-quiz-05",
+          "question": "slave_preserve_commit_order = ON 的含义是什么？",
+          "choices": [
+            {"id": "A", "text": "保证从库各 worker 的执行顺序与主库提交顺序一致"},
+            {"id": "B", "text": "保证从库事务的最终 commit 顺序与主库一致，但执行（apply）可以并行"},
+            {"id": "C", "text": "禁止从库并行回放，强制串行执行"},
+            {"id": "D", "text": "保证 relay log 中事件的写入顺序不被打乱"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "该参数允许多个 worker 并行执行事务，但最终提交（commit）时按照主库的 sequence_number 顺序进行。这确保从库在任意时刻的可见状态都与主库某个历史时刻一致，对主从切换非常重要。"
+        },
+        {
+          "id": "db-q121-quiz-06",
+          "question": "当一个大事务修改了 50 万行数据时，对并行复制会造成什么影响？",
+          "choices": [
+            {"id": "A", "text": "不影响并行度，因为 WRITESET 可以将大事务拆成多个 worker 执行"},
+            {"id": "B", "text": "所有 worker 都会参与回放这个大事务，加速执行"},
+            {"id": "C", "text": "该事务独占一个 worker 执行时间很长，所有与它有依赖的后续事务必须等待，导致其他 worker 阻塞"},
+            {"id": "D", "text": "从库会自动跳过大事务，等主库拆分后再回放"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "并行复制的调度单位是整个事务，不会将一个事务拆分到多个 worker。大事务回放时间长，由于其 writeset 覆盖范围广，大量后续事务与它存在依赖关系，只能等它完成后才能执行，导致并行复制在这段时间退化为串行。"
+        },
+        {
+          "id": "db-q121-quiz-07",
+          "question": "relay_log_recovery = ON 在并行复制场景中为什么特别重要？",
+          "choices": [
+            {"id": "A", "text": "它让从库自动优化 relay log 的存储格式以支持并行读取"},
+            {"id": "B", "text": "并行回放时事务不按顺序完成，crash 后可能有空洞，该参数确保重启时丢弃未完成的 relay log 从主库重新拉取"},
+            {"id": "C", "text": "它启用从库的 relay log 压缩功能减少磁盘占用"},
+            {"id": "D", "text": "它让从库在 crash 后跳过出错的事务继续回放"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "并行回放下，多个 worker 同时处理不同事务，crash 时可能出现 gap（某些事务已完成、中间的还没完成）。relay_log_recovery = ON 在重启时丢弃所有存疑的 relay log，从 I/O thread 上次确认的位点重新拉取，确保数据完整性。"
+        },
+        {
+          "id": "db-q121-quiz-08",
+          "question": "binlog_transaction_dependency_tracking 参数设置在哪一端？",
+          "choices": [
+            {"id": "A", "text": "设置在从库端，控制从库 worker 的调度策略"},
+            {"id": "B", "text": "设置在主库端，影响写入 binlog 时 last_committed 的计算方式"},
+            {"id": "C", "text": "主从两端都必须设置相同的值"},
+            {"id": "D", "text": "设置在 ProxySQL 等中间件上"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "该参数是主库端配置，它改变的是 binlog 中 last_committed 值的生成逻辑。设为 WRITESET 后主库会基于行级依赖重新计算事务间的并行关系，从库端无需额外配置变更即可受益。"
+        },
+        {
+          "id": "db-q121-quiz-09",
+          "question": "MariaDB 的乐观并行复制与 MySQL WRITESET 的根本区别是什么？",
+          "choices": [
+            {"id": "A", "text": "MariaDB 不支持多 worker 并行回放"},
+            {"id": "B", "text": "MariaDB 先乐观并行执行所有事务、冲突时回滚重试；MySQL WRITESET 事先确认无冲突才并行、不会回滚"},
+            {"id": "C", "text": "MariaDB 只支持 DATABASE 级别的并行"},
+            {"id": "D", "text": "MariaDB 需要从库也计算 writeset 哈希"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MariaDB 的策略是乐观执行——假设所有事务可并行，冲突时回滚重试。MySQL 的 WRITESET 是保守策略——主库端预计算依赖关系，只让确认无冲突的事务并行。MariaDB 方案在低冲突时并行度更高，但高冲突时频繁回滚导致性能不稳定。"
+        },
+        {
+          "id": "db-q121-quiz-10",
+          "question": "以下哪种场景下 WRITESET 并行复制的效果最差？",
+          "choices": [
+            {"id": "A", "text": "大量事务分散更新不同用户的独立记录"},
+            {"id": "B", "text": "所有事务都在更新同一张表的同一个热点行（如全局计数器）"},
+            {"id": "C", "text": "多个微服务各自操作自己的业务表"},
+            {"id": "D", "text": "批量 INSERT 操作向不同分区写入新数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当所有事务都修改同一行时，它们的 writeset 全部有交集，WRITESET 机制无法找到任何可并行的事务对，回放完全退化为串行。这是热点行场景的固有限制。选项 A、C、D 都是事务间数据不相关的场景，WRITESET 并行度很高。"
+        }
+      ],
+      "references": [
+        {
+          "title": "MySQL 8.0 Reference Manual: Replication Threads",
+          "url": "https://dev.mysql.com/doc/refman/8.0/en/replication-implementation-details.html"
+        },
+        {
+          "title": "MySQL 8.0 Reference Manual: binlog_transaction_dependency_tracking",
+          "url": "https://dev.mysql.com/doc/refman/8.0/en/replication-options-binary-log.html#sysvar_binlog_transaction_dependency_tracking"
+        },
+        {
+          "title": "Percona Blog: Multi-Threaded Replication in MySQL 8.0",
+          "url": "https://www.percona.com/blog/multi-threaded-replication-in-mysql-8-0/"
+        }
+      ],
+      "relatedQuestions": [
+        "db-q116",
+        "db-q117",
+        "db-q118"
+      ]
+    }
+  ]
+}
