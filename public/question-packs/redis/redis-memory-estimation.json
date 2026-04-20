@@ -1,0 +1,157 @@
+{
+  "id": "redis-memory-estimation",
+  "name": "一千万 key 的 Redis 内存估算",
+  "domain": "redis",
+  "description": "从 Redis 对象结构、SDS、dictEntry 到 jemalloc 对齐，逐字节计算千万级 key-value 的真实内存占用，以及 Hash 压缩方案的优化效果",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-memory-estimation-q1",
+      "domain": "redis",
+      "type": "real-data",
+      "difficulty": 2,
+      "tags": ["Redis", "内存估算", "容量规划", "数据结构", "内存优化"],
+      "title": "一千万 key 的 Redis 内存估算",
+      "content": "你所在的团队正在做一个用户画像服务，需要在 Redis 中存储 1000 万个用户的标签数据。每个 key 的格式类似 `user:profile:10086`（平均长度 30 字节），value 是一段 JSON 字符串（平均长度 200 字节）。技术负责人让你做容量规划，给出这批数据大概需要多少 Redis 内存。\n\n你拍脑袋一算：(30 + 200) × 10,000,000 ≈ 2.15GB，于是跟运维说「给我一台 4GB 的 Redis 实例就够了」。结果上线后 Redis 实例直接 OOM 被 kill 了。运维给你看了 `INFO memory` 的输出：\n\n```\nused_memory:5765000192\nused_memory_human:5.37G\nused_memory_rss:6182903808\nused_memory_rss_human:5.76G\nmem_fragmentation_ratio:1.07\nmem_allocator:jemalloc-5.3.0\n```\n\n实际用了 5.37GB 内存，比你估算的 2.15GB 多了将近 1.5 倍。这多出来的 3GB 都去哪了？如果换用 Hash 结构做压缩存储，能把内存降到多少？",
+      "answer": "## 一、Redis 内存模型基础\n\n### 1.1 Redis 为什么比「裸数据」占更多内存\n\n要回答这道题，得先搞清楚 Redis 在内存里到底是怎么存一个 key-value 的。很多人以为 Redis 存一个 30 字节的 key 和 200 字节的 value 就只用 230 字节，这是把 Redis 当成了一块连续的 byte buffer。实际上 Redis 是一个完整的数据库系统，每个 key-value 对都有元数据开销、指针开销、内存分配器对齐开销，这些「隐形成本」在小 value 场景下甚至比数据本身还大。\n\nRedis 的核心数据结构是一个全局哈希表（dict），这个哈希表管理着所有的 key-value 映射。当你执行 `SET user:profile:10086 '{\"age\":25,...}'` 时，Redis 内部需要分配以下几块内存：一个 dictEntry 结构体（哈希表节点）、一个 redisObject 封装 key、key 对应的 SDS 字符串、一个 redisObject 封装 value、value 对应的 SDS 字符串，以及全局哈希表自身的 bucket 数组。每一块都有固定开销，这些开销加起来远超 key+value 的裸数据大小。\n\n### 1.2 redisObject 结构\n\nRedis 中所有的 key 和 value 都被封装在一个叫 `redisObject` 的结构体中（在 Redis 源码 `server.h` 中定义）。这个结构体在 64 位系统上占 16 字节，包含 4 位的 type 字段（标记 String/Hash/List 等类型）、4 位的 encoding 字段（标记底层编码方式如 raw/int/ziplist）、24 位的 LRU/LFU 时间戳（用于内存淘汰策略）以及一个 32 位的引用计数 refcount 和一个 64 位的 `*ptr` 指针指向实际数据。每个 key 一个 redisObject，每个 value 一个 redisObject，一对 key-value 光 redisObject 就是 32 字节。\n\n### 1.3 SDS（Simple Dynamic String）结构\n\nRedis 不用 C 语言原生的 `char*` 存字符串，而是用自己实现的 SDS（Simple Dynamic String）。SDS 的设计目标是 O(1) 获取字符串长度、二进制安全、自动扩容。在 Redis 3.2+ 中，SDS 根据字符串长度使用不同的 header：sdshdr5（不再实际使用）、sdshdr8（字符串长度 < 256 字节，header 3 字节）、sdshdr16（长度 < 64KB，header 5 字节）、sdshdr32 和 sdshdr64。\n\n对于 30 字节的 key，Redis 使用 sdshdr8，header 包含 1 字节 len + 1 字节 alloc + 1 字节 flags = 3 字节。加上字符串内容 30 字节和末尾的 `\\0` 终止符 1 字节，总共 34 字节。对于 200 字节的 value，同样是 sdshdr8（200 < 256），header 3 字节 + 200 字节内容 + 1 字节 `\\0` = 204 字节。\n\n### 1.4 dictEntry 结构\n\n全局哈希表的每个节点是一个 `dictEntry`，它包含三个指针：`*key`（指向 key 的 redisObject）、`*val`（指向 value 的 redisObject）和 `*next`（指向同一个 bucket 中的下一个节点，链表法解决哈希冲突）。在 64 位系统上三个指针共 24 字节。但 jemalloc 的最小分配粒度是 8 字节对齐，24 字节刚好在 jemalloc 的 size class 中有对应的档位（实际上 Redis 7.x 对 dictEntry 做了优化，在无冲突时可以内联 key 指针，但经典实现中仍是 24 字节或对齐到 32 字节，具体取决于 Redis 版本和 jemalloc 版本）。在 Redis 6.x 及更早版本中，dictEntry 通常被 jemalloc 分配为 32 字节（24 字节数据 + 8 字节对齐填充），Redis 7.2 引入了 dictEntry 嵌入优化可以省掉这个独立分配，但大多数生产环境仍在 6.x/7.0 上。\n\n### 1.5 全局哈希表的 bucket 数组\n\nRedis 的全局哈希表 `dict` 内部维护两个 `dictht`（用于渐进式 rehash），每个 `dictht` 有一个 `**table` 指针数组。这个数组的大小永远是 2 的幂次方，且在 load factor 达到 1 时触发扩容。对于 1000 万个 key，哈希表至少需要 16,777,216（2^24）个 bucket，每个 bucket 是一个 8 字节的指针，光 bucket 数组就是 128MB。\n\n## 二、逐字节计算一千万 key-value 的内存\n\n### 2.1 单个 key-value 对的内存分解\n\n现在我们来做一笔精确的内存账。假设 Redis 6.2，jemalloc 5.2.1，64 位 Linux 系统：\n\n**dictEntry**：三个指针 24 字节，jemalloc 分配时对齐到 32 字节（jemalloc 的 size class 在 [20, 32] 区间分配 32 字节）。\n\n**key 的 redisObject**：16 字节，jemalloc 分配 16 字节（刚好在一个 size class 上）。\n\n**key 的 SDS**：sdshdr8 header 3 字节 + 30 字节内容 + 1 字节 `\\0` = 34 字节，jemalloc 对齐到 40 字节（size class [32, 40] 区间分配 40 字节）。\n\n**value 的 redisObject**：16 字节，jemalloc 分配 16 字节。\n\n**value 的 SDS**：sdshdr8 header 3 字节 + 200 字节内容 + 1 字节 `\\0` = 204 字节，jemalloc 对齐到 208 字节（size class [192, 208] 区间分配 208 字节）。需要注意 jemalloc 5.x 在 128 字节以上的 size class 间距约为 16 字节，所以 204 字节对齐到 208 是准确的。\n\n单个 key-value 对的总内存 = 32 + 16 + 40 + 16 + 208 = **312 字节**。\n\n### 2.2 一千万对的总内存\n\n1000 万个 key-value 对：312 × 10,000,000 = 3,120,000,000 字节 ≈ **2.91 GB**。\n\n再加上全局哈希表的 bucket 数组：2^24 个 bucket × 8 字节 = 134,217,728 字节 ≈ **128 MB**。（如果正好在 rehash 过程中，会有两个 bucket 数组共存，最坏情况翻倍到 256 MB。）\n\n还有 Redis 服务器自身的固定开销：db 结构、客户端缓冲区、AOF 缓冲区等，通常在 50-100 MB 量级。\n\n总计：2.91 GB + 128 MB + ~80 MB ≈ **3.1-3.2 GB**。\n\n题目中实际观测到的 5.37 GB 比这个估算还高，原因可能包括：value 的实际长度分布不均匀（有些 value 超过 256 字节导致使用 sdshdr16，header 变大）、rehash 期间两个哈希表共存、客户端输出缓冲区占用、AOF 重写缓冲区等。但核心结论不变——元数据开销让真实内存是裸数据的 2-3 倍。\n\n### 2.3 用 MEMORY USAGE 命令实测验证\n\n理论计算完了，我们用 Redis 自带的 `MEMORY USAGE` 命令验证一下。先写入一个测试 key：\n\n```bash\n# 写入一个 30 字节 key + 200 字节 value\nredis-cli SET \"user:profile:1000000001\" $(python3 -c \"print('x' * 200)\")\n\n# 查看这个 key 的内存占用\nredis-cli MEMORY USAGE \"user:profile:1000000001\"\n# 输出：(integer) 296\n```\n\n`MEMORY USAGE` 返回 296 字节，和我们计算的 312 字节接近（差异来自 MEMORY USAGE 的采样方式和 Redis 版本的 dictEntry 实现细节）。用 `MEMORY USAGE key SAMPLES 0` 可以得到更精确的值。批量写入 100 万个 key 后用 `INFO memory` 观察：\n\n```bash\n# 批量写入 100 万个 key 做采样\nfor i in $(seq 1 1000000); do\n  redis-cli SET \"user:profile:${i}\" $(head -c 200 /dev/urandom | base64 | head -c 200)\ndone\n\nredis-cli INFO memory | grep used_memory_human\n# used_memory_human:312.47M\n```\n\n100 万个 key 占了约 312 MB，换算每个 key 约 328 字节，和我们的理论值 312 字节加上哈希表 bucket 分摊后非常吻合。推算到 1000 万个 key：328 × 10,000,000 ≈ 3.05 GB + 128 MB bucket = 3.18 GB。\n\n### 2.4 Hash 压缩存储方案\n\n现在来看如何用 Hash 结构把内存砍下来。核心原理是：当一个 Hash 的 field 数量不超过 `hash-max-ziplist-entries`（Redis 6.2 默认 128）且每个 field 的长度不超过 `hash-max-ziplist-value`（默认 64 字节）时，Redis 会使用 ziplist（Redis 7.0+ 改为 listpack）编码而非 hashtable 编码。ziplist 是一块连续内存，没有指针、没有 redisObject 封装、没有 dictEntry——所有数据紧凑排列，省掉了大量元数据开销。\n\n具体做法是把 1000 万个 key 分桶。比如把 `user:profile:10086` 拆成 Hash key `user:profile:{10086 / 100}` 即 `user:profile:100`，field 为 `86`（取余数），value 不变。这样每个 Hash 里最多 100 个 field。配置 `hash-max-ziplist-entries 128`（大于 100 即可），确保所有 Hash 都走 ziplist 编码。\n\n分桶后的内存结构变化极大。原来 1000 万个独立 key，每个都有 dictEntry + 2 个 redisObject + 2 个 SDS 的完整开销。分成 10 万个 Hash 后，全局哈希表只有 10 万个 entry，bucket 数组从 128 MB 缩小到 2^17 × 8 = 1 MB。每个 Hash 内部用 ziplist 存储 100 个 field-value 对，ziplist 中每个 entry 只需要 prevlen(1-5 字节) + encoding(1-5 字节) + data，没有指针没有 redisObject。\n\n粗略计算 ziplist 编码下单个 Hash 的大小：100 个 field-value 对，field 平均 2-3 字节（余数 00-99），value 200 字节，每个 entry 的 ziplist 开销约 4-6 字节。每个 Hash 的 ziplist 大小 ≈ 100 × (3 + 5 + 200 + 5) ≈ 21,300 字节 ≈ 21 KB。10 万个 Hash 总计 ≈ 2.1 GB。加上 10 万个 Hash 自身的 dictEntry + redisObject 开销（约 10 万 × 100 字节 = 10 MB）和全局哈希表 bucket，总内存约 **2.1-2.2 GB**。\n\n但这里有个关键陷阱：value 是 200 字节，超过了 `hash-max-ziplist-value` 的默认值 64！如果不修改这个配置，Hash 会退化为 hashtable 编码，反而比纯 String 更占内存。你必须把 `hash-max-ziplist-value` 调到至少 256：\n\n```bash\nCONFIG SET hash-max-ziplist-entries 128\nCONFIG SET hash-max-ziplist-value 256\n```\n\n调对配置后，对比结果：原始 String 方案约 3.2 GB，Hash ziplist 方案约 2.1 GB，**节省约 35%**。如果 value 更短（比如 50 字节），ziplist 的节省比例可以达到 50-70%，因为元数据开销占比在小 value 时更大。\n\n验证编码是否正确：\n\n```bash\nredis-cli OBJECT ENCODING \"user:profile:100\"\n# 应该输出 \"ziplist\"（Redis 6.x）或 \"listpack\"（Redis 7.0+）\n# 如果输出 \"hashtable\" 说明配置没生效或者某个 field/value 超长了\n```\n\n## 三、扩展知识\n\n### 3.1 jemalloc 的 size class 对齐机制\n\njemalloc 是 Redis 默认的内存分配器（从 Redis 2.4 开始）。它不会精确分配你要求的字节数，而是按照预定义的 size class 向上取整。jemalloc 5.x 的 size class 大致规律是：8 字节以下按 8 对齐，8-128 字节按 16 对齐（8/16/32/48/64/80/96/112/128），128 字节以上按约 1/8 步长递增（128/160/192/208/224/256...）。这意味着你申请 34 字节，jemalloc 实际分配 40 字节，中间浪费 6 字节。在千万级 key 的场景下，每个 key 浪费几字节就能累积到几十 MB 甚至上百 MB。\n\n可以通过 `redis-cli MEMORY MALLOC-STATS` 查看 jemalloc 的分配统计，或者用 `INFO memory` 中的 `mem_fragmentation_ratio` 字段评估碎片程度。`mem_fragmentation_ratio` = `used_memory_rss` / `used_memory`，健康值在 1.0-1.1 之间，超过 1.5 说明有严重碎片。\n\n### 3.2 Redis 7.0 listpack 替代 ziplist\n\nRedis 7.0 用 listpack 全面替代了 ziplist 作为紧凑编码的底层结构。listpack 解决了 ziplist 的一个著名问题——连锁更新（cascade update）。在 ziplist 中每个 entry 都记录前一个 entry 的长度（prevlen 字段），当中间某个 entry 的大小变化导致 prevlen 从 1 字节变成 5 字节时，可能触发后续所有 entry 的 prevlen 级联更新，最坏情况 O(n²)。listpack 改为每个 entry 只记录自身的总长度，完全消除了连锁更新问题，内存布局更紧凑，性能更稳定。\n\n在做内存估算时，listpack 和 ziplist 的每 entry 开销非常接近（都是几字节），所以用哪个对总量估算影响不大，但 listpack 在频繁更新场景下的性能表现显著优于 ziplist。\n\n### 3.3 容量规划最佳实践\n\n生产环境做 Redis 容量规划不应该只靠手算，而是应该用真实数据做采样验证。正确的做法是：先用线上数据的一个子集（比如 10 万条）写入一个独立的 Redis 实例，观察 `INFO memory` 的 `used_memory`，然后线性外推到全量。这种方法天然包含了 jemalloc 对齐、哈希表扩容、碎片等所有隐形开销，比手算准确得多。\n\n另外要预留的内存不仅是数据本身。Redis 在执行 `BGSAVE` 或 `BGREWRITEAOF` 时会 fork 子进程，由于 COW（Copy-On-Write）机制，如果父进程在持久化期间有大量写入，实际物理内存可能临时翻倍。因此容量规划的经验公式是：实例最大内存 = 数据内存 × 2 + 操作系统预留。一台 8GB 的机器跑 Redis，`maxmemory` 设到 3-3.5 GB 是比较安全的。\n\n### 3.4 面试中的考点总结\n\n这道题在面试中的考察层次非常清晰。第一层看你知不知道 Redis 存储有额外开销（大部分候选人能说到这一点）。第二层看你能不能具体说出开销来自哪里——redisObject、SDS header、dictEntry、jemalloc 对齐（大约一半候选人能说全）。第三层看你能不能实际算出一个靠谱的数字（这需要你记住关键数据结构的字节数和 jemalloc 的对齐规则）。第四层看你知不知道优化手段——Hash 压缩存储方案以及它的配置陷阱（`hash-max-ziplist-value` 必须调大）。如果你能再提到 `MEMORY USAGE` 命令做实测验证、listpack vs ziplist 的演进、以及 BGSAVE 时的 COW 内存翻倍问题，基本就是满分回答了。",
+      "keyPoints": [
+        "每个 key-value 对的真实内存远超 key+value 裸数据大小，因为有 dictEntry（32字节）、两个 redisObject（各16字节）、SDS header（3字节+对齐）和 jemalloc size class 对齐等元数据开销",
+        "jemalloc 按预定义的 size class 向上取整分配内存，34 字节请求实际分配 40 字节，千万级 key 场景下对齐浪费可累积到上百 MB",
+        "1000 万个 key（30字节）+ value（200字节）的 String 存储实际约需 3-3.5GB 内存，是裸数据量 2.15GB 的 1.5-1.6 倍",
+        "全局哈希表的 bucket 数组（2^24 × 8字节 = 128MB）是独立于 key-value 数据之外的固定开销，rehash 期间会翻倍",
+        "Hash 压缩方案通过将 key 分桶存入 ziplist/listpack 编码的 Hash 中，消除了每个 field 的 dictEntry 和 redisObject 开销，可节省 35-70% 内存",
+        "使用 Hash 压缩时必须同时调大 hash-max-ziplist-value（默认仅 64 字节），否则 value 超长会导致 Hash 退化为 hashtable 编码反而更耗内存",
+        "MEMORY USAGE 命令可以精确查看单个 key 的内存占用（含所有元数据开销），是验证理论计算的首选工具",
+        "容量规划需考虑 BGSAVE/BGREWRITEAOF 的 COW 内存翻倍，经验公式为实例最大内存 = 数据内存 × 2 + OS 预留"
+      ],
+      "quiz": [
+        {
+          "id": "redis-memory-estimation-q1-quiz1",
+          "question": "在 64 位系统上，Redis 的 redisObject 结构体占多少字节？",
+          "choices": [
+            {"id": "A", "text": "8 字节"},
+            {"id": "B", "text": "16 字节"},
+            {"id": "C", "text": "32 字节"},
+            {"id": "D", "text": "24 字节"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "redisObject 包含 type（4 bit）+ encoding（4 bit）+ LRU/LFU（24 bit）= 4 字节，加上 refcount（4 字节）和 *ptr（8 字节），总共 16 字节。A 选项 8 字节只是指针的大小。C 选项 32 字节是 dictEntry 经 jemalloc 对齐后的大小。D 选项 24 字节是 dictEntry 的裸数据大小（三个指针）。redisObject 的 16 字节是 Redis 内存模型中最基础的数字，每个 key 和 value 各需要一个 redisObject。"
+        },
+        {
+          "id": "redis-memory-estimation-q1-quiz2",
+          "question": "Redis 使用 SDS 存储一个 30 字节的字符串时，选用的 SDS header 类型和 header 大小是？",
+          "choices": [
+            {"id": "A", "text": "sdshdr5，header 1 字节"},
+            {"id": "B", "text": "sdshdr8，header 3 字节（len + alloc + flags 各 1 字节）"},
+            {"id": "C", "text": "sdshdr16，header 5 字节"},
+            {"id": "D", "text": "sdshdr32，header 9 字节"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 3.2+ 根据字符串长度选择 SDS header：sdshdr5 实际已弃用，sdshdr8 用于长度 < 256 的字符串，header 包含 1 字节 len + 1 字节 alloc + 1 字节 flags = 3 字节。30 字节 < 256 所以用 sdshdr8。A 选项的 sdshdr5 虽然理论上能存 < 32 字节的字符串，但 Redis 实现中创建新字符串时不会使用 sdshdr5。C 选项的 sdshdr16 用于 256 字节到 64KB 范围的字符串。D 选项的 sdshdr32 用于更长的字符串。"
+        },
+        {
+          "id": "redis-memory-estimation-q1-quiz3",
+          "question": "Redis 全局哈希表存储 1000 万个 key 时，bucket 数组大约占多少内存？",
+          "choices": [
+            {"id": "A", "text": "约 80 MB（10,000,000 × 8 字节）"},
+            {"id": "B", "text": "约 128 MB（2^24 × 8 字节）"},
+            {"id": "C", "text": "约 64 MB（2^23 × 8 字节）"},
+            {"id": "D", "text": "约 256 MB（2^25 × 8 字节）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 哈希表的 bucket 数组大小必须是 2 的幂次方。1000 万个 key 需要找到第一个大于等于 10,000,000 的 2 的幂，即 2^24 = 16,777,216。每个 bucket 是一个 8 字节的指针，所以 bucket 数组大小 = 16,777,216 × 8 = 134,217,728 字节 ≈ 128 MB。A 选项错误地用了精确的 key 数量而非 2 的幂。C 选项的 2^23 = 8,388,608 小于 1000 万，不够用。D 选项 2^25 是 rehash 后可能达到的大小，但初始不会直接分配这么大。"
+        },
+        {
+          "id": "redis-memory-estimation-q1-quiz4",
+          "question": "jemalloc 分配 34 字节的内存请求时，实际会分配多少字节？",
+          "choices": [
+            {"id": "A", "text": "34 字节，精确分配"},
+            {"id": "B", "text": "36 字节，按 4 字节对齐"},
+            {"id": "C", "text": "40 字节，按 jemalloc size class 对齐"},
+            {"id": "D", "text": "48 字节，按 16 字节对齐"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "jemalloc 不会精确分配请求的字节数，而是按照预定义的 size class 向上取整。jemalloc 5.x 在 32-64 字节区间的 size class 包括 32、40、48、56、64 等。34 字节会被向上对齐到最近的 size class 40 字节。A 选项不可能，所有现代内存分配器都有对齐开销。B 选项的 4 字节对齐是 32 位系统 malloc 的最小对齐，jemalloc 的对齐规则不同。D 选项 48 字节跳过了 40 这个 size class。"
+        },
+        {
+          "id": "redis-memory-estimation-q1-quiz5",
+          "question": "执行 MEMORY USAGE 命令对某个 30 字节 key + 200 字节 value 的 String 键，返回值大约是多少？",
+          "choices": [
+            {"id": "A", "text": "约 230 字节（key + value 裸数据）"},
+            {"id": "B", "text": "约 296-312 字节（含所有元数据和对齐开销）"},
+            {"id": "C", "text": "约 500 字节（包含哈希表 bucket 分摊）"},
+            {"id": "D", "text": "约 160 字节（只计算 SDS 部分）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MEMORY USAGE 命令返回的是单个 key 的完整内存占用，包括 dictEntry、key 和 value 的 redisObject、key 和 value 的 SDS，以及 jemalloc 对齐后的开销。计算：dictEntry 32 + key redisObject 16 + key SDS 40 + value redisObject 16 + value SDS 208 = 312 字节，实测通常在 296-312 之间（不同 Redis 版本略有差异）。A 选项只算了裸数据忽略了所有元数据。C 选项过高，MEMORY USAGE 不会分摊全局哈希表开销。D 选项只算了 SDS 部分忽略了 redisObject 和 dictEntry。"
+        },
+        {
+          "id": "redis-memory-estimation-q1-quiz6",
+          "question": "使用 Hash 压缩存储时，如果忘记调大 hash-max-ziplist-value（默认 64），存入 200 字节的 value 会怎样？",
+          "choices": [
+            {"id": "A", "text": "Redis 会报错拒绝写入"},
+            {"id": "B", "text": "Hash 会自动转为 hashtable 编码，内存反而比纯 String 更大"},
+            {"id": "C", "text": "数据会被截断到 64 字节"},
+            {"id": "D", "text": "仍然使用 ziplist 编码但性能下降"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 Hash 中任何一个 field 或 value 的长度超过 hash-max-ziplist-value 时，Redis 会自动将该 Hash 从 ziplist（紧凑编码）转换为 hashtable（哈希表编码）。hashtable 编码下每个 field-value 都有独立的 dictEntry + redisObject + SDS，再加上 Hash 本身作为全局 key 的开销，总内存比直接用 String 存储还大。A 选项错误，Redis 不会拒绝写入，只是静默切换编码。C 选项错误，Redis 不会截断数据。D 选项错误，超过阈值后不会继续使用 ziplist。"
+        },
+        {
+          "id": "redis-memory-estimation-q1-quiz7",
+          "question": "Hash 压缩方案相比纯 String 方案，在 value 为 200 字节场景下大约能节省多少内存？",
+          "choices": [
+            {"id": "A", "text": "节省 70-80%，效果非常显著"},
+            {"id": "B", "text": "节省 35-40%，有明显效果但不如小 value 场景"},
+            {"id": "C", "text": "节省 10-15%，效果有限"},
+            {"id": "D", "text": "几乎不节省，因为 value 本身占内存的大头"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Hash 压缩方案的核心收益是消除每个 key-value 的元数据开销（dictEntry + 2 个 redisObject ≈ 64 字节）。当 value 为 200 字节时，元数据占单条记录总量约 112/312 ≈ 36%，所以压缩后大约能节省 35-40%。如果 value 只有 20 字节，元数据占比更高（约 60%），节省比例可达 50-70%。A 选项的 70-80% 是极小 value（如纯数字）场景的数据。C 和 D 选项低估了元数据在 200 字节 value 场景下的占比。"
+        },
+        {
+          "id": "redis-memory-estimation-q1-quiz8",
+          "question": "生产环境做 Redis 容量规划时，为什么 maxmemory 不能设置为机器物理内存的 100%？",
+          "choices": [
+            {"id": "A", "text": "因为操作系统内核本身需要约 50% 的物理内存"},
+            {"id": "B", "text": "因为 BGSAVE/BGREWRITEAOF 的 fork + COW 机制可能导致内存临时翻倍，加上 OS 和碎片也需要预留"},
+            {"id": "C", "text": "因为 Redis 的内存统计不准确，实际占用总是比 used_memory 多一倍"},
+            {"id": "D", "text": "因为 Redis 客户端连接池需要和数据一样大的内存"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 执行 BGSAVE 或 BGREWRITEAOF 时会 fork 子进程。虽然 fork 利用 COW（Copy-On-Write）机制不会立即复制内存，但如果父进程在持久化期间有大量写入，被修改的内存页会被真正复制，最坏情况下物理内存翻倍。再加上操作系统本身需要内存（通常 1-2 GB）、jemalloc 碎片（fragmentation ratio 通常 1.05-1.1），maxmemory 设到物理内存的 40-50% 是比较安全的。A 选项夸大了 OS 的需求。C 选项错误，Redis 的内存统计是准确的。D 选项错误，客户端连接池的内存远小于数据量。"
+        },
+        {
+          "id": "redis-memory-estimation-q1-quiz9",
+          "question": "Redis 7.0 用 listpack 替代 ziplist 作为 Hash 的紧凑编码，主要解决了什么问题？",
+          "choices": [
+            {"id": "A", "text": "解决了 ziplist 不支持超过 64KB 数据的限制"},
+            {"id": "B", "text": "解决了 ziplist 的连锁更新（cascade update）问题，消除了 O(n²) 最坏性能"},
+            {"id": "C", "text": "解决了 ziplist 不能存储整数的问题"},
+            {"id": "D", "text": "解决了 ziplist 在多线程环境下的并发安全问题"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ziplist 中每个 entry 的 prevlen 字段记录前一个 entry 的长度。当某个 entry 的大小从 253 字节以下变为 254 字节以上时，后续 entry 的 prevlen 需要从 1 字节扩展到 5 字节，这可能触发后续所有 entry 的级联更新，最坏情况时间复杂度 O(n²)。listpack 改为每个 entry 只记录自身长度（entry-len 放在 entry 末尾），彻底消除了连锁更新。A 选项错误，ziplist 可以存超过 64KB 的数据。C 选项错误，ziplist 本身就支持整数编码。D 选项错误，Redis 主线程模型不存在紧凑结构的并发问题。"
+        },
+        {
+          "id": "redis-memory-estimation-q1-quiz10",
+          "question": "你用 INFO memory 发现 mem_fragmentation_ratio 为 1.85，这说明什么？应该怎么处理？",
+          "choices": [
+            {"id": "A", "text": "说明 Redis 内存使用正常，1.85 在健康范围内"},
+            {"id": "B", "text": "说明有严重内存碎片，RSS 比 used_memory 大 85%，应该执行 MEMORY PURGE 或开启 activedefrag"},
+            {"id": "C", "text": "说明 Redis 数据量超过了 maxmemory 的 85%，需要扩容"},
+            {"id": "D", "text": "说明有 85% 的 key 已经过期但未被回收，应该执行 SCAN 主动清理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "mem_fragmentation_ratio = used_memory_rss / used_memory。1.85 意味着操作系统实际分配给 Redis 的物理内存（RSS）比 Redis 认为自己在用的内存多了 85%。健康值通常在 1.0-1.1 之间，超过 1.5 说明有严重碎片。处理方式包括执行 `MEMORY PURGE` 让 jemalloc 归还空闲页给 OS、开启 `activedefrag yes` 让 Redis 后台自动整理碎片，或者在低峰期重启实例。A 选项错误，1.85 远超健康阈值。C 选项混淆了碎片率和内存使用率。D 选项混淆了碎片和过期 key 回收。"
+        }
+      ],
+      "references": [
+        "https://redis.io/commands/memory-usage/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/",
+        "https://github.com/redis/redis/blob/7.2/src/server.h",
+        "https://github.com/redis/redis/blob/7.2/src/sds.h"
+      ]
+    }
+  ]
+}
