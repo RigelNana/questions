@@ -1,0 +1,155 @@
+{
+  "id": "redis-dist-lock-early-release",
+  "name": "锁的过期时间设置过短导致的问题",
+  "domain": "redis",
+  "description": "分布式锁 TTL 过短导致的并发安全问题与 watchdog 续期机制",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-dist-lock-early-release-q1",
+      "domain": "redis",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["Redis", "分布式锁", "TTL", "锁续期", "watchdog"],
+      "title": "锁的过期时间设置过短导致的问题",
+      "content": "你所在的电商团队维护着一套库存扣减服务，部署了 3 个实例通过 Redis 分布式锁保证同一 SKU 的库存操作互斥。加锁代码使用「SET lock:inventory:{skuId} {requestId} NX PX 5000」，即 TTL 设置为 5 秒。上线初期一切正常，某次大促活动期间 MySQL 所在机器负载飙高，慢查询激增，部分库存扣减的数据库操作耗时从平时的 200ms 飙升到 8 秒以上。\n\n运营反馈出现了超卖：同一件商品库存为 1，却被两个订单同时扣减成功。你拉取了两台实例的日志，拼出了如下时间线：\n\n```\nT+0s    实例A: SET lock:inventory:SKU-1001 req-a1b2 NX PX 5000 → OK\nT+0.1s  实例A: SELECT stock FROM inventory WHERE sku_id='SKU-1001' → stock=1\nT+0.3s  实例A: BEGIN; UPDATE inventory SET stock=stock-1 WHERE sku_id='SKU-1001';\n        (等待 MySQL 行锁中...)\nT+5s    Redis: lock:inventory:SKU-1001 过期自动删除\nT+5.1s  实例B: SET lock:inventory:SKU-1001 req-x9y8 NX PX 5000 → OK\nT+5.2s  实例B: SELECT stock FROM inventory WHERE sku_id='SKU-1001' → stock=1\n        (实例A的UPDATE尚未提交，MVCC读到旧值)\nT+5.4s  实例B: UPDATE inventory SET stock=stock-1 → COMMIT → 成功\nT+8.2s  实例A: COMMIT → 成功（stock变为-1，但代码未校验负数）\nT+8.3s  实例A: DEL lock:inventory:SKU-1001\n        (删除了实例B持有的锁！)\n```\n\n问题有两层：第一，锁在业务逻辑执行完毕前就过期了，导致互斥语义被破坏；第二，实例 A 在 T+8.3s 执行 DEL 时删掉了实例 B 正在持有的锁（虽然标准做法是 Lua 脚本先比较 value 再删，但团队的代码里这段逻辑因历史原因写错了，直接 DEL 而没有校验）。\n\n请分析这个问题的根因，并给出系统性的解决方案：如何在无法准确预估业务耗时的情况下，确保锁不会提前释放？如果锁确实需要续期，应该怎么实现一个可靠的自动续期（watchdog）机制？",
+      "answer": "## 第一步：核心主体概念基础详解\n\n分布式锁的 TTL（Time-To-Live，存活时间）是整个锁模型中最微妙的设计参数。在 Redis 分布式锁的语境下，TTL 本质上是一种「租约」（Lease）机制——客户端获取锁时并非获得了无限期的独占权，而是获得了一段有限时间内的使用权。这种设计的出发点是容错：如果持锁客户端崩溃、网络断开或进程被 OOM Killer 杀死，锁必须在有限时间后自动释放，否则其他客户端将永远无法获取这把锁，系统陷入死锁。\n\n但 TTL 引入了一个根本性矛盾——设长了，客户端崩溃后其他节点要等待整个 TTL 过期才能重新获取锁，影响系统可用性；设短了，业务逻辑还没执行完锁就过期了，互斥语义被破坏。这不是一个可以通过「经验估算」彻底解决的问题，因为业务执行时间在生产环境中是不确定的：GC 停顿、数据库慢查询、网络抖动、CPU 被其他进程抢占，都可能让一次本应 200ms 完成的操作耗时数秒甚至数十秒。\n\nRedis 分布式锁的基本形式是「SET key value NX PX {ttl}」，其中 NX 保证互斥（仅当 key 不存在时设置成功），PX 设置毫秒级过期时间。标准的释放流程通过 Lua 脚本实现原子性的「检查 value 是否匹配 → 删除 key」操作。这套机制在 TTL 设置合理的前提下工作良好，但「合理」这个词本身就是问题的核心。\n\n## 第二步：题目核心问题精准深度解答\n\n### 根因分析\n\n题目中的故障可以拆解为两个独立但相互放大的问题。第一个问题是「锁提前释放」（Early Release）：业务操作实际需要 8 秒以上才能完成，但锁的 TTL 只有 5 秒，Redis 在 T+5s 时刻自动删除了锁的 key，此时实例 A 的数据库事务仍在等待行锁。第二个问题是「误删他人锁」（Wrong DEL）：实例 A 在 T+8.3s 完成业务后执行 DEL，但此时 key 中存储的 value 已经是实例 B 的 req-x9y8 而非自己的 req-a1b2。如果释放代码正确使用了 Lua 校验（比较 value 一致才删除），第二个问题不会发生——但第一个问题仍然存在，两个实例仍然在同一时段内都认为自己持有锁。\n\n核心教训是：即使你的释放逻辑是完美的，TTL 过短这个问题本身就足以破坏互斥性。\n\n### 解决方案一：Watchdog 自动续期机制\n\n最成熟的方案是在客户端持有锁期间，启动一个后台线程（或 goroutine）定期检查业务是否仍在执行，如果是则自动延长锁的 TTL。这就是所谓的 Watchdog（看门狗）机制。Redisson（Java 生态最流行的 Redis 分布式锁客户端，版本 3.23.x）的实现是这个领域的标杆：默认 lease time 为 30 秒（由 lockWatchdogTimeout 配置项控制，默认值 30000ms），watchdog 每隔 lease time 的 1/3（即 10 秒）执行一次续期操作，将锁的 TTL 重新设置为 30 秒。如果客户端进程崩溃，watchdog 线程随之消亡，锁将在最多 30 秒后自动过期释放。\n\n用 Go 实现一个简化版的 watchdog 机制，核心逻辑如下：\n\n```go\nfunc acquireWithWatchdog(ctx context.Context, rdb *redis.Client, key, value string, ttl time.Duration) (context.CancelFunc, error) {\n    ok, err := rdb.SetNX(ctx, key, value, ttl).Result()\n    if err != nil || !ok {\n        return nil, fmt.Errorf(\"acquire lock failed: %w\", err)\n    }\n    \n    // 启动 watchdog goroutine，每 ttl/3 续期一次\n    watchCtx, cancel := context.WithCancel(ctx)\n    go func() {\n        ticker := time.NewTicker(ttl / 3)\n        defer ticker.Stop()\n        for {\n            select {\n            case <-watchCtx.Done():\n                return\n            case <-ticker.C:\n                // 只有当 value 仍然是自己的时候才续期\n                renewed, _ := renewLock(ctx, rdb, key, value, ttl)\n                if !renewed {\n                    return // 锁已被其他人持有，停止续期\n                }\n            }\n        }\n    }()\n    \n    return cancel, nil\n}\n\nfunc renewLock(ctx context.Context, rdb *redis.Client, key, value string, ttl time.Duration) (bool, error) {\n    script := redis.NewScript(`\n        if redis.call('GET', KEYS[1]) == ARGV[1] then\n            return redis.call('PEXPIRE', KEYS[1], ARGV[2])\n        else\n            return 0\n        end\n    `)\n    result, err := script.Run(ctx, rdb, []string{key}, value, ttl.Milliseconds()).Int64()\n    return result == 1, err\n}\n```\n\n调用方在业务完成后调用 cancel() 停止 watchdog，然后执行标准的 Lua 释放脚本。如果进程崩溃，context 取消信号不会发出，但 goroutine 随进程一起消亡，锁在 TTL 到期后自动释放。\n\n### 解决方案二：设置足够大的 TTL\n\n最简单的方案是将 TTL 设置为业务最大预期耗时的 3~5 倍。比如库存扣减正常耗时 200ms，极端慢查询场景下可能到 10 秒，那么 TTL 设为 30~50 秒。这种方案的缺点很明显：如果持锁客户端在获取锁后立即崩溃，其他客户端需要等待整个 TTL 过期才能重新获取锁。在 TTL 为 50 秒的情况下，这意味着 50 秒的服务不可用窗口。对于高频交易场景，这是不可接受的。\n\n### 解决方案三：Fencing Token（防护令牌）\n\n这是 Martin Kleppmann 在其 2016 年著名文章「How to do distributed locking」中提出的理论最优方案。核心思想是：每次成功获取锁时，锁服务返回一个单调递增的 token（类似 ZooKeeper 的 zxid），客户端将这个 token 携带到下游存储的写操作中，存储层拒绝任何 token 值小于当前已见最大值的写入。这样即使锁提前释放导致两个客户端同时「持有」锁，后获取锁的客户端拥有更大的 token 值，先获取锁的客户端的写入会被存储层拒绝。\n\n这个方案理论上最安全，因为它不依赖时钟的正确性。但现实中几乎没人用，原因很务实：它要求下游存储必须支持基于 token 的条件写入（Compare-And-Swap 语义），MySQL 的标准 UPDATE 语句不具备这种能力，你需要在 WHERE 子句中加入 token 比较条件，这侵入了业务逻辑并增加了所有写操作的复杂度。\n\n## 第三步：体系化扩展延伸\n\n### Redisson Watchdog 实现细节\n\nRedisson 3.23.x 中，当用户调用 lock() 方法且不指定 leaseTime 时（即依赖 watchdog 而非固定 TTL），内部流程是：通过 Lua 脚本执行「HSET + PEXPIRE」加锁，然后调用 scheduleExpirationRenewal() 注册一个 Netty HashedWheelTimer 定时任务。该定时任务每 lockWatchdogTimeout/3 毫秒触发一次 renewExpirationAsync()，通过 Lua 脚本检查锁是否仍被当前线程持有（Redisson 使用 Hash 结构支持可重入锁，field 为 clientId:threadId，value 为重入次数），如果是则将 PEXPIRE 重置为 lockWatchdogTimeout。当线程调用 unlock() 时，先取消定时任务再释放锁。\n\n值得注意的是 Redisson 使用 Hash 而非 String 来存储锁状态，这使其支持可重入：同一线程多次获取同一把锁时，重入计数递增而非阻塞。释放时计数递减，直到归零才真正删除 key。\n\n### 生产环境最佳实践\n\n在生产中我推荐的策略是「watchdog + 合理基础 TTL + 业务超时兜底」三层防御。基础 TTL 设为 30 秒（与 Redisson 默认值一致），watchdog 每 10 秒续期一次，同时业务代码本身设置一个绝对超时（比如 60 秒），超时后主动放弃操作并释放锁。这样即使 watchdog 出现 bug 持续续期，业务代码也会在 60 秒后强制终止，避免锁被无限期持有。\n\n另一个容易被忽略的点是：watchdog 续期失败时的处理。如果续期的 Lua 脚本返回 0（表示 key 不存在或 value 不匹配），说明锁已经被其他人拿走了——此时业务代码应该立即中止当前操作并回滚，而不是继续执行然后在提交时才发现冲突。这需要 watchdog 和业务代码之间建立通信机制，比如通过 context 取消或 channel 通知。\n\n### Martin Kleppmann 的批评与工程妥协\n\nKleppmann 指出所有基于 TTL 的分布式锁本质上都依赖「时间假设」：假设进程暂停时间不会超过 TTL，假设时钟漂移在可接受范围内。在 JVM 世界里，一次 Full GC 可能持续数十秒；在容器化环境中，CPU throttling 可能让进程「冻结」任意时长。这些场景下 watchdog 本身也会被暂停，无法执行续期。他的结论是：如果你需要绝对正确性，分布式锁不应该是你的唯一防线，必须在存储层加入额外的安全检查（如 fencing token 或乐观锁版本号）。\n\n从工程实践角度看，绝大多数业务场景并不需要「绝对正确」——偶尔一次重复扣减可以通过幂等设计、对账系统和人工补偿来兜底。在这种「best-effort + 事后修正」的哲学下，watchdog 续期机制已经能覆盖 99.9% 的生产场景。",
+      "keyPoints": [
+        "锁的 TTL 短于业务实际执行时间时，Redis 会自动删除 key 导致互斥性丧失，其他客户端可以在原持锁者尚未完成操作时获取同一把锁",
+        "误删他人锁的防御是释放时必须通过 Lua 脚本原子性地比较 value 后再 DEL，但这无法解决锁已提前释放导致的并发窗口问题",
+        "Watchdog 续期机制的核心逻辑是每隔 TTL/3 时间执行一次 PEXPIRE 重置，Redisson 默认 30s lease + 10s 续期间隔，进程崩溃后 watchdog 随之消亡锁自动过期",
+        "续期的 Lua 脚本必须先验证 value（或 Hash field）仍属于当前持有者才执行 PEXPIRE，防止续期一把已经易主的锁",
+        "Fencing token 方案通过单调递增令牌让存储层拒绝过期写入，理论上最安全但要求下游存储支持条件写入，实际落地成本极高",
+        "生产环境推荐「watchdog + 合理基础 TTL + 业务超时兜底」三层防御策略，避免单一机制失效导致系统性故障",
+        "Martin Kleppmann 指出基于 TTL 的锁本质上依赖时间假设，GC 停顿或 CPU throttling 可能同时冻结 watchdog 和业务线程，仍存在理论上的安全缺口"
+      ],
+      "quiz": [
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz1",
+          "question": "在题目描述的故障场景中，导致超卖的最直接原因是什么？",
+          "choices": [
+            {"id": "A", "text": "MySQL 慢查询导致数据库死锁"},
+            {"id": "B", "text": "Redis 锁的 TTL（5秒）短于业务实际执行时间（8秒），锁提前过期后第二个客户端获取了锁"},
+            {"id": "C", "text": "Redis 主从切换导致锁信息丢失"},
+            {"id": "D", "text": "两个实例使用了相同的 requestId 导致 value 冲突"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "场景中 MySQL 在高负载下响应变慢，库存扣减操作从预期的 200ms 膨胀到 8 秒，但锁的 PX 只设了 5000 毫秒。在 T+5s 时刻锁自动过期被 Redis 删除，实例 B 在 T+5.1s 成功获取了同一把锁，两个实例同时进入临界区操作同一条库存记录。选项 A 错误，这里是 MySQL 慢查询（等待行锁）而非死锁，MySQL 死锁会导致其中一个事务被回滚而非两个都成功；选项 C 错误，场景中没有提到 Redis 主从切换事件；选项 D 错误，日志明确显示两个实例使用了不同的 requestId（req-a1b2 和 req-x9y8）。"
+        },
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz2",
+          "question": "在时间线的 T+8.3s 时刻，实例 A 执行 DEL 为什么会删掉实例 B 的锁？",
+          "choices": [
+            {"id": "A", "text": "因为 Redis 的 DEL 命令会删除所有同名 key 的所有版本"},
+            {"id": "B", "text": "因为实例 A 使用了 UNLINK 而非 DEL，异步删除时机不可控"},
+            {"id": "C", "text": "因为释放代码直接执行 DEL 而没有通过 Lua 脚本先比较 value 是否仍是自己的标识"},
+            {"id": "D", "text": "因为 Lua 脚本在高并发下会出现竞态条件，无法保证原子性"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "正确的锁释放流程是通过 Lua 脚本先 GET key 的值与自己的 requestId 比较，一致才执行 DEL。题目明确指出团队代码「因历史原因写错了，直接 DEL 而没有校验」，所以实例 A 盲目删除了此时已经属于实例 B（value=req-x9y8）的锁。选项 A 错误，Redis 中一个 key 就是一个 key，不存在「多版本」的概念；选项 B 错误，UNLINK 只是将释放内存的操作放到后台线程，删除 key 本身是立即生效的；选项 D 错误，Redis 保证 Lua 脚本执行期间不会被其他命令打断，具有完整的原子性。"
+        },
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz3",
+          "question": "Redisson 的 watchdog 机制中，默认的续期间隔和 lease time 分别是多少？",
+          "choices": [
+            {"id": "A", "text": "lease time 10秒，每 3 秒续期一次"},
+            {"id": "B", "text": "lease time 30秒，每 10 秒续期一次"},
+            {"id": "C", "text": "lease time 60秒，每 20 秒续期一次"},
+            {"id": "D", "text": "lease time 30秒，每 15 秒续期一次"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redisson 的 lockWatchdogTimeout 配置默认值为 30000ms（30秒），watchdog 的续期间隔为 lease time 的 1/3，即 10 秒。每 10 秒 watchdog 检查锁是否仍被当前线程持有，如果是则通过 PEXPIRE 将 TTL 重置为 30 秒。选项 A 的 10 秒 lease time 太短，无法为业务提供足够的安全窗口；选项 C 的 60 秒虽然可行但不是默认值，且崩溃后恢复时间过长；选项 D 的 15 秒续期间隔不符合 1/3 的设计原则，留给网络抖动的容错空间不足（30-15=15秒 vs 30-10=20秒）。"
+        },
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz4",
+          "question": "watchdog 续期时使用的 Lua 脚本为什么必须先检查 value 再执行 PEXPIRE？",
+          "choices": [
+            {"id": "A", "text": "因为 PEXPIRE 命令本身不是原子性的，需要 Lua 包裹"},
+            {"id": "B", "text": "为了防止在锁已易主（被其他客户端获取）的情况下错误地延长他人锁的生存时间"},
+            {"id": "C", "text": "因为 Redis 不允许对不存在的 key 执行 PEXPIRE"},
+            {"id": "D", "text": "为了统计续期次数用于监控告警"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "考虑这样的时序：watchdog 的续期 ticker 触发时，恰好锁在前一瞬间已经过期并被客户端 B 重新获取。如果续期脚本不检查 value 直接执行 PEXPIRE，就会延长客户端 B 的锁的 TTL——这虽然不会破坏互斥性（B 本身持有锁），但会导致 B 释放锁时发现 TTL 被意外延长，或者在 B 崩溃时锁的实际过期时间比预期更长。更重要的是，watchdog 应该在发现锁已易主时立即停止并通知业务代码。选项 A 错误，PEXPIRE 单条命令本身就是原子的；选项 C 错误，对不存在的 key 执行 PEXPIRE 只会返回 0 而不会报错；选项 D 与安全性无关。"
+        },
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz5",
+          "question": "以下 Go 代码实现的 watchdog 存在什么问题？\n\n```go\ngo func() {\n    for {\n        time.Sleep(ttl / 3)\n        rdb.Expire(ctx, key, ttl)\n    }\n}()\n```",
+          "choices": [
+            {"id": "A", "text": "使用 time.Sleep 而非 time.Ticker 会导致时间漂移"},
+            {"id": "B", "text": "没有退出机制（无法停止 goroutine），且续期时未验证锁是否仍属于自己"},
+            {"id": "C", "text": "应该使用 PERSIST 命令而非 Expire 来防止锁过期"},
+            {"id": "D", "text": "ttl/3 的间隔太频繁，应该改为 ttl/2"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这段代码有两个致命缺陷。第一，goroutine 没有退出条件——业务完成后无法通知它停止，它会一直运行并持续续期，导致锁永远不会释放（除非进程退出）。正确做法是传入 context 或 channel，业务完成后 cancel 通知 goroutine 退出。第二，Expire 命令直接对 key 操作而不检查 value 是否仍是自己的标识，可能错误地续期了其他客户端的锁。选项 A 虽然 Ticker 确实比 Sleep 更精确，但这不是主要问题；选项 C 的 PERSIST 会移除 TTL 使锁永不过期，比原问题更严重；选项 D 的续期频率是设计选择而非 bug。"
+        },
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz6",
+          "question": "一个常见的错误做法是将锁的 TTL 设置为业务平均执行时间（如 200ms），这种做法的根本问题是什么？",
+          "choices": [
+            {"id": "A", "text": "200ms 的精度超出了 Redis 的时间分辨率"},
+            {"id": "B", "text": "平均值无法覆盖尾部延迟，GC 停顿、慢查询、CPU 调度抖动等因素随时可能让实际耗时远超平均值"},
+            {"id": "C", "text": "Redis 的 PX 参数不支持小于 1 秒的过期时间"},
+            {"id": "D", "text": "200ms 的 TTL 会导致 Redis 频繁执行过期扫描影响性能"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "分布式系统中的延迟分布通常呈长尾特征。即使 P50 延迟只有 200ms，P99 可能到 2 秒，P99.9 在极端情况下可能到 10 秒以上。JVM 的 Full GC 可以暂停进程数秒，Linux 的 CFS 调度器在 CPU 过载时可能让进程几百毫秒得不到调度，数据库连接池耗尽时等待时间不可预测。用平均值设置 TTL 意味着约 50% 的请求执行时间会超过 TTL——这是灾难性的设计。选项 A 错误，Redis 内部时间精度为 1ms 完全支持 200ms；选项 C 错误，PX 参数接受任意正整数毫秒值；选项 D 错误，Redis 的惰性删除和定期删除机制不会因为 TTL 短而产生显著额外开销。"
+        },
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz7",
+          "question": "对比 watchdog 续期方案与 fencing token 方案，以下哪项描述最准确？",
+          "choices": [
+            {"id": "A", "text": "Fencing token 性能更好因为不需要定期续期的网络开销"},
+            {"id": "B", "text": "Watchdog 依赖时间假设（进程不会被暂停超过 TTL），fencing token 不依赖时间但要求存储层支持条件写入"},
+            {"id": "C", "text": "两种方案都能保证绝对互斥，区别仅在于实现复杂度"},
+            {"id": "D", "text": "Fencing token 只适用于 ZooKeeper，不能与 Redis 配合使用"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Watchdog 的安全性建立在「续期线程不会被暂停超过一个 TTL 周期」的假设上。如果 JVM Full GC 暂停了 35 秒（超过 Redisson 默认的 30 秒 lease），watchdog 线程也被冻结无法续期，锁就会过期。Fencing token 则完全不依赖时间——它通过单调递增的 token 让存储层拒绝过时的写入，即使两个客户端同时「持有」锁，只有 token 更大的那个写入会被接受。但代价是存储层必须支持「仅当 token >= 当前最大值时才接受写入」的语义。选项 A 的性能论述不是核心差异；选项 C 错误，watchdog 不能保证绝对互斥；选项 D 错误，fencing token 是通用模式，Redis 可以用 INCR 生成递增 token。"
+        },
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz8",
+          "question": "在 Kubernetes 环境中，Pod 的 CPU 被 throttle（CFS quota 用尽）时，watchdog 续期机制会面临什么风险？",
+          "choices": [
+            {"id": "A", "text": "CPU throttle 只影响计算密集型操作，I/O 操作（如 Redis 通信）不受影响"},
+            {"id": "B", "text": "Pod 进程可能被整体冻结数百毫秒甚至数秒，watchdog 的 ticker 无法按时触发，续期延迟可能导致锁过期"},
+            {"id": "C", "text": "Kubernetes 会自动检测到锁续期失败并重启 Pod"},
+            {"id": "D", "text": "CPU throttle 时 Redis 客户端会自动断开连接导致锁立即释放"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 Pod 的 CPU CFS quota 耗尽时，Linux 内核的 CFS 带宽控制器会在当前 period（通常 100ms）结束前暂停该 cgroup 中的所有线程，包括 watchdog 线程。如果 throttle 累积（比如 requests=100m 但实际使用 500m），进程可能在一个 period 中被冻结 80ms 以上，多个 period 累积后 watchdog 的实际续期间隔可能从预期的 10 秒变成 12~15 秒。虽然 30 秒的 lease 通常仍有余量，但在极端 throttle 场景下确实存在风险。选项 A 错误，CFS throttle 冻结的是整个线程而非特定类型的操作；选项 C 错误，Kubernetes 没有这种自动检测机制；选项 D 错误，Redis 连接在 TCP 层面不会因为客户端 CPU throttle 而断开。"
+        },
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz9",
+          "question": "如果 watchdog 续期 Lua 脚本返回 0（续期失败），业务代码应该如何处理？",
+          "choices": [
+            {"id": "A", "text": "忽略并继续执行，等业务结束后正常释放锁即可"},
+            {"id": "B", "text": "重新尝试获取锁，获取成功后继续执行剩余业务逻辑"},
+            {"id": "C", "text": "立即中止当前业务操作并回滚已执行的变更，因为此时互斥性已被破坏"},
+            {"id": "D", "text": "将续期间隔缩短为原来的一半后重试续期"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "续期返回 0 意味着锁的 key 已经不存在或者 value 已经变为其他客户端的标识——无论哪种情况，都说明当前客户端已经丧失了互斥保护。此时如果继续执行业务操作，与另一个持锁客户端形成并发写入，数据一致性将被破坏。正确做法是立即停止操作、回滚数据库事务（如果已开启）、记录告警日志。选项 A 极其危险，继续执行等于在没有锁保护的情况下操作共享资源；选项 B 毫无意义，锁已经被别人拿走说明此刻有竞争者在操作，重新获取锁后执行剩余逻辑会基于过期的中间状态产生错误结果；选项 D 不会改变结果，锁已经不属于你了，缩短间隔重试续期只会一直返回 0。"
+        },
+        {
+          "id": "redis-dist-lock-early-release-q1-quiz10",
+          "question": "你的服务日志显示 watchdog 续期成功但锁仍被其他实例获取了，以下哪个排查方向最可能定位问题？",
+          "choices": [
+            {"id": "A", "text": "检查 Redis 是否发生了主从切换导致新 Master 上没有锁数据"},
+            {"id": "B", "text": "检查服务器时区配置是否与 Redis 服务器不一致"},
+            {"id": "C", "text": "检查是否存在多个 Redis 实例，客户端连接了不同的实例"},
+            {"id": "D", "text": "检查 Go 语言的 GC 是否导致了 STW 暂停"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "日志显示续期成功说明 PEXPIRE Lua 脚本返回了 1，但另一个实例又获取了同一把锁——这意味着存在两个「真相」，最可能的原因是 Redis 发生了主从切换。客户端 A 在 Master 上续期成功，但如果此 Master 在续期命令复制到 Slave 之前宕机，Sentinel 将 Slave 提升为新 Master，新 Master 上这把锁可能已经过期（或根本不存在），客户端 B 就能在新 Master 上成功获取锁。选项 B 错误，Redis 的 TTL 是相对时间（多少毫秒后过期），与时区完全无关；选项 C 虽然理论上可能，但这属于配置错误而非运行时故障，且题目描述的是间歇性问题；选项 D 错误，如果 GC 暂停足够长导致锁过期，续期日志应该显示间隔异常而非「续期成功」。"
+        }
+      ],
+      "references": [
+        "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html",
+        "https://redis.io/docs/latest/develop/use/patterns/distributed-locks/",
+        "https://github.com/redisson/redisson/wiki/8.-Distributed-locks-and-synchronizers"
+      ]
+    }
+  ]
+}

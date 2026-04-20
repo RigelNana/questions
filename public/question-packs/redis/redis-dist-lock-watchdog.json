@@ -1,0 +1,167 @@
+{
+  "id": "redis-dist-lock-watchdog",
+  "name": "看门狗锁续期机制的原理",
+  "domain": "redis",
+  "description": "分布式锁看门狗续期机制的实现原理与 Redisson 源码分析",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-dist-lock-watchdog-q1",
+      "domain": "redis",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Redis", "分布式锁", "watchdog", "锁续期", "Redisson"],
+      "title": "看门狗锁续期机制的原理",
+      "content": "在使用 Redis SET NX PX 实现分布式锁时，一个无法回避的工程难题是：锁的过期时间（TTL）应该设为多少？设得太短，业务逻辑尚未执行完毕锁就自动释放了，其他客户端趁虚而入导致并发安全问题；设得太长，当持锁客户端真正崩溃时，系统需要等待漫长的超时窗口才能恢复，期间所有等待该锁的请求全部阻塞。这就是分布式锁的「TTL 困境」——静态过期时间永远无法同时满足安全性与可用性两个相互矛盾的需求。\n\n看门狗（Watchdog）机制正是为了打破这一困境而设计的自动续期策略。其核心思路是：加锁时设置一个相对较短的初始 TTL（例如 30 秒），然后在后台启动一个定时任务，周期性地检查锁是否仍被当前客户端持有，如果是则重置 TTL 为初始值。这样一来，只要持锁客户端进程存活且业务逻辑仍在执行，锁就不会过期；而一旦客户端进程崩溃，后台定时任务随之终止，锁会在最后一次续期后的 TTL 窗口内自然释放，无需任何外部干预。\n\nRedisson 是 Java 生态中最成熟的 Redis 客户端框架之一，其 3.x 版本（当前最新为 3.27.x）内置了完整的 Watchdog 实现。当开发者调用 RLock.lock() 不指定 leaseTime 参数时，Redisson 会自动启动看门狗线程进行续期；而如果显式指定了 leaseTime（例如 lock(10, TimeUnit.SECONDS)），看门狗则不会激活，锁在指定时间后直接过期。这一设计隐含了一个重要的工程决策：如果你已经明确知道业务的最大执行时间，就应该自行设定合理的过期时间而不依赖自动续期。\n\n请深入分析 Redisson 看门狗续期机制的实现原理，包括：默认超时时间与续期周期的关系、续期操作使用的 Lua 脚本内容、底层定时器（Netty HashedWheelTimer）的调度方式，以及当客户端存活但业务逻辑发生死锁时看门狗机制可能带来的问题。",
+      "answer": "## 第一步：核心主体概念基础详解\n\n锁续期（Lock Renewal）本质上是将分布式锁从「一次性租约」升级为「可续租约」的设计模式。在没有续期机制的朴素方案中，客户端必须在加锁时做一个近乎不可能精准的预判——估算业务代码的最大执行时间，并将 TTL 设为这个估算值加上一定的安全余量。但分布式系统中充满不确定性：一次网络调用可能因为对端 Full GC 而从通常的 5 毫秒飙升至 500 毫秒，一个数据库查询可能因为锁竞争而从 10 毫秒退化至 3 秒。静态 TTL 面对这种长尾延迟（tail latency）完全无能为力。\n\n看门狗的设计哲学借鉴了操作系统中的硬件看门狗定时器（Hardware Watchdog Timer）：系统正常运行时需要定期「喂狗」（reset counter），如果在规定时间内没有喂狗，说明系统已经失去响应，看门狗会触发复位操作。在分布式锁语境中，「喂狗」就是续期操作（重置 TTL），「复位」就是锁自然过期释放。这种机制巧妙地利用了一个事实：如果客户端进程存活，它的后台线程就能正常执行续期；如果进程崩溃，后台线程也会随之消亡，续期停止，锁在 TTL 到期后自动释放。\n\n需要强调的是，看门狗并非万能药。它解决的是「客户端存活但业务执行时间不可预测」这一特定问题，而非所有分布式锁的安全性问题。实际上，看门狗引入了一个新的风险维度：如果客户端进程存活但业务线程陷入无限循环或死锁，看门狗会忠实地持续续期，导致锁永远无法释放——这比静态 TTL 方案更危险，因为后者至少还有超时兜底。\n\n## 第二步：题目核心问题精准深度解答\n\nRedisson 的看门狗实现围绕三个核心参数展开。第一个是 lockWatchdogTimeout，默认值为 30000 毫秒（30 秒），它决定了锁的初始 TTL 以及每次续期的目标 TTL。第二个是续期周期，固定为 lockWatchdogTimeout / 3，即默认 10 秒执行一次续期检查。第三个是内部调度器，Redisson 使用 Netty 的 HashedWheelTimer（时间轮定时器）来管理所有续期任务的调度。\n\n当客户端调用 lock() 或 lock(-1, TimeUnit.MILLISECONDS) 时，Redisson 内部的 tryAcquireAsync 方法检测到 leaseTime 为 -1，判定需要启动看门狗。加锁成功后，scheduleExpirationRenewal 方法被调用，它在一个 ConcurrentHashMap（以 entryName 为 key）中注册当前锁的续期任务，避免同一把锁被重复注册。随后 renewExpiration 方法启动真正的定时续期逻辑：通过 Netty 的 HashedWheelTimer 注册一个延迟 internalLockLeaseTime/3（默认 10 秒）后执行的 TimerTask。\n\n续期操作的核心是一段 Lua 脚本：\n\n```lua\nif redis.call('hexists', KEYS[1], ARGV[2]) == 1 then\n    redis.call('pexpire', KEYS[1], ARGV[1]);\n    return 1;\nend;\nreturn 0;\n```\n\n这段脚本的语义清晰而精准：首先通过 HEXISTS 检查锁的 Hash 结构中是否存在当前客户端的持有记录（ARGV[2] 是 clientId:threadId 格式的唯一标识），只有确认当前客户端确实持有该锁时，才执行 PEXPIRE 将 TTL 重置为 ARGV[1]（即 30000 毫秒）。如果锁已经被释放或被其他客户端获取，脚本返回 0，续期任务随之终止。注意这里使用的是 Hash 类型（HEXISTS/HSET）而非简单的 String 类型，因为 Redisson 的锁实现支持可重入（Reentrant），Hash 的 field 记录持有者标识，value 记录重入次数。\n\nrenewExpirationAsync 方法调用这段 Lua 脚本后，通过 CompletionStage（Java 的异步编程抽象）链处理返回结果：如果返回 1（续期成功），则递归调用 renewExpiration 注册下一次定时任务，形成周期性续期循环；如果返回 0（锁已不存在），则取消续期并清理注册信息。这种递归注册模式而非固定频率的 ScheduledExecutorService 方案有两个优势：一是每次续期成功后才注册下一次，天然适应网络延迟波动；二是与 Netty 的事件循环深度集成，避免额外线程开销。\n\nNetty HashedWheelTimer 是整个调度的基石。它通过一个环形数组（默认 512 个 bucket）加链表的结构管理定时任务，时钟指针每 100 毫秒向前推进一格（tickDuration），检查当前 bucket 中是否有到期任务需要执行。相比 JDK 自带的 ScheduledThreadPoolExecutor（基于堆的优先队列，插入/删除复杂度 O(log n)），HashedWheelTimer 的任务注册与取消都是 O(1) 复杂度，在管理数万个锁续期任务的场景下性能优势显著。Redisson 3.17+ 版本默认共用一个全局 HashedWheelTimer 实例处理所有 RedissonLock 的续期调度，避免了为每把锁创建独立 Timer 造成的资源浪费。\n\n关于看门狗不激活的条件，这是面试中最常见的陷阱问题：只有在 leaseTime 参数为 -1 时看门狗才会启动。如果调用者显式传入了 leaseTime（例如 lock.lock(10, TimeUnit.SECONDS)），Redisson 认为调用者已经对锁的生命周期做出了明确承诺，不会启动自动续期。对应的 Lua 加锁脚本会直接使用传入的 leaseTime 作为 PEXPIRE 参数。\n\n## 第三步：体系化扩展延伸\n\n在 Go 语言中实现等价的看门狗机制相当自然。核心模式是使用 context.WithCancel 创建一个可取消的上下文，在 goroutine 中启动 time.Ticker 定期执行 PEXPIRE 续期，当业务逻辑完成调用 cancelFunc 时续期 goroutine 退出：\n\n```go\nfunc lockWithWatchdog(ctx context.Context, rdb *redis.Client, key, value string) (context.CancelFunc, error) {\n    ttl := 30 * time.Second\n    ok, err := rdb.SetNX(ctx, key, value, ttl).Result()\n    if err != nil || !ok {\n        return nil, fmt.Errorf(\"acquire lock failed\")\n    }\n    renewCtx, cancel := context.WithCancel(ctx)\n    go func() {\n        ticker := time.NewTicker(ttl / 3)\n        defer ticker.Stop()\n        for {\n            select {\n            case <-renewCtx.Done():\n                return\n            case <-ticker.C:\n                rdb.PExpire(ctx, key, ttl)\n            }\n        }\n    }()\n    return cancel, nil\n}\n```\n\n当 JVM 进程崩溃时，所有用户线程和守护线程都会终止，看门狗自然停止续期，锁在最后一次续期后的 30 秒内过期释放。这是安全机制运作的正常路径。但有一个容易被忽视的危险场景：客户端进程存活，但持锁的业务线程因为数据库死锁、无限循环、或等待一个永远不会到来的 RPC 响应而永久阻塞。此时看门狗线程并不知道业务已经「卡住」，它只关心「进程是否还活着」，于是会忠实地每 10 秒续期一次，锁永远不会释放。解决方案是在应用层设置明确的超时机制：例如使用 lock.tryLock(waitTime, leaseTime, TimeUnit) 显式指定 leaseTime 作为绝对上界，或者在业务代码中使用 CompletableFuture.orTimeout()（Java 9+）为整个操作设置 deadline。\n\n从对比维度看，etcd 的 Lease + KeepAlive 机制与 Redis 看门狗在概念上高度相似：客户端创建一个带 TTL 的 Lease，然后通过 gRPC 双向流持续发送 KeepAlive 请求来续租。但关键差异在于 etcd 基于 Raft 共识协议，Lease 的创建和续期都经过多数派确认，因此不存在 Redis 单节点主从切换丢锁的问题。ZooKeeper 走了另一条路：它使用临时节点（Ephemeral Node）配合 Session 机制，客户端通过心跳维持 Session，Session 超时后临时节点自动删除。这本质上也是一种「看门狗」，只是粒度从单个锁提升到了整个会话。\n\n在生产环境中需要警惕的是：如果 Redis Master 在看门狗成功续期后、数据同步到 Slave 之前发生故障，新提升的 Master 上该锁的 TTL 可能回退到续期前的值甚至不存在。这意味着即使有看门狗保护，在 Redis Sentinel 或 Cluster 架构下仍然存在短暂的安全窗口。RedLock 通过向多个独立实例执行续期操作来缓解这一问题，但代价是每次续期的网络开销和延迟显著增加。",
+      "keyPoints": [
+        "Redisson 看门狗默认 lockWatchdogTimeout 为 30 秒，续期周期固定为超时时间的三分之一即 10 秒，每次续期通过 Lua 脚本将 TTL 重置为 30 秒，形成周期性的租约刷新循环",
+        "看门狗仅在调用 lock() 不指定 leaseTime 参数时激活，若显式传入 leaseTime 则 Redisson 认为调用者已对锁生命周期做出承诺，不启动自动续期",
+        "续期 Lua 脚本通过 HEXISTS 检查 Hash 结构中的持有者标识后才执行 PEXPIRE，既保证了原子性又支持可重入锁的正确续期",
+        "底层调度基于 Netty HashedWheelTimer 时间轮，相比 JDK ScheduledThreadPoolExecutor 的 O(log n) 堆操作，时间轮的任务注册与取消均为 O(1) 复杂度",
+        "客户端 JVM 崩溃时看门狗线程随进程终止，锁在最后一次续期后 30 秒内自然过期，这是设计中预期的安全释放路径",
+        "客户端存活但业务线程死锁时看门狗会持续续期导致锁永不释放，需要应用层通过显式 leaseTime 或 CompletableFuture.orTimeout 设置绝对超时上界",
+        "etcd Lease KeepAlive 基于 Raft 共识保证续租操作经多数派确认不存在单点丢锁问题，ZooKeeper 通过 Session 心跳维持临时节点实现类似语义但粒度为整个会话",
+        "Redis 主从架构下即使看门狗正常续期，Master 故障切换仍可能导致续期数据丢失，RedLock 通过多实例并行续期缓解但增加了网络开销"
+      ],
+      "quiz": [
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz1",
+          "type": "single",
+          "question": "Redisson 看门狗的默认 lockWatchdogTimeout 值和续期周期分别是多少？",
+          "options": [
+            "A. 超时 60 秒，每 20 秒续期一次",
+            "B. 超时 30 秒，每 10 秒续期一次",
+            "C. 超时 30 秒，每 15 秒续期一次",
+            "D. 超时 10 秒，每 3 秒续期一次"
+          ],
+          "answer": "B",
+          "explanation": "Redisson 的 lockWatchdogTimeout 默认值为 30000 毫秒（30 秒），续期周期固定为该值的三分之一即 10 秒。这意味着在正常情况下，锁的实际剩余 TTL 永远不会低于 20 秒（刚续期后为 30 秒，经过 10 秒后降至 20 秒再次续期）。选项 A 的 60 秒超时不是默认值；选项 C 的 15 秒续期对应的是二分之一而非三分之一的比例；选项 D 的 10 秒超时过短，在网络抖动场景下极易导致锁意外过期。三分之一的设计给了续期操作两次重试机会。"
+        },
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz2",
+          "type": "single",
+          "question": "以下哪种调用方式会激活 Redisson 的看门狗续期机制？",
+          "options": [
+            "A. lock.lock(10, TimeUnit.SECONDS)",
+            "B. lock.lock()",
+            "C. lock.tryLock(5, 10, TimeUnit.SECONDS)",
+            "D. lock.lock(30, TimeUnit.SECONDS)"
+          ],
+          "answer": "B",
+          "explanation": "看门狗仅在不指定 leaseTime 参数时激活。lock() 无参调用等价于 lock(-1, TimeUnit.MILLISECONDS)，Redisson 内部检测到 leaseTime 为 -1 后启动自动续期。选项 A 显式指定了 10 秒 leaseTime，Redisson 认为调用者明确了解锁的生命周期，不启动看门狗；选项 C 的 tryLock 第二个参数即 leaseTime 为 10 秒，同样不会激活；选项 D 指定 30 秒 leaseTime，虽然数值恰好等于默认 watchdogTimeout，但因为是显式指定，看门狗仍不会启动。关键判断条件是 leaseTime 参数是否为 -1。"
+        },
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz3",
+          "type": "single",
+          "question": "Redisson 续期 Lua 脚本中使用 HEXISTS 而非 EXISTS 检查锁的原因是什么？",
+          "options": [
+            "A. HEXISTS 的执行速度比 EXISTS 快 10 倍",
+            "B. Redisson 使用 Hash 结构存储锁以支持可重入，field 记录持有者标识，value 记录重入次数",
+            "C. Hash 类型的 key 不会被 Redis 的惰性删除机制清理",
+            "D. 只有 Hash 类型的 key 才支持 PEXPIRE 命令设置毫秒级过期"
+          ],
+          "answer": "B",
+          "explanation": "Redisson 的分布式锁实现基于 Hash 数据结构而非简单的 String 类型。Hash 的 key 是锁名称，field 是「客户端UUID:线程ID」格式的唯一标识，value 是重入计数器。这种设计使得同一线程多次获取同一把锁时只需递增计数器而非创建新 key，完美支持可重入语义。选项 A 错误，两个命令的时间复杂度都是 O(1)，性能差异可忽略；选项 C 错误，惰性删除机制对所有数据类型一视同仁；选项 D 错误，PEXPIRE 可应用于任何类型的 key。"
+        },
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz4",
+          "type": "single",
+          "question": "当持锁客户端的 JVM 进程因 OOM 被操作系统 kill 时，锁会如何释放？",
+          "options": [
+            "A. Redis 服务端感知到连接断开后立即删除锁",
+            "B. 看门狗线程在另一台机器上继续运行并最终主动释放锁",
+            "C. 看门狗线程随进程终止，锁在最后一次续期后的 TTL 窗口内（最多 30 秒）自然过期",
+            "D. Redisson 的异常钩子会在进程退出前发送 DEL 命令释放锁"
+          ],
+          "answer": "C",
+          "explanation": "当 JVM 进程被强制终止时（如 OOM kill 发送 SIGKILL），所有线程立即停止，包括看门狗的续期线程。没有任何代码有机会执行清理操作（SIGKILL 不可捕获）。此时锁的 TTL 保持在最后一次续期设置的值（最多 30 秒），到期后 Redis 自动删除该 key。选项 A 错误，Redis 的连接断开不会触发 key 删除，这不是临时节点机制；选项 B 错误，看门狗运行在持锁客户端本地而非远程；选项 D 错误，SIGKILL 信号无法被 ShutdownHook 捕获处理。"
+        },
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz5",
+          "type": "single",
+          "question": "Redisson 使用 Netty HashedWheelTimer 而非 JDK ScheduledThreadPoolExecutor 的核心优势是什么？",
+          "options": [
+            "A. HashedWheelTimer 的定时精度可以达到纳秒级而 JDK 只支持毫秒级",
+            "B. HashedWheelTimer 的任务注册与取消为 O(1) 复杂度，适合管理大量定时任务",
+            "C. HashedWheelTimer 使用独立进程运行，不受 JVM GC 影响",
+            "D. HashedWheelTimer 支持分布式调度，可以跨 JVM 实例同步任务"
+          ],
+          "answer": "B",
+          "explanation": "HashedWheelTimer 基于环形数组（时间轮）实现，任务按照到期时间映射到对应的 bucket，注册和取消操作都是 O(1) 复杂度。而 JDK 的 ScheduledThreadPoolExecutor 基于 DelayedWorkQueue（本质是最小堆），插入和删除的复杂度为 O(log n)。当 Redisson 需要管理数千甚至数万把锁的续期任务时，O(1) 与 O(log n) 的差距非常显著。选项 A 错误，时间轮的默认 tickDuration 为 100 毫秒，精度反而不如 ScheduledThreadPoolExecutor；选项 C 错误，HashedWheelTimer 运行在 JVM 线程中同样受 GC 影响；选项 D 错误，它是纯本地的单机调度器。"
+        },
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz6",
+          "type": "single",
+          "question": "如果持锁客户端的业务线程陷入死锁（进程存活但线程阻塞），看门狗会如何表现？",
+          "options": [
+            "A. 看门狗检测到业务线程无响应后自动停止续期，锁在 30 秒后过期",
+            "B. 看门狗不关心业务线程状态，会持续续期导致锁永远不会释放",
+            "C. 看门狗向 Redis 发送特殊标记表示锁处于异常状态，其他客户端可以强制获取",
+            "D. JVM 的死锁检测机制会自动触发看门狗的取消回调"
+          ],
+          "answer": "B",
+          "explanation": "这是看门狗机制最重要的局限性。看门狗线程运行在独立的 Netty EventLoop 或 Timer 线程中，它只判断「当前进程是否存活且锁 key 是否仍由本客户端持有」，完全不感知业务线程的执行状态。即使业务线程已经死锁或进入无限循环，只要进程还在、锁 key 仍存在，看门狗就会每 10 秒忠实续期一次。选项 A 错误，看门狗没有对业务线程的健康检查逻辑；选项 C 错误，Redis 协议中不存在这种「异常标记」机制；选项 D 错误，JVM 的死锁检测（jstack 可以发现）不会触发任何自动回调。"
+        },
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz7",
+          "type": "single",
+          "question": "以下 Go 语言看门狗实现中，如果 context 被 cancel 但 PEXPIRE 续期请求正在网络传输中，可能出现什么问题？",
+          "options": [
+            "A. 锁会被立即删除因为 cancel 会发送 DEL 命令",
+            "B. 没有问题，最后一次续期可能成功也可能失败，但锁最终都会在 TTL 到期后释放",
+            "C. Redis 服务端会拒绝已 cancel 的 context 发出的命令",
+            "D. Go runtime 会 panic 因为在已关闭的 channel 上发送数据"
+          ],
+          "answer": "B",
+          "explanation": "context.Cancel 只是通知 goroutine 退出循环，不会中断正在执行的网络 I/O。最后一次 PEXPIRE 可能成功（TTL 被重置为 30 秒）或因网络超时失败。无论哪种情况，调用者随后会执行 DEL 释放锁。即使 DEL 也失败了，锁最终也会在 TTL 到期后自动过期。选项 A 错误，cancel context 不会自动发送 Redis 命令；选项 C 错误，Redis 服务端不感知客户端的 context 状态；选项 D 错误，select 语句中 ctx.Done() channel 是被读取而非写入，不存在向已关闭 channel 发送数据的问题。"
+        },
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz8",
+          "type": "single",
+          "question": "etcd 的 Lease KeepAlive 机制与 Redis 看门狗相比，在一致性保障方面的根本差异是什么？",
+          "options": [
+            "A. etcd 的续租频率更高所以不会出现锁过期",
+            "B. etcd 的 Lease 续租经过 Raft 多数派确认，不存在单点故障导致续租数据丢失的问题",
+            "C. etcd 使用 TCP 长连接所以续租请求不会丢包",
+            "D. etcd 的 Lease TTL 可以设置为无限大所以不需要续期"
+          ],
+          "answer": "B",
+          "explanation": "etcd 基于 Raft 共识协议，Lease 的创建和 KeepAlive 续租都需要经过 Leader 提议并获得多数派 Follower 确认后才持久化到日志中。即使 Leader 故障，新选出的 Leader 上仍然保有完整的 Lease 信息。而 Redis 看门狗的续期（PEXPIRE）只写入单个 Master 节点，如果该 Master 在同步到 Slave 前故障，续期数据就丢失了。选项 A 错误，续租频率与一致性无关；选项 C 错误，TCP 不保证应用层消息的可靠送达（连接可能中断）；选项 D 错误，etcd Lease 必须设置有限 TTL，最大值受服务端配置约束。"
+        },
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz9",
+          "type": "single",
+          "question": "Redisson 看门狗续期成功后，为什么采用递归注册下一次 TimerTask 而非使用固定频率的 scheduleAtFixedRate？",
+          "options": [
+            "A. HashedWheelTimer 不支持 scheduleAtFixedRate 接口",
+            "B. 递归注册可以根据上一次续期的网络延迟动态调整下次续期时间",
+            "C. 递归模式确保只有上一次续期确认成功后才注册下一次，避免续期已失效锁的无意义操作",
+            "D. Java 的 CompletionStage 不支持固定频率回调"
+          ],
+          "answer": "C",
+          "explanation": "递归注册模式的关键优势是因果依赖：只有当 renewExpirationAsync 返回结果为 1（续期成功，确认锁仍由本客户端持有）时，才会调用 renewExpiration 注册下一次 TimerTask。如果返回 0（锁已不存在或已被其他客户端获取），续期循环立即终止。使用 scheduleAtFixedRate 则无法优雅地实现这种「根据上一次执行结果决定是否继续」的语义。选项 A 不完全正确，HashedWheelTimer 可以通过外部封装实现固定频率但非原生支持；选项 B 错误，实际续期间隔固定为 timeout/3，不会动态调整；选项 D 错误，CompletionStage 的能力与此无关。"
+        },
+        {
+          "id": "redis-dist-lock-watchdog-q1-quiz10",
+          "type": "single",
+          "question": "在 Redis Sentinel 架构下，看门狗刚完成续期后 Master 立即宕机，最坏情况下会发生什么？",
+          "options": [
+            "A. Sentinel 会将续期操作重放到新 Master 上，不会有任何影响",
+            "B. 新 Master 上锁的 TTL 回退到续期前的值甚至锁不存在，另一个客户端可以获取同一把锁导致双重持有",
+            "C. Sentinel 检测到锁状态不一致会自动触发 WAIT 命令等待同步完成",
+            "D. 看门狗会自动感知主从切换并向新 Master 重新发送续期请求"
+          ],
+          "answer": "B",
+          "explanation": "Redis 主从复制默认采用异步模式。看门狗的 PEXPIRE 续期命令写入 Master 后立即返回成功，但如果此时 Master 尚未将该命令传播到 Slave 就发生故障，Sentinel 提升的新 Master 上可能不包含最新的 TTL 值（甚至锁 key 本身就不存在，如果加锁命令也未同步）。此时另一个客户端可以成功获取「同一把锁」，形成危险的双重持有。选项 A 错误，Sentinel 不具备操作重放能力；选项 C 错误，WAIT 需要客户端主动调用而非 Sentinel 自动触发；选项 D 错误，Redisson 看门狗不内置主从切换感知逻辑。"
+        }
+      ],
+      "references": [
+        "Redisson GitHub Wiki - Distributed Locks and Synchronizers: https://github.com/redisson/redisson/wiki/8.-Distributed-locks-and-synchronizers",
+        "Redisson 3.27.x Source Code - RedissonLock.java renewExpiration() method",
+        "Netty HashedWheelTimer Javadoc: https://netty.io/4.1/api/io/netty/util/HashedWheelTimer.html",
+        "Martin Kleppmann - How to do distributed locking (2016): https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"
+      ]
+    }
+  ]
+}
