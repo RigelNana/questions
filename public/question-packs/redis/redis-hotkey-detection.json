@@ -1,0 +1,165 @@
+{
+  "id": "redis-hotkey-detection",
+  "name": "热 Key 发现方法",
+  "domain": "redis",
+  "description": "Redis 热 Key 的多种发现方法及其优缺点对比，包括 redis-cli --hotkeys、MONITOR 命令、代理层统计、客户端埋点以及 Redis 7.0 CLIENT NO-TOUCH 等方案的原理、实操命令和生产选型建议",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-hotkey-detection-q1",
+      "domain": "redis",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["Redis", "热Key", "MONITOR", "hotkeys", "性能诊断"],
+      "title": "热 key 发现的几种方法（MONITOR/hotkeys/代理层统计）",
+      "content": "## 面试场景\n\n你们线上有一组 Redis Cluster（6 主 6 从，Redis 6.2），承载电商平台的商品详情页缓存和购物车数据，日常总 QPS 约 40 万。某天下午大促预热活动开始，运营推了一款爆品到首页 banner 位，30 分钟内该商品的浏览量暴涨到每秒 8 万次。你在 Grafana 上看到 Cluster 的 6 个主节点中，有一个节点的 CPU 使用率飙到了 92%，而其余 5 个节点的 CPU 都在 30% 左右——流量严重倾斜。\n\n你登上那台高负载的节点，用 `INFO commandstats` 看了一下：\n\n```bash\n127.0.0.1:6379> INFO commandstats\n# Commandstats\ncmdstat_get:calls=28439102,usec=8531730,usec_per_call=0.30\ncmdstat_set:calls=1204831,usec=842382,usec_per_call=0.70\ncmdstat_hgetall:calls=9482013,usec=15171221,usec_per_call=1.60\n```\n\n`GET` 和 `HGETALL` 的调用次数远高于其他节点，但 `usec_per_call` 并不高——命令本身没有变慢，而是某几个 key 的请求量太集中了。你高度怀疑存在热 key，但不确定具体是哪些 key。你的同事提议「用 MONITOR 命令抓一下就知道了」，你犹豫了，因为你记得 MONITOR 在高 QPS 下非常危险。\n\n面试官这时候问你：「发现热 key 有哪几种方法？它们各自的原理和优缺点是什么？在你刚才描述的这个 40 万 QPS 的线上集群中，你会选哪种方案？为什么？」\n\n这道题不是简单地列举方法，而是考察你对每种方案的原理、适用场景和风险的深入理解——尤其是 MONITOR 为什么危险、`--hotkeys` 的前置依赖是什么、代理层统计怎么做、以及 Redis 7.0 带来了哪些新能力。",
+      "answer": "## 第一步：什么是热 Key，为什么必须发现它\n\n### 热 Key 的定义与危害\n\n所谓热 Key（Hot Key），是指在 Redis 中被极高频率访问的少数几个 key。在一个 Redis Cluster 中，key 通过 CRC16 哈希被分配到 16384 个 slot 上，每个 slot 固定归属于某一个主节点。如果某个 key 的访问量突然暴涨——比如一个爆款商品的缓存 key `product:detail:88721` 每秒被 GET 8 万次——那么所有这 8 万次请求都会打到同一个节点上，其他节点基本空闲。这就是典型的「热 Key 导致集群流量倾斜」。\n\n热 Key 的危害不仅仅是 CPU 飙高。当单节点 QPS 逼近极限时，命令排队延迟增加，P99 延迟从亚毫秒飙到几十毫秒，触发上游服务超时重试，进而引发雪崩。在极端情况下，热 Key 所在节点的网络带宽（尤其是出方向）也会被打满——如果这个 key 的 value 是一个 5KB 的 JSON 字符串，8 万 QPS 意味着每秒 400MB 的出流量，千兆网卡直接打满。\n\n所以发现热 Key 是解决热 Key 问题的第一步。你只有先知道「是哪个 key 热了」，才能做后续的本地缓存、key 分片、读写分离等优化。下面逐一讲解五种主流的热 Key 发现方法。\n\n## 第二步：五种热 Key 发现方法的原理与实操\n\n### 方法一：redis-cli --hotkeys（Redis 4.0+）\n\n这是 Redis 官方提供的最简单的热 Key 发现方式。`redis-cli` 在 4.0 版本中新增了 `--hotkeys` 参数，执行后它会对整个 key 空间做一次 SCAN 遍历，读取每个 key 的 LFU 计数器值（也就是 `OBJECT FREQ` 返回的那个 0-255 的对数频率计数），然后按频率从高到低排序输出。\n\n```bash\n$ redis-cli -h 10.0.3.21 -p 6379 --hotkeys\n\n# Scanning the entire keyspace to find hot keys as well as\n# temporary per slot hit rate\n\n[00.00%] Hot key 'product:detail:88721' found so far with counter 255\n[05.32%] Hot key 'cart:user:30041' found so far with counter 189\n[12.78%] Hot key 'product:detail:55102' found so far with counter 142\n[38.41%] Hot key 'session:token:a8f3b2c1' found so far with counter 87\n...\n\n-------- summary -------\nSampled 4832910 keys in the keyspace!\nHot key found with counter: 255\tkeyname: product:detail:88721\nHot key found with counter: 189\tkeyname: cart:user:30041\nHot key found with counter: 142\tkeyname: product:detail:55102\nHot key found with counter: 87\t keyname: session:token:a8f3b2c1\n```\n\n这个方法有一个硬性前提：Redis 实例的淘汰策略必须是 LFU 系列（`allkeys-lfu` 或 `volatile-lfu`）。原因是 `--hotkeys` 依赖 `redisObject` 中 24 位 `lru` 字段的低 8 位 `logc`（对数频率计数器），而这个字段只有在 LFU 策略下才会记录访问频率。如果你的实例使用的是 `allkeys-lru` 或 `noeviction`，执行 `--hotkeys` 会直接报错：\n\n```bash\n$ redis-cli --hotkeys\nError: ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between maxmemory policies at runtime LFU data will be lost.\n```\n\n好消息是可以在线切换淘汰策略：`CONFIG SET maxmemory-policy allkeys-lfu`。但要注意切换后历史的 LFU 计数器数据会从零开始积累，需要等一段时间（通常几分钟到十几分钟）才能获得有意义的热度数据。\n\n`--hotkeys` 内部使用 SCAN 遍历 key 空间，不会阻塞 Redis，但在 key 量很大的实例上（比如 500 万以上的 key）遍历时间可能需要几十秒到几分钟。它只能给出一个时间窗口内的累计热度排名，无法做到实时秒级监控。\n\n### 方法二：MONITOR 命令\n\nMONITOR 是 Redis 内置的实时命令流监听功能。执行 `MONITOR` 后，Redis 会将该实例上所有客户端发送的每一条命令都实时推送给 MONITOR 的订阅者，包括命令名、参数、时间戳和客户端信息。你可以把 MONITOR 的输出通过管道传给脚本，统计每个 key 在单位时间内的出现次数，从而找出热 Key。\n\n```bash\n# 用 MONITOR 抓取 10 秒的命令流，统计 key 出现次数 Top 10\n$ redis-cli -h 10.0.3.21 -p 6379 MONITOR | head -n 100000 | \\\n  awk '{print $4}' | sort | uniq -c | sort -rn | head -10\n\n  12847 \"product:detail:88721\"\n   3421 \"cart:user:30041\"\n   1892 \"product:detail:55102\"\n    843 \"session:token:a8f3b2c1\"\n    ...\n```\n\n看起来很好用对吧？但 MONITOR 在生产环境中是极其危险的。Redis 官方文档用了非常明确的措辞警告：「MONITOR 会显著降低吞吐量」。原因在于 MONITOR 的实现机制——Redis 主线程在执行每一条命令后，都会检查是否有 MONITOR 客户端存在，如果有，就要把这条命令序列化成字符串并写入 MONITOR 客户端的输出缓冲区。在 QPS 为 40 万的实例上，这意味着主线程每秒要额外做 40 万次字符串格式化和缓冲区写入操作。\n\nRedis 官方基准测试显示，一个空闲的 MONITOR 连接就能导致吞吐量下降约 30%。在我们的场景下，40 万 QPS 打开 MONITOR 后可能直接降到 28 万，而那个已经 CPU 92% 的热点节点更是雪上加霜——很可能直接打满 CPU 导致节点不可用。\n\n此外，MONITOR 的输出缓冲区膨胀也是一个隐患。40 万 QPS 的命令流每秒产生的数据量可能达到几十 MB，如果 MONITOR 客户端处理不过来，Redis 的 `client-output-buffer-limit` 会被触发，可能断开 MONITOR 连接或者消耗大量内存。\n\n所以 MONITOR 的使用原则是：**只在低 QPS 的测试环境或排查紧急问题时短暂使用（不超过几秒），绝不在高 QPS 生产实例上长时间开启。**\n\n### 方法三：代理层统计\n\n如果你的 Redis 架构中有代理层——比如 Twemproxy（nutcracker）、Codis、Envoy 的 Redis filter、或者阿里云/腾讯云的 Redis 代理——那么在代理层做热 Key 统计是最推荐的方案。原因很简单：代理层处于客户端和 Redis 之间，所有请求都会经过它，它可以在转发请求时对每个 key 做计数，完全不增加 Redis 服务端的任何负担。\n\n以 Codis 为例，Codis 的 Dashboard 自带了 slot 级别的 QPS 统计面板，你可以看到哪些 slot 的 QPS 异常偏高。更精细的 key 级别统计需要在 Codis Proxy 的源码中添加 hook，或者使用 Codis 社区的热 Key 插件。\n\n以 Envoy 的 Redis proxy filter 为例，可以通过自定义 Lua filter 或者 access log 来实现 key 级别的访问计数。不过更常见的做法是在代理层中嵌入一个轻量级的滑动窗口计数器（比如基于 LRU-Cache 的 Top-K 数据结构），统计最近 N 秒内访问次数最高的 key，超过阈值后输出告警日志或上报到监控系统。\n\n美团、字节跳动等公司的自研 Redis 代理都内置了热 Key 发现能力。例如美团的 Squirrel 代理会在本地维护一个 Count-Min Sketch 数据结构（一种概率型数据结构，类似布隆过滤器但用于频率估计），用极小的内存（几百 KB）就能近似统计出 Top-K 热 Key，检测延迟在毫秒级。发现热 Key 后，代理层可以自动将该 key 的值缓存在代理本地内存中，后续请求直接从代理返回，不再打到 Redis——这就是所谓的「热 Key 本地缓存」方案。\n\n代理层方案的优势是零侵入 Redis、实时性好、可以联动自动化处理。劣势是依赖代理架构——如果你的应用直连 Redis（比如直接用 Redis Cluster 的客户端 SDK），就没有代理层可以拦截。\n\n### 方法四：客户端埋点统计\n\n如果没有代理层，也不想碰 Redis 服务端，还可以在客户端 SDK 层面做统计。思路是在 Redis 客户端的封装层（或者通过 SDK 的 hook 机制）拦截每一次 Redis 命令调用，提取 key 并在本地做计数。\n\n以 Java 的 Lettuce 客户端为例，可以通过 `CommandListener` 接口拦截所有命令：\n\n```java\n// 伪代码：Lettuce CommandListener 实现热 Key 统计\npublic class HotKeyListener implements CommandListener {\n    // 本地 LRU 计数器，保留最近 10 分钟的 Top 1000 key\n    private final ConcurrentHashMap<String, LongAdder> counter = new ConcurrentHashMap<>();\n    \n    @Override\n    public void commandStarted(CommandStartedEvent event) {\n        String key = extractKey(event.getCommand());\n        if (key != null) {\n            counter.computeIfAbsent(key, k -> new LongAdder()).increment();\n        }\n    }\n}\n```\n\n每隔 10 秒对 counter 做一次 Top-K 计算并上报到 Prometheus 或内部监控系统，然后清零。这样每个应用实例都有自己的本地热 Key 数据，在监控系统中做聚合就能看到全局的 Top 热 Key。\n\n京东开源的 JD-hotkey 就是这个思路的成熟实现——它在客户端 SDK 中嵌入了热 Key 探测 agent，发现热 Key 后上报到 etcd 集群，然后所有客户端 agent 收到通知后自动在本地 JVM 内存中缓存该 key 的值，后续读请求不再访问 Redis。\n\n客户端方案的优势是完全不影响 Redis 服务端，适合直连 Cluster 的架构。劣势是需要修改客户端代码（或引入 SDK 封装），且每个语言/框架的实现方式不同，多语言团队的统一接入成本较高。\n\n### 方法五：Redis 7.0 CLIENT NO-TOUCH 与访问频率追踪\n\nRedis 7.0 引入了 `CLIENT NO-TOUCH` 命令（通过 `CLIENT NO-TOUCH ON` 启用）。这个命令的原始用途是告诉 Redis：「这个客户端的命令不要更新 key 的 LRU/LFU 时间戳」——主要用于监控类客户端避免干扰淘汰策略。但它也为热 Key 监控带来了一个新思路：你可以启动一个专门的监控客户端，先 `CLIENT NO-TOUCH ON`，然后定期 SCAN + `OBJECT FREQ` 获取每个 key 的访问频率，而不用担心自己的扫描操作会污染 LFU 计数器。\n\n```bash\n# Redis 7.0+ 监控客户端\n127.0.0.1:6379> CLIENT NO-TOUCH ON\nOK\n\n# 扫描 key 并获取 LFU 频率，自身的 SCAN/OBJECT 操作不会更新 key 的 logc\n127.0.0.1:6379> SCAN 0 COUNT 1000\n1) \"17408\"\n2) 1) \"product:detail:88721\"\n   2) \"cart:user:30041\"\n   ...\n\n127.0.0.1:6379> OBJECT FREQ product:detail:88721\n(integer) 255\n\n127.0.0.1:6379> OBJECT FREQ cart:user:30041\n(integer) 189\n```\n\n这种方式结合脚本自动化后，可以构建一个轻量级的热 Key 巡检服务：每隔 30 秒做一次全量或抽样 SCAN，读取 `OBJECT FREQ` 排序输出。优势是不需要代理层也不需要改客户端代码，劣势是仍然依赖 LFU 策略且有遍历延迟。\n\n## 第三步：方案对比与生产选型建议\n\n### 五种方法横向对比\n\n从对 Redis 的性能影响来看，代理层统计和客户端埋点的影响为零，`--hotkeys` 的影响较小（等同于一次 SCAN 遍历），`CLIENT NO-TOUCH` + SCAN 类似，而 MONITOR 的影响最大（30%+ 的吞吐量下降）。从实时性来看，代理层和客户端方案可以做到秒级发现，MONITOR 也是实时的（但代价太高），`--hotkeys` 和 SCAN 巡检则是分钟级的延迟发现。从部署成本来看，`--hotkeys` 几乎零成本（一条命令），MONITOR 也是零成本但风险高，代理层依赖架构支持，客户端需要改代码。\n\n### 生产环境的推荐策略\n\n对于大多数生产系统，推荐组合使用多种方案形成分层防御体系。如果你的架构中有代理层（Codis/Twemproxy/云厂商代理），优先在代理层做热 Key 统计和自动本地缓存，这是效果最好、侵入最低的方案。如果是直连 Redis Cluster 的架构，推荐在客户端 SDK 层面接入热 Key 探测（自研或使用 JD-hotkey 这类开源方案）。作为兜底和日常巡检手段，在 Redis 实例上配置 `allkeys-lfu` 策略并定期执行 `redis-cli --hotkeys`，可以快速确认热 Key 排名。MONITOR 只在万不得已时短暂使用几秒，绝不在高 QPS 节点上执行。\n\n在 content 中描述的那个场景——40 万总 QPS 的 Redis Cluster 中某节点 CPU 飙到 92%——正确的做法是：先在该节点上执行 `redis-cli --hotkeys`（前提是已配置 LFU 策略），确认热 Key 是 `product:detail:88721`；然后在应用侧对该 key 做本地缓存（如 Caffeine/Guava Cache，TTL 设为 1-3 秒），让绝大部分读请求在 JVM 内存中命中，不再打到 Redis。这样单节点的 QPS 能从 8 万+ 降到几百，CPU 使用率立刻回到正常水平。",
+      "keyPoints": [
+        "热 Key 指被极高频率访问的少数 key，在 Redis Cluster 中会导致单节点流量倾斜，CPU 飙高、延迟抖动甚至网络带宽打满，是分布式缓存最常见的性能瓶颈之一",
+        "redis-cli --hotkeys 依赖 LFU 淘汰策略下 redisObject 低 8 位的 logc 对数计数器，实例必须配置为 allkeys-lfu 或 volatile-lfu 才能使用，内部通过 SCAN 遍历不会阻塞 Redis",
+        "MONITOR 命令让主线程在执行每条命令后额外做一次字符串序列化和缓冲区写入，Redis 官方基准测试显示单个 MONITOR 连接即可导致吞吐量下降约 30%，高 QPS 生产环境中极其危险",
+        "代理层统计（Twemproxy/Codis/Envoy/云厂商代理）是零 Redis 侵入的最优方案，代理内部可使用 Count-Min Sketch 等概率数据结构以极小内存（几百 KB）完成 Top-K 热 Key 检测",
+        "客户端埋点通过在 SDK 封装层拦截命令提取 key 并在本地 LRU 计数器中统计频率，JD-hotkey 是该思路的成熟开源实现，适合直连 Cluster 且无代理层的架构",
+        "Redis 7.0 的 CLIENT NO-TOUCH ON 让监控客户端的 SCAN 和 OBJECT FREQ 操作不更新 key 的 LFU 计数器，避免巡检本身污染热度数据",
+        "生产环境推荐分层防御：代理层/客户端实时检测为主，redis-cli --hotkeys 定期巡检为辅，MONITOR 仅在低 QPS 环境或紧急排查时短暂使用几秒",
+        "发现热 Key 后的典型处理方案是在应用侧做本地缓存（Caffeine/Guava Cache，TTL 1-3 秒），将热 Key 的读请求拦截在 JVM 内存中，使 Redis 节点 QPS 从数万降到几百"
+      ],
+      "quiz": [
+        {
+          "id": "redis-hotkey-detection-q1-quiz1",
+          "question": "使用 redis-cli --hotkeys 命令的硬性前提条件是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 版本必须是 6.0 以上且开启了多线程 I/O" },
+            { "id": "B", "text": "Redis 的 maxmemory-policy 必须设置为 LFU 系列策略（allkeys-lfu 或 volatile-lfu）" },
+            { "id": "C", "text": "Redis 实例必须开启 AOF 持久化以记录访问日志" },
+            { "id": "D", "text": "Redis 必须运行在 Cluster 模式下才能跨节点统计热 Key" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "--hotkeys 的工作原理是遍历 key 空间并读取每个 key 的 LFU 对数频率计数器（logc），这个计数器存储在 redisObject 的 24 位 lru 字段的低 8 位中。只有当淘汰策略为 LFU 系列时，Redis 才会在每次访问 key 时更新这个计数器。如果策略是 LRU 或 noeviction，该字段存储的是 LRU 时间戳而非频率，--hotkeys 会直接报错退出。该功能从 Redis 4.0 引入，与多线程 I/O、AOF 持久化和 Cluster 模式均无关。"
+        },
+        {
+          "id": "redis-hotkey-detection-q1-quiz2",
+          "question": "MONITOR 命令为什么会导致 Redis 吞吐量大幅下降？",
+          "choices": [
+            { "id": "A", "text": "MONITOR 会在 Redis 内部开启一个额外的工作线程，与主线程竞争 CPU 资源" },
+            { "id": "B", "text": "MONITOR 会将所有命令写入磁盘日志文件，磁盘 I/O 成为瓶颈" },
+            { "id": "C", "text": "Redis 主线程在执行每条命令后需要额外进行字符串序列化并写入 MONITOR 客户端的输出缓冲区" },
+            { "id": "D", "text": "MONITOR 会锁住整个 key 空间做快照，阻塞其他命令执行" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "MONITOR 的实现机制是在 Redis 主线程的命令处理流程中增加一个 hook：每执行完一条命令后，主线程检查是否有 MONITOR 客户端存在，如果有就将命令及其参数格式化为字符串并写入该客户端的输出缓冲区。这个额外的序列化和写入操作发生在主线程中，是同步的。在高 QPS 场景下，40 万次/秒的额外字符串格式化和缓冲区拷贝操作带来的 CPU 开销足以让吞吐量下降 30% 以上。MONITOR 不涉及磁盘写入、不开额外线程、也不做 key 空间快照。"
+        },
+        {
+          "id": "redis-hotkey-detection-q1-quiz3",
+          "question": "在一个 QPS 为 40 万的 Redis 生产集群中，以下哪种热 Key 发现方式风险最高？",
+          "choices": [
+            { "id": "A", "text": "在代理层（如 Codis Proxy）中嵌入 Count-Min Sketch 做 Top-K 统计" },
+            { "id": "B", "text": "在客户端 SDK 的 CommandListener 中做本地 key 计数" },
+            { "id": "C", "text": "在热点节点上执行 MONITOR 命令并持续抓取命令流" },
+            { "id": "D", "text": "在非高峰期执行 redis-cli --hotkeys 做一次性巡检" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "在 40 万 QPS 的集群中执行 MONITOR 是最危险的操作。MONITOR 会让主线程为每条命令额外做序列化和缓冲区写入，官方测试显示单个 MONITOR 连接可导致吞吐量下降约 30%。在已经 CPU 92% 的热点节点上开启 MONITOR，极有可能直接将 CPU 推到 100% 导致节点不可用。相比之下，代理层和客户端方案完全不影响 Redis 服务端，--hotkeys 基于 SCAN 的开销可控。"
+        },
+        {
+          "id": "redis-hotkey-detection-q1-quiz4",
+          "question": "redis-cli --hotkeys 内部使用什么机制遍历 key 空间？",
+          "choices": [
+            { "id": "A", "text": "使用 KEYS * 命令一次性获取所有 key" },
+            { "id": "B", "text": "通过 SUBSCRIBE 订阅所有 key 的访问事件" },
+            { "id": "C", "text": "使用 SCAN 命令分批遍历 key 空间并对每个 key 调用 OBJECT FREQ" },
+            { "id": "D", "text": "通过读取 RDB 文件离线分析 key 的访问频率" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "--hotkeys 的实现逻辑是使用 SCAN 命令以游标方式分批遍历整个 key 空间，对每个扫描到的 key 执行 OBJECT FREQ 获取其 LFU 对数计数器的值，然后在客户端侧按频率排序输出 Top-K。SCAN 是非阻塞的渐进式遍历，每次只处理少量 key，不会像 KEYS 那样一次性阻塞主线程。它不涉及 Pub/Sub 订阅机制，也不需要读取 RDB 文件。"
+        },
+        {
+          "id": "redis-hotkey-detection-q1-quiz5",
+          "question": "如果 Redis 实例当前的淘汰策略是 noeviction，想使用 --hotkeys 应该怎么做？",
+          "choices": [
+            { "id": "A", "text": "直接执行 --hotkeys，noeviction 策略下也可以正常工作" },
+            { "id": "B", "text": "执行 CONFIG SET maxmemory-policy allkeys-lfu 切换策略，等待数分钟让 LFU 计数器积累数据后再使用" },
+            { "id": "C", "text": "先执行 BGSAVE 生成 RDB 快照，然后用离线工具分析 RDB 文件" },
+            { "id": "D", "text": "需要重启 Redis 并在 redis.conf 中配置 maxmemory-policy 为 LFU 才能生效" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 的 maxmemory-policy 支持在线修改，通过 CONFIG SET 即可立即切换到 allkeys-lfu，不需要重启。但切换后 LFU 计数器数据会从零开始积累——此前所有 key 的 logc 字段记录的是 LRU 时间戳，切换后 Redis 会在每次访问时按 LFU 逻辑更新 logc。因此需要等待几分钟让热 Key 累积足够的访问频率后，--hotkeys 的输出才有参考价值。noeviction 策略下 --hotkeys 会报错，BGSAVE 和 RDB 分析与热 Key 发现无关。"
+        },
+        {
+          "id": "redis-hotkey-detection-q1-quiz6",
+          "question": "代理层热 Key 统计中常用的 Count-Min Sketch 数据结构的核心特点是什么？",
+          "choices": [
+            { "id": "A", "text": "它是一种精确计数器，能准确记录每个 key 的访问次数" },
+            { "id": "B", "text": "它是一种概率型数据结构，用极小的固定内存近似估计元素频率，可能高估但不会低估" },
+            { "id": "C", "text": "它需要为每个 key 分配独立的存储空间，内存使用量随 key 数量线性增长" },
+            { "id": "D", "text": "它只能判断一个 key 是否被访问过，无法估计访问频率" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Count-Min Sketch 是一种概率型频率估计数据结构，由多个哈希函数和一个二维计数器数组组成。查询某个元素的频率时，取所有哈希函数对应位置的计数器最小值作为估计值。由于哈希冲突的存在，它的估计值可能高于真实值（高估），但绝不会低于真实值（不会低估）。它的内存是固定的（取决于数组大小，通常几百 KB），与被统计的 key 数量无关，因此非常适合在代理层做高 QPS 场景下的 Top-K 热 Key 检测。"
+        },
+        {
+          "id": "redis-hotkey-detection-q1-quiz7",
+          "question": "Redis 7.0 引入的 CLIENT NO-TOUCH ON 命令对热 Key 监控的帮助是什么？",
+          "choices": [
+            { "id": "A", "text": "它让 Redis 自动将热 Key 的值缓存到客户端本地内存中" },
+            { "id": "B", "text": "它禁止该客户端的命令更新 key 的 LRU/LFU 时间戳，避免监控操作污染热度数据" },
+            { "id": "C", "text": "它将该客户端设为只读模式，防止监控脚本意外修改数据" },
+            { "id": "D", "text": "它让 MONITOR 命令不再影响 Redis 吞吐量" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "CLIENT NO-TOUCH ON 的作用是告诉 Redis 服务端：该客户端发出的命令在访问 key 时不要更新 redisObject 中的 lru 字段（LRU 时间戳或 LFU 计数器）。这对热 Key 巡检场景非常有用——监控脚本需要频繁 SCAN + OBJECT FREQ 来读取所有 key 的热度数据，如果没有 NO-TOUCH，这些读取操作本身会更新 key 的 LFU 计数器，导致所有 key 的热度数据被污染。NO-TOUCH 与客户端缓存、只读模式和 MONITOR 性能无关。"
+        },
+        {
+          "id": "redis-hotkey-detection-q1-quiz8",
+          "question": "发现热 Key 后，以下哪种处理方案能最有效地降低 Redis 热点节点的压力？",
+          "choices": [
+            { "id": "A", "text": "将热 Key 的过期时间设得更长，减少缓存重建的频率" },
+            { "id": "B", "text": "在应用层使用本地缓存（如 Caffeine/Guava Cache）拦截热 Key 的读请求，TTL 设为 1-3 秒" },
+            { "id": "C", "text": "增加 Redis 集群的节点数量，让热 Key 自动分散到更多节点" },
+            { "id": "D", "text": "对热 Key 开启 Redis 的 WATCH 机制，限制并发访问数" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "本地缓存是解决热 Key 最直接有效的手段。在 JVM 或进程内存中缓存热 Key 的值（TTL 通常 1-3 秒以保证数据新鲜度），绝大部分读请求在本地命中，不再请求 Redis。这可以将热点节点的 QPS 从数万降到几百。延长过期时间不能解决 QPS 过高的问题，增加集群节点也不行——在 Redis Cluster 中一个 key 只归属于一个 slot 和一个节点，增加节点并不会分散单个 key 的流量。WATCH 是乐观锁机制，与限流无关。"
+        },
+        {
+          "id": "redis-hotkey-detection-q1-quiz9",
+          "question": "使用 MONITOR 命令时，如果客户端处理速度跟不上命令流的输出速度，最可能发生什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 会自动降低命令处理速度来匹配 MONITOR 客户端的消费速度" },
+            { "id": "B", "text": "MONITOR 的输出会被写入 AOF 文件作为备份" },
+            { "id": "C", "text": "Redis 服务端的 client-output-buffer-limit 被触发，可能断开 MONITOR 连接或消耗大量内存" },
+            { "id": "D", "text": "MONITOR 自动切换为采样模式，只输出部分命令" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 为每个客户端连接维护一个输出缓冲区（output buffer）。MONITOR 客户端的输出量极大——在 40 万 QPS 的实例上每秒可能产生几十 MB 的数据。如果客户端消费速度跟不上，输出缓冲区会持续膨胀。当缓冲区大小超过 client-output-buffer-limit 配置的阈值时，Redis 会强制断开该客户端连接。在断开之前，膨胀的缓冲区会占用 Redis 进程的大量内存。Redis 不会降低自身的处理速度，MONITOR 输出不会写入 AOF，也没有自动采样模式。"
+        },
+        {
+          "id": "redis-hotkey-detection-q1-quiz10",
+          "question": "以下关于热 Key 发现方案的说法，哪一项是正确的？",
+          "choices": [
+            { "id": "A", "text": "redis-cli --hotkeys 可以在任何淘汰策略下使用，输出结果是实时的秒级数据" },
+            { "id": "B", "text": "MONITOR 命令适合在高 QPS 生产环境中长时间开启，因为它只消耗网络带宽不影响 CPU" },
+            { "id": "C", "text": "代理层统计的优势是零 Redis 侵入，但劣势是依赖代理架构，直连 Cluster 的场景无法使用" },
+            { "id": "D", "text": "客户端埋点方案只能统计写请求的热 Key，无法统计读请求" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "代理层统计确实是零 Redis 侵入的最优方案，所有计数逻辑都在代理进程中完成，但它的使用前提是架构中存在代理层。如果应用直连 Redis Cluster（使用 JedisCluster/Lettuce 等原生 Cluster SDK），请求不经过代理，就无法使用这种方案。选项 A 错误：--hotkeys 必须使用 LFU 策略，且输出是一次性遍历的累计结果而非实时数据。选项 B 错误：MONITOR 的序列化操作在主线程中执行，严重消耗 CPU。选项 D 错误：客户端埋点可以拦截所有类型的 Redis 命令，读写都能统计。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Redis MONITOR command documentation",
+          "url": "https://redis.io/docs/latest/commands/monitor/"
+        },
+        {
+          "title": "Redis --hotkeys option documentation",
+          "url": "https://redis.io/docs/latest/develop/connect/cli/#scanning-for-hot-keys"
+        },
+        {
+          "title": "Redis CLIENT NO-TOUCH documentation",
+          "url": "https://redis.io/docs/latest/commands/client-no-touch/"
+        }
+      ]
+    }
+  ]
+}
