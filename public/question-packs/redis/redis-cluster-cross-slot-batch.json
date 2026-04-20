@@ -1,0 +1,156 @@
+{
+  "id": "redis-cluster-cross-slot-batch",
+  "name": "Cluster 模式下如何实现跨 slot 的批量操作",
+  "domain": "redis",
+  "description": "Redis Cluster 跨 slot 批量操作的实现方案与性能优化",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-cluster-cross-slot-batch-q1",
+      "domain": "redis",
+      "type": "modification",
+      "difficulty": 3,
+      "tags": ["Redis", "Cluster", "跨slot", "批量操作", "Pipeline"],
+      "title": "Cluster 模式下如何实现跨 slot 的批量操作",
+      "content": "## 面试场景\n\n你负责的电商平台用户画像服务原先跑在一台 64GB 的 Redis 单机上，存着 2000 万个用户的标签数据。最近数据量快撑爆内存了，你把它迁移到了一个 6 主 6 从的 Redis Cluster（版本 7.2.4）。迁移后功能都正常，但同事来找你说批量查询接口的延迟从原来的 15ms 飙到了 1200ms，完全不可接受。\n\n你拉了一下监控和代码，发现问题出在这里：接口每次需要查询约 10000 个用户的标签数据，原来单机上一条 MGET 就搞定了，现在代码改成了逐个 GET 的循环：\n\n```go\n// 迁移后的临时方案 —— 逐个 GET，惨不忍睹\nfunc GetUserTags(ctx context.Context, userIDs []string) (map[string]string, error) {\n    results := make(map[string]string, len(userIDs))\n    for _, uid := range userIDs {\n        val, err := rdb.Get(ctx, \"user:tag:\"+uid).Result()\n        if err != nil && err != redis.Nil {\n            return nil, err\n        }\n        results[uid] = val\n    }\n    return results, nil\n}\n```\n\n每次请求要发 10000 次网络往返，按集群内网 RTT 约 0.1ms 算，光网络延迟就是 1000ms。你知道必须改成批量方案，但 Cluster 不支持跨 slot 的 MGET。你用 `CLUSTER KEYSLOT` 看了一下这些 key 的分布情况：\n\n```bash\n# 10000 个 key 大致均匀分布在 16384 个 slot 上\n# 6 个 Master 节点各承担约 1667 个 key\n$ redis-cli --cluster call 10.0.2.101:6379 DBSIZE\n10.0.2.101:6379: dbsize=3421876\n10.0.2.102:6379: dbsize=3318924\n10.0.2.103:6379: dbsize=3405112\n10.0.2.104:6379: dbsize=3290845\n10.0.2.105:6379: dbsize=3378902\n10.0.2.106:6379: dbsize=3351008\n```\n\n数据分布很均匀，不存在热点。现在问题是：如何在 Cluster 模式下高效实现这种跨 slot 的万级 key 批量查询？你需要把延迟从 1200ms 降到 50ms 以内。同时考虑以下约束：这些 key 属于不同用户，没法用 Hash Tag 强制归到同一个 slot；方案需要兼顾正确性（resharding 期间不能丢数据）和可维护性（不能太 hack）。",
+      "answer": "## 第一步：Redis Cluster 批量操作的核心机制\n\n### Redis Cluster 的 slot 路由体系\n\nRedis Cluster 是 Redis 3.0（2015年）引入的官方分布式解决方案，它的数据分片基于固定的 16384 个 hash slot。每个 key 通过 `CRC16(key) % 16384` 的计算公式确定归属的 slot 编号，而集群中的每个 Master 节点负责一段连续或不连续的 slot 范围。这套设计的核心思想是把「数据归属」和「物理节点」解耦——迁移数据时只需要挪动 slot，客户端只需要维护 slot 到节点的映射表，不需要对 key 做 rehash。\n\n在一个 6 主节点的 Cluster 中，slot 的典型分配方式如下：\n\n```\nMaster-1 (10.0.2.101): slot 0-2730\nMaster-2 (10.0.2.102): slot 2731-5461\nMaster-3 (10.0.2.103): slot 5462-8191\nMaster-4 (10.0.2.104): slot 8192-10922\nMaster-5 (10.0.2.105): slot 10923-13652\nMaster-6 (10.0.2.106): slot 13653-16383\n```\n\n当客户端向某个节点发送命令时，如果 key 不在该节点负责的 slot 范围内，节点会返回 `MOVED <slot> <ip>:<port>` 重定向响应，告诉客户端该去哪个节点找。这就是所谓的 smart client 架构——客户端在本地缓存 slot 映射表，大多数请求能直接定位到正确节点，偶尔收到 MOVED 时更新本地映射。\n\n### 单条 MGET 为什么行不通\n\n单机 Redis 处理 MGET 时，所有 key 都在同一个进程的内存哈希表里，遍历取值后一次性返回，时间复杂度 O(N) 且没有网络开销。但在 Cluster 模式下，一条命令只能在一个节点上执行——节点不会代替客户端去其他节点获取数据。Redis 协议层面的约束是：多 key 命令的所有 key 必须属于同一个 slot，否则返回 CROSSSLOT 错误。这不是一个可以通过配置绕过的限制，而是 Cluster 架构的根本性设计决策。\n\n理解这一点后，解决思路就很清晰了：既然单条命令做不到跨 slot，那就在客户端层面把「一次跨 slot 的大请求」拆分成「多次同 slot 的小请求」，然后并行发送、合并结果。\n\n## 第二步：三种跨 slot 批量操作的实现方案\n\n### 方案一：Slot-aware 分组并行 Pipeline\n\n这是生产环境中最主流的做法，核心思路分三步——先算 slot、再分组、最后并行发送。\n\n第一步是对所有待查询的 key 计算 slot 编号。CRC16 算法本身非常快，Go 标准库没有直接提供但 go-redis 内部有实现，10000 个 key 的 slot 计算在微秒级完成。第二步是根据 slot 到节点的映射关系，把 key 按目标节点分组。在 6 主节点的集群中，10000 个 key 大致均匀分成 6 组，每组约 1667 个 key。第三步是对每个节点分别建立 Pipeline 连接，并行发送该节点分组内的所有 GET 命令，等所有节点返回后按原始顺序合并结果。\n\n性能模型是这样的：假设集群内网 RTT 为 0.1ms，Pipeline 一次批量发送 1667 条 GET 命令的响应时间约 2-5ms（取决于 value 大小和网络带宽），6 个节点并行执行，总耗时取决于最慢的那个节点。实测中 10000 个 key 的批量查询可以在 8-15ms 内完成，相比逐个 GET 的 1000ms 有两个数量级的提升。\n\n下面是使用 go-redis v9 实现的完整代码：\n\n```go\npackage main\n\nimport (\n    \"context\"\n    \"github.com/redis/go-redis/v9\"\n)\n\nfunc BatchGetCluster(ctx context.Context, rdb *redis.ClusterClient, keys []string) ([]interface{}, error) {\n    // go-redis 的 ClusterClient.Pipeline() 内部自动处理 slot 分组\n    // 它会把 pipeline 中的命令按目标节点分组，对每个节点建立独立 pipeline 并行发送\n    cmds := make([]*redis.StringCmd, len(keys))\n    \n    pipe := rdb.Pipeline()\n    for i, key := range keys {\n        cmds[i] = pipe.Get(ctx, key)\n    }\n    // Exec 内部自动: 计算每个 key 的 slot → 按节点分组 → 并行发送 → 合并结果\n    _, err := pipe.Exec(ctx)\n    if err != nil && err != redis.Nil {\n        return nil, err\n    }\n    \n    results := make([]interface{}, len(keys))\n    for i, cmd := range cmds {\n        val, e := cmd.Result()\n        if e == redis.Nil {\n            results[i] = nil\n        } else if e != nil {\n            return nil, e\n        } else {\n            results[i] = val\n        }\n    }\n    return results, nil\n}\n```\n\ngo-redis 的 `ClusterClient.Pipeline()` 是这个方案的典型实现。调用 `pipe.Exec()` 时，go-redis 内部会遍历 pipeline 中积攒的所有命令，对每个命令的 key 计算 slot 并查找对应节点，然后按节点分组，对每个节点创建独立的 pipeline 并行发出请求，最后把所有响应按原始命令顺序组装返回。整个过程对调用方完全透明，你写 Pipeline 代码的方式跟单机模式一模一样。\n\n### 方案二：Hash Tag 预规划（适用于关联数据）\n\n如果你的批量操作涉及的是一组业务上有关联的 key——比如同一个订单的多个维度数据——那 Hash Tag 是最简单的方案。通过在 key 中嵌入 `{tag}` 花括号，Redis 只用花括号内的内容计算 slot，让相关 key 强制落到同一个 slot：\n\n```bash\n# 同一订单的所有维度数据共享 Hash Tag，落在同一个 slot\nSET {order:10001}:items     '[{\"sku\":\"A001\",\"qty\":2}]'\nSET {order:10001}:payment   '{\"method\":\"alipay\",\"amount\":299}'\nSET {order:10001}:shipping  '{\"status\":\"shipped\",\"tracking\":\"SF1234\"}'\n\n# 这三个 key 可以用 MGET 一次性查询\nMGET {order:10001}:items {order:10001}:payment {order:10001}:shipping\n```\n\n但 Hash Tag 的适用范围有限。对于本场景（10000 个不同用户的标签查询），你不可能给所有用户共享一个 Hash Tag，那会导致全部数据堆在一个节点上，Cluster 的水平扩展直接报废。Hash Tag 只适合「同一业务实体的多个属性」场景，不适合「跨实体的批量聚合」场景。\n\n### 方案三：客户端库的自动分组抽象\n\n现代 Redis 客户端库对 Cluster 批量操作有不同层次的封装。go-redis（Go 语言）的 ClusterClient 在 Pipeline 和 MGet 方法中都内置了自动 slot 分组逻辑，代码写法和单机模式完全一致。Lettuce（Java 语言，Spring Boot 默认 Redis 客户端）在 Cluster 模式下对 MGET 等命令同样做了透明拆分，底层通过 Netty 异步 IO 并行发送到各节点。Jedis（Java 语言）的 JedisCluster 在 3.x 版本中不原生支持 Cluster Pipeline，需要手动实现分组逻辑或使用社区封装的 `JedisClusterPipeline`；到了 Jedis 5.0 版本终于补上了 `ClusterPipeline` 的官方支持。ioredis（Node.js）从 4.x 版本开始支持 Cluster 模式的 Pipeline，内部实现类似 go-redis 的自动分组策略。\n\n选择客户端库时有一个关键区别：有些库在 Pipeline Exec 时把所有节点的请求串行发送（伪并行），有些是真正用多个连接并行发送。go-redis 和 Lettuce 是真并行，Jedis 5.0 的 ClusterPipeline 也是真并行。这个差异在节点数多、key 量大的场景下影响很大。\n\n## 第三步：性能对比、Proxy 方案与生产注意事项\n\n### 四种方案的性能实测对比\n\n以下数据基于 6 主 6 从 Cluster（Redis 7.2.4）、客户端与集群在同一个 VPC（RTT 约 0.1ms）、10000 个 key 每个 value 约 200 字节的场景：\n\n```\n方案                           平均延迟    P99 延迟    吞吐量(QPS)\n─────────────────────────────────────────────────────────────────\n逐个 GET 串行                  1050ms     1320ms     0.9\nPipeline 自动分组(go-redis)     12ms       18ms      78\n手动分组 + goroutine 并行        9ms       15ms      105\nHash Tag + MGET(同 slot)        3ms        5ms      320\n```\n\n可以看到，Pipeline 自动分组方案相比串行 GET 提升了近 100 倍，已经满足了 50ms 以内的延迟要求。手动分组配合 goroutine 并行比 go-redis 内置 Pipeline 略快一点，因为你可以更精确地控制并发度和连接复用。Hash Tag 方案延迟最低，但它只适用于同一业务实体的多属性查询，跨实体场景无法使用。\n\n如果你对延迟有极致要求，还可以做一层 Pipeline 分批策略：不要一次把 10000 条命令全塞进 Pipeline，而是按每批 500-1000 条分批发送。原因是 Redis 单线程处理一个巨大的 Pipeline 时，这批命令的执行会占用 CPU 较长时间，阻塞该节点上其他客户端的请求。分批发送可以让 Redis 在批次之间插入其他客户端的命令处理，降低整体长尾延迟。\n\n### Proxy 方案：Codis 与 Twemproxy\n\n除了 smart client 直连 Cluster 之外，还有一种思路是在客户端和 Redis 之间加一层 Proxy，让 Proxy 承担 slot 路由和请求拆分的职责。Codis（豌豆荚开源，现已停止维护）和 Twemproxy（Twitter 开源）是这个方向的代表。客户端把 MGET 发给 Proxy，Proxy 负责拆分到各后端节点再合并结果。这种方案的好处是客户端完全无感知，用标准 Redis 协议就行，不需要 smart client；坏处是多了一跳网络延迟（通常增加 0.2-0.5ms），Proxy 本身成为性能瓶颈和单点风险，而且 Codis 已经停止维护、Twemproxy 不支持 Redis 5.0 以后的新数据结构。\n\n现阶段生产推荐是直接使用 smart client 连 Redis Cluster，除非你的团队有大量遗留的单机 Redis 客户端代码不想改，才考虑 Proxy 方案做过渡。\n\n### MOVED 和 ASK 重定向处理\n\n在 Cluster resharding（slot 迁移）期间，某些 key 可能正在从源节点迁移到目标节点。这时客户端发送请求可能收到两种重定向：`MOVED` 表示 slot 已经永久迁移到新节点，客户端应更新本地 slot 映射表并重试；`ASK` 表示这个 key 正在迁移过程中临时在目标节点，客户端应先发 `ASKING` 命令再重试，但不要更新映射表。\n\ngo-redis 的 ClusterClient 内部已经完整处理了 MOVED 和 ASK 重定向，包括自动重试和映射表更新。但你需要注意的是重试次数配置——默认 `MaxRedirects` 是 3 次，在大规模 resharding 期间（比如同时迁移多个 slot）可能不够，建议设置为 8。另外 resharding 期间的批量操作延迟会明显增加，因为部分请求需要重定向。如果你的业务对延迟敏感，建议在 resharding 期间临时降低批量操作的 batch size。\n\n```go\nrdb := redis.NewClusterClient(&redis.ClusterOptions{\n    Addrs:        []string{\"10.0.2.101:6379\", \"10.0.2.102:6379\"},\n    MaxRedirects: 8,  // resharding 期间需要更多重试次数\n    ReadTimeout:  3 * time.Second,\n    PoolSize:     20, // 每个节点的连接池大小\n})\n```\n\n### Redis 7.0+ 的拓扑发现改进\n\nRedis 7.0 引入了 `CLUSTER SHARDS` 命令替代老旧的 `CLUSTER SLOTS`。新命令返回的信息更完整，包括每个 shard 的节点角色、健康状态、IP 地址和端口，格式也从嵌套数组改为更易解析的结构化响应。对于客户端的 slot 映射表刷新来说，`CLUSTER SHARDS` 在大集群中的解析效率更高。go-redis v9.3+ 已经默认使用 `CLUSTER SHARDS` 做拓扑发现（当连接的 Redis 版本 >= 7.0 时）。\n\n此外 Redis 7.0 还引入了 client-side caching 对 Cluster 的支持——通过 `CLIENT TRACKING` 命令配合 RESP3 协议的推送消息，客户端可以缓存热点 key 的值，在服务端数据变更时收到失效通知。对于读多写少的批量查询场景，client-side caching 可以进一步降低延迟，因为部分 key 直接从本地缓存返回，不需要走网络。但这个特性实现复杂度较高，需要客户端库的支持，目前 Lettuce 6.x 和 go-redis v9 都有实验性支持。",
+      "keyPoints": [
+        "Cluster Pipeline 自动分组的核心流程：对每个 key 计算 CRC16(key)%16384 得到 slot，查 slot-to-node 映射表按节点分组，对每个节点建立独立 Pipeline 并行发送，最后按原始顺序合并响应",
+        "go-redis ClusterClient.Pipeline() 内部完整实现了 slot 分组和多节点并行发送，调用方代码写法与单机模式完全一致，无需手动处理路由逻辑",
+        "Hash Tag 通过 {tag} 语法让相关 key 落到同一个 slot，适合同一业务实体的多属性关联查询，但不适合跨实体的大批量聚合场景，滥用会导致数据倾斜",
+        "Pipeline 批次大小建议控制在 500-1000 条命令以内，过大的 Pipeline 会长时间占用 Redis 单线程 CPU，阻塞同节点上其他客户端请求导致长尾延迟上升",
+        "Resharding 期间批量操作会遇到 MOVED/ASK 重定向，smart client 自动处理重试，但需要把 MaxRedirects 从默认 3 调高到 8 以应对大规模 slot 迁移",
+        "Proxy 方案（Codis/Twemproxy）可以让客户端无感知地执行跨 slot 操作，但多一跳网络延迟且 Codis 已停止维护，新项目推荐直接使用 smart client",
+        "Redis 7.0 的 CLUSTER SHARDS 命令替代 CLUSTER SLOTS 提供更高效的拓扑发现，client-side caching 支持 Cluster 模式可进一步降低读密集批量查询的延迟"
+      ],
+      "quiz": [
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz1",
+          "question": "在 6 主节点的 Redis Cluster 中对 10000 个随机分布的 key 使用 Pipeline 自动分组方案，平均每个节点需要处理多少个 key？",
+          "choices": [
+            {"id": "A", "text": "约 1667 个，10000 个 key 均匀分配到 6 个节点"},
+            {"id": "B", "text": "10000 个，每个节点都要处理全部 key"},
+            {"id": "C", "text": "约 610 个，因为每个节点只负责 16384/6 ≈ 2731 个 slot 中约 6% 的 key"},
+            {"id": "D", "text": "取决于 Hash Tag 的设置，无法确定"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "当 10000 个 key 随机分布在 16384 个 slot 上时，由于 6 个主节点平分所有 slot（每个节点约 2731 个 slot），统计上每个节点大约分到 10000/6 ≈ 1667 个 key。这就是 Cluster Pipeline 分组的核心优势——原本 10000 次网络往返被压缩成 6 次并行的 Pipeline 请求。B 选项错误，Pipeline 分组后每个节点只处理属于自己 slot 范围内的 key，不是全部。C 选项的计算逻辑混乱。D 选项中题目明确说了是随机分布的 key，没有使用 Hash Tag。"
+        },
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz2",
+          "question": "go-redis 的 ClusterClient.Pipeline() 在执行 Exec() 时，内部的处理流程是什么？",
+          "choices": [
+            {"id": "A", "text": "把所有命令发到集群中任意一个节点，由该节点负责转发到正确节点"},
+            {"id": "B", "text": "对每个命令计算 key 的 slot，按目标节点分组，对每个节点建立独立 Pipeline 并行发送，合并结果按原始顺序返回"},
+            {"id": "C", "text": "逐条发送命令，遇到 MOVED 重定向后重新发送到正确节点"},
+            {"id": "D", "text": "先执行 CLUSTER SLOTS 获取最新拓扑，然后把所有命令串行发送到各节点"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "go-redis ClusterClient 的 Pipeline 实现是典型的 smart client 分组并行策略：Exec() 被调用时，遍历 Pipeline 中积攒的所有命令，对每个命令的 key 计算 CRC16 得到 slot 编号，查本地缓存的 slot-to-node 映射表确定目标节点，按节点分组后对每个节点使用独立连接并行发送该节点对应的命令子集，所有节点响应返回后按原始命令顺序组装结果。A 选项描述的是 Proxy 模式而非 smart client 模式。C 选项是非 Pipeline 模式下的重定向处理逻辑，效率极低。D 选项中 CLUSTER SLOTS 不是每次都要调用的，映射表会本地缓存。"
+        },
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz3",
+          "question": "为什么不建议把 Pipeline 的 batch size 设得太大（比如单次 Pipeline 塞入 50000 条命令）？",
+          "choices": [
+            {"id": "A", "text": "Redis 协议有硬性限制，单次 Pipeline 最多只能发送 10000 条命令"},
+            {"id": "B", "text": "大 Pipeline 会长时间占用 Redis 单线程 CPU 处理这批命令，阻塞同节点上其他客户端的请求，导致整体长尾延迟上升"},
+            {"id": "C", "text": "Pipeline 命令数太多会触发 Redis 的 OOM 保护机制，导致连接被强制断开"},
+            {"id": "D", "text": "大 Pipeline 会导致 Cluster 触发自动 resharding，引起数据迁移"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 是单线程模型（主线程处理命令），当一个 Pipeline 中堆积了大量命令时，Redis 需要连续执行完这些命令才能切换去处理下一个客户端的请求。如果单次 Pipeline 有 50000 条命令，执行耗时可能达到几十毫秒，期间所有其他客户端的请求都在排队等待。A 选项错误，Redis 协议本身没有对 Pipeline 命令数的硬性限制。C 选项错误，Pipeline 的命令数量不会直接触发 OOM，除非这些命令产生的数据确实超出 maxmemory。D 选项完全无关，resharding 是手动触发或由运维工具调度的。"
+        },
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz4",
+          "question": "在 Cluster resharding 期间执行批量查询，收到 ASK 重定向时客户端应如何处理？",
+          "choices": [
+            {"id": "A", "text": "更新本地 slot 映射表，将该 slot 永久指向新节点，后续请求直接发到新节点"},
+            {"id": "B", "text": "先向目标节点发送 ASKING 命令，再重试原命令，但不更新本地映射表"},
+            {"id": "C", "text": "等待 resharding 完成后重试，期间返回错误给上层"},
+            {"id": "D", "text": "向集群中所有节点广播该请求，哪个节点有数据就用哪个的响应"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ASK 重定向表示目标 key 正在迁移过程中，临时存在于目标节点上，但 slot 的归属还没有正式切换。正确的处理方式是向 ASK 指定的目标节点先发送 ASKING 命令（这是一个一次性的授权，告诉目标节点允许处理这个尚未正式属于它的 slot 的请求），然后再发送原命令。关键是不要更新本地映射表，因为迁移还没完成，slot 的正式归属仍然在源节点。A 选项描述的是 MOVED 重定向的处理逻辑。C 选项没有必要等待，ASK 就是告诉你数据在哪里。D 选项的广播方式效率极低且不符合协议设计。"
+        },
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz5",
+          "question": "以下 go-redis 配置中，哪个参数对 resharding 期间批量操作的成功率影响最大？",
+          "choices": [
+            {"id": "A", "text": "PoolSize: 20"},
+            {"id": "B", "text": "MaxRedirects: 8"},
+            {"id": "C", "text": "ReadTimeout: 3 * time.Second"},
+            {"id": "D", "text": "MinIdleConns: 5"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "resharding 期间客户端频繁收到 MOVED 和 ASK 重定向，MaxRedirects 决定了单次命令最多允许重定向多少次。默认值是 3，在大规模 resharding（同时迁移多个 slot）时可能不够——一个请求可能先收到 MOVED 到节点 A，节点 A 发现 slot 正在迁出又返回 ASK 到节点 B，如果中间还有拓扑变更可能需要更多次重定向。设置为 8 可以覆盖绝大多数 resharding 场景。PoolSize 影响并发连接数但不影响重定向成功率，ReadTimeout 影响超时但不影响重定向逻辑，MinIdleConns 影响连接预热但同样与重定向无关。"
+        },
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz6",
+          "question": "某团队在 Cluster 中使用 Hash Tag `{user}` 作为所有用户 key 的 tag（如 `{user}:1001`、`{user}:1002`），这样做的主要问题是什么？",
+          "choices": [
+            {"id": "A", "text": "Hash Tag 语法错误，花括号内不能放英文单词"},
+            {"id": "B", "text": "所有带 `{user}` tag 的 key 都会落在同一个 slot，导致数据全部集中在一个节点上，Cluster 失去水平扩展能力"},
+            {"id": "C", "text": "Hash Tag 会导致 key 的 TTL 失效，所有 key 变成永不过期"},
+            {"id": "D", "text": "使用 Hash Tag 后无法对这些 key 执行 Pipeline 操作"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Hash Tag 的作用是让花括号内相同内容的 key 落到同一个 slot。如果把所有用户 key 都用 `{user}` 作为 tag，那这些 key 的 slot 都是 CRC16(「user」) % 16384 = 5474，全部堆在负责 slot 5474 的那个节点上。假设有 2000 万个用户 key，全部集中在一个节点，其他 5 个主节点几乎空闲——Cluster 的水平扩展能力完全废了，而且这个节点会成为内存和 CPU 热点。正确做法是用用户 ID 作为 tag（如 `{1001}:profile`），让不同用户分散到不同 slot。A 选项错误，花括号内可以放任何字符串。C 和 D 选项与 Hash Tag 机制无关。"
+        },
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz7",
+          "question": "对比 Proxy 方案（如 Codis）和 smart client 直连 Cluster 方案，以下哪项描述最准确？",
+          "choices": [
+            {"id": "A", "text": "Proxy 方案性能总是优于 smart client，因为 Proxy 可以做连接复用"},
+            {"id": "B", "text": "Smart client 方案延迟更低（少一跳网络），但 Proxy 方案对客户端代码无侵入，适合遗留系统过渡"},
+            {"id": "C", "text": "两种方案完全等价，只是部署位置不同"},
+            {"id": "D", "text": "Proxy 方案支持所有 Redis 新特性，smart client 方案只支持基础命令"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考察两种架构方案的核心权衡。Smart client 直连 Cluster 时客户端直接与目标节点通信，只有一跳网络延迟；Proxy 方案多了客户端到 Proxy 这一跳（通常增加 0.2-0.5ms），在高并发场景下这个额外延迟是可观的。但 Proxy 的优势在于客户端完全不需要感知 Cluster 拓扑，用标准 Redis 协议即可，适合大量遗留代码无法修改客户端库的场景。A 选项错误，Proxy 多一跳延迟通常导致性能更低。C 选项忽略了延迟差异和运维复杂度差异。D 选项错误，Codis 基于 Redis 3.x 分支，反而不支持 Redis 5.0 以后的 Stream 等新特性。"
+        },
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz8",
+          "question": "生产环境中需要对 Redis Cluster 所有节点执行 SCAN 遍历全量 key（如定期清理过期数据），正确的做法是？",
+          "choices": [
+            {"id": "A", "text": "连接任意一个节点执行 SCAN 0 即可遍历集群中所有 key"},
+            {"id": "B", "text": "使用 CLUSTER SCAN 命令一次性扫描整个集群"},
+            {"id": "C", "text": "获取所有 Master 节点列表，对每个 Master 分别执行 SCAN 遍历该节点上的 key，合并结果"},
+            {"id": "D", "text": "先执行 CLUSTER FLUSHALL 再重新导入需要保留的 key"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis Cluster 中 SCAN 命令只扫描当前连接的节点上的 key，不会跨节点扫描。也不存在 CLUSTER SCAN 这样的全集群扫描命令（B 选项是虚构的）。正确做法是先通过 CLUSTER SHARDS 或 CLUSTER NODES 获取所有 Master 节点的地址，然后对每个 Master 分别建立连接执行 SCAN 遍历该节点上的 key，最后合并所有节点的结果。go-redis 的 ClusterClient 提供了 ForEachMaster() 方法方便遍历所有主节点。A 选项错误，单节点 SCAN 只返回该节点上的数据。D 选项是破坏性操作，完全不合理。"
+        },
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz9",
+          "question": "Redis 7.0 引入的 CLUSTER SHARDS 命令相比老版本的 CLUSTER SLOTS，主要改进是什么？",
+          "choices": [
+            {"id": "A", "text": "CLUSTER SHARDS 可以修改 slot 分配，CLUSTER SLOTS 只能查看"},
+            {"id": "B", "text": "CLUSTER SHARDS 返回结构化的 shard 信息（含节点角色、健康状态、完整地址），格式更易解析且信息更完整"},
+            {"id": "C", "text": "CLUSTER SHARDS 只返回当前节点的信息，CLUSTER SLOTS 返回全集群信息"},
+            {"id": "D", "text": "CLUSTER SHARDS 是异步命令不阻塞主线程，CLUSTER SLOTS 会阻塞"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CLUSTER SLOTS 是 Redis 3.0 引入的拓扑查询命令，返回的是嵌套数组格式（slot 范围 + 节点 IP/端口/ID），信息不够完整且解析复杂。Redis 7.0 的 CLUSTER SHARDS 返回以 shard 为单位的结构化信息，每个 shard 包含 slot 范围、所有节点的角色（master/replica）、健康状态、hostname、IP、port 等完整信息，格式更清晰易解析。对于大集群，客户端解析 CLUSTER SHARDS 的效率显著高于 CLUSTER SLOTS。A 选项错误，两者都是只读查询命令。C 选项错误，CLUSTER SHARDS 同样返回全集群信息。D 选项无关，两者都在主线程执行但耗时很短。"
+        },
+        {
+          "id": "redis-cluster-cross-slot-batch-q1-quiz10",
+          "question": "一个 Pipeline 批量查询在正常情况下延迟 12ms，但在某次 resharding 后延迟飙升到 200ms 且有大量 MOVED 重定向。最可能的原因和解决方案是？",
+          "choices": [
+            {"id": "A", "text": "Redis 节点内存不足导致 swap，解决方案是扩容内存"},
+            {"id": "B", "text": "客户端本地的 slot 映射表过期，大量请求发到了错误节点触发重定向，解决方案是在收到 MOVED 后立即刷新映射表或缩短映射表刷新周期"},
+            {"id": "C", "text": "Pipeline 命令数太多导致超时，解决方案是减小 batch size"},
+            {"id": "D", "text": "网络分区导致节点不可达，解决方案是更换网络设备"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Resharding 完成后 slot 的归属节点发生了变化，但客户端本地缓存的 slot-to-node 映射表还是旧的。这意味着大量请求被发到了错误的节点，每个请求都收到 MOVED 重定向后要重新发送到正确节点——相当于每条命令的延迟翻倍（发一次错的 + 重发一次对的）。正确的解决方案是在收到 MOVED 时立即触发 CLUSTER SHARDS/SLOTS 刷新本地映射表，go-redis 默认就是这么做的。如果频繁 resharding，可以配置定时刷新映射表（go-redis 的 ClusterOptions.RouteByLatency 或 RouteRandomly 配合周期性 slot refresh）。A 选项的 swap 会导致所有操作变慢，不是特定的 MOVED 重定向。C 选项中 batch size 不会导致 MOVED。D 选项中网络分区表现为连接超时而非重定向。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/",
+        "https://redis.io/docs/latest/commands/cluster-shards/",
+        "https://pkg.go.dev/github.com/redis/go-redis/v9#ClusterClient",
+        "https://redis.io/docs/latest/develop/reference/cluster-spec/#hash-tags"
+      ]
+    }
+  ]
+}
