@@ -1,0 +1,156 @@
+{
+  "id": "redis-project-rate-limiter",
+  "name": "基于 Redis 的分布式限流器设计",
+  "domain": "redis",
+  "description": "基于 Redis 实现分布式限流器的算法选型、Lua 脚本实现与生产级架构设计",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-project-rate-limiter-q1",
+      "domain": "redis",
+      "type": "project",
+      "difficulty": 4,
+      "tags": ["Redis", "限流", "令牌桶", "滑动窗口", "系统设计", "项目实战"],
+      "title": "基于 Redis 的分布式限流器设计",
+      "content": "## 项目场景\n\n你所在团队负责一个日活 500 万的 SaaS 平台，API 网关层由 8 个 Go 实例组成，部署在 Kubernetes 集群中，前置一个 Nginx Ingress 做 TLS 终止和基础路由。随着业务增长，出现了两个严重问题：一是某个大客户的自动化脚本以每秒 3000 次的频率调用订单查询接口，导致下游 MySQL 连接池被打满，影响了其他客户的正常使用；二是一次促销活动中，全局 QPS 瞬间飙升到 12000，远超后端服务承载能力（设计容量为 5000 QPS），触发了级联故障。\n\n运维团队要求你设计并实现一套分布式限流方案，具体需求如下：全局限流上限为每秒 1000 次请求（保守值，留出余量给突发流量），每用户限流为每分钟 60 次请求（防止单用户滥用），多个网关实例必须共享限流计数状态以保证全局一致性。性能要求是限流判断的额外延迟不超过 1ms（P99），并且限流器本身不能成为系统的单点故障。\n\n技术栈：Go 1.22 + gin 框架 + go-redis/v9 客户端，Redis 7.2 集群模式（3 主 3 从），网络延迟到 Redis 约 0.3ms。面试官追问你：为什么选择 Redis 而不是本地计数器？固定窗口的临界突发问题怎么解决？令牌桶和滑动窗口在这个场景下怎么选？Lua 脚本的原子性如何保证限流判断的准确性？如果 Redis 挂了限流器怎么降级？\n\n请结合实际项目经验，完整阐述你的分布式限流器设计方案。",
+      "answer": "## 第一步：限流算法基础与 Redis 的核心优势\n\n### 限流的本质\n\n限流（Rate Limiting）是系统保护的第一道防线，核心思想是在单位时间窗口内限制请求数量，拒绝超出容量的流量以保护后端服务。在单体应用时代，一个进程内的原子计数器（比如 Go 的 `sync/atomic` 或 `golang.org/x/time/rate` 标准库）就能搞定。但在微服务架构下，8 个网关实例各自维护本地计数器的话，每个实例只能看到全局流量的 1/8，一个实例认为「当前 QPS 是 125，没超限」，但实际全局已经到了 1000——这就是为什么分布式限流必须依赖共享存储。\n\nRedis 做分布式限流有三个不可替代的优势。第一是原子性：Redis 的单线程命令执行模型保证了 `INCR`、`EVAL`（Lua 脚本执行）等操作天然原子，不需要额外的分布式锁来保护计数器。第二是性能：纯内存操作加上 RESP3 协议的低开销，单次限流判断的 Redis 端耗时通常在 50-100μs，加上网络往返也控制在 0.5ms 以内。第三是过期机制：Redis 的 key 级 TTL 天然适合时间窗口的生命周期管理，窗口过期后 key 自动清理，无需额外的 GC 逻辑。\n\n### 四种经典限流算法\n\n**固定窗口计数器**是最简单的方案：将时间切分为固定长度的窗口（比如每秒一个窗口），每个窗口维护一个计数器，请求到来时计数器加一，超过阈值则拒绝。Redis 实现只需两条命令——`INCR key` 加 `EXPIRE key 1`。问题在于临界突发：如果窗口边界在 12:00:00.000，用户在 11:59:59.500 到 12:00:00.500 这一秒内集中发送请求，实际吞吐量是阈值的两倍，因为跨了两个窗口。\n\n**滑动窗口日志**通过记录每个请求的精确时间戳来解决临界突发。不再用固定边界切割，而是以当前时刻为终点向前回溯一个窗口期，统计这个滑动区间内的请求数。Redis 中用 Sorted Set 实现：member 是请求的唯一标识，score 是毫秒级时间戳，每次判断时用 `ZREMRANGEBYSCORE` 清除过期记录再用 `ZCARD` 计数。精确度极高但内存开销大——每个请求都要存一条记录。\n\n**漏桶算法**（Leaky Bucket）将请求放入一个固定容量的队列，以恒定速率从队列中取出处理。它能让输出流量变得非常平滑，但缺点是无法处理合理的突发流量——即使系统完全空闲，漏桶也只允许以固定速率放行。\n\n**令牌桶算法**（Token Bucket）是漏桶的对偶：一个桶以固定速率生成令牌（比如每秒生成 1000 个），桶有容量上限（比如最多存 1500 个令牌），请求到来时消耗一个令牌，桶空则拒绝。令牌桶允许突发——如果桶内积攒了 500 个令牌，可以瞬间放行 500 个请求，然后回到稳态速率。这种「允许短时突发但控制长期平均速率」的特性非常适合真实业务流量模式。\n\n## 第二步：实现方案深度解答\n\n### 固定窗口：INCR + EXPIRE 的实现与缺陷\n\n最基础的固定窗口实现看起来很简洁：\n\n```go\nfunc fixedWindowLimit(ctx context.Context, rdb *redis.Client, key string, limit int64, window time.Duration) (bool, error) {\n    // key 格式：ratelimit:global:1719849600（当前窗口的 Unix 秒）\n    windowKey := fmt.Sprintf(\"%s:%d\", key, time.Now().Unix())\n    count, err := rdb.Incr(ctx, windowKey).Result()\n    if err != nil {\n        return false, err\n    }\n    if count == 1 {\n        rdb.Expire(ctx, windowKey, window) // 首次请求设置过期\n    }\n    return count <= limit, nil\n}\n```\n\n这段代码有两个隐患。第一，`INCR` 和 `EXPIRE` 不是原子的——如果进程在 `INCR` 之后崩溃，这个 key 永远不会过期，计数器累加到天文数字后所有请求都被拒绝。解决方案是改用 Lua 脚本将两步合一。第二就是临界突发问题：在 T=0.9s 时来了 999 个请求（窗口 [0,1) 内接近满），在 T=1.0s 时又来了 1000 个请求（窗口 [1,2) 重新计数），实际在 [0.9, 1.1] 这 0.2 秒内通过了 1999 个请求，远超每秒 1000 的限制。\n\n### 滑动窗口：Sorted Set + Lua 脚本\n\n滑动窗口通过精确的时间戳记录彻底解决临界突发。以下是生产级 Lua 脚本实现：\n\n```lua\n-- KEYS[1]: 限流 key，如 ratelimit:user:10086:api\n-- ARGV[1]: 当前时间戳（毫秒）\n-- ARGV[2]: 窗口大小（毫秒），如 60000 表示一分钟\n-- ARGV[3]: 限流阈值，如 60\n-- ARGV[4]: 请求唯一标识（UUID 或 requestId）\n-- 返回值：0 表示放行，1 表示限流\n\nlocal key = KEYS[1]\nlocal now = tonumber(ARGV[1])\nlocal window = tonumber(ARGV[2])\nlocal limit = tonumber(ARGV[3])\nlocal member = ARGV[4]\n\n-- 清除窗口外的过期记录\nlocal expired = now - window\nredis.call('ZREMRANGEBYSCORE', key, '-inf', expired)\n\n-- 统计当前窗口内的请求数\nlocal count = redis.call('ZCARD', key)\n\nif count >= limit then\n    return 1  -- 触发限流\nend\n\n-- 添加当前请求，score 为时间戳\nredis.call('ZADD', key, now, member)\n-- 设置 key 的过期时间为窗口大小，防止冷 key 占内存\nredis.call('PEXPIRE', key, window)\n\nreturn 0  -- 放行\n```\n\n这个脚本的关键设计点：用 `ZREMRANGEBYSCORE` 在每次请求时惰性清理过期数据，避免了后台定时清理的复杂性；先判断 `ZCARD` 再决定是否 `ZADD`，被限流的请求不会写入集合从而节省内存；整个脚本在 Redis 中原子执行，不存在 TOCTOU（Time-of-check to time-of-use）竞态。\n\n对应的 Go 调用代码：\n\n```go\nvar slidingWindowScript = redis.NewScript(slidingWindowLua)\n\nfunc slidingWindowLimit(ctx context.Context, rdb *redis.Client, key string, limit int64, window time.Duration) (bool, error) {\n    now := time.Now().UnixMilli()\n    member := fmt.Sprintf(\"%d:%s\", now, uuid.NewString()[:8])\n    result, err := slidingWindowScript.Run(ctx, rdb, []string{key},\n        now, window.Milliseconds(), limit, member).Int64()\n    if err != nil {\n        return false, err\n    }\n    return result == 0, nil // 0=放行, 1=限流\n}\n```\n\n滑动窗口的内存开销是它的主要缺点：如果每用户每分钟限 60 次，每个活跃用户的 Sorted Set 最多存 60 条记录，10 万活跃用户就是 600 万条记录。每条记录包含 member（约 20 字节）和 score（8 字节），加上 skiplist 节点的指针开销，总内存约 600 万 × 80 字节 ≈ 460MB。对于用户级限流这是可接受的，但如果是全局每秒 1000 次的限流，用 Sorted Set 存储每个请求的时间戳就太重了。\n\n### 令牌桶：Lua 脚本原子计算令牌数\n\n令牌桶算法的核心思想是「懒计算」——不需要一个真正的后台线程持续往桶里放令牌，而是在每次请求到来时，根据距离上次取令牌的时间差计算出这段时间应该补充多少令牌，再扣减。这种实现只需要存储两个值：当前令牌数和上次补充的时间戳。\n\n```lua\n-- KEYS[1]: 令牌桶 key，如 ratelimit:global:token_bucket\n-- ARGV[1]: 桶容量（最大令牌数），如 1500\n-- ARGV[2]: 令牌生成速率（每秒生成数），如 1000\n-- ARGV[3]: 当前时间戳（毫秒）\n-- ARGV[4]: 本次请求消耗的令牌数，通常为 1\n-- 返回值：[是否放行(0/1), 剩余令牌数]\n\nlocal key = KEYS[1]\nlocal capacity = tonumber(ARGV[1])       -- 桶容量\nlocal rate = tonumber(ARGV[2])           -- 每秒生成令牌数\nlocal now = tonumber(ARGV[3])            -- 当前时间（毫秒）\nlocal requested = tonumber(ARGV[4])      -- 请求消耗令牌数\n\n-- 获取当前桶状态\nlocal bucket = redis.call('HMGET', key, 'tokens', 'last_refill')\nlocal tokens = tonumber(bucket[1])\nlocal last_refill = tonumber(bucket[2])\n\n-- 首次访问，初始化桶为满状态\nif tokens == nil then\n    tokens = capacity\n    last_refill = now\nend\n\n-- 计算自上次补充以来应该新增的令牌数\nlocal elapsed = now - last_refill  -- 毫秒\nlocal new_tokens = math.floor(elapsed * rate / 1000)  -- 按速率计算\n\nif new_tokens > 0 then\n    tokens = math.min(capacity, tokens + new_tokens)  -- 不超过桶容量\n    last_refill = now\nend\n\n-- 判断是否有足够令牌\nif tokens >= requested then\n    tokens = tokens - requested\n    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', last_refill)\n    redis.call('PEXPIRE', key, 2000)  -- 2秒后若无请求则清理\n    return {0, tokens}  -- 放行\nelse\n    -- 令牌不足时也要更新补充状态，避免下次重复计算\n    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', last_refill)\n    redis.call('PEXPIRE', key, 2000)\n    return {1, tokens}  -- 限流\nend\n```\n\n令牌桶相比滑动窗口的优势在于内存固定——无论 QPS 多高，每个限流维度只需要一个 Hash key 存储两个字段（tokens 和 last_refill），内存开销恒定约 100 字节。10 万用户级限流只需约 10MB 内存。同时令牌桶天然支持突发流量：桶容量设为速率的 1.5 倍（每秒 1000 速率，容量 1500），允许短暂的 1.5 倍突发但长期平均速率稳定在 1000/s。\n\n### 性能对比（Redis 7.2，1000 并发连接压测）\n\n在我们的生产环境压测中，三种方案的表现如下：固定窗口方案每次判断耗时约 0.05ms（两条命令 pipeline），但有临界突发问题；滑动窗口方案 Lua 脚本执行耗时约 0.15ms，窗口内记录数超过 500 条时 `ZREMRANGEBYSCORE` 的耗时会显著上升到 0.3ms；令牌桶方案 Lua 脚本执行稳定在 0.08ms，不随请求量增长而变化。综合来看，我们的方案是：全局限流（高 QPS）用令牌桶，用户级限流（低阈值）用滑动窗口。\n\n## 第三步：扩展——生产架构与高级话题\n\n### Redis Cell 模块与 GCRA 算法\n\nRedis 4.0 引入了模块系统，社区开发的 redis-cell 模块提供了 `CL.THROTTLE` 命令，内部实现了 GCRA（Generic Cell Rate Algorithm，通用信元速率算法）。GCRA 本质上是令牌桶的一种数学等价表示，只需要存储一个 TAT（Theoretical Arrival Time，理论到达时间）值就能完成限流判断，比我们手写的令牌桶更节省内存。使用方式极其简洁：\n\n```\nCL.THROTTLE user:10086 60 60 60 1\n# 参数含义：key, 桶容量, 窗口内允许次数, 窗口秒数, 本次消耗\n# 返回：[是否限流, 桶容量, 剩余令牌, 若被限流需等待秒数, 桶满需等待秒数]\n```\n\n返回的第 4 个值「retry-after」可以直接塞到 HTTP 响应头 `Retry-After` 中返回给客户端，非常贴心。但 redis-cell 的局限是它是一个第三方 C 模块，需要编译安装，且在 Redis Cluster 模式下每个节点都要加载，运维复杂度较高。如果你的公司 Redis 是云托管服务（如阿里云 Tair、AWS ElastiCache），可能不支持加载自定义模块，这时候就得用原生 Lua 脚本方案。\n\n### 多级限流架构\n\n单纯依赖 Redis 做限流存在一个隐患：如果 8 个网关实例每秒各发 1000 次 Redis 请求做限流判断，Redis 集群要承受 8000 QPS 的额外负载。我们的生产方案是两级限流架构。第一级是本地令牌桶（Go 标准库 `golang.org/x/time/rate`），每个实例配置为全局限额的 1/N（8 个实例每个分 125/s），处理掉大部分正常流量不需要访问 Redis。第二级是 Redis 全局令牌桶，只在本地桶耗尽时才查询 Redis 做精确的全局判断。这样 Redis 只承受溢出流量的请求，QPS 降低了一个数量级。\n\n具体实现中有个细节：本地桶的配额不是简单的 1/N 平均分配，而是通过定时任务（每 5 秒一次）从 Redis 拉取各实例上报的实际流量分布，动态调整每个实例的本地配额。流量倾斜的实例分到更多配额，空闲实例释放配额。这种「自适应配额」机制避免了流量不均时部分实例被过度限流的问题。\n\n### 限流降级策略\n\n当 Redis 完全不可用时（网络分区、集群故障），限流器必须有降级方案而不是直接放开所有流量或拒绝所有流量。我们的三级降级策略是：第一，Redis 超时（>5ms）时切换到本地限流模式，每个实例独立用本地令牌桶以 1/N 的配额运行，精度下降但总体保护仍在；第二，如果连续 3 次 Redis 请求失败，触发熔断器（circuit breaker）进入 open 状态，完全依赖本地限流，同时每 10 秒尝试一次 Redis 探测；第三，当本地限流也无法初始化时（比如启动阶段配置未加载），以配置文件中的硬编码默认值进行限流，这是最后的保底。\n\n### 与 Nginx/Sentinel/Spring Cloud Gateway 限流对比\n\nNginx 的 `limit_req_zone` 指令基于漏桶算法实现单实例限流，配置简单但不支持多实例共享状态——如果你有多个 Nginx 节点，每个节点独立计数，全局限流不准确。Alibaba Sentinel 提供了完整的限流熔断降级框架，支持集群限流模式（通过一个 Token Server 集中分配令牌），但 Token Server 本身是单点，且 Java 生态之外的语言支持较弱。Spring Cloud Gateway 的 `RequestRateLimiter` 过滤器底层调用 Redis Lua 脚本实现令牌桶，设计思路和我们的方案类似但封装层级更高。从架构灵活性来看，直接用 Redis Lua 脚本给了我们最大的控制力——可以针对不同维度（全局、用户、IP、接口）定制不同的算法和参数，这是框架级方案难以做到的。\n\n### 面试考点与高频追问\n\n面试官通常会沿着这条线追问：先问「你用什么算法做限流」（令牌桶 vs 滑动窗口的选型依据），再问「怎么保证多实例一致」（Redis Lua 脚本的原子性），然后「Redis 挂了怎么办」（降级策略），最后「这个方案的瓶颈在哪」（Redis 单分片的 QPS 上限约 10 万，超过需要按 key hash 分片）。能说清楚这四层的候选人基本在这个话题上拿满分。另一个高频追问是「限流和熔断的区别」——限流是控制入口流量防止过载，熔断是检测到下游故障后主动断开调用快速失败，两者是互补关系而非替代关系。",
+      "keyPoints": [
+        "Redis 做分布式限流的核心优势是单线程命令执行保证原子性、纯内存操作保证亚毫秒延迟、key 级 TTL 天然管理时间窗口生命周期",
+        "固定窗口（INCR + EXPIRE）存在临界突发问题——窗口边界两侧各发送接近阈值的请求会导致实际吞吐量翻倍，生产环境不建议单独使用",
+        "滑动窗口用 Sorted Set 以时间戳为 score 记录每个请求，通过 ZREMRANGEBYSCORE 惰性清除过期记录，精确度最高但内存随请求量线性增长",
+        "令牌桶通过懒计算实现——每次请求时根据时间差补充令牌而非后台线程持续生成，只需 Hash 存储 tokens 和 last_refill 两个字段，内存恒定",
+        "Lua 脚本保证限流判断的原子性——读取计数、比较阈值、更新状态在一次 EVAL 中完成，消除 TOCTOU 竞态条件",
+        "生产级架构采用两级限流：本地令牌桶处理正常流量避免每次请求都访问 Redis，仅溢出流量走 Redis 全局判断，降低 Redis 负载一个数量级",
+        "Redis 不可用时的三级降级：超时切本地限流、连续失败触发熔断器、兜底使用硬编码默认值，保证限流功能永不完全失效",
+        "全局高 QPS 限流适合令牌桶（内存固定、支持突发），用户级低阈值限流适合滑动窗口（精确、记录数可控），两者组合覆盖多维度限流需求"
+      ],
+      "quiz": [
+        {
+          "id": "redis-project-rate-limiter-q1-quiz1",
+          "question": "Redis 做分布式限流相比各实例本地计数器的核心优势是什么？",
+          "choices": [
+            {"id": "A", "text": "所有实例共享同一个计数状态，保证全局限流的准确性"},
+            {"id": "B", "text": "Redis 比本地内存读写更快，限流判断延迟更低"},
+            {"id": "C", "text": "Redis 支持持久化，限流计数不会因重启丢失"},
+            {"id": "D", "text": "Redis 自带限流命令，不需要额外编程实现"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "分布式限流选择 Redis 的根本原因是共享状态——多个网关实例通过访问同一个 Redis key 来维护全局一致的计数。B 选项错误，本地内存读写速度远快于 Redis 网络往返（纳秒 vs 微秒），但本地计数器只能看到单实例流量无法做全局限流。C 选项错误，限流计数是短生命周期数据（通常 TTL 只有几秒到几分钟），持久化反而是不需要的。D 选项错误，Redis 原生不提供限流命令，需要通过 INCR/Sorted Set/Lua 脚本组合实现，只有第三方 redis-cell 模块才提供 CL.THROTTLE 命令。"
+        },
+        {
+          "id": "redis-project-rate-limiter-q1-quiz2",
+          "question": "固定窗口计数器的「临界突发问题」具体指什么现象？",
+          "choices": [
+            {"id": "A", "text": "窗口边界两侧各发送接近阈值的请求，导致实际短时间内通过量达到阈值的两倍"},
+            {"id": "B", "text": "窗口切换瞬间计数器重置为零，导致该窗口的限流完全失效"},
+            {"id": "C", "text": "多个实例同时对同一个窗口 key 执行 INCR，导致计数不准确"},
+            {"id": "D", "text": "EXPIRE 命令执行失败导致窗口 key 永不过期，后续所有请求被拒绝"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "临界突发的本质是固定边界无法感知跨窗口的流量聚集。假设限流 1000/s，用户在第一个窗口的最后 100ms 发了 999 个请求，在第二个窗口的前 100ms 又发了 1000 个请求，两个窗口各自都没超限，但实际在 200ms 的时间跨度内通过了 1999 个请求。B 选项描述的不是临界突发而是正常的窗口切换行为。C 选项不存在，Redis INCR 是原子操作不会因并发导致计数不准。D 选项是原子性 bug 而非临界突发问题。"
+        },
+        {
+          "id": "redis-project-rate-limiter-q1-quiz3",
+          "question": "滑动窗口限流的 Lua 脚本中，为什么要在判断之前先执行 ZREMRANGEBYSCORE 清除过期记录？",
+          "choices": [
+            {"id": "A", "text": "如果不清除过期记录，ZCARD 返回的计数会包含已经不在当前窗口内的历史请求，导致误限流"},
+            {"id": "B", "text": "Sorted Set 的内存不会自动释放，必须手动清除才能回收"},
+            {"id": "C", "text": "Redis 的 Sorted Set 有元素数量上限，不清除会导致 ZADD 失败"},
+            {"id": "D", "text": "为了保证 ZADD 操作的时间复杂度维持在 O(1)"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "滑动窗口的核心是只统计当前时间窗口内的请求数。Sorted Set 中 score 小于 (now - window) 的成员已经「滑出」了窗口，如果不清除，ZCARD 会把这些过期请求也算在内，导致计数偏高、用户被错误限流。这是惰性清理策略——不用后台定时任务，而是在每次限流判断时顺带清理。B 选项关于内存回收是次要目的不是核心原因。C 选项错误，Sorted Set 没有元素数量硬上限。D 选项错误，ZADD 的时间复杂度是 O(logN) 与是否清除无关。"
+        },
+        {
+          "id": "redis-project-rate-limiter-q1-quiz4",
+          "question": "令牌桶算法的 Lua 脚本中，通过 math.floor(elapsed * rate / 1000) 计算新增令牌数，这种实现方式叫什么？",
+          "choices": [
+            {"id": "A", "text": "懒计算（Lazy Evaluation）——不维护后台填充线程，而是在请求时根据时间差反推应补充的令牌数"},
+            {"id": "B", "text": "预分配（Pre-allocation）——提前计算未来时间段的令牌并缓存"},
+            {"id": "C", "text": "乐观锁（Optimistic Locking）——先假设有足够令牌再验证"},
+            {"id": "D", "text": "写时复制（Copy-on-Write）——只有在令牌被消耗时才真正更新存储"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "令牌桶的懒计算是一个精妙的工程优化：不需要一个真实的定时器每毫秒往桶里放令牌，而是记录上次补充的时间戳，下次请求到来时一次性算出这段时间应该补充多少个令牌。这样每个限流维度只需存储两个值（当前令牌数和上次补充时间），无需后台线程或定时任务。B 选项描述的是预取策略不适用于此。C 选项是数据库并发控制概念，与此无关。D 选项 COW 是内存管理技术。"
+        },
+        {
+          "id": "redis-project-rate-limiter-q1-quiz5",
+          "question": "执行 CL.THROTTLE user:10086 60 60 60 1 后返回 [1, 60, 0, 2, 60]，这组返回值表示什么？",
+          "choices": [
+            {"id": "A", "text": "请求被限流（第1位=1），桶容量60，剩余0个令牌，需等待2秒后重试，桶完全恢复需60秒"},
+            {"id": "B", "text": "请求放行（第1位=1表示成功），桶容量60，当前有0个等待请求，2秒后下次检查，60秒后过期"},
+            {"id": "C", "text": "请求被限流，总共60次限额已用完，0次剩余，重试间隔2毫秒，窗口剩余60毫秒"},
+            {"id": "D", "text": "请求放行，60是速率，0是当前计数，2是窗口编号，60是窗口大小"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "CL.THROTTLE 的返回值是一个 5 元素数组：第 1 位是是否被限流（0=放行，1=被限流），第 2 位是桶的总容量，第 3 位是当前剩余令牌数，第 4 位是如果被限流需要等待多少秒后重试（可直接用作 Retry-After 响应头），第 5 位是桶从空到满需要多少秒。返回 [1, 60, 0, 2, 60] 表示被限流了、桶容量60、当前0令牌可用、2秒后有新令牌可重试、完全恢复需60秒。B 选项错误地将 1 解读为成功。C 选项单位错误，时间是秒不是毫秒。"
+        },
+        {
+          "id": "redis-project-rate-limiter-q1-quiz6",
+          "question": "以下哪种做法是分布式限流中常见的错误实践？",
+          "choices": [
+            {"id": "A", "text": "使用 INCR 和 EXPIRE 两条独立命令实现固定窗口，未封装为 Lua 脚本保证原子性"},
+            {"id": "B", "text": "令牌桶的容量设置为速率的 1.5 倍以允许短时突发流量"},
+            {"id": "C", "text": "滑动窗口在 ZADD 之前先用 ZREMRANGEBYSCORE 清理过期记录"},
+            {"id": "D", "text": "限流 key 中包含时间窗口标识以实现自动过期清理"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "INCR 和 EXPIRE 分开执行是经典的原子性 bug：如果进程在 INCR 成功后、EXPIRE 执行前崩溃，这个 key 将永远不会过期，计数器持续累加直到所有后续请求都被拒绝（因为计数远超阈值）。正确做法是用 Lua 脚本将 INCR、判断、EXPIRE 封装为原子操作。B 选项是合理的设计——桶容量大于速率允许消化合理突发。C 选项是滑动窗口的标准实现步骤。D 选项也是正确实践，利用 TTL 自动回收过期窗口的 key。"
+        },
+        {
+          "id": "redis-project-rate-limiter-q1-quiz7",
+          "question": "在全局每秒 1000 次的高 QPS 限流场景下，为什么推荐令牌桶而不是滑动窗口？",
+          "choices": [
+            {"id": "A", "text": "令牌桶内存固定（只存两个字段），而滑动窗口需要为每个请求存一条记录，高 QPS 下内存线性增长"},
+            {"id": "B", "text": "令牌桶的限流精度比滑动窗口更高"},
+            {"id": "C", "text": "滑动窗口无法支持每秒 1000 次以上的限流阈值"},
+            {"id": "D", "text": "令牌桶不需要 Lua 脚本就能保证原子性"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个工程权衡问题。滑动窗口在全局 1000 QPS 场景下，Sorted Set 中持续维护 1000 条记录（一秒窗口内的所有请求），每次 ZREMRANGEBYSCORE 要扫描和删除大量过期记录，O(logN + M) 的复杂度随 M（过期记录数）增长。令牌桶只用一个 Hash 存 tokens 和 last_refill 两个字段，无论 QPS 多高内存恒定，Lua 脚本执行时间也恒定。B 选项错误，滑动窗口精度实际上更高（精确到每个请求的时间戳）。C 选项错误，滑动窗口可以支持任意阈值只是内存和性能代价更大。D 选项错误，令牌桶的读-计算-写也需要 Lua 脚本保证原子性。"
+        },
+        {
+          "id": "redis-project-rate-limiter-q1-quiz8",
+          "question": "生产环境中采用「本地限流 + Redis 全局限流」两级架构的主要目的是什么？",
+          "choices": [
+            {"id": "A", "text": "减少 Redis 的请求量——正常流量在本地桶消化，只有溢出流量才查询 Redis，降低 Redis 负载一个数量级"},
+            {"id": "B", "text": "提高限流精度——本地限流比 Redis 限流更准确"},
+            {"id": "C", "text": "完全替代 Redis 限流——Redis 只做备份存储"},
+            {"id": "D", "text": "解决 Redis Cluster 不支持 Lua 脚本的问题"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "8 个网关实例每秒各 1000 次限流判断意味着 Redis 要承受 8000 QPS 的额外负载。两级架构让每个实例的本地令牌桶先拦截大部分正常流量（各自分配 125/s 的配额），只有本地桶耗尽时才发起 Redis 请求做全局精确判断。这样 Redis 实际承受的 QPS 远低于全量请求。B 选项错误，本地限流只能看到局部流量精度反而更低。C 选项错误，两级是互补不是替代。D 选项完全错误，Redis Cluster 7.0+ 完整支持 Lua 脚本（EVAL/EVALSHA）。"
+        },
+        {
+          "id": "redis-project-rate-limiter-q1-quiz9",
+          "question": "当 Redis 完全不可用时，以下哪种限流降级策略是最危险的？",
+          "choices": [
+            {"id": "A", "text": "直接放行所有请求，等 Redis 恢复后再重新启用限流"},
+            {"id": "B", "text": "切换到本地令牌桶，以 1/N 的配额独立运行"},
+            {"id": "C", "text": "拒绝所有请求直到 Redis 恢复"},
+            {"id": "D", "text": "使用配置文件中的硬编码默认限流值进行兜底"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "直接放行是最危险的降级策略。如果 Redis 恰好在流量高峰时不可用（比如大促期间 Redis 集群被打满），此时放弃限流意味着所有流量直接冲击后端，很可能触发级联故障——数据库连接池耗尽、服务 OOM、整个系统雪崩。正确做法是宁可误杀（偏严格的本地限流）也不能漏放。B 选项是合理的降级方案，虽然精度下降但总体保护仍在。C 选项拒绝所有请求虽然极端但至少保护了后端。D 选项用默认值兜底也是可行的保守策略。"
+        },
+        {
+          "id": "redis-project-rate-limiter-q1-quiz10",
+          "question": "在 Redis Cluster 模式下使用 Lua 脚本做限流，需要注意什么关键约束？",
+          "choices": [
+            {"id": "A", "text": "Lua 脚本中操作的所有 key 必须在同一个 hash slot 上，否则会报 CROSSSLOT 错误，实践中用 hash tag 如 {user:10086} 保证"},
+            {"id": "B", "text": "Lua 脚本在 Cluster 模式下不支持 EVALSHA，只能用 EVAL 执行"},
+            {"id": "C", "text": "每个 Lua 脚本的执行时间不能超过 1ms，否则会被 Cluster 自动终止"},
+            {"id": "D", "text": "Cluster 模式下 Lua 脚本只能操作 String 类型的 key，不支持 Hash 和 Sorted Set"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 将数据按 key 的 CRC16 哈希值分配到 16384 个 slot 上。Lua 脚本要求所有操作的 key 必须落在同一个 slot（因为脚本可能在任意节点执行，跨 slot 意味着跨节点，无法保证原子性）。限流场景中每个 Lua 脚本通常只操作一个 key，天然满足此约束。如果需要操作多个 key（比如同时更新计数器和记录限流日志），可以使用 hash tag 语法如 {user:10086}:counter 和 {user:10086}:log 确保路由到同一 slot。B 选项错误，Cluster 完整支持 EVALSHA。C 选项错误，超时由 lua-time-limit 配置控制（默认 5000ms），且超时只触发 BUSY 错误不会自动终止。D 选项完全错误。"
+        }
+      ],
+      "references": [
+        "https://redis.io/glossary/rate-limiting/",
+        "https://redis.io/learn/develop/dotnet/aspnetcore/rate-limiting/sliding-window",
+        "https://github.com/brandur/redis-cell"
+      ]
+    }
+  ]
+}

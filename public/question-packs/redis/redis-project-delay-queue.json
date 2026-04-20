@@ -1,0 +1,158 @@
+{
+  "id": "redis-project-delay-queue",
+  "name": "基于 Redis 的延迟队列实现",
+  "domain": "redis",
+  "description": "用 Redis Sorted Set 实现轻量级延迟队列，涵盖原子消费 Lua 脚本、多消费者竞争安全、失败重试、取消任务及 Stream 替代方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-project-delay-queue-q1",
+      "domain": "redis",
+      "type": "project",
+      "difficulty": 4,
+      "tags": ["Redis", "延迟队列", "Sorted Set", "系统设计", "项目实战", "定时任务"],
+      "title": "基于 Redis 的延迟队列实现",
+      "content": "## 项目背景\n\n你所在的电商团队（后端 6 人，Java + Spring Boot 技术栈，Redis 7.0 Cluster 三主三从）正面临一个越来越紧迫的需求：平台上线了「30 分钟未支付自动取消订单」的功能，同时运营侧要求支持「优惠券到期前 1 天发提醒推送」，物流团队还提了「发货后 72 小时未更新物流状态则自动预警」。这三个需求的共同特征是——任务不是立刻执行，而是在未来某个确定的时间点触发。\n\n团队最初的方案是每分钟跑一次定时任务扫 MySQL 的 `orders` 表，用 `WHERE status='unpaid' AND create_time < NOW() - INTERVAL 30 MINUTE` 查出超时订单逐条取消。上线初期日单量 2 万的时候没什么问题，但 618 大促期间日单量冲到 50 万，定时任务一次扫表要 8 秒，MySQL 慢查询告警不断，而且扫描间隔 1 分钟意味着最坏情况下订单要等 31 分钟才被取消，精度完全不够。\n\n架构师提议引入 RabbitMQ 的延迟消息插件（rabbitmq_delayed_message_exchange），但 CTO 否了——团队没有 MQ 运维经验，当前体量不值得为这一个需求引入整套 RabbitMQ 集群。Redis 是现成的，每个后端都熟，能不能用 Redis 实现一个轻量级延迟队列？\n\n以下是团队在技术评审会上整理的核心技术问题：\n\n```\n1. 用 Redis 哪种数据结构最适合做延迟队列？怎么入队、怎么到期触发？\n2. 多个消费者实例同时轮询，怎么保证一个任务不会被重复消费？\n3. 消费者取到任务后处理失败了怎么办？怎么做重试？重试几次后怎么进死信？\n4. 用户在超时前完成了支付，怎么取消已入队的延迟任务？\n5. 大促期间同一秒有上千个订单同时到期，会不会出现惊群效应？\n6. Redis 宕机了任务会丢吗？怎么保证可靠性？\n```\n\n请给出一套可以直接落地的方案，包含核心 Redis 命令、Lua 脚本、消费者轮询逻辑和失败重试机制。",
+      "answer": "## 延迟队列基础：为什么 Sorted Set 是天然的选择\n\n延迟队列（Delay Queue）的核心需求可以归纳为三点：任务在指定时间到期后触发执行、消费端必须可靠地消费且不重复、支持在到期前取消任务。传统的做法是用消息中间件——RabbitMQ 通过 `x-delayed-message` 插件支持延迟投递，Kafka 则需要额外建「时间轮」或分层 topic 来实现。但这些方案都要求团队具备 MQ 的部署和运维能力，对于只需要一个延迟触发功能的场景来说确实太重了。\n\nRedis 的 Sorted Set（有序集合，底层由跳表 + 哈希表组成）天然适合做延迟队列，原因非常直接：每个元素有一个 score（双精度浮点数），所有元素按 score 从小到大排序。如果把任务 ID 作为 member、把任务应该执行的时间戳作为 score，那么「取出所有已到期任务」就等价于「取出所有 score ≤ 当前时间戳的元素」——这正是 `ZRANGEBYSCORE` 命令干的事情。\n\n与 RabbitMQ 延迟消息对比，Sorted Set 方案有三个优势：第一，Redis 是大多数团队已有的基础设施，零额外部署成本；第二，取消任务只需一个 `ZREM`，O(logN) 即完成，而 RabbitMQ 要取消一条已发到延迟交换机的消息非常麻烦（需要消费后丢弃或借助 TTL 取巧）；第三，可以用 `ZCARD` 实时查看队列积压量、用 `ZRANGEBYSCORE` 预览即将到期的任务，运维可观测性比 MQ 延迟消息更好。当然它也有劣势——Redis 是内存存储，任务量不能无限膨胀，而且需要客户端自己做轮询消费，没有 MQ 的 push 模式那么实时。\n\n## 实现方案深度解答\n\n### 入队：ZADD 把任务丢进 Sorted Set\n\n入队逻辑非常简单：计算任务的到期时间戳，用 ZADD 写入。以「30 分钟自动取消」为例：\n\n```redis\n# score = 当前 Unix 时间戳（秒）+ 延迟秒数\n# member = 任务唯一标识（通常是业务 ID + 任务类型的组合）\nZADD delay_queue 1718234567 \"order:cancel:10001\"\nZADD delay_queue 1718320967 \"coupon:remind:C2024061801\"\nZADD delay_queue 1718493767 \"logistics:warn:L88421\"\n```\n\n这里 member 的设计有讲究。直接用 `orderId` 不够好，因为同一个订单可能有多种延迟任务（取消、提醒评价、自动确认收货），member 必须全局唯一。推荐格式是 `{业务类型}:{动作}:{业务ID}`，消费端解析 member 字符串就能知道该执行什么逻辑。如果任务携带的数据较多（比如需要订单金额、用户手机号），不要把整个 JSON 塞进 member——member 过长会增加跳表节点的内存开销和比较耗时。正确做法是 member 只存标识，任务详情存在单独的 Hash key 里：\n\n```redis\nZADD delay_queue 1718234567 \"order:cancel:10001\"\nHSET delay_task:order:cancel:10001 orderId 10001 userId 8842 amount 299.00 retryCount 0\nEXPIRE delay_task:order:cancel:10001 3600   # 比延迟时间多留 30 分钟余量\n```\n\n### 消费：ZRANGEBYSCORE + ZREM 的原子性问题\n\n消费端需要不断轮询 Sorted Set，取出所有 score ≤ 当前时间的元素并处理。最朴素的做法是两步走：先 `ZRANGEBYSCORE delay_queue -inf {now} LIMIT 0 1` 取一个到期任务，再 `ZREM delay_queue {member}` 把它删掉防止重复消费。但这两步不是原子的——如果两个消费者同时执行 ZRANGEBYSCORE 拿到了同一个 member，都去执行 ZREM，虽然只有一个 ZREM 能成功删除（返回 1），另一个返回 0，但第一步的「取」和第二步的「删」之间存在竞态窗口。\n\n解决方案是用 Lua 脚本把「查询 + 删除」合并为一个原子操作。Redis 执行 Lua 脚本时是单线程串行的，不会有其他命令插入中间：\n\n```lua\n-- delay_queue_consume.lua\n-- KEYS[1] = delay_queue（Sorted Set 的 key）\n-- ARGV[1] = 当前时间戳（秒）\n-- ARGV[2] = 单次最多取出的任务数（防止一次取太多阻塞 Redis）\n-- 返回值：到期任务的 member 列表（可能为空）\n\nlocal tasks = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])\nif #tasks > 0 then\n    -- unpack 将 Lua table 展开为多个参数传给 ZREM\n    redis.call('ZREM', KEYS[1], unpack(tasks))\nend\nreturn tasks\n```\n\n调用方式（以 redis-cli 为例）：\n\n```bash\n# 取出当前时间（1718234570）之前到期的任务，单次最多取 10 个\nredis-cli --eval delay_queue_consume.lua delay_queue , 1718234570 10\n```\n\n这个 Lua 脚本有一个细节必须注意：`unpack(tasks)` 在 tasks 元素数量很大时会导致 Lua 栈溢出（LuaJIT 默认栈限制约 8000 个元素）。所以 `ARGV[2]` 限制单次最多取出的任务数非常重要，生产环境建议设为 50-100。\n\n### 多消费者竞争安全\n\n上面的 Lua 脚本已经解决了竞争问题。因为 ZRANGEBYSCORE 和 ZREM 在同一个 Lua 脚本中执行，Redis 保证原子性——两个消费者不可能拿到同一批任务。具体来说：消费者 A 的 Lua 脚本执行时，ZRANGEBYSCORE 取到任务后立即 ZREM 删除；消费者 B 的脚本随后执行时，ZRANGEBYSCORE 已经看不到这些任务了。\n\n消费者端的轮询逻辑建议这样设计：\n\n```java\n// Java 伪代码 — 消费者轮询主循环\npublic void pollLoop() {\n    String luaSha = jedis.scriptLoad(CONSUME_LUA_SCRIPT);  // 预加载脚本，后续用 EVALSHA 调用\n    while (!Thread.currentThread().isInterrupted()) {\n        List<String> tasks = (List<String>) jedis.evalsha(\n            luaSha, 1, \"delay_queue\",\n            String.valueOf(System.currentTimeMillis() / 1000), \"50\"\n        );\n        if (tasks == null || tasks.isEmpty()) {\n            // 没有到期任务，短暂休眠避免空转浪费 CPU\n            Thread.sleep(100);  // 100ms 轮询间隔，精度足够\n            continue;\n        }\n        for (String taskId : tasks) {\n            executor.submit(() -> processTask(taskId));  // 线程池异步处理\n        }\n    }\n}\n```\n\n轮询间隔设 100ms 意味着任务到期后最多 100ms 内会被取走，对于「30 分钟取消订单」这种业务来说精度绰绰有余。如果业务对延迟极度敏感（比如秒级），可以缩短到 50ms，但不建议低于 50ms——轮询太频繁会增加 Redis 的 CPU 负担，而且 ZRANGEBYSCORE 在空集上也是 O(logN) 的开销。\n\n### 消费失败重试与死信\n\n消费者取到任务后，执行业务逻辑（比如调用订单服务取消接口）可能失败。失败时不能直接丢弃，需要重新入队并增加重试计数：\n\n```lua\n-- delay_queue_retry.lua\n-- KEYS[1] = delay_queue, KEYS[2] = dead_letter_queue\n-- ARGV[1] = member（任务 ID）\n-- ARGV[2] = 下次重试的时间戳\n-- ARGV[3] = 任务详情 Hash key\n-- ARGV[4] = 最大重试次数\n\nlocal retryCount = redis.call('HINCRBY', ARGV[3], 'retryCount', 1)\nif retryCount > tonumber(ARGV[4]) then\n    -- 超过最大重试次数，进入死信队列\n    redis.call('LPUSH', KEYS[2], ARGV[1])\n    redis.call('DEL', ARGV[3])\n    return -1\nelse\n    -- 重新入队，score 为下次重试时间（指数退避）\n    redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])\n    return retryCount\nend\n```\n\n重试时间建议用指数退避（Exponential Backoff）：第 1 次重试等 5 秒，第 2 次 10 秒，第 3 次 20 秒——`retryDelay = 5 * 2^(retryCount - 1)`。最大重试 5 次后进入死信队列（一个 Redis List），由人工或告警系统处理。死信队列用 List 而非 Sorted Set，因为死信不需要按时间排序，只需要 FIFO 消费。\n\n### 取消任务\n\n取消已入队的延迟任务是 Sorted Set 方案的一大优势。用户在 30 分钟内完成了支付，后端只需：\n\n```redis\nZREM delay_queue \"order:cancel:10001\"\nDEL delay_task:order:cancel:10001\n```\n\n一个 ZREM 就够了，O(logN) 复杂度，10 万元素的 Sorted Set 执行耗时不到 0.1ms。相比之下，RabbitMQ 要取消一条已经投递到延迟交换机的消息几乎不可能——你只能在消费端收到后检查「这个订单是否已支付」，如果已支付则跳过。这种「消费时判断」的方式在 Sorted Set 方案中同样建议保留作为兜底——万一 ZREM 因为网络闪断没执行成功，消费端做一次幂等校验也不亏。\n\n## 生产扩展与面试考点\n\n### 惊群效应处理\n\n大促期间可能出现同一秒有数千个订单同时到期的情况。如果所有消费者同时取到大量任务，瞬间并发调用下游订单取消接口，可能把订单服务打崩。解决方案有两个层面：第一，Lua 脚本的 `LIMIT` 参数控制单次最多取 50 个，消费者处理完这批再取下一批，天然起到削峰作用；第二，消费端用固定大小的线程池（比如 20 个线程）处理任务，超出线程池容量的任务排队等待，不会无限制地并发调下游。\n\n### Redis Stream 作为替代方案\n\nRedis 5.0 引入的 Stream 数据类型原生支持消费者组（Consumer Group），理论上也能做延迟队列。思路是：入队时用 `XADD` 写入 Stream，消费端用 `XREADGROUP GROUP g1 consumer1 COUNT 10 BLOCK 2000 STREAMS delay_stream >` 阻塞读取，配合 `XACK` 确认消费。但 Stream 的问题在于它没有原生的「延迟投递」能力——消息一写入就能被消费，你需要在消费端自己判断「这条消息的执行时间到了没」，没到就重新塞回去或者记录 pending。这个逻辑远不如 Sorted Set 的 `ZRANGEBYSCORE -inf {now}` 来得优雅。Stream 更适合做实时消息队列（替代 Pub/Sub 的可靠版），不太适合做延迟队列。\n\n### 可靠性：Redis 宕机怎么办\n\nRedis 是内存数据库，宕机意味着内存中的数据可能丢失。对于延迟队列来说，丢任务意味着订单永远不会被取消。缓解措施有三层：第一，开启 AOF 持久化并设置 `appendfsync everysec`（每秒刷盘），最坏情况丢失 1 秒内的写入；第二，如果用 Redis Cluster 或 Sentinel，主节点宕机后从节点会提升为主节点，从节点通过复制拥有绝大部分数据（异步复制可能丢少量）；第三，关键业务建议在 MySQL 中保留一张 `delay_tasks` 表作为兜底，定时任务每 5 分钟扫一次这张表，把漏掉的任务补偿入队。三层防护叠加后，丢任务的概率可以控制到极低。\n\n### Redisson DelayedQueue 对比\n\nJava 生态中 Redisson 框架提供了开箱即用的 `RDelayedQueue`，底层原理和本文方案一致——一个 Sorted Set 存延迟任务，一个 List 存到期后待消费的任务，一个定时器负责从 Sorted Set 搬运到 List。Redisson 的优势是封装好了消费者竞争、重试、序列化等细节，缺点是对 Redisson 客户端有强依赖，且内部实现不透明，出了问题排查困难。如果团队用的是 Spring Boot + Jedis/Lettuce，自己用 Lua 脚本实现其实也就几十行代码，掌控力更强。面试中说「我了解 Redisson DelayedQueue 的原理但我们选择了自己实现，因为……」比单纯说「我用了 Redisson」更有加分。\n\n### 面试高频考点\n\n围绕 Redis 延迟队列，面试官最常追问的方向有五个。第一是「为什么用 Sorted Set 而不是 List 或 Stream」——List 没有按时间排序的能力，Stream 没有原生延迟投递，Sorted Set 的 score 机制天然匹配延迟队列的需求。第二是「怎么保证消费的原子性」——必须答出 Lua 脚本把 ZRANGEBYSCORE 和 ZREM 合并为原子操作。第三是「消费失败怎么处理」——重新 ZADD 加指数退避，超过最大次数进死信队列。第四是「Redis 宕机丢数据怎么办」——AOF everysec + MySQL 兜底表 + 定时补偿扫描。第五是「和 RabbitMQ/Kafka 延迟消息的对比」——轻量 vs 重量、取消容易 vs 取消困难、需要轮询 vs push 模式。把这五个方向用代码和具体数字讲清楚，这道题就答得非常到位了。",
+      "keyPoints": [
+        "Sorted Set 以到期时间戳为 score、任务 ID 为 member，ZRANGEBYSCORE -inf {now} 一条命令就能取出所有已到期任务，天然匹配延迟队列的「到期触发」需求",
+        "ZRANGEBYSCORE 和 ZREM 必须用 Lua 脚本合并为原子操作，否则多消费者并发轮询时会出现同一任务被重复取出的竞态问题",
+        "消费失败时通过 ZADD 重新入队并用指数退避计算下次执行时间（5s × 2^retryCount），超过最大重试次数后 LPUSH 进死信队列由人工处理",
+        "取消任务只需 ZREM 一条命令（O(logN)），这是 Sorted Set 方案相对 RabbitMQ 延迟消息的核心优势——MQ 中已投递的延迟消息几乎无法主动撤回",
+        "Lua 脚本中 unpack(tasks) 在元素过多时会触发 LuaJIT 栈溢出，必须通过 LIMIT 参数限制单次取出数量（建议 50-100），同时起到削峰防惊群的效果",
+        "Redis 宕机可能丢失延迟任务，生产环境需要三层防护：AOF appendfsync everysec 最多丢 1 秒数据、主从复制保障高可用、MySQL 兜底表定时补偿扫描",
+        "Redis Stream 虽然支持消费者组和 XACK 确认机制，但缺少原生延迟投递能力，做延迟队列需要消费端自行判断到期时间，不如 Sorted Set 方案直观高效",
+        "轮询间隔建议 100ms，对「30 分钟取消」场景精度绰绰有余；不建议低于 50ms，否则空轮询的 ZRANGEBYSCORE 会增加 Redis CPU 开销"
+      ],
+      "quiz": [
+        {
+          "id": "redis-project-delay-queue-q1-quiz1",
+          "question": "用 Redis Sorted Set 实现延迟队列时，ZADD 的 score 应该设置为什么值？",
+          "choices": [
+            { "id": "A", "text": "任务应该执行的未来时间戳（当前时间 + 延迟秒数）" },
+            { "id": "B", "text": "任务的延迟秒数（如 1800 表示 30 分钟）" },
+            { "id": "C", "text": "任务的优先级数字（1-10，数字越小优先级越高）" },
+            { "id": "D", "text": "任务入队的当前时间戳" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "延迟队列的核心逻辑是「到期触发」，消费端用 ZRANGEBYSCORE -inf {当前时间戳} 取出所有 score ≤ 当前时间的元素，因此 score 必须是任务应该执行的绝对时间戳（当前时间 + 延迟秒数）。选项 B 把 score 设为延迟秒数的话，所有延迟 30 分钟的任务 score 都是 1800，消费端无法通过 ZRANGEBYSCORE 判断哪些已到期。选项 C 是优先级队列的做法，不是延迟队列。选项 D 用入队时间做 score 会导致所有任务入队即到期，失去了「延迟」的意义。"
+        },
+        {
+          "id": "redis-project-delay-queue-q1-quiz2",
+          "question": "为什么延迟队列的消费逻辑不能简单地先 ZRANGEBYSCORE 再 ZREM，而必须用 Lua 脚本？",
+          "choices": [
+            { "id": "A", "text": "ZRANGEBYSCORE 和 ZREM 是两条独立命令，多消费者并发时可能取到同一个任务导致重复消费" },
+            { "id": "B", "text": "ZRANGEBYSCORE 不支持 LIMIT 参数，必须用 Lua 脚本实现分批取出" },
+            { "id": "C", "text": "Redis 的 ZREM 命令不支持批量删除多个 member，只能通过 Lua 循环逐个删除" },
+            { "id": "D", "text": "Lua 脚本的执行速度比原生命令快 10 倍以上，是性能优化的关键" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "核心问题在于原子性。如果两个消费者几乎同时执行 ZRANGEBYSCORE，它们可能拿到相同的 member 列表，然后各自去处理同一个任务，导致重复消费（比如重复取消订单）。Lua 脚本在 Redis 中是原子执行的，不会被其他命令打断，所以把 ZRANGEBYSCORE 和 ZREM 放在同一个 Lua 脚本里就能保证「取出 + 删除」一气呵成。选项 B 错误，ZRANGEBYSCORE 本身支持 LIMIT offset count 参数。选项 C 错误，ZREM 支持一次删除多个 member：ZREM key member1 member2 ...。选项 D 错误，Lua 脚本并不比原生命令更快，它的价值在于原子性而非性能。"
+        },
+        {
+          "id": "redis-project-delay-queue-q1-quiz3",
+          "question": "以下 Lua 脚本用于延迟队列消费，其中 unpack(tasks) 在生产环境中可能引发什么问题？\n\n```lua\nlocal tasks = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])\nif #tasks > 0 then\n    redis.call('ZREM', KEYS[1], unpack(tasks))\nend\nreturn tasks\n```",
+          "choices": [
+            { "id": "A", "text": "当 tasks 数量超过 LuaJIT 栈大小限制（约 8000 个元素）时会栈溢出导致脚本执行失败" },
+            { "id": "B", "text": "unpack 会将 tasks 转为字符串拼接，当 member 包含特殊字符时会导致 ZREM 参数解析错误" },
+            { "id": "C", "text": "unpack 操作的时间复杂度是 O(N²)，tasks 数量多时会导致 Redis 主线程长时间阻塞" },
+            { "id": "D", "text": "unpack 只支持数字类型的 table，如果 member 是字符串会触发类型转换错误" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Lua 的 unpack 函数把 table 展开为多个独立参数压入调用栈，LuaJIT（Redis 内嵌的 Lua 引擎）默认栈大小有限，大约能容纳 8000 个参数。如果 ZRANGEBYSCORE 一次返回超过这个数量的元素，unpack 就会栈溢出，Redis 返回错误。这就是为什么 Lua 脚本中 LIMIT 参数必须设置一个合理上限（建议 50-100）的原因。选项 B 错误，unpack 是将 table 元素展开为函数调用的多个参数，不涉及字符串拼接。选项 C 错误，unpack 是 O(N) 操作而非 O(N²)。选项 D 错误，Lua table 可以存储任意类型，unpack 对字符串没有限制。"
+        },
+        {
+          "id": "redis-project-delay-queue-q1-quiz4",
+          "question": "延迟队列消费者的轮询间隔设为 100ms，以下哪个说法是正确的？",
+          "choices": [
+            { "id": "A", "text": "任务到期后最多 100ms 内会被消费者取走，对于分钟级延迟任务精度足够" },
+            { "id": "B", "text": "轮询间隔越短越好，设为 1ms 可以获得最佳的任务触发精度" },
+            { "id": "C", "text": "100ms 间隔意味着 Redis 每秒要处理 10 次 ZRANGEBYSCORE，会导致性能瓶颈" },
+            { "id": "D", "text": "轮询间隔只影响空闲时的 CPU 消耗，不影响任务到期后的实际触发延迟" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "轮询间隔直接决定了任务到期后被取走的最大延迟：100ms 间隔意味着任务到期后最迟 100ms 内会被下一次轮询发现并取出，对于「30 分钟取消订单」这种分钟级延迟场景来说完全够用。选项 B 错误，1ms 轮询意味着单个消费者每秒向 Redis 发送 1000 次请求，多个消费者叠加会显著增加 Redis CPU 负担，且 ZRANGEBYSCORE 即使没有到期元素也有 O(logN) 的开销。选项 C 的判断方向对但数量级错了——单个消费者每秒 10 次 ZRANGEBYSCORE 对 Redis 来说微不足道，但不建议轮询间隔低于 50ms。选项 D 错误，轮询间隔直接影响触发延迟。"
+        },
+        {
+          "id": "redis-project-delay-queue-q1-quiz5",
+          "question": "执行以下命令后，ZRANGEBYSCORE 的返回结果是什么？\n\n```redis\nZADD delay_queue 1000 \"task:A\" 1005 \"task:B\" 998 \"task:C\" 1010 \"task:D\"\nZRANGEBYSCORE delay_queue -inf 1005\n```",
+          "choices": [
+            { "id": "A", "text": "返回 task:C task:A task:B（score ≤ 1005 的元素，按 score 从小到大排列）" },
+            { "id": "B", "text": "返回 task:B task:A task:C（score ≤ 1005 的元素，按 score 从大到小排列）" },
+            { "id": "C", "text": "返回 task:A task:B task:C task:D（所有元素）" },
+            { "id": "D", "text": "返回 task:C task:A（只返回 score < 1005 的元素，不包含等于 1005 的）" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "ZRANGEBYSCORE key min max 返回 score 在 [min, max] 闭区间内的所有 member，按 score 从小到大排列。-inf 表示负无穷，1005 表示上界（包含）。score 为 998 的 task:C、1000 的 task:A、1005 的 task:B 都满足 score ≤ 1005，按 score 升序排列就是 task:C、task:A、task:B。task:D 的 score 是 1010 大于 1005 所以不包含。选项 B 的排序方向反了——ZRANGEBYSCORE 是升序，降序要用 ZREVRANGEBYSCORE。选项 D 误以为是开区间不包含 1005，实际默认是闭区间；如果要开区间需写 (1005。"
+        },
+        {
+          "id": "redis-project-delay-queue-q1-quiz6",
+          "question": "以下哪种做法在延迟队列的任务入队设计中是常见的错误？",
+          "choices": [
+            { "id": "A", "text": "把整个任务的 JSON 数据（含订单详情、用户信息）直接作为 Sorted Set 的 member 存储" },
+            { "id": "B", "text": "member 用 {业务类型}:{动作}:{业务ID} 格式，任务详情存在单独的 Hash key 中" },
+            { "id": "C", "text": "对任务详情的 Hash key 设置过期时间，比延迟时间多留 30 分钟余量" },
+            { "id": "D", "text": "入队时同时写入 Sorted Set 和 Hash key，用 Pipeline 打包减少 RTT" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "把大段 JSON 直接作为 Sorted Set 的 member 是一个典型的反模式。原因有三个：第一，member 是跳表节点的一部分，过长的 member 会显著增加每个节点的内存开销；第二，Sorted Set 在 score 相同时按 member 的字典序比较，长字符串的比较代价更高；第三，member 在 ZRANGEBYSCORE、ZREM 等命令中都要完整传输，网络带宽浪费严重。正确做法是 member 只存简短的任务标识（选项 B），详情放在独立的 Hash key 里（选项 C 和 D 都是推荐的配套实践）。"
+        },
+        {
+          "id": "redis-project-delay-queue-q1-quiz7",
+          "question": "与 RabbitMQ 的延迟消息插件（rabbitmq_delayed_message_exchange）相比，Redis Sorted Set 延迟队列的核心优势是什么？",
+          "choices": [
+            { "id": "A", "text": "取消已入队的延迟任务只需 ZREM 一条命令（O(logN)），而 RabbitMQ 几乎无法主动撤回已投递的延迟消息" },
+            { "id": "B", "text": "Redis 的消息吞吐量比 RabbitMQ 高 100 倍以上，适合超高 QPS 场景" },
+            { "id": "C", "text": "Redis 支持消息持久化而 RabbitMQ 延迟消息不支持持久化" },
+            { "id": "D", "text": "Redis Sorted Set 支持消费者组机制，能自动做负载均衡" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Sorted Set 做延迟队列最突出的优势在于任务可以随时取消。业务上用户支付了就不需要取消订单，一个 ZREM 命令即可完成，O(logN) 复杂度几乎无感。RabbitMQ 的延迟消息一旦投递到延迟交换机就很难主动撤回，通常只能在消费端收到后判断是否需要执行。选项 B 夸大了性能差距，RabbitMQ 单节点也能达到数万 QPS，差距没有 100 倍。选项 C 事实相反，RabbitMQ 消息默认就支持持久化（delivery_mode=2），而 Redis 作为内存数据库反而有宕机丢数据的风险。选项 D 错误，Sorted Set 没有消费者组机制，那是 Redis Stream 的功能。"
+        },
+        {
+          "id": "redis-project-delay-queue-q1-quiz8",
+          "question": "大促期间同一秒有 5000 个订单同时到期需要取消，以下哪个方案最能有效防止惊群效应打崩下游订单服务？",
+          "choices": [
+            { "id": "A", "text": "Lua 脚本中 LIMIT 参数设为 50，每次最多取 50 个任务，配合消费端固定大小线程池处理" },
+            { "id": "B", "text": "在入队时给每个任务的 score 加上 0-60 秒的随机偏移量，将到期时间打散" },
+            { "id": "C", "text": "增加消费者实例数量到 100 个，让每个实例分担 50 个任务" },
+            { "id": "D", "text": "将轮询间隔从 100ms 增加到 5 秒，降低消费速度" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "选项 A 是最合理的方案：Lua 脚本的 LIMIT 控制单次从 Redis 取出的任务数量，消费端的固定线程池控制并发调下游的速率，两层限流叠加实现了平滑消费。选项 B 给 score 加随机偏移在理论上能打散到期时间，但会破坏业务语义——原本 30 分钟取消变成了 30-31 分钟，用户体验不一致，而且运营和产品通常不允许这种偏差。选项 C 增加消费者数量不仅不能解决惊群，反而可能加剧问题——100 个消费者同时从 Redis 轮询会增加 Redis 压力。选项 D 增大轮询间隔会导致大量到期任务积压，用户等待取消的时间更长。"
+        },
+        {
+          "id": "redis-project-delay-queue-q1-quiz9",
+          "question": "Redis Sorted Set 延迟队列在 Redis 主节点宕机时可能丢失任务。以下哪种防护策略组合最完善？",
+          "choices": [
+            { "id": "A", "text": "AOF appendfsync everysec + 主从复制高可用 + MySQL 兜底表定时补偿扫描" },
+            { "id": "B", "text": "开启 RDB 持久化，配置 save 60 1000 每 60 秒至少 1000 次写入触发快照" },
+            { "id": "C", "text": "使用 Redis Cluster 即可保证数据零丢失，无需额外措施" },
+            { "id": "D", "text": "消费端处理成功后不执行 ZREM，依靠 EXPIRE 让 Sorted Set 自动过期清理" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "选项 A 提供了三层防护：AOF everysec 保证最多丢失 1 秒写入，主从复制（Sentinel 或 Cluster）保证主节点宕机后从节点自动接管，MySQL 兜底表作为最后一道防线——即使 Redis 整个集群不可用，定时扫描 MySQL 也能补偿遗漏的任务。选项 B 只用 RDB，两次快照之间的所有写入都会丢失，60 秒内可能丢上千个延迟任务。选项 C 错误，Redis Cluster 的主从复制是异步的，主节点宕机时少量尚未复制到从节点的数据会丢失，不是零丢失。选项 D 完全不可行——Sorted Set 的 EXPIRE 是对整个 key 生效而非单个 member，不 ZREM 的话已处理的任务下次轮询还会被取到。"
+        },
+        {
+          "id": "redis-project-delay-queue-q1-quiz10",
+          "question": "消费者从延迟队列取到任务 order:cancel:10001 后调用订单取消接口失败了。以下哪种重试策略最合理？",
+          "choices": [
+            { "id": "A", "text": "用 ZADD 重新入队，score 设为当前时间 + 指数退避延迟（5s × 2^重试次数），超过最大重试次数后进死信队列" },
+            { "id": "B", "text": "在消费端本地内存中记录失败任务，用 Timer 每 5 秒重试一次直到成功" },
+            { "id": "C", "text": "直接丢弃失败任务，因为下一次轮询会重新从 Sorted Set 取到它" },
+            { "id": "D", "text": "立即重试 3 次，如果仍然失败则记录日志后丢弃" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "选项 A 的重试策略最完善：ZADD 重新入队保证重试任务仍在 Redis 中被统一管理（可观测、可查询），指数退避（5s、10s、20s、40s...）避免频繁重试打垮下游服务，最大重试次数限制防止死循环，死信队列兜底方便人工排查和补偿。选项 B 在本地内存中记录意味着消费者重启后重试任务就丢了，且无法被其他消费者接管。选项 C 错误，任务在取出时已经被 ZREM 从 Sorted Set 中删除了（Lua 脚本保证了取出即删除），不会被再次轮询到。选项 D 立即重试 3 次可能在下游服务故障期间加重负担，而且失败后丢弃没有任何补救措施。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/zrangebyscore/",
+        "https://redis.io/docs/latest/commands/zadd/",
+        "https://redis.io/docs/latest/commands/zrem/",
+        "https://redis.io/docs/latest/develop/interact/programmability/eval-intro/",
+        "https://redis.io/docs/latest/develop/data-types/streams/"
+      ]
+    }
+  ]
+}
