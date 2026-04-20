@@ -1,0 +1,156 @@
+{
+  "id": "db-two-phase-commit",
+  "name": "Redo Log 与 Binlog 的两阶段提交",
+  "domain": "database",
+  "description": "InnoDB redo log 和 MySQL Server binlog 之间的内部 XA 两阶段提交协议，保证引擎层与服务层日志的崩溃一致性",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q082",
+      "domain": "database",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["MySQL", "两阶段提交", "2PC", "Redo Log", "Binlog", "XA", "crash recovery", "数据一致性"],
+      "title": "Redo Log 与 Binlog 的两阶段提交",
+      "content": "面试官问「MySQL 的 redo log 和 binlog 是怎么保证一致性的」时，答出「两阶段提交」三个字只是及格线。真正让面试官满意的回答，需要你解释清楚为什么两份日志之间存在不一致的风险、两阶段提交的每个步骤具体做了什么、崩溃恢复时 MySQL 怎么利用 XID 来决策 commit 还是 rollback，以及 innodb_flush_log_at_trx_commit 和 sync_binlog 这两个参数如何配合才能达到真正的零丢失。\n\n我们先来看一个困扰过不少 DBA 的真实生产场景。一个 MySQL 主从架构中，主库在执行一批 UPDATE 后突然断电。重启后主库数据正常恢复了，但从库通过 binlog 回放后发现少了几条记录——主从数据不一致。排查时在主库的 error log 中看到这样的信息：\n\n```\n2024-03-15T08:23:17.832451Z 0 [Note] [MY-012551] [InnoDB]\n  InnoDB: Starting crash recovery.\n2024-03-15T08:23:17.901224Z 0 [Note] [MY-013546] [InnoDB]\n  InnoDB: 3 transaction(s) which must be rolled back or cleaned up in total 7 row operations.\n2024-03-15T08:23:18.012385Z 0 [Note] [MY-010232] [Server]\n  Recovering after a crash using mysql-bin.000047\n2024-03-15T08:23:18.156721Z 0 [Note] [MY-010235] [Server]\n  XA RECOVER found 2 prepared transactions in InnoDB, \n  1 matched with binlog, committed; 1 not found in binlog, rolled back.\n```\n\n关键信息在最后一行：崩溃恢复时发现了 2 个处于 prepared 状态的事务，其中 1 个在 binlog 中找到了对应的 XID（说明 binlog 已写成功），所以将其 commit；另 1 个在 binlog 中没有对应记录，所以 rollback。这正是两阶段提交的崩溃恢复逻辑在工作。\n\n要理解为什么需要这套机制，你需要先搞清楚 redo log 和 binlog 分属不同的「管辖范围」这个前提。以下是排查相关问题的核心参数：\n\n```sql\n-- 两阶段提交相关参数\nSHOW VARIABLES LIKE 'innodb_flush_log_at_trx_commit';  -- 1=每次提交 fsync redo log\nSHOW VARIABLES LIKE 'sync_binlog';                      -- 1=每次提交 fsync binlog\n\n-- 查看当前 binlog 状态（MySQL 8.0.22+）\nSHOW BINARY LOG STATUS;\n\n-- 查看 XA 事务恢复信息\nXA RECOVER CONVERT xid;\n```\n\n这道题要求你从 redo log 和 binlog 的「双日志」架构出发，讲清楚为什么需要两阶段提交来协调它们，然后展开 prepare/commit 两个阶段的完整流程和崩溃恢复决策逻辑，最后延伸到 group commit 优化和生产环境的参数最佳实践。",
+      "answer": "## 一、双日志架构：为什么 MySQL 有两套日志系统\n\nMySQL 的存储引擎是插件式的，InnoDB 只是其中一个引擎。这种架构设计导致了一个关键事实：redo log 是 InnoDB 引擎层的私有日志，而 binlog 是 MySQL Server 层的通用日志。两者分属不同的代码模块，有不同的写入路径、不同的刷盘时机、不同的用途。Redo log 的职责是保证引擎层的崩溃恢复能力——事务提交后即使还没刷脏页就断电，重启后可以通过重放 redo log 把数据恢复到提交后的状态。Binlog 的职责则是主从复制和数据归档——从库通过回放主库的 binlog 来同步数据，DBA 通过 binlog 做时间点恢复（Point-in-Time Recovery）。\n\n正因为两者的管辖范围不同，它们必须在事务提交时保持一致。如果 redo log 说某个事务已经提交，但 binlog 中没有这个事务的记录，那主库数据恢复后包含这个事务的修改，而从库永远收不到这个事务——主从就不一致了。反过来，如果 binlog 已经写入了某个事务，但 redo log 还没有标记为 committed，主库崩溃恢复时回滚了这个事务，可从库已经通过 binlog 执行了它——同样不一致。这两种场景都是灾难性的，在金融、电商等对数据一致性要求极高的业务中不可接受。\n\n## 二、两阶段提交的完整流程\n\n为了解决这个一致性问题，MySQL 在 InnoDB 和 Server 层之间实现了一个内部 XA 协议（也叫 internal two-phase commit）。所谓 XA 是 X/Open 组织定义的分布式事务规范，其核心思想是把提交拆成 prepare（准备）和 commit（提交）两个阶段。MySQL 虽然不是真正的分布式系统，但 redo log 和 binlog 分属两个独立的持久化子系统，本质上面临和分布式事务一样的原子性问题，所以复用了 XA 的思路。\n\n当一个事务执行 COMMIT 语句时，MySQL 内部走过以下流程。首先进入 prepare 阶段：InnoDB 将该事务产生的所有 redo log 从 log buffer 刷到磁盘（根据 innodb_flush_log_at_trx_commit 的设置决定刷到哪一层），并在 redo log 中写入一条带有唯一事务标识 XID 的 prepare 记录，把这个事务在 redo log 中的状态标记为 prepared。此时事务在引擎层已经「准备好了」，但还没有正式提交。\n\n接下来进入 commit 阶段，这个阶段又分为两步。第一步是写 binlog：MySQL Server 层将该事务的 binlog event 写入 binlog 文件，这些 event 中同样包含了 XID 信息（对应 Xid_log_event）。当 sync_binlog=1 时，写完后立即 fsync 确保 binlog 落盘。第二步是 commit redo log：InnoDB 在 redo log 中将该事务的状态从 prepared 更新为 committed。到这一步完成，事务才算真正提交成功。\n\n整个流程可以简化为一个确定的时序：write redo log (prepare) → write binlog (with XID) → write redo log (commit)。关键在于 binlog 的写入被夹在 redo log 的两个状态之间，这让崩溃恢复时可以通过 binlog 中是否存在对应 XID 来做出确定性的决策。\n\n## 三、崩溃恢复的决策逻辑\n\nMySQL 崩溃重启时，InnoDB 会扫描 redo log 找到所有处于 prepared 状态的事务（即已经 prepare 但还没有 commit 标记的事务）。对于每一个这样的事务，恢复逻辑去 binlog 中查找是否存在相同 XID 的完整事务记录。如果找到了，说明这个事务的 binlog 在崩溃前已经成功写入磁盘，此时将该事务在 redo log 中标记为 committed（提交它）。如果没找到，说明崩溃发生在 binlog 写入之前或写入中途（不完整），此时将该事务 rollback。\n\n这套逻辑的正确性建立在一个关键前提上：binlog 的写入是原子的。MySQL 通过在每个事务的 binlog event 序列末尾写入 XID event 来保证这一点——只有完整写入了 XID event 的事务才被认为有效。如果崩溃发生在 binlog 写入到一半的时候，由于 XID event 还没写入，恢复时不会认为这个事务的 binlog 是有效的，因此会回滚它。\n\n那么在不同时间点崩溃会发生什么？如果崩溃在 prepare 之前，事务既没有 prepare 的 redo log 也没有 binlog，直接丢弃，没有任何影响。如果崩溃在 prepare 之后、binlog 写入之前，redo log 中有 prepared 记录但 binlog 中找不到 XID，恢复时 rollback——主库和从库都不会有这个事务的数据，一致。如果崩溃在 binlog 写入之后、redo log commit 标记之前，redo log 中是 prepared 状态且 binlog 中有完整 XID，恢复时 commit——主库恢复了这个事务，从库通过 binlog 也会执行它，一致。\n\n## 四、innodb_flush_log_at_trx_commit 与 sync_binlog 的配合\n\n两阶段提交保证了逻辑一致性，但如果日志本身没有落盘，逻辑再正确也没用。innodb_flush_log_at_trx_commit 控制 redo log 的刷盘策略，sync_binlog 控制 binlog 的刷盘策略。只有两者都设为 1（业界称为「双 1 配置」）时，才能在任何故障场景下保证零数据丢失。\n\nsync_binlog 的含义是每隔多少个事务执行一次 binlog 的 fsync。设为 1 表示每个事务提交都 fsync binlog，设为 0 表示由操作系统决定何时刷盘（通常每 30 秒），设为 N（N>1）表示每 N 个事务 fsync 一次。非 1 的配置在断电时可能丢失最后若干个已提交事务的 binlog，导致即使 redo log 恢复了这些事务，从库也永远收不到它们。\n\n双 1 配置的性能代价是每个事务提交需要两次 fsync（一次 redo log，一次 binlog）。在不使用 group commit 的极端情况下，假设 NVMe SSD 的 fsync 延迟为 80μs，那么单线程串行提交的理论上限是 1000000/(80*2) ≈ 6250 TPS。但 MySQL 的 group commit 机制可以将多个事务的 fsync 合并，实际生产中双 1 配置下高并发写入达到 2-5 万 TPS 是完全可行的。\n\n## 五、Group Commit 优化：三阶段流水线\n\nMySQL 5.6 引入了 binlog group commit，将事务提交拆分为三个阶段形成流水线：flush 阶段（将 binlog 从 binlog cache 写入 binlog 文件的 page cache）、sync 阶段（对 binlog 文件执行 fsync）、commit 阶段（在 InnoDB 中完成事务提交并释放锁）。每个阶段都有一个队列，第一个进入队列的事务成为 leader，负责带领队列中所有事务一起执行该阶段的操作。这意味着一次 fsync 可以为整个队列中的所有事务服务，大幅降低了 fsync 频率。\n\nbinlog_group_commit_sync_delay 参数控制 sync 阶段 leader 在执行 fsync 前最多等待多少微秒来攒更多事务（默认 0，不等待）。binlog_group_commit_sync_no_delay_count 控制达到多少个事务后不再等待直接执行 fsync。在高并发写入场景下，设置 binlog_group_commit_sync_delay=2000（2ms）可以显著提升吞吐量，代价是每个事务的提交延迟增加最多 2ms。\n\nbinlog_order_commits 参数（默认 ON）控制事务在 commit 阶段是否按照 binlog 写入的顺序提交。开启时保证 binlog 中的事务顺序和 InnoDB commit 顺序一致，这对基于 binlog position 的并行复制很重要。MySQL 8.0.30 之后引入了 binlog transaction dependency tracking（binlog_transaction_dependency_tracking 参数），通过 WRITESET 模式让从库可以识别没有行冲突的事务并行回放，大幅提升了从库复制的并行度。\n\n## 六、生产环境监控与调优\n\n监控两阶段提交相关的健康状态，可以关注以下几个维度。通过 SHOW BINARY LOG STATUS（MySQL 8.0.22 之前是 SHOW MASTER STATUS）查看当前 binlog 文件位置和 GTID 执行集合。通过 SHOW ENGINE INNODB STATUS 中的 LOG 区段观察 redo log 的 LSN 推进速度。通过 Binlog_cache_disk_use 状态变量判断是否有事务的 binlog 太大超出 binlog_cache_size 溢出到临时文件（这会严重影响提交性能）。通过 performance_schema.events_stages_history_long 可以精确测量 group commit 三个阶段各花了多少时间。\n\n在 sync_binlog=1 的配置下，如果监控发现 binlog 的 fsync 延迟成为瓶颈（表现为 Binlog_sync 事件耗时高），有几个优化方向：首先确认存储设备的写入性能（NVMe 比 SATA SSD 的 fsync 延迟低 3-5 倍），其次调整 binlog_group_commit_sync_delay 来增大每次 fsync 的事务批次，最后考虑将 binlog 文件放在独立的高性能磁盘上以避免和数据文件竞争 I/O。MySQL 8.0 还引入了 binlog_expire_logs_auto_purge（默认开启）配合 binlog_expire_logs_seconds（默认 2592000 秒即 30 天）自动清理过期 binlog，避免磁盘空间被历史 binlog 耗尽。",
+      "keyPoints": [
+        "两阶段提交解决的核心问题是 redo log（InnoDB 引擎层）和 binlog（MySQL Server 层）分属两个独立子系统，没有协调机制时任一日志单独落盘都会导致主从数据不一致",
+        "提交时序为 write redo log (prepare with XID) → write binlog (with XID) → write redo log (commit)，binlog 写入被夹在 redo log 的两个状态变更之间",
+        "崩溃恢复的决策规则是扫描 redo log 中所有 prepared 状态的事务，在 binlog 中查找对应 XID——找到则 commit，找不到则 rollback",
+        "双 1 配置（innodb_flush_log_at_trx_commit=1 + sync_binlog=1）是唯一能在断电场景下保证 redo log 和 binlog 同时不丢数据的参数组合",
+        "binlog group commit 将提交拆为 flush/sync/commit 三阶段流水线，一次 fsync 服务一批事务，是双 1 配置下高并发写入性能的关键保障",
+        "binlog_group_commit_sync_delay 通过牺牲微量延迟（通常 1-2ms）来攒更多事务进同一个 fsync 批次，高并发场景下可提升吞吐量 2-5 倍",
+        "MySQL 8.0.30 的 WRITESET 模式通过追踪事务修改的行集合来标记无冲突事务的并行依赖关系，让从库并行复制不再受限于 binlog group commit 的分组边界"
+      ],
+      "quiz": [
+        {
+          "id": "db-q082-quiz-01",
+          "question": "MySQL 内部两阶段提交协调的是哪两个组件之间的一致性？",
+          "choices": [
+            {"id": "A", "text": "InnoDB redo log（引擎层日志）和 MySQL Server binlog（服务层日志）"},
+            {"id": "B", "text": "redo log 和 undo log（都属于 InnoDB 引擎内部）"},
+            {"id": "C", "text": "主库和从库之间的数据同步"},
+            {"id": "D", "text": "Buffer Pool 脏页和磁盘数据文件之间的一致性"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "MySQL 内部两阶段提交（internal XA）协调的是 InnoDB 引擎层的 redo log 和 MySQL Server 层的 binlog 之间的一致性。B 选项中 redo log 和 undo log 同属 InnoDB 内部，不存在跨层协调的问题。C 选项是复制协议解决的问题，不是 2PC 直接解决的。D 选项是 WAL 和 checkpoint 机制的职责。2PC 的本质是确保这两份独立日志对「事务是否提交」的结论始终一致。"
+        },
+        {
+          "id": "db-q082-quiz-02",
+          "question": "两阶段提交的正确时序是什么？",
+          "choices": [
+            {"id": "A", "text": "write binlog → write redo log (prepare) → write redo log (commit)"},
+            {"id": "B", "text": "write redo log (prepare) → write binlog → write redo log (commit)"},
+            {"id": "C", "text": "write redo log (commit) → write binlog → 完成提交"},
+            {"id": "D", "text": "write redo log (prepare) → write redo log (commit) → write binlog"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确的两阶段提交时序是：先在 redo log 中写入 prepare 标记（prepare 阶段），再写入 binlog（commit 阶段第一步），最后在 redo log 中写入 commit 标记（commit 阶段第二步）。binlog 被夹在 redo log 的 prepare 和 commit 之间，这样崩溃恢复时才能通过检查 binlog 中有无对应 XID 来做出确定性决策。A 选项的顺序无法保证 redo log 的 prepare 语义，C 和 D 选项都在 binlog 写入前就标记了 commit，会导致 binlog 丢失时已提交事务无法恢复。"
+        },
+        {
+          "id": "db-q082-quiz-03",
+          "question": "崩溃恢复时发现一个事务在 redo log 中处于 prepared 状态，MySQL 怎么决定 commit 还是 rollback？",
+          "choices": [
+            {"id": "A", "text": "统一 rollback 所有 prepared 状态的事务以保证安全"},
+            {"id": "B", "text": "统一 commit 所有 prepared 状态的事务因为它们已经准备好了"},
+            {"id": "C", "text": "检查 binlog 中是否存在该事务对应的完整 XID 记录——有则 commit，无则 rollback"},
+            {"id": "D", "text": "检查 undo log 中是否有该事务的回滚段——有则 rollback，无则 commit"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "崩溃恢复的决策逻辑是以 binlog 为裁判：如果 binlog 中存在该事务的完整 XID event，说明 binlog 已成功写入，从库可能已经收到并执行了这个事务，所以必须 commit 以保持主从一致；如果 binlog 中找不到对应 XID，说明 binlog 写入在崩溃时尚未完成，从库不会有这个事务，所以 rollback。A 选项会丢失已经同步到从库的数据。B 选项可能提交一个 binlog 缺失的事务导致主从不一致。D 选项混淆了 undo log 的作用——undo log 存在只说明事务执行过，不能判断是否应该提交。"
+        },
+        {
+          "id": "db-q082-quiz-04",
+          "question": "如果没有两阶段提交，redo log 先 commit 然后写 binlog 时崩溃会导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "主库丢失已提交数据，从库数据正常"},
+            {"id": "B", "text": "主库恢复后有该事务数据，但从库因 binlog 缺失永远同步不到，主从不一致"},
+            {"id": "C", "text": "主库和从库都正常，不会有问题"},
+            {"id": "D", "text": "从库会收到多余的数据，主库反而没有"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "如果 redo log 直接 commit 然后在写 binlog 前崩溃，主库重启时 redo log 有 committed 标记会正常恢复这个事务的数据。但 binlog 中没有这个事务的记录，从库永远收不到对应的 event，于是主库有该事务的修改而从库没有——这就是经典的主从数据不一致。这正是两阶段提交要防止的核心场景。通过 2PC，redo log 在 binlog 成功写入前只能处于 prepared 状态，崩溃恢复时会根据 binlog 的存在与否来最终决策。"
+        },
+        {
+          "id": "db-q082-quiz-05",
+          "question": "以下 SHOW ENGINE INNODB STATUS 输出表示什么状态？\n\nTrx id: 28190324 state: prepared\nMySQL thread id 47, query: COMMIT\nundo log entries 3",
+          "choices": [
+            {"id": "A", "text": "事务已完成 prepare 阶段正在等待写 binlog 或执行 commit，此时如果崩溃将根据 binlog 中有无 XID 决定提交或回滚"},
+            {"id": "B", "text": "事务正在执行中还没开始提交，state: prepared 表示 SQL 语句已准备好执行"},
+            {"id": "C", "text": "事务已经完全提交成功，prepared 是提交后的最终状态"},
+            {"id": "D", "text": "事务遇到了锁等待，prepared 表示等待其他事务释放锁"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "InnoDB 事务的 state: prepared 明确表示该事务已经完成两阶段提交的第一阶段（prepare），redo log 中已写入 prepare 标记和 XID。此时事务正处于 prepare 和 commit 之间的窗口——可能正在写 binlog 或等待 fsync。如果此刻崩溃，恢复时 MySQL 会检查 binlog 中是否有对应 XID 来决策。B 选项混淆了 MySQL prepared statement 和 XA prepared 状态。C 选项完全错误，committed 才是最终状态。D 选项混淆了 lock wait 和 prepared 状态。"
+        },
+        {
+          "id": "db-q082-quiz-06",
+          "question": "关于「双 1 配置」的说法，哪个是错误的？",
+          "choices": [
+            {"id": "A", "text": "innodb_flush_log_at_trx_commit=1 保证每次事务提交 redo log 都 fsync 到磁盘"},
+            {"id": "B", "text": "sync_binlog=1 保证每次事务提交 binlog 都 fsync 到磁盘"},
+            {"id": "C", "text": "双 1 配置下即使不用两阶段提交也能保证主从一致性"},
+            {"id": "D", "text": "双 1 配置是性能代价最高的安全配置，每次提交需要两次 fsync"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "双 1 配置只保证每份日志都物理落盘，但不保证两份日志之间的逻辑一致性。设想一个极端场景：即使双 1 配置下，如果 redo log 先 commit 再写 binlog，在 redo log fsync 成功后、binlog fsync 之前断电，redo log 在磁盘上有 commit 标记但 binlog 磁盘上没有该事务——仍然不一致。双 1 是物理层面的保障（数据不丢），两阶段提交是逻辑层面的保障（两份日志对事务提交结论一致）。两者互补，缺一不可。"
+        },
+        {
+          "id": "db-q082-quiz-07",
+          "question": "Binlog group commit 的三阶段流水线正确的顺序是什么？",
+          "choices": [
+            {"id": "A", "text": "prepare → sync → commit"},
+            {"id": "B", "text": "flush → sync → commit"},
+            {"id": "C", "text": "write → flush → sync"},
+            {"id": "D", "text": "sync → flush → commit"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MySQL 5.6 引入的 binlog group commit 将事务提交拆成三个阶段形成流水线：flush 阶段将 binlog 从各事务的 binlog cache 写入 binlog 文件的 OS page cache（write 系统调用），sync 阶段对 binlog 文件执行 fsync 保证落盘，commit 阶段在 InnoDB 中完成最终提交并释放锁。每个阶段有独立队列，leader 带领整个队列的事务批量执行该阶段操作。A 选项混淆了 XA 的 prepare 阶段和 group commit 的流水线阶段。C 和 D 选项顺序不正确。"
+        },
+        {
+          "id": "db-q082-quiz-08",
+          "question": "生产环境中 sync_binlog 设为 0 或大于 1 时，在什么场景下会暴露问题？",
+          "choices": [
+            {"id": "A", "text": "服务器断电时可能丢失最后若干个已提交事务的 binlog，导致从库比主库少数据且无法自动修复"},
+            {"id": "B", "text": "只有 MySQL 进程崩溃时才会丢数据，服务器断电不受影响"},
+            {"id": "C", "text": "不会丢数据，只是 binlog 文件会出现碎片影响读取性能"},
+            {"id": "D", "text": "主库不受影响，只影响从库的复制延迟"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "sync_binlog 非 1 时，binlog 写入后可能只到达 OS page cache 而未 fsync 到磁盘。如果此时服务器断电（不是 MySQL 进程崩溃——进程崩溃时 OS 还活着会把 page cache 刷盘），page cache 中未 fsync 的 binlog 数据会丢失。主库通过 redo log 恢复了事务数据，但 binlog 缺失导致从库永远同步不到这些事务。B 选项恰好说反了——进程崩溃时 OS page cache 还在不丢数据，断电时 page cache 会丢。C 和 D 选项低估了数据丢失的严重性。"
+        },
+        {
+          "id": "db-q082-quiz-09",
+          "question": "MySQL 8.0 的 binlog_transaction_dependency_tracking 设为 WRITESET 模式时对从库复制有什么影响？",
+          "choices": [
+            {"id": "A", "text": "从库可以识别修改不同行的事务并行回放，不再受限于主库 group commit 的分组边界，大幅提升并行复制效率"},
+            {"id": "B", "text": "从库的复制方式从异步变为半同步，延迟会增加"},
+            {"id": "C", "text": "只影响主库的 binlog 写入性能，与从库复制无关"},
+            {"id": "D", "text": "会跳过所有 DDL 语句的复制以提升速度"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "WRITESET 模式下，主库在生成 binlog 时会计算每个事务修改了哪些行（通过 hash），并将依赖关系信息写入 binlog 的事务头部。从库的 MTS（Multi-Threaded Slave）线程可以据此判断哪些事务修改了不同的行集合，没有行冲突的事务可以并行回放，即使它们在主库不属于同一个 group commit 批次。这比基于 COMMIT_ORDER 的并行复制粒度更细，尤其在主库并发度不高但事务间无行冲突的场景下提升明显。MySQL 8.0.30 后该特性更加成熟稳定。"
+        },
+        {
+          "id": "db-q082-quiz-10",
+          "question": "DBA 发现双 1 配置下高并发写入 TPS 无法突破 5000，排查发现 binlog fsync 耗时占比最高。以下哪个优化方向最合适？",
+          "choices": [
+            {"id": "A", "text": "关闭 binlog 以消除 fsync 开销"},
+            {"id": "B", "text": "设置 binlog_group_commit_sync_delay=1000~2000 微秒增大每次 fsync 的事务批次，牺牲少量延迟换取吞吐量"},
+            {"id": "C", "text": "将 sync_binlog 改为 0 彻底消除 binlog 的 fsync"},
+            {"id": "D", "text": "减小 binlog_cache_size 以减少每次 fsync 的数据量"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在需要保持双 1 配置（不降低数据安全性）的前提下，binlog_group_commit_sync_delay 是最合适的优化手段。设置 1000-2000 微秒的延迟让 sync 阶段的 leader 等待更多事务加入同一批次，一次 fsync 服务 50-200 个事务而不是 5-10 个，fsync 总次数大幅减少而每个事务只多等 1-2ms。A 选项关闭 binlog 会丧失主从复制和数据恢复能力。C 选项降低了数据安全级别。D 选项理解错了——binlog_cache_size 是单事务 binlog 缓冲大小，减小它反而可能导致事务 binlog 溢出到磁盘临时文件，性能更差。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-two-phase-commit.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/binary-log-group-commit.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/replication-options-binary-log.html#sysvar_sync_binlog",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_flush_log_at_trx_commit"
+      ]
+    }
+  ]
+}
