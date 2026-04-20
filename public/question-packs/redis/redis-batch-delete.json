@@ -1,0 +1,168 @@
+{
+  "id": "redis-batch-delete",
+  "name": "批量删除大量 key 的几种安全方案",
+  "domain": "redis",
+  "description": "Redis 大规模 key 安全删除的多种方案与生产实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-batch-delete-q1",
+      "domain": "redis",
+      "type": "practice",
+      "difficulty": 2,
+      "tags": ["Redis", "批量删除", "SCAN", "UNLINK", "运维"],
+      "title": "批量删除大量 key 的几种安全方案",
+      "content": "## 面试场景\n\n你负责一个电商平台的 Redis 6.2 集群（3 主 3 从，每个主节点约 4000 万 key），承载购物车、Session、商品详情缓存等核心业务。某次大促结束后，运营要求清理所有以 `promo:618:` 为前缀的活动缓存 key，经排查这批 key 总量约 320 万个，类型混合（String 占 70%、Hash 占 25%、Set 占 5%）。\n\n一位初级工程师在凌晨三点的维护窗口执行了如下操作：\n\n```bash\nredis-cli KEYS \"promo:618:*\" | xargs redis-cli DEL\n```\n\n执行后 Grafana 监控显示：`instantaneous_ops_per_sec` 从正常的 12 万 ops/s 骤降为 0，`blocked_clients` 瞬间攀升至 1400+，`connected_clients` 开始堆积。整个过程持续 8.3 秒。8.3 秒内所有业务请求——包括购物车加购、下单支付——全部超时失败。事后复盘发现 `KEYS` 命令对 4000 万 key 的全量扫描耗时约 3.1 秒，紧接着对返回的 320 万 key 逐个执行 `DEL` 又耗时约 5.2 秒（其中大量 Hash key 包含数千个 field）。\n\n这次事故暴露了两个致命问题：第一，`KEYS` 命令的时间复杂度是 O(N)，N 是整个 keyspace 的 key 总数——不是匹配的 key 数量，而是全量 key 数量。在 4000 万 key 的实例上执行 `KEYS *` 意味着主线程要遍历完整的全局哈希表，期间无法处理任何其他命令。第二，`DEL` 对集合类型 key 是同步释放内存，大量 Hash/Set 的连续 DEL 让主线程持续阻塞。\n\n面试官问你：生产环境中需要批量删除数百万 key 时，有哪些安全方案可以做到「业务无感知」？每种方案的适用场景、性能特征和实现细节是什么？请给出可直接在生产环境使用的脚本或代码。",
+      "answer": "## 第一步：核心主体概念基础详解——为什么朴素的批量删除是危险的\n\nRedis 的单线程命令执行模型决定了任何长耗时命令都会阻塞整个实例。批量删除 key 的朴素做法通常分两步：先用 `KEYS pattern` 获取目标 key 列表，再对列表逐个或批量执行 `DEL`。这两步各有致命缺陷。\n\n`KEYS` 命令的实现是对 Redis 全局哈希表的线性遍历，源码路径 `db.c` 中的 `keysCommand()` 调用 `dictScan()` 遍历 `server.db[i].dict`，逐个 key 做 pattern 匹配。时间复杂度 O(N)，N 为当前数据库的 key 总数。在 4000 万 key 的实例上实测，即使 pattern 只匹配 1 个 key，`KEYS` 仍需遍历全部 4000 万个 entry，耗时约 2.5-4 秒（取决于 CPU 频率和内存访问延迟）。这 2.5-4 秒内 Redis 完全停摆，等同于宕机。Redis 官方文档在 `KEYS` 命令页面用红色警告标注：「Don't use KEYS in your regular application code. It is intended for debugging and special operations only.」\n\n`DEL` 命令虽然单条执行对 String 类型只需微秒级，但当连续执行数百万次时累积效应不可忽视。更危险的是集合类型 key——一个 5000 field 的 Hash 执行 `DEL` 约需 3-5ms，320 万 key 中若有 80 万个这样的 Hash，仅 DEL 的累积阻塞就超过 4000 秒（当然实际是在 pipeline 中分摊，但单次 DEL 的阻塞依然存在）。Redis 4.0 引入的 `UNLINK` 命令通过将内存释放下推到后台 `bio_lazy_free` 线程，将主线程阻塞降至 O(1)，是批量删除场景的必选命令。\n\n安全批量删除的核心原则可以概括为三点：用 `SCAN` 替代 `KEYS` 实现增量式游标遍历；用 `UNLINK` 替代 `DEL` 实现异步内存释放；在批次之间引入主动限流（sleep）确保 Redis 有时间处理正常业务请求。\n\n## 第二步：题目核心问题精准深度解答——四种安全删除方案\n\n### 方案一：SCAN + UNLINK + Pipeline 分批删除（推荐方案）\n\n`SCAN` 命令（Redis 2.8.0+）是 `KEYS` 的安全替代品。它使用游标（cursor）机制增量遍历 keyspace，每次调用只返回少量 key（由 `COUNT` 参数建议，默认 10），不会阻塞主线程。时间复杂度：单次调用 O(1)~O(COUNT)，全量遍历 O(N) 但分散在多次网络往返中。\n\n生产级 Shell 脚本实现：\n\n```bash\n#!/bin/bash\n# safe-batch-delete.sh —— SCAN + UNLINK 安全批量删除\nHOST=\"10.0.2.31\"\nPORT=6379\nPATTERN=\"promo:618:*\"\nBATCH=200\nSLEEP_MS=50\nDELETED=0\n\ncursor=0\nwhile true; do\n  result=$(redis-cli -h $HOST -p $PORT SCAN $cursor MATCH \"$PATTERN\" COUNT $BATCH)\n  cursor=$(echo \"$result\" | head -1)\n  keys=$(echo \"$result\" | tail -n +2)\n\n  if [ -n \"$keys\" ]; then\n    count=$(echo \"$keys\" | wc -l)\n    echo \"$keys\" | xargs redis-cli -h $HOST -p $PORT UNLINK\n    DELETED=$((DELETED + count))\n    echo \"[$(date '+%H:%M:%S')] deleted: $DELETED, cursor: $cursor\"\n  fi\n\n  if [ \"$cursor\" == \"0\" ]; then\n    echo \"Done. Total deleted: $DELETED\"\n    break\n  fi\n\n  # 限流：每批之间休眠，让 Redis 处理正常业务\n  sleep $(echo \"scale=3; $SLEEP_MS/1000\" | bc)\ndone\n```\n\n更高效的一行式写法（适合运维快速执行）：\n\n```bash\nredis-cli -h 10.0.2.31 --scan --pattern \"promo:618:*\" | xargs -L 200 redis-cli -h 10.0.2.31 UNLINK\n```\n\n这条命令利用 `redis-cli --scan`（底层调用 SCAN）逐批输出 key，`xargs -L 200` 每累积 200 行就调用一次 `UNLINK`。缺点是没有限流，如果 key 量特别大（千万级），建议用脚本版本加入 sleep。\n\n### 方案二：Go 语言生产级实现（带限流与进度监控）\n\n```go\npackage main\n\nimport (\n    \"context\"\n    \"fmt\"\n    \"time\"\n\n    \"github.com/redis/go-redis/v9\" // go-redis v9.5+\n)\n\nfunc SafeBatchDelete(ctx context.Context, rdb *redis.Client, pattern string, batchSize int64, sleepPerBatch time.Duration) (int64, error) {\n    var (\n        cursor  uint64\n        deleted int64\n        start   = time.Now()\n    )\n\n    for {\n        keys, nextCursor, err := rdb.Scan(ctx, cursor, pattern, batchSize).Result()\n        if err != nil {\n            return deleted, fmt.Errorf(\"SCAN failed at cursor %d: %w\", cursor, err)\n        }\n\n        if len(keys) > 0 {\n            // Pipeline 批量 UNLINK，一次网络往返删除整批\n            pipe := rdb.Pipeline()\n            for _, key := range keys {\n                pipe.Unlink(ctx, key)\n            }\n            _, err = pipe.Exec(ctx)\n            if err != nil {\n                return deleted, fmt.Errorf(\"pipeline UNLINK failed: %w\", cursor, err)\n            }\n            deleted += int64(len(keys))\n        }\n\n        // 进度日志：每删除 1 万条打印一次\n        if deleted%10000 < batchSize {\n            elapsed := time.Since(start).Seconds()\n            rate := float64(deleted) / elapsed\n            fmt.Printf(\"[%s] deleted: %d, rate: %.0f keys/s, cursor: %d\\n\",\n                time.Now().Format(\"15:04:05\"), deleted, rate, nextCursor)\n        }\n\n        cursor = nextCursor\n        if cursor == 0 {\n            break\n        }\n\n        // 限流休眠，保护 Redis 主线程\n        time.Sleep(sleepPerBatch)\n    }\n\n    fmt.Printf(\"Completed. Total deleted: %d, duration: %s\\n\", deleted, time.Since(start))\n    return deleted, nil\n}\n```\n\n调用示例：`SafeBatchDelete(ctx, rdb, \"promo:618:*\", 200, 20*time.Millisecond)` 每批 200 key、批间休眠 20ms，对 320 万 key 大约需要 6-8 分钟完成，期间 Redis 的 ops/s 几乎无感知下降。\n\n### 方案三：设置 TTL 让 Redis 自动过期（适合「不急」的场景）\n\n如果业务允许这些 key 在未来几分钟内逐渐消失而非立刻全部删除，可以用 `EXPIRE` 给每个 key 设置一个短 TTL：\n\n```bash\nredis-cli --scan --pattern \"promo:618:*\" | while read key; do\n  redis-cli EXPIRE \"$key\" $((RANDOM % 60 + 1))  # 1-60秒随机 TTL\ndone\n```\n\n优势在于 Redis 的过期机制本身就是分散式的——主动过期（`activeExpireCycle`）每 100ms 随机检查 20 个 key，惰性过期在访问时检查。配合 `lazyfree-lazy-expire yes` 配置，过期 key 的内存释放也是异步的。这种方案对 Redis 的瞬时压力最小，但代价是删除不是即时的，且在 TTL 到期前 key 仍然可被访问到。\n\n### 方案四：Lazy Rename —— 重命名后后台慢删（适合前缀整体迁移）\n\n如果要删除的 key 共享同一前缀且业务可以接受「换前缀」的语义，可以用 Lua 脚本将目标 key 批量 RENAME 到 `trash:` 前缀下，然后用低优先级后台任务慢慢清理 `trash:*`：\n\n```lua\n-- rename-to-trash.lua（在每个 SCAN 批次中执行）\nlocal keys = redis.call('SCAN', ARGV[1], 'MATCH', ARGV[2], 'COUNT', ARGV[3])\nlocal cursor = keys[1]\nfor _, key in ipairs(keys[2]) do\n    redis.call('RENAME', key, 'trash:' .. key)\nend\nreturn cursor\n```\n\n然后用一个独立的 worker 以极低速率（每秒 50-100 key）SCAN `trash:*` 并 UNLINK。这种模式的好处是业务侧可以立刻认为「旧 key 已删除」（因为原前缀不存在了），实际内存回收在后台缓慢进行。\n\n## 第三步：体系化扩展延伸——生产监控与事故防御\n\n### 删除过程中的监控指标\n\n执行批量删除时，应同时在另一个终端监控 Redis 的核心指标：\n\n```bash\nredis-cli --stat -i 1  # 每秒刷新一次关键指标\n# 或者精确监控：\nwatch -n 1 'redis-cli INFO stats | grep -E \"instantaneous_ops|blocked_clients|used_memory_human\"'\n```\n\n关键阈值：如果 `instantaneous_ops_per_sec` 下降超过正常值的 30%，说明限流不够，应增加 sleep 时间；如果 `blocked_clients` 出现非零值，说明已经有客户端被阻塞，应立即暂停删除。\n\n### SCAN 的注意事项\n\n`SCAN` 的 `COUNT` 参数是「建议值」而非「精确值」，实际返回的 key 数量可能多于或少于 COUNT。在 Redis Cluster 模式下需要对每个主节点分别执行 SCAN（或使用客户端库的 cluster scan 封装）。SCAN 遍历期间如果有新 key 写入，这些 key 可能被遍历到也可能被跳过，但保证不会重复返回同一个 key（Redis 使用 reverse binary iteration 算法保证这一点）。\n\n### 真实事故回顾\n\n2023 年某社交平台运维在一台承载 5200 万 key 的 Redis 7.0 实例上执行 `KEYS user:session:*` 试图统计 Session 数量，结果主线程阻塞 8 秒，触发 Sentinel 主从切换。切换期间新主尚未完成全量同步，导致 2.3 秒的数据不可用窗口。事后该团队在所有生产 Redis 实例上通过 `rename-command KEYS \"\"` 彻底禁用了 KEYS 命令，并在 ACL 规则中对运维账号也移除了 KEYS 权限。这是防御性最强的做法——从根源上消除误操作的可能性。",
+      "keyPoints": [
+        "KEYS 命令的时间复杂度 O(N) 中的 N 是整个 keyspace 的 key 总数而非匹配数量，4000 万 key 的实例上执行 KEYS 可阻塞主线程 3-4 秒，等同于服务宕机",
+        "SCAN 命令使用游标增量遍历，单次调用 O(1)~O(COUNT)，不阻塞主线程，是生产环境唯一应该使用的 key 遍历方式",
+        "UNLINK（Redis 4.0+）将内存释放下推到后台 bio_lazy_free 线程，主线程只做 O(1) 的 keyspace 摘除，批量删除场景必须用 UNLINK 替代 DEL",
+        "Pipeline 批量提交可以将数百次 UNLINK 合并为一次网络往返，显著降低客户端与 Redis 间的 RTT 开销，配合 SCAN 的 COUNT 参数控制每批大小",
+        "批次间引入 sleep 限流是保护 Redis 主线程的关键——建议每批 100-500 key、批间休眠 10-50ms，删除期间持续监控 instantaneous_ops_per_sec 和 blocked_clients",
+        "TTL 方案利用 Redis 自身的过期机制分散删除压力，配合 lazyfree-lazy-expire yes 实现异步内存释放，适合对删除时效性要求不高的场景",
+        "生产环境应通过 rename-command KEYS \"\" 或 ACL 规则彻底禁用 KEYS 命令，从根源上杜绝误操作导致的全量扫描阻塞"
+      ],
+      "quiz": [
+        {
+          "id": "redis-batch-delete-q1-quiz1",
+          "question": "在一个包含 5000 万 key 的 Redis 实例上执行 KEYS \"user:*\"（匹配到 200 万 key），主线程的阻塞时间主要取决于什么？",
+          "choices": [
+            { "id": "A", "text": "匹配到的 200 万 key 的数量" },
+            { "id": "B", "text": "整个 keyspace 的 5000 万 key 总数" },
+            { "id": "C", "text": "匹配到的 key 的 value 总大小" },
+            { "id": "D", "text": "pattern 字符串 \"user:*\" 的正则复杂度" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "KEYS 命令的实现是对全局哈希表的线性遍历（dictScan），无论 pattern 匹配多少 key，它都必须检查 keyspace 中的每一个 entry。因此阻塞时间与总 key 数成正比，5000 万 key 大约需要 3-5 秒完整遍历。选项 A 错误，匹配数量只影响返回结果的序列化时间（相对遍历时间可忽略）；选项 C 错误，KEYS 不读取 value，只检查 key 名称；选项 D 错误，Redis 使用的是 glob 风格的简单通配符匹配而非正则表达式，单次匹配开销极低。"
+        },
+        {
+          "id": "redis-batch-delete-q1-quiz2",
+          "question": "以下哪条命令可以在生产环境安全地增量遍历 keyspace？",
+          "choices": [
+            { "id": "A", "text": "KEYS * COUNT 100" },
+            { "id": "B", "text": "SCAN 0 MATCH \"prefix:*\" COUNT 100" },
+            { "id": "C", "text": "DBSCAN MATCH \"prefix:*\" LIMIT 100" },
+            { "id": "D", "text": "ITERATE 0 PATTERN \"prefix:*\" BATCH 100" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SCAN 命令（Redis 2.8.0+）是唯一正确的增量遍历方式，语法为 SCAN cursor [MATCH pattern] [COUNT hint]。它使用游标机制分批返回 key，每次调用只处理哈希表的一小部分 slot，不会阻塞主线程。选项 A 错误，KEYS 命令不支持 COUNT 参数，它总是一次性返回所有匹配结果；选项 C 错误，Redis 中不存在 DBSCAN 命令；选项 D 错误，Redis 中不存在 ITERATE 命令。只有 SCAN、HSCAN、SSCAN、ZSCAN 是 Redis 提供的游标遍历命令族。"
+        },
+        {
+          "id": "redis-batch-delete-q1-quiz3",
+          "question": "SCAN 命令的 COUNT 参数的实际作用是什么？",
+          "choices": [
+            { "id": "A", "text": "严格限制每次返回的 key 数量，绝不超过该值" },
+            { "id": "B", "text": "作为建议值告诉 Redis 每次大约遍历多少个哈希表 slot，实际返回数量可能多于或少于该值" },
+            { "id": "C", "text": "设置 SCAN 命令的最大执行时间（毫秒）" },
+            { "id": "D", "text": "限制 SCAN 总共返回的 key 数量上限" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "COUNT 是一个「hint」参数，Redis 内部根据它决定每次遍历多少个哈希表 bucket。由于一个 bucket 中可能有多个 key（哈希冲突），或者 bucket 正处于 rehash 过程中需要同时遍历新旧两张表，实际返回的 key 数量经常与 COUNT 值不同。选项 A 错误，COUNT 不是严格上限，一次 SCAN 可能返回 0 到数千个 key；选项 C 错误，COUNT 与执行时间无关，SCAN 没有超时控制参数；选项 D 错误，COUNT 只影响单次调用，要遍历所有匹配 key 需要循环调用直到 cursor 返回 0。"
+        },
+        {
+          "id": "redis-batch-delete-q1-quiz4",
+          "question": "批量删除场景中，使用 UNLINK 替代 DEL 的核心优势是什么？",
+          "choices": [
+            { "id": "A", "text": "UNLINK 可以一次删除多个 key 而 DEL 只能删除单个 key" },
+            { "id": "B", "text": "UNLINK 将实际内存释放交给后台线程完成，主线程只做 O(1) 的 keyspace 摘除，避免集合类型 key 的同步释放阻塞" },
+            { "id": "C", "text": "UNLINK 不会触发 keyspace notification，因此不会影响订阅了 __keyevent__ 的客户端" },
+            { "id": "D", "text": "UNLINK 删除的 key 可以在 30 秒内通过 RESTORE 命令恢复，相当于回收站功能" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "UNLINK 的核心价值是异步内存释放。主线程调用 dictUnlink() 把 key 从全局哈希表中 O(1) 摘除后立即返回，真正的内存释放（遍历集合元素逐个 zfree）由后台 bio_lazy_free 线程完成。在批量删除数百万 key 的场景中，这意味着主线程每次 UNLINK 只耗费微秒级时间。选项 A 错误，DEL 同样支持一次删除多个 key（DEL key1 key2 key3）；选项 C 错误，UNLINK 同样会触发 keyspace notification（del 事件）；选项 D 错误，UNLINK 是不可逆操作，key 一旦删除无法恢复。"
+        },
+        {
+          "id": "redis-batch-delete-q1-quiz5",
+          "question": "使用 Pipeline 将 200 条 UNLINK 命令打包发送的主要目的是什么？",
+          "choices": [
+            { "id": "A", "text": "Pipeline 使 200 条命令在 Redis 服务端并行执行，利用多核加速" },
+            { "id": "B", "text": "Pipeline 将 200 条命令合并为一次网络往返，消除逐条发送时 200 次 RTT 的延迟开销" },
+            { "id": "C", "text": "Pipeline 在客户端缓存删除结果，如果 Redis 崩溃可以自动重试" },
+            { "id": "D", "text": "Pipeline 将 200 条 UNLINK 合并为一个原子操作，保证要么全部执行要么全部不执行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Pipeline 的本质是客户端一次性将多条命令写入 TCP 发送缓冲区，服务端批量读取、逐条执行、然后一次性返回所有响应。核心收益是消除了逐条请求时每条命令都需等待一个 RTT（通常 0.1-1ms）的延迟。200 条命令逐条执行需要 200 个 RTT，Pipeline 只需 1 个 RTT。选项 A 错误，Redis 服务端仍然在单线程中串行执行这 200 条命令，Pipeline 不提供并行能力；选项 C 错误，Pipeline 没有重试机制；选项 D 错误，Pipeline 不是原子操作，中间某条命令失败不影响其他命令执行。"
+        },
+        {
+          "id": "redis-batch-delete-q1-quiz6",
+          "question": "在批量删除脚本的批次之间加入 sleep 休眠的目的是什么？",
+          "choices": [
+            { "id": "A", "text": "等待 Redis 将已删除 key 的变更同步到从节点" },
+            { "id": "B", "text": "等待操作系统将释放的内存页归还给内核" },
+            { "id": "C", "text": "给 Redis 主线程留出时间处理正常业务请求，避免删除操作长时间独占 CPU 导致业务延迟升高" },
+            { "id": "D", "text": "等待 AOF 文件将本批次的删除命令 fsync 到磁盘" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "虽然单条 UNLINK 只消耗微秒级主线程时间，但如果不加限流、连续不断地提交成千上万条 UNLINK，这些命令的累积处理时间会持续占用主线程，挤压正常业务命令的执行机会。批次间 sleep 10-50ms 能确保正常的 GET/SET 等业务命令有充足的执行时间片。选项 A 错误，主从同步是异步的，不需要客户端等待；选项 B 错误，jemalloc 的内存释放是即时的，无需等待 OS 回收；选项 D 错误，AOF fsync 由后台 bio_aof_fsync 线程处理，不需要客户端同步等待。"
+        },
+        {
+          "id": "redis-batch-delete-q1-quiz7",
+          "question": "使用 EXPIRE 设置短 TTL 代替直接删除 key 的方案，以下哪项描述是正确的？",
+          "choices": [
+            { "id": "A", "text": "设置 TTL 后 key 立刻从 keyspace 中消失，客户端无法再访问" },
+            { "id": "B", "text": "Redis 会在 TTL 到期后由 activeExpireCycle 和惰性过期机制逐渐清理这些 key，删除压力分散在时间轴上" },
+            { "id": "C", "text": "EXPIRE 命令本身是异步执行的，不占用主线程时间" },
+            { "id": "D", "text": "设置 TTL 后 key 的内存立刻被释放，只是 keyspace 引用保留到过期时间" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "EXPIRE 只是给 key 关联一个过期时间戳（存储在 expires dict 中），key 在 TTL 到期前仍然存在且可正常访问。过期后通过两种机制清理：主动过期（activeExpireCycle 每 100ms 采样 20 个 key 检查是否过期）和惰性过期（客户端访问时检查 TTL）。选项 A 错误，设置 TTL 不会立即删除 key；选项 C 错误，EXPIRE 本身是同步执行的 O(1) 命令（只是写入 expires dict），但它确实很快；选项 D 错误，设置 TTL 不释放任何内存，只有过期后真正删除时才释放。"
+        },
+        {
+          "id": "redis-batch-delete-q1-quiz8",
+          "question": "在 Redis Cluster 模式下执行批量删除，以下哪种做法是正确的？",
+          "choices": [
+            { "id": "A", "text": "连接任意一个节点执行 SCAN 0 MATCH pattern COUNT 100 即可遍历整个集群的所有 key" },
+            { "id": "B", "text": "需要对集群中的每个主节点分别执行 SCAN 遍历，因为每个节点只负责部分 hash slot 的 key" },
+            { "id": "C", "text": "使用 CLUSTER SCAN 命令可以一次性遍历整个集群的 keyspace" },
+            { "id": "D", "text": "只需在集群的 master-0 节点上执行 SCAN，它会自动将请求转发给其他节点" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis Cluster 将 16384 个 hash slot 分配给多个主节点，每个节点只存储分配给它的 slot 对应的 key。SCAN 命令只能遍历当前连接节点上的 key，不会跨节点。因此批量删除脚本需要获取集群拓扑（CLUSTER NODES），然后对每个主节点分别建立连接并执行 SCAN。选项 A 错误，单节点 SCAN 只能看到本节点的 key；选项 C 错误，Redis 中不存在 CLUSTER SCAN 命令；选项 D 错误，SCAN 不像 GET/SET 那样支持 MOVED 重定向，它只在本地节点执行。"
+        },
+        {
+          "id": "redis-batch-delete-q1-quiz9",
+          "question": "批量删除过程中，哪个监控指标最能直接反映删除操作对正常业务的影响？",
+          "choices": [
+            { "id": "A", "text": "used_memory_rss 的下降速率" },
+            { "id": "B", "text": "total_commands_processed 的累积值" },
+            { "id": "C", "text": "instantaneous_ops_per_sec 的变化趋势（是否出现异常下降）" },
+            { "id": "D", "text": "keyspace_hits / keyspace_misses 的比率变化" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "instantaneous_ops_per_sec 反映 Redis 当前每秒处理的命令数。如果批量删除导致主线程过载，正常业务的命令处理能力会下降，这个指标会明显低于基线值。当观察到下降超过 30% 时应增加批次间 sleep 时间。选项 A 错误，used_memory_rss 下降说明内存在释放，是正常现象而非问题指标；选项 B 错误，total_commands_processed 是累积值，无法直接反映瞬时压力；选项 D 错误，命中率变化反映的是缓存有效性而非主线程阻塞情况。"
+        },
+        {
+          "id": "redis-batch-delete-q1-quiz10",
+          "question": "为什么生产环境建议通过 rename-command KEYS \"\" 禁用 KEYS 命令？",
+          "choices": [
+            { "id": "A", "text": "KEYS 命令会泄露所有 key 的名称，存在安全风险" },
+            { "id": "B", "text": "KEYS 命令返回结果过大会导致客户端 OOM" },
+            { "id": "C", "text": "KEYS 的 O(N) 全量遍历会阻塞主线程数秒，在高 key 数量实例上执行等同于服务宕机，禁用可从根源杜绝误操作" },
+            { "id": "D", "text": "KEYS 命令会触发 RDB 快照，影响磁盘 IO 性能" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "KEYS 命令最大的危险不在于安全或内存，而在于它对主线程的阻塞。在数千万 key 的生产实例上，一次 KEYS 调用会导致 Redis 完全无响应 3-8 秒，所有客户端都会超时。通过 rename-command 禁用后，即使有人误操作也不会触发全量扫描。选项 A 虽然有一定道理但不是禁用的主要原因，且 SCAN 同样可以遍历 key 名称；选项 B 错误，客户端 OOM 只是理论可能，主要问题是服务端阻塞；选项 D 错误，KEYS 不会触发 RDB 快照，这两者完全无关。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Redis SCAN command documentation",
+          "url": "https://redis.io/commands/scan/"
+        },
+        {
+          "title": "Redis UNLINK command documentation",
+          "url": "https://redis.io/commands/unlink/"
+        },
+        {
+          "title": "Redis KEYS command warning",
+          "url": "https://redis.io/commands/keys/"
+        },
+        {
+          "title": "Redis Latency Problems Troubleshooting",
+          "url": "https://redis.io/docs/management/optimization/latency/"
+        }
+      ]
+    }
+  ]
+}
