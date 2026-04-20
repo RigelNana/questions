@@ -1,0 +1,156 @@
+{
+  "id": "redis-cache-degradation",
+  "name": "缓存降级策略的设计与实现",
+  "domain": "redis",
+  "description": "缓存降级策略设计、熔断机制与容错方案的生产实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-cache-degradation-q1",
+      "domain": "redis",
+      "type": "open-ended",
+      "difficulty": 2,
+      "tags": ["Redis", "缓存降级", "高可用", "熔断", "容错"],
+      "title": "缓存降级策略的设计与实现",
+      "content": "你所在的电商团队维护着一个日活 500 万的商品服务，使用 Redis Cluster 6.2 作为缓存层，后端数据库是 MySQL 8.0 主从集群。某天晚高峰 21:00 左右，运维告警显示 Redis 集群中的一个分片发生了网络分区（network partition），Sentinel 开始触发故障转移（failover），整个切主过程耗时约 30 秒。在这 30 秒里，所有命中该分片的缓存请求全部超时，每秒大约 8000 个请求直接穿透到了 MySQL。MySQL 的连接池被打满，慢查询堆积，主库 CPU 飙到 95%，最终导致整个商品服务接口响应时间从平时的 20ms 飙升到 8 秒，前端页面白屏，客服电话被打爆。\n\n事后复盘时，架构师提出了一个问题：我们的系统为什么对 Redis 的依赖如此脆弱？Redis 挂了 30 秒，整个服务就跟着挂了 30 秒甚至更久——因为 MySQL 过载后恢复也需要时间。我们需要一套缓存降级方案，让系统在 Redis 不可用或响应变慢时，能够自动「降档行驶」而不是直接熄火。\n\n以下是事故期间的部分监控数据：\n\n```\n21:00:05  redis_commands_timeout_total{shard=\"3\"} 从 0 跳涨到 3200/s\n21:00:08  mysql_active_connections 从 45 飙到 200（连接池上限）\n21:00:12  mysql_slow_queries_per_sec 从 2 涨到 180\n21:00:15  http_response_time_p99 从 35ms 涨到 6800ms\n21:00:18  http_5xx_rate 从 0.01% 涨到 34%\n21:00:35  redis_sentinel_failover_complete{shard=\"3\"} = 1\n21:01:20  mysql_active_connections 回落到 120（仍高于正常）\n21:03:45  系统完全恢复正常\n```\n\n从这组数据可以看出，Redis 虽然在 30 秒后恢复了，但整个系统的恢复耗时超过了 3 分钟。请你设计一套完整的缓存降级方案，包括：降级触发的条件与时机、不同级别的降级策略、降级状态下的流量处理方式、以及降级恢复（摘除降级）的机制。给出关键的代码实现思路或伪代码。",
+      "answer": "## 第一步：缓存降级的核心概念基础\n\n### 什么是缓存降级\n\n缓存降级（Cache Degradation）是分布式系统高可用设计中的一种容错策略，其核心思想是：当缓存层（通常是 Redis）出现故障、响应变慢或完全不可用时，系统不是简单地将所有请求转发到后端数据库，而是主动降低服务质量，用「有损服务」代替「无服务」，确保系统整体不会因为一个组件的故障而产生级联崩溃（cascading failure）。\n\n降级不是一个开关，而是一组分层策略。你可以把它想象成汽车的档位——正常情况下跑五档，Redis 变慢了就降到三档（用本地缓存兜底），Redis 完全挂了就降到一档（返回静态兜底数据），极端情况甚至可以挂空挡（直接拒绝非核心请求）。关键在于：每一档都比直接熄火（系统崩溃）好。\n\n### 为什么需要缓存降级\n\n在没有降级策略的系统中，Redis 故障的传播路径是这样的：Redis 超时 → 请求穿透到数据库 → 数据库连接池耗尽 → 数据库查询排队 → 应用线程池被阻塞的请求占满 → 新请求无法被处理 → HTTP 5xx → 上游调用方超时重试 → 流量放大 → 整条链路雪崩。这就是典型的「雪崩效应」，一个点的故障在几秒内扩散为全局不可用。\n\n缓存降级要解决的问题就是切断这个传播链：在 Redis 出问题的第一时间，用熔断器（circuit breaker）阻止请求继续尝试访问 Redis，转而执行预设的降级逻辑，保护后端数据库不被打穿。\n\n### 降级与熔断的关系\n\n熔断器是实现降级的核心机制。熔断器模式（Circuit Breaker Pattern）最早由 Michael Nygard 在《Release It!》一书中提出，Netflix 的 Hystrix 让它广为人知。在 Java 生态中 Sentinel（阿里巴巴开源，版本 1.8.6+）和 resilience4j（轻量级替代 Hystrix，当前主流版本 2.1.x）是最常用的实现。在 Go 生态中，sony/gobreaker 和 afex/hystrix-go 是典型选择。熔断器有三个状态：Closed（正常通行）、Open（熔断，所有请求直接走降级逻辑）、Half-Open（半开，放一小部分请求试探性地访问 Redis，如果成功率达标则恢复 Closed 状态）。\n\n## 第二步：降级策略的设计与实现\n\n### 降级触发条件的量化\n\n降级不能靠拍脑袋决定「Redis 挂了就降级」——你需要精确定义什么叫「Redis 出问题了」。在生产中通常用滑动窗口统计来判断：过去 10 秒内对 Redis 的请求中，如果错误率（超时 + 连接失败）超过 50%，或者 P99 响应时间超过 500ms（正常应该在 1-2ms），就触发熔断。以 resilience4j 为例，配置大概长这样：\n\n```yaml\nresilience4j:\n  circuitbreaker:\n    instances:\n      redisBreaker:\n        slidingWindowType: COUNT_BASED\n        slidingWindowSize: 100          # 统计最近 100 次调用\n        failureRateThreshold: 50        # 错误率超过 50% 触发熔断\n        slowCallRateThreshold: 80       # 慢调用率超过 80% 也触发\n        slowCallDurationThreshold: 500ms\n        waitDurationInOpenState: 30s    # 熔断 30s 后进入半开状态\n        permittedNumberOfCallsInHalfOpenState: 10  # 半开时放 10 个请求试探\n        minimumNumberOfCalls: 20        # 至少 20 次调用才开始统计\n```\n\n这里的 `minimumNumberOfCalls: 20` 很关键——如果系统刚启动只有 2 个请求，其中 1 个超时，你不应该因为「50% 错误率」就触发熔断。\n\n### 四级降级策略\n\n生产环境中，我们通常设计四个降级等级，从轻到重依次为：\n\n**L1 级（本地缓存兜底）**：Redis 响应变慢但还没完全挂掉时，优先从本地缓存（如 Caffeine、Ristretto）中读取数据。本地缓存的数据可能是几分钟前从 Redis 同步过来的「次新」数据，不是最新的但对用户来说是可接受的。比如商品价格 5 分钟前是 99 元，现在可能改成了 98 元，用户看到 99 元虽然不完美但不会造成业务错误。Go 语言中用 dgraph-io/ristretto 实现本地缓存的一个简化示例：\n\n```go\ntype CacheWrapper struct {\n    redis      *redis.Client\n    local      *ristretto.Cache  // 本地缓存兜底\n    breaker    *gobreaker.CircuitBreaker\n}\n\nfunc (c *CacheWrapper) Get(ctx context.Context, key string) (string, error) {\n    // 熔断器包裹 Redis 调用\n    result, err := c.breaker.Execute(func() (interface{}, error) {\n        val, err := c.redis.Get(ctx, key).Result()\n        if err == nil {\n            // Redis 正常时同步写入本地缓存\n            c.local.Set(key, val, 1)\n        }\n        return val, err\n    })\n    if err == nil {\n        return result.(string), nil\n    }\n    // Redis 失败或熔断，降级到本地缓存\n    if val, found := c.local.Get(key); found {\n        return val.(string), nil  // L1: 返回本地缓存的次新数据\n    }\n    return \"\", err  // 本地也没有，继续走下一级\n}\n```\n\n**L2 级（返回默认值 / 静态数据）**：当本地缓存也没有命中时（比如这个 key 从来没被访问过），返回预先配置好的默认值。比如商品详情页，图片用占位图、价格显示「暂时无法获取」、库存显示「请稍后重试」。这些默认值是在部署时就配置好的，不依赖任何外部服务。\n\n**L3 级（功能裁剪）**：如果降级持续时间较长（超过 1 分钟），通过 feature flag 关闭那些强依赖缓存的非核心功能。比如个性化推荐、浏览历史、猜你喜欢这些模块直接隐藏，只保留核心的搜索和下单流程。这个级别需要前端配合，通常通过配置中心（如 Apollo、Nacos）下发开关。\n\n**L4 级（请求拒绝）**：极端情况下，如果数据库也开始过载，主动拒绝一定比例的非核心请求（比如商品浏览），只保障核心交易链路（下单、支付）。这就是所谓的「有损服务」——牺牲部分用户体验来保全核心功能。\n\n### 熔断器状态机的工作流\n\n熔断器的状态转换是降级机制的心脏。以 sony/gobreaker v0.5.0 为例，它的状态机如下工作：正常情况下熔断器处于 Closed 状态，所有请求正常通过。当滑动窗口内的失败次数达到阈值（比如连续 5 次失败），状态切换为 Open，此时所有请求不再尝试调用 Redis，直接执行降级逻辑。经过一个等待周期（比如 30 秒）后，状态自动转为 Half-Open，允许少量请求尝试访问 Redis，如果这些探测请求成功了，状态恢复为 Closed；如果仍然失败，状态重新回到 Open 继续等待。\n\n```go\nbreaker := gobreaker.NewCircuitBreaker(gobreaker.Settings{\n    Name:        \"redis-breaker\",\n    MaxRequests: 3,                    // Half-Open 时最多放 3 个请求\n    Interval:    10 * time.Second,     // Closed 状态下每 10s 重置计数\n    Timeout:     30 * time.Second,     // Open 状态持续 30s 后进入 Half-Open\n    ReadyToTrip: func(counts gobreaker.Counts) bool {\n        // 连续失败 5 次或错误率超过 60% 就触发熔断\n        return counts.ConsecutiveFailures >= 5 ||\n            (counts.Requests > 20 && float64(counts.TotalFailures)/float64(counts.Requests) > 0.6)\n    },\n    OnStateChange: func(name string, from, to gobreaker.State) {\n        log.Printf(\"breaker %s: %s -> %s\", name, from, to)\n        metrics.BreakerStateChange(name, to.String())  // 上报监控\n    },\n})\n```\n\n### 降级恢复：不能简单地「打开水龙头」\n\n很多人只关注如何触发降级，却忽略了恢复的复杂性。Redis 恢复后，如果瞬间把所有流量打回去会发生什么？缓存里大量 key 已经过期（降级期间没有回填），所有请求同时 cache miss，全部穿透到数据库——这就是「缓存击穿」的放大版。正确的恢复姿势是渐进式的：熔断器从 Open 进入 Half-Open 后，先放 5% 的流量试探 Redis，确认正常后逐步提升到 20%、50%、100%。在流量恢复的过程中，同步做缓存预热（cache warmup），把热点 key 提前加载到 Redis 中，避免恢复瞬间的缓存风暴。\n\n## 第三步：体系化扩展\n\n### 监控与自动化\n\n降级方案离不开完善的监控体系。你至少需要监控以下指标并设置告警：Redis 命令超时率（正常 < 0.1%，告警阈值 1%）、熔断器状态变更事件、本地缓存命中率（降级期间应该 > 90%，否则说明本地缓存容量不够）、数据库连接池利用率、HTTP 5xx 率。在 Prometheus + Grafana 的监控栈中，可以配一条告警规则：`rate(redis_commands_timeout_total[1m]) / rate(redis_commands_total[1m]) > 0.01` 表示过去 1 分钟内 Redis 超时率超过 1%，触发 P2 告警。\n\n### 手动降级开关\n\n除了自动熔断外，还需要一个手动降级开关。运维在做 Redis 维护（版本升级、数据迁移）时可以提前手动触发降级，等维护完成后再手动恢复。这个开关通常放在配置中心里，修改后秒级生效，不需要重新部署服务。\n\n### 与多级缓存架构的结合\n\n成熟的系统通常采用多级缓存：L1 本地缓存（Caffeine / Ristretto，容量小但零网络延迟）→ L2 Redis 集群（容量大但有网络开销）→ L3 数据库。在这种架构下，降级策略天然就是「当 L2 不可用时，L1 自动承担更大的流量」。但要注意 L1 的容量规划——如果平时 L1 只缓存了 1000 个热点 key，降级时突然要承接全部流量，命中率可能只有 30%，剩下的 70% 还是会打到数据库。所以 L1 的容量应该按「降级场景」来规划，而不是按「正常场景」来规划。一个经验值是：L1 至少能覆盖 Top 80% 流量对应的热点 key 集合。",
+      "keyPoints": [
+        "缓存降级是分层容错策略，核心思想是在 Redis 故障时用有损服务代替无服务，避免级联雪崩传播到数据库和整条调用链",
+        "熔断器（Circuit Breaker）是降级的核心执行机制，通过 Closed → Open → Half-Open 三态转换实现自动故障检测与恢复",
+        "降级触发条件应基于滑动窗口统计量化定义，如错误率超过 50% 或 P99 超过 500ms，且需设置最小调用次数阈值避免误触发",
+        "四级降级策略从轻到重依次为：本地缓存兜底、返回默认静态值、feature flag 裁剪非核心功能、主动拒绝非核心请求",
+        "降级恢复不能瞬间恢复全部流量，必须渐进式放量并配合缓存预热，否则会因大面积 cache miss 引发二次雪崩",
+        "本地缓存的容量应按降级场景规划而非正常场景，至少覆盖 Top 80% 流量的热点 key 集合才能保证降级时的有效命中率",
+        "生产环境需同时具备自动熔断和手动降级开关，手动开关用于计划性维护场景，通过配置中心秒级下发无需重新部署"
+      ],
+      "quiz": [
+        {
+          "id": "redis-cache-degradation-q1-quiz1",
+          "question": "缓存降级的核心目标是什么？",
+          "choices": [
+            {"id": "A", "text": "当 Redis 故障时，将所有请求自动路由到数据库以保证数据一致性"},
+            {"id": "B", "text": "当 Redis 故障时，通过分层兜底策略提供有损服务，防止故障级联传播导致全局不可用"},
+            {"id": "C", "text": "当 Redis 故障时，直接返回错误给客户端，让客户端自行决定重试策略"},
+            {"id": "D", "text": "当 Redis 故障时，切换到备用 Redis 集群继续提供完整的缓存服务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "缓存降级的核心目标是「有损服务优于无服务」，通过分层兜底避免故障从 Redis 传播到数据库再到整个系统。A 错在把所有请求转发到数据库恰恰是降级要避免的行为——这样做会打穿数据库导致更严重的雪崩。C 错在直接返回错误等于完全没有容错能力，用户体验直接崩溃。D 描述的是高可用切换（failover），不是降级——切换到备用集群仍然是在提供完整服务，而降级强调的是在无法提供完整服务时的有损替代方案。"
+        },
+        {
+          "id": "redis-cache-degradation-q1-quiz2",
+          "question": "熔断器从 Open 状态转为 Half-Open 状态的触发条件是什么？",
+          "choices": [
+            {"id": "A", "text": "运维人员手动执行恢复命令"},
+            {"id": "B", "text": "Redis 主动向应用发送恢复通知"},
+            {"id": "C", "text": "经过一个预设的等待时间（如 30 秒）后自动转换，允许少量探测请求通过"},
+            {"id": "D", "text": "当本地缓存的命中率恢复到正常水平时自动转换"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "熔断器的 Open → Half-Open 转换是基于时间的自动行为，经过配置的 waitDurationInOpenState（如 30 秒）后自动进入 Half-Open 状态，放少量请求去试探目标服务是否恢复。A 错在熔断器的设计初衷就是自动化容错，不依赖人工介入（虽然手动开关是额外的补充手段，但不是状态机的触发条件）。B 错在 Redis 不会主动通知应用自己恢复了，熔断器的探测是应用侧主动发起的。D 错在本地缓存命中率与 Redis 是否恢复没有直接因果关系，本地缓存在降级前就存在。"
+        },
+        {
+          "id": "redis-cache-degradation-q1-quiz3",
+          "question": "在使用 resilience4j 配置熔断器时，设置 minimumNumberOfCalls: 20 的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "限制熔断器 Open 状态下最多只记录 20 次失败调用"},
+            {"id": "B", "text": "要求滑动窗口内至少有 20 次调用才开始统计错误率，避免样本过少导致的误触发"},
+            {"id": "C", "text": "Half-Open 状态下最多允许 20 个探测请求通过"},
+            {"id": "D", "text": "每 20 次调用后自动重置错误计数器"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "minimumNumberOfCalls 是一个统计生效的最低门槛。如果系统刚启动只有 3 个请求，其中 2 个因为 Redis 冷启动而超时，错误率是 66%，超过了 50% 的阈值——但这不代表 Redis 真的有故障，只是样本太少导致的统计偏差。设置最低 20 次调用才开始计算错误率，能有效避免这种误熔断。A 错在 Open 状态下不会有正常调用（全部走降级），不存在记录失败的说法。C 描述的是 permittedNumberOfCallsInHalfOpenState 参数的功能。D 错在 resilience4j 不会基于调用次数来重置计数器，它用的是滑动窗口机制。"
+        },
+        {
+          "id": "redis-cache-degradation-q1-quiz4",
+          "question": "以下哪种降级级别适用于「Redis 响应变慢但未完全不可用」的场景？",
+          "choices": [
+            {"id": "A", "text": "L4 级：主动拒绝所有非核心请求，只保留交易链路"},
+            {"id": "B", "text": "L1 级：优先从本地缓存读取数据，用次新数据兜底"},
+            {"id": "C", "text": "L3 级：通过 feature flag 关闭所有缓存相关功能"},
+            {"id": "D", "text": "L2 级：对所有请求返回预配置的静态默认值"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "L1 级降级是最轻量的策略，适用于 Redis 还没完全挂掉只是变慢的场景。此时用本地缓存（如 Caffeine、Ristretto）中几分钟前同步的数据来响应请求，数据虽然不是最新的但基本准确，对用户感知影响最小。A 错在 L4 是最极端的措施，用于数据库也快撑不住的情况，Redis 只是变慢远不至于此。C 错在 L3 级裁剪功能是较重的措施，用于降级持续较长时间的场景，Redis 只是暂时慢了不需要砍功能。D 错在返回静态默认值意味着用户看不到真实数据，是 L2 级的措施，在 L1 本地缓存能命中的情况下没必要降到这一步。"
+        },
+        {
+          "id": "redis-cache-degradation-q1-quiz5",
+          "question": "观察以下监控数据，Redis 恢复后系统为什么又花了 3 分钟才完全恢复？\n\n21:00:35 Redis failover 完成\n21:01:20 MySQL 连接数仍为 120（正常值 45）\n21:03:45 系统完全恢复",
+          "choices": [
+            {"id": "A", "text": "因为 Sentinel 的 failover 过程本身就需要 3 分钟"},
+            {"id": "B", "text": "因为 Redis 恢复后大量 key 已过期，海量 cache miss 持续冲击数据库，需要时间重建缓存"},
+            {"id": "C", "text": "因为 MySQL 需要 3 分钟时间执行主从切换"},
+            {"id": "D", "text": "因为应用服务器需要重启才能重新连接 Redis"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "从监控数据可以看出，Redis 在 21:00:35 已经完成 failover 恢复正常，但 MySQL 到 21:01:20 连接数仍然偏高。这是因为 Redis 故障的 30 秒内没有新数据写入缓存，大量 key 在这段时间过期了。Redis 恢复后，所有请求重新打到 Redis 发现 cache miss，全部穿透到 MySQL 回填缓存。这个「缓存重建风暴」需要时间消化。A 错在 failover 在 21:00:35 就完成了，数据明确写着。C 错在没有任何迹象表明 MySQL 发生了主从切换。D 错在现代 Redis 客户端都支持自动重连和服务发现，不需要重启应用。"
+        },
+        {
+          "id": "redis-cache-degradation-q1-quiz6",
+          "question": "以下关于本地缓存容量规划的说法，哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "本地缓存容量应按正常运行时的热点数据量来规划，只缓存 Top 100 个热点 key 即可"},
+            {"id": "B", "text": "本地缓存应缓存所有 Redis 中的数据，确保降级时 100% 命中"},
+            {"id": "C", "text": "本地缓存容量应按降级场景规划，至少覆盖 Top 80% 流量对应的热点 key 集合"},
+            {"id": "D", "text": "本地缓存不需要预规划，降级时会自动从数据库加载所有需要的数据"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "本地缓存容量规划的关键是：按降级场景来设计，而不是按正常场景。正常运行时 L1 本地缓存只是锦上添花，但降级时它是唯一的兜底层，必须有足够的覆盖率。覆盖 Top 80% 流量的热点 key 是一个经验阈值——意味着降级时只有 20% 的请求需要走更下层（默认值或数据库）。A 错在只缓存 100 个 key 在降级时命中率可能不到 30%，大量请求仍会打穿数据库。B 错在本地内存有限不可能存所有 Redis 数据（Redis 可能有几十 GB），且没必要追求 100% 命中。D 错在降级场景下数据库本身已经是被保护对象，不应该让它来填充本地缓存。"
+        },
+        {
+          "id": "redis-cache-degradation-q1-quiz7",
+          "question": "对比自动熔断和手动降级开关，以下哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "有了自动熔断就不需要手动降级开关，两者功能完全重复"},
+            {"id": "B", "text": "手动降级开关用于计划性维护场景（如 Redis 版本升级），自动熔断用于突发故障，两者互补"},
+            {"id": "C", "text": "手动降级开关比自动熔断更可靠，生产环境应只使用手动开关"},
+            {"id": "D", "text": "自动熔断和手动开关不能同时存在，会导致状态冲突"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "自动熔断和手动降级开关解决的是不同场景的问题，是互补关系。自动熔断应对的是突发故障（Redis 突然挂了），它的优势是毫秒级响应，不需要人工介入。手动降级开关应对的是计划性维护（比如凌晨做 Redis 集群扩容），运维可以提前手动触发降级，等维护完成后再手动恢复，全程可控。A 错在计划性维护时你明确知道 Redis 即将不可用，提前手动降级比等自动熔断触发更优雅。C 错在突发故障时人工响应速度远慢于自动熔断，等运维打开手动开关可能数据库早已被打穿。D 错在两者完全可以共存，逻辑上取 OR 关系即可——任一个触发都执行降级。"
+        },
+        {
+          "id": "redis-cache-degradation-q1-quiz8",
+          "question": "电商大促期间，Redis 集群的一个分片发生 30 秒 failover。如果没有降级方案，以下哪个是最可能首先被触发的问题？",
+          "choices": [
+            {"id": "A", "text": "Redis 数据永久丢失，需要从 RDB 文件恢复"},
+            {"id": "B", "text": "数据库连接池耗尽，所有依赖该数据库的服务同时不可用"},
+            {"id": "C", "text": "Sentinel 检测失效，无法完成 failover"},
+            {"id": "D", "text": "Redis 客户端内存溢出导致应用 OOM"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在没有降级方案的系统中，Redis 超时后所有请求穿透到数据库。大促期间 QPS 很高，假设每秒 8000 个请求突然全部打到 MySQL，数据库连接池（通常配 100-200）会在几秒内被耗尽。连接池满了之后新请求排队等待，线程池也会被阻塞的请求填满，导致所有依赖该数据库的服务（不只是当前服务）同时不可用——这就是级联故障。A 错在 Sentinel failover 只是主从切换，不会导致数据丢失（最多丢 failover 期间的写入）。C 错在 Sentinel 的检测机制是独立的，与应用侧的流量压力无关。D 错在 Redis 客户端超时后不会无限缓存请求，通常会返回错误。"
+        },
+        {
+          "id": "redis-cache-degradation-q1-quiz9",
+          "question": "熔断器处于 Half-Open 状态时，如果放过去的 10 个探测请求中有 3 个失败，正确的行为是什么？",
+          "choices": [
+            {"id": "A", "text": "保持 Half-Open 状态继续观察，等失败率降到 0% 才恢复"},
+            {"id": "B", "text": "立即恢复到 Closed 状态，因为 70% 的成功率已经足够"},
+            {"id": "C", "text": "回退到 Open 状态重新等待，说明目标服务还没完全恢复"},
+            {"id": "D", "text": "根据 failureRateThreshold 判断：如果 30% < 阈值则恢复 Closed，如果 30% ≥ 阈值则回退 Open"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "Half-Open 状态的判断逻辑取决于你配置的 failureRateThreshold。如果阈值是 50%（即错误率超过 50% 才认为有问题），那么 30% 的失败率低于阈值，熔断器会恢复到 Closed 状态。但如果阈值配的是 20%，30% 的失败率超过了阈值，熔断器会回退到 Open 重新等待。这不是一个固定行为，而是由配置决定的。A 错在等 0% 失败率过于严苛，网络偶尔抖动都会阻止恢复，系统可能永远无法回到正常状态。B 错在不考虑阈值配置就直接恢复是不安全的。C 错在一刀切地认为任何失败都代表未恢复，实际生产中少量超时是正常的网络波动。"
+        },
+        {
+          "id": "redis-cache-degradation-q1-quiz10",
+          "question": "降级恢复时使用「渐进式放量」而非瞬间恢复全部流量，主要是为了避免什么问题？",
+          "choices": [
+            {"id": "A", "text": "避免 Redis 刚恢复就被写入过多数据导致内存溢出"},
+            {"id": "B", "text": "避免大面积 cache miss 引发的缓存风暴，给缓存预热留出时间"},
+            {"id": "C", "text": "避免熔断器在 Closed 和 Open 之间频繁切换"},
+            {"id": "D", "text": "避免本地缓存中的数据与 Redis 产生版本冲突"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 故障期间，大量 key 因为没有被回填而过期。如果故障恢复后瞬间将 100% 流量打回 Redis，几乎所有请求都会遇到 cache miss，然后全部穿透到数据库回填缓存——这等于短时间内对数据库施加了巨大压力，可能引发二次雪崩。渐进式放量的目的是把缓存重建的压力分散在一段时间内：先放 5% 流量，这 5% 的 miss 请求回填缓存，然后放 20% 流量时命中率已经有所提升，以此类推，直到缓存充分预热后再恢复 100%。A 错在 Redis 的内存容量是提前规划好的，正常回填不会 OOM。C 错在渐进放量跟熔断器频繁切换没有直接关系。D 错在本地缓存和 Redis 之间不存在版本冲突的概念，本地缓存只是 Redis 的一个副本。"
+        }
+      ],
+      "references": [
+        "https://resilience4j.readme.io/docs/circuitbreaker",
+        "https://github.com/sony/gobreaker",
+        "https://sentinelguard.io/en-us/docs/circuit-breaking.html",
+        "https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker"
+      ]
+    }
+  ]
+}
