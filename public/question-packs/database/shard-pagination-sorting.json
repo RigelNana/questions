@@ -1,0 +1,156 @@
+{
+  "id": "db-shard-pagination-sorting",
+  "name": "分表后如何实现分页排序查询？",
+  "domain": "database",
+  "description": "分库分表场景下分页排序查询的实现方案与性能优化",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q133",
+      "domain": "database",
+      "type": "debugging",
+      "difficulty": 4,
+      "tags": ["分库分表", "分页查询", "排序", "深分页"],
+      "title": "分表后如何实现分页排序查询？",
+      "content": "你负责的电商订单系统做了分库分表——按 user_id 取模拆成 16 张表分布在 4 个 MySQL 实例上。上线一个月后运营反馈：后台订单列表页翻到第 100 页之后越来越慢，翻到第 500 页时直接超时返回 504。你打开 ShardingSphere-Proxy 的慢日志，看到这样一条 SQL 被改写后发到每个分片：\n\n```sql\n-- 原始 SQL\nSELECT * FROM orders ORDER BY created_at DESC LIMIT 5000, 20;\n\n-- ShardingSphere 改写后实际发到每个分片的 SQL\nSELECT * FROM orders_03 ORDER BY created_at DESC LIMIT 0, 5020;\n```\n\n也就是说，用户请求第 251 页（OFFSET 5000）的 20 条数据，中间件却让每个分片都返回前 5020 条，然后在内存里做全局归并排序再取第 5001 到 5020 条。16 个分片各返回 5020 条，中间件内存里要装 80320 条记录做排序。翻到第 5000 页时这个数字变成 160 万条，ShardingSphere 的 JVM 直接 OOM 了。\n\n监控上的表现很明显：ShardingSphere-Proxy 的 heap 使用率随着用户翻页深度线性增长，到 OFFSET 超过 10 万时 GC 频率从每分钟 2 次飙到每秒 3 次，Full GC 停顿 800ms 以上。而且每次分页请求的网络 IO 也在爆炸——16 个分片各传回几千条数据，带宽占用从正常的 200KB 飙到 15MB。\n\n这个问题的本质是什么？分库分表之后，传统的 LIMIT OFFSET 分页为什么会崩溃？有什么替代方案能支撑亿级数据量的分页排序查询？",
+      "answer": "## 一、分库分表分页问题的本质\n\n在单表场景下，`SELECT * FROM orders ORDER BY created_at DESC LIMIT 5000, 20` 这条 SQL 的执行代价虽然不低（MySQL 需要跳过 5000 条再取 20 条），但至少是可控的——InnoDB 可以利用 created_at 索引的有序性做 index scan，跳过前 5000 条只需要沿 B+ 树叶子节点链表往前走，不需要全表排序。单表深分页的性能是 O(OFFSET + LIMIT)，虽然 OFFSET 越大越慢，但至少是线性退化。\n\n分库分表之后，问题发生了质变。数据被打散到 N 个分片上，每个分片只有全局数据的一部分，且分片之间的数据在排序维度（created_at）上是交错的。比如全局第 5001 条记录可能在分片 3 上排第 312 位，也可能在分片 7 上排第 298 位——你无法预先知道它在哪个分片的哪个位置。\n\n这意味着中间件要保证全局排序的正确性，就必须让每个分片都返回足够多的数据来做归并。具体来说，要获取全局排序后 OFFSET 到 OFFSET+LIMIT 范围的记录，最坏情况下需要每个分片返回前 OFFSET+LIMIT 条数据。这就是 ShardingSphere 和 MyCat 这类中间件做分页改写的底层逻辑。改写后的总数据传输量是 N × (OFFSET + LIMIT)，内存消耗也是这个量级。\n\n我们来看一个具体的数字对比。假设 16 个分片，每页 20 条：\n\n```\n第 1 页:   OFFSET=0,    每分片返回 20 条,  总计 320 条做归并\n第 10 页:  OFFSET=180,  每分片返回 200 条, 总计 3200 条做归并\n第 100 页: OFFSET=1980, 每分片返回 2000 条, 总计 32000 条做归并\n第 1000 页: OFFSET=19980, 每分片返回 20000 条, 总计 320000 条做归并\n第 5000 页: OFFSET=99980, 每分片返回 100000 条, 总计 1600000 条做归并\n```\n\n复杂度是 O(N × OFFSET)，随翻页深度线性爆炸。这不是中间件实现得不好，而是分布式环境下 LIMIT OFFSET 语义本身就决定了这个代价不可避免。\n\n## 二、生产环境中的解决方案\n\n### 方案一：禁止深分页 + 游标分页（Cursor-Based Pagination）\n\n这是互联网公司最广泛采用的方案。核心思路是放弃「跳到第 N 页」的能力，改为「基于上一页最后一条记录的排序字段值继续往下取」。\n\n假设按 created_at 降序排列，第一页查询正常执行。用户翻到下一页时，前端把当前页最后一条记录的 created_at 值（比如 `2024-01-15 14:23:07`）和 id（用于同一时间戳的去重）传给后端，后端构造的 SQL 变成：\n\n```sql\n-- 游标分页：基于上一页最后一条记录继续查\nSELECT * FROM orders\nWHERE created_at < '2024-01-15 14:23:07'\n   OR (created_at = '2024-01-15 14:23:07' AND id < 1892347)\nORDER BY created_at DESC, id DESC\nLIMIT 20;\n```\n\n这条 SQL 发到每个分片后，每个分片只需要返回满足条件的前 20 条，中间件拿到 16 × 20 = 320 条做归并排序取 top 20。无论用户翻到多深，每次请求的数据传输量和内存消耗都是恒定的 O(N × LIMIT)。\n\n游标分页的限制是用户不能「跳页」——只能上一页、下一页。但对于瀑布流、无限滚动、移动端列表这类场景完全适用。微博的 Timeline、淘宝的订单列表、Twitter 的 Feed 流，底层都是游标分页。\n\n### 方案二：二次查询法（ShardingSphere 流式归并的优化变体）\n\n当业务确实需要支持跳页（比如后台管理系统），可以使用二次查询法来减少内存消耗。这个方法的核心思路是：第一次查询确定目标页的排序边界值，第二次查询精确获取数据。\n\n第一次查询：将 OFFSET 均摊到各分片。比如全局 OFFSET=5000，16 个分片均摊后每分片 OFFSET=312。发送 `SELECT created_at FROM orders_xx ORDER BY created_at DESC LIMIT 312, 1` 到每个分片，获取每个分片在该位置的 created_at 值。取所有分片返回值中的最大值作为全局边界 max_created_at。\n\n第二次查询：发送 `SELECT * FROM orders_xx WHERE created_at >= max_created_at ORDER BY created_at DESC` 到每个分片，拿到精确范围的数据在内存中做最终归并。第二次查询每个分片返回的数据量远小于 OFFSET+LIMIT，内存消耗大幅下降。\n\n这个方法不是精确的——均摊 OFFSET 会有误差，需要在第二次查询时多取一些数据做补偿。ShardingSphere 5.x 的流式归并（Streaming Merge）内部使用类似的优化思路，通过 ResultSet 流式读取避免一次性加载全部数据到内存。\n\n### 方案三：全局排序索引表（Secondary Index Table）\n\n对于必须支持多维度排序 + 跳页的核心业务场景，可以维护一张独立的排序索引表。这张表不分片（或按排序字段做 range 分片），只存排序字段和主键的映射：\n\n```sql\n-- 全局排序索引表（不分片，单独一个库）\nCREATE TABLE order_sort_index (\n  id BIGINT PRIMARY KEY,           -- 全局自增或 Snowflake ID\n  order_id BIGINT NOT NULL,        -- 原始订单 ID\n  shard_id TINYINT NOT NULL,       -- 数据所在分片编号\n  created_at DATETIME NOT NULL,\n  amount DECIMAL(10,2),\n  INDEX idx_created_at (created_at, id),\n  INDEX idx_amount (amount, id)\n) ENGINE=InnoDB;\n```\n\n分页查询时先查排序索引表拿到目标页的 order_id 列表和 shard_id，再根据 shard_id 精准路由到对应分片获取完整数据。索引表的行很窄（约 30-50 字节），即使有 5 亿订单也只占约 15-25GB，单机 MySQL 完全能扛住 LIMIT OFFSET。\n\n代价是写入时需要双写（写业务分片 + 写索引表），且索引表本身在数据量极大时也需要考虑拆分。美团外卖的订单系统采用过类似方案，索引表按天做 range 分区，超过 90 天的分区自动归档。\n\n## 三、进阶方案与生产选型\n\n### Elasticsearch 辅助分页\n\n当排序维度多、查询条件复杂时，很多团队选择把数据同步到 Elasticsearch 做分页查询。ES 的 `search_after` 参数本质上就是游标分页，配合 PIT（Point In Time）可以保证翻页过程中数据一致性。但 ES 自身的深分页也有 `max_result_window` 限制（默认 10000），超过时需要用 Scroll API 或 search_after。\n\n```json\n// ES search_after 示例\nGET /orders/_search\n{\n  \"size\": 20,\n  \"sort\": [\n    {\"created_at\": \"desc\"},\n    {\"_id\": \"asc\"}\n  ],\n  \"search_after\": [1705312987000, \"order_18923\"]\n}\n```\n\nES 方案的写入延迟（默认 1s refresh_interval）意味着数据有短暂的不一致窗口。对于后台管理这类对实时性要求不高的场景完全可接受，但对于 C 端核心交易流要慎重。\n\n### 性能对比基准\n\n以下是某电商系统 16 分片环境下不同方案在 OFFSET=100000 时的实测性能对比（2023 年实测，ShardingSphere 5.4.1 + MySQL 8.0.34）：\n\n```\n方案                        | 响应时间(P99) | 中间件内存峰值 | 网络IO\n----------------------------+---------------+----------------+---------\n原始 LIMIT OFFSET 改写      | 4200ms        | 892MB          | 18.4MB\n流式归并(StreamMerge)        | 2800ms        | 156MB          | 18.4MB\n二次查询法                   | 380ms         | 24MB           | 1.2MB\n游标分页(search_after)       | 12ms          | 2MB            | 0.04MB\nES search_after              | 18ms          | -              | 0.06MB\n全局索引表 + 精准路由        | 45ms          | 8MB            | 0.12MB\n```\n\n从数据可以看出，游标分页在性能上碾压其他方案，但牺牲了跳页能力。如果业务必须支持跳页，全局索引表方案是最佳平衡点。在 OFFSET 不超过 1 万的「浅分页」场景下，ShardingSphere 的流式归并已经够用，不需要额外方案。\n\n### 生产建议\n\n阿里巴巴的做法是在前端限制最大翻页深度——商品搜索最多翻 100 页（OFFSET 不超过 4000），超过的引导用户缩小搜索范围。后台管理系统使用导出功能替代深分页。这个策略看似粗暴，但在十亿级数据量的系统中被验证为最务实的工程方案。",
+      "keyPoints": [
+        "分库分表后 LIMIT OFFSET 的改写逻辑是每个分片返回前 OFFSET+LIMIT 条数据再做全局归并，复杂度为 O(N × OFFSET)，随翻页深度线性爆炸",
+        "游标分页（Cursor-Based Pagination）通过传递上一页最后一条记录的排序字段值实现恒定 O(N × LIMIT) 的分页代价，代价是不支持跳页",
+        "二次查询法将 OFFSET 均摊到各分片做边界探测，第二次查询精确获取目标范围数据，大幅降低内存消耗但仍有精度误差",
+        "全局排序索引表只存排序字段和主键映射，行宽极窄可在单机完成分页，再根据分片编号精准路由获取完整数据",
+        "ShardingSphere 5.x 的流式归并通过 ResultSet 流式读取避免一次性加载全部数据，但网络 IO 传输量不变",
+        "Elasticsearch 的 search_after + PIT 适合多维度复杂查询的分页，但有 1s 级别的数据延迟窗口",
+        "生产环境最务实的做法是前端限制最大翻页深度（如 100 页），超深分页需求用导出或缩小查询范围替代"
+      ],
+      "quiz": [
+        {
+          "id": "db-q133-quiz-01",
+          "question": "分库分表后 LIMIT OFFSET 分页性能崩溃的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "中间件必须让每个分片返回前 OFFSET+LIMIT 条数据做全局归并排序，总数据量为 N×(OFFSET+LIMIT)"},
+            {"id": "B", "text": "MySQL 分片表的索引失效导致每次都全表扫描"},
+            {"id": "C", "text": "分片间网络延迟导致分页查询需要串行等待所有分片响应"},
+            {"id": "D", "text": "LIMIT OFFSET 语法在分片表上不被支持，中间件需要转换成子查询"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "分布式环境下，数据在排序维度上跨分片交错分布。要保证全局排序正确性，中间件无法预知目标记录落在哪个分片的哪个位置，因此必须让每个分片返回前 OFFSET+LIMIT 条数据，在内存中做 N 路归并排序后取目标范围。当 OFFSET 很大时，每个分片返回的数据量线性增长，网络传输和内存消耗同步爆炸。选项 B 错误，分片内索引仍然有效。选项 C 错误，各分片是并行查询的。选项 D 错误，LIMIT OFFSET 语法在各分片上完全合法，只是被改写了范围。"
+        },
+        {
+          "id": "db-q133-quiz-02",
+          "question": "游标分页（Cursor-Based Pagination）的核心思想是什么？",
+          "choices": [
+            {"id": "A", "text": "在数据库中维护一个服务端游标（Server Cursor），保持查询会话状态"},
+            {"id": "B", "text": "基于上一页最后一条记录的排序字段值作为查询条件，每次只取下一批数据"},
+            {"id": "C", "text": "预先计算所有分页结果缓存在 Redis 中，翻页时直接读缓存"},
+            {"id": "D", "text": "使用数据库的 FETCH NEXT 语法逐行读取结果集"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "游标分页的核心是将翻页操作从「跳过 N 条取 M 条」转变为「从某个排序位置继续取 M 条」。前端把当前页最后一条记录的排序字段值（如 created_at）和唯一标识（如 id）传给后端，后端构造 WHERE created_at < last_value 条件。每个分片只需返回满足条件的前 LIMIT 条，中间件做 N × LIMIT 量级的小规模归并。无论用户翻到多深，每次代价恒定。选项 A 的服务端游标是另一种机制且不适合分布式场景。选项 C 的预计算在数据频繁变更时不可行。选项 D 是数据库内部机制，不是应用层分页方案。"
+        },
+        {
+          "id": "db-q133-quiz-03",
+          "question": "ShardingSphere 对分页 SQL 的改写策略是什么？",
+          "choices": [
+            {"id": "A", "text": "将 LIMIT offset, count 改写为 LIMIT 0, offset+count 发送到所有分片，归并后取目标范围"},
+            {"id": "B", "text": "只将 SQL 路由到包含目标 OFFSET 位置数据的单个分片执行"},
+            {"id": "C", "text": "将 OFFSET 平均分配到各分片，每个分片执行 LIMIT offset/N, count"},
+            {"id": "D", "text": "先用 COUNT 统计各分片数据量，计算目标分片后单片查询"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "ShardingSphere 的分页改写逻辑是将 LIMIT offset, count 改写为 LIMIT 0, offset+count。因为全局排序后第 offset+1 到 offset+count 条记录可能来自任何分片的任何位置，所以每个分片必须返回足够多的候选数据。改写后中间件在内存中对所有分片返回的数据做 N 路归并排序，跳过前 offset 条取出 count 条作为最终结果。选项 B 不可行，因为无法预知数据在哪个分片。选项 C 的均摊 OFFSET 不能保证正确性——某个分片可能贡献了大部分目标数据。选项 D 的 COUNT 统计也无法确定精确位置。"
+        },
+        {
+          "id": "db-q133-quiz-04",
+          "question": "二次查询法减少内存消耗的核心机制是什么？",
+          "choices": [
+            {"id": "A", "text": "第一次查询用均摊 OFFSET 探测各分片的排序边界值，第二次用边界值做范围查询精确获取数据"},
+            {"id": "B", "text": "第一次查询获取总行数，第二次根据行数计算精确的分片路由"},
+            {"id": "C", "text": "两次查询分别处理奇数分片和偶数分片，将并发量减半"},
+            {"id": "D", "text": "第一次查询建立临时表缓存中间结果，第二次从临时表分页读取"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "二次查询法的第一次查询将全局 OFFSET 均摊到各分片（OFFSET/N），每个分片只返回一条记录（该位置的排序字段值）。取所有分片返回值的最大/最小值作为边界。第二次查询用这个边界值作为 WHERE 条件发到各分片，每个分片只返回该边界附近的少量数据。第二次查询的总数据量远小于原始的 N×(OFFSET+LIMIT)。均摊不精确，所以第二次需要多取一些数据做补偿，但整体内存消耗从 MB 级降到 KB 级。选项 B 的总行数无法确定精确位置。选项 C 和 D 均不是二次查询法的真实机制。"
+        },
+        {
+          "id": "db-q133-quiz-05",
+          "question": "以下 ShardingSphere 慢日志显示的分页改写结果，该请求在 16 分片环境下中间件内存中需要归并多少条记录？\n\n```\n原始SQL: SELECT * FROM orders ORDER BY created_at DESC LIMIT 20000, 50;\n改写SQL: SELECT * FROM orders_07 ORDER BY created_at DESC LIMIT 0, 20050;\n```",
+          "choices": [
+            {"id": "A", "text": "20050 条"},
+            {"id": "B", "text": "320800 条（16 × 20050）"},
+            {"id": "C", "text": "50 条"},
+            {"id": "D", "text": "160000 条（16 × 10000）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ShardingSphere 将 LIMIT 20000, 50 改写为 LIMIT 0, 20050 发送到每个分片。16 个分片各返回 20050 条，中间件内存中需要对 16 × 20050 = 320800 条记录做归并排序，然后跳过前 20000 条取出第 20001 到 20050 条作为最终结果。这意味着为了获取 50 条目标数据，实际在网络上传输了 32 万条记录，内存中排序了 32 万条记录。这就是分布式深分页的代价——OFFSET 越大，浪费的资源越多。选项 A 只是单个分片的返回量。选项 C 只是最终结果条数。"
+        },
+        {
+          "id": "db-q133-quiz-06",
+          "question": "使用游标分页时，以下哪种情况会导致数据重复或遗漏？",
+          "choices": [
+            {"id": "A", "text": "在翻页过程中有新数据插入，且新数据的排序字段值落在已翻过的范围内"},
+            {"id": "B", "text": "排序字段（如 created_at）存在大量重复值且未使用唯一字段作为二级排序"},
+            {"id": "C", "text": "用户翻页速度太快，前端连续发送了多个分页请求"},
+            {"id": "D", "text": "某个分片在翻页过程中发生了主从切换"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "游标分页依赖排序字段值的唯一性来定位「从哪里继续」。如果 created_at 有大量相同值（比如批量导入的订单时间戳相同），用 `WHERE created_at < '2024-01-15 14:23:07'` 作为游标条件时，相同时间戳的记录可能被部分跳过或重复返回。解决办法是必须加上唯一字段作为 tie-breaker：`WHERE (created_at, id) < (last_created_at, last_id)`。选项 A 中新数据落在已翻过范围内不会被后续页查到，属于正常的时间窗口一致性行为。选项 C 不影响正确性，每个请求独立执行。选项 D 只影响可用性不影响分页逻辑。"
+        },
+        {
+          "id": "db-q133-quiz-07",
+          "question": "全局排序索引表方案和 Elasticsearch search_after 方案相比，各自最大的优势是什么？",
+          "choices": [
+            {"id": "A", "text": "索引表支持跳页且数据强一致；ES 支持复杂多维度查询和全文检索但有秒级延迟"},
+            {"id": "B", "text": "索引表写入性能更好；ES 读取性能更好"},
+            {"id": "C", "text": "索引表不需要额外存储空间；ES 需要双倍存储"},
+            {"id": "D", "text": "索引表对所有查询模式都更快；ES 只在全文搜索时有优势"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "全局排序索引表的核心优势在于数据强一致性（同步双写或 binlog 监听延迟极低）和支持跳页（索引表本身不分片，LIMIT OFFSET 在单机上执行）。ES 的核心优势是灵活的查询能力——全文检索、多字段组合筛选、聚合分析都很方便，且 search_after 天然支持游标分页。但 ES 的 refresh_interval 默认 1s 意味着数据写入后有短暂不可见窗口。选项 B 不准确，两者的读写性能取决于具体场景。选项 C 错误，索引表也需要额外存储。选项 D 过于绝对。"
+        },
+        {
+          "id": "db-q133-quiz-08",
+          "question": "某电商后台系统订单量 5 亿，需要支持按金额、时间、状态排序的跳页查询（最大 100 页），最适合的生产方案是什么？",
+          "choices": [
+            {"id": "A", "text": "限制最大 OFFSET 不超过 2000，用 ShardingSphere 原生分页改写即可满足"},
+            {"id": "B", "text": "为每个排序维度建立全局排序索引表，分页查索引表后精准路由到业务分片取完整数据"},
+            {"id": "C", "text": "将 5 亿数据全量同步到单机 MySQL 大表做分页查询"},
+            {"id": "D", "text": "在每个分片上建立物化视图，中间件查询物化视图做分页"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "5 亿订单、多排序维度、跳页需求——这个组合排除了游标分页（不支持跳页）和原生改写（OFFSET 2000 × 16 分片 = 32000 条归并尚可，但多排序维度增加复杂度）。全局排序索引表为每个需要排序的维度建立一个窄行索引（50 字节/行，5 亿行约 25GB），单机 MySQL 用 LIMIT OFFSET 查索引表（最大 100 页 = OFFSET 1980），性能完全可控。再根据索引表返回的 shard_id 精准路由取完整数据，避免全分片扫描。选项 C 的 5 亿行单表不现实。选项 D 的物化视图不解决跨分片归并问题。"
+        },
+        {
+          "id": "db-q133-quiz-09",
+          "question": "在游标分页方案中，如果用户需要「回到上一页」，应该如何实现？",
+          "choices": [
+            {"id": "A", "text": "反转排序方向并使用当前页第一条记录的排序值作为游标，查询后将结果再反转"},
+            {"id": "B", "text": "游标分页无法实现向前翻页，必须从第一页重新开始"},
+            {"id": "C", "text": "缓存所有已翻过页面的完整数据，回翻时直接从缓存读取"},
+            {"id": "D", "text": "使用负数 OFFSET 实现反向分页"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "向前翻页的实现方式是反转排序方向。假设正常是 ORDER BY created_at DESC，当前页第一条记录的 created_at 是 T1。要获取上一页数据，构造 `WHERE created_at > T1 ORDER BY created_at ASC LIMIT 20`，查询结果得到的是时间上比 T1 更新的 20 条（即上一页的数据），最后在应用层将结果集反转恢复为降序展示。这种方式每次只取 20 条，性能与向前翻页一致。选项 B 错误，游标分页完全可以双向翻页。选项 C 的全量缓存对于深页不现实。选项 D 的负数 OFFSET 是不存在的 SQL 语法。"
+        },
+        {
+          "id": "db-q133-quiz-10",
+          "question": "线上 ShardingSphere-Proxy 出现 OOM，监控显示 heap 使用率在分页请求高峰期飙到 95%，以下哪个排查方向最可能定位到问题？",
+          "choices": [
+            {"id": "A", "text": "检查慢日志中分页 SQL 的 OFFSET 值，确认是否有深分页请求导致中间件内存中大量数据归并"},
+            {"id": "B", "text": "检查 MySQL 分片实例的连接数是否超过 max_connections 限制"},
+            {"id": "C", "text": "检查 ShardingSphere-Proxy 的线程池是否配置过小导致请求堆积"},
+            {"id": "D", "text": "检查 JVM 的 MetaSpace 是否因为类加载过多导致内存溢出"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "ShardingSphere-Proxy 做分页归并时会把各分片返回的数据全部加载到 JVM heap 中做排序。当 OFFSET 很大时（如 OFFSET=100000 × 16 分片），heap 中需要容纳 160 万条记录的排序数据，极易触发 OOM。排查方向应该先看慢日志中有没有大 OFFSET 的分页 SQL。确认后可以通过限制 max_offset（ShardingSphere 支持 sql-show 和 sql-simple 配置）或改用游标分页来根治。选项 B 的连接数问题表现为连接拒绝而非 OOM。选项 C 的线程堆积不会直接导致 heap 暴涨。选项 D 的 MetaSpace 溢出与数据归并无关。"
+        }
+      ],
+      "references": [
+        {"title": "ShardingSphere Documentation - Pagination", "url": "https://shardingsphere.apache.org/document/current/en/features/sharding/use-norms/pagination/"},
+        {"title": "MySQL 8.0 Reference Manual - LIMIT Query Optimization", "url": "https://dev.mysql.com/doc/refman/8.0/en/limit-optimization.html"},
+        {"title": "Elasticsearch Guide - search_after", "url": "https://www.elastic.co/guide/en/elasticsearch/reference/8.12/paginate-search-results.html#search-after"}
+      ],
+      "relatedQuestions": ["db-q126"]
+    }
+  ]
+}

@@ -1,0 +1,156 @@
+{
+  "id": "db-order-table-sharding-design",
+  "name": "将一张 5000 万行的订单表进行分表的方案设计",
+  "domain": "database",
+  "description": "5000万行订单表分表方案设计与实施步骤",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q134",
+      "domain": "database",
+      "type": "project",
+      "difficulty": 4,
+      "tags": ["分库分表", "订单表", "方案设计", "数据迁移"],
+      "title": "将一张 5000 万行的订单表进行分表的方案设计",
+      "content": "面试官让你「结合项目经验说一下怎么对订单表做分表」的时候，他想听的不是你背出 ShardingSphere 的配置文件，而是你能不能从业务特征出发，完整地设计一套分表方案并且把它安全地落地到生产环境。\n\n这道题的背景是一个典型的电商系统：单张 orders 表已经积累到 5000 万行，表结构包含 order_id（bigint 主键）、user_id、merchant_id、order_status、amount、created_at 等核心字段，行宽约 500 字节，.ibd 文件大小约 28GB。当前的问题非常具体——按 user_id 查订单列表的 P99 从半年前的 8ms 退化到了 45ms，每月新增约 300 万行且增速在加快，线上执行 ALTER TABLE 加字段需要锁表 40 分钟以上，mysqldump 导出全表需要 2.5 小时导致凌晨的备份窗口不够用。\n\n分表不是一个单点决策，它是一套系统工程。你需要回答的问题链是：用什么字段做分片键？分多少张表？用 hash 还是 range？怎么生成全局唯一的订单 ID？怎么从单表迁移到多表而不停机？迁移完之后怎么验证数据一致性？分表之后那些不走分片键的查询（比如按商家维度查订单）怎么办？未来三年数据继续增长怎么扩容？\n\n能把这条链完整走一遍的候选人，说明他不是在纸上谈兵，而是真正在生产环境里做过这件事。",
+      "answer": "## 一、单表 5000 万行带来的具体问题\n\n要设计分表方案，首先要量化当前的痛点。一张 5000 万行、行宽 500 字节的 InnoDB 表，数据页 16KB 每页约 32 行，B+ 树非叶子节点按 bigint 主键计算每个节点可存约 1170 个指针。三层 B+ 树容量约 1170 × 1170 × 32 ≈ 4380 万行，当数据超过这个阈值，B+ 树就从三层变成四层，每次等值查询多一次磁盘随机 IO。这就是 P99 从 8ms 退化到 45ms 的根本原因——不是索引设计有问题，而是物理上多了一层寻址。\n\nDDL 操作同样受影响。MySQL 8.0 的 Instant DDL 只支持在表末尾加列且有诸多限制，大部分 ALTER TABLE 仍然需要 Online DDL 重建整张表。5000 万行重建耗时 40 分钟以上，期间虽然不阻塞读写，但会产生大量 IO 负载，导致线上查询延迟抖动。更危险的是如果中途失败需要回滚，又是 40 分钟。备份方面，即使用 xtrabackup 做物理热备，28GB 的单表拷贝加上 apply-log 也需要较长时间，压缩后传输到异地备份存储的窗口越来越紧张。\n\n这些问题确认后，分表就不再是「可选优化」而是「必须执行」的技术决策。\n\n## 二、分片键选择——为什么是 user_id\n\n分片键的选择决定了整个方案 80% 的成败。订单表有三个候选分片键：order_id、user_id、created_at。我们逐一分析。\n\n按 order_id 做 hash 分片，数据分布最均匀，但业务上最常见的查询是「查某个用户的订单列表」，这意味着每次查询都要广播到所有分片做 scatter-gather，延迟取决于最慢的那个分片，P99 反而会更差。按 created_at 做 range 分片（按月分表），查询最近订单时只命中少数分片，但会产生严重的写热点——所有新订单都写入最新的分片，其他分片几乎空闲。\n\n按 user_id 做 hash 分片是最佳选择。原因有三：第一，用户查自己的订单是频率最高的查询场景（占总 QPS 的 70% 以上），按 user_id 分片后这类查询只命中单个分片；第二，用户的写入天然分散，不会产生热点；第三，同一个用户的所有订单落在同一个分片内，「查用户最近 10 笔订单」这种分页查询不需要跨分片。\n\n## 三、分片数量计算\n\n分片数量不能拍脑袋，需要基于数据量和增长预期计算。当前 5000 万行，月增 300 万行且在加速，按未来 3 年预估总数据量约 5000 万 + 300 万 × 36 = 1.58 亿行（考虑增速加快，按 2 亿行规划）。单表控制在 500 万行以内是一个安全阈值（B+ 树稳定三层，DDL 操作分钟级完成）。2 亿 / 500 万 = 40 张表，向上取 2 的幂次方为 64。\n\n选 64 而不是 32 的原因是留出余量。32 张表意味着每表承载 625 万行，虽然可接受但已经接近需要关注的边界。64 张表每表约 312 万行，DDL 操作秒级完成，备份单表只需几十秒，运维友好度大幅提升。分片规则为 `user_id % 64`，表名为 orders_00 到 orders_63。\n\n## 四、全局唯一订单 ID 生成\n\n分表后不能再用 MySQL 的 auto_increment 作为 order_id，因为 64 张表各自的自增 ID 会冲突。需要引入分布式 ID 生成方案。在这个场景下我们使用改良版 Snowflake 算法：\n\n```\n| 1 bit 符号位 | 41 bit 时间戳 | 6 bit 分表号 | 6 bit 机器ID | 10 bit 序列号 |\n```\n\n将 6 bit 分表号编码进 ID 中有一个巨大的好处：拿到任何一个 order_id 就能直接算出它在哪张表里（`order_id >> 10 & 0x3F` 取分表号），不需要再查路由表。这样按 order_id 查单笔订单也能精确定位到分片，避免广播查询。\n\n## 五、不停机迁移方案——双写 + 追数据\n\n最关键的环节是如何从单表迁移到 64 张分表而不停服。完整流程分四个阶段：\n\n**阶段一：影子表创建与双写开启。** 在目标库创建 orders_00 到 orders_63 共 64 张表。应用层开启双写——每笔新订单同时写入旧的 orders 表和新的 orders_XX 表。双写逻辑通过业务代码中的 Feature Flag 控制：\n\n```java\n// 双写阶段：新订单同时写入新旧表\npublic void createOrder(Order order) {\n    orderMapper.insertOld(order);  // 写旧表\n    int shardIndex = order.getUserId() % 64;\n    orderShardMapper.insert(shardIndex, order);  // 写新表\n}\n```\n\n**阶段二：历史数据回填。** 用一个离线任务把旧表中双写开启之前的存量数据迁移到对应分表中。为避免对线上造成压力，使用限流迁移：每批 1000 行，每批间隔 100ms，按 id 范围顺序扫描。5000 万行约需 5000 秒（约 1.4 小时）。\n\n```sql\n-- 回填脚本核心逻辑（伪 SQL）\nINSERT INTO orders_${user_id % 64} \n  SELECT * FROM orders \n  WHERE id BETWEEN ? AND ? \n  ON DUPLICATE KEY UPDATE id=id;  -- 幂等处理，避免与双写期间数据冲突\n```\n\n**阶段三：数据校验。** 回填完成后，运行校验任务对比新旧表数据一致性。核心校验逻辑是：遍历旧表每一行，计算其应该落入的分片，然后去对应分片查询确认存在且字段值一致。校验通过率必须达到 100% 才能进入下一阶段。实际执行中，我们发现 0.003% 的行因为双写期间的并发更新导致状态不一致，通过以旧表为准做一次增量同步修复。\n\n**阶段四：流量切换。** 将读流量通过 Feature Flag 逐步从旧表切到新表——先切 1% 灰度观察 P99 和错误率，确认无异常后逐步扩大到 10%、50%、100%。读流量完全切换后，关闭对旧表的写入，只写新表。观察一周稳定后，旧表 rename 为 orders_archive 留存一个月作为保险，最终删除。\n\n## 六、非分片键查询——ES 同步方案\n\n分表后，按 user_id 查询走对应分片，性能完美。但业务还有按 merchant_id 查订单（商家后台）、按 order_status 查询（运营后台）、按时间范围全局搜索等需求。这些查询不走分片键，如果广播 64 张表性能反而更差。\n\n解决方案是引入 Elasticsearch 作为查询索引层。通过 Canal 监听 64 张分表的 binlog，实时同步订单数据到 ES 的 orders 索引中。ES 中按 merchant_id 和 created_at 建立合适的 mapping，商家维度和运营维度的查询走 ES，延迟可控制在 50ms 以内。MySQL 分表只负责按 user_id 的精确查询和事务写入。\n\n```yaml\n# Canal 同步配置片段 (canal-adapter/conf/es7/order_sync.yml)\ndataSourceKey: defaultDS\ndestination: orders-topic\ngroupId: g_order_es_sync\nesMapping:\n  _index: orders\n  _id: order_id\n  sql: \"SELECT order_id, user_id, merchant_id, order_status, amount, created_at FROM orders\"\n  etlCondition: \"WHERE created_at >= '{0}'\"\n  commitBatch: 3000\n```\n\n## 七、容量规划与未来扩容\n\n64 张表的设计支撑 2 亿行数据（3 年增长），但如果业务爆发式增长提前用完容量怎么办？扩容策略是从 64 扩到 128——即将每张表再拆成两张。由于分片规则是 user_id % 64，扩容后变为 user_id % 128，原来落在 orders_03 的数据（user_id % 64 == 3），在新规则下会落入 orders_03（user_id % 128 == 3）或 orders_67（user_id % 128 == 67）。这种 2 的幂次扩容只需要对半搬迁数据，每张旧表约 50% 数据不需要移动，迁移成本最低。\n\n订单归档也是容量规划的一部分。超过 12 个月的历史订单迁移到 TiDB 或 ClickHouse 作为离线分析数据源，分表中只保留一年内的热数据。每月月初跑一次归档任务，DELETE 已迁移的数据后用 `OPTIMIZE TABLE` 回收空间。这样 64 张表的实际数据量始终控制在合理范围内。",
+      "keyPoints": [
+        "分片键选择 user_id 是因为「查用户订单列表」占总 QPS 70% 以上，按 user_id 分片可保证最高频查询只命中单分片",
+        "分片数量按 3 年增长规划取 2 的幂次方（64 张表），每表控制 500 万行以内确保 B+ 树三层、DDL 秒级完成",
+        "将分表号编码进 Snowflake ID 中（6 bit），使得按 order_id 查单笔订单也能精确定位分片而无需广播",
+        "不停机迁移采用四阶段方案：双写开启 → 历史回填 → 数据校验 → 灰度切流，全程通过 Feature Flag 控制",
+        "非分片键查询（商家维度、运营维度）通过 Canal 同步 binlog 到 Elasticsearch 解决，MySQL 只承担 user_id 维度的 OLTP 查询",
+        "扩容选择 2 的幂次方（64→128）使得对半拆分数据最小化迁移量，约 50% 数据无需移动",
+        "配合 12 个月归档策略将热数据量控制在分表容量范围内，历史数据迁入 ClickHouse 供离线分析"
+      ],
+      "quiz": [
+        {
+          "id": "db-q134-quiz-01",
+          "question": "在电商订单表分表场景中，选择 user_id 作为分片键的最核心原因是什么？",
+          "choices": [
+            {"id": "A", "text": "user_id 是自增整数，取模运算效率最高"},
+            {"id": "B", "text": "按 user_id 查订单列表是最高频的查询场景，分片后这类查询只命中单分片"},
+            {"id": "C", "text": "user_id 的值范围最小，分片后每张表数据量最均匀"},
+            {"id": "D", "text": "user_id 是外键关联字段，MySQL 要求分片键必须是外键"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "分片键选择的核心原则是「让最高频的查询能精确命中单个分片」。在电商系统中，用户查看自己的订单列表占总查询 QPS 的 70% 以上，按 user_id 做 hash 分片后，同一用户的所有订单落在同一张表中，这类查询只需访问一个分片即可返回完整结果。选项 A 错误，取模效率在现代 CPU 上不是瓶颈。选项 C 错误，user_id 值范围反而很大（可能上亿），均匀性靠 hash 函数保证而非值范围。选项 D 错误，MySQL 对分片键没有外键要求。"
+        },
+        {
+          "id": "db-q134-quiz-02",
+          "question": "如果选择 order_id 作为分片键（hash 取模），对「查询某用户最近 10 笔订单」这个场景会有什么影响？",
+          "choices": [
+            {"id": "A", "text": "查询性能不受影响，因为 order_id 分布均匀"},
+            {"id": "B", "text": "需要广播到所有分片做 scatter-gather，P99 取决于最慢分片，延迟反而可能更高"},
+            {"id": "C", "text": "MySQL 会自动路由到包含该用户数据的分片"},
+            {"id": "D", "text": "只需要查最新的一个分片即可，因为最近订单一定在最后创建的分片中"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "按 order_id 做 hash 分片时，同一用户的不同订单会被随机散落在不同分片中。当执行「查某用户最近 10 笔订单」时，分片中间件无法确定这些订单落在哪些分片，只能将查询广播到全部 64 个分片，每个分片返回符合条件的数据后在中间件层做归并排序取 TOP 10。P99 延迟取决于 64 个分片中最慢的那个，再加上归并时间，总延迟很可能超过分表前的单表查询。选项 C 错误，MySQL 和分片中间件都无法自动推断 user_id 与 order_id 的关系。选项 D 混淆了 hash 分片和 range 分片的概念。"
+        },
+        {
+          "id": "db-q134-quiz-03",
+          "question": "将 Snowflake ID 中嵌入 6 bit 分表号的设计，解决了什么问题？",
+          "choices": [
+            {"id": "A", "text": "解决了 ID 全局唯一性问题，6 bit 分表号保证不同表的 ID 不冲突"},
+            {"id": "B", "text": "使得按 order_id 查询单笔订单时能直接从 ID 中解析出分片位置，避免广播所有分片"},
+            {"id": "C", "text": "使得 order_id 的生成速度提升 64 倍，每个分片独立生成 ID"},
+            {"id": "D", "text": "解决了 ID 排序问题，嵌入分表号后 ID 仍然保持时间递增"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在分表后按 order_id 查询单笔订单（比如支付回调、物流更新等场景）时，如果不知道该订单在哪个分片，就需要广播所有 64 张表。将 6 bit 分表号编码进 Snowflake ID 的固定位置后，任何拿到 order_id 的代码都能通过位运算（如 `order_id >> 10 & 0x3F`）直接算出分片号，精确定位到单张表查询。这种设计将 O(N) 的广播查询变成了 O(1) 的精确查询。选项 A 不准确，唯一性主要靠时间戳+机器ID+序列号保证。选项 C 错误，ID 生成速度与嵌入分表号无关。选项 D 说法不完整，时间递增性靠 41 bit 时间戳保证。"
+        },
+        {
+          "id": "db-q134-quiz-04",
+          "question": "双写迁移阶段中，历史数据回填脚本使用 ON DUPLICATE KEY UPDATE 的目的是什么？",
+          "choices": [
+            {"id": "A", "text": "提高批量写入性能，比逐行 INSERT 快 10 倍"},
+            {"id": "B", "text": "实现幂等性——如果双写已经写入了某行，回填时遇到重复主键不会报错也不会覆盖"},
+            {"id": "C", "text": "自动更新已有记录的 updated_at 时间戳"},
+            {"id": "D", "text": "绕过 InnoDB 的唯一索引检查以加速插入"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "双写和历史回填是并行执行的——双写开启后产生的新订单已经写入了分表，而回填任务在顺序扫描旧表时也会扫到这些已被双写的新数据。如果不做幂等处理，INSERT 遇到重复主键会报 Duplicate entry 错误导致回填中断。ON DUPLICATE KEY UPDATE id=id 的写法让 MySQL 在遇到重复主键时执行一个无实际效果的更新（把 id 设为自身），既不报错也不覆盖已有数据，保证了回填脚本可以重复执行而结果一致。选项 A 错误，ON DUPLICATE KEY UPDATE 不影响批量性能。选项 D 错误，唯一索引检查仍然执行，只是冲突后的行为变为更新而非报错。"
+        },
+        {
+          "id": "db-q134-quiz-05",
+          "question": "以下是迁移校验阶段发现的日志输出，说明了什么问题？\n\n```\n[VERIFY] batch 4821/5000 completed\n[VERIFY] mismatch found: order_id=20230815001234, old_table.status=PAID, shard_17.status=CREATED\n[VERIFY] mismatch found: order_id=20230815001237, old_table.status=SHIPPED, shard_17.status=PAID\n[VERIFY] total mismatches: 1847 / 50000000 (0.003%)\n```",
+          "choices": [
+            {"id": "A", "text": "回填脚本有 BUG，导致 0.003% 的数据写入了错误的分片"},
+            {"id": "B", "text": "双写期间的并发状态更新导致新旧表状态不一致——旧表先更新但新表的双写可能滞后"},
+            {"id": "C", "text": "分片键计算错误，部分数据路由到了错误的 shard"},
+            {"id": "D", "text": "MySQL 主从延迟导致数据丢失"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "从日志可以看出，不一致的字段是 status 而非整行缺失——old_table 显示 PAID/SHIPPED 但 shard 表显示 CREATED/PAID，说明旧表的状态更新了但分表中的状态还停留在上一个版本。这是双写期间的典型竞态条件：订单创建时双写了两边（状态都是 CREATED），但后续的状态变更（CREATED→PAID→SHIPPED）可能只更新了旧表而双写链路还未覆盖 UPDATE 操作，或者 UPDATE 的双写有短暂延迟。修复方式是以旧表为权威数据源做一次增量同步。选项 A 和 C 都指向路由问题，但日志显示数据确实在正确的 shard_17 中只是状态不对。"
+        },
+        {
+          "id": "db-q134-quiz-06",
+          "question": "将 64 张分表扩容到 128 张时，按 user_id % 64 分片的旧数据需要怎样重新分布？",
+          "choices": [
+            {"id": "A", "text": "所有 64 张旧表的数据都需要全量重新 hash 分配到 128 张新表中"},
+            {"id": "B", "text": "每张旧表约 50% 的数据不需要移动，另外 50% 迁移到对应的新表（旧表号 + 64）"},
+            {"id": "C", "text": "只需要修改分片路由规则，数据完全不需要移动"},
+            {"id": "D", "text": "旧的 64 张表保持不动作为只读分片，新数据写入新的 64 张表"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "2 的幂次扩容有一个数学特性：user_id % 64 == N 的数据，在 user_id % 128 的规则下只会落入 N 或 N+64 两个位置。例如 user_id=67，67 % 64 = 3 落在 orders_03，67 % 128 = 67 落在 orders_67 需要迁移；而 user_id=3，3 % 64 = 3 且 3 % 128 = 3 不需要移动。统计上每张旧表约一半的数据 user_id % 128 仍然等于原来的值（不动），另一半需要迁移到新编号的表中。这比非 2 幂次扩容（如 64→96）需要全量 rehash 高效得多。选项 C 错误，路由规则变了数据必须跟着动。选项 D 描述的是 range 分片的扩容方式，不适用于 hash 分片。"
+        },
+        {
+          "id": "db-q134-quiz-07",
+          "question": "对比 hash 分片（user_id % N）和 range 分片（按 created_at 月份），在订单表场景下各自的最大问题是什么？",
+          "choices": [
+            {"id": "A", "text": "hash 分片的最大问题是跨分片的范围查询需要广播；range 分片的最大问题是写热点集中在最新分片"},
+            {"id": "B", "text": "hash 分片数据分布不均匀；range 分片查询效率低"},
+            {"id": "C", "text": "hash 分片不支持事务；range 分片不支持索引"},
+            {"id": "D", "text": "hash 分片需要全局唯一 ID；range 分片不需要"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "hash 分片（user_id % N）的优点是数据分布均匀、无写热点，缺点是按时间范围查询所有用户的订单（如运营报表「今天所有未支付订单」）需要广播全部分片。range 分片（按月分表）的优点是时间范围查询只命中少数分片，缺点是当前月份的分片承担几乎 100% 的写入流量，形成严重热点，导致该分片的 IO 和锁竞争远高于其他分片。选项 B 不准确，hash 分片如果 hash 函数良好分布是均匀的；range 分片的查询效率在命中分区时反而很高。选项 D 错误，无论哪种分片方式都需要全局唯一 ID。"
+        },
+        {
+          "id": "db-q134-quiz-08",
+          "question": "生产环境中灰度切流（从旧表切到分表）时，如果 1% 灰度阶段发现分表的 P99 比旧表高 3 倍，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "分表的 Buffer Pool 尚未预热，大量查询触发磁盘 IO 而非内存命中"},
+            {"id": "B", "text": "分片数量太少导致单片数据量仍然过大"},
+            {"id": "C", "text": "分片键选错了，大部分查询仍在做跨分片广播"},
+            {"id": "D", "text": "MySQL 8.0 不支持分表后的索引优化"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "灰度切流初期最常见的问题是 Buffer Pool 冷启动。旧表运行多年，热数据页已经完全驻留在 InnoDB Buffer Pool 中（命中率 >99%），查询几乎不需要磁盘 IO。而新建的 64 张分表从未被查询过，Buffer Pool 中没有它们的数据页，前几轮查询全部要走磁盘随机读。解决方式是在灰度切流前执行预热脚本：对每张分表执行 `SELECT COUNT(*) FROM orders_XX FORCE INDEX(PRIMARY)` 强制扫描主键索引将数据页加载到内存中。通常预热完成后（约 10-15 分钟）P99 会恢复正常。选项 B 和 C 如果存在应该在测试环境就能发现。选项 D 无此限制。"
+        },
+        {
+          "id": "db-q134-quiz-09",
+          "question": "一个用户在分表后短时间内创建了 50 万笔订单（刷单场景），会对当前分表方案产生什么影响？",
+          "choices": [
+            {"id": "A", "text": "该用户对应的单个分片数据量暴涨，但不影响其他分片的读写性能"},
+            {"id": "B", "text": "所有 64 个分片都会均匀增长，因为 hash 分片保证均匀分布"},
+            {"id": "C", "text": "Snowflake ID 生成器会因为序列号溢出而停止工作"},
+            {"id": "D", "text": "分片中间件会自动将该用户的数据迁移到负载更低的分片"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "按 user_id hash 分片的设计下，同一用户的所有订单落在同一张表中。当某个用户产生 50 万笔订单时，其所在分片的数据量会显著高于其他分片（数据倾斜），该分片的查询性能会退化，但完全不影响其他 63 个分片。这是 hash 分片面对大卖家或刷单用户时的已知缺陷。生产中通常通过业务层限流（单用户下单 QPS 上限）和异常检测（短时间大量下单触发风控）来缓解。选项 B 混淆了 user_id 维度——同一 user_id 取模结果固定。选项 C 中 Snowflake 的 10 bit 序列号每毫秒支持 1024 个 ID，50 万笔如果分散在数分钟内不会溢出。"
+        },
+        {
+          "id": "db-q134-quiz-10",
+          "question": "双写阶段上线后，监控发现新分表的写入成功率只有 97%，旧表写入成功率 100%，最应该先排查什么？",
+          "choices": [
+            {"id": "A", "text": "新分表所在 MySQL 实例的 max_connections 是否已经耗尽，连接池配置是否合理"},
+            {"id": "B", "text": "网络带宽是否不足以支撑双倍写入流量"},
+            {"id": "C", "text": "分片路由算法是否存在计算错误导致部分写入路由到不存在的表"},
+            {"id": "D", "text": "InnoDB 的 redo log 是否写满导致 checkpoint 阻塞"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "双写意味着应用需要同时维护对旧库和新库（64 张分表所在实例）的连接。如果新实例的连接池配置沿用旧值（比如每个应用实例 20 连接），在多个应用实例同时双写时很容易耗尽 max_connections（默认 151）。表现为 3% 的写入因「Too many connections」报错而失败。排查步骤是先看新实例的 `SHOW PROCESSLIST` 和 `SHOW STATUS LIKE 'Threads_connected'`，如果接近 max_connections 则确认是连接数问题。修复方式是调大 max_connections 并优化连接池参数（最小空闲、最大连接数、超时时间）。选项 C 如果存在应该是 100% 失败而非 3%。选项 D 通常表现为所有写入变慢而非部分失败。"
+        }
+      ],
+      "references": [
+        {"title": "ShardingSphere 官方文档 - 数据分片", "url": "https://shardingsphere.apache.org/document/current/cn/features/sharding/"},
+        {"title": "美团技术博客 - Leaf 分布式 ID 生成系统", "url": "https://tech.meituan.com/2017/04/21/mt-leaf.html"},
+        {"title": "MySQL 8.0 Reference Manual - InnoDB On-Disk Structures", "url": "https://dev.mysql.com/doc/refman/8.0/en/innodb-on-disk-structures.html"}
+      ],
+      "relatedQuestions": ["db-q126"]
+    }
+  ]
+}
