@@ -1,0 +1,157 @@
+{
+  "id": "db-rc-readview-per-select",
+  "name": "READ COMMITTED 下每次 SELECT 都创建新 Read View 的影响",
+  "domain": "database",
+  "description": "深入分析 RC 隔离级别下每条 SELECT 创建独立 ReadView 的机制，与 RR 单 ReadView 复用的行为差异，以及这种设计在生产环境中带来的具体影响",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-q054",
+      "domain": "database",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["MySQL", "InnoDB", "READ COMMITTED", "Read View", "MVCC", "事务隔离"],
+      "title": "READ COMMITTED 下每次 SELECT 都创建新 Read View 的影响",
+      "content": "面试中聊到事务隔离级别时，候选人往往能背出「RC 每次 SELECT 都创建新的 ReadView，RR 只创建一次」这句结论，但面试官紧接着的追问才是真正的区分度所在：这个设计差异到底会带来哪些具体的行为差异？在什么业务场景下 RC 比 RR 更合适？RC 下不可重复读到底是 bug 还是 feature？为什么互联网大厂（如阿里、字节）的线上 MySQL 普遍使用 RC 而非 MySQL 默认的 RR？\n\n为了把这些问题讲清楚，我们需要一个足够贴近真实业务的实验环境。以下是一个订单表，用它可以覆盖所有关键场景：\n\n```sql\n-- MySQL 8.0.35 / InnoDB\nCREATE TABLE orders (\n    id          INT PRIMARY KEY AUTO_INCREMENT,\n    user_id     INT NOT NULL,\n    amount      DECIMAL(10,2) NOT NULL,\n    status      VARCHAR(20) NOT NULL DEFAULT 'pending',\n    created_at  DATETIME NOT NULL DEFAULT NOW()\n) ENGINE=InnoDB;\n\nINSERT INTO orders (id, user_id, amount, status) VALUES\n(1, 1001, 99.00,  'pending'),\n(2, 1001, 250.00, 'paid'),\n(3, 1002, 180.00, 'pending');\n```\n\n现在假设有三个并发会话在操作这张表：事务 A（trx_id=100）负责支付回调、事务 B（trx_id=200）负责订单查询、事务 C（trx_id=300）负责定时任务扫描超时订单。它们的执行顺序交错在一起，而 RC 和 RR 下同样的执行时间线却会产生截然不同的查询结果。面试官想看到的，是你能在白板上画出完整的时间线并推演每一步的可见性判断过程。",
+      "answer": "## ReadView 机制回顾：理解差异的前提\n\n### 快照读的核心数据结构\n\n在深入讨论 RC 下每次 SELECT 创建新 ReadView 带来的影响之前，我们需要快速回顾 ReadView 的本质。ReadView 是 InnoDB 在执行快照读（普通 SELECT）时创建的一个内存结构，它记录了创建那一刻事务系统的「快照信息」。这个快照包含四个核心字段：`m_ids`（当前所有活跃事务的 ID 列表）、`min_trx_id`（活跃列表中最小的事务 ID）、`max_trx_id`（下一个将被分配的事务 ID）、以及 `creator_trx_id`（创建此 ReadView 的事务自身 ID）。InnoDB 用这四个字段来判断数据行版本链上的每个版本对当前事务是否可见——如果最新版本不可见，就沿着 undo log 的版本链往回找，直到找到第一个可见版本。\n\n整套可见性判断逻辑非常清晰：如果版本的 trx_id 等于 creator_trx_id，说明是自己修改的，可见；如果 trx_id 小于 min_trx_id，说明修改它的事务早在 ReadView 创建前就已提交，可见；如果 trx_id 大于等于 max_trx_id，说明修改它的事务在 ReadView 创建之后才出现，不可见；如果 trx_id 在 [min_trx_id, max_trx_id) 区间内，则需要检查它是否在 m_ids 列表中——在列表中意味着该事务在 ReadView 创建时尚未提交，不可见；不在列表中则说明已提交，可见。\n\n这个判断算法本身在 RC 和 RR 下完全一样，两种隔离级别的唯一区别仅仅在于：ReadView 什么时候创建、用多久就丢弃。\n\n## RC 与 RR 的 ReadView 生命周期对比\n\n### RR 的策略：一次创建，终生复用\n\n在 REPEATABLE READ 下，ReadView 在事务第一条快照读执行时创建，之后无论事务内再执行多少条 SELECT，都复用这同一个 ReadView。它的 m_ids 列表是创建时刻的静态快照，绝不会因为列表中的事务后来提交了而去更新。这保证了事务内多次读取同一行数据，永远得到相同的结果——即所谓的「可重复读」语义。\n\n### RC 的策略：每读一次，重新拍照\n\n在 READ COMMITTED 下，情况截然不同。每执行一条 SELECT 语句，InnoDB 都会创建一个全新的 ReadView，这条语句执行完毕后 ReadView 随即释放。下一条 SELECT 执行时又创建一个全新的 ReadView。这意味着每次读取时，m_ids 列表都是「此刻此刻」的最新活跃事务快照。如果两次 SELECT 之间有其他事务提交了修改，第二次 SELECT 的新 ReadView 就不会在 m_ids 中包含那个已提交的事务 ID，于是那个事务的修改变得可见了。\n\n这个设计差异看起来很简单，但它在真实业务场景中引起的行为差异远比大多数人想象的要大。我们用一个完整的时间线来演示。\n\n### 具体时间线推演：同一场景，两种结果\n\n假设初始状态下 orders 表中 id=1 的订单 status='pending'，amount=99.00。三个会话按以下时间线执行：\n\n```sql\n-- 初始状态: orders.id=1, status='pending', amount=99.00, 最后修改 trx_id=50(已提交)\n\n-- ===== 时间线 =====\n\n-- T1: Session A (trx_id=100) 开始事务\nBEGIN;\n\n-- T2: Session B (trx_id=200) 开始事务\nBEGIN;\n\n-- T3: Session B 执行第一条 SELECT\nSELECT status, amount FROM orders WHERE id = 1;\n-- 无论 RC 还是 RR, 此时创建 ReadView:\n-- m_ids=[100], min_trx_id=100, max_trx_id=201, creator_trx_id=200\n-- trx_id=50 < min_trx_id=100 → 可见\n-- 结果: status='pending', amount=99.00\n\n-- T4: Session A 修改订单状态并提交\nUPDATE orders SET status = 'paid', amount = 99.00 WHERE id = 1;\nCOMMIT;  -- trx_id=100 提交了!\n\n-- T5: Session B 再次查询同一行\nSELECT status, amount FROM orders WHERE id = 1;\n```\n\n在 T5 这一刻，RC 和 RR 的行为出现了分歧：\n\n```sql\n-- ===== RR 下 T5 的行为 =====\n-- 复用 T3 创建的 ReadView: m_ids=[100], min_trx_id=100\n-- 最新版本 trx_id=100, 检查: 100 在 m_ids 中 → 不可见!\n-- 沿版本链回溯到 trx_id=50 的旧版本\n-- 50 < min_trx_id=100 → 可见\n-- 结果: status='pending', amount=99.00  ← 看不到 Session A 的修改\n\n-- ===== RC 下 T5 的行为 =====\n-- 创建全新的 ReadView #2:\n-- m_ids=[] (此刻没有其他活跃事务), min_trx_id=201, max_trx_id=201\n-- 最新版本 trx_id=100, 检查: 100 < min_trx_id=201 → 可见!\n-- 结果: status='paid', amount=99.00  ← 立即看到 Session A 已提交的修改\n```\n\n这就是 RC 下「不可重复读」现象的完整发生过程。注意，Session B 并没有做错任何事情——它只是在两个不同的时间点读了同一行数据。在 RC 下，两次读取看到了不同的结果，原因纯粹是因为第二次 SELECT 创建了新的 ReadView，而新 ReadView 中 Session A 已经不在活跃列表中了。\n\n### 多行查询下的「部分可见」现象\n\n不可重复读不仅仅影响单行数据。考虑 Session B 在 T3 和 T5 执行的是一个范围查询：\n\n```sql\n-- T3: Session B 查询用户 1001 的所有待处理订单\nSELECT * FROM orders WHERE user_id = 1001 AND status = 'pending';\n-- RC 和 RR 均返回: id=1 (status='pending')\n\n-- T4: Session A 将 id=1 的 status 改为 'paid' 并提交\n-- 同时 Session C (trx_id=300) INSERT 一条新订单:\nINSERT INTO orders (id, user_id, amount, status) VALUES (4, 1001, 50.00, 'pending');\nCOMMIT;  -- Session C 也提交了\n\n-- T5: Session B 再次执行同样的查询\nSELECT * FROM orders WHERE user_id = 1001 AND status = 'pending';\n```\n\n在 RC 下，T5 的 ReadView 是全新的，Session A 和 Session C 都已提交。所以 id=1 的新版本（status='paid'）可见但不满足 WHERE 条件，id=4 的新插入行可见且满足条件。结果变成了只返回 id=4。而在 RR 下，复用 T3 的 ReadView，id=1 仍然看到旧版本 status='pending'（满足条件），id=4 的 trx_id=300 >= max_trx_id=201 所以不可见，结果仍然只返回 id=1。两种隔离级别下同样的查询返回了完全不同的行集合。\n\n值得注意的是，RC 下能看到新插入的行这一点，有时被称为「幻读」。但严格来说 SQL 标准中 RC 允许幻读也允许不可重复读，它是一个「正确的」行为而非 bug。\n\n## 生产环境的深层影响\n\n### 为什么大厂普遍选择 RC 而非 RR\n\n阿里巴巴、字节跳动、美团等国内互联网大厂的 MySQL 线上实例绝大多数使用 READ COMMITTED 而非默认的 REPEATABLE READ。这个选择背后有多重考量，每一个都和 RC 下 ReadView 的创建策略直接相关。\n\n第一个原因是 undo log 回收效率。RC 下 ReadView 的生命周期极短——一条 SELECT 执行完就释放。这意味着 purge 线程几乎可以实时清理不再被引用的 undo log 旧版本。而 RR 下 ReadView 从第一条 SELECT 一直存活到事务结束，在高频更新的业务表上，一个 5 秒的事务就可能导致 History list length 增长数千。在阿里的场景下，核心交易表的 TPS 可以达到每秒数万次 UPDATE，一个存活 10 秒的 RR 长事务会让 History list length 暴涨到十万级别。RC 下即使事务很长，只要两次 SELECT 之间有间隔，purge 线程就能在这个窗口内清理旧版本。\n\n第二个原因是锁行为的差异——这一点虽然不是 ReadView 本身导致的，但与隔离级别的选择紧密耦合。RC 下 InnoDB 不使用 gap lock（间隙锁），只加 record lock（记录锁）。这大幅减少了死锁的概率和锁等待时间。在高并发场景下，gap lock 导致的死锁是 RR 下最常见的线上事故之一。\n\n第三个原因是业务语义的匹配度。互联网业务通常更关心「看到最新数据」而非「一个事务内的一致性快照」。比如支付回调处理器需要读取订单最新状态来决定后续操作——如果在 RR 下读到的是事务开始时的旧快照，可能做出错误的业务决策。RC 下每次 SELECT 都能看到最新已提交数据，天然匹配这种「看到即最新」的业务需求。\n\n### RC 下不可重复读导致的实际问题\n\n虽然 RC 有诸多优势，但「不可重复读」在某些场景下确实会引发问题。最经典的例子是报表查询：\n\n```sql\n-- 场景: 财务对账脚本, 在同一个事务中读取多张表的汇总数据\nBEGIN;\n\n-- 第一条查询: 统计用户 1001 的总支付金额\nSELECT SUM(amount) AS total_paid\nFROM orders WHERE user_id = 1001 AND status = 'paid';\n-- RC 下 ReadView #1 创建, 假设结果: total_paid = 250.00\n\n-- 此时另一个事务提交了一笔新的支付: amount=99.00, status='paid'\n\n-- 第二条查询: 统计用户 1001 的订单数量\nSELECT COUNT(*) AS paid_count\nFROM orders WHERE user_id = 1001 AND status = 'paid';\n-- RC 下 ReadView #2 创建, 能看到刚提交的那笔订单\n-- 结果: paid_count = 2 (包含新提交的订单)\n\n-- 问题: total_paid=250 只算了 1 笔订单, 但 paid_count=2 算了 2 笔\n-- 数据出现了逻辑不一致!\nCOMMIT;\n```\n\n这种「同一事务内两条查询基于不同快照」的问题在 RR 下完全不会出现，因为两条 SELECT 使用的是同一个 ReadView。所以报表类、对账类业务如果使用 RC 隔离级别，要么需要把所有相关查询合并成一条 SQL（单条 SQL 内部是一致的），要么使用 `SELECT ... FOR SHARE` 强制当前读加锁来保证一致性。\n\n### 半一致性读（Semi-Consistent Read）：RC 独有的优化\n\n在 RC 下，InnoDB 有一个被称为「半一致性读」的优化机制。当一个 UPDATE 语句尝试对一行加锁时，如果发现这行正被其他事务持有排他锁，InnoDB 不会立即阻塞等待，而是先读取这行数据的最新已提交版本，检查它是否满足 UPDATE 的 WHERE 条件。如果不满足，就直接跳过这行，不再等锁。这在 RR 下是不启用的。\n\n```sql\n-- Session A (RC):\nBEGIN;\nUPDATE orders SET status = 'cancelled'\n  WHERE user_id = 1001 AND status = 'pending';\n-- 假设此 UPDATE 对 id=1 加了排他锁, 但事务还没提交\n\n-- Session B (RC):\nUPDATE orders SET amount = amount * 0.9\n  WHERE user_id = 1001 AND status = 'paid';\n-- Session B 的 UPDATE 扫描到 id=1 时发现它被锁住了\n-- 半一致性读: 读取 id=1 的最新已提交版本, status='pending'\n-- 'pending' != 'paid', WHERE 条件不满足 → 跳过, 不等锁!\n-- 结果: Session B 不会被 Session A 阻塞\n```\n\n在 RR 下，Session B 遇到锁冲突会直接等待，直到 Session A 提交或回滚后才能继续。半一致性读显著降低了 RC 下的锁等待时间，这也是大厂选择 RC 的一个重要原因。\n\n### binlog 格式约束\n\n使用 RC 隔离级别有一个硬性前提：binlog 格式必须设置为 ROW 或 MIXED，不能使用 STATEMENT 格式。原因在于 RC 下缺少 gap lock，不同事务对相同范围的并发修改可能以不同的顺序执行，如果用 STATEMENT 格式记录 SQL 原文，在从库上重放时可能得到与主库不同的结果，导致主从数据不一致。MySQL 5.7.7 之后默认 binlog 格式已经是 ROW，所以对于新版本来说这不再是障碍，但在维护老系统时需要特别注意。\n\n```sql\n-- 确认当前 binlog 格式\nSHOW VARIABLES LIKE 'binlog_format';\n-- 必须是 ROW 或 MIXED\n\n-- 如果是 STATEMENT 格式下强行设置 RC, MySQL 会报错:\n-- ERROR 1598 (HY000): Binary logging not possible.\n-- Message: Transaction level 'READ-COMMITTED' in InnoDB is not safe\n-- for binlog mode 'STATEMENT'\n```\n\n### ReadView 创建频率对性能的量化影响\n\n在极端高并发场景下（比如单实例 QPS 超过 10 万），RC 下频繁创建和销毁 ReadView 的开销是可以被观测到的。MySQL 8.0 中 ReadView 的创建需要获取 `trx_sys` 的 mutex 来读取当前活跃事务列表，这在活跃事务数很多时会形成热点争用。MySQL 8.0.18 引入的 CATS（Contention-Aware Transaction Scheduling）调度算法对此有所缓解，但真正大幅改善的是 MySQL 8.0.25 中对 ReadView 创建路径的无锁优化——通过 hazard pointer 机制将 m_ids 的获取变成无锁读取，使得 RC 下高频创建 ReadView 的开销降低了约 30%（根据 Oracle 官方在 MySQL 8.0.25 release notes 中公布的基准测试数据，在 1024 并发连接、纯读场景下 TPS 提升了约 15%）。\n\n尽管如此，RC 下 ReadView 的创建开销在绝大多数生产环境中依然是可忽略的。真正的性能差距在于 undo log 清理效率和锁竞争——这两者的量级比 ReadView 创建本身大得多。\n\n### 常见误区与面试陷阱\n\n第一个常见误区是认为「RC 下事务没有隔离性」。实际上 RC 依然保证了原子性和持久性，每条 SELECT 看到的都是已提交数据的一致快照（只不过不同 SELECT 看到的快照时间点不同）。RC 杜绝了脏读——你永远不会在 RC 下读到其他事务尚未提交的修改。\n\n第二个误区是把 RC 下的「不可重复读」和「脏读」混为一谈。脏读是读到未提交的数据，不可重复读是两次读到不同的已提交数据——前者是数据完整性问题，后者只是一致性视角的差异。\n\n第三个误区是认为「RC 下不需要关心长事务」。虽然 RC 下 ReadView 生命周期短，undo log 清理比 RR 高效得多，但如果一个 RC 事务内大量使用 SELECT ... FOR UPDATE 持有锁很久不释放，同样会导致其他事务阻塞和锁超时。长事务的危害不仅仅体现在 undo log 上，锁持有时长同样是关键因素。\n\n第四个面试高频追问：「RC 下 UPDATE 之后紧接着 SELECT，能看到自己的修改吗？」答案是能——可见性判断的第一条规则就是 trx_id == creator_trx_id 则可见。这跟 ReadView 是否重新创建无关，因为无论新旧 ReadView，creator_trx_id 都是自己的事务 ID。",
+      "keyPoints": [
+        "RC 下每条 SELECT 都创建全新的 ReadView 并在语句结束后释放，RR 下首次快照读创建后复用到事务结束。两种隔离级别的可见性判断算法完全相同，唯一差异是 ReadView 的创建时机和生命周期",
+        "RC 下不可重复读是设计使然而非 bug：同一事务内两次 SELECT 因使用不同 ReadView 而看到不同已提交版本，这在需要「始终看到最新数据」的业务场景中反而是优势",
+        "互联网大厂普遍使用 RC 的核心原因有三：undo log 回收更高效（ReadView 短命不阻止 purge）、无 gap lock 减少死锁、半一致性读优化降低锁等待时间",
+        "RC 下报表类查询可能出现逻辑不一致（两条 SELECT 基于不同快照），解决方案包括合并为单条 SQL、使用 FOR SHARE 当前读、或在报表场景中临时切换到 RR",
+        "RC 的硬性前提是 binlog 必须使用 ROW 或 MIXED 格式，STATEMENT 格式下 RC 会导致主从不一致。MySQL 5.7.7+ 默认 ROW 格式已消除此限制",
+        "半一致性读（Semi-Consistent Read）是 RC 独有的优化：UPDATE 遇到锁冲突时先读最新已提交版本判断 WHERE 条件，不满足则跳过不等锁，显著降低锁等待",
+        "MySQL 8.0.25 通过 hazard pointer 无锁机制优化了 ReadView 创建路径，使 RC 下高频创建 ReadView 的额外开销降至可忽略水平"
+      ],
+      "quiz": [
+        {
+          "id": "db-q054-quiz-01",
+          "question": "在 READ COMMITTED 隔离级别下，一个事务内执行了 3 条普通 SELECT 语句，InnoDB 总共创建了几个 ReadView？",
+          "choices": [
+            {"id": "A", "text": "1 个，事务开始时创建并复用到事务结束"},
+            {"id": "B", "text": "3 个，每条 SELECT 创建一个独立的 ReadView"},
+            {"id": "C", "text": "取决于两次 SELECT 之间是否有其他事务提交，有提交才创建新的"},
+            {"id": "D", "text": "0 个，RC 隔离级别不使用 ReadView 而是直接读取最新数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "RC 下的规则非常明确：每执行一条快照读（普通 SELECT）语句，都会创建一个全新的 ReadView，语句执行完毕后释放。3 条 SELECT 就创建 3 个独立的 ReadView，与其间是否有其他事务提交无关。A 描述的是 RR 的行为。C 的条件判断逻辑不存在——RC 下不会做这种优化判断，一律创建新的。D 也不对——RC 仍然使用 MVCC 和 ReadView 来保证只读到已提交数据（防止脏读），只是 ReadView 是即时创建即时释放的。"
+        },
+        {
+          "id": "db-q054-quiz-02",
+          "question": "Session A（RC）在 T1 时刻 SELECT 看到 balance=1000，T2 时刻另一事务将 balance 改为 500 并提交，T3 时刻 Session A 再次 SELECT。Session A 在 T3 看到的 balance 是多少？",
+          "choices": [
+            {"id": "A", "text": "1000，因为事务内应保证一致性视图"},
+            {"id": "B", "text": "500，因为 RC 下 T3 的 SELECT 创建新 ReadView，已提交的修改可见"},
+            {"id": "C", "text": "取决于 Session A 的事务 ID 是否大于修改事务的 ID"},
+            {"id": "D", "text": "会返回错误，因为检测到数据在事务执行期间被修改了"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 RC 下不可重复读的标准场景。T3 时刻 Session A 执行 SELECT，InnoDB 创建全新的 ReadView。此时修改 balance 的事务已经提交，不在新 ReadView 的 m_ids 活跃列表中，其 trx_id 小于新 ReadView 的 min_trx_id，因此修改后的 balance=500 对 Session A 可见。A 描述的是 RR 的行为——RR 复用旧 ReadView 所以看不到后来的提交。C 错误——可见性判断不是简单比较两个事务 ID 的大小。D 也不对——MVCC 的核心设计目标就是读写不冲突、不报错。"
+        },
+        {
+          "id": "db-q054-quiz-03",
+          "question": "在 RC 下执行一个财务对账事务，先查 SUM(amount) 再查 COUNT(*)，两条查询之间有新订单被提交。以下哪个说法正确？",
+          "choices": [
+            {"id": "A", "text": "两条查询看到的数据集一致，因为它们在同一个事务中"},
+            {"id": "B", "text": "两条查询可能基于不同的数据快照，SUM 不包含新订单但 COUNT 包含，导致逻辑不一致"},
+            {"id": "C", "text": "第二条查询会自动回退到第一条查询的快照以保证一致性"},
+            {"id": "D", "text": "InnoDB 会检测到不一致并自动回滚事务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 RC 下最容易踩的坑之一。在 RC 隔离级别下，每条 SELECT 都有自己的 ReadView。如果两条查询之间有新事务提交，第二条 SELECT 的新 ReadView 能看到这些新提交的数据，而第一条 SELECT 用的旧 ReadView 看不到。结果就是 SUM(amount) 统计了 N 条记录的金额，但 COUNT(*) 统计了 N+1 条记录，数据出现逻辑矛盾。A 混淆了「同一事务」和「同一快照」——在 RC 下同一事务不等于同一快照。C 描述的自动回退机制不存在。D 也不存在——InnoDB 不做这种跨语句的一致性校验。解决方案是改用 RR 或把多条查询合并为单条 SQL。"
+        },
+        {
+          "id": "db-q054-quiz-04",
+          "question": "关于 RC 下的「半一致性读」（Semi-Consistent Read）优化，以下哪个描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "是 SELECT 语句遇到锁冲突时使用的优化，读取已提交版本而非等待锁释放"},
+            {"id": "B", "text": "是 UPDATE 语句遇到锁冲突时的优化，先读最新已提交版本判断 WHERE 条件，不满足则跳过不等锁"},
+            {"id": "C", "text": "是 RC 和 RR 下都启用的优化，用于减少所有 DML 语句的锁等待"},
+            {"id": "D", "text": "是在事务提交阶段使用的优化，允许部分行先提交以减少锁持有时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "半一致性读是 RC（以及 RR 下设置了 innodb_locks_unsafe_for_binlog=ON 的特殊情况）独有的优化策略，专门用于 UPDATE 语句。当 UPDATE 扫描行时如果遇到排他锁冲突，InnoDB 不会立即阻塞，而是读取该行最新已提交版本来检查 WHERE 条件：如果不满足条件就直接跳过这行不再等锁，满足条件才会真正等待锁释放。A 的错误在于这不是 SELECT 的优化——普通 SELECT 是快照读根本不需要加锁也不会遇到锁冲突。C 不对——这个优化在标准 RR 下不启用。D 描述的场景跟半一致性读完全无关。"
+        },
+        {
+          "id": "db-q054-quiz-05",
+          "question": "互联网大厂使用 RC 而非 RR 的一个重要原因是 undo log 回收效率更高。这是因为？",
+          "choices": [
+            {"id": "A", "text": "RC 下不产生 undo log，所以不需要回收"},
+            {"id": "B", "text": "RC 下 ReadView 生命周期极短（单条 SELECT 级别），purge 线程能更快回收不被引用的旧版本"},
+            {"id": "C", "text": "RC 下 InnoDB 使用不同的 undo log 存储格式，占用空间更小"},
+            {"id": "D", "text": "RC 下 purge 线程的优先级更高，可以抢占用户线程的 CPU 时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "InnoDB 的 purge 线程负责清理不再被任何 ReadView 引用的 undo log 旧版本。在 RR 下，一旦事务执行了第一条 SELECT，ReadView 就一直存活到事务结束。只要这个 ReadView 存在，它创建之后产生的所有 undo log 版本都不能被清理。而 RC 下每条 SELECT 结束后 ReadView 就释放了，purge 线程在任意两条 SELECT 之间的时间窗口内都可以清理旧版本。A 完全错误——RC 下修改数据同样产生 undo log，MVCC 的基础就是 undo log 中的版本链。C 和 D 也都是编造的——undo log 格式和 purge 线程优先级与隔离级别无关。"
+        },
+        {
+          "id": "db-q054-quiz-06",
+          "question": "使用 RC 隔离级别时，binlog 格式有什么限制？",
+          "choices": [
+            {"id": "A", "text": "必须使用 STATEMENT 格式以精确记录每条 SQL 的执行顺序"},
+            {"id": "B", "text": "必须使用 ROW 或 MIXED 格式，STATEMENT 格式下 RC 可能导致主从数据不一致"},
+            {"id": "C", "text": "没有任何限制，三种 binlog 格式都与 RC 完全兼容"},
+            {"id": "D", "text": "必须关闭 binlog，因为 RC 下的不可重复读无法被 binlog 正确记录"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "RC 下缺少 gap lock，不同事务对相同范围的并发修改可能以交错顺序执行。如果使用 STATEMENT 格式（记录 SQL 原文），在从库上按提交顺序重放这些 SQL 可能得到不同的结果，导致主从数据不一致。MySQL 在检测到 binlog_format=STATEMENT 且事务隔离级别为 RC 时会直接报错：ERROR 1598。ROW 格式记录的是行数据的 before/after image，不存在重放顺序问题。MySQL 5.7.7+ 默认 binlog_format=ROW，所以这个限制对新版本几乎透明。A 和 D 方向完全反了。C 忽略了这个真实存在的兼容性限制。"
+        },
+        {
+          "id": "db-q054-quiz-07",
+          "question": "在 RC 下，事务 B 执行了一条 UPDATE 修改了 id=1 的数据，但尚未提交。此时事务 A（也是 RC）执行 SELECT 查询 id=1，会看到什么？",
+          "choices": [
+            {"id": "A", "text": "看到事务 B 未提交的最新修改，因为 RC 总是读取最新数据"},
+            {"id": "B", "text": "看到 id=1 在事务 B 修改之前的最后一个已提交版本"},
+            {"id": "C", "text": "查询被阻塞，直到事务 B 提交或回滚"},
+            {"id": "D", "text": "返回空结果集，因为该行正在被其他事务修改"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题验证对 RC 的准确理解——RC 是 READ COMMITTED（读已提交），不是 READ UNCOMMITTED（读未提交）。在 RC 下，事务 A 的 SELECT 创建新 ReadView 时，事务 B 仍在 m_ids 活跃列表中（因为还没提交）。所以 trx_id=事务B 的版本对事务 A 不可见，InnoDB 会沿版本链回溯，找到事务 B 修改之前的最后一个已提交版本返回。A 描述的是 READ UNCOMMITTED（脏读）的行为，RC 不会发生脏读。C 也不对——快照读不加锁，不会被其他事务的排他锁阻塞。D 纯属编造。"
+        },
+        {
+          "id": "db-q054-quiz-08",
+          "question": "在 RC 下，如果需要保证同一事务内多条查询看到一致的数据快照，以下哪种方案可行？",
+          "choices": [
+            {"id": "A", "text": "使用 START TRANSACTION WITH CONSISTENT SNAPSHOT 在事务开始时固定快照"},
+            {"id": "B", "text": "将多条 SELECT 合并为一条 SQL（如使用子查询或 JOIN），利用单条语句内快照一致性"},
+            {"id": "C", "text": "在每条 SELECT 前执行 FLUSH TABLES 刷新表缓存"},
+            {"id": "D", "text": "将事务的隔离级别临时设置为 READ UNCOMMITTED"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 RC 下，START TRANSACTION WITH CONSISTENT SNAPSHOT 语法是无效的——MySQL 官方文档明确指出这个语法在 RC 下被忽略，因为 RC 的设计就是每条 SELECT 独立快照。所以 A 行不通。真正可行的方案是 B：把多条查询合并成一条 SQL。InnoDB 保证单条 SQL 语句内部看到的是一致的快照（一条语句只创建一个 ReadView），所以把 SUM 和 COUNT 放在同一条 SELECT 中（通过子查询或条件表达式）就能避免不一致。C 的 FLUSH TABLES 跟快照一致性完全无关。D 改成 READ UNCOMMITTED 会允许脏读，不仅不能解决一致性问题反而会引入更严重的问题。"
+        },
+        {
+          "id": "db-q054-quiz-09",
+          "question": "MySQL 8.0 对 RC 下频繁创建 ReadView 的性能问题做了什么关键优化？",
+          "choices": [
+            {"id": "A", "text": "引入 ReadView 对象池，复用已释放的 ReadView 内存避免频繁分配释放"},
+            {"id": "B", "text": "通过 hazard pointer 无锁机制读取活跃事务列表，避免获取 trx_sys mutex 的开销"},
+            {"id": "C", "text": "将 ReadView 的创建推迟到语句执行结束时才创建，减少无效创建"},
+            {"id": "D", "text": "在 RC 下自动缓存 ReadView 60 秒，期间的 SELECT 复用同一个 ReadView"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 MySQL 8.0.25 之前，创建 ReadView 需要获取 trx_sys 的 mutex 来安全读取活跃事务列表。在高并发场景下（数百上千连接同时执行查询），这个 mutex 成为热点瓶颈。MySQL 8.0.25 引入了 hazard pointer（风险指针）无锁机制，使得读取 m_ids 列表变成了无锁操作，显著减少了 RC 下高频创建 ReadView 的性能损耗。A 虽然听起来合理但不是实际采用的方案——内存分配释放的开销远小于 mutex 争用。C 的「推迟到结束时」完全没有意义。D 描述的缓存机制会改变 RC 的语义（不再是每条 SELECT 看到最新提交），MySQL 不会做这种破坏语义正确性的优化。"
+        },
+        {
+          "id": "db-q054-quiz-10",
+          "question": "以下哪个业务场景最适合使用 RR 而非 RC 隔离级别？",
+          "choices": [
+            {"id": "A", "text": "高并发订单创建和支付回调处理，需要最大化 TPS 和最小化死锁"},
+            {"id": "B", "text": "数据导出或报表生成，需要在整个导出过程中看到一致的数据快照"},
+            {"id": "C", "text": "秒杀系统的库存扣减，需要读取到最新的库存值来判断是否有余量"},
+            {"id": "D", "text": "消息队列的消费者，每次处理消息时需要看到数据库中最新的业务状态"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "数据导出和报表生成是 RR 的经典适用场景。这类任务需要在整个过程中看到一致的数据快照：比如 mysqldump 导出时使用 --single-transaction 参数，内部就是在 RR 下通过 START TRANSACTION WITH CONSISTENT SNAPSHOT 获取一致快照，保证导出的所有表数据基于同一时间点。如果用 RC，导出过程中其他事务的提交会导致前后导出的表数据不一致。A、C、D 三个场景都更适合 RC——A 需要减少死锁和锁等待，C 需要通过当前读获取最新库存（不过实际用 FOR UPDATE 不受隔离级别影响），D 需要看到最新业务状态。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-consistent-read.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/set-transaction.html",
+        "https://github.com/mysql/mysql-server/blob/8.0/storage/innobase/include/read0types.h",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-deadlocks.html"
+      ]
+    }
+  ]
+}
