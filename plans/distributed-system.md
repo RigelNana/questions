@@ -14,7 +14,7 @@
 | # | 题目 | type | difficulty | file | 状态 |
 |---|------|------|-----------|------|------|
 | 1 | 什么是CAP定理？C、A、P分别代表什么含义 | concept | 1 | | ⬜ |
-| 2 | CAP定理中为什么无法同时满足三个特性 | principle | 1 | | ⬜ |
+| 2 | CAP定理中为什么无法同时满足三个特性 | principle | 1 | ds-cap-impossibility.json | ✅ |
 | 3 | 什么是BASE理论？核心思想是什么 | concept | 1 | | ⬜ |
 | 4 | 什么是Soft State？它在BASE理论中的含义 | concept | 1 | | ⬜ |
 | 5 | 常见的CP系统和AP系统各有哪些代表 | trivia | 1 | | ⬜ |
