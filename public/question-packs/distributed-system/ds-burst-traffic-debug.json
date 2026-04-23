@@ -1,0 +1,165 @@
+{
+  "id": "ds-burst-traffic-debug",
+  "name": "突发流量限流排查",
+  "domain": "distributed-system",
+  "description": "通过真实排查场景讲解突发流量导致服务抖动时，如何定位限流配置问题并优化",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-burst-traffic-debug-q1",
+      "domain": "distributed-system",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["限流", "Sentinel", "服务抖动", "突发流量", "令牌桶", "漏桶", "线程池"],
+      "title": "突发流量导致服务抖动，CPU 正常但错误率飙高，怎么排查？",
+      "content": "你负责的电商平台每天 10:00 整点会推送一批营销消息，大约 200 万条。推送完成后的 30 秒内，「商品详情」接口的流量会从平时的 800 QPS 激增到约 4000 QPS，峰值倍数接近 5 倍。\n\n今天这个推送窗口刚结束，值班同学收到了告警：\n\n- 服务 TP99 从平时的 50ms 飙升到 2000ms，P50 也从 20ms 涨到 800ms\n- 错误率从 0.1% 跳到 8%，绝大部分是 HTTP 500，用户端出现「系统繁忙，请稍后重试」\n- CPU 使用率 35%，内存使用率 60%，**完全正常**，既没有打满也没有异常 GC\n- JVM 线程 dump 显示线程池队列积压 800 条，但线程池本身并没有 RejectedExecutionException\n\n你打开 Sentinel Dashboard，看到「queryProduct」资源的监控数据如下：\n\n```\n时间       pass_qps   block_qps   rt(ms)   error_qps\n09:59:58     820         0          48        1\n10:00:01     980        3021       1850       78\n10:00:04     970        3108       1920       82\n10:00:08     965        2890       1760       71\n10:00:35     810         0          52        1\n```\n\n`block_qps` 在整点后瞬间从 0 飙到 3000+，持续约 35 秒后恢复。与此同时你发现限流规则配置如下：\n\n```java\n// 当前生效的限流规则（启动时加载，未经大促评审）\nFlowRule rule = new FlowRule(\"queryProduct\");\nrule.setGrade(RuleConstant.FLOW_GRADE_QPS);\nrule.setCount(1000);  // 阈值 1000 QPS\nrule.setControlBehavior(RuleConstant.CONTROL_BEHAVIOR_DEFAULT);  // 直接拒绝\nFlowRuleManager.loadRules(Collections.singletonList(rule));\n```\n\n**核心问题**：CPU 完全正常，为什么错误率高达 8%？线程池队列都积压 800 了，为什么没有 RejectedExecutionException？怎么从根本上解决这个抖动问题？",
+      "answer": "## 第一步：理解限流与服务抖动的核心机制\n\n在开始排查之前，先把「限流」这个概念真正讲清楚，因为很多人对它的理解停留在「设一个 QPS 上限，超了就拒绝」，而这个片面的理解正是导致这次事故的根因。\n\n限流（Rate Limiting）的本质是**保护服务不被超过其处理能力的流量压垮**。一个服务的实际处理能力取决于 CPU、内存、线程数、下游连接池等多种资源，而不是某一个单一指标。当流量超出这个综合上限时，服务会出现排队、超时、甚至雪崩。限流的作用就是在流量到达服务之前做一道「水闸」，让服务平稳地在能力范围内工作。\n\n主流的限流算法有四种，它们面对突发流量的行为截然不同：**固定窗口**是最简单的，统计当前时间窗口内的请求数，超过阈值直接拒绝，但在窗口边界容易出现两倍流量的问题。**滑动窗口**用滑动的时间窗口计数，平滑了边界突刺，是固定窗口的改进版。**令牌桶**（Token Bucket）模拟一个放令牌的桶，以固定速率往桶里放令牌，每个请求消耗一个令牌，桶满时多余的令牌溢出丢弃——这个算法的关键特性是**允许一定程度的突发**，因为桶里积累的令牌可以被突发流量快速消费。**漏桶**（Leaky Bucket）则相反，所有请求先进入队列排队，以固定速率出队处理，无论进入多少，出去的速率是恒定的，多余的请求要么排队等待要么丢弃。\n\n「服务抖动」（Jitter）指的是响应时间忽高忽低、不稳定的现象，TP99 和 TP50 的剪刀差很大。抖动的根源通常不是「太慢了」，而是「有些请求被额外延误了」——可能是在等队列、可能是触发了某种限速、也可能是 GC 暂停。在限流场景下，抖动的典型表现正是这次监控里看到的：pass_qps 很稳定（始终 970 左右），但 rt 从 50ms 涨到 1900ms。这说明被放进来的请求本身处理变慢了，而不是服务器真的算不过来。\n\nSentinel 是阿里开源的流量治理框架，在 Java 生态中使用极为广泛。它的核心概念是「资源」（Resource）——每个被保护的接口、方法或代码段都是一个资源，围绕资源配置流控规则（FlowRule）、熔断规则（DegradeRule）等。Sentinel 的实现基于滑动窗口统计，默认是 1 秒内分成 2 个 500ms 的小格子（slot），每个小格子记录 pass、block、rt、exception 等统计数据。\n\n---\n\n## 第二步：排查步骤与根因定位\n\n### 第一个问题：CPU 正常为什么错误率这么高？\n\n这个问题看似反直觉，实际上一旦你理解了限流的工作方式就很自然。Sentinel 的 `CONTROL_BEHAVIOR_DEFAULT`（直接拒绝模式）工作机制是：当 QPS 超过阈值，**请求在进入业务逻辑之前就被 Sentinel 拦截，直接抛出 `FlowException`，整个过程不执行任何业务代码，不走数据库，不走 RPC，几乎不消耗 CPU**。\n\n所以监控数据完全自洽：CPU 35% 对应的是 970 个 pass_qps 在正常执行；那 3000 个 block_qps 在 Sentinel 的拦截层就被弹回去了，根本没有执行业务逻辑，所以 CPU 没有对应涨幅。错误率 8% = 被拒绝的请求数 / 总请求数 ≈ 3000 / (970 + 3000) ≈ 75%……等等，那为什么监控显示错误率只有 8% 而不是 75%？\n\n这里有个关键细节：告警里的「错误率 8%」是**用户层面的错误率**，而 Sentinel 的 block 统计是服务内部的 block_qps。实际上整点推送的 200 万用户中，大多数人打开 App 后会有重试机制，加上前端有本地缓存，真正打到服务端的请求中被 block 的比例远高于 8%。但无论如何，核心结论是：**CPU 正常不代表服务没问题，限流拒绝产生的 500 错误跟 CPU 利用率是解耦的**。\n\n### 第二个问题：队列积压 800 但为什么没有 RejectedExecutionException？\n\n这是另一个值得细抠的点。线程池的 `RejectedExecutionException` 只有在队列也满了之后才会触发。如果线程池配置的是 `LinkedBlockingQueue` 且队列容量是 1000，那么积压 800 条请求是完全正常的排队行为，线程池不会拒绝任何任务。但问题在于：队列里积压的 800 个任务都在等待执行，**它们的等待时间直接叠加到了 TP99 上**。pass_qps 虽然只有 970，但这 970 个请求并不是瞬间完成的，它们要在线程池里排队，排队时间从几十毫秒涨到几百毫秒，这就解释了为什么 rt 从 50ms 涨到 1900ms。\n\n### 根因一：固定窗口阈值在窗口边界的双倍流量问题\n\n仔细看监控数据，10:00:01 的 block_qps 就已经是 3021 了，反应速度极快。这里有一个经典的固定窗口陷阱值得注意：假设 Sentinel 的统计窗口是 09:59:00–09:59:59，最后这一秒进来了 900 个请求，没有触发限流；10:00:00 窗口重置，新的一秒开始，整点推送的流量瞬间进来 4000 个请求。Sentinel 看到的是「新窗口内已经有 1000 个 pass 了，后面的全部 block」，但实际上 09:59:59 到 10:00:00 这一秒内，服务真正收到的是 900 + 3000 = 3900 个请求，远超服务能力。\n\n虽然 Sentinel 用的是滑动窗口而非严格的固定窗口，但在毫秒级别的突发场景下，滑动窗口的粒度（默认 500ms）仍然不够细，依然会出现局部突刺。\n\n### 根因二：直接拒绝模式让错误率在突发时瞬间飙高\n\n当前配置的 `CONTROL_BEHAVIOR_DEFAULT` 是「直接拒绝」：超出阈值的请求立刻返回错误。这在突发流量场景下是最粗暴的处理方式，用户体验极差——刚推完消息就告诉用户「系统繁忙」，转化率直接损失。\n\n而真正适合这种「整点推送后的有规律突发」的模式是**匀速排队**（`CONTROL_BEHAVIOR_RATE_LIMITER`），本质上是漏桶算法。超出阈值的请求不会被立刻拒绝，而是进入等待队列，以均匀的速率依次处理。只要请求的等待时间在容忍范围内（比如 500ms），用户得到的是「稍微慢一点但成功」的结果，而不是「立刻报错」。\n\n### 根因三：没有考虑预热（WarmUp）\n\n除了算法选择问题，还有一个容易被忽视的根因：整点推送后，大量用户同时打开 App，这对服务来说是一个「冷启动」场景——不是服务本身没启动，而是连接池、缓存、JVM JIT 编译都处于「冷」的状态。平时 800 QPS 时，数据库连接池 10 个活跃连接够用；突然来了 4000 QPS，连接池需要快速扩容，扩容期间请求等待连接，进一步拉高 RT。\n\nSentinel 的 WarmUp 模式（`CONTROL_BEHAVIOR_WARM_UP`）就是为这个场景设计的：限流阈值从一个较低的值开始，在 warmUpPeriodSec（默认 10 秒）内线性增加到设定的最大 QPS，给服务一个「热身」时间，让连接池、缓存逐渐就绪。\n\n### 修复方案\n\n针对上述三个根因，改造限流规则如下：\n\n```java\n// 方案一：匀速排队（漏桶），适合「不能丢流量，允许稍微慢」的场景\n// 例如商品详情页，用户等 300ms 内得到结果是可接受的\nFlowRule rateLimiterRule = new FlowRule(\"queryProduct\");\nrateLimiterRule.setGrade(RuleConstant.FLOW_GRADE_QPS);\nrateLimiterRule.setCount(1000);  // 1000 QPS 的处理速率\n// 匀速排队：超出部分进入等待队列，最长等待 500ms\nrateLimiterRule.setControlBehavior(RuleConstant.CONTROL_BEHAVIOR_RATE_LIMITER);\nrateLimiterRule.setMaxQueueingTimeMs(500);\n\n// 方案二：WarmUp + 直接拒绝，适合「服务刚启动或冷启动」的场景\n// 前 20 秒 QPS 从 333（= 1000/3）线性升到 1000，避免冷启动时的连接池压力\nFlowRule warmUpRule = new FlowRule(\"queryProduct\");\nwarmUpRule.setGrade(RuleConstant.FLOW_GRADE_QPS);\nwarmUpRule.setCount(1000);\nwarmUpRule.setControlBehavior(RuleConstant.CONTROL_BEHAVIOR_WARM_UP);\nwarmUpRule.setWarmUpPeriodSec(20);\n\n// 生产建议：两种模式结合，或根据业务特征二选一\n// 本场景用方案一更合适：流量是有规律的突发，不是服务重启后的冷启动\nFlowRuleManager.loadRules(Collections.singletonList(rateLimiterRule));\n```\n\n改完之后验证的关键指标：`block_qps` 应该接近 0（请求不再被直接拒绝），`rt` 可能从 50ms 涨到 150-300ms（排队等待时间），但错误率会降到接近 0。这是用「轻微延迟」换「零错误」的合理取舍。\n\n---\n\n## 第三步：预防措施与进阶实践\n\n### 大促前的压测与限流评审\n\n这次事故暴露的最根本问题是：限流规则是「启动时写死的默认配置」，从没有针对整点推送场景做过评审。在有规律的大流量事件（大促、推送）前，应该做专项压测，验证限流配置在 5 倍流量下的行为。压测工具推荐 JMeter 或 Gatling，压测时关注的指标不是 TPS，而是 `block_qps` 和 `rt` 的分布。\n\n### 削峰推送，从源头降低突发系数\n\n如果业务允许，最优解是「不要整点推送」。把 200 万条消息的推送时间分散到 10:00–10:05 的 5 分钟内，每秒推送约 6667 条，用户打开 App 的时间自然错开，流量突发系数从 5 倍降到 1.5 倍以内。这是最低成本的削峰方案，不需要改任何服务代码。\n\n### 监控告警分层\n\n现有告警配置只监控了 TP99 和错误率，等收到告警时已经在影响用户了。更好的做法是**提前告警**：当 `sentinel_flow_block_qps > 100`（限流开始触发）时立即发出「预警」，让 SRE 有时间在错误率飙高之前介入调整阈值。Prometheus 的告警规则如下：\n\n```yaml\n# 限流触发预警（提前感知，比错误率告警早 30 秒）\n- alert: SentinelBlockQPSHigh\n  expr: sentinel_flow_block_qps{resource=\"queryProduct\"} > 100\n  for: 10s\n  labels:\n    severity: warning\n  annotations:\n    summary: \"Sentinel 限流触发，block_qps={{ $value }}\"\n    description: \"queryProduct 接口限流拒绝数超过阈值，请检查是否需要调整 count 或切换限流模式\"\n```\n\n### 动态规则推送\n\n在 Sentinel 2.x + Nacos 集成方案中，限流规则可以通过 Nacos 配置中心动态下发，无需重启服务。大促前在配置中心把阈值从 1000 临时调高到 2000，推送结束后再改回来，全程不影响服务运行。这比「在代码里写死阈值」要灵活得多，是生产环境的标准做法。",
+      "keyPoints": [
+        "Sentinel 的「直接拒绝」模式下，被限流的请求不执行任何业务逻辑就返回错误，所以 CPU 完全正常但错误率会飙高，CPU 和错误率是解耦的",
+        "「匀速排队」模式本质是漏桶算法，突发请求进入等待队列以均匀速率处理，用「轻微延迟」换「零错误」，比直接拒绝对用户体验更友好",
+        "线程池队列积压导致 RT 飙高的原理：pass_qps 受限流保护保持稳定，但每个请求在线程池内的等待时间随队列长度线性增长，直接体现在 TP99 上",
+        "WarmUp 预热模式解决的是「冷启动」场景：限流阈值从低值线性爬升至最大值，给连接池建立、JVM JIT 热编译、本地缓存预热提供时间窗口",
+        "固定窗口和粗粒度滑动窗口在毫秒级突发场景下都会出现局部双倍流量问题，Sentinel 默认 500ms 统计粒度在整点推送这种瞬时场景下仍然不够细",
+        "生产环境的限流规则应该通过 Nacos、Apollo 等配置中心动态下发，不应硬编码在启动代码中，以便在大促前后快速调整阈值",
+        "削峰推送比调限流参数更彻底：把整点推送改为分批分时推送，从源头将突发系数从 5 倍降到 1.5 倍以内，是成本最低的优化手段",
+        "监控告警应分层：先对 block_qps 做「预警」，再对错误率做「告警」，让 SRE 在用户感知到问题之前就介入，而不是等到 TP99 飙高才响应"
+      ],
+      "quiz": [
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz1",
+          "question": "Sentinel 配置 CONTROL_BEHAVIOR_DEFAULT（直接拒绝），突发流量触发限流后，被拒绝的请求会怎样处理？",
+          "choices": [
+            { "id": "A", "text": "请求被放入等待队列，超时后才返回错误" },
+            { "id": "B", "text": "请求在 Sentinel 拦截层直接抛出 FlowException，不执行任何业务逻辑" },
+            { "id": "C", "text": "请求被转发到备用服务实例处理" },
+            { "id": "D", "text": "请求被缓存，待流量下降后重新执行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "直接拒绝模式下，Sentinel 的 SlotChain 在流控检查阶段就会抛出 BlockException（具体为 FlowException），请求根本不会进入业务方法。这也是为什么 CPU 完全正常：被拒绝的 3000 QPS 没有执行任何数据库查询或 RPC 调用，消耗的 CPU 极少。A 是匀速排队模式的行为，C 和 D 是熔断降级或容错框架的能力，不是 Sentinel 限流的标准行为。"
+        },
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz2",
+          "question": "为什么监控显示 CPU 35%、内存 60% 完全正常，但 TP99 从 50ms 飙到 2000ms？",
+          "choices": [
+            { "id": "A", "text": "CPU 指标有延迟，实际 CPU 已经打满了，只是监控没及时刷新" },
+            { "id": "B", "text": "被放进来的请求虽然只有 970 QPS，但在线程池队列中等待时间叠加，导致 RT 飙高" },
+            { "id": "C", "text": "数据库慢查询导致，与限流无关" },
+            { "id": "D", "text": "GC 暂停导致请求处理时间变长" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一道理解「RT = 处理时间 + 等待时间」的题目。pass_qps 受限流保护维持在 970，本身不超过服务能力，但线程池队列积压了 800 个任务。每个请求要在队列里等待前面的 800 个任务执行完才能被处理，等待时间 = 队列长度 × 平均处理时间 ≈ 800 × 2ms = 1600ms，加上实际处理时间 50ms，RT ≈ 1650ms，与监控的 1850ms 数量级吻合。A 选项明显是错的，监控延迟不会有这么大的差异。C 和 D 没有对应的证据（block_qps 突增是直接证据）。"
+        },
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz3",
+          "question": "令牌桶（Token Bucket）和漏桶（Leaky Bucket）算法面对突发流量的核心行为差异是什么？",
+          "choices": [
+            { "id": "A", "text": "令牌桶允许一定程度的突发（消耗桶内积累的令牌），漏桶以恒定速率处理请求不允许突发" },
+            { "id": "B", "text": "令牌桶只允许均匀流量，漏桶允许突发" },
+            { "id": "C", "text": "两者行为完全相同，只是实现方式不同" },
+            { "id": "D", "text": "令牌桶适合限制下游调用速率，漏桶适合限制上游接入速率" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "令牌桶以固定速率向桶中放令牌，桶满则令牌溢出不继续积累。当突发流量到来时，可以快速消耗桶内积累的令牌，允许短时间内超过平均速率的处理量，适合「允许短暂突发但整体限速」的场景。漏桶则无论流量多大，出口速率始终恒定，超出的请求只能排队或被丢弃，适合「强制平滑流量、保护下游」的场景。Sentinel 的 RATE_LIMITER 模式本质是漏桶，WARM_UP 模式结合了令牌桶的思想。B 把两者特性反转了，是典型的混淆错误。"
+        },
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz4",
+          "question": "Sentinel 的 WarmUp 模式（CONTROL_BEHAVIOR_WARM_UP）主要解决什么问题？",
+          "choices": [
+            { "id": "A", "text": "解决固定窗口在时间边界产生双倍流量的问题" },
+            { "id": "B", "text": "解决服务冷启动时连接池、缓存未就绪，骤然高 QPS 导致大量超时的问题" },
+            { "id": "C", "text": "解决限流拒绝直接报错导致用户体验差的问题" },
+            { "id": "D", "text": "解决分布式场景下多个服务实例限流阈值不一致的问题" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "WarmUp 的设计初衷是让服务从「冷」状态平滑过渡到满负荷状态。冷启动场景包括：服务刚重启、长时间低流量后突然高流量。这两种情况下，JVM JIT 编译尚未生效（热点代码还在解释执行）、数据库连接池还没扩充到最大、本地缓存是空的，此时直接打满 QPS 会让每个请求都变慢。WarmUp 通过在 warmUpPeriodSec 内线性升温阈值（内部用令牌桶 coldFactor 实现），给服务足够的时间热身。A 是滑动窗口解决的问题，C 是 RATE_LIMITER 解决的问题，D 是 Sentinel 集群限流模式解决的问题。"
+        },
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz5",
+          "question": "以下哪个 Sentinel 监控指标最能提前预警「限流即将触发」，而不是等到错误率飙高才告警？",
+          "choices": [
+            { "id": "A", "text": "sentinel_flow_pass_qps 降低" },
+            { "id": "B", "text": "sentinel_flow_block_qps 从 0 开始增长" },
+            { "id": "C", "text": "JVM 线程池 active_count 接近最大值" },
+            { "id": "D", "text": "HTTP 5xx 错误率超过 1%" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "block_qps 是限流开始工作的直接信号：从 0 变成正数意味着已经有请求被拒绝。这个指标的变化早于错误率告警（错误率告警通常设置 > 1% 阈值，有一定延迟），也早于 TP99 告警（需要积压一定队列才体现）。在 block_qps 刚开始增长时就触发预警，SRE 有 10-30 秒的窗口期来决定是否需要临时调高阈值或切换限流模式，而不是等用户投诉了才发现问题。A 选项 pass_qps 降低可能是流量本身下降，不是限流信号。C 和 D 都是滞后指标。"
+        },
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz6",
+          "question": "线程池配置了 coreSize=50、maxSize=100、queueCapacity=1000，当前队列积压 900，此时会发生 RejectedExecutionException 吗？",
+          "choices": [
+            { "id": "A", "text": "会，队列积压超过 90% 就会触发拒绝策略" },
+            { "id": "B", "text": "不会，只有队列满了（积压 1000）且线程数达到 maxSize 后，新任务才会触发拒绝策略" },
+            { "id": "C", "text": "会，因为线程数已经超过 coreSize" },
+            { "id": "D", "text": "不会，Java 线程池永远不会拒绝任务" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Java ThreadPoolExecutor 的任务接受逻辑是：先判断线程数是否达到 coreSize，未达到则创建新线程；达到后将任务放入队列；队列满了之后再判断线程数是否达到 maxSize，未达到则继续创建线程；只有队列满且线程数达到 maxSize 时，才执行拒绝策略（默认 AbortPolicy，抛出 RejectedExecutionException）。所以队列积压 900/1000 只是排队等待，不会报错。这也解释了为什么监控里看到的是 RT 飙高而不是大量异常：请求被「慢死」了而不是「快死」。A 选项的「90% 阈值」是不存在的，D 选项明显错误。"
+        },
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz7",
+          "question": "对比「整点批量推送 200 万条」和「分 5 分钟分批推送」两种策略，从服务保护角度哪个更优？",
+          "choices": [
+            { "id": "A", "text": "整点推送更优，用户体验更一致，打开率更高" },
+            { "id": "B", "text": "分批推送更优，流量突发系数从 5 倍降到约 1.5 倍，显著减少限流触发概率" },
+            { "id": "C", "text": "两者对服务的压力完全相同，因为总请求数相同" },
+            { "id": "D", "text": "分批推送会导致用户之间信息不对称，不适合电商场景" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "流量峰值的影响不是取决于总请求数，而是取决于「单位时间内的最大 QPS」。整点推送会让 200 万用户在 30 秒内集中打开 App，服务在 30 秒内承受 4000 QPS；分 5 分钟推送则把这 200 万次打开分散到 300 秒内，平均只有 667 QPS 的额外流量，峰值最多不超过 1500 QPS，完全在正常处理能力范围内。C 选项是错误的——总请求数相同但速率不同，对服务的瞬时压力差异极大。A 和 D 是业务视角，不是服务保护视角。削峰是分布式系统保护中成本最低、效果最显著的手段。"
+        },
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz8",
+          "question": "生产环境中，Sentinel 限流规则最佳的存储和分发方式是什么？",
+          "choices": [
+            { "id": "A", "text": "硬编码在 @PostConstruct 方法中，保证每次启动都加载" },
+            { "id": "B", "text": "存储在 Nacos 或 Apollo 配置中心，通过监听器动态推送到各实例，无需重启" },
+            { "id": "C", "text": "存储在数据库中，服务启动时定时拉取" },
+            { "id": "D", "text": "每个实例独立配置，防止单点故障" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "将限流规则硬编码（A 选项）是本次事故的直接原因之一：规则无法在运行时调整，大促前需要改代码、重新部署，操作窗口短且风险高。Nacos/Apollo 集成方案让规则存储在配置中心，修改后通过长连接推送到所有实例，秒级生效，无需重启。这是 Sentinel 官方推荐的「推数据源」模式。C 选项的数据库定时拉取有延迟且增加了 DB 依赖。D 选项每个实例独立配置意味着总体阈值不可控，在多实例场景下实际通过的 QPS = 单实例阈值 × 实例数，很难精确控制。"
+        },
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz9",
+          "question": "Sentinel 1.x 的滑动窗口默认统计粒度是多少？这对毫秒级突发流量意味着什么？",
+          "choices": [
+            { "id": "A", "text": "统计粒度是 1 秒整，突发流量在 1 秒内均匀分布，无局部突刺问题" },
+            { "id": "B", "text": "统计粒度是 500ms（1 秒分 2 个 slot），在 500ms 窗口内仍可能出现超出阈值的局部突刺" },
+            { "id": "C", "text": "统计粒度是 10ms，可以精确检测任何突发流量" },
+            { "id": "D", "text": "统计粒度是可以无限精细化的，不存在局部突刺问题" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Sentinel 1.x 默认使用 LeapArray 实现滑动窗口，intervalInMs=1000ms，sampleCount=2，即每 500ms 一个统计 bucket。这意味着在同一个 500ms 窗口内，如果前 10ms 进入了 500 个请求而不触发限流，后续 490ms 的处理压力依然存在。对于整点推送这种「毫秒级突发」场景，500ms 的粒度不足以抹平突刺。可以通过调大 sampleCount（如 10，对应 100ms 粒度）来改善，但代价是统计精度提升的同时内存消耗也增加。C 和 D 都不符合 Sentinel 的实际实现，是错误选项。"
+        },
+        {
+          "id": "ds-burst-traffic-debug-q1-quiz10",
+          "question": "采用 CONTROL_BEHAVIOR_RATE_LIMITER（匀速排队）+ maxQueueingTimeMs=500 后，如果瞬时流量超出处理能力且等待时间超过 500ms 的请求会怎样？",
+          "choices": [
+            { "id": "A", "text": "所有请求都会被执行，无论等待多久" },
+            { "id": "B", "text": "等待时间预估超过 500ms 的请求仍然会被直接拒绝，不进入队列" },
+            { "id": "C", "text": "请求进入队列后等待满 500ms 被执行，不会被丢弃" },
+            { "id": "D", "text": "maxQueueingTimeMs 参数在匀速排队模式下无效" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "RATE_LIMITER 模式并不是「无限排队」，maxQueueingTimeMs 是每个请求的最大允许等待时间。Sentinel 在接受请求时会计算当前队列状态下该请求预计需要等待多长时间：如果预计等待时间 > maxQueueingTimeMs，则直接拒绝（抛出 FlowException），不进入队列。这个机制防止了队列无限增长导致的内存溢出，同时也给了用户一个合理的超时保证。因此即使切换了 RATE_LIMITER 模式，当流量极端突发（远超 1000 QPS）时仍会有少量请求被拒绝，但拒绝的是「无论等多久都来不及处理的请求」，比无差别拒绝更合理。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Sentinel 官方文档 - 流量控制",
+          "url": "https://sentinelguard.io/zh-cn/docs/flow-control.html"
+        },
+        {
+          "title": "Sentinel GitHub - FlowRule 源码",
+          "url": "https://github.com/alibaba/Sentinel/blob/master/sentinel-core/src/main/java/com/alibaba/csp/sentinel/slots/block/flow/FlowRule.java"
+        },
+        {
+          "title": "限流算法对比：令牌桶与漏桶",
+          "url": "https://cloud.tencent.com/developer/article/1631808"
+        }
+      ]
+    }
+  ]
+}
