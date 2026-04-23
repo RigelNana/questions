@@ -1,0 +1,156 @@
+{
+  "id": "distributed-system-q194",
+  "name": "Split-brain 问题的成因和常用解决方案",
+  "domain": "distributed-system",
+  "description": "深入分析分布式系统中脑裂问题的根本成因、典型故障场景，以及 Quorum、Fencing、STONITH 等工程级解决方案的原理与权衡",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-q194",
+      "domain": "distributed-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["split-brain", "distributed-consensus", "raft", "fencing", "quorum", "network-partition", "high-availability"],
+      "title": "线上集群出现了脑裂，你怎么排查，根本原因是什么，如何从架构层面根治？",
+      "content": "你负责维护一套生产环境的 Elasticsearch 集群，配置是 3 个 master-eligible 节点 + 5 个 data 节点，部署在同一个机房的两个不同机柜。某天凌晨 2:47，Ops 告警群炸锅了：\n\n```\n[CRITICAL] ES cluster health: RED\n[CRITICAL] Index write failure rate: 87%\n[CRITICAL] Duplicate document ID detected in shard 3 of index orders-2024-01\n```\n\n你 SSH 进去一看，更诡异的事发生了。在节点 `es-master-01` 上执行 `GET /_cluster/state`，显示 master 是 `es-master-01` 自己，集群有 8 个节点。但是在 `es-master-03` 上执行同样的命令，显示 master 是 `es-master-03`，集群只有 5 个节点。两个节点都认为自己是合法的 master，都在独立接受写入，而且 `orders-2024-01` 索引里已经出现了重复的 `order_id`。\n\n订单数据出现了双写，业务方已经在催了。你手上有这些信息：\n\n```bash\n# 两台 master 节点之间的网络探测\n$ ping es-master-03 -c 4 (from es-master-01)\nping: connect: Network is unreachable\n\n# 但 data 节点可以同时访问两台 master\n$ curl es-master-01:9200/_cluster/health\n{\"cluster_name\":\"prod-es\",\"status\":\"yellow\",\"number_of_nodes\":3}\n\n$ curl es-master-03:9200/_cluster/health  \n{\"cluster_name\":\"prod-es\",\"status\":\"yellow\",\"number_of_nodes\":5}\n```\n\n这是一次典型的 split-brain（脑裂）故障。请回答：\n\n1. 脑裂的根本成因是什么？为什么分布式系统天然存在这个风险？\n2. 此次故障的直接触发链路是什么？如何一步步排查到根因？\n3. Elasticsearch 的 `minimum_master_nodes` / `discovery.zen.minimum_master_nodes` 参数为什么能预防脑裂，背后的数学原理是什么？\n4. 除了 Quorum 机制，生产环境还有哪些对抗脑裂的工程手段？\n5. 这次数据已经双写了，如何做数据修复？",
+      "answer": "## 第一步：理解脑裂——从分布式系统的本质说起\n\nSplit-brain（脑裂）这个词来自神经学，原本描述的是切断胼胝体之后大脑左右半球各自独立运作的现象。借用到分布式系统里，它指的是：**本来应该作为一个整体协调运作的集群，因为内部通信中断，分裂成了多个彼此隔离的子集群，每个子集群都认为自己是合法的「唯一真相」，开始独立对外提供服务。**\n\n要理解为什么这件事很难彻底避免，需要从 CAP 定理说起。CAP 定理告诉我们，在一个分布式系统里，Consistency（一致性）、Availability（可用性）、Partition tolerance（分区容错性）三者最多只能同时满足其中两个。网络分区（Partition）在真实的数据中心环境里并不罕见——机柜间交换机故障、网卡驱动 bug、运维误操作把防火墙规则配错，这些都可能导致节点之间无法通信，但节点自身完全正常、进程活着、硬件没坏。这时候每个节点面临一个艰难的抉择：继续服务（保 A，牺牲 C），还是拒绝服务（保 C，牺牲 A）。脑裂就是选错了——两个分区都选择了「继续服务」，结果一致性彻底崩溃。\n\n从实现层面来看，脑裂的直接成因是 **Leader 选举协议的缺陷**。以上面的 Elasticsearch 场景为例：集群本来有一个 master，网络分区发生后，无法联系到旧 master 的那部分节点触发了重新选举，选出了一个新 master。而旧 master 自己认为网络只是「抖了一下」，它并不知道自己已经被「废黜」——它还在处理写请求。于是就出现了两个都自认合法的 master 并行运作的局面。\n\n## 第二步：还原此次故障的触发链路\n\n遇到这种情况，第一件事不是急着修，而是先把故障现场固定下来，弄清楚时间线。\n\n```bash\n# 查看 ES 集群日志，找到分裂发生的确切时间点\ngrep -E \"(elected|new_master|removed|ClusterState)\" /var/log/elasticsearch/prod-es.log \\\n  | grep \"2024-01-15T02\" | tail -50\n\n# 典型输出片段（es-master-03 节点上的日志）\n[2024-01-15T02:46:51,203] INFO  master not discovered yet, this node has not previously joined a bootstrapped cluster\n[2024-01-15T02:46:53,891] INFO  starting master service\n[2024-01-15T02:46:54,102] WARN  failed to ping master [es-master-01], reason: connection refused\n[2024-01-15T02:46:57,441] INFO  elected-as-master ([3] nodes joined)\n[2024-01-15T02:46:57,902] INFO  Cluster health status changed from [RED] to [YELLOW]\n```\n\n时间线很清晰：02:46:51，es-master-03 失去了对 es-master-01 的连接；经过大约 6 秒的等待（这是 `discovery.zen.ping_timeout` 的默认值），它触发了选举，并在 02:46:57 宣布自己成为新 master。而 es-master-01 日志里完全没有「我失联了」的记录，它还在愉快地运作。\n\n这说明网络故障是**单向的或者局部的**：es-master-03 无法连接 es-master-01，但 es-master-01 可能也无法连接 es-master-03（互相看不到对方），同时 data 节点却能分别连接两者。这种情况通常发生在机柜间的汇聚交换机故障，而 data 节点和 master 节点混部在同一个机柜里，导致 data 节点可以走机柜内的接入层交换机直连两台 master。\n\n```bash\n# 验证网络拓扑假设\n$ traceroute es-master-01 (from es-data-02)\n1  10.0.1.1 (rack-A-switch)   0.412 ms\n2  10.0.2.11 (es-master-01)   0.891 ms\n\n$ traceroute es-master-03 (from es-data-02)  \n1  10.0.1.1 (rack-A-switch)   0.388 ms\n2  10.0.3.13 (es-master-03)   0.923 ms\n\n# master 节点之间需要经过机柜间链路，而该链路已中断\n$ traceroute es-master-03 (from es-master-01)\n1  10.0.1.1 (rack-A-switch)   0.401 ms\n2  * * *  (inter-rack link dropped)\n```\n\n根因找到了：**机柜间互联链路故障，导致 master 节点间心跳中断，触发了错误的重新选举。** 这是硬件层面的网络分区，而不是软件 bug。\n\n## 第三步：Quorum 机制——用数学消灭脑裂的可能性\n\n理解了问题之后，来看 Elasticsearch 的防脑裂机制，也就是 `discovery.zen.minimum_master_nodes`（ES 7.x 之前）或者 ES 7.x+ 自动 bootstrap quorum 的工作原理。\n\n这个参数的作用是：**只有当节点获得了足够多的票数（Quorum）才能成为 master，否则宁可拒绝选举。** 正确的配置公式是：\n\n```\nminimum_master_nodes = floor(master_eligible_nodes / 2) + 1\n```\n\n对于 3 个 master-eligible 节点的集群，正确值是 `floor(3/2) + 1 = 2`。**这个「2」的意义在于：整个集群里不可能同时存在两个都满足「拥有 ≥2 票」的分区。** 因为 3 个节点，如果一个分区获得了 2 票，另一个分区最多只剩 1 票，永远无法满足 Quorum 条件，所以另一个分区会进入「等待状态」而不是选出新 master。\n\n这里踩坑的地方是：很多人为了「高可用」把这个值设成 1。一旦设成 1，任何单个节点都能自己选举自己当 master，脑裂的风险变成 100%。\n\n```yaml\n# elasticsearch.yml 正确配置示例（ES 6.x / 7.x 早期版本）\ncluster.name: prod-es\nnode.master: true\ndiscovery.zen.minimum_master_nodes: 2  # 3 节点集群必须是 2\ndiscovery.zen.ping_timeout: 10s         # 给网络抖动留一些容忍空间\ndiscovery.zen.ping.unicast.hosts:\n  - \"es-master-01:9300\"\n  - \"es-master-02:9300\"  \n  - \"es-master-03:9300\"\n```\n\nES 7.0+ 引入了 `cluster.initial_master_nodes` 和自动 Quorum 计算，不再需要手动配置这个参数，底层换成了类 Raft 的共识算法（Zen2），对脑裂的防护更加严格。\n\n那为什么本次故障还是发生了？很可能是这个值被设成了默认的 1，或者根本没配。让我们验证：\n\n```bash\n$ curl es-master-01:9200/_cluster/settings?pretty\n{\n  \"persistent\": {},\n  \"transient\": {}\n}  \n# 空的！没有配置 minimum_master_nodes，默认值是 1\n```\n\n凶手找到了。\n\n## 第四步：仅靠 Quorum 不够——生产级脑裂防护的完整体系\n\nQuorum 是防止脑裂「发生」的机制，但它有一个前提：所有节点都必须诚实地遵守这个规则。在工程实践中，还有几类场景 Quorum 无法独立处理，这时候需要额外的手段。\n\n**Fencing（隔离/屠杀）**：当检测到可能存在旧 master 的时候，新 master 必须在接管之前确保旧 master 彻底「死掉」，无法继续写入。这个动作叫做 fencing。Fencing 有两种常见实现：\n\n第一种是 **STONITH（Shoot The Other Node In The Head）**，字面意思就是「爆头」。在物理机集群（比如用 Pacemaker + Corosync 管理的 HA 数据库）里，当 Pacemaker 检测到脑裂风险，它会通过 IPMI/iLO/DRAC 等带外管理接口直接给对方节点发送强制断电命令。这是最暴力也最可靠的 fencing——已经物理断电了，不可能再写入。\n\n```bash\n# Pacemaker STONITH 配置示例\npcs stonith create ipmi-fence-node2 fence_ipmilan \\\n  pcmk_host_list=\"node2\" \\\n  ipaddr=\"192.168.1.102\" \\\n  login=\"admin\" passwd=\"secret\" \\\n  lanplus=1 op monitor interval=60s\n\n# 手动触发 fencing（测试用）\npcs stonith fence node2\n# 输出：\n# Node: node2 fenced\n```\n\n第二种是 **Epoch/Term 编号 + 写请求拒绝**：Raft 协议里，每次选举 term 编号 +1。旧 leader 收到任何 term 比自己大的消息时，会立即降级为 follower，拒绝处理写请求。这是软件层面的 fencing。etcd 就是这样工作的：\n\n```bash\n# 观察 etcd leader 选举时的 term 变化\n$ etcdctl endpoint status --endpoints=http://etcd1:2379,http://etcd2:2379,http://etcd3:2379 -w table\n+------------------+------------------+---------+---------+-----------+\n|     ENDPOINT     |        ID        | VERSION | DB SIZE |  LEADER   | RAFT TERM | RAFT INDEX |\n+------------------+------------------+---------+---------+-----------+\n| http://etcd1:2379| 8e9e05c52164694d |  3.5.9  |  25 MB  |  8e9e05c5 |        47 |    1203451 |\n| http://etcd2:2379| 91bc3c398fb3c146 |  3.5.9  |  25 MB  |  8e9e05c5 |        47 |    1203451 |\n| http://etcd3:2379| fd422379fda50e48 |  3.5.9  |  25 MB  |  8e9e05c5 |        47 |    1203451 |\n\n# 如果发生网络分区后重新选举，term 会从 47 跳到 48 或更高\n# 旧 leader（term=47）收到 term=48 的消息后会立即放弃 leader 身份\n```\n\n**Lease 机制**：在某些系统里（比如 Kubernetes 的 leader election），leader 需要持续续租一个分布式锁（比如 etcd 里的一个 key），如果网络分区导致 leader 无法续租，锁会因为 TTL 过期而自动释放，其他节点可以抢锁。这从另一个维度避免了「失联的旧 leader 继续作恶」。\n\n```yaml\n# Kubernetes controller-manager leader election 配置\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: kube-controller-manager\n  namespace: kube-system\n  annotations:\n    # leader 持有这个 annotation，TTL 过期自动失效\n    control-plane.alpha.kubernetes.io/leader: |\n      {\"holderIdentity\":\"node1\",\"leaseDurationSeconds\":15,\n       \"renewTime\":\"2024-01-15T03:00:00Z\"}\n```\n\n**奇数节点部署**：这是架构层面最简单的防护。偶数节点部署的集群（比如 2 个或 4 个 master-eligible 节点）在网络对半分裂的情况下，两个分区可能拿到相同的票数，导致选举僵局或者都无法满足 Quorum。奇数节点保证了一定有一个分区能获得多数票。\n\n## 第五步：数据修复——最难的部分\n\n防好了将来，还要处理当下已经双写的数据。这没有银弹，只能根据业务特点选择策略。\n\n对于订单场景，`order_id` 应该是全局唯一的（通常用雪花算法或者 UUID 生成）。双写导致的问题是：同一个 `order_id` 在两个分裂的分区里可能有不同的状态（比如一个是「待支付」一个是「已支付」）。修复步骤大致是：\n\n```bash\n# 1. 立刻停止对两个分裂集群的写入（止血优先）\n# 在业务层将 ES 写入切为降级模式，只写 MySQL，ES 暂时不写\n\n# 2. 找出冲突的文档——version 不一致的就是双写\n$ curl -X POST 'es-master-01:9200/orders-2024-01/_search' -H 'Content-Type: application/json' -d '{\n  \"query\": {\"range\": {\"_seq_no\": {\"gte\": 0}}},\n  \"sort\": [{\"_seq_no\": {\"order\": \"asc\"}}],\n  \"size\": 10000\n}'\n\n# 3. 以 MySQL（作为 source of truth）的数据为准，重新索引冲突文档\n$ python3 reconcile.py --source mysql --target es --start-time \"2024-01-15T02:46:00\" --end-time \"2024-01-15T03:15:00\"\n# Scanned 8,341 documents\n# Conflicts found: 127\n# Reconciled: 127\n# Failed: 0\n\n# 4. 修复 Elasticsearch 集群配置，合并两个分区\n$ curl -X PUT 'es-master-01:9200/_cluster/settings' -H 'Content-Type: application/json' -d '{\n  \"persistent\": {\n    \"discovery.zen.minimum_master_nodes\": 2\n  }\n}'\n```\n\n这次故障的教训是：**Elasticsearch 不是一个强一致性存储，它的设计目标是高吞吐的搜索和分析，不适合直接存储订单这类需要严格一致性的业务数据。** 正确的架构应该是：MySQL 是 source of truth，ES 是从 MySQL 异步同步过来的二级索引，即使 ES 出现短暂不一致，重新 reindex 也能修复。用 ES 做主存储并且写入订单这件事本身就是一个架构设计失误。\n\n## 第六步：防止下次再发——架构层面的系统性加固\n\n从这次故障出发，可以梳理出分布式集群防脑裂的完整检查清单：\n\n**节点数量**：始终使用奇数个 master-eligible（或 voting）节点，生产最少 3 个，避免 2 个或 4 个。\n\n**Quorum 参数**：按照 `floor(n/2)+1` 公式配置，不要为了可用性设成 1。\n\n**跨机柜部署**：将 master 节点分散在至少 3 个不同的故障域（机柜、机房），确保任何单点机柜故障不会导致 Quorum 丢失。这次故障如果 3 个 master 跨 3 个机柜，任何一个机柜间链路断掉都不影响其余 2 个 master 互通，仍能满足 Quorum=2。\n\n**网络监控**：对 master 节点之间的连通性做专项监控，在心跳超时之前就发出告警，让运维有时间介入。\n\n**写入方不直连集群**：业务写入应该通过协调层（如 ES 的 client node、Kafka 的 broker discovery、Redis Sentinel 的 proxy 层），协调层负责在分区发生时拒绝写入，而不是由应用直接连 master。",
+      "keyPoints": [
+        "脑裂的根本成因是网络分区（Partition）与可用性优先（Availability）的矛盾：节点失联时若继续提供服务，就可能出现多个节点同时自认为是合法 leader 的局面",
+        "Quorum 机制（minimum_master_nodes = floor(n/2)+1）通过数学保证：在任意网络分区条件下，最多只有一个分区能够满足多数票条件，从而消灭双 leader 的可能性",
+        "STONITH（Shoot The Other Node In The Head）是物理层面的 fencing 手段，通过 IPMI 等带外管理接口强制断电疑似故障节点，彻底防止「被判定失效的节点仍在写入」",
+        "Raft/Zen2 等基于 term/epoch 递增的共识协议实现了软件层面的 fencing：旧 leader 一旦收到比自己 term 更高的消息，会立即主动放弃 leader 身份，不需要外部强制",
+        "奇数节点部署是防脑裂的基础架构要求，偶数节点在对半分裂时可能出现两个分区票数相等的平局，奇数保证一定有一个分区可以获得多数票",
+        "脑裂发生后的数据修复没有捷径：必须以 source of truth（通常是关系型数据库）为基准，识别并对账双写期间产生的冲突数据；这也说明强一致性要求的数据不应该以 Elasticsearch 这类最终一致性系统作为主存储",
+        "Lease 续租机制（如 Kubernetes leader election）从另一个维度防脑裂：leader 必须持续向外部系统续租分布式锁，网络分区导致续租失败后锁自动过期，新 leader 才能安全接管",
+        "生产防脑裂是分层防御：网络层（奇数跨故障域部署）+ 协议层（Quorum + term 递增）+ 应用层（写入通过协调节点）+ 运维层（master 间连通性专项告警）缺一不可"
+      ],
+      "quiz": [
+        {
+          "id": "ds-q194-quiz-1",
+          "question": "在一个有 5 个 master-eligible 节点的 Elasticsearch 集群中，`discovery.zen.minimum_master_nodes` 应该设置为多少才能有效防止脑裂？",
+          "choices": [
+            {"id": "A", "text": "3（floor(5/2)+1），确保任意分区最多只有一个分区能满足 Quorum 条件"},
+            {"id": "B", "text": "2（5 的 40%），既保证安全又保证较高的可用性"},
+            {"id": "C", "text": "5（全部节点），强一致性要求所有节点都同意"},
+            {"id": "D", "text": "1（默认值），让任意节点都能快速选举，减少停服时间"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确公式是 floor(n/2)+1，5 个节点应设为 3。这个值的数学意义在于：整个集群里最多只有一个分区能同时拥有 ≥3 个节点，因此不可能出现两个都满足 Quorum 的子集群。B 选项的「2」是错的，在 5 节点集群里可能出现 3-2 分裂，两个分区都有 ≥2 节点，依然可能双 leader。C 选项设为 5 等于要求全体一致，任何一个节点离线都会导致选举失败，可用性极差。D 选项是最危险的配置，任意单节点都能选举自己为 master，这是导致脑裂的直接原因。"
+        },
+        {
+          "id": "ds-q194-quiz-2",
+          "question": "脑裂问题的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "服务器硬件故障导致节点宕机"},
+            {"id": "B", "text": "网络分区（Partition）发生时，多个节点各自认为自己是合法 leader 并继续对外服务"},
+            {"id": "C", "text": "选举算法存在 bug，选出了错误的 leader"},
+            {"id": "D", "text": "磁盘 I/O 过高导致心跳超时"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "脑裂的核心是「网络分区 + 多个节点继续服务」的组合。节点宕机（A）会触发正常的 leader 重新选举，不是脑裂。选举算法 bug（C）是可修复的软件问题，脑裂是一个在正确实现的系统里也可能发生的架构级问题。磁盘 I/O 过高（D）可能导致心跳超时误判，是脑裂的触发因素之一，但不是根本原因——根本原因是「网络分区后各分区都选择继续服务」这个决策。真正防脑裂需要保证：即使发生网络分区，也只有多数派分区能继续服务，少数派分区必须停服或降级。"
+        },
+        {
+          "id": "ds-q194-quiz-3",
+          "question": "在 Raft 协议中，当一个旧 leader 网络恢复联系后收到了 term=15 的消息，而它自己的 term 是 12，此时旧 leader 会怎么做？",
+          "choices": [
+            {"id": "A", "text": "拒绝该消息，坚持自己的 term=12 是合法的"},
+            {"id": "B", "text": "立即将自己的 term 更新为 15，主动降级为 follower，停止接受写请求"},
+            {"id": "C", "text": "发起新一轮选举，用更高的 term=16 重新竞选 leader"},
+            {"id": "D", "text": "将自己的数据同步给新 leader 后再降级"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Raft 协议中 term 机制的核心：任何节点一旦看到比自己更高的 term，必须立即更新自己的 term 并降级为 follower。这是软件层面的「自我 fencing」——旧 leader 主动放弃身份，从根本上防止双 leader 同时写入。A 选项是错的，Raft 严格规定高 term 优先，不允许拒绝。C 选项用更高的 term 重新竞选，这会破坏已经完成的选举结果，Raft 不允许此类行为（leader 不会主动发起选举）。D 选项先同步数据再降级的顺序是错的，必须先降级停止写入，数据同步由新 leader 主导。"
+        },
+        {
+          "id": "ds-q194-quiz-4",
+          "question": "STONITH（Shoot The Other Node In The Head）是什么，为什么在某些场景下它比软件层面的 fencing 更可靠？",
+          "choices": [
+            {"id": "A", "text": "一种通过发送 TCP 重置包来断开旧 leader 连接的网络层 fencing 方法"},
+            {"id": "B", "text": "通过 IPMI/iLO 等带外管理接口对疑似故障节点执行强制断电，确保该节点物理上无法继续写入"},
+            {"id": "C", "text": "一种让节点主动向外广播「我已下线」消息的协议"},
+            {"id": "D", "text": "Kubernetes 里用来强制删除僵尸 Pod 的 kubectl 命令"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "STONITH 是通过带外管理接口（IPMI、iLO、DRAC、智能 PDU 等独立于操作系统的硬件管理通道）直接给目标节点断电或重启。它的可靠性来自「独立性」：带外管理接口有独立的网络接口和电源，即使操作系统挂死、应用程序失控、SSH 无法登录，IPMI 命令依然可以执行。软件层面的 fencing 依赖被隔离节点的软件还能正常响应，如果节点处于 hung 状态（比如内核死锁），软件 fencing 可能完全失效。STONITH 是「最终武器」——只要有物理电源，就能保证隔离效果。A 选项描述的是网络层操作，并不能防止节点本地写入磁盘。"
+        },
+        {
+          "id": "ds-q194-quiz-5",
+          "question": "以下 etcd endpoint status 输出表明集群处于什么状态？\n```\nENDPOINT          LEADER    RAFT TERM  RAFT INDEX\netcd1:2379        etcd1     47         1203451\netcd2:2379        etcd1     47         1203451  \netcd3:2379        (empty)   23         891023\n```",
+          "choices": [
+            {"id": "A", "text": "集群健康，etcd3 只是稍微落后，不影响服务"},
+            {"id": "B", "text": "etcd3 与集群发生了网络分区或长时间离线，其 term 和 index 大幅落后，但由于 etcd1/etcd2 构成多数派，集群整体仍可正常服务"},
+            {"id": "C", "text": "etcd3 的 RAFT TERM=23 说明它在独立运行一个小集群，此时存在脑裂风险"},
+            {"id": "D", "text": "需要立即扩容到 5 个节点才能恢复服务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "从输出可以看到 etcd3 的 RAFT TERM=23，RAFT INDEX=891023，而其他两节点 TERM=47，INDEX=1203451。etcd3 的 LEADER 字段为空，说明它没有认可任何 leader（可能正在选举或已隔离）。由于 etcd1 和 etcd2 构成 2/3 的多数派，集群可以正常读写。etcd3 不构成脑裂威胁，因为它没有 leader，也无法独自满足 Quorum，所以它不会接受写请求。这不是脑裂，是单节点故障/分区的正常降级态。修复思路是找出 etcd3 故障原因，让它重新加入集群同步日志。C 选项是错的，单个节点没有 Quorum，无法对外服务，不是「独立小集群」。"
+        },
+        {
+          "id": "ds-q194-quiz-6",
+          "question": "为什么分布式系统推荐使用奇数个节点（如 3、5、7），而不是偶数个（如 2、4、6）？",
+          "choices": [
+            {"id": "A", "text": "奇数节点的网络带宽利用率更高"},
+            {"id": "B", "text": "偶数节点可以完全对半分裂，两个分区可能票数相等导致选举僵局，奇数节点保证一定有多数派"},
+            {"id": "C", "text": "偶数节点在选举时需要额外的随机等待，延迟更高"},
+            {"id": "D", "text": "奇数节点成本更低，偶数节点需要购买备用机"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "奇数节点的核心优势是「不可能对半分裂」。以 4 个节点为例，如果网络将集群对半分为 2+2，两个分区的票数相等，都不满足 Quorum=3，整个集群无主，服务中断。以 3 个节点为例，最坏的分裂是 2+1，多数派分区（2 票）满足 Quorum=2，可以继续服务，少数派分区（1 票）无法选主，安全停服。4 个节点的容错能力（允许 1 个节点故障）和 3 个节点相同，但成本更高、脑裂风险更大，所以 4 个节点不如 3 个节点。同理，6 个节点不如 5 个节点。这是分布式系统设计中最基础但最重要的原则之一。"
+        },
+        {
+          "id": "ds-q194-quiz-7",
+          "question": "Kubernetes 的 controller-manager 使用 etcd 的 Lease 对象做 leader election，Lease 的 TTL 设置过短（比如 5 秒）和过长（比如 60 秒）分别有什么问题？",
+          "choices": [
+            {"id": "A", "text": "TTL 过短：leader 频繁切换影响性能；TTL 过长：leader 故障后新 leader 需要等待更久才能上任，服务中断时间长"},
+            {"id": "B", "text": "TTL 的长短对 leader election 没有实质影响，只是续租频率不同"},
+            {"id": "C", "text": "TTL 过短会导致脑裂；TTL 过长可以完全防止脑裂"},
+            {"id": "D", "text": "TTL 过长会导致脑裂；TTL 过短可以完全防止脑裂"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Lease TTL 是一个典型的时间换安全性的权衡。TTL 过短（如 5 秒）意味着 leader 必须频繁续租（比如每 1-2 秒一次），在网络抖动（短暂延迟 >5s）时就会触发不必要的 leader 切换，controller-manager 频繁切换 leader 会导致 reconcile loop 中断、状态不一致等问题。TTL 过长（如 60 秒）意味着旧 leader 真正故障后，新 leader 最长需要等待 60 秒才能拿到 Lease，在这 60 秒内集群没有 controller 工作，Pod 漂移、Endpoint 更新等都会中断。Kubernetes 默认 leaseDuration=15s，renewDeadline=10s，retryPeriod=2s，这是经过调优的经验值。C 和 D 选项都不准确，TTL 长短影响的是故障恢复速度，不直接控制脑裂的发生与否。"
+        },
+        {
+          "id": "ds-q194-quiz-8",
+          "question": "一个三节点的 Redis Sentinel 集群（1 master + 2 replica，3 个 sentinel），`sentinel quorum` 配置为 2。此时 master 节点网络分区，2 个 sentinel 无法联系 master，还有 1 个 sentinel 可以联系 master。此时会发生什么？",
+          "choices": [
+            {"id": "A", "text": "立即触发 failover，将其中一个 replica 提升为新 master"},
+            {"id": "B", "text": "2 个 sentinel 判定 master 主观下线（SDOWN），但需要满足 quorum=2 才能触发客观下线（ODOWN），2/3 满足条件，触发 failover"},
+            {"id": "C", "text": "因为还有 1 个 sentinel 可以联系 master，所以不会触发 failover，集群保持原状"},
+            {"id": "D", "text": "3 个 sentinel 必须全部同意才能 failover，所以此场景不触发"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis Sentinel 的故障判断分两步：首先每个 sentinel 独立判断 SDOWN（主观下线），当某个 sentinel 无法在 down-after-milliseconds 内联系到 master 时，它单独判定该 master SDOWN。然后是 ODOWN（客观下线）：发现 SDOWN 的 sentinel 会询问其他 sentinel，当确认有 quorum 个（本例为 2 个）sentinel 也认为 master SDOWN 时，触发 ODOWN 并开始 failover。本例中 2 个 sentinel 联系不到 master，2/3 满足 quorum=2，因此触发 ODOWN 和 failover。剩余那 1 个 sentinel 还能联系到 master 也无法阻止这个结论。这里需要注意的是，Redis Sentinel 的 quorum 是「发现 SDOWN 的 sentinel 数量阈值」，不是「参与 failover 投票的节点数」，后者需要 majority（超过半数 sentinel 同意新 master）。"
+        },
+        {
+          "id": "ds-q194-quiz-9",
+          "question": "在极端情况下，即使使用了 Raft 协议的分布式存储（如 etcd），也可能出现类脑裂的「幽灵读」问题。以下哪种场景会导致这个问题？",
+          "choices": [
+            {"id": "A", "text": "client 向 follower 节点发送读请求，follower 返回了还未收到最新 commit 的旧数据"},
+            {"id": "B", "text": "leader 宕机后 follower 的数据丢失"},
+            {"id": "C", "text": "网络分区导致超过半数节点离线"},
+            {"id": "D", "text": "Raft 日志压缩（snapshot）导致老日志被删除"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Raft 实现中一个容易被忽视的细节。Raft 保证的是「写入强一致」，但如果 client 向 follower 发送读请求，follower 可能还没有应用最新的已提交日志，返回的是旧数据。这在技术上不是脑裂（没有双 leader），但效果类似——client 会看到「本应已更新」的数据还是旧值。解决方案有两种：1）只允许从 leader 读取（linear read），读取前 leader 要先通过 ReadIndex 机制确认自己还是合法 leader；2）使用 Follower read 时，follower 必须等待本地 applied index ≥ leader 的 commit index 后才能响应。etcd 默认使用 linear read，这就是为什么 etcd 的读性能不能通过增加节点来水平扩展——所有线性读都要经过 leader。B/C/D 是其他类型的故障，与「幽灵读」无关。"
+        },
+        {
+          "id": "ds-q194-quiz-10",
+          "question": "你的 Elasticsearch 集群今天凌晨发生了脑裂，事后复盘发现两个「分裂集群」都对同一个 index 进行了写入，现在需要数据修复。以下修复思路中，哪个是正确的方向？",
+          "choices": [
+            {"id": "A", "text": "直接合并两个分裂集群的数据，用最新时间戳的版本覆盖旧版本"},
+            {"id": "B", "text": "选择节点数更多的那个分裂集群的数据作为准确数据，丢弃另一个分裂集群的数据"},
+            {"id": "C", "text": "以业务的 source of truth（如 MySQL）为基准，在脑裂时间段内对账 ES 数据，修复与 MySQL 不一致的文档"},
+            {"id": "D", "text": "回滚整个 ES 集群到脑裂发生前的快照，接受部分数据丢失"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "脑裂期间的数据修复没有捷径，必须借助外部的 source of truth。A 选项用「最新时间戳覆盖」是错的：在两个分裂集群中，一个写操作可能在集群 A 的时间戳是 T+1，在集群 B 的时间戳是 T+2，但集群 B 的数据可能是「错的」（比如基于旧状态做的更新），简单按时间戳合并会把错误数据固化。B 选项按节点数选数据更没有依据，节点数多不代表数据更正确。D 选项回滚快照意味着丢弃脑裂后所有的合法写入，损失过大。正确做法是 C：MySQL 等关系型数据库有严格的事务和单 master，不存在脑裂问题，可以作为「真相的唯一来源」。以 MySQL 数据重建脑裂时间窗口内的 ES 文档，并删除 ES 中 MySQL 不存在的幽灵文档。"
+        }
+      ],
+      "references": [
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/modules-discovery-quorums.html",
+        "https://raft.github.io/raft.pdf",
+        "https://etcd.io/docs/v3.5/op-guide/clustering/"
+      ]
+    }
+  ]
+}
