@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuestionStore } from '../stores/questionStore';
 import { useProgressStore } from '../stores/progressStore';
@@ -46,6 +46,12 @@ export function QuestionDetail() {
   const [showAnswer, setShowAnswer] = useState(false);
   const [activeTab, setActiveTab] = useState<DetailTab>('content');
 
+  // Sliding tab indicator — measure the active tab button and animate the
+  // underline between them with a back-ease for a confident settle.
+  const tabContentRef = useRef<HTMLButtonElement | null>(null);
+  const tabQuizRef = useRef<HTMLButtonElement | null>(null);
+  const [indicator, setIndicator] = useState<{ left: number; width: number }>({ left: 0, width: 0 });
+
   useEffect(() => {
     fetchRegistry();
   }, [fetchRegistry]);
@@ -68,6 +74,24 @@ export function QuestionDetail() {
   const currentIndex = allQuestions.findIndex((q) => q.id === questionId);
   const progress = questionId ? getQuestionProgress(questionId) : undefined;
   const bookmarked = questionId ? isBookmarked(questionId) : false;
+
+  // Measure + track the active tab button. Runs after `question` is known so
+  // the quiz tab (conditional on `question.quiz.length`) is already mounted.
+  const hasQuizBar = !!question && question.quiz.length > 0;
+  useLayoutEffect(() => {
+    if (!hasQuizBar) return;
+    const active = activeTab === 'content' ? tabContentRef.current : tabQuizRef.current;
+    if (!active) return;
+    const update = () => {
+      setIndicator({ left: active.offsetLeft, width: active.offsetWidth });
+    };
+    update();
+    // Re-measure on parent resize so the indicator stays aligned when the
+    // layout reflows (mobile/desktop breakpoints, font loads, etc.).
+    const ro = new ResizeObserver(update);
+    if (active.parentElement) ro.observe(active.parentElement);
+    return () => ro.disconnect();
+  }, [activeTab, hasQuizBar]);
 
   const handleToggleAnswer = () => {
     if (!showAnswer && questionId) {
@@ -132,10 +156,10 @@ export function QuestionDetail() {
     <div className="animate-fade-in">
       {/* Breadcrumb */}
       <div className="text-sm text-[var(--color-notion-text-secondary)] mb-5 flex items-center flex-wrap gap-y-1">
-        <Link to="/" className="hover:text-[var(--color-notion-accent)] no-underline transition-colors">首页</Link>
+        <Link to="/" className="hover:text-[var(--color-notion-accent)] no-underline transition-colors duration-200">首页</Link>
         <span className="mx-2 opacity-40">/</span>
-        <Link to={`/domains/${domain}`} className="hover:text-[var(--color-notion-accent)] no-underline flex items-center gap-1 transition-colors">
-          <DomainIcon className="w-3.5 h-3.5" /> {DOMAIN_LABELS[domainKey]}
+        <Link to={`/domains/${domain}`} className="group hover:text-[var(--color-notion-accent)] no-underline flex items-center gap-1 transition-colors duration-200">
+          <DomainIcon className="w-3.5 h-3.5 transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] group-hover:-translate-x-0.5" /> {DOMAIN_LABELS[domainKey]}
         </Link>
         <span className="mx-2 opacity-40">/</span>
         <span className="text-[var(--color-notion-text)] truncate">{question.title}</span>
@@ -160,35 +184,46 @@ export function QuestionDetail() {
         {question.title}
       </h1>
 
-      {/* Tab bar */}
+      {/* Tab bar — underline slides between tabs with back-ease */}
       {hasQuiz && (
-        <div className="mb-6 flex min-w-0 items-stretch gap-1 border-b border-[var(--color-notion-border)]">
+        <div className="relative mb-6 flex min-w-0 items-stretch gap-1 border-b border-[var(--color-notion-border)]">
           <button
+            ref={tabContentRef}
             onClick={() => setActiveTab('content')}
-            className={`-mb-px flex min-w-0 flex-1 items-center justify-center gap-1.5 border-b-2 px-3 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 sm:flex-none sm:px-4 ${
+            className={`flex min-w-0 flex-1 items-center justify-center gap-1.5 px-3 py-2.5 text-sm font-medium whitespace-nowrap transition-colors duration-300 sm:flex-none sm:px-4 ${
               activeTab === 'content'
-                ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
-                : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
+                ? 'text-[var(--color-notion-accent)]'
+                : 'text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
             }`}
           >
-            <BookOpen className="w-4 h-4" /> 题目内容
+            <BookOpen className={`w-4 h-4 transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] ${activeTab === 'content' ? 'scale-110' : ''}`} /> 题目内容
           </button>
           <button
+            ref={tabQuizRef}
             onClick={() => setActiveTab('quiz')}
-            className={`-mb-px flex min-w-0 flex-1 items-center justify-center gap-1.5 border-b-2 px-3 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 sm:flex-none sm:px-4 ${
+            className={`flex min-w-0 flex-1 items-center justify-center gap-1.5 px-3 py-2.5 text-sm font-medium whitespace-nowrap transition-colors duration-300 sm:flex-none sm:px-4 ${
               activeTab === 'quiz'
-                ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
-                : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
+                ? 'text-[var(--color-notion-accent)]'
+                : 'text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
             }`}
           >
-            <ClipboardCheck className="w-4 h-4" /> 选择题 ({question.quiz.length})
+            <ClipboardCheck className={`w-4 h-4 transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] ${activeTab === 'quiz' ? 'scale-110' : ''}`} /> 选择题 ({question.quiz.length})
           </button>
+          {/* Animated underline — width and translateX both tween with back ease */}
+          <span
+            className="tab-underline"
+            style={{
+              width: indicator.width,
+              transform: `translate3d(${indicator.left}px, 0, 0)`,
+            }}
+            aria-hidden="true"
+          />
         </div>
       )}
 
       {/* Tab: Content */}
       {activeTab === 'content' && (
-        <div className="animate-fade-in">
+        <div className="animate-tab-content-in">
           {/* Content (可划线批注) */}
           <div className="p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] mb-3">
             <HighlightableMarkdown
@@ -225,34 +260,49 @@ export function QuestionDetail() {
           <div className="mb-5 flex flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center">
             <button
               onClick={handleToggleAnswer}
-              className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-4 py-2 text-sm font-medium text-[var(--color-notion-text)] transition-all duration-200 hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:justify-start sm:py-2.5"
+              className="group hover-press flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-4 py-2 text-sm font-medium text-[var(--color-notion-text)] hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:justify-start sm:py-2.5"
             >
-              {showAnswer ? <><ChevronUp className="w-4 h-4" /> 收起答案</> : <><Lightbulb className="w-4 h-4 text-[var(--color-notion-warning)]" /> 显示答案</>}
+              {showAnswer ? (
+                <>
+                  <ChevronUp key="up" className="w-4 h-4 animate-pop" /> 收起答案
+                </>
+              ) : (
+                <>
+                  <Lightbulb key="bulb" className="w-4 h-4 text-[var(--color-notion-warning)] animate-pop transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] group-hover:rotate-12 group-hover:scale-110" /> 显示答案
+                </>
+              )}
             </button>
             <button
               onClick={() => questionId && toggleBookmark(questionId)}
-              className={`flex w-full items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-all duration-200 sm:w-auto sm:justify-start sm:py-2.5 ${
+              className={`hover-press flex w-full items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium sm:w-auto sm:justify-start sm:py-2.5 ${
                 bookmarked
                   ? 'border-[var(--color-notion-warning)] bg-[var(--color-notion-warning-light)] text-[var(--color-notion-warning)]'
                   : 'border-[var(--color-notion-border)] text-[var(--color-notion-text-secondary)] hover:border-[var(--color-notion-warning)] hover:bg-[var(--color-notion-warning-light)]'
               }`}
             >
-              <Star className={`w-4 h-4 ${bookmarked ? 'fill-current' : ''}`} />
+              {/* Re-key on bookmark state so the pop animation replays each
+                  toggle; a star that just became filled gets a small rock +
+                  settle (back-ease), plain state gets pop-in fade. */}
+              <Star
+                key={bookmarked ? 'on' : 'off'}
+                className={`w-4 h-4 ${bookmarked ? 'fill-current animate-bookmark-pop' : 'animate-pop'}`}
+              />
               {bookmarked ? '已收藏' : '收藏'}
             </button>
             {hasQuiz && (
               <button
                 onClick={() => setActiveTab('quiz')}
-                className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-4 py-2 text-sm font-medium text-[var(--color-notion-text)] transition-all duration-200 hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:justify-start sm:py-2.5"
+                className="group hover-press flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-4 py-2 text-sm font-medium text-[var(--color-notion-text)] hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:justify-start sm:py-2.5"
               >
-                <ClipboardCheck className="w-4 h-4" /> 开始做题
+                <ClipboardCheck className="w-4 h-4 transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] group-hover:scale-110" /> 开始做题
               </button>
             )}
           </div>
 
-          {/* Answer */}
+          {/* Answer — reveal with back ease so the panel feels like it's
+              catching itself, not just sliding. */}
           {showAnswer && (
-            <div className="mb-5 p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] animate-slide-up">
+            <div className="mb-5 p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] animate-reveal-up">
               <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4">
                 参考答案
               </h3>
@@ -299,7 +349,7 @@ export function QuestionDetail() {
 
       {/* Tab: Quiz */}
       {activeTab === 'quiz' && hasQuiz && (
-        <div className="animate-fade-in">
+        <div className="animate-tab-content-in">
           <QuizPanel
             quizzes={question.quiz}
             existingAttempts={progress?.quizAttempts ?? []}
@@ -313,19 +363,19 @@ export function QuestionDetail() {
         <button
           onClick={() => handleNav(-1)}
           disabled={currentIndex <= 0}
-          className="flex items-center gap-1.5 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
+          className="group flex items-center gap-1.5 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-colors duration-200 disabled:hover:text-[var(--color-notion-text-secondary)]"
         >
-          <ChevronLeft className="w-4 h-4" /> 上一题
+          <ChevronLeft className="w-4 h-4 transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] group-hover:-translate-x-1 group-disabled:group-hover:translate-x-0" /> 上一题
         </button>
-        <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono">
+        <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono tabular-nums">
           {currentIndex + 1} / {allQuestions.length}
         </span>
         <button
           onClick={() => handleNav(1)}
           disabled={currentIndex >= allQuestions.length - 1}
-          className="flex items-center gap-1.5 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
+          className="group flex items-center gap-1.5 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-colors duration-200 disabled:hover:text-[var(--color-notion-text-secondary)]"
         >
-          下一题 <ChevronRight className="w-4 h-4" />
+          下一题 <ChevronRight className="w-4 h-4 transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] group-hover:translate-x-1 group-disabled:group-hover:translate-x-0" />
         </button>
       </div>
     </div>

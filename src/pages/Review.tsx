@@ -24,7 +24,7 @@ export function Review() {
   return (
     <div className="animate-fade-in">
       <h1 className="text-xl font-bold text-[var(--color-notion-text)] mb-2 flex items-center gap-2">
-        <XCircle className="w-5 h-5 text-[var(--color-notion-error)]" /> 错题回顾
+        <XCircle className="w-5 h-5 text-[var(--color-notion-error)] animate-pop" /> 错题回顾
       </h1>
       <p className="text-sm text-[var(--color-notion-text-secondary)] mb-6">
         共 {wrongAttempts.length} 道错题，来自 {Object.keys(groupedByQuestion).length} 个知识点
@@ -35,13 +35,13 @@ export function Review() {
           暂无错题，继续刷题吧
         </div>
       ) : (
-        <div className="space-y-4">
+        <div className="space-y-4 animate-stagger-up">
           {Object.entries(groupedByQuestion).map(([questionId, attempts]) => {
             const questionData = getQuestionById(questionId);
             return (
               <div
                 key={questionId}
-                className="rounded-lg border border-[var(--color-notion-border)] overflow-hidden"
+                className="hover-lift rounded-lg border border-[var(--color-notion-border)] hover:border-[var(--color-notion-error)]/40 overflow-hidden"
               >
                 <div className="px-3 sm:px-4 py-2.5 sm:py-3 bg-[var(--color-notion-bg-secondary)] border-b border-[var(--color-notion-border)] flex flex-col sm:flex-row sm:items-center gap-1.5 sm:gap-0 sm:justify-between">
                   <span className="text-sm font-medium text-[var(--color-notion-text)] truncate">

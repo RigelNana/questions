@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { useQuestionStore } from "../stores/questionStore";
 import { useProgressStore } from "../stores/progressStore";
 import { DomainCard } from "../components/domain/DomainCard";
+import { AnimatedNumber } from "../components/ui/AnimatedNumber";
 import { ALL_DOMAINS, DOMAIN_LABELS } from "../types";
 import {
   Target,
@@ -100,7 +101,13 @@ export function Dashboard() {
     );
   }
 
-  const stats = [
+  const stats: {
+    label: string;
+    value: number;
+    suffix?: string;
+    icon: typeof Target;
+    color: string;
+  }[] = [
     {
       label: "已完成",
       value: completedCount,
@@ -115,7 +122,8 @@ export function Dashboard() {
     },
     {
       label: "正确率",
-      value: `${correctRate}%`,
+      value: correctRate,
+      suffix: "%",
       icon: BarChart3,
       color: "text-[var(--color-notion-warning)]",
     },
@@ -132,7 +140,7 @@ export function Dashboard() {
       {/* Hero */}
       <div className="mb-10">
         <div className="flex items-center gap-3 mb-2">
-          <div className="w-9 h-9 rounded-xl bg-[var(--color-notion-accent)] flex items-center justify-center">
+          <div className="w-9 h-9 rounded-xl bg-[var(--color-notion-accent)] flex items-center justify-center animate-float-y shadow-lg shadow-[var(--color-notion-accent)]/20">
             <Target className="w-5 h-5 text-white" />
           </div>
           <h1 className="text-2xl font-bold text-[var(--color-notion-text)] tracking-tight">
@@ -145,22 +153,22 @@ export function Dashboard() {
       </div>
 
       {/* Stats overview */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-10">
-        {stats.map(({ label, value, icon: Icon, color }) => (
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-10 animate-stagger-up">
+        {stats.map(({ label, value, suffix, icon: Icon, color }) => (
           <div
             key={label}
-            className="p-4 sm:p-5 rounded-xl border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)] transition-all duration-200 group"
+            className="p-4 sm:p-5 rounded-xl border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)] hover-lift hover:shadow-lg hover:shadow-[var(--color-notion-accent)]/5 group"
           >
             <div className="flex items-center gap-2 mb-1">
               <Icon
-                className={`w-4 h-4 ${color} opacity-70 group-hover:opacity-100 transition-opacity`}
+                className={`w-4 h-4 ${color} opacity-70 group-hover:opacity-100 group-hover:scale-110 transition-all duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)]`}
               />
               <span className="text-xs text-[var(--color-notion-text-secondary)]">
                 {label}
               </span>
             </div>
-            <div className="text-2xl sm:text-3xl font-bold text-[var(--color-notion-text)] tracking-tight">
-              {value}
+            <div className="text-2xl sm:text-3xl font-bold text-[var(--color-notion-text)] tracking-tight tabular-nums">
+              <AnimatedNumber value={value} suffix={suffix} duration={1100} />
             </div>
           </div>
         ))}
@@ -168,12 +176,12 @@ export function Dashboard() {
 
       {/* Continue last */}
       {lastVisited && (
-        <div className="mb-8 p-4 rounded-xl border border-[var(--color-notion-accent)]/30 bg-[var(--color-notion-accent-light)] hover:bg-[var(--color-notion-accent)]/10 transition-colors">
+        <div className="mb-8 p-4 rounded-xl border border-[var(--color-notion-accent)]/30 bg-[var(--color-notion-accent-light)] hover-lift hover:bg-[var(--color-notion-accent)]/10">
           <Link
             to={`/domains/${lastVisited.domain}/${lastVisited.questionId}`}
-            className="flex items-center gap-2.5 text-sm text-[var(--color-notion-accent)] font-medium no-underline hover:underline"
+            className="flex items-center gap-2.5 text-sm text-[var(--color-notion-accent)] font-medium no-underline group"
           >
-            <BookOpen className="w-4 h-4" />
+            <BookOpen className="w-4 h-4 transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] group-hover:translate-x-0.5 group-hover:scale-110" />
             继续上次 —{" "}
             {DOMAIN_LABELS[lastVisited.domain as keyof typeof DOMAIN_LABELS]}
           </Link>
@@ -182,9 +190,9 @@ export function Dashboard() {
 
       {/* Bookmarks quick access */}
       {bookmarkCount > 0 && (
-        <div className="mb-6 flex items-center gap-2 text-sm text-[var(--color-notion-text-secondary)]">
-          <Star className="w-4 h-4 text-[var(--color-notion-warning)]" />
-          已收藏 {bookmarkCount} 道题目
+        <div className="mb-6 flex items-center gap-2 text-sm text-[var(--color-notion-text-secondary)] animate-fade-in">
+          <Star className="w-4 h-4 text-[var(--color-notion-warning)] animate-pop" />
+          已收藏 <span className="font-semibold text-[var(--color-notion-text)] tabular-nums"><AnimatedNumber value={bookmarkCount} duration={700} /></span> 道题目
         </div>
       )}
 
@@ -192,7 +200,7 @@ export function Dashboard() {
       <h2 className="text-lg font-semibold text-[var(--color-notion-text)] mb-5 tracking-tight">
         知识域
       </h2>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 animate-stagger">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 animate-stagger-up">
         {ALL_DOMAINS.map((domain) => {
           const domainStats = getDomainStats(domain);
           return (

@@ -1,0 +1,157 @@
+{
+  "id": "ds-etcd-watch-concept",
+  "name": "etcd Watch 机制与服务发现",
+  "domain": "distributed-system",
+  "description": "讲解 etcd Watch 的长连接推送原理，以及如何用 Lease + Watch 实现服务注册发现",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-etcd-watch-concept-q1",
+      "domain": "distributed-system",
+      "type": "concept",
+      "difficulty": 1,
+      "tags": ["etcd", "Watch", "服务发现", "Lease", "gRPC", "Kubernetes", "MVCC", "Raft"],
+      "title": "etcd 的 Watch 机制是如何工作的？如何用它实现服务发现？",
+      "content": "面试官问你「说说 etcd 的 Watch 机制」时，很多人的第一反应是「Watch 就是监听某个 key 的变化，有变化就通知你」。这个回答不能说错，但它完全没有触及真正有价值的东西。\n\n更深的问题是：Watch 是轮询实现的还是推送实现的？客户端重启后如何保证不漏事件？etcd 同时支持数万个 Watcher，这背后是怎么做到的？\n\n更重要的是：为什么 Kubernetes 的整个控制平面（API Server、Controller Manager、Scheduler、kubelet）都重度依赖 etcd 的 Watch 机制来感知资源变化？如果 Watch 只是简单的轮询，这套系统怎么可能高效地管理数千个节点上的数万个 Pod？\n\n要真正理解 Watch，需要先理解 etcd 本身的设计哲学：它不只是一个分布式 KV 存储，它的核心能力是「强一致性 + 变更推送」的组合。\n\n请回答：\n\n1. etcd 是什么？它的核心特性（Raft、MVCC、Lease、Watch）各自解决什么问题？\n2. Watch 机制的底层工作原理是什么？如何保证断线重连不漏事件？\n3. 用 Lease + Watch 实现服务注册与发现的完整代码和设计思路是什么？",
+      "answer": "## 第一步：etcd 是什么，它为什么适合做服务注册中心\n\n在理解 Watch 之前，必须先搞清楚 etcd 是什么。etcd 是一个由 CoreOS（现已被 Red Hat 收购）开发的分布式键值存储，从 2013 年起就是 Kubernetes 的核心数据库，所有集群状态——Pod、Service、ConfigMap、Deployment——都存在这里。它的名字来自「/etc distributed」，含义是「分布式的配置目录」。\n\netcd 的底层共识算法是 Raft。理解 Raft 对理解 etcd 的行为非常重要：Raft 保证了集群中所有节点的数据最终一致，任何写入操作都必须经过 Leader 节点，被多数节点（Quorum，一般是 `floor(N/2) + 1` 个节点）确认后才算提交。这意味着 etcd 是 CP 系统——在发生网络分区时，它选择放弃可用性而保证一致性。对于服务注册这类场景，「准确」比「快」更重要，所以这个取舍是正确的。\n\netcd 有三个核心特性，它们紧密配合才形成了服务发现的完整能力。\n\n**MVCC（Multi-Version Concurrency Control，多版本并发控制）** 是 etcd 存储引擎的基础。与普通 KV 不同，etcd 中每次对 key 的写操作不会覆盖旧值，而是追加一个新版本，每个版本有一个全局单调递增的 `revision`（修订版本号）。比如 key `/services/order/instance-1` 被创建时 revision 是 5，被修改时 revision 变成 12，被删除时 revision 变成 20。这些历史记录并不会无限保留——etcd 会通过 compaction（压缩）定期清理旧版本，但在保留窗口内，任何时刻的历史状态都可以被查询。MVCC 的意义在于：它让 Watch 机制能够实现「断点续传」，客户端断线后可以指定从特定 revision 继续接收事件，而不会漏掉任何变更。\n\n**Lease（租约）** 解决的是服务实例心跳检测的问题。创建一个 Lease 时指定 TTL（存活时间），比如 10 秒。任何绑定到这个 Lease 的 key 都会在 Lease 过期时被自动删除。服务实例只要定期调用 KeepAlive 来续租，Lease 就一直存在；一旦服务实例崩溃、断网或异常退出，KeepAlive 停止，TTL 倒计时结束，Lease 过期，所有绑定的 key 被自动清除。这是比 ZooKeeper 的临时节点（ephemeral node）更简洁的实现：不需要维护 session 状态，只需要续租一个 TTL。\n\n**Watch** 是整套机制的消费端，它让客户端能实时感知 key 的变化，而不需要轮询。这三个特性的组合就是服务发现的完整方案：服务注册 = Put key + Lease（用 Lease 保证服务下线时 key 自动消失），服务发现 = Watch key 前缀（有服务上线下线时立即收到通知）。\n\n## 第二步：Watch 机制的底层工作原理\n\n### 长连接推送，而非轮询\n\nWatch 的核心是 gRPC 的 server-side streaming。客户端调用 `Watch` RPC 后，etcd 不会立即返回，而是保持这条 gRPC 流开放，每当被监听的 key 发生变化，etcd 就通过这条流向客户端推送 `WatchEvent`。整个过程客户端不需要反复发请求，一条长连接搞定。\n\n这和 HTTP 轮询有本质区别。如果用 HTTP 轮询，假设轮询间隔是 1 秒，那事件的感知延迟最高可达 1 秒，且每秒都在浪费一个 HTTP 请求。gRPC 长连接下，事件延迟取决于 etcd 处理写操作的速度，通常是几毫秒，几乎是实时的。\n\n每个 `WatchEvent` 包含以下关键信息：\n\n```\n{\n  type: PUT | DELETE,   // 事件类型：写入/删除\n  kv: {\n    key: \"/services/order/instance-1\",  // 发生变化的 key\n    value: \"192.168.1.100:8080\",        // 新值（DELETE 事件无 value）\n    create_revision: 5,   // 这个 key 第一次被创建时的 revision\n    mod_revision: 12,     // 这次修改发生时的全局 revision\n    version: 3            // 这个 key 被修改的次数（从 1 开始计数）\n  },\n  prev_kv: { ... }       // 变更前的旧值（需要显式请求才包含）\n}\n```\n\n`mod_revision` 是整个 Watch 机制中最关键的字段，它标识了这个事件在 etcd 全局变更历史中的位置。\n\n### etcd 内部如何管理 Watcher\n\netcd 服务端维护着一个 `watchableStore`，其中有两类 Watcher 列表：`synced`（已同步，正在实时监听最新变化的 Watcher）和 `unsynced`（未同步，还在追赶历史事件的 Watcher）。\n\n当客户端建立一个新的 Watch 时，如果指定的 start_revision 就是当前最新 revision，Watcher 直接进入 `synced` 列表，等待新事件。如果指定的 start_revision 比当前 revision 小（意味着客户端之前断线，错过了一些事件），Watcher 先进入 `unsynced` 列表，etcd 会从 MVCC 历史中回放 start_revision 之后的所有事件推给客户端，追上之后再转入 `synced` 列表。\n\netcd 3.4 之后，同一个客户端的所有 Watch 共用一条 gRPC 流（multiplexing），通过 `WatchID` 区分不同的 Watch。这意味着不管你 Watch 了多少个 key，对服务端来说只消耗一条 TCP 连接。\n\n### 断线重连不漏事件的保证\n\n这是很多人忽视但面试官最喜欢追问的细节。假设客户端在 revision=100 时断线，重连后如何保证 revision=101 到 revision=150 之间的事件不漏掉？\n\n答案是：重连时指定 `WithRev(101)`，etcd 会从 MVCC 历史中找出 revision 101 之后的所有事件，依次推送给客户端。只要这段历史还没有被 compaction 清理掉，就一定不会漏事件。\n\n```go\n// 断线重连时，记录上次收到的最大 revision\nlastRevision := int64(100)\n\n// 重连时从 lastRevision+1 开始接收，不会漏事件\nwatchChan := cli.Watch(\n    ctx,\n    \"/services/order/\",\n    clientv3.WithPrefix(),\n    clientv3.WithRev(lastRevision+1), // 从上次断线位置续接\n)\n```\n\n如果 compaction 已经清理了这段历史，Watch 会收到一个特殊的 `ErrCompacted` 错误，客户端需要用 `Get` + `WithPrefix` 做一次全量同步，然后记录当前 revision，再重新建立 Watch。这就是 Kubernetes Informer 中「list-watch」机制的由来：先 List 获取全量状态，再 Watch 增量事件。\n\n### 完整的 Go 客户端 Watch 代码\n\n```go\npackage main\n\nimport (\n    \"context\"\n    \"fmt\"\n    \"log\"\n\n    clientv3 \"go.etcd.io/etcd/client/v3\"\n    \"go.etcd.io/etcd/client/v3/mvccpb\"\n)\n\nfunc watchServices(cli *clientv3.Client) {\n    ctx := context.Background()\n\n    // Watch /services/order/ 前缀下的所有 key\n    // WithPrefix() 表示前缀匹配，监听该前缀下所有 key 的变化\n    watchChan := cli.Watch(ctx, \"/services/order/\", clientv3.WithPrefix())\n\n    for resp := range watchChan {\n        // 检查是否有错误（比如 compaction 导致的 ErrCompacted）\n        if resp.Err() != nil {\n            log.Printf(\"watch error: %v, need to re-list\", resp.Err())\n            // 生产代码这里应该触发全量 List + 重新 Watch\n            return\n        }\n\n        for _, ev := range resp.Events {\n            switch ev.Type {\n            case mvccpb.PUT:\n                // PUT 事件：key 被创建或更新\n                // ev.IsCreate() 可以区分是新创建还是更新\n                if ev.IsCreate() {\n                    fmt.Printf(\"[上线] 服务实例注册: %s → %s (revision: %d)\\n\",\n                        ev.Kv.Key, ev.Kv.Value, ev.Kv.ModRevision)\n                } else {\n                    fmt.Printf(\"[更新] 服务实例变更: %s → %s\\n\",\n                        ev.Kv.Key, ev.Kv.Value)\n                }\n            case mvccpb.DELETE:\n                // DELETE 事件：key 被删除，通常是 Lease 过期触发的\n                fmt.Printf(\"[下线] 服务实例注销: %s (revision: %d)\\n\",\n                    ev.Kv.Key, ev.Kv.ModRevision)\n            }\n        }\n    }\n}\n```\n\n## 第三步：用 Lease + Watch 实现完整的服务注册发现\n\n理解了 Watch 原理之后，把它和 Lease 组合在一起，就得到了一套完整的服务注册发现方案。下面是生产可用的 Go 实现，包含服务注册端和发现端两部分。\n\n### 服务注册端（服务实例启动时调用）\n\n```go\n// ServiceRegistry 服务注册器\ntype ServiceRegistry struct {\n    client     *clientv3.Client\n    leaseID    clientv3.LeaseID\n    instanceID string\n    serviceName string\n    addr       string\n}\n\nfunc (r *ServiceRegistry) Register(ctx context.Context) error {\n    // 第一步：创建 TTL 为 10 秒的租约\n    // 租约过期时，所有绑定到该租约的 key 会被自动删除\n    leaseResp, err := r.client.Grant(ctx, 10)\n    if err != nil {\n        return fmt.Errorf(\"创建 lease 失败: %w\", err)\n    }\n    r.leaseID = leaseResp.ID\n\n    // 第二步：注册服务地址，key 绑定到租约\n    // key 格式：/services/{服务名}/{实例ID}\n    // value 通常是 JSON，包含 addr、权重、版本等元数据\n    key := fmt.Sprintf(\"/services/%s/%s\", r.serviceName, r.instanceID)\n    _, err = r.client.Put(ctx, key, r.addr, clientv3.WithLease(r.leaseID))\n    if err != nil {\n        return fmt.Errorf(\"注册服务失败: %w\", err)\n    }\n    fmt.Printf(\"服务已注册: %s → %s, leaseID: %x\\n\", key, r.addr, r.leaseID)\n\n    // 第三步：启动自动续约协程\n    // KeepAlive 内部每 TTL/3 秒自动发送一次续约请求（即每 ~3.3 秒一次）\n    // 返回的 channel 会持续推送续约响应，直到 ctx 取消或连接断开\n    keepAliveChan, err := r.client.KeepAlive(ctx, r.leaseID)\n    if err != nil {\n        return fmt.Errorf(\"启动自动续约失败: %w\", err)\n    }\n\n    // 在后台 goroutine 中消费续约响应（必须消费，否则 channel 会满导致阻塞）\n    go func() {\n        for resp := range keepAliveChan {\n            if resp == nil {\n                // channel 关闭，说明 ctx 取消或 etcd 连接断开\n                log.Println(\"续约 channel 关闭，服务可能已下线\")\n                return\n            }\n            // resp.TTL 是续约成功后的剩余 TTL，正常情况下应该接近 10 秒\n        }\n    }()\n\n    return nil\n}\n\nfunc (r *ServiceRegistry) Deregister(ctx context.Context) error {\n    // 主动下线：撤销 Lease，绑定的 key 立即被删除，触发 Watch DELETE 事件\n    // 这比等 TTL 过期要快得多（不需要等 10 秒）\n    _, err := r.client.Revoke(ctx, r.leaseID)\n    return err\n}\n```\n\n### 服务发现端（客户端启动时调用）\n\n```go\n// ServiceDiscovery 服务发现器\ntype ServiceDiscovery struct {\n    client      *clientv3.Client\n    serviceName string\n    instances   map[string]string // instanceID → addr\n    mu          sync.RWMutex\n}\n\nfunc (d *ServiceDiscovery) Start(ctx context.Context) error {\n    prefix := fmt.Sprintf(\"/services/%s/\", d.serviceName)\n\n    // 第一步：全量 List 获取当前所有实例（初始化本地缓存）\n    // 同时记录当前的 revision，作为后续 Watch 的起始点\n    resp, err := d.client.Get(ctx, prefix, clientv3.WithPrefix())\n    if err != nil {\n        return fmt.Errorf(\"初始化服务列表失败: %w\", err)\n    }\n\n    d.mu.Lock()\n    for _, kv := range resp.Kvs {\n        instanceID := strings.TrimPrefix(string(kv.Key), prefix)\n        d.instances[instanceID] = string(kv.Value)\n        fmt.Printf(\"[初始化] 发现服务实例: %s → %s\\n\", instanceID, kv.Value)\n    }\n    d.mu.Unlock()\n\n    // 记录 List 时的 revision，从下一个 revision 开始 Watch\n    // 这样保证 List 完成后到 Watch 建立之间产生的事件不会被漏掉\n    currentRevision := resp.Header.Revision\n\n    // 第二步：从 currentRevision+1 开始 Watch，增量接收后续变化\n    watchChan := d.client.Watch(\n        ctx, prefix,\n        clientv3.WithPrefix(),\n        clientv3.WithRev(currentRevision+1),\n    )\n\n    go func() {\n        for resp := range watchChan {\n            if resp.Err() != nil {\n                log.Printf(\"Watch 出错: %v\", resp.Err())\n                // 生产代码：重新执行 Start() 做全量同步\n                return\n            }\n            for _, ev := range resp.Events {\n                instanceID := strings.TrimPrefix(string(ev.Kv.Key), prefix)\n                d.mu.Lock()\n                switch ev.Type {\n                case mvccpb.PUT:\n                    d.instances[instanceID] = string(ev.Kv.Value)\n                    fmt.Printf(\"[Watch] 服务实例上线/更新: %s → %s\\n\",\n                        instanceID, ev.Kv.Value)\n                case mvccpb.DELETE:\n                    delete(d.instances, instanceID)\n                    fmt.Printf(\"[Watch] 服务实例下线: %s\\n\", instanceID)\n                }\n                d.mu.Unlock()\n            }\n        }\n    }()\n\n    return nil\n}\n\nfunc (d *ServiceDiscovery) GetInstances() []string {\n    d.mu.RLock()\n    defer d.mu.RUnlock()\n    addrs := make([]string, 0, len(d.instances))\n    for _, addr := range d.instances {\n        addrs = append(addrs, addr)\n    }\n    return addrs\n}\n```\n\n## 体系化扩展：进阶特性、坑点与 Kubernetes 关联\n\n### Kubernetes 如何使用 etcd Watch\n\nKubernetes 的整个控制平面架构建立在 etcd Watch 之上。kube-apiserver 是唯一直接和 etcd 通信的组件，其他所有组件（controller-manager、scheduler、kubelet、kube-proxy）都通过 API Server 的 watch API 间接使用 etcd Watch。\n\nAPI Server 内部维护着一个叫 `watchCache` 的内存缓存，它通过一个单一的 etcd Watch 连接监听所有资源的变化，然后扇出（fan-out）给所有连接到 API Server 的客户端 Informer。这个设计的好处是：不管有多少个 controller 在 Watch Pod 资源，API Server 对 etcd 只维护一个 Watch 连接，极大减少了 etcd 的连接压力。\n\n### etcd Watch 与 ZooKeeper Watch 的关键区别\n\nZooKeeper 的 Watch 是一次性的（one-shot）：触发一次事件后，Watch 自动失效，客户端必须重新注册 Watch 才能继续监听。这在高频变更场景下是个严重的问题——在重新注册 Watch 和收到确认之间，可能会有事件漏掉。etcd 的 Watch 是持久的（persistent），一次注册，持续推送，直到客户端主动取消或连接断开，不存在「重注册窗口期漏事件」的问题。\n\n### 常见坑点\n\n**坑一：忘记消费 KeepAlive channel**。`KeepAlive` 返回一个 channel，如果不在 goroutine 中持续读取这个 channel，它会满，导致续约请求被 block，最终 Lease 过期服务意外下线。务必像上面的代码一样，启动一个 goroutine 消费这个 channel。\n\n**坑二：Watch channel 满导致事件丢失**。etcd 客户端内部给每个 Watch 维护了一个 buffer（默认大小是 128），如果你的 Watch handler 处理事件太慢，buffer 满了之后客户端会强制取消这个 Watch 并在日志中打印 `\"dropping watch events due to slow client\"`，然后触发重连和全量 re-sync。在事件高频的场景下，Watch handler 中不能做耗时操作，应该把事件投递到另一个 channel 由专门的 goroutine 处理。\n\n**坑三：prefix Watch 的 key 范围**。`/services/order/` 的前缀 Watch 也会匹配 `/services/order-v2/`，因为 etcd 的 WithPrefix 本质是范围查询：`[prefix, prefix 的字典序后继)`。如果你的服务名有共同前缀，建议在设计 key 结构时加上分隔符（末尾加 `/`），避免意外匹配。",
+      "keyPoints": [
+        "etcd 基于 Raft 算法保证强一致性，是 CP 系统；写操作必须经过 Leader 并被多数节点确认后才提交，这使它成为服务注册的可靠基石，而代价是在网络分区时可能短暂不可用。",
+        "MVCC 赋予了 etcd Watch 「断点续传」的能力：每次写操作不覆盖旧值而是追加新版本并分配全局单调递增的 revision，客户端断线重连时指定 WithRev(lastRevision+1) 即可从上次断点续接，不会漏掉任何事件。",
+        "Watch 底层是 gRPC server-side streaming 长连接，etcd 服务端在 key 变更时主动推送 WatchEvent，相比 HTTP 轮询延迟低（毫秒级 vs 秒级），且同一客户端的所有 Watch 复用一条 TCP 连接，通过 WatchID 区分，对服务端连接数压力极小。",
+        "Lease（租约）的过期机制是服务健康检测的核心：服务实例持有 Lease 并定期调用 KeepAlive 续租，服务崩溃后 KeepAlive 停止，Lease 自动过期，所有绑定的 key 被删除并触发 Watch DELETE 事件，整个过程无需第三方检测。",
+        "服务发现的正确初始化顺序是 List + Watch：先用 Get + WithPrefix 拿到全量服务列表（记录此时的 revision），再用 WithRev(revision+1) 建立 Watch，这样 List 完成到 Watch 建立之间产生的事件也不会遗漏。",
+        "KeepAlive 返回的 channel 必须被持续消费，否则 channel 满会导致续约阻塞，Lease 因续约失败而过期，服务意外下线；Watch channel 处理器中不能执行耗时操作，高频事件场景应异步投递避免 buffer 满触发 re-sync。",
+        "Kubernetes 的 API Server 通过单个 etcd Watch 连接监听所有资源变化，再通过 watchCache 扇出给所有 Informer，而非让每个 controller 直接 Watch etcd；etcd Watch 与 ZooKeeper Watch 的本质区别在于 etcd 的 Watch 是持久的，ZooKeeper 的 Watch 是一次性的。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-1",
+          "question": "etcd Watch 底层使用的是什么通信机制？",
+          "choices": [
+            { "id": "A", "text": "gRPC server-side streaming，客户端建立长连接后 etcd 主动推送变更事件" },
+            { "id": "B", "text": "HTTP 长轮询（long polling），客户端每次请求阻塞等待直到有变化才返回" },
+            { "id": "C", "text": "WebSocket 双向通信，客户端和 etcd 可以互相发送消息" },
+            { "id": "D", "text": "客户端每秒发送一次 HTTP GET 请求，检查 key 是否有变化" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd Watch 使用的是 gRPC 的 server-side streaming RPC，客户端发起一个 Watch 请求后，gRPC 流保持开放状态，etcd 服务端在 key 发生 PUT 或 DELETE 时主动向客户端推送 WatchEvent，不需要客户端反复请求。etcd 3.4+ 还支持同一个客户端的多个 Watch 复用同一条 gRPC 流，通过 WatchID 区分。B 的 HTTP 长轮询虽然也能实现类似效果，但延迟更高且 etcd 实际上不用这种方式。C 的 WebSocket 是 Web 场景的技术，etcd 的 gRPC 接口不使用 WebSocket。D 是最原始的轮询方式，etcd Watch 的设计目标之一就是消除这种低效轮询。"
+        },
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-2",
+          "question": "etcd 中的 revision 字段有什么作用？",
+          "choices": [
+            { "id": "A", "text": "表示 key 被修改的次数，每个 key 独立计数，从 1 开始" },
+            { "id": "B", "text": "全局单调递增的版本号，每次写操作产生新 revision，用于实现断点续传 Watch" },
+            { "id": "C", "text": "Raft 任期号（term），用于区分不同的 Leader 任期" },
+            { "id": "D", "text": "客户端连接的序列号，用于区分不同客户端的请求" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "etcd 的 revision 是整个集群范围内全局单调递增的版本号，每一次写操作（PUT 或 DELETE）都会使全局 revision 加一。MVCC 利用 revision 来保存 key 的历史版本：同一个 key 在不同时刻可以有多个版本，每个版本对应一个 revision。Watch 机制利用 revision 实现断点续传：客户端断线重连时指定 `WithRev(lastRevision+1)`，etcd 就能从 MVCC 历史中找出所有 revision 大于等于该值的事件，确保不漏事件。A 选项描述的是 `version` 字段而非 `revision`，`version` 是单个 key 的修改次数。C 和 D 都与 revision 无关。"
+        },
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-3",
+          "question": "使用 etcd Lease 实现服务注册时，如果服务进程突然崩溃（没有执行 Deregister），注册的 key 会怎样？",
+          "choices": [
+            { "id": "A", "text": "key 永远不会被删除，因为没有调用 Revoke，需要人工清理" },
+            { "id": "B", "text": "key 会在 Lease TTL 过期后被 etcd 自动删除，无需人工干预" },
+            { "id": "C", "text": "key 会立即被删除，etcd 通过 TCP 连接断开检测到服务崩溃" },
+            { "id": "D", "text": "key 会被标记为不可用状态，但不会被删除" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这正是 Lease 机制的核心价值所在。服务注册时，key 绑定到一个有 TTL 的 Lease（比如 10 秒），服务存活时 KeepAlive 不断续租使 Lease 保持有效。一旦服务崩溃，KeepAlive 停止，etcd 等待 TTL 倒计时归零后自动删除该 Lease 绑定的所有 key，并触发 Watch DELETE 事件通知所有服务发现客户端。整个过程完全自动，不需要人工干预，也不需要第三方的健康检查组件。A 是理解误区，Lease 有 TTL 会自动过期。C 不正确，etcd 不通过 TCP 连接断开来判断服务状态，而是通过 Lease TTL，这也意味着从崩溃到 key 被删除有最多一个 TTL 的延迟。"
+        },
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-4",
+          "question": "服务发现客户端初始化时，正确的「全量 List + Watch」操作顺序是什么？",
+          "choices": [
+            { "id": "A", "text": "先建立 Watch，再做全量 List，避免初始化期间的事件丢失" },
+            { "id": "B", "text": "先做全量 List 并记录返回的 revision，再用 WithRev(revision+1) 建立 Watch" },
+            { "id": "C", "text": "先做全量 List，再建立不带 revision 参数的 Watch（从当前最新开始）" },
+            { "id": "D", "text": "只需建立 Watch，Watch 会自动补全历史数据，不需要额外的全量 List" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确顺序是：Get + WithPrefix 全量拉取当前服务列表，同时记录响应头中的 revision（这代表 List 时刻的全局版本），然后用 clientv3.WithRev(revision+1) 建立 Watch。这样 Watch 会从 revision+1 开始接收事件，精确衔接 List 结束的时刻，不会漏掉 List 完成到 Watch 建立之间产生的任何变更。A 的顺序虽然也有人用，但如果先建 Watch 再做 List，List 过程中产生的事件可能会被重复处理，逻辑更复杂。C 的做法是错的：不指定 revision 的 Watch 从当前最新 revision 开始，如果 List 完成到建立 Watch 之间有服务上下线，这段事件就会漏掉，导致本地缓存不一致。D 也是错的，Watch 不会自动做历史回放。"
+        },
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-5",
+          "question": "etcd Watch 和 ZooKeeper Watch 最本质的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "etcd Watch 是持久的，ZooKeeper Watch 是一次性的（触发一次后需要重新注册）" },
+            { "id": "B", "text": "etcd Watch 基于 HTTP，ZooKeeper Watch 基于 TCP，两者协议不同" },
+            { "id": "C", "text": "etcd Watch 只能监听单个 key，ZooKeeper Watch 可以监听目录" },
+            { "id": "D", "text": "etcd Watch 有延迟，ZooKeeper Watch 是实时的" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 etcd Watch 相比 ZooKeeper Watch 最重要的架构优势。ZooKeeper 的 Watch 是一次性的（one-shot）：当 Watch 的节点发生变化后，ZooKeeper 推送一次通知，之后 Watch 自动失效，客户端必须立即重新注册 Watch。问题在于：「收到通知」和「重新注册成功」之间有一个时间窗口，如果这段时间内又发生了变更，就会漏掉。在高频变更场景下，这是一个严重的设计缺陷。etcd 的 Watch 一旦建立就持续有效，etcd 保证把 Watch 建立之后的所有事件都推送给客户端，不存在重注册窗口期漏事件的问题。B 不正确，两者都是基于 TCP 的协议。C 不正确，etcd Watch 通过 WithPrefix 可以监听整个前缀（类似目录）。D 也不正确，两者延迟都在毫秒级。"
+        },
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-6",
+          "question": "下面关于 KeepAlive 的用法，哪一段代码存在问题？",
+          "choices": [
+            { "id": "A", "text": "leaseResp, _ := cli.Grant(ctx, 10); keepAliveChan, _ := cli.KeepAlive(ctx, leaseResp.ID); go func() { for range keepAliveChan {} }()" },
+            { "id": "B", "text": "leaseResp, _ := cli.Grant(ctx, 10); keepAliveChan, _ := cli.KeepAlive(ctx, leaseResp.ID)（不消费 channel，直接忽略）" },
+            { "id": "C", "text": "leaseResp, _ := cli.Grant(ctx, 10); keepAliveChan, _ := cli.KeepAlive(ctx, leaseResp.ID); go func() { for resp := range keepAliveChan { if resp == nil { return } } }()" },
+            { "id": "D", "text": "leaseResp, _ := cli.Grant(ctx, 10); cli.Put(ctx, key, val, clientv3.WithLease(leaseResp.ID)); keepAliveChan, _ := cli.KeepAlive(ctx, leaseResp.ID); go func() { for range keepAliveChan {} }()" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 是有问题的写法。KeepAlive 返回一个 channel，etcd 客户端会定期（每 TTL/3 秒）通过这个 channel 推送续约响应。如果不消费这个 channel，它会在堆积 128 个元素后满，之后续约响应无法写入，导致 etcd 客户端内部的续约逻辑认为 channel 已无人消费，停止发送续约请求，最终 Lease 因为无法续约而过期，所有绑定的 key 被删除，服务意外下线。A 用 for range 消费并丢弃所有响应，这是简洁但正确的写法。C 更完整，额外处理了 channel 关闭（resp == nil）的情况。D 先注册再续约，这是正确的操作顺序。"
+        },
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-7",
+          "question": "etcd Watch 收到 ErrCompacted 错误意味着什么？应该如何处理？",
+          "choices": [
+            { "id": "A", "text": "etcd 集群发生了数据压缩，Watch 指定的起始 revision 已被清除，需要重新 List + Watch" },
+            { "id": "B", "text": "etcd 磁盘空间不足，需要立即扩容" },
+            { "id": "C", "text": "Watch 连接超时，重新建立 Watch 即可" },
+            { "id": "D", "text": "客户端网络断开，等待重连后 Watch 会自动恢复" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "ErrCompacted 错误发生的场景是：客户端请求从某个较旧的 revision 开始 Watch（比如 WithRev(50)），但 etcd 的自动压缩（compaction）已经清理了 revision 50 之前的历史版本，etcd 无法从那个 revision 回放事件，因此返回 ErrCompacted。正确的处理方式是：重新用 Get + WithPrefix 做全量 List，拿到最新的 revision 和完整的当前状态，然后从 List 返回的 revision+1 重新建立 Watch。这就是 Kubernetes Informer 的「re-list」逻辑。ErrCompacted 与磁盘空间、连接超时、网络断开都没有关系，它纯粹是因为 Watch 指定的历史 revision 已被清理。"
+        },
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-8",
+          "question": "在 Kubernetes 中，各个 controller（如 Deployment Controller）是如何监听 etcd 中 Pod 状态变化的？",
+          "choices": [
+            { "id": "A", "text": "每个 controller 独立直连 etcd，建立自己的 Watch 连接，互不影响" },
+            { "id": "B", "text": "通过 kube-apiserver 的 Informer/Watch 机制，API Server 内部通过 watchCache 扇出事件，etcd 只有一个 Watch 连接" },
+            { "id": "C", "text": "通过消息队列（如 Kafka）订阅 etcd 变更事件，API Server 把事件写入消息队列" },
+            { "id": "D", "text": "controller 每 5 秒轮询 API Server，获取最新的 Pod 状态差异" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kubernetes 的设计原则是「API Server 是唯一的 etcd 访问入口」。API Server 内部维护一个 watchCache，通过单一的 etcd Watch 连接监听某类资源（如 Pod）的所有变化，再把事件扇出（fan-out）给所有连接到 API Server 并注册了 Watch 的客户端。不管有多少个 controller 在 Watch Pod，对 etcd 来说只有一个 Watch 连接，这是 K8s 支撑大规模集群的关键优化。A 的方式会导致大量 etcd Watch 连接，随着 controller 数量增加线性增长，不可扩展。C 和 D 都不符合 K8s 的实际架构。"
+        },
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-9",
+          "question": "服务注册时，key 绑定 Lease 和不绑定 Lease 的最大区别是什么？",
+          "choices": [
+            { "id": "A", "text": "绑定 Lease 的 key 在 Lease 过期后会自动删除，不绑定的 key 永久存在直到显式删除" },
+            { "id": "B", "text": "绑定 Lease 的 key 写入速度更快，因为跳过了持久化步骤" },
+            { "id": "C", "text": "绑定 Lease 的 key 只能被创建 Lease 的客户端读取，其他客户端无法访问" },
+            { "id": "D", "text": "绑定 Lease 的 key 不会被计入 etcd 的 quota 限制" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Lease 的核心作用就是给 key 附加一个生命周期。绑定了 Lease 的 key 在 Lease 过期（TTL 归零且 KeepAlive 停止）后会被 etcd 自动删除，并触发 Watch DELETE 事件。不绑定 Lease 的 key 则永久存在，直到客户端显式调用 Delete 删除为止。这个机制对服务注册至关重要：服务崩溃时没有机会调用 Delete，依靠 Lease TTL 来实现自动清理。B 不正确，Lease 不影响写入的持久化流程，etcd 的每次写都会走 WAL fsync。C 不正确，Lease 没有访问控制的语义，所有客户端都可以读取绑定了 Lease 的 key。D 不正确，绑定 Lease 的 key 同样计入 quota。"
+        },
+        {
+          "id": "ds-etcd-watch-concept-q1-quiz-10",
+          "question": "以下哪种场景下，etcd Watch 加前缀（WithPrefix）可能会意外匹配到不期望的 key？",
+          "choices": [
+            { "id": "A", "text": "Watch 前缀 /services/order 时，也会匹配到 /services/order-v2/instance-1" },
+            { "id": "B", "text": "Watch 前缀 /services/order/ 时，也会匹配到 /services/ 下的所有 key" },
+            { "id": "C", "text": "Watch 前缀 /services/order/ 时，不会匹配到以 /services/order/ 开头的任何 key" },
+            { "id": "D", "text": "Watch 前缀 /services/order/ 时，也会匹配到前缀为 /services/ 的 key" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd 的 WithPrefix 在底层实现为范围查询：[prefix, prefix的字典序后继)。对于前缀 /services/order，其字典序后继是 /services/orders（最后一个字符 ASCII 码加一，'r' 变成 's'）。这意味着 /services/order-v2/instance-1 也在这个范围内，因为字母 '-'（ASCII 45）小于 '/'（ASCII 47）……实际上更准确的说法是：/services/order-v2 确实在 /services/order 和 /services/orders 之间，会被匹配到。解决方法是在服务名后面加 /，Watch /services/order/ 而非 /services/order，这样前缀更精确，不会误匹配到 /services/order-v2/ 等相邻服务。B 和 D 的描述方向是反的，Watch 子前缀不会匹配到父前缀下的所有 key。C 是完全错误的。"
+        }
+      ],
+      "references": [
+        "https://etcd.io/docs/v3.5/learning/api/#watch-api",
+        "https://etcd.io/docs/v3.5/learning/data_model/",
+        "https://etcd.io/docs/v3.5/dev-guide/interacting_v3/",
+        "https://kubernetes.io/docs/concepts/architecture/controller/",
+        "https://github.com/etcd-io/etcd/tree/main/client/v3"
+      ]
+    }
+  ]
+}
