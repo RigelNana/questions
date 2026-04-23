@@ -1,0 +1,158 @@
+{
+  "id": "ds-raft-membership",
+  "name": "Raft 集群成员动态变更",
+  "domain": "distributed-system",
+  "description": "解析 Raft 单步成员变更与 Joint Consensus 方法，以及 etcd 生产中的操作实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-raft-membership-q1",
+      "domain": "distributed-system",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["Raft", "成员变更", "Joint Consensus", "etcd", "动态扩容"],
+      "title": "Raft 集群成员变更（动态扩缩容）是如何实现的？",
+      "content": "你负责维护一套基于 etcd 3.5 的分布式配置中心，当前是 3 节点部署（node1/node2/node3）。业务增长后，架构师要求把集群扩容到 5 节点以提升吞吐量；与此同时，有一台老节点硬件老化需要下线替换。\n\n在操作之前，你的同事提出了一个疑问：「直接在 etcd 配置里加上两个新节点地址，然后重启不就行了？」你知道这样做非常危险，但一时说不清楚为什么。\n\n你需要解释清楚以下问题：\n\n1. Raft 集群成员变更为什么不能直接切换配置？有什么具体的危险场景？\n2. Raft 论文中提出了哪两种安全的成员变更方案？各自的原理是什么？\n3. etcd 实际使用的是哪种方案？如何用 `etcdctl` 命令安全地完成扩容和缩容操作？",
+      "answer": "## Raft 是什么，它为什么需要「成员变更」这个特殊机制\n\nRaft 是 Diego Ongaro 和 John Ousterhout 在 2014 年 USENIX ATC 上发表的一致性算法，其核心目标是「可理解性」——相比 Paxos 更容易实现、更容易推导正确性。Raft 把分布式一致性问题拆成三个相对独立的子问题：Leader 选举、日志复制、以及成员变更（membership change）。前两个子问题的解法在入门阶段就能说清楚，但成员变更是 Raft 论文中最容易被忽略、也是最容易出 Bug 的部分。\n\nRaft 集群的成员列表（也叫「配置」，configuration）决定了谁有资格参与选举、谁的日志确认算数。3 节点集群的多数派（Quorum）是 2，5 节点集群的多数派是 3。这套算术在集群成员稳定的时候工作得很好，但一旦集群成员数量发生变化，就会出现一段「新旧配置并存」的危险窗口——如果处理不当，这个窗口期可能导致同一个 term 内选出两个 Leader，从而破坏 Raft 最核心的安全性保证：任意 term 内最多只有一个 Leader。\n\n在深入讲成员变更之前，先快速建立对 Raft 基本运作的认知。Raft 集群中有且仅有一个 Leader，其余节点是 Follower。Leader 负责接受客户端写入，把日志条目（log entry）复制到多数派节点，然后提交（commit）。「提交」意味着这条日志已经被多数派持久化，即使少数节点挂掉也不会丢失。每次选举都有一个单调递增的任期号（term），用来区分旧 Leader 的过期消息。Leader 通过周期性发送心跳（AppendEntries RPC 的空消息）来维持自己的权威，Follower 如果超过随机的 election timeout 没有收到心跳，就会发起新一轮选举。\n\n## 为什么直接切换配置会导致「双 Leader」\n\n现在来回答你同事的问题。假设当前是 3 节点集群（node1、node2、node3），你想扩容到 5 节点（再加上 node4、node5）。所谓「直接切换配置」，就是在某个时间点让所有节点同时把配置文件从 C_old（3 节点）换成 C_new（5 节点）。\n\n听起来很合理，但问题在于「同时」在分布式系统中是不存在的。网络延迟、节点处理速度各不相同，不同节点切换到新配置的时间必然有先后之差。在某个短暂的窗口期内，node1 和 node2 还在用旧配置（3 节点，多数派=2），而 node3、node4、node5 已经在用新配置（5 节点，多数派=3）。\n\n这时候如果发生网络分区，把集群分成两组：{node1, node2} 和 {node3, node4, node5}。左边的 node1、node2 用旧配置，它们两个节点就构成了 3 节点集群的多数派，可以选出一个 Leader（比如 node1）。右边的 node3、node4、node5 用新配置，三个节点也构成了 5 节点集群的多数派，可以选出另一个 Leader（比如 node3）。同一个 term 内出现了两个 Leader，两个 Leader 都能提交日志，就发生了「脑裂」（split-brain），数据从此分叉，一致性彻底破坏。\n\n这不是小概率事件。只要你在切换配置的过程中没有做任何同步保证，这个窗口期就必然存在，哪怕只有几毫秒。\n\n## 方案一：Joint Consensus（联合共识）\n\nRaft 论文（Extended version，§6）提出的第一个方案叫 Joint Consensus，联合共识。它的核心思想是：在 C_old 和 C_new 之间插入一个过渡状态 C_old,new，在这个过渡状态下，任何决策——无论是 Leader 选举还是日志提交——都必须同时获得旧配置的多数派和新配置的多数派的认可。\n\n具体流程是这样的。当 Leader 收到成员变更请求时，它不是直接切换到 C_new，而是先把「C_old,new 联合配置」作为一条普通日志条目写入日志并复制给所有节点（包括新节点）。一旦这条日志被提交（即被旧配置的多数派 + 新配置的多数派都确认），集群就进入了联合共识状态。在联合共识状态下，所有决策需要双重多数派（C_old 的多数 ∩ C_new 的多数），这样就保证了不管是按旧配置算还是按新配置算，任何两个多数派之间都有交集，不可能同时选出两个 Leader。\n\n随后，Leader 再把 C_new 作为一条日志条目写入并提交。一旦 C_new 被提交，集群完成过渡，不再需要旧配置的认可，成员变更完成。在整个过程中，集群始终是可用的，不存在任何短暂的「双多数派」窗口。\n\nJoint Consensus 理论上非常严谨，可以一次性增加或删除多个节点，也可以同时增减节点（比如替换一台机器的同时扩容）。但它的缺点也很明显：实现复杂，需要维护三种配置状态（C_old、C_old,new、C_new），处理每种状态下的选举和提交逻辑，还要处理 Leader 在联合共识期间崩溃的情况，代码路径大幅增加，容易引入新的 Bug。\n\n## 方案二：单步成员变更（One-at-a-time），etcd 的实际选择\n\nDiego Ongaro 在其博士论文（§4.2）中提出了一个更简洁的替代方案：每次只增加或删除一个节点，利用数学性质来保证安全性，避免了 Joint Consensus 的复杂状态机。\n\n这个数学性质是：如果两个配置只相差一个节点，那么这两个配置的多数派必然有非空交集。以 3 节点扩到 4 节点为例，旧配置多数派是 2，新配置多数派是 3，2+3=5 > 4，鸽巢原理保证两个多数派至少有 1 个节点重叠。同理，4 节点扩到 5 节点，旧多数派 3，新多数派 3，3+3=6 > 5，重叠至少 1 个节点。这个交集保证了：旧配置的多数派里必然包含至少一个知晓新配置的节点，新配置的 Leader 候选人必须得到这个节点的投票，从而不可能在不知情的情况下绕过旧 Leader 独立选举。\n\n单步成员变更的流程非常简洁：Leader 把新配置（C_new）作为一条日志条目写入并提交，就像提交普通业务日志一样。关键规则有两条：第一，节点收到包含新配置的日志条目后，立即应用新配置，不需要等到提交（这是为了让新节点尽快加入选举）；第二，必须等上一次成员变更完全提交之后，才能发起下一次变更。这第二条规则是安全性的关键——如果你允许并发的成员变更，就可能重新引入「双多数派」问题。\n\netcd 采用的正是单步成员变更方案。在 etcd 的实现中，成员变更通过 `etcdctl member` 子命令完成，底层走的是 Raft 的 ConfChange RPC。操作 3 节点扩容到 5 节点的正确流程如下：\n\n```bash\n# 第一步：确认集群当前健康状态，确保有 Leader 且所有成员在线\netcdctl --endpoints=http://node1:2379 endpoint health\n# 预期输出（三个节点都要是 healthy）：\n# http://node1:2379 is healthy: successfully committed proposal: took = 1.23ms\n# http://node2:2379 is healthy: successfully committed proposal: took = 1.87ms\n# http://node3:2379 is healthy: successfully committed proposal: took = 2.01ms\n\n# 第二步：查看当前成员列表，记录每个成员的 ID\netcdctl --endpoints=http://node1:2379 member list\n# 输出示例：\n# 8e9e05c52164694d, started, node1, http://node1:2380, http://node1:2379, false\n# 91bc3c398fb3c146, started, node2, http://node2:2380, http://node2:2379, false\n# fd422379fda50e48, started, node3, http://node3:2380, http://node3:2379, false\n\n# 第三步：添加第一个新成员（注意：先添加，再启动新节点，顺序不能反！）\netcdctl --endpoints=http://node1:2379 member add node4 --peer-urls=http://node4:2380\n# 输出示例：\n# Member  2a60e6e8e39b8a2d added to cluster  cdf818194e3a8c32\n# ETCD_NAME=\"node4\"\n# ETCD_INITIAL_CLUSTER=\"node1=http://node1:2380,node2=http://node2:2380,node3=http://node3:2380,node4=http://node4:2380\"\n# ETCD_INITIAL_CLUSTER_STATE=\"existing\"\n\n# 第四步：用上面输出的参数启动 node4，特别注意 ETCD_INITIAL_CLUSTER_STATE=existing\n# 不要用 new，否则 node4 会尝试自己组建新集群！\n\n# 第五步：等待 node4 追上日志（watch endpoint status 直到 db size 趋于一致）\netcdctl --endpoints=http://node4:2379 endpoint status --write-out=table\n\n# 第六步：再添加 node5（必须等 node4 的变更完全提交后再做）\netcdctl --endpoints=http://node1:2379 member add node5 --peer-urls=http://node5:2380\n\n# 移除一个故障/退役节点\netcdctl --endpoints=http://node1:2379 member remove fd422379fda50e48\n# 注意：要用 member list 查到的 ID，不是节点名！\n```\n\n有一个非常容易踩的坑：添加新成员的时候，必须先执行 `member add` 命令（让 Leader 把 ConfChange 写入 Raft 日志并提交），然后再启动新节点进程。如果顺序反了，先启动了 node4 的 etcd 进程，它会因为找不到初始集群配置而挂在 bootstrap 阶段，或者更糟的是在某些旧版本中会独立组建一个单节点集群。\n\n## Learner 角色：etcd v3.4 引入的优雅缓冲层\n\n即使用了单步成员变更，还有一个生产中的实际问题：新节点加入时，它的日志是空的，需要从头追 Leader 的所有日志。如果集群的数据量很大（比如 etcd 存了几个 GB 的 Kubernetes 状态），追日志可能需要几十秒到几分钟。在这段时间里，新节点虽然已经是「正式成员」（Voter），但它随时可能触发选举（因为 Follower 超时），而它根本还没准备好，这会给集群带来不必要的选举抖动，影响正在服务的写入。\n\netcd v3.4 引入了 Learner 角色（也叫 non-voting member）来解决这个问题。Learner 会接收 Leader 发来的日志复制，但它的确认不计入 Quorum，也不参与 Leader 选举。等 Learner 追上 Leader 的进度（通常以日志 index 差距小于某个阈值为标准），再通过 `member promote` 命令把它提升为正式 Voter。整个过程中，集群的 Quorum 大小没有变化，写入服务完全不受影响。\n\n```bash\n# 添加 Learner（非投票成员）\netcdctl --endpoints=http://node1:2379 member add node4 \\\n  --peer-urls=http://node4:2380 \\\n  --learner\n\n# 查看 Learner 的追赶进度（isLearner 字段为 true）\netcdctl --endpoints=http://node1:2379 member list --write-out=table\n\n# 等 node4 追上后，提升为正式 Voter\netcdctl --endpoints=http://node1:2379 member promote <node4-member-id>\n```\n\n在 etcd v3.4 之前，生产中扩容时推荐的做法是在业务低峰期操作，然后监控 `etcd_server_proposals_pending`（待提交提案数）指标，确保新节点追上之后再操作第二个节点。v3.4 之后，强烈建议先以 Learner 模式加入，这是目前最安全的扩容实践。\n\n## 生产操作的完整 Checklist\n\n在生产环境做 etcd 成员变更，有几条铁律不能违背。第一，操作前必须备份 etcd 数据快照：`etcdctl snapshot save backup.db`，一旦操作失误，恢复的时间窗口很短。第二，操作前用 `endpoint health` 和 `endpoint status` 确认集群当前是健康的——如果集群已经只有 2/3 节点在线（处于 degraded 状态），此时再做成员变更就更危险了。第三，每次成员变更之间要有观察时间，不要连续快速地执行多次 `member add`，给集群时间消化。第四，缩容时，绝对不能把 3 节点缩到 1 节点，要一步一步来（3→2 本身也有风险，因为 2 节点集群没有容错能力），缩容的顺序是先从集群中移除成员，再关闭该节点进程。\n\n还有一个常见的故障场景值得特别提醒：添加新成员后，新节点持续追不上 Leader 的日志，导致 Leader 不断往 Follower 的日志队列里塞数据，内存压力上升，最终所有写入变慢。这通常有两个原因：一是网络带宽不足（跨机房场景尤其常见），二是新节点的磁盘 IO 性能太差，写 WAL 跟不上。排查时先看 `etcd_server_slow_apply_total` 和 `etcd_disk_wal_fsync_duration_seconds` 这两个 Prometheus 指标，前者反映状态机应用慢，后者反映磁盘写慢。\n\n## 面试中如何展示深度\n\n当面试官问到 Raft 成员变更时，大多数候选人能说出「单步变更」和「Joint Consensus」两个名词就算不错了。真正让面试官眼前一亮的回答，是能说清楚「为什么直接切换配置会导致双多数派」（这需要你真的理解 Quorum 计算），以及「单步变更的数学直觉是什么」（两个只差 1 节点的配置，多数派必然有交集）。再往上一层，能提到 etcd Learner 角色解决了什么实际问题，并给出生产操作的 Checklist，这说明你不只是读过论文，还真的操作过。",
+      "keyPoints": [
+        "直接切换配置的危险在于：网络分区窗口期内，旧配置的多数派和新配置的多数派可能互不重叠，从而在同一 term 内选出两个 Leader，彻底破坏 Raft 的安全性保证",
+        "Joint Consensus 通过引入 C_old,new 联合配置过渡状态，要求所有决策同时获得旧多数派和新多数派的双重认可，理论严谨但实现复杂，需要维护三种配置状态",
+        "单步成员变更（One-at-a-time）利用数学性质：任意两个只相差 1 个节点的配置，其多数派必然有非空交集（鸽巢原理），因此每次只增减一个节点就能保证安全性",
+        "单步变更的关键约束：必须等上一次成员变更的 ConfChange 日志完全提交后，才能发起下一次变更，否则会重新引入并发配置导致的双多数派问题",
+        "etcd 使用单步成员变更方案，添加新成员时必须先执行 `etcdctl member add` 让 Leader 提交 ConfChange，再启动新节点进程，顺序反了会导致新节点启动失败或意外自组集群",
+        "etcd v3.4 引入 Learner（非投票成员）角色：新节点先以 Learner 身份追日志，不参与 Quorum 计算和 Leader 选举，追上后再用 `member promote` 提升为 Voter，避免新节点未就绪时触发不必要的选举",
+        "生产操作铁律：变更前备份快照（`etcdctl snapshot save`）、确认集群健康状态、每次变更后充分观察再做下一步、缩容时先从集群移除成员再关闭进程",
+        "新节点追不上 Leader 日志是常见故障，根因通常是网络带宽不足或磁盘 IO 瓶颈，排查指标：`etcd_server_slow_apply_total` 和 `etcd_disk_wal_fsync_duration_seconds`"
+      ],
+      "quiz": [
+        {
+          "id": "ds-raft-membership-q1-quiz1",
+          "question": "Raft 集群直接切换成员配置（不做任何安全保证）会导致什么核心问题？",
+          "choices": [
+            { "id": "A", "text": "在新旧配置切换的窗口期内，可能存在两个独立的多数派，从而在同一 term 内选出两个 Leader，破坏一致性" },
+            { "id": "B", "text": "新节点没有历史日志，直接加入会导致日志校验失败，集群拒绝新节点的加入" },
+            { "id": "C", "text": "切换配置会触发全量 Leader 选举，导致集群在选举期间完全不可用" },
+            { "id": "D", "text": "旧节点会拒绝接受新配置，因为配置版本号不匹配，导致写入超时" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "核心问题是「双多数派」（split quorum）。以 3→5 节点为例，切换窗口期内，还持有旧配置的 node1、node2 认为多数派是 2，可以自己选出 Leader；同时持有新配置的 node3/node4/node5 认为多数派是 3，也可以自己选出 Leader。两组节点互不交叉，可能在同一 term 内各自选出一个 Leader，形成脑裂，两个 Leader 都能提交日志，数据从此不一致。选项 B、C、D 描述的问题在现实中不会直接发生，日志追赶是正常流程，选举本身不会让集群完全不可用，旧节点也没有拒绝新配置的内置机制。"
+        },
+        {
+          "id": "ds-raft-membership-q1-quiz2",
+          "question": "关于 Joint Consensus（联合共识）的描述，哪一项是正确的？",
+          "choices": [
+            { "id": "A", "text": "联合共识要求所有决策必须同时获得 C_old 的多数派和 C_new 的多数派的认可，通过 C_old,new 过渡配置实现" },
+            { "id": "B", "text": "联合共识允许一次性完成多个节点的增删，但要求停止所有写入直到变更完成" },
+            { "id": "C", "text": "联合共识是 etcd 的默认成员变更实现，因为它比单步变更更简单" },
+            { "id": "D", "text": "联合共识中，C_old,new 阶段的 Leader 选举只需要满足 C_new 的多数派即可" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Joint Consensus 的核心是引入 C_old,new 联合配置作为过渡状态。在这个状态下，无论是 Leader 选举还是日志提交，都需要同时满足两个条件：获得旧配置 C_old 的多数派认可，以及获得新配置 C_new 的多数派认可。这种双重多数派要求保证了两个多数派之间必然有交集，从而排除了双 Leader 的可能性。选项 B 错误，联合共识期间集群不需要停写；选项 C 错误，etcd 实际使用单步变更而非 Joint Consensus；选项 D 错误，C_old,new 阶段需要双重多数派，只满足 C_new 是不够的。"
+        },
+        {
+          "id": "ds-raft-membership-q1-quiz3",
+          "question": "单步成员变更（One-at-a-time）安全性的数学基础是什么？",
+          "choices": [
+            { "id": "A", "text": "两个相差一个节点的配置，其多数派必然有非空交集，保证不可能选出两个独立的 Leader" },
+            { "id": "B", "text": "每次只变更一个节点，集群规模小，选举收敛更快，降低双 Leader 概率到可接受范围" },
+            { "id": "C", "text": "Leader 在提交新配置前会锁定整个集群，阻止任何其他节点发起选举" },
+            { "id": "D", "text": "单步变更要求所有节点同时原子切换配置，避免了不一致窗口" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "单步变更的安全性来自鸽巢原理：设旧配置节点数为 n，新配置为 n+1（添加一个节点），旧多数派大小为 ⌊n/2⌋+1，新多数派大小为 ⌊(n+1)/2⌋+1。两者之和大于 n+1，因此在 n+1 个节点中，任意两个多数派集合必然有至少 1 个共同节点，不可能各自独立地完成选举。删除节点时同理。选项 B 错误，安全性不是概率降低，而是数学上保证不可能；选项 C 错误，Raft 没有全局锁机制；选项 D 错误，「同时原子切换」在分布式系统中不可实现，这正是问题的根源。"
+        },
+        {
+          "id": "ds-raft-membership-q1-quiz4",
+          "question": "在 etcd 中用 `etcdctl member add` 添加新成员时，正确的操作顺序是？",
+          "choices": [
+            { "id": "A", "text": "先执行 `member add` 命令（让 Leader 提交 ConfChange），再用输出的参数启动新节点的 etcd 进程" },
+            { "id": "B", "text": "先启动新节点的 etcd 进程（用 ETCD_INITIAL_CLUSTER_STATE=new），再执行 `member add` 命令" },
+            { "id": "C", "text": "先执行 `member add`，再同时重启所有现有节点，然后启动新节点" },
+            { "id": "D", "text": "顺序不影响结果，etcd 会自动协调新节点的加入流程" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确顺序必须是先 `member add`，再启动新节点。原因是 `member add` 会在 Raft 集群中提交一条 ConfChange 日志条目，让所有现有成员知道有新成员即将加入。如果先启动新节点进程，它会因为找不到集群 bootstrap 信息而启动失败，或者在某些情况下以 ETCD_INITIAL_CLUSTER_STATE=new 启动时尝试独立组建单节点集群，这是非常危险的操作，可能导致数据分叉。`member add` 输出的环境变量（ETCD_INITIAL_CLUSTER、ETCD_INITIAL_CLUSTER_STATE=existing）必须原封不动地用于启动新节点。"
+        },
+        {
+          "id": "ds-raft-membership-q1-quiz5",
+          "question": "以下是 etcd 的一段操作日志片段。在 3 节点集群中执行 `member add node4` 后立即执行 `member add node5`，没有等待间隔，可能导致什么问题？",
+          "choices": [
+            { "id": "A", "text": "两次 ConfChange 可能并发提交，违反单步变更「上一次变更完全提交后才能发起下一次」的约束，引入安全风险" },
+            { "id": "B", "text": "etcd 会自动序列化两次变更请求，虽然慢一点，但最终结果是正确的" },
+            { "id": "C", "text": "第二次 `member add` 会立即报错失败，etcd 有内置保护机制阻止并发配置变更" },
+            { "id": "D", "text": "没有任何问题，单步变更只是建议，不是强制约束" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "单步变更的安全约束要求：必须等上一次 ConfChange 日志完全提交（被集群多数派持久化）之后，才能发起下一次变更。如果连续快速执行两次 `member add`，第一次变更还没提交，集群就已经在处理第二次变更，相当于同时存在两个未提交的配置变更，可能回退到「多个配置并存」的危险状态。实践中，etcd 客户端默认会做序列化，但在不同客户端并发操作、或使用底层 API 时这个问题真实存在。即使 etcd 有部分保护，也不应该依赖它，应当操作后观察确认再继续。"
+        },
+        {
+          "id": "ds-raft-membership-q1-quiz6",
+          "question": "etcd v3.4 引入的 Learner 角色（non-voting member）主要解决什么问题？",
+          "choices": [
+            { "id": "A", "text": "新节点追日志期间不参与 Quorum 计算和 Leader 选举，避免未就绪的节点因超时触发不必要的重新选举" },
+            { "id": "B", "text": "Learner 节点可以单独服务读请求，分担 Leader 的读压力，提升集群读吞吐量" },
+            { "id": "C", "text": "Learner 是跨机房部署的只读副本，用于数据备份和灾难恢复，不参与正常集群操作" },
+            { "id": "D", "text": "Learner 节点在 Leader 故障时可以立即顶替成为新 Leader，缩短选举时间" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Learner 解决的核心问题是「新节点未就绪但已计入 Quorum」的矛盾。在没有 Learner 之前，新节点一旦通过 `member add` 加入就成为正式 Voter，它的 election timeout 开始计时，如果它还没追完日志就超时了，会发起 RequestVote，触发不必要的选举，影响正在服务的写入。Learner 通过分离「接收日志」和「参与选举」两个职责来优雅解决这个问题——新节点先做 Learner，追完日志再 promote。选项 B 是常见误解，etcd Learner 默认不服务客户端读请求；选项 C 和 D 描述的能力 Learner 都不具备。"
+        },
+        {
+          "id": "ds-raft-membership-q1-quiz7",
+          "question": "Joint Consensus 和单步成员变更相比，Joint Consensus 的主要优势是什么？",
+          "choices": [
+            { "id": "A", "text": "可以一次性安全地增删多个节点，不需要逐个操作，适合大规模集群重组" },
+            { "id": "B", "text": "实现更简单，代码路径更少，不容易引入 Bug" },
+            { "id": "C", "text": "变更过程中集群写入延迟更低，因为不需要等待两次日志提交" },
+            { "id": "D", "text": "不需要引入中间过渡状态，配置切换更直接" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Joint Consensus 的核心优势是支持批量成员变更——可以一次操作同时增加和删除多个节点，比如将 {A, B, C} 替换为 {D, E, F}，这在单步变更中需要多次操作，且顺序很关键。在需要整体替换机器或跨机房迁移的场景下，Joint Consensus 更具优势。选项 B 恰恰相反，Joint Consensus 的实现远比单步变更复杂，需要维护 C_old、C_old,new、C_new 三种状态及其各自的选举和提交逻辑，Diego Ongaro 在其博士论文中明确指出正是因为 Joint Consensus 的实现复杂性，才提出了单步变更作为更简洁的替代方案。"
+        },
+        {
+          "id": "ds-raft-membership-q1-quiz8",
+          "question": "生产环境中需要把 5 节点 etcd 集群中的一台故障节点（node3）下线，下列操作步骤哪个是正确的？",
+          "choices": [
+            { "id": "A", "text": "先用 `member list` 获取 node3 的 member ID，执行 `member remove <id>`，然后再关闭 node3 的进程" },
+            { "id": "B", "text": "先关闭 node3 的 etcd 进程，再执行 `member remove`，这样更安全，避免成员列表和实际进程不一致" },
+            { "id": "C", "text": "直接关闭 node3 进程即可，etcd 会自动检测到节点失联并从成员列表中移除" },
+            { "id": "D", "text": "先备份 node3 的数据目录，然后修改所有节点的配置文件删除 node3，再重启整个集群" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确顺序是先从集群成员列表中移除（`member remove`），再关闭进程。这样 Leader 会先提交 ConfChange，通知集群忽略 node3 的投票和心跳，Quorum 计算中也不再包含 node3，之后关闭 node3 进程不会引发任何选举或一致性问题。如果先关闭进程再 remove（选项 B），集群会立即进入「一个节点失联」的 degraded 状态，5 节点集群需要 3 个节点才能提交日志，只剩 4 个活跃节点还能工作，但此时操作 `member remove` 是在降级状态下操作，风险更高。选项 C 完全错误，etcd 不会自动移除成员。选项 D 是绝对不推荐的手动修改配置方式，会导致集群状态不一致。"
+        },
+        {
+          "id": "ds-raft-membership-q1-quiz9",
+          "question": "在 etcd 集群成员变更中，ConfChange 日志条目和普通业务日志条目在提交机制上有什么不同？",
+          "choices": [
+            { "id": "A", "text": "节点收到含 ConfChange 的日志条目后立即应用新配置（不等提交），而普通日志条目必须等提交后才对状态机生效" },
+            { "id": "B", "text": "ConfChange 日志需要全部节点（而非多数派）确认后才能提交，确保所有节点都有最新配置" },
+            { "id": "C", "text": "ConfChange 日志提交后会触发全量快照，确保新节点可以从快照而非从头回放日志加入" },
+            { "id": "D", "text": "ConfChange 和普通日志完全相同，都需要等多数派确认后提交，没有任何差异" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Raft 成员变更实现中一个重要的微妙之处。论文（和 etcd 的实现）规定：节点收到包含新配置的 ConfChange 日志条目后，立即应用新配置，无需等到该条目被提交。这样做的原因是：如果等到提交再应用，新节点就不能参与提交过程本身（因为它还用旧配置），会造成死锁。这个「立即应用」的特性和普通日志不同，普通日志必须等到提交（commit）之后才能应用到状态机。当然，这个「立即应用」需要和单步变更的顺序约束配合使用，才能保证安全。选项 B 要求全节点确认，这会导致集群在任何节点挂掉时都无法完成变更，不可取。"
+        },
+        {
+          "id": "ds-raft-membership-q1-quiz10",
+          "question": "添加新 etcd 成员后，发现新节点一直追不上 Leader 的日志，集群写入延迟明显升高，最可能的原因和排查方向是？",
+          "choices": [
+            { "id": "A", "text": "新节点的磁盘 IO 或网络带宽存在瓶颈，导致写 WAL 或接收日志跟不上 Leader；排查 `etcd_disk_wal_fsync_duration_seconds` 和网络带宽指标" },
+            { "id": "B", "text": "新节点的 etcd 版本和现有节点不一致，版本兼容性问题导致日志格式无法解析" },
+            { "id": "C", "text": "集群 Leader 的日志压缩（compaction）过于频繁，导致新节点需要的旧日志被删除，只能通过快照同步" },
+            { "id": "D", "text": "新节点的时钟偏差（clock skew）超过了 etcd 的容忍范围，导致 heartbeat 超时被频繁触发" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "新节点追不上日志最常见的根因是 IO 或网络瓶颈。etcd WAL 写入是同步 fsync 的，如果新节点使用机械硬盘（HDD）而现有节点是 SSD，或者跨机房网络带宽不足（etcd 推荐节点间带宽至少 1Gbps），新节点处理日志的速度会持续慢于 Leader 的写入速度，追赶永远追不上，同时 Leader 要维护越来越大的日志队列内存缓冲，影响整体写入延迟。排查时先看 `etcd_disk_wal_fsync_duration_seconds_p99`（正常应小于 10ms），再看 `etcd_server_proposals_committed_total` 和 `etcd_server_proposals_applied_total` 的差值（applied 持续远小于 committed 说明追不上）。选项 C 描述的「快照同步」实际上是 etcd 内置的 catch-up 机制，不是问题而是解决方案，但极端情况下频繁 compaction 确实可能减慢追赶速度，不过不是最常见根因。"
+        }
+      ],
+      "references": [
+        "https://raft.github.io/raft.pdf",
+        "https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf",
+        "https://etcd.io/docs/v3.5/op-guide/runtime-configuration/",
+        "https://etcd.io/docs/v3.5/learning/learner/",
+        "https://etcd.io/docs/v3.5/op-guide/clustering/"
+      ]
+    }
+  ]
+}

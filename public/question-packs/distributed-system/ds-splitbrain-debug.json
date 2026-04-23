@@ -1,0 +1,279 @@
+{
+  "id": "ds-splitbrain-debug",
+  "name": "etcd 脑裂故障排查与恢复",
+  "domain": "distributed-system",
+  "description": "专家级排查 etcd 集群脑裂场景：识别症状、定位根因、执行恢复步骤",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-splitbrain-debug-q1",
+      "domain": "distributed-system",
+      "type": "debugging",
+      "difficulty": 4,
+      "tags": ["脑裂", "split-brain", "etcd", "Raft", "故障恢复", "网络分区", "Kubernetes", "分布式系统"],
+      "title": "etcd 集群出现脑裂（split-brain），如何排查和恢复？",
+      "content": "## 故障背景\n\n你的团队维护一套生产 Kubernetes 集群，底层 etcd 采用三节点部署（node1、node2、node3），平时运行稳定。某天下午网络团队做了一次交换机 VLAN 策略调整，变更窗口结束后约 5 分钟，值班同学收到告警：K8s API Server 开始批量报错，`kubectl get pods` 也开始卡住。\n\n**告警日志（API Server 端）：**\n\n```\nE0715 14:23:11.482301 1 store.go:338] unable to sync watch cache: etcdserver: request timed out\nE0715 14:23:14.901233 1 cacher.go:420] cacher (*core.Pod): unexpected watch close - watch is legit failed\nW0715 14:23:18.320441 1 reflector.go:535] k8s.io/apiserver/pkg/storage/caches: watch of *v1.Pod ended with: very short watch: 1.234567ms\n```\n\n**监控异常（Prometheus 告警触发）：**\n\n```\nALERT etcd_high_leader_changes\nexpr: increase(etcd_server_leader_changes_seen_total[5m]) > 3\nvalue: 14\n```\n\n也就是说，在过去 5 分钟里，集群的 Leader 已经换了 14 次。你登上 node1 和 node2，发现两台机器的 etcd 进程都在疯狂打印选举相关日志，并且两个节点的 `endpoint status` 都声称自己是 Leader，但集群就是无法提交任何写入。\n\n**问题：**\n\n1. 这个现象是「真脑裂」还是「伪脑裂」？两者有什么根本区别？\n2. 给出完整的排查命令序列，定位根因。\n3. 针对不同的根因（网络分区 vs 节点异常 vs 时钟偏差），给出对应的恢复操作步骤。",
+      "answer": "## 第一步：理解 etcd 与 Raft——脑裂为什么会（以及不会）发生\n\netcd 是 Kubernetes 的「大脑」，集群的所有状态——Pod、Service、ConfigMap、Secret——全部持久化在 etcd 里。etcd 从 v3 起底层基于 Raft 共识算法，这个算法的核心承诺是：在任意时刻，整个集群只能有一个合法的 Leader，并且只有 Leader 被多数节点（即「法定人数」Quorum）确认后，一条写入才算成功提交。对于三节点 etcd，Quorum = 2，也就是说任何一次写入都必须至少两个节点应答。\n\nRaft 的这个设计从根本上杜绝了「真脑裂」：两个 Leader 不可能同时提交写入，因为同时让两个 Leader 各自凑够多数派在数学上是不可能的——三个节点，A 得到 A+B 两票就已经用掉了多数，B 此时就算得到 B+C 也刚好凑满多数，但 B 的 term 一定比 A 更新（每次选举 term 单调递增），C 不会在同一 term 给 B 投票，所以两个 Leader 根本无法并存。这是 Raft 算法的数学保证，不是工程约定。\n\n但你在本次故障中看到的现象——两个节点都宣称自己是 Leader、`leader_changes` 指标飙升、写入全部超时——这是「伪脑裂」（pseudo split-brain）。它的本质不是两个 Leader 在同时提交写入，而是两个节点都处于 candidate 或 leader 状态、互相发选举消息，但由于网络故障导致没有任何节点能够凑齐 2 票的 Quorum，集群因此陷入选举死循环，完全不可用。这比真脑裂更常见，也更容易排查——因为它一定有一个具体的工程原因，而不是算法本身的问题。\n\n理解这个区别很重要。如果你误认为这是真脑裂，可能会去做强制切换或修改 member ID 之类的错误操作，反而把数据弄坏。正确的认知是：集群现在是「选举风暴」状态，没人能提交写入，Raft 的一致性保证仍然有效，我们只需要找到是什么在阻止多数派形成，然后修复它。\n\n## 第二步：分步排查——从症状到根因\n\n### 第一关：确认集群状态\n\n排查的第一步，先用 `etcdctl endpoint status` 逐节点查询，不要用 `--endpoints=node1:2379,node2:2379,node3:2379` 一次性查，因为故障状态下这个命令会挂起。要单独查每个节点：\n\n```bash\n# 分别对每个节点单独查询，加上超时避免卡死\nETCDCTL_API=3 etcdctl --endpoints=http://node1:2379 \\\n  --dial-timeout=3s --command-timeout=5s \\\n  endpoint status --write-out=table\n\nETCDCTL_API=3 etcdctl --endpoints=http://node2:2379 \\\n  --dial-timeout=3s --command-timeout=5s \\\n  endpoint status --write-out=table\n\nETCDCTL_API=3 etcdctl --endpoints=http://node3:2379 \\\n  --dial-timeout=3s --command-timeout=5s \\\n  endpoint status --write-out=table\n```\n\n典型的「选举风暴」输出长这样：\n\n```\n# node1 的输出\n+------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n|     ENDPOINT     |        ID        | VERSION | DB SIZE | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS |\n+------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n| http://node1:2379 | 8e9e05c52164694d |  3.5.9  |  42 MB  |   true    |   false    |    127    |   891234   |       891234       |        |\n+------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n\n# node2 的输出（30 秒后再查，RAFT TERM 已经涨到 143）\n+------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n|     ENDPOINT     |        ID        | VERSION | DB SIZE | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS |\n+------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n| http://node2:2379 | 91bc3c398fb3c146 |  3.5.9  |  42 MB  |   true    |   false    |    143    |   891190   |       891190       |        |\n+------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n\n# node3 超时（节点可能与另外两个都不通）\nError: context deadline exceeded\n```\n\n关键线索有三条：node1 和 node2 都声称是 Leader，但它们的 `RAFT TERM` 不一样（127 vs 143），而且还在持续增长；node3 无响应。RAFT TERM 快速增长是选举风暴的铁证——每一轮选举都会让 term +1，这里 30 秒涨了 16 个 term，说明每 2 秒就在重选一次。\n\n### 第二关：读 etcd 日志，找到选举时间线\n\n```bash\n# 在 node1 上执行，过滤选举相关日志\njournalctl -u etcd --since \"15 minutes ago\" --no-pager \\\n  | grep -E \"(leader|election|timeout|heartbeat|term|member)\" \\\n  | tail -60\n```\n\n典型的问题日志模式：\n\n```\nJul 15 14:18:42 node1 etcd[1234]: raft: node1 [term: 41] received a MsgVote message with higher term from node2 [term: 42]\nJul 15 14:18:42 node1 etcd[1234]: raft: node1 became follower at term 42\nJul 15 14:18:43 node1 etcd[1234]: raft: node1 is starting a new election at term 43\nJul 15 14:18:43 node1 etcd[1234]: raft: node1 became candidate at term 43\nJul 15 14:18:45 node1 etcd[1234]: raft: node1 [logterm: 42, index: 891190] sent MsgVote request to node3 at term 43\nJul 15 14:18:47 node1 etcd[1234]: raft: node1 [quorum:2] has received 1 MsgVoteResp votes and 0 vote rejections\nJul 15 14:18:49 node1 etcd[1234]: rafthttp: failed to dial node3 peer URL (http://node3:2380): dial tcp 10.0.0.3:2380: i/o timeout\nJul 15 14:18:50 node1 etcd[1234]: raft: node1 [term: 43] received a MsgVote message with higher term from node2 [term: 44]\n```\n\n这段日志告诉了你整个故事：node1 发 MsgVote 给 node3，被 timeout；同时 node2 也在发起选举，node1 收到更高 term 就变回 follower；然后 node1 再次超时、再次发起选举……无限循环。关键线索是 `failed to dial node3 peer URL`——node3 与 node1/node2 都断联了，但 node1 和 node2 之间的 peer 通信也有问题（否则其中一个早就凑够了 2 票当上 Leader）。\n\n### 第三关：检查 peer 网络连通性\n\netcd 的集群通信走 2380 端口（peer port），客户端通信走 2379（client port）。一个常见的坑是：2379 通了但 2380 断了，导致外部能查到 etcd，但集群内部无法选举。\n\n```bash\n# 在每个节点上，检查到其他节点 2380 端口的连通性\n# node1 上执行：\nnc -zv node2 2380   # 检查 peer 端口\nnc -zv node3 2380\ncurl -v http://node2:2380/members  # 更直观的 HTTP 检查\n\n# 看 etcd 自己认为的集群成员状态\nETCDCTL_API=3 etcdctl --endpoints=http://node1:2379 member list --write-out=table\n\n# 检查防火墙规则，重点看 2380 端口\niptables -L INPUT -n -v | grep 2380\niptables -L FORWARD -n -v | grep 2380\nnft list ruleset | grep 2380   # 如果用 nftables\n\n# 检查路由表（VLAN 变更可能导致路由丢失）\nip route show\ntraceroute node3  # 看到哪一跳断了\n```\n\n如果是本次的 VLAN 变更导致的，你可能会看到：\n\n```bash\n# nc 输出\nnc: connect to node3 port 2380 (tcp) failed: Connection timed out\n\n# iptables 输出（发现误加了 DROP 规则）\nChain INPUT (policy ACCEPT)\ntarget     prot opt source               destination\nDROP       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:2380\n```\n\n找到了！网络变更时误操作在所有 etcd 节点上加了一条 DROP 规则，把 2380 端口全封了。\n\n### 第四关：排除时钟偏差（NTP 问题）\n\n如果网络看起来没问题，要检查时钟偏差。Raft 的心跳和选举超时是基于时间的，如果节点间时钟偏差超过 `election-timeout`，也会触发频繁选举。\n\n```bash\n# 检查各节点时间同步状态\nchronyc tracking          # Chrony 用户\ntimedatectl status         # systemd-timesyncd 用户\nntpstat                    # NTP 用户\n\n# 快速比较各节点时间戳\nfor node in node1 node2 node3; do\n  echo -n \"$node: \"; ssh $node \"date +%s.%N\"\ndone\n```\n\n如果偏差超过 500ms 就要当心，etcd 默认的 `--heartbeat-interval=100ms`，`--election-timeout=1000ms`，时钟偏差接近 election-timeout 会导致 follower 误判 Leader 失联，触发新一轮选举。\n\n## 第三步：针对根因的恢复操作\n\n### 场景 A：网络/防火墙问题（最常见）\n\n如果确认是防火墙规则或路由问题，修复方式最简单：\n\n```bash\n# 删除误加的 iptables DROP 规则（在所有 etcd 节点执行）\niptables -D INPUT -p tcp --dport 2380 -j DROP\n\n# 保存规则，防止重启后 iptables 规则恢复导致问题（取决于你的发行版）\niptables-save > /etc/iptables/rules.v4   # Debian/Ubuntu\nservice iptables save                     # CentOS/RHEL\n\n# 修复后，观察 etcd 日志——Raft 应该在几秒内自动收敛\njournalctl -u etcd -f | grep -E \"(became leader|elected)\"\n```\n\n修复网络后，正常情况下 5-10 秒内你就会看到：\n\n```\nJul 15 14:31:02 node1 etcd[1234]: raft: node1 elected leader at term 148\nJul 15 14:31:02 node1 etcd[1234]: etcdserver: published {Name:node1 ClientURLs:[http://node1:2379]}\n```\n\n集群自动恢复，不需要任何额外操作。这也是 Raft 设计的优雅之处：底层问题一旦修复，算法自己会完成收敛。\n\n### 场景 B：节点彻底故障（少数派不可用）\n\n如果是物理节点故障（比如 node3 硬件挂了），三节点中还剩 node1 和 node2，这两个节点能凑够 Quorum（2/3），集群应该自动选出新 Leader。如果没有自动恢复，手动将故障节点移出集群：\n\n```bash\n# 先查出 node3 的 member ID\nETCDCTL_API=3 etcdctl --endpoints=http://node1:2379,http://node2:2379 \\\n  member list\n# 输出示例：\n# 2c34a: node3, http://node3:2380, started\n\n# 将 node3 从集群移除\nETCDCTL_API=3 etcdctl --endpoints=http://node1:2379,http://node2:2379 \\\n  member remove 2c34a\n\n# 此时集群变为 2 节点，Quorum=2，仍然可以运行\n# 当 node3 修复后，重新加入：\nETCDCTL_API=3 etcdctl --endpoints=http://node1:2379 \\\n  member add node3 --peer-urls=http://node3:2380\n```\n\n### 场景 C：多数派失联，需要快照恢复（最严重）\n\n如果三节点全部出问题，或者 node1/node2 的数据已经不一致且无法自动协商，则需要走「灾难恢复」流程。**这是破坏性操作，必须先备份。**\n\n```bash\n# Step 1：从任意一个数据最新的节点取快照（优先选 RAFT INDEX 最大的节点）\nETCDCTL_API=3 etcdctl --endpoints=http://node1:2379 \\\n  snapshot save /var/lib/etcd-backup/etcd-snapshot-$(date +%Y%m%d%H%M%S).db\n\n# Step 2：验证快照完整性\nETCDCTL_API=3 etcdctl snapshot status /var/lib/etcd-backup/etcd-snapshot-*.db \\\n  --write-out=table\n# 输出应包含 hash、revision、total keys、total size\n\n# Step 3：停止所有 etcd 节点\nsystemctl stop etcd   # 在所有三个节点上执行\n\n# Step 4：从快照恢复（在每个节点分别执行，参数不同）\n# node1：\nETCDCTL_API=3 etcdctl snapshot restore /var/lib/etcd-backup/etcd-snapshot-latest.db \\\n  --name node1 \\\n  --initial-cluster \"node1=http://node1:2380,node2=http://node2:2380,node3=http://node3:2380\" \\\n  --initial-cluster-token etcd-cluster-production-restored \\\n  --initial-advertise-peer-urls http://node1:2380 \\\n  --data-dir /var/lib/etcd-restored\n\n# node2（修改 --name 和 --initial-advertise-peer-urls）：\nETCDCTL_API=3 etcdctl snapshot restore /var/lib/etcd-backup/etcd-snapshot-latest.db \\\n  --name node2 \\\n  --initial-cluster \"node1=http://node1:2380,node2=http://node2:2380,node3=http://node3:2380\" \\\n  --initial-cluster-token etcd-cluster-production-restored \\\n  --initial-advertise-peer-urls http://node2:2380 \\\n  --data-dir /var/lib/etcd-restored\n\n# node3 同理...\n\n# Step 5：更新 etcd 启动配置，将 --data-dir 指向恢复目录\n# 修改 /etc/etcd/etcd.conf 或 systemd unit 中的 --data-dir 参数\n# 然后启动 etcd\nsystemctl start etcd\n\n# Step 6：验证恢复成功\nETCDCTL_API=3 etcdctl --endpoints=http://node1:2379,http://node2:2379,http://node3:2379 \\\n  endpoint health --write-out=table\n```\n\n注意 `--initial-cluster-token` 要换一个新值，这会强制 etcd 把这次恢复视为一个全新集群的启动，而不是试图与旧节点协商。\n\n## 第四步：体系化扩展与生产建议\n\n### etcd 时钟与超时参数调优\n\n`--heartbeat-interval` 和 `--election-timeout` 这两个参数的关系是：election-timeout 必须是 heartbeat-interval 的 10 倍以上（etcd 官方建议 10-20 倍）。如果你的 etcd 跨可用区部署，节点间 RTT 可能有 10-20ms，这时把 heartbeat-interval 设为 100ms 是合理的，但 election-timeout 就不应该只有 500ms——至少设 1000ms，最好 2000ms。参数过小会导致正常的网络抖动就触发选举，造成本文所述的「伪脑裂」。\n\n```\n# /etc/etcd/etcd.conf 中的关键超时参数\n--heartbeat-interval=150        # 跨 AZ 场景建议 150ms\n--election-timeout=1500         # heartbeat-interval 的 10 倍\n```\n\n### 生产级监控与告警 SOP\n\n`etcd_server_leader_changes_seen_total` 是最核心的健康指标，任何 5 分钟内超过 3 次的 Leader 变更都值得告警。此外，`etcd_server_proposals_failed_total` 增长说明有写入失败，`etcd_disk_wal_fsync_duration_seconds` 的 P99 超过 100ms 说明磁盘 I/O 正在影响 Raft 心跳，这也是一个常被忽略的脑裂诱因——磁盘太慢导致 Leader 无法及时 fsync WAL 日志、心跳超时，和网络问题的效果完全一样。\n\n### 备份策略\n\n生产 etcd 至少要做到：每 30 分钟自动 snapshot 一次，保留最近 48 小时的快照，快照存储在集群节点之外的对象存储（比如 S3 或 MinIO）。一个简单的 CronJob 脚本：\n\n```bash\n#!/bin/bash\n# /etc/cron.d/etcd-backup 每 30 分钟运行一次\nBACKUP_DIR=\"/mnt/etcd-backups\"\nFILE=\"etcd-snapshot-$(date +%Y%m%d%H%M%S).db\"\nETCDCTL_API=3 etcdctl \\\n  --endpoints=https://node1:2379 \\\n  --cacert=/etc/etcd/ca.crt \\\n  --cert=/etc/etcd/etcd.crt \\\n  --key=/etc/etcd/etcd.key \\\n  snapshot save \"${BACKUP_DIR}/${FILE}\" && \\\n  aws s3 cp \"${BACKUP_DIR}/${FILE}\" s3://my-etcd-backups/ && \\\n  find \"${BACKUP_DIR}\" -name \"*.db\" -mtime +1 -delete\n```\n\n### 架构层面的防脑裂建议\n\netcd 节点必须是奇数（3、5、7），永远不要部署 2 或 4 节点——偶数节点在网络对半分时刚好两个分区各有同等票数，真正无法选出 Leader。三节点是性价比最高的配置（Quorum=2，最多容忍 1 个节点故障）。五节点（Quorum=3，容忍 2 个节点故障）适合对可用性要求更高的场景，代价是写入需要更多节点确认，延迟略高。\n\netcd 应当独立部署，不要与 K8s 的业务 Pod 混跑在同一个节点。etcd 对磁盘 I/O 非常敏感，业务 Pod 的磁盘竞争完全可以触发 etcd 心跳超时。最后，一定要给 etcd 节点单独配置 TLS peer 认证（`--peer-client-cert-auth`），防止游离节点意外加入集群。",
+      "keyPoints": [
+        "etcd 基于 Raft 算法在数学上保证不可能出现「真脑裂」，因为两个 Leader 不可能同时各自凑够多数派（Quorum）来提交写入；生产中出现的都是「伪脑裂」，本质是选举风暴导致集群无法收敛出一个 Leader",
+        "Raft TERM 单调递增是选举风暴的铁证：正常集群的 term 变化极为缓慢（甚至几天不变），如果 30 秒内涨了十几个 term，说明 peer 网络不通导致每次选举都超时失败",
+        "`etcd_server_leader_changes_seen_total` 是最关键的 etcd 健康指标，生产告警规则应设为「5 分钟内 leader change 超过 3 次」，一旦触发立即介入，不要等到 API Server 大面积报错",
+        "排查 etcd 故障时必须分别对每个节点单独执行 `endpoint status`，不能用逗号合并 endpoints——故障状态下合并查询会超时卡死，分开查才能逐一确认哪些节点还活着",
+        "etcd peer 通信走 2380 端口，客户端走 2379，防火墙误配最常只封了 2379 或 2380 其中之一，导致「外部能连上 etcd 但集群内部无法选举」这种迷惑性故障",
+        "磁盘 I/O 慢和网络不通对 Raft 的影响是等价的：etcd Leader 写 WAL 日志（fsync）超时会导致心跳无法按时发出，效果和网络断开一样；`etcd_disk_wal_fsync_duration_seconds` P99 超过 100ms 时需要警惕",
+        "从快照恢复 etcd 时，`--initial-cluster-token` 必须改一个新值，强制 etcd 以全新集群模式启动而不是尝试与旧节点数据协商，否则可能因 member ID 冲突导致恢复失败",
+        "etcd 节点数必须为奇数（3 或 5），偶数节点在网络对半分割时两侧票数相等，真正无法选出 Leader；三节点是生产最小推荐配置，五节点适合对可用性要求更高的场景"
+      ],
+      "quiz": [
+        {
+          "id": "ds-splitbrain-debug-q1-quiz1",
+          "question": "在 Raft 算法中，为什么三节点集群理论上不可能出现两个 Leader 同时提交写入的「真脑裂」？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "因为 Raft 要求写入必须得到多数派（Quorum）节点应答，三节点中多数派为 2，两个 Leader 不可能各自独立凑齐 2 票"
+            },
+            {
+              "id": "B",
+              "text": "因为 etcd 会在检测到两个 Leader 时自动触发网络隔离，强制其中一个降级"
+            },
+            {
+              "id": "C",
+              "text": "因为 Raft 的心跳机制会让旧 Leader 定期检查集群状态，主动退位"
+            },
+            {
+              "id": "D",
+              "text": "因为 etcd 使用分布式锁来确保同时只有一个节点处于 Leader 状态"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Raft 的核心安全性来自 Quorum 机制，不是任何主动检测或锁机制。三节点集群中，多数派 = 2。如果 node1 作为 Leader 提交写入，它需要 node1+node2 或 node1+node3 这 2 票；如果此时 node2 也试图成为 Leader 并提交，它需要 node2+node1 或 node2+node3 这 2 票。两个 Leader 都需要拉拢 node2 或 node3 作为自己的多数派，而这两个节点在同一个 term 内只会投给一个候选人——这是 Raft 选举的基本约束。因此两个 Leader 在数学上不可能各自都达到 Quorum。B 选项中「自动触发网络隔离」不存在，C 选项描述的是 Leader 通过心跳维持地位而非主动退位，D 选项中「分布式锁」是应用层概念，Raft 本身不依赖外部锁。"
+        },
+        {
+          "id": "ds-splitbrain-debug-q1-quiz2",
+          "question": "下列哪个 Prometheus 指标最能直接反映 etcd 集群正在经历「选举风暴」？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "etcd_server_proposals_failed_total 持续增长"
+            },
+            {
+              "id": "B",
+              "text": "etcd_server_leader_changes_seen_total 在 5 分钟内增长超过 10"
+            },
+            {
+              "id": "C",
+              "text": "etcd_mvcc_db_total_size_in_bytes 超过磁盘容量的 80%"
+            },
+            {
+              "id": "D",
+              "text": "etcd_network_client_grpc_received_bytes_total 下降"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选举风暴的直接表现是 Leader 频繁变更，每一轮失败的选举后 term 递增，每次新 Leader 选出都会被记录在 `etcd_server_leader_changes_seen_total` 中。正常运行的 etcd 集群几乎不会换 Leader（除非主动重启节点），5 分钟内超过 3 次就应该告警，超过 10 次则是严重的选举风暴。A 选项 proposals_failed_total 增长是 etcd 不可用的结果而不是选举风暴的直接表征，它可能由多种原因导致。C 选项描述的是磁盘空间问题，与选举无关。D 选项 client 流量下降是 etcd 不可用后 API Server 停止发请求的结果，是下游现象，不是根因指标。"
+        },
+        {
+          "id": "ds-splitbrain-debug-q1-quiz3",
+          "question": "排查 etcd 集群时，为什么推荐对每个节点单独执行 `etcdctl endpoint status`，而不是一次性传入所有节点的 endpoints？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "因为 etcdctl 不支持多个 endpoints 同时查询，语法上不允许"
+            },
+            {
+              "id": "B",
+              "text": "因为集群故障状态下，某些节点无响应会导致整个命令挂起超时，单独查才能逐一确认哪些节点存活"
+            },
+            {
+              "id": "C",
+              "text": "因为多 endpoints 查询会触发 etcd 的选举，影响集群状态"
+            },
+            {
+              "id": "D",
+              "text": "因为合并查询时 etcdctl 只会返回 Leader 节点的信息，无法看到每个节点的状态"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "etcdctl 支持用逗号分隔多个 endpoints，语法上完全没有问题。但在故障排查场景下，当集群处于选举风暴状态时，部分节点可能无响应或响应极慢。如果一次性传入三个 endpoints，etcdctl 需要等待所有节点返回或超时，可能导致整个命令挂起 10-30 秒甚至更长，反而影响排查效率。单独查每个节点时，可以加 `--dial-timeout=3s --command-timeout=5s` 快速超时，迅速定位哪些节点能响应、哪些不行。C 选项错误，etcdctl 的只读查询不会触发选举。D 选项在合并查询下 etcdctl 实际上会尝试连接所有节点并各自返回，只是在故障时体验很差。"
+        },
+        {
+          "id": "ds-splitbrain-debug-q1-quiz4",
+          "question": "etcd 的 peer 通信端口和 client 通信端口分别是什么？在故障排查中，这个区分有何重要性？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "peer 端口 2379，client 端口 2380；防火墙通常只开放 2379，所以排查要重点检查 2380"
+            },
+            {
+              "id": "B",
+              "text": "peer 端口 2380，client 端口 2379；防火墙误配可能只封了 2380，导致集群内部无法通信但外部 API Server 短期内感觉 etcd 还在"
+            },
+            {
+              "id": "C",
+              "text": "两者共用 2379 端口，通过请求头区分 peer 和 client 流量"
+            },
+            {
+              "id": "D",
+              "text": "peer 端口 2380，client 端口 2379；这两个端口的流量完全等价，封任意一个效果相同"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "etcd 默认使用 2380 作为 peer port（节点间选举和日志复制），2379 作为 client port（给 API Server 等客户端使用）。这个区别在故障排查中极为重要：如果防火墙只封了 2380 而放行了 2379，外部客户端（包括 API Server）还能建立连接并发请求，etcd 进程也还在响应；但集群内部节点之间无法通信，Raft 心跳和选举消息全部被丢弃，集群陷入选举风暴而无法提交写入。这种情况下 API Server 发出的所有写入请求都会超时，但读请求（如果读的是本地缓存）可能还短暂可用，造成「etcd 看起来还活着但其实不行了」的迷惑性现象。"
+        },
+        {
+          "id": "ds-splitbrain-debug-q1-quiz5",
+          "question": "以下是从 etcd 节点日志中截取的片段，请判断集群当前处于什么状态：\n\n```\n[term: 127] received MsgVote from node2 [term: 128]\nbecame follower at term 128\nstarting a new election at term 129\nbecame candidate at term 129\nfailed to dial node3: dial tcp: i/o timeout\nreceived MsgVote from node2 [term: 130]\nbecame follower at term 130\nstarting a new election at term 131\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "集群正常运行，Leader 在轮换是因为在做滚动升级"
+            },
+            {
+              "id": "B",
+              "text": "node3 与其他节点断联，node1 和 node2 之间互相触发选举但都未能凑够 Quorum，集群陷入选举风暴"
+            },
+            {
+              "id": "C",
+              "text": "node1 正在从 snapshot 恢复，term 增长是恢复过程中的正常现象"
+            },
+            {
+              "id": "D",
+              "text": "etcd 检测到数据不一致，正在通过多轮选举来确定哪个节点的数据更新"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这段日志清晰地展示了选举风暴的完整循环：node1 收到 node2 更高 term 的选举请求 → 变成 follower → 因为没人凑够 Quorum（node3 连不上），node1 自己的 election timeout 到期 → node1 发起新一轮选举 → node2 用更高 term 打断 → node1 又变 follower → 无限循环。关键证据是：term 在每次循环都 +2（node2 先涨，node1 再涨），以及 `failed to dial node3` 揭示了 node3 已经离线。三节点中 node3 断联，node1 和 node2 理应能凑够 Quorum（2/3），但日志显示 node1 和 node2 之间的选举请求在互相打断而非合作——说明 node1 和 node2 之间的 peer 通信本身也有问题（比如延迟极高或丢包），导致每次选票都因超时而重新开始。"
+        },
+        {
+          "id": "ds-splitbrain-debug-q1-quiz6",
+          "question": "一个常见的排查误区：etcd 集群不可用时，工程师直接对所有节点执行 `systemctl restart etcd`。这会带来什么问题？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "不会有问题，重启是最快速的恢复手段，Raft 会在重启后自动同步数据"
+            },
+            {
+              "id": "B",
+              "text": "重启会清空 etcd 的内存缓存，导致 K8s 所有资源定义需要重新创建"
+            },
+            {
+              "id": "C",
+              "text": "如果三个节点同时重启，etcd 集群会以 `--initial-cluster-state=new` 模式启动，尝试组建新集群而不是加入已有集群，可能触发数据冲突或导致集群分裂为多个独立实例"
+            },
+            {
+              "id": "D",
+              "text": "重启会导致 etcd 的 WAL 日志损坏，无法恢复"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是生产事故中很常见的操作失误。etcd 的启动配置里有一个参数 `--initial-cluster-state`，值为 `new` 时表示这是集群的首次启动，值为 `existing` 时表示加入已有集群。正常情况下生产集群的 etcd 配置里这个值是 `existing`，重启时没有问题。但如果有工程师为了「彻底重置」而把这个值改成了 `new`，或者 etcd 的数据目录被清空（误操作 rm -rf），那么重启的节点会认为自己在创建一个全新的集群，不会去加入现有集群的 Raft group，导致集群进一步分裂。正确的做法是在修复底层问题（网络/磁盘）后，让 etcd 以 `existing` 模式自然重启，Raft 算法会自动完成日志同步和状态对齐。"
+        },
+        {
+          "id": "ds-splitbrain-debug-q1-quiz7",
+          "question": "etcd 集群应该选择 3 节点还是 5 节点？在什么情况下 5 节点是必要的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "节点越多越好，10 节点的集群比 3 节点可用性高很多"
+            },
+            {
+              "id": "B",
+              "text": "3 节点已经足够，5 节点没有任何额外收益，只会增加维护成本"
+            },
+            {
+              "id": "C",
+              "text": "3 节点允许最多 1 个节点故障（Quorum=2），5 节点允许最多 2 个节点同时故障（Quorum=3）；对可用性要求极高、需要跨 3 个可用区部署的场景适合用 5 节点"
+            },
+            {
+              "id": "D",
+              "text": "只有数据量超过 8GB 时才需要 5 节点，节点数量与容量线性相关"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "etcd 节点数与容错能力的关系：3 节点 Quorum=2，最多容忍 1 个节点故障；5 节点 Quorum=3，最多容忍 2 个节点故障。选择 5 节点主要是为了跨 3 个可用区部署时能容忍 1 个可用区整体故障（一个 AZ 可能有 2 个 etcd 节点，AZ 故障时损失 2 个节点，5 节点集群仍剩 3 个满足 Quorum）。3 节点跨 3 个 AZ 时，任意 1 个 AZ 故障损失 1 个节点，仍满足 Quorum=2，是最低成本的高可用方案。A 选项错误，节点越多写入延迟越高（需要等更多节点确认），超过 7 节点几乎没有收益。D 选项 etcd 节点数与数据量无关，etcd 本身不是数据存储系统，推荐数据库大小不超过 8GB。"
+        },
+        {
+          "id": "ds-splitbrain-debug-q1-quiz8",
+          "question": "生产 etcd 集群的 `--heartbeat-interval=100ms`，`--election-timeout=500ms`，etcd 跨可用区部署，节点间 RTT 约 15ms。这个配置有什么问题？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "election-timeout 太长了，应该设为 heartbeat-interval 的 2-3 倍以加快故障检测"
+            },
+            {
+              "id": "B",
+              "text": "election-timeout=500ms 只是 heartbeat-interval 的 5 倍，官方建议 10-20 倍；加上 15ms 的网络延迟，正常的网络抖动就可能让 follower 误判 Leader 失联并触发选举"
+            },
+            {
+              "id": "C",
+              "text": "heartbeat-interval 太长了，应该设为 10ms 以下"
+            },
+            {
+              "id": "D",
+              "text": "这个配置没有问题，500ms 的 election-timeout 在任何场景下都是安全的"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "etcd 官方文档明确建议 election-timeout 应该是 heartbeat-interval 的 10 倍以上。这里 500ms/100ms = 5 倍，低于推荐值。问题在于：一次心跳的往返时间包括网络传输（2×15ms=30ms）+ etcd 处理时间 + fsync WAL 的磁盘时间（p99 可能 20-50ms）。在磁盘 I/O 有抖动的情况下，一次心跳完整往返可能需要 80-100ms，而 election-timeout 只有 500ms，意味着只要连续 5 次心跳稍微慢一点，follower 就会发起选举。跨 AZ 场景建议 heartbeat-interval=150ms，election-timeout=1500ms，给正常的网络和磁盘抖动留足余量。A 选项是完全错误的方向，election-timeout 太短会加剧选举风暴。"
+        },
+        {
+          "id": "ds-splitbrain-debug-q1-quiz9",
+          "question": "执行 `etcdctl snapshot restore` 从快照恢复 etcd 时，`--initial-cluster-token` 参数为什么必须设置为一个新值，而不是沿用原来集群的 token？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "因为旧 token 可能已经过期，etcd 不允许使用相同的 token 两次"
+            },
+            {
+              "id": "B",
+              "text": "使用新 token 会强制 etcd 以全新集群模式启动，避免恢复后的节点尝试与网络中残存的旧节点（可能数据已损坏）进行 Raft 协商，防止数据覆盖或 member ID 冲突"
+            },
+            {
+              "id": "C",
+              "text": "因为 token 是加密密钥，每次重启后都需要轮换"
+            },
+            {
+              "id": "D",
+              "text": "新 token 会让 etcd 忽略快照中的数据，直接从一个空集群开始"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "etcd 用 `--initial-cluster-token` 来区分不同的集群实例，每个节点在加入集群时会把这个 token 和自己的 member ID 绑定。如果灾难恢复时使用与原集群相同的 token，恢复后的节点可能会尝试联系网络中还存活的旧节点（比如某个节点数据损坏但进程还在运行），这会导致旧节点认为恢复节点是「已知集群成员」并试图进行 Raft 日志同步，可能用旧的（损坏的）数据覆盖刚恢复好的快照数据。换一个新 token 会让所有恢复节点形成一个独立的新 Raft group，互相认识但与任何旧实例隔离，从快照的状态重新出发。D 选项错误，token 不影响快照数据的加载，快照数据会完整恢复。"
+        },
+        {
+          "id": "ds-splitbrain-debug-q1-quiz10",
+          "question": "除了网络分区，还有哪种生产常见的问题会导致 etcd 触发频繁选举，且初始症状与网络分区几乎相同？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "etcd 版本不一致（不同节点运行不同版本的 etcd）"
+            },
+            {
+              "id": "B",
+              "text": "etcd 数据目录磁盘 I/O 延迟过高，导致 WAL fsync 超时，Leader 无法按时发出心跳，Follower 误判 Leader 失联"
+            },
+            {
+              "id": "C",
+              "text": "K8s API Server 并发请求过多，etcd QPS 达到上限触发限流"
+            },
+            {
+              "id": "D",
+              "text": "etcd 的 TLS 证书即将过期，节点间 TLS 握手失败"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个生产环境中非常容易被忽视的陷阱。etcd 的 Raft 心跳是「Leader 写 WAL 日志并 fsync 到磁盘，然后发送心跳」，如果磁盘 I/O 因为同机器跑了其他服务（或云盘 IOPS 被限制）导致 fsync 延迟高（P99 超过 100ms），心跳就无法按时发出。Follower 在 election-timeout 内没收到心跳，会认为 Leader 挂了，发起新一轮选举，效果和网络断开完全一致。排查这类问题要看 `etcd_disk_wal_fsync_duration_seconds` 指标，以及 `iostat -x 1` 观察磁盘利用率。D 选项（TLS 证书过期）也会导致 peer 通信失败，症状类似，但通常会在日志中明显显示 TLS handshake failure，比磁盘问题更容易发现。"
+        }
+      ],
+      "references": [
+        "https://etcd.io/docs/v3.5/op-guide/recovery/",
+        "https://etcd.io/docs/v3.5/faq/",
+        "https://etcd.io/docs/v3.5/tuning/",
+        "https://github.com/etcd-io/etcd/blob/main/Documentation/op-guide/clustering.md",
+        "https://raft.github.io/raft.pdf",
+        "https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/"
+      ]
+    }
+  ]
+}

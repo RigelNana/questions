@@ -1,0 +1,279 @@
+{
+  "id": "ds-etcd-perf-realdata",
+  "name": "etcd 生产性能基准数据",
+  "domain": "distributed-system",
+  "description": "基于真实生产数据分析 etcd 集群的延迟、吞吐量指标及影响性能的关键因素",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-etcd-perf-realdata-q1",
+      "domain": "distributed-system",
+      "type": "real-data",
+      "difficulty": 3,
+      "tags": ["etcd", "性能", "吞吐量", "延迟", "Raft", "基准测试", "Kubernetes", "调优"],
+      "title": "etcd 集群在生产中的写入延迟与吞吐量数据是多少？",
+      "content": "你的团队运行着一个中等规模的 Kubernetes 集群（约 500 个节点，3000 个 Pod），最近收到报警：K8s API Server 响应延迟 P99 飙升到 800ms，部分 kubectl apply 操作超时返回 503。你登上监控面板，发现 etcd 的写延迟指标 `etcd_disk_wal_fsync_duration_seconds` 的 P99 已经从正常的 3ms 涨到了 500ms 以上，同时 `etcd_server_proposals_failed_total` 计数器在持续增长。\n\n集群是三节点 etcd，部署在同机房三台物理机上，磁盘是 SATA SSD。你用 `etcdctl endpoint status` 查了一下节点状态：\n\n```\n+---------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n|         ENDPOINT          |        ID        | VERSION | DB SIZE | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS |\n+---------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n| https://10.0.0.1:2379     | 8e9e05c52164694d |  3.5.9  |   6.8GB |      true |      false |        42 |  189547823 |          189547820 |        |\n| https://10.0.0.2:2379     | 91bc3c398fb3c146 |  3.5.9  |   6.8GB |     false |      false |        42 |  189547823 |          189547819 |        |\n| https://10.0.0.3:2379     | fd422379fda50e48 |  3.5.9  |   6.8GB |     false |      false |        42 |  189547823 |          189547821 |        |\n+---------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n```\n\n三个节点都在线，Raft Term 一致，DB SIZE 都是 6.8GB。但写延迟就是高。你会如何系统地排查这个问题，最终找到根因并优化？",
+      "answer": "## etcd 是什么，以及为什么它的性能如此关键\n\netcd 是 CoreOS（现 Red Hat）开源的一个分布式 KV 存储，基于 Raft 共识算法实现强一致性。它不是 Redis 那种追求极致吞吐量的缓存系统，而是一个「小而可靠」的元数据存储——官方建议单个集群数据量不超过 8GB，这已经是硬限制了（超过后 `--quota-backend-bytes` 会拒绝写入）。Kubernetes 把所有集群状态——Pod、Service、ConfigMap、Node——全部存在 etcd 里，所以 etcd 的延迟直接等于 K8s API Server 的延迟下限。当 etcd 写入慢时，任何涉及状态变更的 API 调用都会卡住，这就是为什么你看到 API Server 大面积 503。\n\netcd 的核心模型可以用一句话概括：**每一次写入都要经过 Raft 日志复制 + 磁盘 fsync，缺一不可**。写入流程是这样的：Client 把请求发到 Leader → Leader 把日志条目追加到本地 WAL（Write Ahead Log）并 fsync → Leader 把这条日志并行发给所有 Follower → 等待多数派（即至少一个 Follower）ACK → Leader 把条目应用到 BoltDB（etcd 的后端存储引擎）→ 返回给 Client。这个流程里有两个串行的 I/O 操作：Leader 本地的 WAL fsync，以及等待 Follower 的网络往返。任何一个变慢，整个写入都会慢。\n\n## 真实的性能基准数字\n\n先建立一个「正常」的认知基线，这样你看到异常数据才知道偏离了多少。\n\n**单节点模式（仅供参考，生产不用）**：在 NVMe SSD 上，etcd 单节点写入可以跑到 30,000-50,000 ops/s，P99 延迟 < 1ms。在 SATA SSD 上大约 10,000-30,000 ops/s，P99 延迟 1-5ms。这个数字意义不大，真实生产都是集群模式。\n\n**3节点集群（同机房，NVMe SSD）**：约 15,000-25,000 ops/s，P99 写延迟 2-5ms。这是「理想」生产环境的基线，etcd 官方文档和 benchmark 报告引用的数字基本在这个区间。\n\n**3节点集群（同机房，SATA SSD）**：约 5,000-15,000 ops/s，P99 写延迟 3-10ms。这是大多数公司实际用的配置，也是「可接受」的范围。你的集群走的是 SATA SSD，正常 P99 应该在 3-8ms，现在飙到 500ms，说明出了严重问题。\n\n**跨机房部署（两机房间网络 RTT 20ms）**：P99 写延迟直接 50ms+，吞吐量会下降到 2,000-5,000 ops/s。原因很简单：Raft 复制需要等 Follower ACK，跨机房的一个网络往返就吃掉 20ms。所以 etcd 官方建议节点间 RTT < 1ms，强烈不推荐跨机房部署（用 etcd learner 做异地容灾是另一回事）。\n\n用官方的 `benchmark` 工具可以直接复现这些数字，这个工具在 etcd 源码仓库的 `tools/benchmark` 目录下：\n\n```bash\n# 向 3 节点集群压测 put，100 个并发连接，1000 个客户端，共写 100000 次\n# key 8 字节，value 256 字节（模拟 K8s 典型工作负载）\nbenchmark --endpoints=https://10.0.0.1:2379,https://10.0.0.2:2379,https://10.0.0.3:2379 \\\n  --cacert=/etc/etcd/ca.crt \\\n  --cert=/etc/etcd/peer.crt \\\n  --key=/etc/etcd/peer.key \\\n  --conns=100 --clients=1000 \\\n  put --total=100000 --key-size=8 --val-size=256\n```\n\n一个「健康」的 SATA SSD 3节点集群，你应该看到类似这样的输出：\n\n```\nSummary:\n  Total:        10.423 secs.\n  Slowest:      0.043 secs.\n  Fastest:      0.001 secs.\n  Average:      0.008 secs.\n  Stddev:       0.003 secs.\n  Requests/sec: 9593.12\n\nResponse time histogram:\n  0.001 [1]     |\n  0.005 [12438] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎\n  0.009 [51203] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎\n  0.013 [28643] |∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎∎\n  0.017 [5742]  |∎∎∎∎\n  0.021 [1381]  |∎\n  0.025 [428]   |\n  0.030 [118]   |\n  0.034 [28]    |\n  0.038 [15]    |\n  0.043 [3]     |\n\nLatency distribution:\n  10% in 0.005 secs.\n  25% in 0.006 secs.\n  50% in 0.008 secs.\n  75% in 0.010 secs.\n  90% in 0.013 secs.\n  95% in 0.015 secs.\n  99% in 0.020 secs.\n```\n\nP99 在 20ms，ops/s 约 9600。如果你的集群跑出来 P99 > 100ms，就需要开始排查了。\n\n## 排查这个 500ms 的问题：从磁盘开始\n\n回到题目的案例。三节点都在线，Raft Term 一致，DB SIZE 6.8GB——这已经是一个很大的线索了。官方建议 etcd 数据库 < 8GB，而 6.8GB 已经接近上限。但这本身不会导致写入慢，关键在于要确认磁盘是不是出了问题。\n\n最直接的诊断：在 etcd 机器上用 `fio` 测一下磁盘的 fsync 延迟。etcd 每次写 WAL 都要调用 `fdatasync`，所以磁盘的 fsync 性能就是 etcd 写入延迟的硬下限：\n\n```bash\n# 测试 4KB 随机写 + fdatasync 的延迟，这模拟的是 etcd WAL 写入模式\nfio --rw=write --ioengine=sync --fdatasync=1 --directory=/var/lib/etcd \\\n    --size=22m --bs=2300 --name=etcd-disk-test --numjobs=1 --runtime=60\n```\n\n在健康的 SATA SSD 上你应该看到 99th 百分位延迟 < 10ms。如果看到类似这样的输出：\n\n```\nwrite: IOPS=1243, BW=2873KiB/s (2942kB/s)(168MiB/60001msec)\nclat (usec): min=312, max=89421, avg=803.16, stdev=2134.55\n   percentiles (usec):\n     |  1.00th=[  343],  5.00th=[  359], 10.00th=[  375],\n     | 20.00th=[  408], 30.00th=[  441], 40.00th=[  482],\n     | 50.00th=[  529], 60.00th=[  603], 70.00th=[  726],\n     | 80.00th=[  963], 90.00th=[ 1680], 95.00th=[ 2933],\n     | 99.00th=[12518], 99.50th=[22938], 99.90th=[55575],\n     | 99.99th=[88081]\n```\n\nP99 12ms 还算正常，但如果 P99 跑出来 400ms、500ms，那磁盘就是根因——可能是磁盘老化、SATA 控制器有问题、或者这台机器上有其他进程在疯狂写磁盘，挤占了 I/O。\n\n另一个快速诊断是 `ionice`：etcd 进程的磁盘 I/O 优先级有没有被其他进程抢走？\n\n```bash\n# 查看 etcd 进程的 I/O 优先级\nionice -p $(pgrep etcd)\n\n# 如果输出是 \"none: prio 0\"，说明没有设置优先级，用默认的 best-effort\n# 把 etcd 设置为 realtime 最高优先级\nionice -c 1 -n 0 -p $(pgrep etcd)\n```\n\n不过 `ionice` 是临时的，重启 etcd 就失效了。生产上应该在 etcd 的 systemd service 文件里加 `IOSchedulingClass=realtime IOSchedulingPriority=0`。\n\n## DB SIZE 6.8GB：压缩和碎片整理\n\n题目里 DB SIZE 6.8GB 这个数字值得重点关注。etcd 使用 BoltDB 作为后端存储，BoltDB 的特点是只增不删——即使你删了一个 key，那块空间也不会立刻还给操作系统，而是被标记为「可复用」。随着时间推移，数据库文件会越来越大，里面充满了碎片，这会让 B+ 树的查询路径变长，也会让 mmap 的内存占用变大。\n\n首先检查 etcd 有没有开启自动压缩。Kubernetes 的 etcd 通常会配置 `--auto-compaction-mode=periodic --auto-compaction-retention=1h`，意思是每小时压缩一次，只保留最近 1 小时的历史版本。如果这个没有开，etcd 会保留所有历史版本，数据量会无限增长：\n\n```bash\n# 手动触发一次压缩，获取当前 revision\nREV=$(etcdctl --endpoints=https://10.0.0.1:2379 endpoint status --write-out=json \\\n  | python3 -c \"import sys,json; print(json.load(sys.stdin)[0]['Status']['header']['revision'])\")\n\n# 压缩到当前 revision（清除所有历史版本）\netcdctl --endpoints=https://10.0.0.1:2379 compact $REV\n\n# 但是压缩只是逻辑删除，磁盘空间还没释放，需要做碎片整理\netcdctl --endpoints=https://10.0.0.1:2379 defrag --cluster\n```\n\n`defrag` 操作会让 etcd 暂时不可写（大概几秒到几十秒，取决于数据量），所以建议在低峰期执行，并且先在 Follower 上做，最后再做 Leader。做完之后你会看到 DB SIZE 从 6.8GB 可能降到 2-3GB，磁盘读写压力会明显减轻。\n\n这里有个常见误区：很多人以为压缩（compact）之后 etcd 磁盘就瘦身了。实际上不是，compact 只是把历史版本标记为删除，`defrag` 才是真正重新整理磁盘文件、释放空间的操作。\n\n## Watch 风暴：另一个常见根因\n\n如果磁盘没问题，DB SIZE 也合理，那就要看 Watch 的数量了。在 K8s 里，kube-controller-manager、kube-scheduler、各种 operator 都会对 etcd 建立大量 Watch。每一个 Watch 事件触发时，etcd 需要把变更推送给所有相关的 watcher，这是一个 CPU 密集型操作。当 K8s 集群大规模扩缩容、或者有大量 Pod 在快速创建销毁时，etcd 可能会同时产生成千上万个 Watch 事件，CPU 打满，写入延迟也随之飙升。\n\n查看 Watch 的数量：\n\n```bash\n# 查看当前的 watcher 数量\netcdctl --endpoints=https://10.0.0.1:2379 endpoint status --write-out=table\n\n# 在 Prometheus 里查询\netcd_debugging_watchers_total\n```\n\n如果 watcher 超过 10,000，就要开始看是哪些客户端建了过多 watch 了。一个典型的坑是某些 operator 写得不好，每次重启都重新建 Watch 而不复用，导致 watcher 泄漏。\n\n## Kubernetes 场景下的 etcd 分离：终极方案\n\n上面说的都是单个 etcd 集群的优化。但在大规模 K8s 集群中，有一个架构级的优化往往效果最显著：把 etcd 拆成两个集群，一个存 K8s 核心资源（Pod、Service、Deployment 等），另一个专门存 Events。\n\nK8s Event 是一种高写入、低重要性的数据。每当 Pod Pending、容器重启、Liveness 探针失败，K8s 都会写一条 Event。在繁忙集群里，Event 的写入量可能占到 etcd 总写入量的 60-70%。这些 Event 对于集群的正常运行没有任何必要性，但它们的高频写入会严重影响核心资源的写入延迟。\n\n在 kube-apiserver 配置里加这两个参数就可以做分离：\n\n```yaml\n# kube-apiserver 配置片段\n--etcd-servers=https://10.0.0.1:2379,https://10.0.0.2:2379,https://10.0.0.3:2379\n--etcd-servers-overrides=/events#https://10.0.1.1:2379;https://10.0.1.2:2379;https://10.0.1.3:2379\n```\n\n第一行是核心 etcd，第二行是专门处理 Events 的 etcd（可以用更便宜的磁盘，毕竟 Event 数据丢了也没关系）。做这个改动之后，生产上见过核心 etcd 的写延迟从 50ms 降到 5ms 以内的案例。\n\n另外，核心 etcd 的 `--quota-backend-bytes` 默认是 2GB，应该根据实际需要调大，比如设到 8GB（`--quota-backend-bytes=8589934592`），同时务必配置 `--auto-compaction-retention=1h`，防止历史版本无限积累。\n\n## 监控这几个指标就够了\n\n在 Prometheus 里，etcd 最重要的几个指标是这些。`etcd_disk_wal_fsync_duration_seconds` 告诉你磁盘的 fsync 延迟，P99 > 10ms 就要警觉。`etcd_disk_backend_commit_duration_seconds` 是 BoltDB commit 的延迟，反映数据库本身的健康度。`etcd_network_peer_round_trip_time_seconds` 是 Raft peer 间的 RTT，间接反映网络质量。`etcd_server_proposals_failed_total` 是 Raft proposal 失败次数，这个计数器增长说明集群有问题（可能是节点失联、磁盘满等）。`etcd_server_leader_changes_seen_total` 是 Leader 切换次数，频繁切换说明集群不稳定，每次切换都会造成写入暂停。\n\n把这几个指标的告警规则配好，大部分 etcd 问题都能在影响业务之前被发现。",
+      "keyPoints": [
+        "etcd 的每次写入必须经过 Raft 日志复制（多数派 ACK）和本地 WAL fsync 两个串行 I/O 操作，因此磁盘 fsync 延迟和节点间网络 RTT 共同决定了写入延迟的下限，任何一个变慢都会直接体现在 P99 延迟上。",
+        "在 SATA SSD 上，健康的 3 节点同机房 etcd 集群写入吞吐量约为 5,000-15,000 ops/s，P99 写延迟应在 3-10ms 以内；跨机房部署因网络 RTT 影响，P99 延迟会达到 50ms+，这是架构选型时必须考虑的硬约束。",
+        "用 fio 测试 `--fdatasync=1` 的延迟是判断磁盘是否适合运行 etcd 的标准方法，etcd 官方要求磁盘 fsync P99 < 10ms，NVMe SSD 是首选，SATA SSD 可接受，HDD 基本不可用。",
+        "etcd compact（压缩）和 defrag（碎片整理）是两个独立操作：compact 只清除历史版本的逻辑引用，磁盘空间不会立刻释放；必须在 compact 之后执行 defrag 才能真正缩小数据库文件，释放 mmap 内存压力。",
+        "大规模 K8s 集群中 Event 写入量可占 etcd 总写入量的 60-70%，通过 kube-apiserver 的 `--etcd-servers-overrides` 参数把 Event 路由到独立的 etcd 集群，是降低核心 etcd 写入压力最直接的架构级优化。",
+        "etcd watcher 泄漏是生产中容易被忽视的问题：operator 或控制器每次重启如果不复用已有 Watch 连接，会导致 watcher 数量持续增长，Watch 事件广播时的 CPU 开销会间接拖慢写入延迟。",
+        "etcd 的 `--quota-backend-bytes` 默认只有 2GB，超过后集群会进入只读的「alarm」状态拒绝所有写入，生产环境应根据实际数据量配置到 4-8GB，同时必须配合 `--auto-compaction-retention=1h` 防止历史版本无限积累。",
+        "监控 etcd 的核心 Prometheus 指标：`etcd_disk_wal_fsync_duration_seconds`（磁盘健康）、`etcd_server_proposals_failed_total`（集群稳定性）、`etcd_server_leader_changes_seen_total`（Leader 频繁切换是不稳定预警），这三个指标异常往往是大规模故障的前兆。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz1",
+          "question": "etcd 写入操作的关键路径中，下面哪个描述最准确？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Client → Leader WAL fsync → 并行发送给 Follower → 多数派 ACK → 应用到 BoltDB → 返回客户端"
+            },
+            {
+              "id": "B",
+              "text": "Client → Leader 直接写入 BoltDB → 异步同步给 Follower → 返回客户端"
+            },
+            {
+              "id": "C",
+              "text": "Client → 任意节点接收 → 转发给 Leader → Leader 写入内存 → 异步 fsync → 返回客户端"
+            },
+            {
+              "id": "D",
+              "text": "Client → Leader → 所有 Follower 全部 ACK → WAL fsync → 返回客户端"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd 基于 Raft，写入流程是 Leader 先把日志条目写入 WAL 并 fsync（保证崩溃安全），然后并行发给所有 Follower，等多数派（N/2+1 个节点）确认后，Leader 将条目 apply 到 BoltDB，最后返回给客户端。B 选项是错的，etcd 不是异步同步，这违反强一致性。C 选项错在「写入内存异步 fsync」，etcd 必须在返回前完成 fsync。D 选项错在「所有 Follower 全部 ACK」，Raft 只需要多数派 ACK，不需要等所有节点，这正是 Raft 能容忍节点失败的原因。"
+        },
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz2",
+          "question": "etcd 官方推荐的单集群数据库大小上限是多少？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "8GB，超过后 --quota-backend-bytes 会让集群进入只读 alarm 状态"
+            },
+            {
+              "id": "B",
+              "text": "100GB，etcd 是高性能数据库，可以存储大量数据"
+            },
+            {
+              "id": "C",
+              "text": "2GB，超过后 etcd 进程会自动重启"
+            },
+            {
+              "id": "D",
+              "text": "无限制，etcd 会自动扩容"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd 官方明确建议单集群数据量不超过 8GB，这是基于 BoltDB 的 mmap 内存模型和 Raft 快照恢复性能综合给出的建议。`--quota-backend-bytes` 的默认值是 2GB，超过配额后集群会进入 alarm 状态，拒绝所有写操作（进入只读模式）。这个默认值在生产环境中经常不够用，应该主动调大到 4-8GB，但不应该无限放大，超大的数据库会让快照恢复时间和 defrag 耗时都大幅增加。B、D 选项完全错误，etcd 不是通用数据库，它的设计目标是小、快、可靠，不是大容量存储。"
+        },
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz3",
+          "question": "在 SATA SSD 上部署 3 节点同机房 etcd 集群，生产中 P99 写入延迟的正常范围是？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "3-10ms"
+            },
+            {
+              "id": "B",
+              "text": "< 0.1ms，etcd 基于内存操作所以极快"
+            },
+            {
+              "id": "C",
+              "text": "50-200ms，分布式共识算法本来就有这个开销"
+            },
+            {
+              "id": "D",
+              "text": "10-50ms，这是网络 RTT 和磁盘 I/O 叠加的结果"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "在同机房 SATA SSD 上，3 节点 etcd 的 P99 写入延迟通常在 3-10ms 之间，这是 Raft 一次往返（约 0.1-0.5ms LAN RTT）加上两次 fsync（Leader 写 WAL + Leader 写 BoltDB commit）的综合结果。B 选项是最常见的误解——etcd 每次写入必须 fsync，不是纯内存操作，fsync 本身在 SATA SSD 上就需要 1-5ms。C 和 D 选项把延迟高估了，同机房的 Raft 复制 RTT 极低，不会造成 50ms+ 的延迟；如果 P99 > 20ms 就该开始排查问题了。"
+        },
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz4",
+          "question": "执行 `etcdctl compact $REV` 之后，磁盘上的 etcd 数据库文件大小会立刻减小吗？为什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "不会，compact 只是逻辑删除历史版本，需要再执行 defrag 才能真正缩小文件并释放磁盘空间"
+            },
+            {
+              "id": "B",
+              "text": "会，compact 执行后 BoltDB 会立即回收空闲页并截断文件"
+            },
+            {
+              "id": "C",
+              "text": "会，但需要等 etcd 下次做 checkpoint 时才生效"
+            },
+            {
+              "id": "D",
+              "text": "不会，compact 是压缩网络传输，与磁盘无关"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个非常常见的操作误区。BoltDB 的设计是「文件只增不缩」（monotonically growing file），当 compact 把历史 revision 标记为删除后，这些页面只是被加入到 BoltDB 的 freelist（空闲页列表），文件本身不会缩小，操作系统看到的文件大小不变。只有执行 `etcdctl defrag` 后，etcd 才会创建一个新的 BoltDB 文件，把存活的数据页重新紧凑地写入，然后替换旧文件，这时磁盘占用才会真正下降。B 选项描述的行为是 PostgreSQL 的 VACUUM FULL，不是 BoltDB 的行为。defrag 期间 etcd 不可写，要规划好维护窗口。"
+        },
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz5",
+          "question": "下面是一台 etcd 机器上的 fio 测试输出（部分）：\n```\nfsync lat (usec): min=312, max=156421\n  percentiles:\n    99.00th=[524288]\n    99.90th=[876512]\n```\n这说明什么问题？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "磁盘 fsync P99 延迟超过 500ms，严重不达标，这台机器不适合运行 etcd，需要更换磁盘或排查 I/O 争用"
+            },
+            {
+              "id": "B",
+              "text": "这是正常范围，etcd 内部会批量合并 fsync 请求，实际影响不大"
+            },
+            {
+              "id": "C",
+              "text": "P99 高是偶发性问题，只要平均延迟低就没关系"
+            },
+            {
+              "id": "D",
+              "text": "fio 测试不代表真实 I/O 负载，可以忽略这个结果"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "输出中 `99.00th=[524288]` 单位是微秒（usec），524288 usec ≈ 524ms，这意味着有 1% 的 fsync 操作需要超过 500ms 才能完成。etcd 官方要求磁盘 fsync P99 < 10ms，500ms 是官方基准的 50 倍，这台机器完全不适合运行 etcd。根因可能是磁盘老化、RAID 控制器的写缓存关闭、或者有其他进程（比如日志收集、备份）在同时疯狂写磁盘。B 选项的「etcd 内部批量 fsync」虽然真实存在（etcd 会批量处理 WAL 写入），但即便批量，500ms 的 fsync 延迟也是不可接受的。C 选项犯了「均值掩盖长尾」的错误，P99 高意味着 1% 的请求会超时，在高 QPS 下会严重影响稳定性。"
+        },
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz6",
+          "question": "在 Kubernetes 中，为什么要把 etcd 拆分成「核心资源 etcd」和「Events etcd」两个集群？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "K8s Events 写入频率极高但对集群运行不关键，将 Events 路由到独立 etcd 可以避免其高频写入挤压核心资源（Pod、Service 等）的写入带宽"
+            },
+            {
+              "id": "B",
+              "text": "因为 etcd 单集群无法同时存储 Events 和其他资源，会产生 key 冲突"
+            },
+            {
+              "id": "C",
+              "text": "两个 etcd 集群可以互相备份，提高数据安全性"
+            },
+            {
+              "id": "D",
+              "text": "Events 需要更强的一致性保证，而核心资源不需要"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "在繁忙的 K8s 集群中，Events（比如 Pod 调度事件、探针失败事件）的写入量可以占到 etcd 总写入量的 60-70%。这些 Events 对于集群正常运行完全不必要——删了也不影响 Pod 调度，而它们产生的写入压力却会直接导致 Pod、Service 等核心资源的写入延迟升高。把 Events 分离到独立的低配置 etcd（可以用普通 SSD 甚至 HDD），就让核心 etcd 的磁盘带宽专门服务于重要资源。通过 kube-apiserver 的 `--etcd-servers-overrides=/events#<etcd-endpoint>` 参数可以轻松实现路由。B 选项是无中生有，etcd 的 key 是 K8s 资源的路径，不会冲突。C、D 完全错误。"
+        },
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz7",
+          "question": "etcd 跨机房部署（两机房间 RTT 20ms）时，P99 写入延迟大约是多少？为什么不推荐这样部署？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "P99 写延迟 50ms+，因为每次 Raft 日志复制需要等跨机房 Follower ACK，20ms RTT 直接加到写入路径上"
+            },
+            {
+              "id": "B",
+              "text": "P99 写延迟仍然 < 10ms，etcd 对跨机房部署有专门优化，网络延迟影响可以忽略"
+            },
+            {
+              "id": "C",
+              "text": "P99 写延迟约 5-10ms，因为 Raft 只需要本地节点 ACK，不等 Follower"
+            },
+            {
+              "id": "D",
+              "text": "P99 写延迟约 200-500ms，跨机房 etcd 基本不可用"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Raft 的强一致性要求 Leader 必须等到多数派节点确认才能提交。在 3 节点集群中，Leader 需要至少 1 个 Follower ACK。如果那个 Follower 在 20ms RTT 的另一个机房，这 20ms 就不可避免地加到了每次写入的延迟上，P99 轻松超过 50ms。这不是可以优化掉的问题，是 Raft 协议的根本约束。这就是为什么 etcd 官方建议节点间 RTT < 1ms（即同机房或同可用区），不推荐跨机房拉伸。想做异地容灾，应该使用 etcd 的 Learner 角色（只复制不参与投票），或者在不同机房分别部署独立 etcd 集群。C 选项描述的是错误的 Raft 理解，Leader 不能只 ACK 自己就提交。"
+        },
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz8",
+          "question": "监控显示 `etcd_server_leader_changes_seen_total` 在 1 小时内增加了 15 次，这意味着什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "集群不稳定，Leader 频繁切换，每次切换期间写入会暂停（通常 150ms-1s），应排查磁盘、网络或 CPU 资源竞争"
+            },
+            {
+              "id": "B",
+              "text": "这是正常的负载均衡行为，etcd 会定期轮换 Leader 以均衡磁盘写入压力"
+            },
+            {
+              "id": "C",
+              "text": "说明集群在做滚动升级，Leader 切换是预期内的"
+            },
+            {
+              "id": "D",
+              "text": "15 次 Leader 切换在 1 小时内完全正常，不需要关注"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd 没有主动负载均衡 Leader 的机制，Leader 只会在当前 Leader 心跳超时（Follower 在 election timeout 内没收到心跳）时才发生切换。1 小时 15 次意味着平均每 4 分钟 Leader 就换一次，这非常不正常。每次 Leader 切换都伴随着写入暂停（等待新 Leader 选出并稳定，通常 150ms 到 1s 以上），会直接造成 K8s API Server 请求积压。常见根因：磁盘 I/O 过高导致 Leader 心跳发送延迟（Leader 的心跳消息也要经过 WAL fsync，磁盘慢会直接影响心跳）、CPU 被其他进程抢占、网络出现丢包或抖动。B 选项描述的行为不存在于 etcd 的设计中。"
+        },
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz9",
+          "question": "对 etcd 执行 `defrag` 操作时，有哪些注意事项？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "应先对 Follower 节点做 defrag，最后对 Leader 做；defrag 期间该节点暂时不可写，需要规划维护窗口"
+            },
+            {
+              "id": "B",
+              "text": "可以对 Leader 节点优先 defrag，Follower 会自动同步结果"
+            },
+            {
+              "id": "C",
+              "text": "defrag 是在线操作，对服务完全无影响，可以随时执行"
+            },
+            {
+              "id": "D",
+              "text": "应该同时对所有节点做 defrag，才能保证数据一致性"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "defrag 的本质是重建 BoltDB 数据库文件，etcd 在 defrag 期间会拒绝写入请求（该节点暂时不可用）。在 3 节点集群中，如果先对 Leader 做 defrag，Leader 会暂时下线，触发一次新的 Leader 选举（增加 `leader_changes_seen_total`），增加集群抖动。正确做法是先依次对 Follower1、Follower2 做 defrag，最后再对 Leader 做（此时可以先手动转移 Leader 到另一节点，再 defrag）。这样整个过程集群始终保持有效 Leader 提供服务。D 选项的「同时对所有节点 defrag」会让 3 个节点同时下线，等于整个 etcd 集群停摆，是非常危险的操作。"
+        },
+        {
+          "id": "ds-etcd-perf-realdata-q1-quiz10",
+          "question": "你发现 etcd 的 `etcd_server_proposals_failed_total` 计数器在持续增长，下一步最应该检查什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "检查是否有节点离线（`etcdctl endpoint health`）、磁盘是否已满（`df -h`）、以及 etcd 日志中是否有 `raft: failed to send message` 或 `request ignored (cluster ID mismatch)` 等错误"
+            },
+            {
+              "id": "B",
+              "text": "proposals_failed 只是统计信息，不代表真实问题，可以忽略"
+            },
+            {
+              "id": "C",
+              "text": "立即重启所有 etcd 节点，这可以清除失败状态"
+            },
+            {
+              "id": "D",
+              "text": "增加 etcd 的 CPU 和内存资源，proposals_failed 一般是资源不足导致的"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "`etcd_server_proposals_failed_total` 增长意味着有 Raft proposal（即客户端写入请求）被拒绝或超时，这是一个严重的告警信号。常见根因有三类：第一，集群失去多数派（比如 3 节点中有 2 个节点宕机或网络隔离），此时 Leader 无法获得足够的 ACK；第二，磁盘已满或超过 quota，etcd 进入 alarm 状态拒绝所有写入；第三，Raft 网络出现严重丢包，peer 消息无法送达。排查顺序：先用 `etcdctl endpoint health --cluster` 确认所有节点是否在线，再检查 DB SIZE 是否接近 quota，最后看 etcd 的错误日志（通常日志里有明确的错误消息）。B 选项是错的，proposals_failed 是有实际意义的告警指标。C 选项的「重启所有节点」非常危险，如果是磁盘满导致的，重启不会解决问题，反而会让集群在重启恢复期间不可用。"
+        }
+      ],
+      "references": [
+        "https://etcd.io/docs/v3.5/op-guide/performance/",
+        "https://etcd.io/docs/v3.5/faq/",
+        "https://etcd.io/docs/v3.5/op-guide/hardware/",
+        "https://github.com/etcd-io/etcd/tree/main/tools/benchmark",
+        "https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/",
+        "https://etcd.io/docs/v3.5/op-guide/maintenance/"
+      ]
+    }
+  ]
+}
