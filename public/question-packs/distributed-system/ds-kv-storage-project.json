@@ -1,0 +1,169 @@
+{
+  "id": "ds-kv-storage-project",
+  "name": "自动扩缩容 KV 存储设计",
+  "domain": "distributed-system",
+  "description": "结合 Redis Cluster 生产经验，设计支持自动扩缩容的 KV 存储系统，覆盖扩容触发条件、数据迁移、流量切换和缩容安全保证",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-kv-storage-project-q1",
+      "domain": "distributed-system",
+      "type": "project",
+      "difficulty": 4,
+      "tags": ["Redis Cluster", "自动扩缩容", "槽迁移", "分布式存储", "系统设计", "大促"],
+      "title": "结合项目经验，说说你是怎么设计支持自动扩缩容的 KV 存储系统的",
+      "content": "## 项目背景\n\n你所在的团队维护一套核心 KV 存储服务，底层基于 Redis Cluster 6.2，目前部署规模是 12 个主节点（每节点 32GB 内存），总计承载约 60 万 QPS 的峰值读写流量。每年双十一期间，流量会在 15 分钟内从日常基准的 1 倍飙升到 10 倍，历史上曾出现过内存打满导致 `OOM` 触发 `key eviction`，核心商品库存缓存被驱逐，下游服务回源数据库造成雪崩。\n\n现在你需要设计一套**自动扩缩容机制**，具体要求如下：\n\n**扩容触发条件（满足任意一项即触发）**：\n- 集群内任意节点内存使用率 > 75%，持续 5 分钟\n- 单节点 QPS > 80,000，持续 2 分钟\n\n**缩容触发条件（需同时满足）**：\n- 集群所有节点内存使用率 < 30%，持续 1 小时\n- 单节点 QPS < 20,000，持续 1 小时\n- 当前不在大促窗口期\n\n**核心约束**：\n- 扩缩容过程中服务**不中断**，P99 延迟波动不超过 20%\n- 扩容完成后新节点必须实际承担流量，不能只加节点不迁数据\n- 缩容必须等槽迁移 100% 完成才能下线节点，不允许任何数据丢失\n\n请你结合这个场景，从系统架构设计到具体实现细节，完整描述这套自动扩缩容机制。面试官会特别关注：你如何保证迁移过程中的低延迟，以及你在大促场景中有哪些「教训」。",
+      "answer": "## Redis Cluster 自动扩缩容：从监控决策到槽迁移的完整设计\n\n说这道题之前，我想先说一个认知误区：很多人以为「自动扩缩容」就是「来了流量自动加机器」，以为有了这套机制大促就万事大吉了。我们在第一次做这个系统的时候也是这么想的，结果双十一当天扩容触发的时候流量已经在崩的边缘了——新节点申请到位加上槽迁移完成足足花了 22 分钟，而那波流量尖峰 15 分钟就结束了。这个教训我后面会细说。\n\n先讲系统架构。**自动扩缩容系统由三个核心层组成：监控决策层、编排执行层、流量管理层。** 这三层分工明确：监控决策层负责「什么时候该扩/缩」，编排执行层负责「怎么扩/怎么缩」，流量管理层负责「扩缩过程中请求怎么不出错」。\n\n### 第一层：监控决策层\n\n监控决策层的核心逻辑不复杂，但有几个细节是容易忽略的坑。首先是「持续时间」的设计——我们最早的版本是「一旦超阈值立刻触发」，结果每次业务做压测或者短暂流量抖动都会触发扩容，浪费资源不说，频繁的槽迁移本身也会影响性能。加上持续时间窗口（扩容 5 分钟、缩容 1 小时）之后这个问题就解决了。缩容窗口设得比扩容长得多，原因是缩容比扩容危险：扩容最坏情况是资源浪费，缩容最坏情况是数据丢失。\n\n```yaml\n# 扩容触发规则（任一满足即触发）\nscale_out_rules:\n  - metric: memory_usage_percent\n    threshold: 75          # 内存使用率 > 75%\n    duration: 5m           # 持续 5 分钟才触发，避免短暂抖动\n    scope: any_node        # 任意节点超阈值即触发\n  - metric: qps_per_node\n    threshold: 80000       # 单节点 QPS > 8 万\n    duration: 2m           # QPS 上涨快，窗口可以短一点\n    scope: any_node\n\n# 缩容触发规则（所有条件同时满足才触发）\nscale_in_rules:\n  - metric: memory_usage_percent\n    threshold: 30          # 所有节点内存 < 30%\n    duration: 60m          # 持续 1 小时，确保不是临时低谷\n    scope: all_nodes\n  - metric: qps_per_node\n    threshold: 20000\n    duration: 60m\n    scope: all_nodes\n  - condition: not_in_promotion_window  # 禁止在大促窗口期内缩容\n\n# 安全边界\nsafety_limits:\n  min_nodes: 6             # 至少保留 6 个主节点，低于此数禁止缩容\n  max_nodes: 48            # 最多 48 个节点，超出需人工审批\n  cooldown_after_scale: 10m  # 上次扩缩容后 10 分钟内不再触发\n```\n\n其次是「大促窗口期」的互斥逻辑。缩容规则里有一条 `not_in_promotion_window`，这个窗口通过运营系统写入配置中心（我们用的是 etcd），系统读取这个标志位。这样大促前运营配置了窗口期，即使流量跌下来了也不会触发缩容。\n\n第三个细节是**监控数据的来源**。我们没有自己采集，而是直接对接 Prometheus + Redis Exporter，用 PromQL 计算滑动窗口内的聚合值：\n\n```promql\n# 判断是否有节点内存持续超阈值（5分钟）\nmin_over_time(\n  (redis_memory_used_bytes / redis_memory_max_bytes)[5m:30s]\n) > 0.75\n```\n\n### 第二层：编排执行层\n\n编排执行层是整个系统最复杂的部分，因为它要处理各种异常情况：节点申请失败怎么办？迁移途中主节点宕机怎么办？迁移速度过快导致延迟飙升怎么办？\n\n**扩容流程**分五步，每步都有失败回滚逻辑：\n\n第一步，从节点池（K8s StatefulSet）申请新节点。我们预先维护了一个「热备节点池」，里面有 4 个已经启动的空 Redis 实例等待加入集群，这样省去了容器启动时间（节省约 90 秒）。节点池用完后异步补充。\n\n第二步，执行 `CLUSTER MEET <new-node-ip> <port>`，让新节点加入集群。此时新节点还没有任何槽，不承担任何读写流量。\n\n第三步，计算槽迁移计划。Redis Cluster 总共 16384 个槽，新节点加入后理论上应该均匀分配。比如原来 12 个节点每个承担 1365 个槽，加入 4 个新节点后应该变成每个节点 1024 个槽。实际上我们会根据各节点的**当前负载**而非简单平均来分配，把更多槽迁到负载低的新节点。\n\n第四步，执行槽迁移（这是最关键的一步）。Redis 官方提供了 `CLUSTER SETSLOT`、`MIGRATE` 命令来实现槽迁移，核心流程是：\n\n```bash\n# 在目标节点上标记槽为「importing」状态\nREDIS-CLI -h new-node CLUSTER SETSLOT <slot> IMPORTING <source-node-id>\n\n# 在源节点上标记槽为「migrating」状态\nREDIS-CLI -h old-node CLUSTER SETSLOT <slot> MIGRATING <target-node-id>\n\n# 批量迁移该槽内的 key（每批 100 个，控制对主线程的阻塞时间）\nREDIS-CLI -h old-node MIGRATE new-node 6379 \"\" 0 5000 \\\n  KEYS $(redis-cli -h old-node CLUSTER GETKEYSINSLOT <slot> 100)\n\n# 迁移完成后，通知所有节点更新槽归属\nREDIS-CLI -h all-nodes CLUSTER SETSLOT <slot> NODE <target-node-id>\n```\n\n迁移期间，客户端可能收到 `MOVED` 或 `ASK` 响应。`MOVED` 表示槽已经永久迁移完成，客户端应更新本地路由表；`ASK` 表示槽正在迁移中，这次请求临时转发到新节点，但下次还得继续问旧节点。Jedis Cluster 和 Lettuce 都能自动处理这两种响应，应用层无感知。\n\n**缩容流程**比扩容更危险，必须更严格：\n\n缩容的核心原则是「先迁数据，再下线节点」，而且迁移必须 100% 完成。一个常见的错误是在迁移达到 99% 时就认为「差不多了」提前下线节点——剩下那 1% 的 key 在节点关闭后就永久丢失了。我们的实现里有一个显式的完成度检查：\n\n```python\ndef is_migration_complete(source_node, slot):\n    \"\"\"确认槽内所有 key 已迁移完毕\"\"\"\n    remaining_keys = redis_cli(source_node, f\"CLUSTER GETKEYSINSLOT {slot} 1\")\n    return len(remaining_keys) == 0\n\ndef safe_scale_in(target_node):\n    # 安全前置检查\n    assert cluster.node_count() > MIN_NODES, \"节点数已达下限，拒绝缩容\"\n    assert not cluster.has_ongoing_migration(), \"有进行中的迁移任务，拒绝缩容\"\n    assert cluster.current_qps() < SAFE_QPS_THRESHOLD, \"当前 QPS 过高，拒绝缩容\"\n\n    # 迁移该节点的所有槽\n    for slot in target_node.slots:\n        dest = cluster.pick_least_loaded_node(exclude=target_node)\n        migrate_slot(target_node, dest, slot)\n        # 强制等待每个槽完全迁完再继续\n        while not is_migration_complete(target_node, slot):\n            time.sleep(1)\n\n    # 从集群移除节点（CLUSTER FORGET 必须在 60 秒内对所有节点执行，否则节点会重新加入）\n    for node in cluster.all_nodes():\n        redis_cli(node, f\"CLUSTER FORGET {target_node.id}\")\n\n    # 等待客户端路由刷新（Smart Client 收到 MOVED 后会更新本地缓存，通常 10-30 秒）\n    time.sleep(30)\n\n    # 最后才关闭 Redis 进程、释放资源\n    target_node.shutdown()\n```\n\n### 第三层：流量管理层（迁移限速）\n\n迁移过程中最大的风险是延迟抖动。`MIGRATE` 命令是同步的，执行期间 Redis 主线程会阻塞。如果单次 `MIGRATE` 批量迁移的 key 太多，或者 key 的 value 太大（比如几十 MB 的 hash），阻塞时间会很长，P99 延迟直接飙升。\n\n我们用了**自适应限速**来解决这个问题：实时监测当前的 P99 延迟，如果延迟上升超过基线的 20%，就降低迁移速率；延迟正常时，适当加速：\n\n```python\nBASELINE_P99_MS = 2.0   # 基线 P99 延迟（毫秒）\nMIN_RATE = 10           # 最低迁移速率：每秒 10 个 key\nMAX_RATE = 500          # 最高迁移速率：每秒 500 个 key\n\ndef adaptive_migration_rate(current_rate: int) -> int:\n    \"\"\"根据实时 P99 延迟动态调整迁移速率\"\"\"\n    current_p99 = get_p99_latency_ms()   # 从 Prometheus 拉取最近 30s 的 P99\n    ratio = current_p99 / BASELINE_P99_MS\n\n    if ratio > 1.20:   # P99 超基线 20%，大幅降速\n        new_rate = max(int(current_rate * 0.5), MIN_RATE)\n        logger.warning(f\"P99={current_p99:.1f}ms 超阈值，迁移速率从 {current_rate} 降至 {new_rate}\")\n        return new_rate\n    elif ratio > 1.10: # P99 轻微上升，小幅降速\n        return max(int(current_rate * 0.8), MIN_RATE)\n    elif ratio < 1.05: # P99 正常，适当加速\n        return min(int(current_rate * 1.2), MAX_RATE)\n    return current_rate\n```\n\n实测数据：在 12 节点集群（每节点约 1000 万 key）的扩容场景中，使用自适应限速后迁移期间 P99 延迟从原来的波动 +45% 降到了 +12%，满足了 20% 的约束要求。完整迁移时间从原来的 8 分钟拉长到了 14 分钟，这是用时间换延迟稳定性的合理取舍。\n\n### 大促场景的真实教训：自动扩缩容不是万能的\n\n说到最关键的一点——**自动扩缩容适合处理日常流量波动，而不适合应对大促极端峰值。** 这不是设计上的缺陷，而是物理限制：申请新节点（即使用热备池也要 30 秒）加上数据迁移（保守估计 10 分钟），整个流程最快也要 11 分钟。而大促流量可以在 5 分钟内从 1 倍涨到 10 倍。\n\n我们现在的做法是**双轨制**：大促提前 24 小时根据预案手动扩容到目标规模（比如从 12 节点扩到 24 节点），大促结束后依赖自动缩容慢慢回收资源。自动扩容只作为日常流量波动的兜底机制，不作为大促的核心保障手段。\n\n另一个教训是**大 key 迁移**。有一次迁移卡住了，一个 hash key 有 500 万个 field，大小接近 2GB，`MIGRATE` 执行超时失败。解决方案是迁移前先扫描大 key（`redis-cli --bigkeys`），超过 100MB 的 key 走特殊迁移路径：在目标节点上用 `RESTORE` 命令逐批写入，而不是用 `MIGRATE` 一次性传输。\n\n最后，**CLUSTER FORGET 的 60 秒时间窗口**是一个极容易踩的坑。Redis Cluster 的 gossip 协议会让节点重新广播自己，如果你不能在 60 秒内对所有节点执行 `CLUSTER FORGET`，被下线的节点会重新出现在集群里。解决方案是把所有节点的 `CLUSTER FORGET` 操作并发执行，而不是串行。",
+      "keyPoints": [
+        "自动扩缩容触发条件必须加「持续时间」窗口（扩容 5 分钟、缩容 1 小时），避免瞬时抖动导致频繁触发，缩容窗口要远长于扩容窗口，因为缩容操作的风险远高于扩容",
+        "槽迁移期间客户端收到 MOVED 响应表示槽已永久迁移、需更新路由缓存，收到 ASK 响应表示槽迁移进行中、临时转发但下次仍需问原节点，Jedis Cluster/Lettuce 的 Smart Client 会自动处理两者",
+        "缩容时必须等每个槽内的 key 计数归零才能继续迁下一个槽，然后在 60 秒内对所有节点并发执行 CLUSTER FORGET，否则被下线节点会通过 gossip 协议重新加入集群",
+        "迁移期间用自适应限速控制 P99 延迟：实时监测延迟比值，超基线 20% 时将迁移速率减半，延迟正常时以 1.2 倍速率逐步提速，用迁移时长换延迟稳定性",
+        "大 key（超过 100MB 的 hash/zset）不能用 MIGRATE 命令一次性迁移，因为会导致主线程长时间阻塞；需要预先扫描并走逐批 RESTORE 的特殊迁移路径",
+        "自动扩缩容适合处理日常流量波动，不适合大促极端峰值：从触发到完成最快也需要 10 分钟以上，而大促流量可以在 5 分钟内飙升 10 倍，正确做法是提前 24 小时根据预案手动扩容",
+        "预先维护「热备节点池」（4 个已启动的空 Redis 实例），省去容器启动时间（约 90 秒），大幅缩短扩容的端到端耗时",
+        "缩容必须有多重安全门禁：当前节点数 > 最小节点数、无进行中的迁移任务、当前 QPS 低于安全阈值、不在大促窗口期，全部通过才允许执行缩容"
+      ],
+      "quiz": [
+        {
+          "id": "ds-kv-storage-project-q1-quiz1",
+          "question": "Redis Cluster 在槽迁移过程中，客户端向源节点请求一个正在被迁移的 key，源节点会返回什么响应？",
+          "choices": [
+            {"id": "A", "text": "ASK 响应，附带目标节点地址，客户端临时转发此次请求，但下次仍向源节点查询"},
+            {"id": "B", "text": "MOVED 响应，附带目标节点地址，客户端更新本地路由表并永久指向新节点"},
+            {"id": "C", "text": "直接返回 nil，等待迁移完成后重试"},
+            {"id": "D", "text": "返回 WAIT 响应，阻塞客户端直到该 key 迁移完成"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "槽迁移期间，被迁移的 key 可能仍在源节点（尚未 MIGRATE），源节点会对该 key 返回 ASK 响应，指引客户端临时向目标节点发一次 ASKING + 原命令。注意「临时」二字：客户端不应更新路由缓存，下次请求同一 key 时仍从源节点问起，因为下一个 key 可能还在源节点。只有整个槽迁移完成后，源节点才会对该槽的所有请求返回 MOVED 响应，客户端这时才应永久更新路由。B 选项描述的是 MOVED 的场景（槽已永久迁移完成），是迁移完成后而非迁移中的行为。C 和 D 都不是真实的 Redis 行为，Redis 不会主动阻塞客户端。"
+        },
+        {
+          "id": "ds-kv-storage-project-q1-quiz2",
+          "question": "在执行 CLUSTER FORGET 下线一个节点时，为什么必须在 60 秒内对所有节点都执行一遍？",
+          "choices": [
+            {"id": "A", "text": "Redis Cluster 使用 gossip 协议传播节点信息，被 FORGET 的节点会在 60 秒内通过 gossip 重新广播自己，如果有节点未执行 FORGET，被下线节点会重新被接受加入集群"},
+            {"id": "B", "text": "CLUSTER FORGET 命令有 60 秒的有效期，超时后命令自动失效需要重新执行"},
+            {"id": "C", "text": "Redis 主从复制需要 60 秒同步 FORGET 操作到从节点"},
+            {"id": "D", "text": "客户端连接池需要 60 秒才能刷新路由缓存，必须等待这段时间"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 节点通过 gossip 协议定期互相交换集群状态（包括哪些节点存活、各节点负责哪些槽）。当你对节点 A 执行 `CLUSTER FORGET <target-id>` 后，节点 A 会在内存中记住「这个节点 ID 要忽略」的黑名单，但这条记录只保留 60 秒。如果在这 60 秒窗口内，有某个节点 B 还没有执行 FORGET，它就会通过 gossip 把被下线节点的信息重新广播给节点 A，导致节点 A 的黑名单失效，被下线节点「起死回生」重新加入集群。所以正确做法是对所有集群节点并发执行 CLUSTER FORGET，而不是串行慢慢执行。B、C、D 都不是真实原因。"
+        },
+        {
+          "id": "ds-kv-storage-project-q1-quiz3",
+          "question": "为什么自动扩缩容的触发条件要设置「持续时间」窗口（比如内存超阈值持续 5 分钟才触发），而不是「一超就触发」？",
+          "choices": [
+            {"id": "A", "text": "避免瞬时流量抖动、压测、或监控采集误差导致误触发，频繁扩缩容会引发不必要的数据迁移，迁移本身会增加延迟并消耗集群资源"},
+            {"id": "B", "text": "Redis Cluster 的内部机制要求等待 5 分钟才能接受新节点加入"},
+            {"id": "C", "text": "云厂商 API 有频率限制，申请节点后需要等待 5 分钟才能创建成功"},
+            {"id": "D", "text": "Prometheus 的指标采集延迟约 5 分钟，设置相同的时间窗口是为了等待数据稳定"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "「持续时间」窗口的核心目的是防止「误触发」和「抖动触发」。业务压测、突发的短暂流量尖峰、甚至监控采集的毛刺都可能导致指标短暂超阈值，如果一超就触发扩容，会造成：1) 浪费资源（扩容后流量立刻恢复，又要缩容）；2) 槽迁移本身会给集群带来额外的 CPU 和网络开销，可能让本来就在抖动的集群雪上加霜。Prometheus 的默认采集间隔是 15 秒到 1 分钟，不存在 5 分钟延迟。Redis Cluster 和云 API 也没有 5 分钟的强制等待。"
+        },
+        {
+          "id": "ds-kv-storage-project-q1-quiz4",
+          "question": "迁移一个包含 500 万个 field、总大小接近 2GB 的 hash key 时，为什么不能直接使用 MIGRATE 命令？",
+          "choices": [
+            {"id": "A", "text": "MIGRATE 命令在传输期间会阻塞源节点的主线程，迁移 2GB 数据可能需要数十秒甚至更长，导致该节点在此期间完全不可用，所有请求超时"},
+            {"id": "B", "text": "MIGRATE 命令有最大传输限制，单次不能超过 512MB"},
+            {"id": "C", "text": "hash 类型不支持 MIGRATE 命令，只有 string 类型可以跨节点迁移"},
+            {"id": "D", "text": "MIGRATE 命令不支持大 key，超过 1MB 的 key 会直接返回错误"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "MIGRATE 命令的执行模型是同步阻塞的：源节点在执行 MIGRATE 期间，主线程被完全占用，无法处理任何其他客户端请求。对于一个 2GB 的 hash，即使在千兆内网下传输也需要约 16 秒，这 16 秒内源节点上所有 key 的读写请求都会超时，等同于该节点短暂不可用。Redis 并没有限制 MIGRATE 传输大小（B 错），hash 类型完全支持 MIGRATE（C 错），也没有 1MB 的限制（D 错）。正确做法是迁移前先用 `redis-cli --bigkeys` 扫描找出大 key，对超过阈值的 key 采用在目标节点逐批 RESTORE 的方式，或者业务层面拆分这个大 key。"
+        },
+        {
+          "id": "ds-kv-storage-project-q1-quiz5",
+          "question": "以下哪种情况下缩容操作应该被系统自动拒绝执行？",
+          "choices": [
+            {"id": "A", "text": "当前有另一个槽迁移任务正在进行中"},
+            {"id": "B", "text": "目标节点的内存使用率当前为 15%（低于缩容阈值 30%）"},
+            {"id": "C", "text": "目标节点的所有从节点均已正常同步"},
+            {"id": "D", "text": "集群整体内存使用率为 25%，持续时间已超过 1 小时"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "有进行中的迁移任务时必须拒绝新的缩容操作，原因是两个并发的迁移任务会相互竞争：同一个槽可能被同时标记为 migrating 和 importing 的不同状态组合，导致客户端收到矛盾的路由指令。更严重的是，两个任务都在消耗集群资源（网络、CPU），延迟抖动会叠加放大，有可能违反 P99 约束。B 选项实际上是符合缩容条件的（内存低于阈值），不应拒绝。C 选项从节点正常同步是健康状态，更没有理由拒绝。D 选项是缩容的触发条件之一，说明可以触发而非应该拒绝。"
+        },
+        {
+          "id": "ds-kv-storage-project-q1-quiz6",
+          "question": "在大促场景（流量 15 分钟内从 1 倍涨到 10 倍）中，依赖自动扩缩容来应对流量峰值的核心问题是什么？",
+          "choices": [
+            {"id": "A", "text": "自动扩容的端到端耗时（节点申请 + 数据迁移）通常在 10 分钟以上，而大促流量上涨速度远快于此，等扩容完成时峰值已经过去或系统已经过载"},
+            {"id": "B", "text": "Redis Cluster 在扩容时必须停止所有写操作，会导致业务中断"},
+            {"id": "C", "text": "云厂商在大促期间资源紧张，无法快速申请到新节点"},
+            {"id": "D", "text": "自动扩容会触发全量数据重新分片，导致缓存命中率短期归零"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是大促场景中最本质的矛盾：自动扩容是一个需要时间的异步过程，最乐观的估计（使用热备节点池 + 低负载时迁移）也需要 10-15 分钟；而大促流量可以在 5-15 分钟内完成从正常到峰值的整个过程。等扩容完成的时候，要么峰值已经过去（扩容多余了），要么系统在这段窗口期内已经因为容量不足而出现了故障。所以大促的正确策略是「提前 24 小时手动预扩容到目标规模」，让自动扩缩容只处理大促结束后的缩容回收。B 选项是错的，Redis Cluster 扩容期间写操作不停止。C 是运营问题而非设计缺陷。D 是错的，槽迁移是渐进的，不会导致缓存命中率归零。"
+        },
+        {
+          "id": "ds-kv-storage-project-q1-quiz7",
+          "question": "自适应限速算法在检测到 P99 延迟超过基线 20% 时将迁移速率减半，这个策略的核心权衡是什么？",
+          "choices": [
+            {"id": "A", "text": "用更长的迁移时间（总时长可能增加一倍以上）换取对线上业务延迟的保护，保证扩缩容过程对用户无感知"},
+            {"id": "B", "text": "用更多的内存消耗换取更低的 CPU 使用率"},
+            {"id": "C", "text": "用更高的网络带宽消耗换取更快的迁移速度"},
+            {"id": "D", "text": "用降低集群可用性换取数据一致性保证"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "自适应限速的本质是「以空间换时间」的逆命题——「以时间换延迟」。当迁移速率降低时，MIGRATE 命令对主线程的阻塞变少，线上业务的正常请求可以更快被处理，P99 延迟恢复正常。代价是迁移总时长延长，比如原本 8 分钟能完成的迁移，在降速后可能需要 14-20 分钟。这个权衡在生产环境中通常是合理的：线上业务的延迟 SLA 是核心约束，迁移速度只是运维效率问题。实测数据也验证了这一点：降速后迁移期间 P99 延迟波动从 +45% 降到了 +12%，满足了不超过 20% 的约束。"
+        },
+        {
+          "id": "ds-kv-storage-project-q1-quiz8",
+          "question": "Redis Cluster 的槽迁移完成后，使用 Jedis Cluster 的客户端是如何感知到新的槽分布的？",
+          "choices": [
+            {"id": "A", "text": "客户端收到 MOVED 响应后，自动刷新本地槽映射缓存并重定向请求到正确节点，应用层代码无需任何修改"},
+            {"id": "B", "text": "需要调用 JedisCluster.refreshClusterSlots() 方法手动刷新，否则客户端会持续请求旧节点"},
+            {"id": "C", "text": "应用程序需要重启才能加载新的槽分布"},
+            {"id": "D", "text": "通过 ZooKeeper 监听槽变更事件，收到通知后更新本地路由表"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Jedis Cluster 和 Lettuce 等 Smart Client 内置了槽路由自动刷新机制：本地维护一份 16384 个槽到节点的映射表，发送请求时先查这张本地表确定目标节点。当目标节点返回 MOVED 响应（表示该槽已永久迁移到另一个节点），客户端立刻更新本地映射表并把请求重发到新节点，整个过程对应用层透明，不需要重启也不需要手动调用刷新方法。B 选项描述的是某些旧版本 Jedis 的一个已知 bug，正常情况下不需要手动刷新。C 和 D 都不是 Redis Cluster 的标准机制。"
+        },
+        {
+          "id": "ds-kv-storage-project-q1-quiz9",
+          "question": "在扩容时，为什么要根据各节点「当前负载」来分配新节点承担的槽数量，而不是简单地按节点数均分？",
+          "choices": [
+            {"id": "A", "text": "各槽的访问热度不均匀，热点槽流量可能是普通槽的数十倍，简单均分槽数会导致新节点承担过多热点槽，反而成为新的瓶颈"},
+            {"id": "B", "text": "Redis Cluster 协议要求每个节点的槽数必须是整数，均分可能导致除不尽"},
+            {"id": "C", "text": "新节点的硬件配置通常与旧节点不同，需要根据硬件性能调整槽分配"},
+            {"id": "D", "text": "均分槽数会导致迁移数量最大化，增加不必要的数据移动"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 的 16384 个槽的访问频率分布是极不均匀的，一个只有 100 个 key 的槽（如果这 100 个 key 是热点 key）可能承担的 QPS 是其他普通槽的数十倍。如果机械地按节点数均分槽，把大量热点槽迁到新节点，新节点可能一上线就过载，而旧节点反而轻松了，完全没有达到扩容的目的。更好的做法是根据每个槽在过去一段时间的实际 QPS 和内存占用来制定迁移计划，优先把高负载的槽迁走。D 选项说的角度有点对（减少迁移量也是一个考量），但核心原因是负载均衡而不是减少迁移数量。B 是无关的计算问题，C 通常不成立（生产中新旧节点规格相同）。"
+        },
+        {
+          "id": "ds-kv-storage-project-q1-quiz10",
+          "question": "预先维护「热备节点池」（提前启动几个空 Redis 实例等待加入集群）主要解决了扩容流程中的哪个耗时环节？",
+          "choices": [
+            {"id": "A", "text": "省去了容器/虚机的启动和 Redis 初始化时间（约 60-120 秒），让扩容的第一步（节点就绪）从分钟级变成秒级"},
+            {"id": "B", "text": "省去了槽迁移的时间，热备节点已经预先持有了部分数据"},
+            {"id": "C", "text": "省去了客户端路由刷新的等待时间"},
+            {"id": "D", "text": "省去了 CLUSTER MEET 命令的执行时间，热备节点已经是集群成员"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "扩容流程的耗时分为两大部分：节点就绪时间（申请资源、启动容器、Redis 初始化）和数据迁移时间。前者在 K8s 环境中通常需要 60-120 秒（镜像拉取 + 容器启动 + Redis 启动预热），后者取决于要迁移的 key 数量，通常是 5-15 分钟的量级。热备节点池把第一部分的耗时降到了几秒（直接从已就绪的实例池里取），但数据迁移时间完全不受影响——热备节点是空实例，没有任何数据（B 错）。CLUSTER MEET 是毫秒级操作，不是瓶颈（D 的描述不准确，热备节点在加入集群之前不应该已经是成员）。客户端路由刷新是迁移后的操作，与热备池无关（C 错）。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Redis Cluster Specification — Slot migration protocol",
+          "url": "https://redis.io/docs/reference/cluster-spec/"
+        },
+        {
+          "title": "Redis MIGRATE command documentation",
+          "url": "https://redis.io/commands/migrate/"
+        },
+        {
+          "title": "Lettuce — Cluster-aware routing and auto-reconnect",
+          "url": "https://lettuce.io/core/release/reference/#redis-cluster"
+        },
+        {
+          "title": "redis-cli --cluster reshard — resharding slots between nodes",
+          "url": "https://redis.io/docs/manual/scaling/#redis-cluster-resharding"
+        }
+      ]
+    }
+  ]
+}
