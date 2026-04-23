@@ -1,0 +1,294 @@
+import json
+import os
+
+OUTPUT_PATH = r"C:\Users\RigelShrimp\questions\public\question-packs\distributed-system\q186-quorum-nwr.json"
+os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+
+content = """Quorum NWR 是分布式存储领域一个绕不开的话题。无论是 Apache Cassandra、Amazon DynamoDB，还是 Riak，底层都用到了这套参数体系来在一致性与可用性之间做权衡。
+
+面试中关于 NWR 的问题通常分两层：第一层是「N、W、R 各是什么意思」，这层大多数候选人都能答上来；第二层是「W + R > N 为什么能保证强一致性，什么场景下应该用 QUORUM，什么场景下该用 ALL」，能把这层答清楚的候选人就少很多了。
+
+以下是一段典型的 Cassandra 集群配置，创建 keyspace 时指定了 N=3 的复制策略，读写操作使用 QUORUM 一致性级别（W=2, R=2）：
+
+```cql
+-- 创建 keyspace，NetworkTopologyStrategy 指定每个 DC 的副本数（N=3）
+CREATE KEYSPACE order_service
+  WITH replication = {
+    'class': 'NetworkTopologyStrategy',
+    'us-east-1': 3
+  };
+
+-- 写操作：QUORUM 要求 2 个节点（N/2+1=2）确认才返回成功
+INSERT INTO orders (order_id, user_id, amount, status)
+  VALUES (uuid(), 10001, 299.00, 'CREATED')
+  USING TIMESTAMP 1700000001000000;
+
+-- 读操作：QUORUM 需要 2 个节点响应，取时间戳最大的版本
+-- 驱动层配置：session.execute(stmt, consistency_level=ConsistencyLevel.QUORUM)
+SELECT * FROM orders WHERE order_id = ?;
+```
+
+请解释 N、W、R 三个参数各自的含义，以及 W + R > N 这个不等式如何从数学上保证读操作一定能读到最新写入的数据。"""
+
+answer = """Quorum NWR 出自 2007 年亚马逊发布的 Dynamo 论文，是分布式存储领域最优雅的一致性模型之一。理解它，要先理解为什么分布式存储需要把数据复制到多个节点上。单节点存储在节点宕机时会完全不可用，所以我们把同一份数据写到 N 个不同的节点上。但多副本立刻带来一个矛盾：如果写操作只写了一部分节点就返回了，读操作去读另一部分节点，可能读到旧数据。Quorum NWR 就是在这个矛盾上建立的一套数学约定，用三个整数精确控制一致性与可用性的权衡点。它最初由 Dynamo 采用，后来影响了 Apache Cassandra、Riak、ScyllaDB 等一系列分布式存储的设计。
+
+## N：副本数，持久性的基础
+
+N 是副本数（Replication Factor），表示同一份数据被复制到多少个节点上。增大 N 提高了数据的持久性和可用性——即使 N-1 个节点同时宕机，数据仍然存在。但 N 越大，存储成本越高，写入延迟也可能越大，因为需要通知更多节点。在 Cassandra 里创建 keyspace 时通过 `NetworkTopologyStrategy` 指定每个数据中心的副本数：
+
+```cql
+-- us-east-1 数据中心保存 3 个副本（N=3）
+-- 数据通过一致性哈希决定落在哪 3 个节点，不是所有节点都存
+CREATE KEYSPACE order_service
+  WITH replication = {
+    'class': 'NetworkTopologyStrategy',
+    'us-east-1': 3
+  };
+```
+
+业界通常 N=3，这个配置能容忍任意单节点故障，同时存储开销在可接受范围内。更高的 N（如 5）通常只在金融级别的强持久性需求下使用，因为它会让存储成本增加 67%。
+
+## W：写仲裁数，一致性与写延迟的权衡
+
+W 是写仲裁数（Write Quorum），表示一次写操作必须得到多少个副本节点的确认才能返回成功。协调者节点（Coordinator）把写请求同时发送给所有 N 个副本节点，等待其中至少 W 个节点回复 ACK 才向客户端返回成功，其他节点的确认在后台异步到达。W=1 意味着只要协调者节点确认就返回，速度最快但持久性最低——如果这个唯一确认的节点后来宕机，其他节点还没复制到这条数据，数据就丢了。W=N（ALL）意味着所有节点都必须确认，任何节点不可用都会导致写入失败。W=N/2+1，即 Cassandra 的 QUORUM 级别（N=3 时 W=2），是最常见的生产选择：能容忍 1 个节点故障，同时保证写入不会只落在少数节点上。
+
+## R：读仲裁数，版本比较的成本
+
+R 是读仲裁数（Read Quorum），表示一次读操作需要从多少个副本节点读取数据，然后取版本最新的那个返回给客户端。读操作不是只访问一个节点取最快的响应，而是并发访问 R 个节点，比较它们返回数据的时间戳（或向量时钟），选择最新版本。Cassandra 在后台还会把旧版本节点修复为最新版本，这个机制叫 Read Repair（读修复）——它让不一致的副本逐渐收敛，但不是 QUORUM 读取的依赖。
+
+R=1 最快，但可能读到过期数据。R=ALL 最慢但最准确，任何节点不可用都会导致读取失败。R=N/2+1（QUORUM，N=3 时 R=2）是与 W=QUORUM 配合的标准选择。
+
+## W + R > N：强一致性的数学保证
+
+这是整个 NWR 模型最核心的数学直觉。当 N=3、W=2、R=2 时，W+R=4 > N=3。让我们用具体场景理解这个不等式的意义。假设节点是 A、B、C 三个，客户端发起一次写操作「把 x 的值改为 100」，这次写操作需要 W=2 个节点确认才返回成功。假设节点 A 和 B 收到了这次写入，节点 C 由于网络延迟还没收到（或者 C 短暂宕机）。此时三个节点的数据状态是：A=100（新），B=100（新），C=42（旧）。
+
+现在客户端发起读操作，需要从 R=2 个节点读取数据。无论读操作访问哪 2 个节点的组合——{A,B}、{A,C}、{B,C}——都必然包含 A 或 B 中的至少一个。为什么？因为旧数据只在 C 这 1 个节点上，而我们需要读 R=2 个节点，2 > N-W = 3-2 = 1，所以「只包含旧数据节点」的读取组合不可能满足 R 的数量要求。读取到 A 或 B 后，系统比较多个节点返回的版本时间戳，取最新值返回——读操作一定能读到 x=100。
+
+这就是 W + R > N 保证 read-your-writes 一致性的直觉：**写仲裁集合和读仲裁集合在 N 个节点上必然有交集**，交集大小至少为 W+R-N 个节点，这些节点同时参与了最新的写入和本次读取，因此读取结果一定包含最新写入的数据。
+
+反过来，当 W + R = N 时交集可能为空。以 N=4、W=2、R=2 为例：写操作确认了节点 {A, B}，读操作恰好访问节点 {C, D}，两个集合完全不重叠，读到的是旧数据。W + R < N 则更糟糕，不一致是必然的。
+
+## 生产环境配置实战
+
+以 N=3 的 Cassandra 集群为例，不同场景下的配置选择如下。**均衡配置（W=2, R=2）**是大多数业务系统的首选：满足 W+R=4>3 的强一致性，同时容忍单节点故障，写入延迟大约是单节点延迟的 1.2-1.5 倍（等待 W=2 个节点中较慢的那个）。电商订单、用户数据、支付流水等对一致性敏感的场景都适合这个配置。
+
+**高写入持久性配置（W=3, R=1，ALL/ONE）**适合写入不频繁但对持久性极度敏感的场景，比如分布式锁的元数据。代价是任意节点不可用都会导致写失败。**最终一致性配置（W=1, R=1，ONE/ONE）**完全放弃 read-your-writes 保证，换取最低延迟和最高可用性，适用于点赞数、浏览量等允许短暂不一致的场景。
+
+用 Riak 的配置文件来表达这三种策略：
+
+```
+# riak.conf — 均衡生产配置（推荐）
+n_val = 3          # N=3，三副本
+w = quorum         # W = N/2+1 = 2，写仲裁
+r = quorum         # R = N/2+1 = 2，读仲裁
+dw = quorum        # 持久写仲裁（数据落盘后才计数，比 w 更严格）
+
+# 最终一致性配置（高吞吐低延迟场景）
+# w = one
+# r = one
+
+# 强持久性配置（金融级数据保护，牺牲写可用性）
+# w = all
+# r = one
+```
+
+## 生产踩坑：时钟不同步让 QUORUM「失效」
+
+有一个常见的误区值得单独讲：很多人以为配置了 QUORUM 就万事大吉，但 Cassandra 的「最新版本」判断依赖时间戳，而这个时间戳是写入时由客户端生成的。如果集群中不同应用服务器的时钟没有严格同步，QUORUM 读取时「取最新版本」的逻辑会选错数据——时钟走快的应用服务器写入的数据会带着较大的时间戳，即使业务语义上是「旧」数据，也会被认为是「新版本」返回。这类问题的特征是：所有节点在线，写入成功率 100%，但偶发性读到旧数据。
+
+排查第一步是检查节点间时钟偏差：
+
+```bash
+# 在 Cassandra 各节点上检查 NTP 同步状态
+$ ntpq -p
+     remote           refid      st t when poll reach   delay   offset  jitter
+==============================================================================
+*ntp1.corp.com   10.0.0.1       2 u   42   64  377    0.523   +0.341   0.128
++ntp2.corp.com   10.0.0.1       2 u   18   64  377    0.891   -1.823   0.245
+ ntp3.corp.com   .INIT.        16 u    -   64    0    0.000    0.000   0.000
+# offset 单位是毫秒，超过 ±1000ms 需要立即处理
+# ntp3 的 reach=0 说明 NTP 不可达，该节点时钟可能大幅漂移
+```
+
+如果 offset 超过 1 秒，立刻修复 NTP 配置，并用 `nodetool repair` 触发全量修复。Cassandra 4.0+ 中启用 `paxos_variant: v2` 使用 Paxos 共识协议可以彻底绕开时钟依赖。
+
+最后一个值得注意的点：NWR 模型假设节点会诚实地返回它存储的数据，不防御拜占庭故障（Byzantine Fault）——比如磁盘静默损坏（Silent Corruption）。对抗这类问题需要额外的机制，定期执行 `nodetool scrub` 检测和修复数据文件：
+
+```bash
+# 修复指定 keyspace 的数据文件静默损坏（建议低峰期执行）
+$ nodetool scrub order_service orders
+Scrubbing sstables to fix out-of-order rows...
+Scrubbing BigTableReader(path='.../nb-1-big-Data.db') (34.56 MiB)
+Scrub of orders complete: 18234 rows scrubbed, 0 rows quarantined
+```
+
+理解了这些之后，Quorum NWR 就不再是一个「背 W+R>N 就够了」的公式，而是你能灵活运用、在具体业务场景下做权衡决策的工具。"""
+
+key_points = [
+    'N（副本数）决定数据持久性上限，生产通常 N=3，可容忍任意单节点故障，同时保持合理存储开销；N=5 虽更持久但存储成本增加 67%',
+    'W（写仲裁数）是写操作必须等待确认的节点数，W=1 速度最快但节点宕机时可能丢数据，W=N/2+1（QUORUM）是兼顾可靠性与延迟的生产首选',
+    'R（读仲裁数）是读操作并发访问并比较版本的节点数，取时间戳最大的版本返回；R=N/2+1（QUORUM）配合 W=QUORUM 是强一致性的标准配置',
+    'W + R > N 保证写仲裁集合与读仲裁集合在 N 个节点中必然有非空交集（大小 ≥ W+R-N），该交集节点同时参与了最新写入和本次读取，因此读操作一定能读到最新数据',
+    'W + R = N 时写仲裁与读仲裁可能完全不重叠（交集大小可为 0），不保证强一致性；W + R < N 时交集必定不存在，读到旧数据是确定的',
+    '生产中 QUORUM/QUORUM（N=3,W=2,R=2）是最常见均衡配置，强一致性且容忍单节点故障；ALL/ONE（W=3,R=1）保证写持久性但任意节点故障导致写失败',
+    'Cassandra 的 QUORUM 一致性依赖客户端生成的时间戳来判断「最新版本」，节点间 NTP 时钟偏差超过 1 秒会导致即使配置了 QUORUM 也可能读到旧数据，表现为所有节点在线却偶发读到旧值',
+    'NWR 模型只对抗节点故障模型，不防御拜占庭故障（磁盘静默损坏等），生产环境需额外配合 nodetool scrub 和数据校验机制；Cassandra 4.0+ 可用 Paxos v2 绕开时钟依赖'
+]
+
+quiz = [
+    {
+        'id': 'ds-q186-quiz-1',
+        'question': '在 Quorum NWR 模型中，N 代表什么？',
+        'choices': [
+            {'id': 'A', 'text': '副本数，即同一份数据被复制并持久化到多少个节点上'},
+            {'id': 'B', 'text': '集群中节点的总数，包括所有角色的节点'},
+            {'id': 'C', 'text': '一次写操作需要通知的节点数量'},
+            {'id': 'D', 'text': '系统能容忍同时宕机的最大节点数'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': 'N 是副本数（Replication Factor），指同一份数据被复制并持久化到多少个节点上。B 是干扰项，N 不等于集群总节点数——集群可以有更多节点，每个 key 通过一致性哈希只落在 N 个节点上。C 描述的是 W（写仲裁数）的概念，写操作会通知所有 N 个节点，但只需 W 个确认。D「能容忍宕机的节点数」是由 N 和 W/R 共同决定的派生值，使用 QUORUM 时能容忍 floor((N-1)/2) 个节点故障，不是 N 本身的含义。'
+    },
+    {
+        'id': 'ds-q186-quiz-2',
+        'question': '以下哪种 NWR 配置能保证强一致性（read-your-writes）？',
+        'choices': [
+            {'id': 'A', 'text': 'N=5, W=3, R=3（W+R=6 > N=5）'},
+            {'id': 'B', 'text': 'N=5, W=3, R=2（W+R=5 = N=5）'},
+            {'id': 'C', 'text': 'N=5, W=2, R=2（W+R=4 < N=5）'},
+            {'id': 'D', 'text': 'N=5, W=1, R=4（W+R=5 = N=5）'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': '只有 W + R > N（严格大于）才能保证写仲裁集合和读仲裁集合必然有非空交集，从而保证强一致性。A 中 W+R=6 > 5，交集大小 ≥ 1，满足条件。B 中 W=3,R=2，W+R=5 = N=5，写了节点 {1,2,3}，读了节点 {3,4,5} 虽然有交集，但写了 {1,2,3} 而读了 {4,5,?} 时（N=5 不够）……实际上 W+R=N 时交集大小为 0，不保证有重叠。D 同理 W+R=5=N。C 中 W+R=4 < 5，肯定不满足。只有 A 严格大于才保证强一致性。'
+    },
+    {
+        'id': 'ds-q186-quiz-3',
+        'question': 'W + R > N 能保证强一致性的根本原因是什么？',
+        'choices': [
+            {'id': 'A', 'text': '写仲裁集合和读仲裁集合在 N 个节点中必然有非空交集，该交集节点同时参与了最新写入和本次读取'},
+            {'id': 'B', 'text': 'W 和 R 都超过了 N/2，形成各自的多数派，两个多数派之间互相感知数据状态'},
+            {'id': 'C', 'text': 'Quorum 协议要求协调者节点在写入后等待所有节点同步完成再返回'},
+            {'id': 'D', 'text': 'W 个写入节点会主动将数据推送给剩余 N-W 个节点，确保全量同步后读操作才被允许'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': '本质原因是集合论：写操作确认了 W 个节点有最新数据，读操作访问了 R 个节点。由于 W+R > N，这两个集合在 N 个节点的全集中必然有非空交集（交集大小 ≥ W+R-N > 0）。交集节点同时持有最新写入的数据，读操作比较所有 R 个节点返回的版本后取最新值，一定能得到最新数据。B 混淆了 Raft/Paxos 多数派概念，NWR 不要求 W>N/2（比如 N=5,W=3,R=3 时 W=3>2.5 满足，但 N=5,W=4,R=2 时 W+R=6>5 也满足）。C 描述的是 W=ALL 的行为，不是通用原理。D 完全错误，NWR 写操作不保证同步到所有节点，W<N 时其他节点异步复制。'
+    },
+    {
+        'id': 'ds-q186-quiz-4',
+        'question': '当 N=4, W=2, R=2（W+R=N）时，下列说法正确的是？',
+        'choices': [
+            {'id': 'A', 'text': '读操作可能读到旧数据，因为写仲裁集合和读仲裁集合可能完全不重叠'},
+            {'id': 'B', 'text': '系统仍然保证强一致性，因为 W=R=N/2 已经是各自的多数'},
+            {'id': 'C', 'text': '系统退化为最终一致性，数据会在几秒内自动同步到所有节点'},
+            {'id': 'D', 'text': '写操作会失败，因为 W+R 等于 N 是非法的仲裁配置'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': 'W + R = N 时，写仲裁集合（W 个节点）和读仲裁集合（R 个节点）在 N 个节点中可能刚好不重叠，交集大小 = W+R-N = 0。以 N=4,W=2,R=2 为例：写入确认了节点 {A,B}，读操作访问节点 {C,D}，两个集合完全不重叠，读到的是旧数据。写操作成功返回，读操作也成功返回，但结果是过期的，没有任何错误提示。B 错误，W=N/2 不保证强一致性，需要严格 W+R > N。C 错误，最终一致性是 NWR 底层异步复制的特性，与 W+R=N 的等式无直接关系。D 完全错误，W+R=N 是合法配置，只是不保证强一致性。'
+    },
+    {
+        'id': 'ds-q186-quiz-5',
+        'question': 'Cassandra 集群 N=3，对某个 key 查询三个副本节点，读操作配置 R=2（QUORUM），各节点返回如下：节点 A 值为 v3 时间戳 1700000003000000，节点 B 值为 v1 时间戳 1700000001000000，节点 C 值为 v3 时间戳 1700000003000000。最终返回哪个值？',
+        'choices': [
+            {'id': 'A', 'text': 'v3，取 R 个节点中时间戳最大的版本'},
+            {'id': 'B', 'text': 'v1，取最旧版本以保证写入顺序稳定'},
+            {'id': 'C', 'text': '返回错误，因为节点间数据不一致'},
+            {'id': 'D', 'text': '随机返回 v3 或 v1，因为 R=2 只读了部分节点存在不确定性'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': 'Cassandra 的 QUORUM 读取并发向所有 N=3 个节点发送请求，取最快返回的 R=2 个节点的响应进行版本比较，取时间戳最大的版本——也就是 v3（timestamp=1700000003000000）。节点 B 持有旧版本，但在后台 Cassandra 会触发 Read Repair，将 B 的数据更新为 v3。这不会报错（C 错误，数据不一致是 Cassandra 正常处理的情况）；也不会随机选择（D 错误，版本比较是确定性的）；更不会选旧版本（B 错误）。注意这里依赖时间戳，因此时钟不同步是一个潜在风险：若节点 B 的系统时钟比其他节点快，其 v1 可能会有更大的时间戳，从而被错误地当作新版本返回。'
+    },
+    {
+        'id': 'ds-q186-quiz-6',
+        'question': '在 N=3 的集群中，「W=1, R=3」和「W=3, R=1」在一致性保证上有什么区别？',
+        'choices': [
+            {'id': 'A', 'text': '无故障时一致性保证相同（W+R=4>3），但可用性不同：W=1,R=3 写入可在任意节点故障时成功；W=3,R=1 在任意节点故障时写入失败'},
+            {'id': 'B', 'text': 'W=3,R=1 比 W=1,R=3 一致性更强，因为更多节点确认了写入'},
+            {'id': 'C', 'text': '两者可用性相同，只是写入和读取的延迟分布不同'},
+            {'id': 'D', 'text': 'W=1,R=3 不满足强一致性，因为写入时只有 1 个节点立即持有数据'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': '两者都满足 W+R=4 > N=3，从 NWR 模型的数学角度来看，一致性保证是等价的——都能保证 read-your-writes。区别在于可用性和延迟分布：W=1,R=3 写入只需 1 个节点确认，速度极快，即使 2 个节点不可用也能写入，但 R=ALL=3（N=3 时）在任一节点故障时读取就失败；W=3,R=1 写入需要所有节点确认，任意节点故障写入就失败，但读取只需 1 个节点响应，读取可用性极高。B 错误，一致性由 W+R>N 的数学关系决定，不是 W 的绝对值。D 错误，W=1 虽然写时只有 1 个节点立即确认，但 R=3 读取会从所有节点比较版本，满足强一致性。'
+    },
+    {
+        'id': 'ds-q186-quiz-7',
+        'question': 'Cassandra 中 QUORUM 和 LOCAL_QUORUM 一致性级别的主要区别是什么？',
+        'choices': [
+            {'id': 'A', 'text': 'LOCAL_QUORUM 只要求本地数据中心达到仲裁数（N/2+1），适合多 DC 部署中减少跨 DC 延迟，代价是跨 DC 数据可能暂时不一致'},
+            {'id': 'B', 'text': 'LOCAL_QUORUM 比 QUORUM 一致性更强，因为它避免了跨 DC 数据不一致的问题'},
+            {'id': 'C', 'text': 'LOCAL_QUORUM 是 Cassandra 5.0 引入的新特性，早期版本只有 QUORUM'},
+            {'id': 'D', 'text': 'LOCAL_QUORUM 在单 DC 部署中会退化为 ONE 级别以优化性能'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': 'QUORUM 要求跨所有 DC 的总副本数满足全局 N/2+1，这意味着一次写入可能需要等待远端 DC 节点确认，跨洋延迟可达 100ms+。LOCAL_QUORUM 只统计本地 DC 的副本节点，当本地 DC 的副本数满足仲裁条件就返回，极大降低了写入延迟。代价是跨 DC 的一致性降弱——远端 DC 通过异步复制接收数据，可能暂时读到旧数据。B 错误，LOCAL_QUORUM 一致性反而弱于 QUORUM，因为它不等待跨 DC 确认，是以降低一致性换低延迟的权衡。C 错误，LOCAL_QUORUM 很早就支持（Cassandra 1.x 时代就有）。D 错误，LOCAL_QUORUM 在单 DC 部署中等同于 QUORUM，不会退化为 ONE。'
+    },
+    {
+        'id': 'ds-q186-quiz-8',
+        'question': '电商订单系统使用 Cassandra（N=3），要求「下单后立即能查到订单」（read-your-writes），同时希望在单节点故障时写入仍然可用。最合适的 NWR 配置是？',
+        'choices': [
+            {'id': 'A', 'text': 'W=2（QUORUM），R=2（QUORUM）'},
+            {'id': 'B', 'text': 'W=1（ONE），R=3（ALL）'},
+            {'id': 'C', 'text': 'W=3（ALL），R=1（ONE）'},
+            {'id': 'D', 'text': 'W=1（ONE），R=1（ONE）'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': '分析各选项：A 满足 W+R=4>3（强一致性，保证「立即可查」），W=2 表示 1 个节点故障仍可写入（满足「单节点故障写入可用」），R=2 表示 1 个节点故障仍可读取，完全符合需求。B 虽满足 W+R=4>3，但 R=ALL=3 意味着任意节点故障读取就失败，不满足高可用要求。C 满足 W+R=4>3，但 W=ALL=3 意味着任意节点故障写入就失败，不满足「单节点故障写入可用」的要求。D 是 W+R=2<3，不满足强一致性，「下单后立即能查到」无法保证。因此 A 是唯一同时满足强一致性和单节点故障容忍的配置。'
+    },
+    {
+        'id': 'ds-q186-quiz-9',
+        'question': 'N=3, W=2, R=2 的 Cassandra 集群发生网络分区，分成「2节点组（A,B）」和「1节点组（C）」，以下说法正确的是？',
+        'choices': [
+            {'id': 'A', 'text': '「2节点组」能正常处理读写请求（W=2,R=2 在本组均可满足），「1节点组」无法处理任何读写请求'},
+            {'id': 'B', 'text': '两个分区组都无法处理请求，系统完全不可用以保护数据一致性'},
+            {'id': 'C', 'text': '「1节点组」可以处理读请求，因为 QUORUM 在分区时会自动降级为 ONE'},
+            {'id': 'D', 'text': '两个分区组各自独立处理请求，分区恢复时通过向量时钟自动合并冲突'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': '这体现了 NWR 的 CAP 权衡实践（CP 倾向）。「2节点组」有 A 和 B 两个节点，W=2 和 R=2 都能满足，因此可以正常提供服务，牺牲了对 C 节点数据的全局可见性。「1节点组」只有 C 一个节点，无法满足 W=2 或 R=2，所有请求会超时或返回 UnavailableException——这是正确行为，拒绝服务而非返回可能过期的数据，保证了 CP。C 错误，Cassandra 的 QUORUM 配置不会因为分区自动降级为 ONE，降级是有意为之需要代码层面处理（如 Cassandra driver 的 retry policy）。D 描述的是最终一致性系统（如配置了 ONE/ONE）的行为，QUORUM/QUORUM 配置不会允许两个分区各自独立写入。'
+    },
+    {
+        'id': 'ds-q186-quiz-10',
+        'question': '线上 Cassandra 集群（N=3, QUORUM/QUORUM）偶发读取到旧数据，监控显示所有节点在线，写入成功率 100%，最可能的根本原因是？',
+        'choices': [
+            {'id': 'A', 'text': '集群节点间 NTP 时钟偏差过大，导致 QUORUM 读取时以错误的时间戳判定「最新版本」'},
+            {'id': 'B', 'text': 'QUORUM 级别本身不能保证强一致性，应该改用 ALL 级别'},
+            {'id': 'C', 'text': 'Read Repair 机制存在延迟，属于 QUORUM 的正常行为，无需处理'},
+            {'id': 'D', 'text': 'Cassandra 驱动版本过旧导致一致性级别没有正确传递给服务端'}
+        ],
+        'correctAnswer': 'A',
+        'explanation': '这是生产中最常见的 QUORUM「失效」案例。Cassandra 使用客户端时间戳判断哪个副本数据更新。当应用服务器时钟不同步时（某台服务器时间比其他服务器快 2 秒），它写入的数据会带着较大时间戳，即使业务语义上是「旧」数据，也会被 QUORUM 读取认为是「新版本」。所有节点在线、写入成功率 100% 恰恰是时钟问题的特征——节点本身没有故障，只是版本仲裁出错。排查方法：在各节点执行 ntpq -p，检查 offset 是否超过 ±1000ms。B 错误，QUORUM（W+R>N）在正确时钟同步下能保证强一致性。C 错误，Read Repair 是后台修复机制，QUORUM 读取本身不依赖 Read Repair 完成才返回正确结果。D 概率极低，且通常有更明显的错误表现如写入成功率下降。'
+    }
+]
+
+references = [
+    {'title': 'Amazon Dynamo: Highly Available Key-value Store (SOSP 2007)', 'url': 'https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf'},
+    {'title': 'Apache Cassandra — Dynamo Architecture & Replication', 'url': 'https://cassandra.apache.org/doc/stable/cassandra/architecture/dynamo.html'},
+    {'title': 'Werner Vogels — Eventually Consistent (All Things Distributed)', 'url': 'https://www.allthingsdistributed.com/2007/12/eventually_consistent.html'}
+]
+
+data = {
+    'id': 'distributed-system-q186',
+    'name': 'Quorum NWR 参数含义与配置',
+    'domain': 'distributed-system',
+    'description': '深入解析分布式存储中 Quorum NWR 模型的 N、W、R 三个参数含义、W+R>N 数学保证以及生产环境配置策略',
+    'version': '1.0.0',
+    'questions': [
+        {
+            'id': 'ds-q186',
+            'domain': 'distributed-system',
+            'type': 'principle',
+            'difficulty': 3,
+            'tags': ['quorum', 'consistency', 'replication', 'distributed-storage', 'cassandra', 'dynamo'],
+            'title': '分布式存储中的 Quorum NWR 是什么，N、W、R 三个参数分别代表什么',
+            'content': content,
+            'answer': answer,
+            'keyPoints': key_points,
+            'quiz': quiz,
+            'references': references
+        }
+    ]
+}
+
+with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+
+print(f"Generated: {OUTPUT_PATH}")
+print(f"File size: {os.path.getsize(OUTPUT_PATH)} bytes")

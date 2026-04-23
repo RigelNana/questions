@@ -1,0 +1,156 @@
+{
+  "id": "distributed-system-q190",
+  "name": "设计一个支持多种一致性级别的读写系统",
+  "domain": "distributed-system",
+  "description": "开放设计题：如何在同一套分布式系统中同时支持强一致性、最终一致性和因果一致性的读写路径，涵盖 CAP 权衡、Quorum 机制、版本向量与实际落地方案。",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-q190",
+      "domain": "distributed-system",
+      "type": "open-ended",
+      "difficulty": 4,
+      "tags": ["consistency", "distributed-system", "CAP", "quorum", "eventual-consistency", "strong-consistency", "causal-consistency", "system-design"],
+      "title": "设计一个支持多种一致性级别的读写系统",
+      "content": "## 场景背景\n\n你所在的团队正在为一个大型电商平台构建统一的数据访问层（Data Access Layer）。这个平台同时承载着多种业务场景，对数据一致性的要求差异极大：\n\n**库存扣减**：促销活动期间，10 万 QPS 的并发写入，必须保证不超卖，容忍 50ms 以内的写延迟。\n\n**用户行为记录**（浏览历史、收藏、加购）：写入量极大，读取时允许短暂的数据延迟（几秒到几分钟），但用户自己刚做的操作必须立即能看到（「我刚收藏了，刷新后消失了」是不可接受的）。\n\n**商品评论**：跨地域部署，允许不同用户短时间内看到不同版本的评论列表，但同一用户的评论必须按因果顺序呈现（「我先发了一条评论，回复里的引用内容不能比原评论先出现」）。\n\n当前架构是一套 etcd + 自研 key-value 存储的混合体，但 etcd 撑不住高并发写，自研 KV 又没有一致性保证，整个系统的一致性模型混乱不清，时常出现下面的报错：\n\n```\n[WARN] 2024-03-15 14:23:07 inventory-service: read stale data, expected version=1047 got version=1031\n[ERROR] 2024-03-15 14:23:09 order-service: oversell detected, sku_id=88291, sold=152, stock=100\n[WARN] 2024-03-15 14:23:11 review-service: causal violation, reply_id=9921 arrived before parent_id=9920\n```\n\n**你的任务**：作为这个项目的技术负责人，请设计一套统一的读写系统，能够在同一套基础设施上支持三种一致性级别：强一致性（Strong Consistency）、因果一致性（Causal Consistency）和最终一致性（Eventual Consistency）。重点阐述：\n\n1. 每种一致性级别在这套系统里是如何实现的，核心机制是什么？\n2. 客户端如何声明自己需要哪种一致性级别，系统如何路由请求？\n3. 面对网络分区，每种级别各自如何降级？\n4. 如何用 metrics 验证一致性保证没有被打破？",
+      "answer": "## 先把一致性模型说清楚，再谈实现\n\n很多工程师一听到「一致性」就直接跳到「用 Raft 就行了」，但这个电商场景的问题恰恰不是「选哪个算法」，而是「不同业务对一致性的需求根本不是同一个东西」。CAP 定理说的 Consistency 指的是线性一致性（Linearizability），而业务说的「一致性」涵盖了从「我刚写的数据立刻能读到」（read-your-writes）到「全局所有节点立刻同步」（linearizability）到「不同用户看到的顺序可以不同但因果关系不能乱」（causal consistency）的一整个谱系。\n\n在正式设计之前，我们先把三种级别用形式化方式钉牢：**强一致性**意味着所有读操作总是返回最新写入的值，无论读哪个节点，表现得好像整个系统只有一个副本。**因果一致性**的保证是：如果操作 A 在因果上先于操作 B（A 发生在 B 之前，或者 A 的结果被 B 依赖），那么所有节点都必须按 A→B 的顺序看到它们。**最终一致性**只保证在没有新写入的情况下，所有副本最终会收敛到同一状态，中间可以有任意时间的不一致窗口。\n\n## 核心架构：三路写入，两层路由\n\n整套系统建立在一个三节点（或五节点）的副本组之上，每个节点维护相同的物理存储（这里选用 RocksDB 作为底层引擎，因为它的 WriteBatch 和 ColumnFamily 特性非常适合这个场景）。关键设计是：**存储层是统一的，一致性语义由协调层在请求路径上动态注入**。\n\n```\n客户端 SDK\n    │  ConsistencyLevel: STRONG / CAUSAL / EVENTUAL\n    ▼\n协调节点（Coordinator）\n    ├── STRONG  → Raft Leader + Quorum Read\n    ├── CAUSAL  → 版本向量追踪 + 因果依赖检查\n    └── EVENTUAL → 异步多主写入 + Anti-entropy 修复\n    ▼\n副本节点 × 3（RocksDB + WAL）\n```\n\n客户端 SDK 在每个请求头里携带一个 `X-Consistency-Level` 字段，协调节点根据这个字段选择不同的执行路径。这个设计的核心好处是：同一个 key 可以被不同业务以不同一致性级别访问，比如库存服务用 STRONG 写、分析服务用 EVENTUAL 读，它们操作的是同一条记录，但走的是完全不同的执行路径。\n\n## 强一致性：Raft + Quorum Read 的正确姿势\n\n**写路径**很直接：所有写请求都路由到 Raft Leader，经过 Log Replication 后，当 `(N/2 + 1)` 个节点确认写入 WAL，Leader 才 commit 并响应客户端。以三节点为例，`W=2` 就够了。这是标准 Raft，没什么新奇的。\n\n**读路径**才是强一致性的陷阱所在。很多人以为「从 Leader 读就是强一致」，这是错的。Leader 可能发生网络分区后仍然认为自己是 Leader（旧 Leader），此时读到的数据实际上是 stale 的。正确做法是 **ReadIndex 机制**：Leader 在响应读请求前，先向多数节点广播一个心跳，确认自己仍然是 Leader，然后等本地 apply index 追上 commit index，再从状态机读。etcd 的 `linearizable read` 就是这么实现的。\n\n```go\n// 伪代码：强一致性读的执行流程\nfunc (s *Server) StrongRead(ctx context.Context, key string) ([]byte, error) {\n    // 1. 向集群广播 ReadIndex 请求，获取当前 commit index\n    readIndex, err := s.raft.ReadIndex(ctx)\n    if err != nil {\n        return nil, fmt.Errorf(\"readindex failed: %w\", err) // 可能是网络分区\n    }\n    \n    // 2. 等待本地 apply index 至少追上 readIndex\n    if err := s.waitApplied(ctx, readIndex); err != nil {\n        return nil, err\n    }\n    \n    // 3. 从本地状态机读取（此时保证是最新值）\n    return s.storage.Get(key)\n}\n```\n\n在库存扣减的场景里，写入延迟实测大概是这样：\n\n```\n# 三节点，同机房，强一致性写入延迟分布（wrk 压测，1000 并发）\np50:  8.2ms\np95: 18.7ms\np99: 31.4ms\np999: 89.2ms   ← 网络抖动导致的尾延迟\n```\n\n31ms 的 P99 在大多数场景是可以接受的，但如果业务方要求 P99 < 20ms，就需要考虑把强一致性写入拆成「先写缓冲，批量提交」——但那就不是严格的强一致性了，是一个工程权衡。\n\n## 因果一致性：版本向量（Version Vector）是关键\n\n因果一致性比很多人想象的难实现。它不像强一致性那样有 Raft 这种通用框架，必须靠客户端配合追踪因果依赖。\n\n核心数据结构是**版本向量（Version Vector，VV）**：每个节点维护一个向量 `{node_id → logical_clock}`，记录「我见过的每个节点的最新写入时间戳」。当客户端写入一条数据，服务端把当前节点的向量随响应返回；客户端把这个向量存在 session 里，下次请求时带上。服务端收到请求后，检查本地 VV 是否已经覆盖了客户端 VV 的所有分量——如果没有，说明客户端依赖的因果前驱还没同步到本节点，需要等待或重定向到一个更新的节点。\n\n```python\n# 客户端 SDK 伪代码：因果一致性会话\nclass CausalSession:\n    def __init__(self):\n        self.version_vector = {}  # {node_id: clock}\n    \n    def write(self, key, value):\n        resp = client.put(key, value,\n            consistency=\"CAUSAL\",\n            client_vv=self.version_vector)  # 携带当前已知 VV\n        # 更新本地 VV：取每个分量的最大值\n        for node, clock in resp.server_vv.items():\n            self.version_vector[node] = max(\n                self.version_vector.get(node, 0), clock)\n    \n    def read(self, key):\n        # 读时也带上 VV，确保服务端满足因果依赖\n        return client.get(key,\n            consistency=\"CAUSAL\",\n            client_vv=self.version_vector)\n```\n\n对于评论系统的场景，假设用户 A 在节点 1 发了评论 P（VV 变成 `{N1:5}`），用户 B 在节点 2 看到了 P 后发了回复 R（B 的 session VV 是 `{N1:5, N2:3}`）。当任何用户读取 R 时，系统必须保证 P 也已经可见——因为 R 的 VV 声明了「我依赖 N1 的第 5 个写入」。如果某个副本节点的 N1 时钟还停在 4，它就不能响应这个读请求，必须让客户端重试或等待同步。\n\n版本向量的一个实际问题是向量大小会随节点数增长。三节点系统的 VV 只有三个整数（24 字节），完全可以接受；但如果是几百个微服务节点，就需要用 **Dotted Version Vectors** 或者 **Interval Tree Clocks** 来压缩。\n\n## 最终一致性：异步复制 + Anti-entropy\n\n用户行为记录这类场景对延迟极敏感，不能让每次写入都等 Quorum。这里采用**多主异步复制**：任意节点都可以接受写入，写入本地后立即响应客户端（P50 通常 < 2ms），然后通过后台 gossip 协议异步同步到其他节点。\n\n但是「用户自己刚做的操作必须立即能看到」这个需求需要特殊处理——这是最终一致性里的 **read-your-writes（读己所写）**保证，本质上是一种特殊的因果一致性。实现方式是：客户端写入成功后，把对应的 `(key, write_timestamp)` 存在会话 token 里（可以放 cookie 或请求头），读取时如果路由到一个旧节点，协调层检测到节点时间戳落后于 token 里记录的写入时间戳，就把请求重定向到刚才接受写入的那个节点，或者等待该节点同步完成。\n\n节点间的同步通过 Anti-entropy 保证最终收敛。每隔 5 秒，两个节点互相交换 Merkle Tree 的根哈希，如果不一致就递归找出差异分片，发起修复。\n\n```\n# Anti-entropy 日志示例（节点间数据修复）\n2024-03-15 14:30:01 [anti-entropy] N1→N2 merkle diff: 3 segments diverged\n2024-03-15 14:30:02 [anti-entropy] syncing segment [user_behavior:0000-1FFF], 142 keys\n2024-03-15 14:30:02 [anti-entropy] syncing segment [user_behavior:A000-BFFF], 89 keys\n2024-03-15 14:30:03 [anti-entropy] sync complete, N2 lag was 4.2s\n```\n\n最终一致性的不一致窗口在正常网络下大概是 2-5 秒，网络抖动时可能延长到 30 秒。这对浏览历史、收藏记录这类场景完全可以接受。\n\n## 网络分区时的降级策略\n\n这是整个设计最需要工程判断的地方。CAP 定理说在网络分区时必须在一致性（C）和可用性（A）之间二选一，但「二选一」不代表「全有或全无」——不同业务对 C 和 A 的权重完全不同。\n\n强一致性路径在分区时，如果 Raft 无法形成多数派（比如三节点丢失两个），Leader 会拒绝写入并返回 `ErrLeaderNotFound`，系统完全不可用。这对库存来说是正确的——超卖的代价比不可用大得多。\n\n因果一致性路径在分区时，如果客户端的 VV 依赖的节点不可达，可以降级为「本地节点尽力提供服务，但在响应头里标记 `X-Consistency-Degraded: true`」，让调用方自行决定是否接受这个结果。评论系统可以接受临时的因果顺序混乱，但必须记录下来，分区恢复后触发因果修复流程。\n\n最终一致性路径对分区几乎透明，写入本地节点就返回，分区恢复后自动收敛。\n\n## 用 Metrics 验证一致性没有被打破\n\n「一致性保证」不能只是一个口头承诺，必须可观测、可告警。这里设计三组核心 metrics：\n\n强一致性健康度通过 **stale read rate** 来衡量：在写入一个值后的 100ms 内，从所有节点发起读取，统计返回旧值的比例。正常情况应该是 0；一旦出现非零值，说明 ReadIndex 机制有 bug 或者有节点绕过了一致性检查。\n\n因果一致性健康度通过 **causal violation count** 来衡量：在应用层注入因果关系追踪埋点，检测「R 依赖 P，但 P 尚未可见时 R 被读到」的次数。这需要在评论服务的读路径里加一个因果完整性校验器。\n\n```\n# Prometheus metrics 示例\ndistributed_system_strong_stale_reads_total{cluster=\"prod\",dc=\"cn-north\"} 0\ndistributed_system_causal_violations_total{service=\"review\",dc=\"cn-north\"} 3\ndistributed_system_eventual_convergence_lag_seconds{p99=\"4.7\",dc=\"cn-north\"} 4.7\n```\n\n`causal_violations_total` 出现非零值后应该立即告警，并触发自动的因果依赖回放。\n\n## 落地建议：不要从零造轮子\n\n这整套方案听起来很复杂，但在实际工程中，强一致性路径直接用 etcd 或 TiKV 就行（它们已经实现了正确的 Raft + ReadIndex），不需要自己写 Raft。因果一致性的版本向量追踪可以在客户端 SDK 里实现，服务端只需要存储和校验 VV，改动量不大。最终一致性路径可以用 Cassandra 或 DynamoDB 风格的多主复制，配上 Merkle Tree Anti-entropy。\n\n整套系统的协调层（根据 `X-Consistency-Level` 路由请求的那一层）大约需要 2000 行 Go 代码，是这个方案里唯一需要认真自研的部分。剩下的可以全部站在巨人肩膀上。",
+      "keyPoints": [
+        "强一致性读不能简单地「从 Leader 读」，必须使用 ReadIndex 机制——Leader 先广播心跳确认自己仍是合法 Leader，等本地 apply index 追上 commit index 后才能响应，否则网络分区后的旧 Leader 会返回 stale 数据",
+        "因果一致性的核心数据结构是版本向量（Version Vector），客户端在 session 中持续追踪「我见过的每个节点的最新写入时间戳」，读写请求都携带 VV，服务端检查本地 VV 是否已覆盖客户端 VV 的所有分量来决定是否能响应",
+        "最终一致性中「读己所写」是一种特殊的因果保证，需要把写入时间戳存入会话 token，读取时协调层检测目标节点是否满足该时间戳要求，否则重定向或等待",
+        "网络分区时不同一致性级别的降级策略差异巨大：强一致性应直接拒绝服务（宁可不可用也不返回错误数据），因果一致性可以降级并在响应头里标记 Degraded 状态，最终一致性对分区几乎透明",
+        "节点间数据修复依赖 Anti-entropy + Merkle Tree：两节点互相交换根哈希，递归定位差异分片后发起修复，正常网络下收敛延迟在 2-5 秒，这个延迟必须通过 convergence_lag 指标持续监控",
+        "同一个 key 可以被不同业务以不同一致性级别访问（库存用 STRONG 写，分析用 EVENTUAL 读），关键是协调层根据请求头里的 ConsistencyLevel 字段选择执行路径，存储层统一不感知一致性语义",
+        "一致性保证必须可观测：用 stale_read_rate 验证强一致性、用 causal_violations_total 验证因果一致性、用 convergence_lag 监控最终一致性收敛窗口，任何非零的 causal_violations 都应立即触发告警和因果修复流程",
+        "工程落地时强一致性直接复用 etcd 或 TiKV（Raft + ReadIndex 已在生产中验证），最终一致性复用 Cassandra 多主复制，需要自研的只有根据 ConsistencyLevel 路由请求的协调层，约 2000 行 Go 代码"
+      ],
+      "quiz": [
+        {
+          "id": "ds-q190-quiz-01",
+          "question": "在本系统设计中，强一致性、因果一致性、最终一致性三者的「可用性」从高到低的正确排序是什么？",
+          "choices": [
+            {"id": "A", "text": "强一致性 > 因果一致性 > 最终一致性"},
+            {"id": "B", "text": "最终一致性 > 因果一致性 > 强一致性"},
+            {"id": "C", "text": "因果一致性 > 最终一致性 > 强一致性"},
+            {"id": "D", "text": "三者可用性相同，只是性能不同"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "根据 CAP 定理，在网络分区时一致性越强，可用性越低。强一致性（Raft Quorum）在无法形成多数派时会直接拒绝服务；因果一致性可以降级运行并标记 Degraded；最终一致性几乎不感知分区，写入本地即返回。因此可用性从高到低是：最终 > 因果 > 强。选 A 完全相反；选 C 颠倒了因果和最终；选 D 混淆了性能和可用性，可用性描述的是分区故障时能否响应，和正常路径的性能延迟是两个维度。"
+        },
+        {
+          "id": "ds-q190-quiz-02",
+          "question": "为什么「直接从 Raft Leader 读取数据」不能保证强一致性（线性一致性）？",
+          "choices": [
+            {"id": "A", "text": "Leader 的磁盘 IO 比 Follower 慢，读取延迟更高"},
+            {"id": "B", "text": "网络分区后旧 Leader 可能不知道自己已被替换，仍然响应读请求，返回过期数据"},
+            {"id": "C", "text": "Leader 节点上的 RocksDB 会有缓存不一致问题"},
+            {"id": "D", "text": "Raft 协议规定 Leader 只能处理写请求，不能直接处理读请求"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Raft 里一个非常经典的陷阱。当网络发生分区，原 Leader 被隔离在少数派分区时，它可能因为没有收到足够多的心跳超时而还没意识到自己已经失去 Leader 身份，同时新的 Leader 已经在多数派分区中产生并接受了新的写入。此时如果客户端仍然从旧 Leader 读取，就会拿到 stale 数据，破坏线性一致性。ReadIndex 机制通过让 Leader 在响应读取前先广播心跳确认自己仍然是合法 Leader 来解决这个问题。选 A 和 C 描述的是不相关的性能问题；选 D 是错的，Raft 并没有禁止 Leader 处理读请求，只是需要额外机制保证。"
+        },
+        {
+          "id": "ds-q190-quiz-03",
+          "question": "版本向量（Version Vector）在因果一致性实现中的核心作用是什么？",
+          "choices": [
+            {"id": "A", "text": "记录每个 key 的修改历史，用于冲突解决"},
+            {"id": "B", "text": "追踪「客户端见过的每个节点的最新逻辑时间戳」，让服务端判断是否满足因果前驱条件"},
+            {"id": "C", "text": "替代 Lamport 时钟，为全局操作提供全序排列"},
+            {"id": "D", "text": "压缩 WAL 日志，减少节点间同步的数据量"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "版本向量是一个 `{node_id → logical_clock}` 的映射，每个分量记录「我最后一次从该节点看到的写入时间戳」。客户端在 session 中维护这个向量，每次写入后用服务端返回的 VV 更新本地 VV（取每个分量的最大值）。读取时携带 VV，服务端检查自己的本地 VV 是否已覆盖客户端 VV 的所有分量——如果某个分量落后，说明客户端依赖的因果前驱还没同步到本节点，不能响应。选 A 描述的是 MVCC 的功能；选 C 是错的，VV 提供偏序而非全序；选 D 完全无关。"
+        },
+        {
+          "id": "ds-q190-quiz-04",
+          "question": "最终一致性路径中，「读己所写（Read-Your-Writes）」是如何在不牺牲写入性能的前提下实现的？",
+          "choices": [
+            {"id": "A", "text": "所有读请求都路由到最近一次写入的节点，绕过其他副本"},
+            {"id": "B", "text": "写入成功后把 (key, write_timestamp) 存入客户端会话 token，读取时协调层检测目标节点时间戳，若落后则重定向或等待"},
+            {"id": "C", "text": "对同一个 session 的读写请求加分布式锁，保证同一时间只有一个请求在处理"},
+            {"id": "D", "text": "把所有写入缓存在 Redis 中，读取时先查 Redis 再查底层存储"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "读己所写的核心挑战是：异步复制的写入很快（< 2ms），但复制到其他节点需要几秒，如果用户的下一个读取请求被路由到还没同步完的节点就会「看不到自己的写入」。解决方案是在客户端 session 或 cookie 里记录写入时间戳，读取时协调层拿这个时间戳与目标节点的本地时钟比较，如果节点落后就重定向到接受写入的原始节点（该节点一定有最新数据）。这样写入路径完全不变，只有「立即读」的路径需要额外检查。选 A 会造成热点；选 C 引入全局锁会彻底破坏性能；选 D 引入了额外依赖且没有解决时间戳比较的问题。"
+        },
+        {
+          "id": "ds-q190-quiz-05",
+          "question": "观察以下 Prometheus 指标输出，哪个结论是正确的？\n```\ndistributed_system_strong_stale_reads_total{dc=\"cn-north\"} 0\ndistributed_system_causal_violations_total{service=\"review\"} 3\ndistributed_system_eventual_convergence_lag_seconds{p99} 4.7\n```",
+          "choices": [
+            {"id": "A", "text": "系统运行正常，所有一致性级别都在预期范围内"},
+            {"id": "B", "text": "强一致性和最终一致性正常，但因果一致性出现了 3 次违规，需要立即告警和调查"},
+            {"id": "C", "text": "最终一致性的 4.7 秒收敛延迟说明系统有严重问题，需要立即优化"},
+            {"id": "D", "text": "causal_violations_total=3 是正常的容忍值，因果一致性允许少量违规"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "三个指标分别对应三种一致性级别的健康度。strong_stale_reads=0 表示强一致性正常工作。eventual_convergence_lag p99=4.7s 在最终一致性的预期范围内（正常 2-5 秒，网络抖动时可达 30 秒），不需要告警。但 causal_violations_total=3 是严重问题——因果一致性违规意味着系统向用户呈现了因果顺序混乱的数据（比如回复比原评论先出现），这是不可接受的，必须立即告警并触发因果修复流程。选 A 忽视了因果违规；选 C 对最终一致性的延迟标准过于严格；选 D 完全错误，因果违规不存在「容忍值」，任何非零值都是 bug。"
+        },
+        {
+          "id": "ds-q190-quiz-06",
+          "question": "以下关于 Anti-entropy 和 Merkle Tree 的描述，哪个是错误的？",
+          "choices": [
+            {"id": "A", "text": "Merkle Tree 的叶子节点存储数据块的哈希值，内部节点存储子节点哈希的哈希"},
+            {"id": "B", "text": "两个节点比较根哈希不一致后，可以通过递归比较子树来定位差异分片，而不需要传输全量数据"},
+            {"id": "C", "text": "Anti-entropy 可以保证最终一致性，同时也能保证强一致性"},
+            {"id": "D", "text": "Anti-entropy 修复只会在分区恢复后触发，正常运行时不需要"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Anti-entropy 是一种后台的异步修复机制，两个节点定期（比如每 5 秒）比较 Merkle Tree 根哈希，发现差异后同步缺失数据。这个机制只能保证「最终」一致——在修复完成之前，节点间可能存在不一致窗口。它完全无法保证强一致性，因为强一致性要求「任意时刻的读取都返回最新值」，而 Anti-entropy 的修复是异步的，修复期间仍然会有 stale read。选 D 也是错误的——Anti-entropy 通常在后台持续运行，而不仅仅在分区恢复后触发，它的目的是持续修复可能由于网络抖动、节点重启等原因导致的轻微不一致，是 cassandra 等系统日常运作的一部分。"
+        },
+        {
+          "id": "ds-q190-quiz-07",
+          "question": "库存扣减业务应该选择哪种一致性级别，原因是什么？",
+          "choices": [
+            {"id": "A", "text": "最终一致性，因为它写入延迟最低，能支持 10 万 QPS"},
+            {"id": "B", "text": "因果一致性，因为只需要保证同一用户的操作顺序正确即可"},
+            {"id": "C", "text": "强一致性，因为超卖的代价远大于短暂不可用的代价，宁可拒绝服务也不能出错"},
+            {"id": "D", "text": "根据促销活动的规模动态切换，高峰期用最终一致性，平时用强一致性"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "库存扣减是一个典型的「宁可不可用，不可不正确」的场景。一旦使用最终一致性，在几秒到几十秒的不一致窗口内，多个请求可能都读到「库存充足」，同时扣减，导致超卖。电商超卖的业务损失（赔付、投诉、品牌伤害）通常远大于几秒钟的服务降级。选 A 的逻辑是错的——高 QPS 不是放弃一致性的理由，TiKV 等存储在强一致性模式下也能支撑很高的 QPS。选 B 的因果一致性不够——库存扣减需要跨用户的全局一致，而因果一致性只保证单 session 内的顺序，两个并发用户仍然可能超卖。选 D 在高峰期切换为最终一致性恰恰是最危险的时候用最弱的一致性。"
+        },
+        {
+          "id": "ds-q190-quiz-08",
+          "question": "在生产环境中，强一致性写入出现 P999 延迟飙到 500ms，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "RocksDB 的 LSM-tree compaction 阻塞了写入路径"},
+            {"id": "B", "text": "Raft Log Replication 中某个 Follower 响应慢，拖慢了 Quorum 确认"},
+            {"id": "C", "text": "客户端 SDK 的版本向量计算消耗了大量 CPU"},
+            {"id": "D", "text": "Merkle Tree 的 Anti-entropy 扫描占用了大量磁盘 IO"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "强一致性写入需要等待 `(N/2+1)` 个节点确认，三节点集群需要等 2 个节点。如果其中一个 Follower 因为网络抖动、GC pause、磁盘写慢等原因响应延迟，Leader 会等到 2 个确认才能 commit，这直接体现在 P999 尾延迟上。P999 飙高而 P50/P99 正常，正是「单个慢节点影响尾延迟」的典型特征。排查方向：查看各节点的心跳延迟 metrics，找出落后的 Follower；检查该节点的 IO 等待和 GC 日志。选 A 的 compaction 会影响写入吞吐但不会只影响 P999；选 C 是最终一致性路径的问题，强一致性不用 VV；选 D 是最终一致性的后台任务，与强一致性写路径无关。"
+        },
+        {
+          "id": "ds-q190-quiz-09",
+          "question": "如果版本向量（VV）中的节点数随微服务扩张增长到 500 个，每个请求携带的 VV 会变成多大，应该如何优化？",
+          "choices": [
+            {"id": "A", "text": "500 个节点的 VV 是 500 × 8 = 4000 字节，可以接受，不需要优化"},
+            {"id": "B", "text": "可以用 Bloom Filter 替代 VV，把空间压缩到固定大小"},
+            {"id": "C", "text": "使用 Dotted Version Vectors 或 Interval Tree Clocks 等紧凑表示，或者把 VV 存在服务端以 token ID 代替"},
+            {"id": "D", "text": "限制版本向量只追踪最近 10 个操作，忘记更早的因果依赖"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "500 节点的 VV 大小是 500 × (node_id + clock) ≈ 几 KB，每个请求都携带会给网络带来明显压力，而且客户端存储成本也高。有几种优化方向：一是使用 Dotted Version Vectors（DVV），它通过把向量分成「已确认」和「待确认」两部分来避免向量无限增长；二是 Interval Tree Clocks（ITC），用树结构紧凑表示 VV；三是把完整 VV 存在服务端，颁发一个不透明的 token（本质是 VV 的 handle），客户端只传 token ID，服务端解引用。选 A 低估了规模——4KB per request 在高 QPS 场景下是显著开销；选 B 的 Bloom Filter 是概率性数据结构，无法精确表示版本依赖；选 D 会导致因果依赖被截断，产生因果违规。"
+        },
+        {
+          "id": "ds-q190-quiz-10",
+          "question": "系统监控发现 `causal_violations_total` 突然从 0 跳到 47，在没有代码发布的情况下，哪个排查方向最有可能找到根因？",
+          "choices": [
+            {"id": "A", "text": "检查 RocksDB 的 compaction 日志，可能有 key 被意外删除"},
+            {"id": "B", "text": "检查是否有网络分区导致某个节点的本地 VV 长时间没有更新，以及客户端 SDK 的 VV 合并逻辑是否有 bug（比如版本号比较时用了 < 而不是 <=）"},
+            {"id": "C", "text": "重启所有节点，因果违规通常在节点重启后会自动消失"},
+            {"id": "D", "text": "增加副本数量，从三节点扩展到五节点可以消除因果违规"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "causal_violations_total 突然激增，说明系统开始向用户呈现因果顺序混乱的数据，而不是一致性在慢慢降级。最可能的原因有两类：其一是网络层问题——某个节点因为网络抖动长期收不到其他节点的更新，导致它的本地 VV 严重落后，但协调层的「VV 落后就重定向」逻辑失效了（比如重定向超时后fallback到了本地读取）；其二是 SDK bug——VV 合并时的比较逻辑有问题，比如用 < 而不是 <=，导致某些版本被漏掉，客户端误认为因果依赖已满足。检查步骤：先看网络分区告警，再看各节点的 VV 漂移 metrics，最后 review SDK 最近的 VV 合并相关代码（即使没有发布，可能是隐性 bug 被特定条件触发）。选 C 的重启可能暂时掩盖症状但不解决根因；选 D 的扩容与因果违规无关。"
+        }
+      ],
+      "references": [
+        "https://jepsen.io/consistency",
+        "https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf",
+        "https://tikv.org/docs/6.5/concepts/architecture/"
+      ]
+    }
+  ]
+}
