@@ -1,0 +1,159 @@
+{
+  "id": "linux-q171",
+  "name": "内存泄漏的检测与定位方法",
+  "domain": "linux",
+  "description": "系统讲解 Linux 下内存泄漏的检测思路与定位工具链，覆盖 /proc/smaps、valgrind、AddressSanitizer、gperftools、heaptrack、eBPF memleak 的完整排查工作流。",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "linux-q171",
+      "domain": "linux",
+      "type": "debugging",
+      "difficulty": 4,
+      "tags": ["内存泄漏", "valgrind", "AddressSanitizer", "gperftools", "heaptrack", "eBPF", "smaps", "pmap", "smem", "性能排查"],
+      "title": "Linux 下怎么检测和定位进程的内存泄漏？",
+      "content": "你们团队维护一个用 C++ 写的后台服务，部署在 Linux 上，负责处理实时日志聚合，单实例 QPS 约 8000。这个服务稳定运行了大概两年，最近几个月 SRE 发现一个怪现象：服务上线时 RSS 大约 200MB，但每隔 72 小时左右，RSS 会涨到 1.4GB 左右，然后触发 OOM 被 kill 掉，重启后一切恢复正常，下一个 72 小时又重复一次。\n\n监控告警里的关键数据如下：\n\n```\n# Prometheus 指标（摘录）\nprocess_resident_memory_bytes{job=\"log-aggregator\"} 1.47e+09   # 1.47GB\nprocess_virtual_memory_bytes{job=\"log-aggregator\"} 2.31e+09   # 2.31GB\n\n# 同期 malloc_stats 打印（服务内部埋点）\nArena 0:\nsystem bytes     =  823492608   # 785MB 系统分配\nin use bytes     =  201326592   # 192MB 实际在用\n...\nTotal (incl. mmap):\nsystem bytes     = 1089470464\nin use bytes     =  209715200\nMax mmap regions =        312\nMax mmap bytes   =  268435456\n```\n\n从这个数据可以看出：glibc malloc 认为「在用」的内存只有 192MB，但系统分配了 785MB，中间差了将近 600MB。这 600MB 是真正泄漏了，还是 glibc 的内存碎片化，还是有其他的内存消耗来源？\n\n请回答以下问题：\n\n1. 拿到一个疑似内存泄漏的进程，你的第一步是什么？如何用 `/proc/PID/smaps`、`pmap`、`smem` 快速判断内存属于哪种类型的增长？\n2. 如何用 Valgrind Memcheck 和 AddressSanitizer 在开发环境复现并精确定位泄漏的调用栈？两者各有什么局限性？\n3. 对于无法重新编译的生产进程，gperftools heap profiler 和 eBPF memleak 工具分别怎么用？\n4. heaptrack 相比 Valgrind 的优势在哪里，适合什么场景？\n5. 如何构建一套「从发现到定位到修复验证」的完整内存泄漏排查工作流？",
+      "answer": "## 第一步：先搞清楚内存泄漏在 Linux 里究竟是什么\n\n在 Linux 的内存模型里，「内存泄漏」并不是一个单一的现象，而是几类不同问题的统称。搞清楚这一点非常重要，因为不同类型的泄漏，排查工具完全不同。\n\n第一类是**堆内存泄漏**，也就是最经典的那种：malloc 了但没有 free，或者 new 了但没有 delete。这类泄漏会让进程的堆段持续增大，在 `/proc/PID/maps` 里表现为 `[heap]` 区域不断扩张。第二类是 **mmap 匿名段泄漏**：glibc 对超过 128KB 的分配默认走 mmap 而不是 brk，这类内存在 `/proc/PID/smaps` 里显示为 `anon` 段，不属于 `[heap]`，很多人排查时漏掉了。第三类是**文件描述符泄漏**，通常不直接表现为 RSS 增长，但如果 fd 上有 mmap 的内存映射就会。第四类是**共享内存或内存池的逻辑泄漏**：内存从技术上讲已经「还给了」内存池，但内存池本身无限增长而不缩容，这是业务逻辑层面的问题。\n\n你在题目中看到的那个现象——glibc 报告「in use 192MB」但「system bytes 785MB」——正是典型的第一类加第二类混合情况，或者是 glibc 的 arena 碎片化。这两种情况的定位方法有本质区别，不能一上来就拿 Valgrind 乱扫。\n\n## 第二步：用 /proc/smaps、pmap、smem 做快速粗定位\n\n在动用任何重型工具之前，先用操作系统自带的文件系统接口做一次快速判断，成本几乎为零。\n\n`/proc/PID/smaps` 是 Linux 内核提供的进程内存段详细信息，每一段都有 RSS、PSS（比例分摊后的实际占用）、Anonymous、Shared 等字段。找到一个内存持续增长的进程，在增长前后分别抓一次 smaps，用 diff 对比就能立刻看出是哪类内存段在增长：\n\n```bash\n# 每隔 60 秒抓一次 smaps 快照\nPID=12345\ncat /proc/$PID/smaps > smaps_t0.txt\nsleep 3600\ncat /proc/$PID/smaps > smaps_t1.txt\n\n# 对比匿名段的 RSS 变化\ngrep -A20 'anon' smaps_t0.txt | grep -E 'Size|Rss|Anonymous'\ngrep -A20 'anon' smaps_t1.txt | grep -E 'Size|Rss|Anonymous'\n```\n\n一份真实的 smaps 片段长这样：\n\n```\n7f3a2c000000-7f3a4c000000 rw-p 00000000 00:00 0\nSize:             524288 kB   # 这段 VMA 的虚拟空间大小\nKernelPageSize:        4 kB\nRss:              498412 kB   # 实际在物理内存中的页数 × 4KB\nPss:              498412 kB   # 只有这个进程用，所以 PSS = RSS\nShared_Clean:          0 kB\nShared_Dirty:          0 kB\nPrivate_Clean:         0 kB\nPrivate_Dirty:    498412 kB   # 全是脏页，说明是堆或匿名 mmap\nReferenced:       498412 kB\nAnonymous:        498412 kB   # 匿名内存，没有对应文件\nVmFlags: rd wr mr mw me ac   # ac = accounting，参与 RSS 计算\n```\n\n如果你看到大量这样的匿名段（没有文件路径、Anonymous 值很高），并且随时间增加，那几乎可以确定是堆泄漏或 mmap 泄漏，而不是共享库加载或文件映射的正常消耗。\n\n`pmap -x PID` 是 smaps 的可读化封装，输出格式更友好，快速看总量用这个：\n\n```bash\npmap -x 12345 | tail -3\n# 输出示例：\n# total kB    2257920   1438716         0   1433600\n#              ^^^^^^   ^^^^^^^\n#              虚拟内存   RSS\n```\n\n`smem` 工具（需要单独安装）能显示系统级别的 PSS 排名，用来确认某个进程是不是内存消耗大户：\n\n```bash\nsmem -s pss -r | head -20\n# PID   User     Command                         Swap      USS      PSS      RSS\n# 12345 appuser  /usr/bin/log-aggregator            0  1398732  1399104  1402368\n```\n\nPSS（Proportional Set Size）是比 RSS 更准确的指标，它把共享内存按使用进程数均摊，避免共享库被重复计算。如果一个进程的 PSS 和 RSS 几乎相等，说明它占用的内存几乎都是私有的，共享库导致的虚高可能性小。\n\n## 第三步：开发环境用 Valgrind 和 AddressSanitizer 精确定位\n\n确认是堆泄漏之后，如果能在开发环境复现，Valgrind Memcheck 是最简单直接的工具。它通过插桩（instrumentation）技术，在进程运行期间拦截所有的内存分配和释放调用，在进程退出时报告所有未释放的分配：\n\n```bash\n# 基本用法：在 Valgrind 下运行程序\nvalgrind --leak-check=full \\\n         --show-leak-kinds=all \\\n         --track-origins=yes \\\n         --verbose \\\n         --log-file=valgrind_output.txt \\\n         ./log-aggregator --config=/etc/app.conf\n\n# 程序运行一段时间后 Ctrl+C 停止，查看报告\ncat valgrind_output.txt\n```\n\nValgrind 的输出会精确到调用栈，告诉你在哪一行代码分配了内存但没有释放：\n\n```\n==12345== 524,288 bytes in 1 blocks are definitely lost in loss record 42 of 58\n==12345==    at 0x4C2FB0F: malloc (in /usr/lib/valgrind/vgpreload_memcheck.so)\n==12345==    by 0x10A3C5: LogBuffer::allocateChunk(unsigned long) (log_buffer.cpp:87)\n==12345==    by 0x10B1D2: LogBuffer::append(std::string const&) (log_buffer.cpp:134)\n==12345==    by 0x10C8A9: LogAggregator::process(LogEntry const&) (aggregator.cpp:256)\n==12345==    by 0x10D3F1: WorkerThread::run() (worker.cpp:89)\n```\n\n这个输出直接告诉你：是 `log_buffer.cpp` 第 87 行的 `allocateChunk` 分配了内存，但在某个路径下没有释放。定位到这个精度，修复就很简单了。\n\nValgrind 的致命缺点是**性能开销极大**，通常会让程序慢 10-50 倍。一个本来 QPS 8000 的服务，在 Valgrind 下可能只有 200 QPS，复现「每 72 小时泄漏一次」的问题可能需要等上几周。这时候 AddressSanitizer 是更好的选择。\n\nAddressSanitizer（ASan）是 LLVM/GCC 提供的编译期插桩工具，性能开销只有 Valgrind 的十分之一（约 2 倍慢），同时还能检测 use-after-free、堆溢出等 Valgrind 无法检测的问题：\n\n```bash\n# 编译时加上 ASan 标志（GCC 或 Clang 均支持）\ng++ -O1 -g \\\n    -fsanitize=address \\\n    -fsanitize=leak \\\n    -fno-omit-frame-pointer \\\n    -o log-aggregator-asan \\\n    src/*.cpp\n\n# 运行时设置环境变量控制行为\nexport ASAN_OPTIONS=\"detect_leaks=1:leak_check_at_exit=1:print_stats=1\"\n./log-aggregator-asan --config=/etc/app.conf\n```\n\nASan 发现泄漏时的输出格式与 Valgrind 类似，但通常更快捷清晰。注意 ASan 需要重新编译，如果是第三方库的二进制没有 ASan 符号，调用栈可能会有部分缺失。\n\n## 第四步：生产环境在线分析用 gperftools 和 eBPF\n\n开发环境能复现当然最好，但很多泄漏只在特定的生产流量下才出现，这时候需要对线上进程做非侵入式分析。\n\ngperftools 的 heap profiler 支持通过 LD_PRELOAD 注入，不需要重新编译程序：\n\n```bash\n# 方法一：LD_PRELOAD 启动（推荐，对生产影响最小）\nexport LD_PRELOAD=/usr/lib/libprofiler.so\nexport HEAPPROFILE=/tmp/heap_profile\nexport HEAPPROFILESIGNAL=12  # 用 SIGUSR2 触发快照\n./log-aggregator --config=/etc/app.conf\n\n# 运行一段时间后，发送信号触发快照\nkill -12 $PID\n\n# 用 pprof 分析快照文件\ngoogle-pprof --pdf ./log-aggregator /tmp/heap_profile.0001.heap > heap_t0.pdf\ngoogle-pprof --pdf ./log-aggregator /tmp/heap_profile.0002.heap > heap_t1.pdf\n\n# 或者对比两个时间点的差异（这才是关键！）\ngoogle-pprof --pdf --base=/tmp/heap_profile.0001.heap \\\n             ./log-aggregator /tmp/heap_profile.0002.heap > heap_diff.pdf\n```\n\n差异报告会以火焰图或调用图的形式，直接展示哪些代码路径在两个时间点之间分配了最多的内存且没有释放。这是在不停服的情况下定位生产泄漏最有效的方法之一。\n\n如果你不想动进程的启动方式，Linux 4.9+ 内核提供了 eBPF 的 `memleak` 工具（来自 bcc-tools 包），可以直接 attach 到任何运行中的进程：\n\n```bash\n# 安装 bcc-tools\napt install bcc-tools   # Ubuntu\nyum install bcc-tools   # CentOS/RHEL\n\n# 对 PID 12345 监控内存分配，每 5 秒输出一次 top 调用栈\n/usr/share/bcc/tools/memleak -p 12345 -a --interval 5 --top 10\n```\n\n`memleak` 的输出示例：\n\n```\n[11:42:15] Top 10 stacks with outstanding allocations:\n        524288 bytes in 1 allocations from stack\n                LogBuffer::allocateChunk(unsigned long)+0x45 [log-aggregator]\n                LogBuffer::append(std::__cxx11::basic_string<char, ...>)+0x82 [log-aggregator]\n                LogAggregator::process(LogEntry const&)+0x101 [log-aggregator]\n                WorkerThread::run()+0x59 [log-aggregator]\n                std::thread::_State_impl<...>::_M_run()+0xd [libstdc++.so.6]\n```\n\neBPF memleak 的原理是在内核层面 hook malloc/free 调用，记录所有「分配了但还没 free」的内存及其调用栈，不需要重新编译、不需要 LD_PRELOAD，对进程几乎透明。唯一限制是需要 Linux 4.9+ 内核和 root 权限。\n\n## 第五步：heaptrack 的独特优势\n\nheaptrack 是一个经常被忽视但极其好用的工具，它比 Valgrind 快 10 倍以上，比 gperftools 的离线分析更强大。heaptrack 通过 LD_PRELOAD 注入，记录进程整个生命周期内的每一次 malloc/free，然后离线分析：\n\n```bash\n# 启动时注入（最完整）\nheaptrack ./log-aggregator --config=/etc/app.conf\n# 或者 attach 到运行中的进程\nheaptrack --pid 12345\n\n# 程序退出后会生成 heaptrack.log-aggregator.XXXXX.gz\n# 用 GUI 分析（需要安装 heaptrack_gui）\nheaptrack_gui heaptrack.log-aggregator.12345.gz\n\n# 也可以命令行分析\nheaptrack_print heaptrack.log-aggregator.12345.gz 2>&1 | head -50\n```\n\nheaptrack 最强大的特性是**时间线视图**：它能展示内存在时间轴上的增长曲线，精确到哪一次函数调用导致了内存峰值。这对于「每 72 小时泄漏一次」这种慢性泄漏的定位极其有价值——你可以让它跑 24 小时，然后在时间线上找到内存开始异常增长的那个时间点，直接跳转到对应的调用栈。\n\n## 第六步：完整的排查工作流\n\n把以上工具串联起来，形成一套可重复的排查流程：\n\n第一阶段是**确认和量化**。用 `smem` 和 `/proc/PID/smaps` 确认 RSS 在持续增长，区分是匿名内存泄漏还是文件映射或共享内存问题。如果 `pmap` 显示有大量无文件映射的匿名段，基本确认是堆泄漏或 mmap 泄漏。\n\n第二阶段是**开发环境复现**。用加速手段（增大并发、缩短时间周期、注入高频触发场景）在开发机复现。先用 ASan 编译运行，如果能复现泄漏，调用栈基本精确到代码行。如果 ASan 跑不出来，换 heaptrack 跑更长时间做时间线分析。\n\n第三阶段是**生产环境确认**。如果开发环境无法复现，在生产上用 gperftools 的差分快照或 eBPF memleak 做在线分析，捕获增量内存的调用栈。\n\n第四阶段是**修复和验证**。修复完成后，用 ASan 重新运行完整测试套件（不仅仅是压测，还要包含所有边界路径），确认 ASan 的退出报告里「definitely lost」一行清零。然后重新部署，观察 7 天内 RSS 是否保持稳定，并在 Prometheus 中设置 `increase(process_resident_memory_bytes[1h]) > 50e6`（1小时增长超过 50MB）的告警规则，作为长期监控。",
+      "keyPoints": [
+        "/proc/PID/smaps 里的 Anonymous 字段区分堆/mmap 匿名泄漏与文件映射，是免费且最快速的第一手诊断信息，在动用任何重型工具之前必须先看这个",
+        "glibc malloc 的「system bytes」和「in use bytes」之间的差值不一定是泄漏，也可能是 arena 碎片化——需要结合 smaps 的段增长情况才能确认",
+        "Valgrind Memcheck 适合精确定位调用栈但有 10-50 倍性能损耗，AddressSanitizer 只有 2 倍损耗且能检测 use-after-free，生产接近场景的复现优先选 ASan",
+        "gperftools heap profiler 支持 LD_PRELOAD 无需重编译，通过两个时间点快照的差分分析可以精确定位增量内存的来源调用栈，是生产环境最实用的工具",
+        "eBPF memleak（来自 bcc-tools）可以 attach 到任意正在运行的进程，在内核层 hook malloc/free，无需修改程序，适合对连接时间或 LD_PRELOAD 有限制的生产场景",
+        "heaptrack 相比 Valgrind 快约 10 倍，独有时间线视图能精确展示内存在时间轴上的增长曲线，对「慢性泄漏」（每几十小时才表现一次）的定位效率远高于快照对比法",
+        "内存泄漏修复后的验证不能只靠压测，必须结合 ASan 的退出报告（确认 definitely lost 归零）加 7 天生产 RSS 趋势监控双重确认",
+        "smem 的 PSS 指标比 RSS 更准确地反映单进程的实际内存占用，能过滤共享库的虚高干扰，是系统级别内存诊断的推荐指标"
+      ],
+      "quiz": [
+        {
+          "id": "linux-q171-q1",
+          "question": "用 `/proc/PID/smaps` 排查内存泄漏时，哪个字段能最直接地区分「堆/mmap 匿名泄漏」和「文件映射内存」？",
+          "choices": [
+            {"id": "A", "text": "Anonymous 字段，匿名内存为非零值表示该段是堆或 mmap 匿名段而非文件映射"},
+            {"id": "B", "text": "Rss 字段，RSS 越大说明越可能是泄漏"},
+            {"id": "C", "text": "Size 字段，虚拟空间大小超过 1GB 就是泄漏"},
+            {"id": "D", "text": "Shared_Dirty 字段，共享脏页越多说明内存被错误共享导致泄漏"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "smaps 的 Anonymous 字段记录该 VMA 段中没有对应文件的内存页数量（单位 kB）。堆（[heap]）、匿名 mmap（无路径的 rw-p 段）的 Anonymous 值等于 RSS，而 libc.so 等文件映射段的 Anonymous 为 0。排查时对比前后两次 smaps 快照，如果 Anonymous 值高的匿名段在增长，几乎可以确认是堆泄漏或 mmap 泄漏。RSS 本身无法区分是泄漏还是正常的文件缓存页；Size 是虚拟空间，有 VMA 合并等因素；Shared_Dirty 是共享映射的脏页，与泄漏无直接关系。"
+        },
+        {
+          "id": "linux-q171-q2",
+          "question": "glibc malloc 内部的 `malloc_stats()` 输出中，`system bytes = 800MB` 而 `in use bytes = 100MB`，最合理的解释是什么？",
+          "choices": [
+            {"id": "A", "text": "进程已泄漏约 700MB，这部分内存永久丢失"},
+            {"id": "B", "text": "glibc 的 arena 存在碎片化，或有大量超过 128KB 的 mmap 分配已释放但未归还内核，不一定是泄漏"},
+            {"id": "C", "text": "malloc_stats 统计有 bug，实际 in use 应该等于 system bytes"},
+            {"id": "D", "text": "这 700MB 是共享内存段，不属于进程堆"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "glibc 的内存管理有两个行为会导致 system bytes 远大于 in use bytes，且不是泄漏：第一是 arena 碎片化，glibc 从内核申请的内存即使全部 free 掉，如果有任何一个存活的小块分配在区间末尾，整块都无法通过 sbrk 归还给内核；第二是 mmap 阈值动态调整（M_MXFAST），超过阈值的大块分配走 mmap 分配再 munmap 释放，但 glibc 会缓存一部分 mmap arena 不立即归还。真正确认是否泄漏，需要结合 smaps 看哪些段在随时间增长，而不能只看 malloc_stats 的差值。"
+        },
+        {
+          "id": "linux-q171-q3",
+          "question": "Valgrind Memcheck 和 AddressSanitizer 都能检测堆内存泄漏，以下关于两者的对比哪一条是正确的？",
+          "choices": [
+            {"id": "A", "text": "Valgrind 需要重新编译程序，ASan 不需要"},
+            {"id": "B", "text": "ASan 的性能损耗约为 2 倍，Valgrind 约为 10-50 倍，因此在需要接近真实负载复现时 ASan 更合适"},
+            {"id": "C", "text": "Valgrind 能检测 use-after-free，ASan 不能"},
+            {"id": "D", "text": "ASan 只支持 Clang 编译器，GCC 不支持"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ASan 通过编译期插桩实现（-fsanitize=address），性能损耗通常在 1.5-2.5 倍之间，远小于 Valgrind 的 10-50 倍。这个差距在需要复现「高负载下才出现」的泄漏时非常关键——Valgrind 下服务可能只有 200 QPS，泄漏路径根本触发不到。选项 A 相反，Valgrind 不需要重新编译（通过 JIT 插桩），而 ASan 需要重编译。选项 C 相反，ASan 对 use-after-free 的检测反而更灵敏。选项 D 错误，GCC 4.8+ 就原生支持 -fsanitize=address。"
+        },
+        {
+          "id": "linux-q171-q4",
+          "question": "使用 gperftools heap profiler 做内存泄漏分析时，以下哪种方法能最有效地定位「慢性增长」型泄漏的代码路径？",
+          "choices": [
+            {"id": "A", "text": "只取一个快照，找 allocation bytes 最大的调用栈"},
+            {"id": "B", "text": "取两个时间点的快照，用 `pprof --base` 做差分分析，找增量最大的调用栈"},
+            {"id": "C", "text": "在程序退出时自动输出的 heap profile 里找 unreleased bytes"},
+            {"id": "D", "text": "打开 HEAPCHECK=normal 模式，让 pprof 自动检测泄漏"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "慢性泄漏的特征是每次运行时有大量「正常的」长生命周期内存（缓存、连接池、全局数据结构），这些在快照里占据绝大部分，会淹没真正泄漏的那一小部分。差分分析（--base 参数）从 T1 时刻的快照里减去 T0 时刻的，剩下的就是这段时间内净增加的内存分配，能精确揭示「在时间窗口内只增不减」的调用路径。单快照法（A）容易误判；程序退出时的 profile（C）对于 72 小时才崩一次的进程完全不可行；HEAPCHECK（D）是 leak checker 而非 profiler，适合开发阶段而非生产差分分析。"
+        },
+        {
+          "id": "linux-q171-q5",
+          "question": "以下是 eBPF `memleak` 工具的一段输出，如何解读这段信息？\n\n```\n[14:32:10] Top 5 stacks with outstanding allocations:\n        8,388,608 bytes in 1,024 allocations from stack\n                operator new(unsigned long)+0x1c [libstdc++.so.6]\n                std::vector<char>::_M_realloc_insert+0x8a [libstdc++.so.6]\n                EventQueue::push(Event const&)+0x67 [event-server]\n                NetworkHandler::onData(int, char*, int)+0x134 [event-server]\n```",
+          "choices": [
+            {"id": "A", "text": "libstdc++ 库本身有 bug，需要升级 libstdc++ 版本"},
+            {"id": "B", "text": "EventQueue 在不断 push 事件但没有消费，导致内部 vector 持续扩容，内存积压在队列里"},
+            {"id": "C", "text": "vector 的 realloc 是正常的扩容行为，这不是泄漏，memleak 工具判断错了"},
+            {"id": "D", "text": "这 8MB 是 vector 的预分配空间，属于正常的内存预留，不需要处理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "memleak 输出的「outstanding allocations」指的是「已分配但还没有对应 free 的内存」。调用栈从下往上读：NetworkHandler::onData 收到网络数据，调用 EventQueue::push，push 触发 vector 扩容（_M_realloc_insert），分配了 8MB 内存（1024 次分配平均每次 8KB）。这说明事件不断入队但消费端跟不上或完全没有在消费，队列持续增大。这是一个典型的逻辑性内存积压，严格说不是「泄漏」（内存有指针引用）但效果等同，修复方向是检查消费者线程是否正常运行，或加背压机制限制入队速率。"
+        },
+        {
+          "id": "linux-q171-q6",
+          "question": "以下关于 AddressSanitizer 的使用，哪个是常见的错误做法？",
+          "choices": [
+            {"id": "A", "text": "编译时同时加 `-fsanitize=address -fsanitize=leak -fno-omit-frame-pointer`"},
+            {"id": "B", "text": "在 Docker 容器里用 ASan 编译的二进制，同时挂载了宿主机的 /proc，因此 ASan 报告的地址是宿主机地址"},
+            {"id": "C", "text": "用 `-O1 -g` 而不是 `-O0` 编译，以在接近真实性能的情况下运行 ASan"},
+            {"id": "D", "text": "设置 `ASAN_OPTIONS=halt_on_error=0` 让程序在发现第一个错误后继续运行以收集更多泄漏点"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个错误选项描述的错误用法——实际上 ASan 的地址报告始终是进程虚拟地址空间内的地址，与宿主机 /proc 无关，挂载宿主机 /proc 不会影响 ASan 的地址输出。真正常见的错误做法是：在 CI 流水线里用 `-O0` 编译（优化掉的代码路径在 -O0 下行为不同，某些泄漏只在优化代码里出现）、忘记加 -fno-omit-frame-pointer（导致调用栈截断）、在多个线程里共享 ASan 不支持的锁实现导致 false positive。选项 A、C、D 均为正确做法。"
+        },
+        {
+          "id": "linux-q171-q7",
+          "question": "heaptrack 与 Valgrind Memcheck 相比，在什么场景下 heaptrack 明显更有优势？",
+          "choices": [
+            {"id": "A", "text": "需要检测 use-after-free 漏洞时"},
+            {"id": "B", "text": "需要分析内存泄漏随时间的增长曲线，找到「何时开始泄漏」这个时间点时"},
+            {"id": "C", "text": "不需要重新编译、直接注入正在运行的生产进程时"},
+            {"id": "D", "text": "程序使用了大量 SIMD 指令，Valgrind 无法正确插桩时"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "heaptrack 的核心独特能力是完整记录整个进程生命周期内的每一次分配和释放，并以时间轴的形式可视化。这意味着你可以在离线分析时「回放」内存历史，精确找到内存开始异常增长的那一刻，以及触发这次增长的具体函数调用。这对于「慢性泄漏」（每隔几十小时才表现出来）的定位效率远高于 Valgrind。Valgrind 只能在程序退出时报告最终泄漏状态，无法提供时间维度。选项 A 是 Valgrind/ASan 的优势；选项 C 是 gperftools LD_PRELOAD 的优势；选项 D heaptrack 同样需要 LD_PRELOAD 方式，对 SIMD 的支持与 Valgrind 不同但这不是主要区别。"
+        },
+        {
+          "id": "linux-q171-q8",
+          "question": "生产环境有一个不能停服的 Java 进程（非 C/C++），发现 RSS 持续增长。以下哪种排查路径最合适？",
+          "choices": [
+            {"id": "A", "text": "用 Valgrind 直接 attach 到正在运行的 Java 进程"},
+            {"id": "B", "text": "先用 `/proc/PID/smaps` 判断是 JVM 堆外内存（Direct Buffer 或 JNI）还是 JVM 堆内增长，再针对性地用 NativeMemoryTracking 或 eBPF memleak"},
+            {"id": "C", "text": "直接用 jmap 导出堆 dump，用 MAT 分析"},
+            {"id": "D", "text": "重启进程，用 jvisualvm 连接观察 GC 曲线"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Java 进程的内存分为 JVM 堆（由 GC 管理）和堆外内存（Direct ByteBuffer、JNI、JVM 自身的元空间、线程栈等）。RSS 持续增长不一定是 Java 对象泄漏，很可能是堆外内存泄漏，而 jmap/MAT 只能看 JVM 堆。正确做法是先用 smaps 判断增长的是哪类内存段：如果是 JVM 管理的堆段，走 JVM heap dump 路径；如果是匿名 mmap 段或无文件映射的 anon，很可能是 Direct Buffer 或 JNI 泄漏，应该用 `-XX:NativeMemoryTracking=detail` 启动 JVM 并观察，或者用 eBPF memleak attach 到 JVM 进程观察 malloc 层面的分配。Valgrind 无法 attach 到已运行的进程，且 Java 的 JIT 会干扰 Valgrind 的插桩。"
+        },
+        {
+          "id": "linux-q171-q9",
+          "question": "AddressSanitizer 在检测内存泄漏时，`definitely lost`、`indirectly lost`、`possibly lost` 三种类型中，修复优先级最高的是哪种，原因是什么？",
+          "choices": [
+            {"id": "A", "text": "possibly lost，因为「可能泄漏」的数量通常最多"},
+            {"id": "B", "text": "definitely lost，因为这类内存没有任何指针指向它，绝对无法被访问到也无法释放，是真正的泄漏"},
+            {"id": "C", "text": "indirectly lost，因为间接泄漏涉及的内存块更多，影响面更大"},
+            {"id": "D", "text": "三种优先级相同，都需要立即修复"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ASan/Valgrind 的 definitely lost 指的是：程序在退出时，没有任何指针（包括栈上、全局变量、其他堆块里）指向这块内存，这块内存已经被完全「孤立」，绝对无法通过任何代码路径被释放。这是最严重也最明确的泄漏。indirectly lost 是指有指针指向它，但那个指针本身在一块 definitely lost 的内存里，所以根因是修复 definitely lost。possibly lost 指的是有指针指向这块内存的中间位置（非起始地址），Valgrind 无法确认是有意为之还是泄漏，通常是自定义内存分配器或 tagged pointer 导致的误报，优先级最低。正确的修复顺序是先清零 definitely lost，indirectly lost 会随之消失，最后才处理 possibly lost。"
+        },
+        {
+          "id": "linux-q171-q10",
+          "question": "题目描述中，服务每 72 小时 OOM 一次，`smem` 显示进程 PSS 在最后 6 小时内从 800MB 线性增长到 1.4GB。你用 gperftools 取了 T0（800MB 时）和 T1（1.3GB 时）两个快照做差分，发现以下调用栈占了差值的 78%：\n\n```\n(530 MB)\n    LogBuffer::allocateChunk\n    LogBuffer::append\n    LogAggregator::processLine\n    FileReader::readLine\n```\n\n但是代码 review 发现 `allocateChunk` 里分配的内存都有对应的 `freeChunk` 调用。这时最可能的问题是什么？",
+          "choices": [
+            {"id": "A", "text": "gperftools 统计有误差，差分结果不可信，应该换 Valgrind 重新分析"},
+            {"id": "B", "text": "freeChunk 的调用路径存在条件分支，在某些错误路径下（如文件读取异常）没有调用 freeChunk，导致错误处理路径的内存泄漏"},
+            {"id": "C", "text": "LogBuffer 使用了内存池，freeChunk 只是把内存还给池，内存池本身在无限增长而没有缩容机制"},
+            {"id": "D", "text": "B 和 C 都可能，需要进一步用 ASan 加上模拟异常注入测试来区分"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "这道题的关键陷阱是「代码 review 发现有 freeChunk」——这只是正常路径有释放，不代表所有路径都有释放。B 所描述的「异常路径漏 free」是 C++ 中极其高频的泄漏模式，尤其是在用 C 风格错误处理（if error return，return 前没有 free）的代码里。C 所描述的「内存池逻辑泄漏」也很常见，freeChunk 看起来「释放了」但内存池的 free list 只增不减，最终内存池容量无限膨胀。这两种情况外表一样（都有 freeChunk 调用）但根因不同，修复方式不同。区分它们的最好方法是 D：在 ASan 下用故障注入（让 readLine 返回错误）测试异常路径，并观察内存池的统计指标（chunk 总数 vs 已用 chunk 数）判断池是否在缩容。"
+        }
+      ],
+      "references": [
+        "https://valgrind.org/docs/manual/mc-manual.html",
+        "https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer",
+        "https://gperftools.github.io/gperftools/heapprofile.html",
+        "https://github.com/KDE/heaptrack",
+        "https://github.com/iovisor/bcc/blob/master/tools/memleak.py",
+        "https://www.kernel.org/doc/Documentation/filesystems/proc.txt"
+      ]
+    }
+  ]
+}
