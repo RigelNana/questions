@@ -1,0 +1,276 @@
+{
+  "id": "ds-idempotency-failure-debug",
+  "name": "幂等性失效排查",
+  "domain": "distributed-system",
+  "description": "排查重试风暴下幂等性机制失效的常见根因：Redis主从延迟、key过期、状态机竞态、key生成不一致",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-idempotency-failure-debug-q1",
+      "domain": "distributed-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["幂等性", "Redis", "分布式", "重试", "并发"],
+      "title": "支付服务在重试风暴后出现重复扣款，幂等机制为什么失效了？",
+      "content": "你所在的团队负责一个金融支付平台的核心扣款服务，技术栈是 Java + Spring Boot，幂等层使用 Redis（主从架构，1 主 2 从）存储幂等 key，TTL 设置为 60 秒。正常情况下，上游调用方会在请求头中携带 `X-Idempotency-Key`，服务用这个 key 做去重。\n\n某天凌晨 2 点，机房发生了一次网络抖动，持续约 3 秒。网络恢复后，上游客户端的重试风暴涌入，在 30 秒内打入了约 4 万次请求，其中大量是对同一批订单的重复请求。监控告警在凌晨 2:07 触发，财务对账发现有 127 笔订单出现了重复扣款。\n\n事故发生后你拿到了以下信息：\n\n**Redis 主节点日志（故障期间片段）**\n```\n[2024-01-15 02:00:03] WARN: Slave 10.0.1.12:6379 disconnected\n[2024-01-15 02:00:06] INFO: Slave 10.0.1.12:6379 reconnected, sending PSYNC\n[2024-01-15 02:00:06] INFO: Starting BGSAVE for SYNC\n[2024-01-15 02:00:08] INFO: Background saving started by slave request\n```\n\n**应用日志（故障期间片段）**\n```\n[02:00:06.112] INFO  PaymentService - Processing payment order_id=PAY-20240115-003821, idempotency_key=pay_1705248006112_order_003821\n[02:00:06.234] INFO  PaymentService - Processing payment order_id=PAY-20240115-003821, idempotency_key=pay_1705248006234_order_003821\n[02:00:06.891] INFO  PaymentService - Processing payment order_id=PAY-20240115-003821, idempotency_key=pay_1705248006891_order_003821\n[02:00:07.103] INFO  IdempotencyFilter - Key not found in Redis, proceeding with payment\n[02:00:07.215] INFO  IdempotencyFilter - Key not found in Redis, proceeding with payment\n```\n\n**核心幂等检查代码（简化版）**\n```java\npublic boolean isDuplicate(String idempotencyKey) {\n    // 先查 Redis\n    String existing = redisTemplate.opsForValue().get(idempotencyKey);\n    if (existing != null) {\n        return true;  // 已处理过，是重复请求\n    }\n    // 不存在则写入，标记为正在处理\n    redisTemplate.opsForValue().set(idempotencyKey, \"processing\", 60, TimeUnit.SECONDS);\n    return false;\n}\n```\n\n请根据以上信息分析：这次幂等机制失效的根因有哪些？应该如何逐一排查并修复？",
+      "answer": "## 第一步：幂等性基础与四类根因总览\n\n幂等性（Idempotency）在分布式系统中是一个听起来简单、做起来处处有坑的概念。它的定义是：对同一个请求执行任意多次，产生的结果和执行一次完全相同。支付场景里，这意味着无论上游因为超时重试了多少次，用户账户只能被扣一次款。\n\n大部分团队的幂等方案都是「拿到 idempotency-key → 查 Redis 有没有 → 没有就写入并处理 → 有就直接返回上次结果」。这个模式在低并发、网络稳定的环境下工作得很好，但一旦进入重试风暴或者主从切换的场景，就会在四个地方同时崩塌。\n\n从这次事故的表现来看，有四类根因都在同一时间窗口内被触发了，而不是单一故障。理解这一点很重要——幂等失效往往是多因素叠加的结果，单独修复任何一个都不够。\n\n## 第二步：逐一排查四类根因\n\n### 根因一：Redis 主从复制延迟导致读到旧数据\n\n这是本次事故中最核心的根因。先看一下故障发生时的时序：\n\n```\n时间轴（毫秒）\n\nClient A ──► Master: SET pay_key_001 \"processing\" EX 60\n                        │\n                        │ 主从复制（正常延迟 <1ms，故障期间 >3000ms）\n                        │\nClient B ──► Slave:  GET pay_key_001  ←── 返回 nil（复制还没到）\n                        │\nClient B ──► Master: SET pay_key_001 \"processing\" EX 60  ←── 重复写入！\n                        │\n                        ▼\n两个线程都认为自己是第一个处理者，双重扣款发生\n```\n\n网络抖动导致从节点断连并重连，在重新全量同步期间（BGSAVE 完成前），从节点的数据是陈旧的。而应用程序的 `redisTemplate.opsForValue().get()` 默认读的是从节点（大多数 Spring + Lettuce 配置都是这样做读写分离的），所以从节点没有主节点刚写入的数据，`GET` 返回了 `nil`。\n\n排查这个问题，第一步是确认主从延迟的实际情况：\n\n```bash\n# 在故障时段的主节点上执行\nredis-cli -h 10.0.1.11 -p 6379 INFO replication\n\n# 输出示例（故障期间）\n# role:master\n# connected_slaves:1\n# slave0:ip=10.0.1.12,port=6379,state=sync,offset=0,lag=N/A\n# master_failover_state:no-failover\n# master_replid:8371b4fb1155b71f4a60d646\n# master_repl_offset:158765432\n# repl_backlog_active:1\n# repl_backlog_size:1048576\n# repl_backlog_first_byte_offset:157716857\n# repl_backlog_histlen:1048575\n```\n\n看到 `state:sync` 而不是 `state:online`，说明从节点正在全量同步，此时读从节点得到的是完全不可靠的数据。`lag:N/A` 表示延迟无法计算，这比延迟几百毫秒更危险。\n\n解决方案有两条路：一是改用 **Redlock**（分布式锁），在多数节点上同时加锁，容忍单节点故障；二是更务实的方案——把 Redis 幂等层做成**只负责快速拒绝**，真正的去重保证交给数据库的唯一约束（`UNIQUE KEY`）。后者在金融场景里更可靠，因为数据库的事务保证比 Redis 强。\n\n### 根因二：idempotency-key 生成包含时间戳，每次重试都不同\n\n看应用日志就能发现这个问题，三次重试日志里的 key 分别是：\n\n```\npay_1705248006112_order_003821\npay_1705248006234_order_003821\npay_1705248006891_order_003821\n```\n\n`1705248006112` 这串数字是毫秒级时间戳。每次请求时间戳不同，生成的 key 就不同，Redis 里当然查不到，当然会被当成新请求处理。这个 bug 比主从延迟更致命，因为它让幂等机制在逻辑上就是错的，跟 Redis 的状态没有任何关系。\n\n**错误的 key 生成方式（每次重试都产生不同的 key）：**\n```java\n// ❌ 错误：用时间戳生成 key，重试时 key 不同\npublic String generateIdempotencyKey(String orderId) {\n    return \"pay_\" + System.currentTimeMillis() + \"_\" + orderId;\n}\n```\n\n**正确的 key 生成方式（同一业务请求始终相同）：**\n```java\n// ✅ 正确：key 由业务语义决定，不含任何随机或时间因素\n// 方案一：直接用上游传入的幂等 key（最推荐，语义最清晰）\n// 在 HTTP 请求头中：X-Idempotency-Key: <由客户端生成的 UUID>\nString idempotencyKey = request.getHeader(\"X-Idempotency-Key\");\n\n// 方案二：如果上游不传，由服务端用业务 ID 派生\npublic String generateIdempotencyKey(String orderId, String userId, String amount) {\n    // key 只包含业务语义字段，同一笔订单永远是同一个 key\n    return \"pay:\" + orderId;  // 或者 MD5(orderId + userId + amount)\n}\n```\n\n幂等 key 的黄金规则是：**相同的业务请求必须产生相同的 key，任何时间、任何节点都一样**。只要 key 里含有时间戳、随机数、递增序列号这类每次都不同的元素，幂等就是空壳子。\n\n### 根因三：check-then-act 是非原子操作，存在竞态窗口\n\n即使 key 生成正确，原来的代码也有一个并发 bug：`GET` 和 `SET` 是两个独立的 Redis 命令，两者之间存在竞态窗口。在重试风暴下，多个线程完全可能同时执行 `GET` 都返回 `nil`，然后都去执行 `SET`，都认为自己是第一个处理者。\n\n**错误的非原子实现：**\n```java\n// ❌ 错误：GET 和 SET 之间存在竞态窗口\npublic boolean isDuplicate(String idempotencyKey) {\n    String existing = redisTemplate.opsForValue().get(idempotencyKey);  // 操作 1\n    // ← 危险窗口：其他线程也可能在此刻通过了 GET 检查\n    if (existing != null) {\n        return true;\n    }\n    redisTemplate.opsForValue().set(idempotencyKey, \"processing\",       // 操作 2\n        60, TimeUnit.SECONDS);\n    return false;\n}\n```\n\n**正确的原子实现（SET NX）：**\n```java\n// ✅ 正确：用 SET NX EX 原子命令，只有第一个成功的线程才能设置\npublic boolean tryAcquireIdempotency(String idempotencyKey) {\n    // SET key value NX EX seconds\n    // NX = Only set if Not eXists，原子性地检查+设置\n    Boolean acquired = redisTemplate.opsForValue().setIfAbsent(\n        idempotencyKey,\n        \"processing\",\n        60,\n        TimeUnit.SECONDS\n    );\n    // 返回 true 表示成功抢到锁，是第一个请求；返回 false 表示已存在，是重复请求\n    return Boolean.TRUE.equals(acquired);\n}\n```\n\n`SET key value NX EX 60` 在 Redis 内部是一个原子操作，要么设置成功（说明 key 之前不存在），要么失败（key 已存在）。这消除了两步操作之间的竞态窗口。\n\n### 根因四：TTL 过短，在最大重试间隔内幂等 key 就过期了\n\n当前 TTL 是 60 秒。假设上游客户端的重试策略是指数退避，最大等待时间是 120 秒，那么就可能出现这种情况：第一次请求在 t=0 时写入 key，t=60 时 key 过期，t=90 时上游第三次重试打进来，发现 key 不存在，又被当成新请求处理。\n\n排查 TTL 的方式很直接：\n\n```bash\n# 查看幂等 key 的剩余生存时间\nredis-cli -h 10.0.1.11 TTL pay:PAY-20240115-003821\n# 返回 -2 说明 key 已过期不存在\n# 返回 -1 说明 key 存在但没有设置过期时间（也是 bug，会永久占用内存）\n# 返回正整数说明还有多少秒过期\n```\n\nTTL 的设置必须满足：**TTL > 上游最大重试持续时间 + 一定的安全余量**。如果上游的最大重试窗口是 120 秒，TTL 至少要设置为 300 秒（5 分钟）。对于金融支付场景，建议设置为 24 小时甚至更长，磁盘不值钱，重复扣款的损失远比几个 Redis key 贵得多。\n\n## 第三步：系统性防护方案\n\n上面四个根因修复了之后，还需要建立系统性的防护，因为你永远不知道下次是哪种新的失效模式。\n\n**双重保险：Redis + 数据库唯一约束**。Redis 负责快速拒绝（性能好，但不绝对可靠），数据库负责兜底保证（慢一点，但强一致）。在 `payment_records` 表上建唯一约束 `UNIQUE KEY uk_idempotency_key (idempotency_key)`，当 Redis 失效时，数据库的 `INSERT` 会抛出 `DuplicateKeyException`，服务捕获这个异常后返回上次的处理结果，而不是执行新的扣款。这种「Redis 快拒绝 + DB 慢兜底」的双重保险，是金融场景幂等的标准架构。\n\n**监控 `duplicate_request` 指标**。正常业务下重复请求率应该接近 0。当 Redis 的幂等命中率突然下降（或者 DB 的 `DuplicateKeyException` 突然增加），说明上游在大量重试，这是系统压力的早期预警信号，比等到财务对账发现重复扣款要早几个小时。在 Prometheus 中暴露这个指标，配合 Alertmanager 设置告警阈值，比如「5 分钟内重复请求率超过 1%」就触发告警。",
+      "keyPoints": [
+        "幂等 key 的生成规则必须保证：相同的业务请求在任何时间、任何节点上都能产生完全相同的 key，绝不能包含时间戳、随机数等易变因素。",
+        "Redis 的 GET + SET 两步操作之间存在竞态窗口，必须改用 SET NX EX 原子命令，只有第一个成功执行 setIfAbsent 的线程才能获得处理权。",
+        "主从 Redis 架构在主从同步期间存在数据延迟，从从节点读取幂等 key 可能读到旧数据，应将幂等检查的读操作路由到主节点，或改用 Redlock。",
+        "Redis 幂等 key 的 TTL 必须显著大于上游客户端的最大重试持续时间，金融场景建议设置为 24 小时，TTL 过短会导致幂等在合理重试窗口内失效。",
+        "Redis 幂等层只能作为性能优化（快速拒绝重复请求），不能作为唯一保证；必须在数据库层建立唯一约束作为最终兜底，构成双重保险架构。",
+        "通过 redis-cli INFO replication 观察主从延迟和同步状态，通过 redis-cli TTL 检查幂等 key 的剩余时间，是排查幂等失效的两个关键诊断命令。",
+        "监控 duplicate_request 指标（Redis 命中率骤降或 DB DuplicateKeyException 突增）是发现幂等机制异常和上游重试风暴的早期预警手段。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz1",
+          "question": "关于幂等 key 的生成规则，以下哪种方式是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "使用「业务订单 ID」作为幂等 key，相同订单的重试请求产生相同的 key"
+            },
+            {
+              "id": "B",
+              "text": "使用「毫秒时间戳 + 订单 ID」组合，确保每次请求 key 唯一不冲突"
+            },
+            {
+              "id": "C",
+              "text": "使用「UUID」每次随机生成，避免 key 碰撞"
+            },
+            {
+              "id": "D",
+              "text": "使用「请求 IP + 时间戳」确保不同客户端的请求不冲突"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "幂等 key 的核心要求是：相同的业务请求必须产生相同的 key。选项 A 使用业务订单 ID，同一笔订单无论重试多少次，key 始终相同，Redis 可以正确识别重复请求。选项 B 含时间戳，每次重试时间不同则 key 不同，幂等机制形同虚设——这正是本题事故的直接原因之一。选项 C 每次随机生成 UUID，同一请求的重试也会有不同 key，完全无法去重。选项 D 同理，时间戳导致每次 key 不同。真正应该由客户端生成一个代表「这次业务操作」的幂等 key，在所有重试中保持不变，通常做法是 UUID 在客户端生成并在请求头中传递，而不是在服务端每次请求时重新生成。"
+        },
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz2",
+          "question": "在支付场景中，Redis 幂等 key 的 TTL 应该如何设置？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "设置为 5-10 秒，请求处理完就不需要了，短 TTL 节省内存"
+            },
+            {
+              "id": "B",
+              "text": "设置为显著大于上游最大重试持续时间，金融场景建议 24 小时"
+            },
+            {
+              "id": "C",
+              "text": "不设置 TTL，让 key 永久存在以防万一"
+            },
+            {
+              "id": "D",
+              "text": "设置为与 HTTP 请求超时时间相同，通常 30 秒"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "TTL 的核心逻辑是：在上游可能重试的时间窗口内，幂等 key 必须一直存在。如果 TTL 比最大重试间隔短，重试时 key 已过期，Redis 找不到，请求会被错误地当成新请求处理。选项 A 的 5-10 秒明显不够，网络超时重试往往需要几十秒到几分钟。选项 C 不设 TTL 会导致 Redis 内存无限增长，生产环境中当 Redis 内存打满时会触发 key 淘汰，反而导致幂等 key 被删除，适得其反。选项 D 的 30 秒只覆盖了单次请求超时，没有考虑多轮重试的累计时间。正确做法是 TTL 远大于重试窗口，金融场景甚至应该设为 24 小时，因为一笔支付的业务周期可能延伸很长，而存储几亿个 Redis key 的成本远低于一次重复扣款的损失。"
+        },
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz3",
+          "question": "为什么 GET + SET 两步操作会导致并发下幂等失效？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "因为 Redis 不支持并发访问，同时只能处理一个连接"
+            },
+            {
+              "id": "B",
+              "text": "因为 GET 和 SET 是两个独立命令，两者之间存在时间窗口，多线程可能同时通过 GET 检查"
+            },
+            {
+              "id": "C",
+              "text": "因为 SET 操作比 GET 慢，导致数据不一致"
+            },
+            {
+              "id": "D",
+              "text": "因为 Redis 的 GET 命令有缓存，返回的可能是过期数据"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是经典的「check-then-act」竞态条件（race condition）。假设两个线程 T1 和 T2 几乎同时执行：T1 执行 GET，返回 nil（key 不存在）；在 T1 执行 SET 之前，T2 也执行 GET，同样返回 nil；然后 T1 和 T2 都认为自己是第一个请求，各自执行 SET 并各自处理业务逻辑，导致重复处理。这个竞态窗口在正常低并发下很少触发，但在重试风暴下，大量请求同时涌入，竞态概率急剧升高。解决方案是使用 SET NX EX 这个原子命令，它在单个命令内完成「检查是否存在 + 如果不存在则设置」，Redis 保证这个操作的原子性，从根本上消除竞态窗口。选项 A 错误，Redis 虽然单线程执行命令，但客户端连接是并发的，两个命令之间仍有窗口期。"
+        },
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz4",
+          "question": "Redis SET NX EX 命令中，NX 的含义是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "NX = No eXpiry，表示 key 永不过期"
+            },
+            {
+              "id": "B",
+              "text": "NX = Not eXists，表示只有 key 不存在时才执行 SET，key 已存在则不操作"
+            },
+            {
+              "id": "C",
+              "text": "NX = New eXclusive，表示为新 key 加排他锁"
+            },
+            {
+              "id": "D",
+              "text": "NX = Numeric eXtension，表示 value 必须是数字类型"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SET key value NX EX seconds 是 Redis 实现分布式锁和幂等去重的核心命令。NX（Not eXists）的语义是：只有当 key 在 Redis 中不存在时，才执行 SET 操作并返回 OK；如果 key 已经存在，则什么都不做并返回 nil。这个「检查是否存在 + 条件设置」的操作在 Redis 内部是原子的，不会被其他命令打断。EX 参数则是同时设置过期时间（秒），等同于 SETEX 命令。在 Jedis 中对应 `set(key, value, SetParams.setParams().nx().ex(seconds))`，在 Spring Data Redis 中对应 `redisTemplate.opsForValue().setIfAbsent(key, value, duration)`。只有第一个执行该命令的客户端会成功，后续的调用都会因为 key 已存在而失败，从而实现幂等控制。"
+        },
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz5",
+          "question": "执行 `redis-cli INFO replication` 时，从节点出现 `state:sync` 而非 `state:online`，说明什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "从节点正在进行全量数据同步，此时数据不完整，读从节点可能读到陈旧数据"
+            },
+            {
+              "id": "B",
+              "text": "从节点已成功同步所有数据，正在向客户端同步"
+            },
+            {
+              "id": "C",
+              "text": "主节点正在同步从节点的写操作，发生了脑裂"
+            },
+            {
+              "id": "D",
+              "text": "从节点在执行 SYNC 命令扩容内存"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 主从复制有两个阶段：全量同步（FULL RESYNC）和增量同步（PSYNC）。当从节点断连后重新连接，如果复制偏移量已经超出主节点的 replication backlog 范围，就会触发全量同步：主节点执行 BGSAVE 生成 RDB 快照，传输给从节点，从节点加载 RDB。在这整个过程中，从节点的 state 显示为 sync，数据处于中间状态。此时对从节点的 GET 操作读到的是同步前的旧数据，甚至可能读到完全空的数据。这正是本次事故的触发机制：网络抖动后从节点开始全量同步，重试风暴的读请求路由到从节点，所有幂等 key 都查不到，导致重复处理。运维上可以通过监控 `master_sync_in_progress` 指标（值为 1 时说明正在全量同步）来提前告警。"
+        },
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz6",
+          "question": "以下哪种情况会导致幂等机制「看起来正常但实际上没有保护」？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "使用 SET NX EX 原子命令写入幂等 key"
+            },
+            {
+              "id": "B",
+              "text": "idempotency-key 由上游客户端生成 UUID 并在 Header 中传递"
+            },
+            {
+              "id": "C",
+              "text": "服务端每次请求都重新生成 idempotency-key，再用这个 key 查 Redis"
+            },
+            {
+              "id": "D",
+              "text": "TTL 设置为业务处理时间的 100 倍"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个非常隐蔽的 bug，代码看起来完整：有查 Redis、有写 Redis、有 TTL，但实际上幂等根本没有生效。原因在于每次请求都重新生成 key——无论是加时间戳、加随机数还是其他易变因素，只要重试时生成的 key 跟第一次不同，Redis 里就永远找不到，每次都被当成新请求处理。这种问题很难在单元测试中发现，因为测试通常只测单次请求，不测重试场景。在 Code Review 时需要特别关注 idempotency key 的生成逻辑：任何包含 `System.currentTimeMillis()`、`UUID.randomUUID()`、`System.nanoTime()` 的 key 生成代码，都是潜在的幂等失效风险。正确做法是 key 应该由调用方（客户端）在发起业务操作时生成一次，并在该业务操作的所有重试中复用同一个 key。"
+        },
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz7",
+          "question": "Redis 幂等层 + 数据库唯一约束的双重保险架构中，两者的职责划分是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Redis 负责持久化保证，数据库负责性能优化"
+            },
+            {
+              "id": "B",
+              "text": "Redis 负责快速拒绝重复请求（性能层），数据库唯一约束负责最终一致性兜底（正确性层）"
+            },
+            {
+              "id": "C",
+              "text": "两者功能完全相同，其中一个失效时另一个接替，互为主备"
+            },
+            {
+              "id": "D",
+              "text": "Redis 处理读请求，数据库处理写请求，通过分离提高性能"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "双重保险的设计哲学是「快路径 + 慢路径兜底」。Redis 的 SET NX EX 命令在微秒级别就能完成，99% 的重复请求在 Redis 层就被拦截，不会给数据库带来压力。但 Redis 存在主从延迟、网络抖动、内存淘汰等风险，不能作为正确性的唯一保证。数据库的 UNIQUE KEY 约束在事务提交时由存储引擎保证，是强一致的。当极少数情况下 Redis 失效（比如本次事故中的主从同步期间），请求到达数据库层，INSERT 会抛出 DuplicateKeyException，服务捕获异常后返回已有记录，而不是执行新的扣款。这种分层设计在金融、支付等对正确性要求极高的场景是标准实践。选项 C 描述的互为主备是不准确的，它们在架构层次上并不对等，Redis 是性能优化层，DB 是正确性保证层。"
+        },
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz8",
+          "question": "线上出现重复扣款告警，作为 SRE 第一时间应该执行哪个命令来判断 Redis 主从状态？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "redis-cli PING"
+            },
+            {
+              "id": "B",
+              "text": "redis-cli INFO replication"
+            },
+            {
+              "id": "C",
+              "text": "redis-cli MONITOR"
+            },
+            {
+              "id": "D",
+              "text": "redis-cli DEBUG SLEEP 0"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "redis-cli INFO replication 是诊断主从复制状态的标准命令，输出包含：当前节点角色（role: master/slave）、已连接的从节点数量、每个从节点的状态（state: online/sync）、复制偏移量（master_repl_offset 和各从节点的 offset）、主从延迟（lag）。在重复扣款场景下，需要重点关注从节点的 state 是否为 sync（正在全量同步）、lag 值是否异常大、replication backlog 是否已满。选项 A 的 PING 只检查节点是否存活，不反映复制状态。选项 C 的 MONITOR 会输出所有命令，在高流量下会严重影响 Redis 性能，生产环境慎用。选项 D 是测试命令。排查幂等问题还应结合 redis-cli TTL <key> 检查具体幂等 key 的过期状态，以及 redis-cli DEBUG OBJECT <key> 查看 key 的编码信息。"
+        },
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz9",
+          "question": "Redlock 算法相比单节点 Redis 幂等，解决了什么问题？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "解决了 Redis 内存不足的问题，通过分布式存储扩容容量"
+            },
+            {
+              "id": "B",
+              "text": "解决了主从复制延迟导致的幂等失效，通过在多数节点上加锁保证一致性"
+            },
+            {
+              "id": "C",
+              "text": "解决了 SET NX 命令的性能瓶颈，通过并行写多节点提高吞吐量"
+            },
+            {
+              "id": "D",
+              "text": "解决了 Redis key 过期的问题，Redlock 的 key 永不过期"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redlock 是 Redis 作者 antirez 提出的分布式锁算法，核心思想是：向多个（通常是 5 个）独立的 Redis 节点发送 SET NX EX 请求，只有当多数节点（≥3 个）都成功返回，才认为锁获取成功。这样即使某个节点出现主从切换、全量同步或者宕机，只要多数节点状态正常，锁的语义仍然成立。单节点 Redis 幂等的致命弱点是：一旦主节点的数据还没同步到从节点就发生故障或者主从切换，新主节点没有这个 key，下一个请求会错误地获得处理权。Redlock 用多数派原则消除了这个单点风险。但要注意 Redlock 有争议（Martin Kleppmann 发表过批评文章），在时钟漂移的极端情况下仍可能失效，所以金融场景最终还是需要数据库唯一约束兜底。"
+        },
+        {
+          "id": "ds-idempotency-failure-debug-q1-quiz10",
+          "question": "如何通过监控指标提前发现幂等机制可能出现问题？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "只监控 Redis 的内存使用率，内存满了幂等就会出问题"
+            },
+            {
+              "id": "B",
+              "text": "监控 duplicate_request 命中率（Redis 幂等拒绝率）骤降，以及 DB DuplicateKeyException 突增"
+            },
+            {
+              "id": "C",
+              "text": "监控每秒请求数，QPS 变化说明有问题"
+            },
+            {
+              "id": "D",
+              "text": "监控支付接口的平均响应时间，响应变慢说明幂等层有问题"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "幂等机制的健康状态可以通过两个互补的指标来监控。第一个是 Redis 幂等命中率（duplicate_request_redis_hit_rate）：正常业务下，重试率通常在 0.1%-1% 之间，命中率突然大幅下降说明幂等 key 没有被正确创建或者已经过期，重试请求都当成新请求在处理。第二个是数据库层的 DuplicateKeyException 计数：正常情况下几乎为 0，突增说明 Redis 层失效了，兜底逻辑在发挥作用，这时候虽然没有重复扣款（DB 兜底了），但也说明上游在大量重试且 Redis 层有问题。用 Prometheus Counter 记录这两个指标，配合 Grafana 仪表盘和 Alertmanager 告警，可以在财务对账发现问题之前几个小时就收到预警。选项 A 内存使用率是相关但滞后的指标。选项 C 和 D 是通用指标，与幂等机制没有直接关联。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/manual/patterns/distributed-locks/",
+        "https://redis.io/commands/set/",
+        "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html",
+        "https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,157 @@
+{
+  "id": "ds-retry-storm-idempotency",
+  "name": "重试风暴下幂等失效排查",
+  "domain": "distributed-system",
+  "description": "排查Redis主从切换窗口、Key过期、状态机竞争等幂等失效根因",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-retry-storm-idempotency-q1",
+      "domain": "distributed-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["幂等性", "Redis", "主从切换", "重试风暴", "分布式事务", "大促"],
+      "title": "大促期间用户重复扣款，怎么排查幂等性失效的根本原因",
+      "content": "## 故障背景\n\n双十一凌晨 00:03，支付系统告警触发：用户投诉重复扣款，同一笔订单被扣了两次甚至三次费用。监控大盘显示支付成功率从 99.7% 骤降到 91.2%，同时 Redis 命中率告警拉起。\n\n你的系统架构是：前端 → API 网关 → 支付服务（Java, Spring Boot 3.x）→ Redis Sentinel（1主2从）→ MySQL（主从，InnoDB）。幂等性设计方案是：每笔支付请求携带 `idempotencyKey`（由客户端生成的 UUID），支付服务在处理前用 `SET NX EX 300` 占位，处理完成后将状态从 `PROCESSING` 更新为 `SUCCESS`。\n\n```\n# 故障窗口 Redis Sentinel 日志（节选）\n+sdown master mymaster 10.0.1.10 6379\n+odown master mymaster 10.0.1.10 6379 #quorum 2/2\n+switch-master mymaster 10.0.1.10 6379 10.0.1.11 6379\n+slave slave 10.0.1.12:6379 10.0.1.12 6379 @ mymaster 10.0.1.11 6379\n# ↑ 上述切换耗时约 3.2 秒，期间写操作全部失败或超时\n```\n\n```\n# 支付服务错误日志（同一时间窗口，节选）\n[00:02:58.341] WARN  RedisCommand FAILED: SET idempotency:pay_order_88831 PROCESSING NX EX 300 → timeout\n[00:02:58.342] INFO  Idempotency check MISS (key not found), proceeding with payment\n[00:02:58.901] INFO  Payment deducted for order 88831, amount=398.00\n[00:02:59.103] WARN  RedisCommand FAILED: SET idempotency:pay_order_88831 SUCCESS NX EX 300 → connection refused\n[00:02:59.201] INFO  Retry attempt #1 for order 88831 (client retry due to timeout)\n[00:02:59.801] INFO  Idempotency check MISS (key not found), proceeding with payment  ← 第二次扣款\n[00:02:59.902] INFO  Payment deducted for order 88831, amount=398.00\n```\n\n从上面的日志可以看出，用户被扣了两次 398 元。但这只是最典型的一种失效场景。在这次故障的事后分析中，团队发现了至少四个不同的幂等失效路径。\n\n**问题：**\n1. 分析这次故障中幂等性失效的所有根因，不要仅停留在「Redis 切换」这一个原因。\n2. 给出每种根因对应的修复方案，包括关键代码或配置。\n3. 如果 Redis 在未来再次发生故障，如何保证幂等性不失效？\n4. 说明预防幂等失效的体系化方案，包括 TTL 设计、状态机管理、监控和对账。",
+      "answer": "## 先把幂等性本身说清楚\n\n幂等性（Idempotency）这个词来自数学，f(f(x)) = f(x)，意思是一个操作执行多次和执行一次结果相同。在分布式支付场景里，这意味着：无论因为网络超时、客户端重试、网关重发导致同一笔支付请求被处理多少次，用户的账户只扣一次钱。\n\n实现幂等最常见的手段是「幂等键 + 分布式锁占位」：客户端带一个全局唯一的 `idempotencyKey`，服务端用 `SET key value NX EX ttl` 原子地写入 Redis——`NX` 确保只有第一次调用能写入，`EX` 控制过期时间，后续重试拿到已存在的 key 就直接返回之前的结果，不再重复执行业务逻辑。理论上很完美，但生产中有四个地方会让这个方案悄悄失效。\n\n## 根因一：Redis 主从切换窗口导致「写丢失」\n\n这是日志里最直接暴露的问题。Redis Sentinel 的故障检测和切换流程是：主节点超过 `down-after-milliseconds`（默认 30s，很多团队为了快速切换会改成 3-5s）没有响应 → Sentinel 认定其主观下线 → 多数 Sentinel 投票确认客观下线 → 选出新主节点 → 更新路由。整个过程通常需要 3-10 秒，这段时间里对原主节点的写操作全部超时或报错。\n\n更危险的是 Redis 异步复制的本质：主节点接受写入后立刻返回 `OK`，再异步把写操作同步给从节点。切换前主节点宕机的那一刻，还没来得及复制的数据就永久丢失了。日志里的 `idempotency:pay_order_88831` 这个 key，在旧主节点上写入成功，但还没同步到从节点，切换后新主节点不知道这个 key 的存在，下一次重试自然通过了幂等检查，于是发生了第二次扣款。\n\n**修复方案：** 把 Redis 配置改为 `min-slaves-to-write 1` + `min-slaves-max-lag 10`，要求至少一个从节点复制完成才确认写入，用同步复制换掉异步复制的「最后一英里」。但这会让写入延迟增加 1-3ms，大促期间要权衡。更彻底的方案是用 Redlock（红锁）：同时向 3 个或 5 个独立的 Redis 实例写入，只有多数节点（N/2+1）写入成功才认为加锁成功，任何一个节点宕机都不影响锁的有效性。\n\n```java\n// Redisson RedLock 示例（Java）\nRLock lock1 = redisson1.getLock(\"idempotency:\" + idempotencyKey);\nRLock lock2 = redisson2.getLock(\"idempotency:\" + idempotencyKey);\nRLock lock3 = redisson3.getLock(\"idempotency:\" + idempotencyKey);\nRedissonRedLock redLock = new RedissonRedLock(lock1, lock2, lock3);\n\nboolean acquired = redLock.tryLock(\n    500,   // waitTime: 最多等 500ms\n    300_000, // leaseTime: 锁持有 5 分钟（覆盖最长重试窗口）\n    TimeUnit.MILLISECONDS\n);\nif (!acquired) {\n    // 加锁失败说明同 key 请求正在处理，直接返回「处理中」\n    return IdempotencyResult.PROCESSING;\n}\n```\n\n## 根因二：幂等 Key 的 TTL 短于客户端重试窗口\n\n这个根因更隐蔽，不需要 Redis 故障就能触发。假设业务设置 `EX 300`（5 分钟），但客户端的重试策略是指数退避，最大重试间隔 30 分钟，重试总时长可能达到 2 小时。用户下单后因为网络抖动没收到响应，客户端在 35 分钟后发起第 3 次重试——此时 Redis 里的幂等 key 早已过期，幂等检查再次 MISS，第二次扣款就发生了。\n\n这个问题在大促期间尤其严重。大促流量高峰时支付系统经常出现 30-60 秒的处理超时，客户端会不停重试，重试窗口很容易超过默认的 5 分钟 TTL。\n\n**修复方案：** TTL 必须大于客户端最长重试窗口的 2 倍，且不能小于订单的最长处理时间。通常设置为 24 小时：`SET idempotency:{key} PROCESSING NX EX 86400`。有人担心 24 小时的 key 会撑爆 Redis 内存，但算一下：大促峰值 10 万 QPS，每个 key 占约 200 字节，24 小时累积 8640 亿 key……显然不对，应该是 10 万 × 86400 秒 × 200 字节 ≈ 1.7TB。这确实很大，所以要结合业务评估 —— 对于支付场景，TTL 设为订单过期时间（通常 15-30 分钟）就够了，只要大于最长重试窗口即可。关键是要**测量**你的实际重试分布，而不是拍脑袋定 5 分钟。\n\n## 根因三：状态机竞争导致「PROCESSING 状态被并发请求覆盖」\n\n日志里出现了这样的操作顺序：\n\n```\n请求 A: SET idempotency:pay_88831 PROCESSING NX EX 300  → OK（成功占位）\n请求 A: 执行扣款逻辑（耗时 ~500ms）\n请求 A: SET idempotency:pay_88831 SUCCESS NX EX 300  → NIL（NX 失败，key 已存在）\n```\n\n注意到问题了吗？完成后更新状态时也用了 `NX`，这意味着把 `PROCESSING` 更新为 `SUCCESS` 这步永远不会成功——因为 key 已经存在（被请求 A 自己写入的 `PROCESSING`）。这是代码逻辑 bug：状态更新不能用 `NX`，应该用 `SET`（覆盖写）或者用 Lua 脚本做原子的「检查-更新」。\n\n更严重的竞争场景是：请求 A 执行扣款后 Redis 超时，没能写入 SUCCESS，然后请求 B 来了，看到 key 是 `PROCESSING`，等了一会儿之后 key 因某种原因（比如 Redis 切换）消失，请求 B 重新占位并二次扣款。\n\n**修复方案：** 用 Lua 脚本做原子状态机转换，杜绝 check-then-act 的竞争窗口：\n\n```lua\n-- 原子地将 PROCESSING 转换为 SUCCESS\n-- KEYS[1] = idempotencyKey, ARGV[1] = 业务结果 JSON\nlocal current = redis.call('GET', KEYS[1])\nif current == 'PROCESSING' then\n    redis.call('SET', KEYS[1], ARGV[1])\n    return 1  -- 成功转换\nelseif current == false then\n    return -1  -- key 已过期（需要查 DB 兜底）\nelse\n    return 0   -- 已经是 SUCCESS，直接返回缓存结果\nend\n```\n\n## 根因四：错误地删除了 PROCESSING 状态的占位 Key\n\n这个根因最容易被忽视。有些团队为了「及时释放 Redis 内存」，在异常处理里加了这样的代码：\n\n```java\n} catch (PaymentException e) {\n    // 支付失败，清理幂等 key 以允许用户重试\n    redisTemplate.delete(\"idempotency:\" + idempotencyKey);  // ← 危险！\n    throw e;\n}\n```\n\n逻辑看起来合理：支付失败了，应该让用户能重试。但问题在于，删除操作本身不是原子的。场景如下：请求 A 执行了扣款，但在返回结果途中网络断了，客户端认为请求失败，异常处理删掉了幂等 key；请求 B 重试，幂等检查 MISS，再次扣款。用户实际上被扣了两次，但只有一次明确的「成功」响应。\n\n**规则：只有 PROCESSING 状态且确认业务逻辑未执行时才能删 key，一旦进入扣款流程就不能删 key，应该把状态改为 FAILED 并记录原因，允许用户发起新的支付请求（携带新的 idempotencyKey）。**\n\n## 兜底方案：Redis 故障时降级到数据库\n\n四种根因修复之后，还需要一个「Redis 整体不可用」时的兜底方案，否则任何 Redis 故障都会让支付系统完全失去幂等保障。DB 降级兜底的思路是在 MySQL 里维护一张幂等记录表：\n\n```sql\nCREATE TABLE idempotency_records (\n    idempotency_key VARCHAR(64) PRIMARY KEY,\n    status ENUM('PROCESSING', 'SUCCESS', 'FAILED') NOT NULL DEFAULT 'PROCESSING',\n    result_json TEXT,                     -- 业务结果（用于重复请求直接返回）\n    order_id BIGINT NOT NULL,\n    created_at DATETIME DEFAULT NOW(),\n    updated_at DATETIME DEFAULT NOW() ON UPDATE NOW(),\n    expired_at DATETIME NOT NULL,\n    INDEX idx_order (order_id),\n    INDEX idx_expire (expired_at)\n) ENGINE=InnoDB;\n```\n\n正常情况下 Redis 作为第一道检查，DB 作为最终写入；Redis 故障时直接查 DB，性能有所下降但幂等性不失效。DB 的 `INSERT IGNORE` 或 `ON DUPLICATE KEY UPDATE` 本身就是原子的，不需要额外的分布式锁。AOF 配置方面，如果把 Redis 的 `appendfsync` 从默认的 `everysec` 改为 `always`，每次写入都 fsync 到磁盘，可以把数据丢失窗口从 1 秒降到接近 0，代价是写入吞吐量下降约 30-40%，大促期间要提前压测评估。\n\n## 预防体系：四条不能省的原则\n\n**TTL 大于重试窗口**是最基础的原则。建议把支付幂等 key 的 TTL 与订单超时时间对齐，通常 30 分钟，绝对不能低于客户端最长重试间隔。可以在创建 key 时把 TTL 写入 key 的 value 里，方便后续排查：`{\"status\":\"PROCESSING\",\"created_at\":1699632178,\"ttl\":1800}`。\n\n**只删 PROCESSING，绝不删 SUCCESS**。一旦一个支付请求成功执行，对应的幂等 key 必须保留到过期，这是「防止重复扣款」的最后一道防线。代码审查中要专门 check 所有 `redisTemplate.delete(\"idempotency:*\")` 的调用点。\n\n**监控命中率而不只是 Redis 可用性**。幂等 key 的「命中率」（重复请求被拦截的比例）应该有独立的业务监控指标。正常情况下大促期间命中率应该在 5-15%（大量重试请求被拦截），如果命中率突然下降到接近 0，很可能是幂等保护失效了。Prometheus 指标建议：`payment_idempotency_hit_total` / `payment_idempotency_miss_total`，配置告警：`irate(payment_idempotency_miss_total[5m]) / irate(payment_idempotency_total[5m]) > 0.3`（超过 30% 的请求都是 MISS 时告警）。\n\n**对账是最终保障**。所有上述技术手段都不能 100% 保证不出问题，所以需要异步对账：每隔 5 分钟扫描支付流水表，找出同一 `order_id` 有多条 SUCCESS 记录的订单，自动发起退款或人工介入。对账是幂等失效的「最终裁判」，无论技术方案多完善，这道防线不能省。",
+      "keyPoints": [
+        "Redis 主从切换期间 3-10 秒的写入失败窗口，叠加异步复制的数据丢失，是大促期间幂等失效最常见的根因，需要用 min-slaves-to-write 或 Redlock 多节点写入来消除",
+        "幂等 Key 的 TTL 必须严格大于客户端最长重试窗口，否则 Key 过期后重试请求会通过幂等检查，大促场景下建议 TTL 与订单超时时间对齐（通常 30 分钟）",
+        "状态机转换必须使用 Lua 脚本保证原子性，用 NX 标志更新 SUCCESS 状态是常见代码 bug，会导致 PROCESSING 永远无法转换为 SUCCESS",
+        "一旦业务逻辑（如扣款）开始执行，对应的幂等 Key 绝对不能删除，异常处理中删除 PROCESSING Key 会打开重复扣款的窗口",
+        "AOF always 模式可以将 Redis 数据丢失窗口从 1 秒降至接近 0，但写入吞吐量下降约 30-40%，需要在大促前压测评估是否可以承受",
+        "DB 幂等记录表是 Redis 故障时的降级兜底，利用 MySQL InnoDB 的 INSERT IGNORE 原子性保证幂等，确保 Redis 不可用时支付系统不会完全失去幂等保护",
+        "幂等命中率是比 Redis 可用性更贴近业务的监控指标，命中率突然下降往往是幂等失效的早期信号，应在 Prometheus 中单独埋点并配置告警",
+        "异步对账是所有技术手段之外的最终保障，定期扫描同一 order_id 的重复 SUCCESS 记录并自动触发退款，这道防线在任何生产支付系统中都不能省略"
+      ],
+      "quiz": [
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz1",
+          "question": "Redis Sentinel 架构中，主从切换期间幂等 Key 丢失的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Redis 使用异步复制，主节点写入成功后从节点未必立刻同步，主节点宕机时未复制的数据永久丢失"},
+            {"id": "B", "text": "Sentinel 切换时会主动清空从节点数据以保证主从一致性"},
+            {"id": "C", "text": "Redis 默认开启了 maxmemory 策略，切换时会触发 LRU 淘汰"},
+            {"id": "D", "text": "新主节点在升级后会执行 FLUSHDB 清空旧数据"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 主从复制默认是异步的：主节点接收到写命令后立即返回 OK，然后将命令异步发送给从节点。当主节点在异步复制完成前宕机时，那些已经返回 OK 但还没同步到从节点的写操作就永久丢失了。Sentinel 切换时不会清空从节点数据（B 错误），Redis 的 LRU 淘汰与切换流程无关（C 错误），新主节点升级后也不会执行 FLUSHDB（D 错误）。解决方案是使用 `min-slaves-to-write` 配置要求至少一个从节点确认写入，或使用 Redlock 向多个独立 Redis 实例写入。"
+        },
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz2",
+          "question": "以下哪条 Redis SET 命令能正确实现「仅在 Key 不存在时写入，且设置过期时间」的原子操作？",
+          "choices": [
+            {"id": "A", "text": "SET key value NX EX 300"},
+            {"id": "B", "text": "SETNX key value 之后再执行 EXPIRE key 300"},
+            {"id": "C", "text": "SET key value EX 300 之后判断返回值"},
+            {"id": "D", "text": "GET key; 如果不存在则 SET key value EX 300"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`SET key value NX EX 300` 是一条原子命令，NX（Not eXists）保证只有 key 不存在时才写入，EX 300 设置 300 秒过期。B 选项的问题在于 SETNX 和 EXPIRE 是两条命令，不是原子的——如果 SETNX 成功后进程崩溃，EXPIRE 没有执行，key 就永远不会过期，形成死锁。C 选项缺少 NX，所有请求都会成功写入，失去了幂等检查的作用。D 选项的 GET + SET 是典型的 check-then-act 竞争条件，两个并发请求都可能通过 GET 检查然后都执行 SET。在 Redis 2.6.12 之前确实需要用 SETNX + EXPIRE，这也是很多老代码存在 bug 的原因。"
+        },
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz3",
+          "question": "支付服务在处理完成后执行 `SET idempotency:key SUCCESS NX EX 300`，但这条命令总是返回 NIL，原因是什么？",
+          "choices": [
+            {"id": "A", "text": "NX 标志导致写入失败，因为 key 在 PROCESSING 阶段已经存在，NX 不允许覆盖已有 key"},
+            {"id": "B", "text": "SUCCESS 是 Redis 保留关键字，不能作为 value"},
+            {"id": "C", "text": "SET 命令不支持同时使用 NX 和 EX 标志"},
+            {"id": "D", "text": "300 秒的 TTL 太短，Redis 拒绝了写入"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个极其常见的代码逻辑 bug。幂等占位时已经执行了 `SET idempotency:key PROCESSING NX EX 300`，key 已经存在。当处理完成后再执行 `SET idempotency:key SUCCESS NX EX 300` 时，NX 条件不满足（key 已存在），Redis 返回 NIL，写入失败，key 的值永远停留在 PROCESSING 状态。正确做法是状态更新应该使用 `SET key value`（不带 NX）直接覆盖，或者用 Lua 脚本做原子的「检查当前值为 PROCESSING → 更新为 SUCCESS」操作。SUCCESS 不是保留字，SET 支持 NX+EX 组合，TTL 长度不影响写入许可。"
+        },
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz4",
+          "question": "幂等 Key 的 TTL 设置为 5 分钟，客户端重试策略为指数退避（最大间隔 10 分钟，最长重试 2 小时），以下哪种场景会导致重复扣款？",
+          "choices": [
+            {"id": "A", "text": "首次请求因超时无法确认结果，客户端在 8 分钟后发起第 2 次重试，此时幂等 Key 已过期"},
+            {"id": "B", "text": "首次请求成功，客户端在 2 分钟后发起重试，被幂等 Key 拦截"},
+            {"id": "C", "text": "并发的两个请求都在 TTL 内到达，第二个被幂等 Key 拦截"},
+            {"id": "D", "text": "首次请求在 30 秒内完成，1 分钟后客户端发起第 2 次重试，被拦截"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "TTL 5 分钟（300 秒）短于客户端的最大重试间隔 10 分钟。当首次请求因超时无法确认时，客户端按指数退避等待，到第 8 分钟发起重试时，幂等 Key 已经过期，Redis 检查为 MISS，重试请求被当作新请求处理，导致二次扣款。B、C、D 三个场景中，重试都发生在 TTL 之内，幂等 Key 有效，重复请求都会被正确拦截。这说明 TTL 设计必须基于客户端实际的重试时间分布，而不是一个随意的值。生产中建议 TTL = max(订单超期时间, 客户端最长重试窗口 × 2)。"
+        },
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz5",
+          "question": "以下 Redis 日志片段中，哪个配置可以将主从数据丢失窗口从「秒级」降低到「接近 0」，代价是什么？",
+          "choices": [
+            {"id": "A", "text": "将 appendfsync 从 everysec 改为 always，代价是写入吞吐量下降约 30-40%"},
+            {"id": "B", "text": "将 save 配置改为 save 1 1，代价是 CPU 开销增加"},
+            {"id": "C", "text": "开启 repl-diskless-sync，代价是主从初始化时间变长"},
+            {"id": "D", "text": "将 maxmemory-policy 改为 allkeys-lru，代价是热点数据可能被淘汰"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`appendfsync everysec` 是 AOF 的默认配置，Redis 每秒执行一次 fsync，意味着最多丢失 1 秒的数据。改为 `appendfsync always` 后，每次写操作都会立即 fsync 到磁盘，数据丢失窗口接近 0。代价是每次写入都需要等待磁盘 IO，在 SSD 上大约增加 1-2ms 延迟，写入吞吐量下降约 30-40%，大促前必须压测评估。`save` 配置影响的是 RDB 快照频率，RDB 持久化本质上是定时快照，数据丢失窗口取决于快照间隔，无法降到「接近 0」。`repl-diskless-sync` 影响主从复制方式，`maxmemory-policy` 影响内存淘汰策略，都与数据丢失窗口无关。"
+        },
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz6",
+          "question": "以下代码在异常处理中删除幂等 Key，这段代码存在什么问题？",
+          "choices": [
+            {"id": "A", "text": "删除 PROCESSING 状态的 Key 会打开重复扣款的窗口，因为扣款可能已经执行但结果未返回"},
+            {"id": "B", "text": "这段代码是正确的，支付失败后必须删除幂等 Key 才能允许用户重试"},
+            {"id": "C", "text": "问题在于应该用 UNLINK 而非 DELETE，UNLINK 是异步删除性能更好"},
+            {"id": "D", "text": "问题在于没有检查 DELETE 的返回值，如果 DELETE 失败会导致 Key 残留"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是支付系统里最危险的代码模式之一。异常不等于「扣款未执行」——在网络超时场景中，扣款请求可能已经发给银行并成功执行，但返回结果时网络断了，服务端收到超时异常。此时删除幂等 Key，下一次重试就会绕过幂等检查，再次扣款。正确处理是将 Key 的状态改为 FAILED 并记录原因，让用户发起带新 idempotencyKey 的全新支付请求，而不是重用原来的 Key 重试。如果确实需要允许用户用同一个 Key 重试，必须先查询支付渠道确认第一次支付的结果，只有在确认「未扣款」的情况下才能删 Key。"
+        },
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz7",
+          "question": "Redlock 算法要求向 N 个独立 Redis 实例写入，N/2+1 个实例成功才认为加锁成功。N=5 时，最多可以容忍几个实例同时不可用？",
+          "choices": [
+            {"id": "A", "text": "2 个实例不可用（5/2+1=3 个成功即可，容忍 2 个失败）"},
+            {"id": "B", "text": "1 个实例不可用"},
+            {"id": "C", "text": "3 个实例不可用"},
+            {"id": "D", "text": "4 个实例不可用，只要有 1 个实例成功即可"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redlock 要求 N/2+1 个节点成功才认为加锁成功，这是多数派原则（Quorum）。N=5 时，需要至少 ceil(5/2)+1=3 个节点成功，最多能容忍 5-3=2 个节点同时不可用。这与 Raft 等共识算法的容错能力相同。N=3 时只能容忍 1 个节点失败，N=5 可以容忍 2 个，所以生产环境推荐使用 5 个独立节点（不是 5 个槽，必须是物理上独立的 5 个 Redis 实例，部署在不同服务器上）。值得注意的是，Redlock 在网络分区场景下仍存在争议（见 Martin Kleppmann 对 Antirez 的反驳），对于支付这类对一致性要求极高的场景，DB 降级兜底是比 Redlock 更可靠的方案。"
+        },
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz8",
+          "question": "大促期间幂等 Key 命中率从 12% 突然下降到 0.3%，这最可能意味着什么？",
+          "choices": [
+            {"id": "A", "text": "幂等保护失效：Redis 中的幂等 Key 大量不存在（可能因 Key 过期或 Redis 故障），重试请求全部通过了幂等检查"},
+            {"id": "B", "text": "用户重试请求减少了，说明支付成功率提升"},
+            {"id": "C", "text": "Redis 连接池耗尽，读操作超时，命中率统计不准确"},
+            {"id": "D", "text": "幂等 Key 前缀配置错误，导致写入和读取的 Key 名称不一致"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "大促期间网络抖动、超时、限流会导致大量客户端重试，正常情况下命中率应该在 5-20%（相当一部分请求是被拦截的重复请求）。命中率从 12% 突然降到 0.3% 说明几乎所有重试请求都绕过了幂等检查，最可能的原因是 Redis 不可用（幂等检查 SET NX 失败后服务降级为放行）或幂等 Key 大量过期（TTL 设置过短）。这个指标应该配置告警，一旦命中率异常低就需要立刻介入排查，否则可能已经有大量重复扣款在发生。D 选项描述的场景会导致命中率为 0（从不命中），但这是持续的问题而非突然下降，且通常会在上线时被发现。"
+        },
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz9",
+          "question": "以下 Lua 脚本用于原子地将幂等 Key 从 PROCESSING 转换为 SUCCESS，哪个版本是正确且安全的？",
+          "choices": [
+            {"id": "A", "text": "GET current; if current == 'PROCESSING' then SET key result; return 1; else return 0; end（Lua 脚本保证原子性）"},
+            {"id": "B", "text": "直接执行 SET key result（不检查当前状态，直接覆盖）"},
+            {"id": "C", "text": "DEL key; SET key result NX EX 300（删除后重新写入）"},
+            {"id": "D", "text": "SETNX key result（只在 key 不存在时写入，PROCESSING 已存在所以失败）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Lua 脚本在 Redis 中以原子方式执行，不会被其他命令打断，所以 GET + 条件判断 + SET 这一系列操作是完全原子的，不存在竞争条件。B 选项直接覆盖虽然功能上可以工作，但会丢失「当前状态检查」——如果并发的两个请求都执行了扣款（幂等已经失效），直接覆盖会让第二次的结果覆盖第一次，掩盖了双扣问题。C 选项的 DEL + SET NX 不是原子的，中间有竞争窗口，另一个请求可能在 DEL 后、SET NX 前插入。D 选项是我们已经分析过的 bug：PROCESSING 状态的 key 已存在，SETNX 永远失败，状态永远无法更新为 SUCCESS。"
+        },
+        {
+          "id": "ds-retry-storm-idempotency-q1-quiz10",
+          "question": "对账系统发现订单 order_88831 有两条 status=SUCCESS 的支付流水记录，amount 分别为 398.00 元，正确的处理流程是什么？",
+          "choices": [
+            {"id": "A", "text": "确认为重复扣款后，自动向银行/第三方支付发起第二笔 398 元的退款，同时将其中一条流水标记为 REFUNDED，并触发告警通知 on-call 工程师排查根因"},
+            {"id": "B", "text": "删除其中一条流水记录，保持数据库干净"},
+            {"id": "C", "text": "两条记录都标记为 INVALID，让用户重新支付"},
+            {"id": "D", "text": "不处理，等用户自己发现后投诉，再人工退款"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "重复扣款是最严重的资金安全问题，必须有明确的自动化处理流程。正确步骤是：1）对账系统识别出双扣后，优先自动退款，不能等用户投诉（用户可能根本没有发现）；2）退款后在流水表中标记 REFUNDED，保留完整审计链，绝不能删除原始记录（B 错误）；3）立刻触发告警，通知 on-call 工程师排查幂等失效的根因，防止更多用户受影响。C 选项让用户重新支付会造成用户体验极差，且第一笔钱用户已经被扣了，不能让用户自费排查。D 选项是完全不可接受的处理方式，在金融监管层面也是违规的。对账系统本身也应该有误报保护，比如确认两条流水的 idempotencyKey 相同且 amount 相同，才认定为重复扣款。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/management/sentinel/",
+        "https://redis.io/docs/reference/patterns/distributed-locks/",
+        "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html",
+        "https://antirez.com/news/101"
+      ]
+    }
+  ]
+}
