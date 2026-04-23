@@ -1,0 +1,165 @@
+{
+  "id": "ds-message-backlog-debug",
+  "name": "消息积压排查处理",
+  "domain": "distributed-system",
+  "description": "通过真实场景讲解消息积压的监控指标、根因定位步骤，以及临时扩容消费者、跳过积压消息等应急手段",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-message-backlog-debug-01",
+      "domain": "distributed-system",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["kafka", "consumer-lag", "消息积压", "大促", "应急处理", "监控"],
+      "title": "大促期间 Kafka 消费积压了 500 万条，你怎么排查和处理？",
+      "content": "下午 2 点整，电商平台「双十一」预热大促准时开始。订单服务部署在 6 个 Pod 上，每笔订单创建成功后都会向 Kafka 的 `order-topic` 发一条消息，这个 topic 有 6 个分区，下游有三个消费者组分别处理库存扣减、积分发放和物流通知。\n\n大促开始 15 分钟后，告警群里炸了。监控大盘显示 `order-consumer-group` 的 consumer lag 从 0 暴增到 **500 万**，并且还在以每分钟 30 万的速度继续攀升。与此同时，客服开始收到用户投诉：「下单成功了，但积分没到账」「库存扣了但状态还是处理中」「物流那边说还没收到通知」。\n\n表面上看，订单是创建成功的——MySQL 里的数据没问题，用户也收到了下单确认短信。但所有依赖消息队列的下游业务都卡住了，延迟超过 30 分钟。\n\n你是今天的 on-call 工程师，现在面临两个紧迫问题：**第一，积压是怎么产生的，根因在哪？第二，怎么在最短时间内把积压消化掉，同时不丢数据？**\n\n你会怎么做？",
+      "answer": "## 第一步：先搞清楚 Kafka Consumer Lag 是什么\n\nKafka 的设计哲学和传统消息队列不同，它不是「推送」给消费者的，而是消费者主动来「拉取」的。每条消息在分区里都有一个唯一的位置标识叫做 offset，就像书的页码一样，是单调递增的整数。生产者写入消息，offset 就往后推；消费者读完消息，提交当前的 offset 告诉 Kafka「我读到这里了」。\n\nConsumer Lag（消费延迟）的计算公式非常直白：**Lag = Log End Offset（分区最新消息的 offset）- Consumer Committed Offset（消费者已提交的 offset）**。Lag 为 0 意味着消费者跟上了生产者的节奏，没有积压；Lag 持续增大意味着生产者写入的速度超过了消费者处理的速度，差距在不断扩大。\n\n有一点经常被忽视：Kafka 本身不会因为积压而丢消息。默认情况下消息会保留 7 天（`log.retention.hours=168`），只要消费者在这个窗口内追上来，数据就不会丢。这和 RabbitMQ 的内存队列不同，过载时 RabbitMQ 可能会触发 flow control 甚至丢消息，Kafka 的积压通常只是延迟问题，不是数据丢失问题——当然，如果积压超过了保留期限，消息就真的没了。\n\n理解了 Lag 的本质之后，积压的根本原因其实只有两种：**生产速率突增**，消费者来不及处理；**消费者能力下降**，可能是消费者宕机了、处理逻辑变慢了、或者消费者数量不够。大促场景几乎 100% 是第一种。\n\n## 第二步：快速定位根因\n\n上线的第一个命令是查 consumer group 的详细状态：\n\n```bash\nkafka-consumer-groups.sh --bootstrap-server kafka:9092 \\\n  --group order-consumer-group --describe\n\n# 典型输出如下：\n# GROUP               TOPIC         PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG    CONSUMER-ID\n# order-consumer-group  order-topic   0          1000000         1850000         850000  order-consumer-0\n# order-consumer-group  order-topic   1          1200000         1950000         750000  order-consumer-0\n# order-consumer-group  order-topic   2          900000          1800000         900000  order-consumer-1\n# order-consumer-group  order-topic   3          1100000         1700000         600000  order-consumer-1\n# order-consumer-group  order-topic   4          800000          1650000         850000  - （无消费者！）\n# order-consumer-group  order-topic   5          950000          1750000         800000  - （无消费者！）\n```\n\n这个输出一眼就能看出问题：分区 4 和分区 5 的 CONSUMER-ID 是空的，说明这两个分区当前没有任何消费者在消费。6 个分区只有 2 个消费者实例在跑，意味着每个消费者要负责 3 个分区，吞吐量打了折扣。而且有两个分区根本没人消费，lag 在原地等待。\n\n再去查消费者的日志，确认为什么少了实例：\n\n```bash\nkubectl get pods -l app=order-consumer\n# NAME                    READY   STATUS             RESTARTS\n# order-consumer-abc12    1/1     Running            0\n# order-consumer-def34    1/1     Running            0\n# order-consumer-ghi56    0/1     CrashLoopBackOff   8\n# order-consumer-jkl78    0/1     CrashLoopBackOff   5\n\nkubectl logs order-consumer-ghi56 --previous | tail -50\n# 关键报错：\n# ERROR - Failed to process message: java.sql.SQLException: \n#   Too many connections (max_connections=500, current=512)\n# WARN  - Consumer rebalance triggered, partition assignment changed\n# ERROR - org.apache.kafka.clients.consumer.CommitFailedException: \n#   Offset commit cannot be completed since the consumer is not part of\n#   an active group for auto partition assignment\n```\n\n找到了。根因链条非常清晰：大促开始后订单量激增，消费者要频繁查询库存数据库，数据库连接池被打满了（`Too many connections`），消费者处理消息失败，然后抛出异常导致 Pod 重启。Pod 重启触发 Rebalance（Kafka 重新分配分区），在 Rebalance 期间所有消费者都暂停消费（这个停顿叫做 Stop-The-World Rebalance），Rebalance 结束后 Pod 又崩了，再次触发 Rebalance——就这样陷入了死循环。Lag 在这个过程中以几何级数增长。\n\n这类故障的排查口诀是：**先看 lag 总量和分布，再看消费者是否存活，最后看消费者日志找业务层报错。** 不要跳过中间环节直接去看业务日志，因为消费者根本没跑起来的情况下，业务日志里什么都没有。\n\n## 第三步：应急处理——先止血，再治根\n\n应急处理的顺序很关键：先恢复消费能力，再解决根因，最后消化积压。不要颠倒顺序，不然根因没解决，扩容的消费者又会崩掉。\n\n**修复根因：解决数据库连接池打满的问题。** 这是最优先的事。快速方案有两个：一是临时调大 MySQL 的 `max_connections`（需要评估内存，`max_connections=1000` 大约额外消耗 500MB 内存），二是调整消费者的数据库连接池配置，每个消费者实例最多保持 20 个连接，6 个实例就是 120 个，留足余量。紧急情况下可以直接 `kubectl set env` 热更新环境变量，让 Pod 重启时生效。\n\n**临时扩容消费者（最直接的方案）：** 根因修复后，把消费者实例数从 2 扩到 6，正好和分区数相等——Kafka 的黄金法则是「消费者数 ≤ 分区数」，超过分区数的消费者实例会闲置，白白占资源。\n\n```bash\nkubectl scale deployment order-consumer --replicas=6\n# 等待 Pod 就绪\nkubectl rollout status deployment/order-consumer\n\n# 扩容后再次检查 lag，应该看到所有分区都有消费者，lag 开始下降\nkafka-consumer-groups.sh --bootstrap-server kafka:9092 \\\n  --group order-consumer-group --describe\n```\n\n扩容到 6 个消费者后，每个消费者只负责 1 个分区，处理速度理论上提升 3 倍。原来每秒消费 500 条，现在能到 1500 条，而生产速率假设是 5000 条/秒，还是跟不上。这时候有两个选择。\n\n**方案 A：增加分区数，再扩消费者（可以突破分区数限制）。** 注意增加分区数对已有消息不会重新分配，只有新消息会路由到新分区。\n\n```bash\n# 把分区从 6 扩到 18\nkafka-topics.sh --bootstrap-server kafka:9092 \\\n  --alter --topic order-topic --partitions 18\n\n# 消费者也相应扩到 18 个\nkubectl scale deployment order-consumer --replicas=18\n```\n\n**方案 B：提升单个消费者的处理并发。** 如果消费者代码支持批量拉取（`max.poll.records=500`），可以通过批量写库替代逐条写库，把单次 poll 的吞吐量提升 10 倍以上。这需要改代码，通常大促现场不适合，但可以作为后续优化项。\n\n**方案 C：跳过积压（谨慎使用，仅限非关键消息）。** 如果积压的是可以重放或者允许丢失的消息（比如埋点日志、推荐系统的点击事件），可以直接把 offset 重置到最新位置，放弃积压的消息，让消费者只处理实时消息。但「库存扣减」「积分发放」这类消息绝对不能用这个方案，因为丢消息意味着用户下了单但库存没扣——数据不一致，严重的财务问题。\n\n```bash\n# 危险操作！执行前必须确认消息可以丢弃\n# 先停止消费者，否则 reset 会失败\nkubectl scale deployment order-consumer --replicas=0\n\nkafka-consumer-groups.sh --bootstrap-server kafka:9092 \\\n  --group order-consumer-group \\\n  --topic order-topic \\\n  --reset-offsets --to-latest --execute\n\n# 再启动消费者\nkubectl scale deployment order-consumer --replicas=6\n```\n\n## 第四步：预防措施——让这件事不再发生\n\n事后复盘，这次故障完全可以提前预防。第一个问题是告警阈值设错了，等 lag 到 500 万才报警，已经延迟了 15 分钟。正确的阈值应该是：lag 超过 **10 万**时 warning，超过 **50 万**时 critical，让团队在积压刚开始时就介入，而不是等到深度积压。\n\n第二个问题是大促前没有提前扩容。标准的大促 playbook 应该包含：提前 30 分钟手动把消费者扩容到最大分区数，确认所有分区都有消费者分配，数据库连接池提前调大，慢查询监控临时降低阈值（从 500ms 降到 100ms）。\n\n第三个问题是消费者缺乏隔离性保护。库存扣减、积分发放、物流通知本来就应该是三个独立的消费者组，用三个不同的 consumer group id 订阅同一个 topic。这样库存消费者崩了，不影响积分消费者。而现在三个业务都挂在一个 consumer group 上，一挂全挂。\n\n最后是消费者的弹性设计：消费者在处理消息时遇到数据库连接失败，不应该直接抛异常让 Pod 崩掉，而应该有本地重试（指数退避，最多 3 次），3 次后把消息发到死信队列（Dead Letter Queue），消费者继续处理下一条消息，保证消费进度不停。等数据库恢复后，再从死信队列补偿处理失败的消息。这才是生产环境消费者应有的健壮性。",
+      "keyPoints": [
+        "Consumer Lag = Log End Offset - Consumer Committed Offset，是衡量 Kafka 消息积压的核心指标，Lag 持续增大说明消费速率落后于生产速率",
+        "Kafka 默认保留消息 7 天（log.retention.hours=168），积压本身不会立即导致数据丢失，但超过保留期限的消息会被删除",
+        "消费者数量不能超过分区数，超过分区数的消费者实例会闲置；扩容消费者的上限就是当前的分区数",
+        "消费者崩溃会触发 Rebalance，Rebalance 期间所有消费者暂停消费（Stop-The-World），如果根因未修复会陷入「崩溃→Rebalance→崩溃」的死循环",
+        "应急处理顺序必须是：先修复根因（如数据库连接池打满），再扩容消费者，最后消化积压——颠倒顺序只会让扩容的消费者继续崩溃",
+        "跳过积压（reset offset to latest）只适用于允许丢失的非关键消息；库存扣减、支付回调等强一致性消息绝对不能用此方案",
+        "生产级消费者应具备死信队列（DLQ）机制：处理失败的消息不能让 Pod 崩溃，而应该投递到 DLQ，保证消费进度不停滞，后续再补偿处理",
+        "大促前的标准 playbook：提前将消费者扩容到最大分区数，把 lag 告警阈值设置在 10 万而非 500 万，不同业务使用独立的 consumer group 互相隔离"
+      ],
+      "quiz": [
+        {
+          "id": "ds-message-backlog-debug-01-q01",
+          "question": "Kafka Consumer Lag 的计算公式是什么？",
+          "choices": [
+            {"id": "A", "text": "Log End Offset - Consumer Committed Offset"},
+            {"id": "B", "text": "Consumer Committed Offset - Log Start Offset"},
+            {"id": "C", "text": "Producer Offset - Broker Offset"},
+            {"id": "D", "text": "Log End Offset - Log Start Offset"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Consumer Lag = Log End Offset（分区中最新消息的 offset）减去 Consumer Committed Offset（消费者已提交的消费进度）。这个值代表有多少条消息已经写入 Kafka 但消费者还没有处理。B 选项计算的是消费者已处理的消息量。C 选项混淆了 Producer 和 Broker 的概念。D 选项计算的是分区中消息的总存量（受 log.retention 影响），和 lag 无关。"
+        },
+        {
+          "id": "ds-message-backlog-debug-01-q02",
+          "question": "order-topic 有 6 个分区，当前 order-consumer-group 有 8 个消费者实例，实际参与消费的是几个？",
+          "choices": [
+            {"id": "A", "text": "8 个，全部参与消费，每个分区被多个消费者并行消费"},
+            {"id": "B", "text": "6 个，多出来的 2 个消费者会空闲等待"},
+            {"id": "C", "text": "6 个，多出来的 2 个消费者会被自动缩容"},
+            {"id": "D", "text": "8 个，Kafka 会自动将 6 个分区重新拆分以适应 8 个消费者"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的同一个 consumer group 中，每个分区在同一时刻只能被一个消费者实例消费。这是 Kafka 保证分区内消息顺序消费的基础设计。当消费者数量超过分区数时，多余的消费者处于空闲状态（idle），不会处理任何消息。A 选项错误，分区不支持多个消费者并行消费（不同 consumer group 可以重复消费，但同一 group 内不行）。D 选项错误，Kafka 不会自动拆分分区，分区数只能手动增加。"
+        },
+        {
+          "id": "ds-message-backlog-debug-01-q03",
+          "question": "执行 kafka-consumer-groups.sh --describe 时，发现某个分区的 CONSUMER-ID 列为空（-），这最可能意味着什么？",
+          "choices": [
+            {"id": "A", "text": "该分区是 leader 副本，不需要消费者"},
+            {"id": "B", "text": "该分区正在进行 Rebalance，暂时没有消费者分配"},
+            {"id": "C", "text": "该分区没有任何消费者在消费，分区的 lag 会持续增长"},
+            {"id": "D", "text": "该分区的消息已经全部消费完，lag 为 0"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "CONSUMER-ID 为空或显示「-」意味着这个分区当前没有分配任何活跃的消费者实例，消息只进不出，lag 会持续增长。这通常是消费者实例数量少于分区数导致的（部分分区无法被分配到消费者），或者消费者实例崩溃后 Rebalance 还未完成。B 选项描述的 Rebalance 期间确实会暂时无消费者，但 Rebalance 结束后应该恢复分配，如果持续为空则说明消费者实例不够用。"
+        },
+        {
+          "id": "ds-message-backlog-debug-01-q04",
+          "question": "消费者因处理消息时抛出异常而频繁重启，会触发什么 Kafka 机制，为什么这会加剧 lag 增长？",
+          "choices": [
+            {"id": "A", "text": "触发分区重选 leader，影响消息写入速度"},
+            {"id": "B", "text": "触发 Consumer Group Rebalance，Rebalance 期间所有消费者停止消费"},
+            {"id": "C", "text": "触发 Kafka Broker 自动暂停接收生产者消息，等待消费者恢复"},
+            {"id": "D", "text": "触发消息重发机制，Broker 主动把消息推送给其他消费者"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当消费者实例崩溃或离开 group 时，Kafka 的 Group Coordinator 会触发 Consumer Group Rebalance——重新把所有分区分配给存活的消费者。Rebalance 期间，整个 consumer group 的所有消费者都必须停止消费，等待 Rebalance 完成（即所谓的 Stop-The-World Rebalance）。如果根因未修复，新启动的消费者又崩溃，就会陷入「崩溃→Rebalance→崩溃」的死循环，lag 在每次 Rebalance 期间持续积累。Kafka 没有 A、C、D 描述的机制。"
+        },
+        {
+          "id": "ds-message-backlog-debug-01-q05",
+          "question": "以下 kafka-consumer-groups.sh 命令的输出中，哪个分区的情况最严重，最需要优先处理？\n```\nPARTITION  LAG   CONSUMER-ID\n0          5000  consumer-1\n1          8000  consumer-2\n2          950000  -\n3          3000  consumer-1\n```",
+          "choices": [
+            {"id": "A", "text": "分区 1，因为 lag 最大（8000）"},
+            {"id": "B", "text": "分区 2，因为 lag 达到 95 万且没有消费者"},
+            {"id": "C", "text": "分区 0 和 3，因为同一个 consumer-1 负责两个分区，负载不均衡"},
+            {"id": "D", "text": "所有分区同等紧急，需要整体扩容"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "分区 2 是最严重的：lag 达到 95 万，远超其他分区，而且 CONSUMER-ID 为空，表示没有任何消费者在处理它，这个分区的 lag 还在以生产速率持续增长，不会自动消化。其他分区虽然有 lag，但至少有消费者在工作，是可以逐渐消化的。分区 0 和 3 的负载不均（一个消费者负责两个分区）是次要问题，在 Kafka 的 range 分配策略下这是正常的。正确的处理顺序是：先增加消费者实例，让分区 2 得到分配，再整体评估扩容需求。"
+        },
+        {
+          "id": "ds-message-backlog-debug-01-q06",
+          "question": "处理消息积压时，以下哪个操作的风险最高，在大促订单场景下绝对不能执行？",
+          "choices": [
+            {"id": "A", "text": "kubectl scale deployment order-consumer --replicas=6，扩容消费者到 6 个"},
+            {"id": "B", "text": "kafka-topics.sh --alter --partitions 18，把分区从 6 扩到 18"},
+            {"id": "C", "text": "kafka-consumer-groups.sh --reset-offsets --to-latest --execute，把 offset 重置到最新"},
+            {"id": "D", "text": "调整消费者的 max.poll.records 参数，提升单次拉取消息数量"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "将 offset 重置到最新（--to-latest）意味着消费者会直接跳过所有积压的消息，从当前最新消息开始消费。对于「库存扣减」「积分发放」这类强一致性业务消息，跳过就意味着数据丢失：用户下了单、付了钱，但库存没有扣减、积分没有到账，导致超卖和财务对不上。这是不可逆的操作，执行前必须先停止消费者，且只能用于明确允许丢弃的日志类、监控类消息。A、B、D 都是安全的扩容/调优操作，不会丢数据。"
+        },
+        {
+          "id": "ds-message-backlog-debug-01-q07",
+          "question": "把 order-topic 的分区从 6 增加到 18 后，对于分区数增加之前已有的 500 万条积压消息，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Kafka 会自动把积压消息重新分布到 18 个分区，消费速度立即提升 3 倍"},
+            {"id": "B", "text": "积压消息仍然留在原来的 0-5 分区，新消息才会路由到新增的 6-17 分区"},
+            {"id": "C", "text": "已有消息会被删除，需要生产者重新发送到新分区"},
+            {"id": "D", "text": "分区数增加会触发全量 Rebalance，消费者需要重新从头消费所有消息"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 增加分区是「追加」操作，已有数据不会重新分布。原来 0-5 分区上的消息会继续留在那里，新写入的消息才会根据 key hash 或 round-robin 策略路由到所有 18 个分区（包括新增的 6-17）。所以扩容分区对消化现有积压的直接效果有限，但增加分区数后可以相应扩容消费者，让更多消费者并行处理原来 0-5 分区的积压。如果当前 6 个分区已有 6 个消费者（已达上限），通过扩分区+扩消费者才能进一步提升消费能力。"
+        },
+        {
+          "id": "ds-message-backlog-debug-01-q08",
+          "question": "库存扣减、积分发放、物流通知三个业务，都订阅 order-topic。最佳的 consumer group 设计是什么？",
+          "choices": [
+            {"id": "A", "text": "三个业务共用一个 consumer group（order-consumer-group），减少 Kafka 连接数"},
+            {"id": "B", "text": "三个业务各自使用独立的 consumer group，相互隔离，互不影响"},
+            {"id": "C", "text": "三个业务共用一个 consumer group，通过消息 tag 过滤各自需要的消息"},
+            {"id": "D", "text": "三个业务分别订阅三个不同的 topic，由订单服务分别发送"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "不同业务使用独立的 consumer group 是最佳实践。原因有三：第一，消费进度相互独立，库存服务故障时积分和物流服务不受影响，各自维护自己的 offset；第二，扩缩容互不干扰，库存业务需要扩容不影响其他组；第三，一个 group 内的消费者崩溃触发 Rebalance 只影响该 group，不会波及其他 group。Kafka 的 consumer group 机制天然支持同一条消息被多个 group 各自消费一次，这正是 pub/sub 模式的核心价值。A 和 C 的共用方案会造成故障传播。"
+        },
+        {
+          "id": "ds-message-backlog-debug-01-q09",
+          "question": "消费者在处理消息时遇到数据库连接超时，最符合生产环境健壮性要求的处理策略是什么？",
+          "choices": [
+            {"id": "A", "text": "捕获异常后直接跳过该消息，继续消费下一条，保证消费进度不停滞"},
+            {"id": "B", "text": "抛出异常让 Pod 崩溃重启，依靠 Kubernetes 的重启策略重试"},
+            {"id": "C", "text": "本地指数退避重试 3 次，失败后投递到死信队列（DLQ），继续消费下一条消息"},
+            {"id": "D", "text": "永久循环重试直到成功，不提交 offset，保证消息一定被成功处理"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "生产环境的消费者应该具备「有界重试 + 死信队列」机制。本地指数退避重试（如 1s/2s/4s）处理瞬时故障（数据库抖动），3 次后仍失败说明是持续性故障，此时把消息投递到 DLQ（死信队列，通常是一个独立的 Kafka topic），消费者继续处理后续消息，保证主流程的消费进度不被阻塞。等根因修复后，再单独消费 DLQ 里的消息做补偿处理。A 选项直接丢弃，数据丢失。B 选项 Pod 崩溃触发 Rebalance，加剧积压。D 选项阻塞消费进度，更严重的是会导致 Kafka session 超时（超过 max.poll.interval.ms）触发 Rebalance。"
+        },
+        {
+          "id": "ds-message-backlog-debug-01-q10",
+          "question": "大促前 1 小时，你作为 on-call 工程师，最应该提前检查哪项配置来防止消费积压？",
+          "choices": [
+            {"id": "A", "text": "确认 Kafka topic 的 replication.factor 是否为 3，防止 Broker 宕机"},
+            {"id": "B", "text": "确认消费者实例数等于分区数，且 lag 告警阈值已经设置在一个合理的低水位"},
+            {"id": "C", "text": "确认 Kafka 的 log.retention.hours 是否足够长，防止消息在消费前过期"},
+            {"id": "D", "text": "确认生产者的 acks 配置为 all，防止消息丢失"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "大促前最关键的消费侧准备是：把消费者实例数预扩到分区数（6 个分区就预先跑 6 个消费者实例），这样大促开始后生产速率激增时，消费者有最大并发能力立刻响应，而不是靠告警后再手动扩容（这时候 lag 可能已经几十万了）。同时把 lag 告警阈值降低到保守值（比如 10 万），让告警在积压刚开始时就响，留出足够的响应窗口。A 和 D 是高可用和数据可靠性配置，和应对积压无直接关系。C 是担忧消息过期，大促只持续几小时，7 天保留期完全够用。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Kafka Documentation - Consumer Group",
+          "url": "https://kafka.apache.org/documentation/#intro_consumers"
+        },
+        {
+          "title": "Confluent: Monitor Consumer Lag",
+          "url": "https://docs.confluent.io/platform/current/kafka/monitoring.html"
+        },
+        {
+          "title": "Kafka Consumer Group Rebalance Protocol",
+          "url": "https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol"
+        }
+      ]
+    }
+  ]
+}
