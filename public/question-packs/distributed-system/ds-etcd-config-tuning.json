@@ -1,0 +1,159 @@
+{
+  "id": "ds-etcd-config-tuning",
+  "name": "etcd 生产配置调优指南",
+  "domain": "distributed-system",
+  "description": "系统梳理 etcd 核心配置参数，结合高负载 K8s 场景给出针对性调优建议",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-etcd-config-tuning-q1",
+      "domain": "distributed-system",
+      "type": "env-config",
+      "difficulty": 3,
+      "tags": ["etcd", "配置调优", "heartbeat", "election-timeout", "quota", "compaction", "kubernetes", "Raft"],
+      "title": "etcd 生产环境关键配置参数有哪些？如何针对高负载场景调优？",
+      "content": "你们公司的 Kubernetes 集群在过去半年里从 50 个节点扩展到了 500 个节点，业务方反映 kubectl 操作越来越慢，CI/CD 流水线里的 kubectl apply 偶尔会超时报错。你登录监控平台一看，发现几个异常信号：\n\netcd 集群的 `etcd_server_leader_changes_seen_total` 指标在过去 24 小时内增长了 17 次，而正常情况下一周都不应该超过 5 次；API Server 的 P99 响应延迟从两个月前的 200ms 涨到了现在的 2s；etcd 的 `etcd_mvcc_db_total_size_in_bytes` 已经达到了 7.8GB，而默认配置的 quota 只有 8GB，随时可能触发「database space exceeded」报错让整个集群陷入只读模式。\n\n你把现有的 etcd 启动参数翻出来看了一眼，发现大部分都是安装时默认生成的，从来没有针对大规模集群做过调整：\n\n```bash\n# 现有 etcd 启动参数（节点规模为 50 时的默认配置，从未调整）\netcd \\\n  --name=etcd-0 \\\n  --data-dir=/var/lib/etcd \\\n  --heartbeat-interval=100 \\\n  --election-timeout=1000 \\\n  --quota-backend-bytes=0 \\\n  --snapshot-count=100000 \\\n  --auto-compaction-mode=periodic \\\n  --auto-compaction-retention=0 \\\n  --max-request-bytes=1572864\n```\n\n注意 `--quota-backend-bytes=0` 意味着使用默认值（2GB），而 `--auto-compaction-retention=0` 表示**关闭了自动压缩**。\n\n现在需要你对这套 etcd 配置进行全面审查和调优，回答以下问题：\n\n1. etcd 的性能模型是什么？为什么 fsync 是主要瓶颈？\n2. 上面这份配置中哪些参数有问题？应该如何调整？\n3. 对于 500 节点规模的 K8s 集群，给出一份完整的生产级 etcd 调优方案，包括时序参数、存储参数、网络参数，以及磁盘优化和监控告警阈值。",
+      "answer": "## 第一步：理解 etcd 的性能模型，才能真正懂调优\n\n在讨论具体配置之前，必须先搞清楚 etcd 的性能瓶颈在哪里，否则调参就是盲目调。\n\netcd 是一个基于 Raft 共识算法的分布式键值存储，它的核心工作流程是这样的：客户端发送写请求到 Leader，Leader 把这条操作追加到 WAL（Write-Ahead Log，预写日志）并 fsync 到磁盘，然后通过 AppendEntries RPC 把日志复制到 Follower，当多数节点（Quorum）确认写入后，Leader 才能提交这条日志并应用到 boltdb 存储引擎，最后返回客户端成功。\n\n这里有两个关键的串行路径：第一是 `WAL fsync`，每条写请求都必须等待 fsync 完成才能走后续流程，因为如果不 fsync 就宕机了，日志就丢了，Raft 的持久化保证就破坏了。第二是 `网络 RTT`，Leader 必须等 Follower 确认后才能提交，网络延迟直接决定了写吞吐量的上限。\n\n用 fio 测一下你的磁盘：\n\n```bash\n# 模拟 etcd WAL 的写入模式：顺序写 + 每次 fdatasync\nfio --rw=write --ioengine=sync --fdatasync=1 \\\n    --directory=/var/lib/etcd \\\n    --size=22m --bs=2300 --name=etcd-wal-test\n\n# 看 99th 百分位延迟，期望值 < 10ms\n# 如果你的磁盘是 HDD 或共享存储，很可能是 50ms+，这就是 leader 选举频繁的根因之一\n```\n\netcd 官方有一条经验法则：WAL fsync P99 延迟如果超过 10ms，就应该认为磁盘成为了瓶颈。机械硬盘的随机写延迟通常在 5-10ms，但如果有其他 IO 竞争（比如日志采集 agent、容器运行时的 overlay 操作），实际延迟可以轻松超过 50ms，直接导致 Raft 心跳超时、触发不必要的 leader 选举。\n\n理解了这个模型，就能理解为什么「频繁 leader 选举」和「磁盘延迟高」往往是同一个问题的两面：磁盘慢 → fsync 慢 → Leader 处理心跳的线程被阻塞 → Follower 没收到心跳就发起选举 → 集群振荡 → API Server 连接断开重连 → P99 飙升。\n\n## 第二步：逐一拆解关键配置参数，找出问题并给出调优方案\n\n### 时序参数：heartbeat-interval 和 election-timeout\n\n`--heartbeat-interval` 控制 Leader 向 Follower 发送心跳的间隔，默认 100ms。`--election-timeout` 控制 Follower 在多久没收到心跳后发起选举，默认 1000ms。**etcd 要求 election-timeout 必须是 heartbeat-interval 的 10 倍以上**，否则正常的网络抖动就可能误触发选举。\n\n那么这两个值应该设多少？核心判断依据是**集群节点之间的网络 RTT**。etcd 文档给出的建议是：heartbeat-interval 应该设为两个节点之间 RTT 的均值，election-timeout 应该设为 RTT × 10 加上 fsync 时间的估算。\n\n对于同机房部署（节点间 RTT 通常 < 1ms），100ms 的 heartbeat 已经够用。但如果你的集群跨机房部署，或者节点间 RTT 在 10ms 以上，就需要调大：\n\n```bash\n# 同机房部署，500 节点 K8s 集群，保守起见稍微调大以应对偶发磁盘抖动\n--heartbeat-interval=250\n--election-timeout=2500\n\n# 跨机房部署（比如三机房容灾），RTT 约 50ms\n--heartbeat-interval=500\n--election-timeout=5000\n```\n\n为什么把 heartbeat 从 100ms 调到 250ms？因为在 500 节点的 K8s 集群中，etcd 的 Leader 每 100ms 就要向所有 Follower 发心跳，同时还在处理大量来自 API Server 的 Watch 事件推送，CPU 和网络压力更大，磁盘偶尔的抖动更容易导致心跳延迟超过 100ms。把 heartbeat 调到 250ms，相当于给系统留了更大的容错空间，但代价是 leader 选举在真正需要时会稍慢一些，这个 tradeoff 在生产中完全值得。\n\n### 存储参数：quota、compaction 和 snapshot\n\n`--quota-backend-bytes` 是 etcd 数据库大小的硬性上限。默认值 0 等价于 2GB。一旦数据库超过这个值，etcd 会拒绝所有写请求，集群进入只读模式，你会看到 API Server 开始大量报错 `etcdserver: mvcc: database space exceeded`，整个 Kubernetes 集群陷入瘫痪——没有新 Pod 能被创建，没有 ConfigMap 能被更新，没有 Service 能被修改。\n\n题目中的集群 db size 已经到了 7.8GB，配额却是 2GB，这说明**自动压缩被关闭了**（`--auto-compaction-retention=0`），历史版本无限积累，导致数据库膨胀。etcd 采用 MVCC（Multi-Version Concurrency Control，多版本并发控制）机制，每次写操作都不会覆盖旧值，而是追加一个新版本。如果不定期清理旧版本，数据库会持续增大，最终 OOM 或触发 quota 限制。\n\n正确的配置是：\n\n```bash\n# 对于 500 节点 K8s 集群，8GB 是比较合理的起点\n# 极大型集群（1000+ 节点）可以调到 16GB，但超过 8GB 时要评估 boltdb 的性能\n--quota-backend-bytes=8589934592\n\n# 开启按时间自动压缩，保留最近 1 小时的历史版本\n# periodic 模式：每隔 retention 时间压缩一次，删除 1 小时前的所有旧版本\n--auto-compaction-mode=periodic\n--auto-compaction-retention=1h\n```\n\n为什么是 1 小时？因为 K8s 的 list-watch 机制依赖 etcd 的历史版本来实现增量同步（ResourceVersion 机制）。如果把 retention 设得太短（比如 5 分钟），正在做 list-watch 的 Informer 如果超过 5 分钟没有处理完，就会收到 `410 Gone` 错误，不得不做全量 list，反而增加 etcd 的压力。1 小时是一个经过生产验证的平衡点。\n\n压缩之后还有一个容易被忽略的操作：碎片整理。压缩只是把旧版本标记为可以复用，但 boltdb 的文件大小不会缩小，需要手动 defrag：\n\n```bash\n# 对集群中每个成员逐一 defrag，不要同时对所有成员操作！\n# defrag 会暂时锁住 etcd，期间该节点不可用，每次只对一个节点操作以保持集群可用\nETCDCTL_API=3 etcdctl defrag \\\n  --endpoints=https://etcd-0:2379 \\\n  --cacert=/etc/etcd/ca.crt \\\n  --cert=/etc/etcd/client.crt \\\n  --key=/etc/etcd/client.key\n\n# defrag 前后对比\nETCDCTL_API=3 etcdctl endpoint status --write-out=table\n# 通常 defrag 后 db size 能缩小 30%-50%\n```\n\n`--snapshot-count` 控制多少条 Raft 日志后触发一次快照（snapshot），默认 100000。快照的作用是让新加入的 Follower 或者落后太多的节点能快速追上 Leader，而不用从头回放所有日志。对于写入量大的 K8s 集群，100000 条日志可能在几分钟内就积累完，触发频繁的快照生成，每次快照都会 fork 进程并序列化整个数据库，对 CPU 和 IO 有明显影响。可以适当调大：\n\n```bash\n# 对于 500 节点集群，写入量大时可调大到 200000\n# 代价是新 Follower 追赶时需要回放更多日志，但通常影响不大\n--snapshot-count=200000\n```\n\n### 网络与并发参数\n\n`--max-request-bytes` 控制单个请求的最大字节数，默认 1.5MB（1572864 字节）。在 K8s 集群中，有些资源的大小可能超过这个限制，最典型的是体积较大的 ConfigMap（比如存了大量配置的 istio ConfigMap）或者 CRD 对象，写入时会报 `etcdserver: request is too large` 错误。通常建议调到 10MB：\n\n```bash\n--max-request-bytes=10485760\n```\n\n但要注意，这个值不能无限调大，过大的请求会占用大量内存，etcd 内部有 10 个 goroutine 同时处理请求，如果每个都在处理 100MB 的请求，内存就撑不住了。\n\n### 磁盘优化：这不是配置参数，但比配置更重要\n\n如果底层磁盘性能差，所有参数调优都是治标不治本。etcd 对磁盘的要求非常敏感，官方建议使用 SSD，并且 etcd 的数据目录应该独立挂载，不能和操作系统盘或容器 overlay 共享 IO：\n\n```bash\n# 检查 etcd 磁盘延迟（模拟 WAL fsync 写入模式）\nfio --rw=write --ioengine=sync --fdatasync=1 \\\n    --directory=/var/lib/etcd \\\n    --size=22m --bs=2300 --name=etcd-disk-check\n# P99 < 10ms：合格\n# P99 在 10ms-50ms：黄线，需要关注\n# P99 > 50ms：直接去换磁盘，调参帮不了你\n\n# 提高 etcd 进程的 IO 调度优先级\n# -c2 表示 best-effort 调度类，-n0 表示该类中最高优先级（0-7）\nionice -c2 -n0 -p $(pgrep etcd)\n\n# 在 systemd 管理的 etcd 服务中持久化 ionice 设置\n# /etc/systemd/system/etcd.service\n[Service]\nIOSchedulingClass=best-effort\nIOSchedulingPriority=0\n```\n\n在容器化部署场景（比如 etcd 跑在 K8s 上，或者通过 kubeadm 安装的 static pod），务必给 etcd 挂载独立的 hostPath 卷，并且该路径对应的磁盘只给 etcd 用：\n\n```yaml\n# etcd static pod 的 volumes 配置示例\nvolumes:\n- hostPath:\n    path: /var/lib/etcd    # 这个路径应该对应独立的 SSD 挂载点\n    type: DirectoryOrCreate\n  name: etcd-data\n```\n\n## 第三步：体系化扩展——监控告警、K8s 特化优化与高频面试考点\n\n### 监控指标与告警阈值\n\n光调配置不够，还需要建立监控体系。以下是 etcd 最关键的几个 Prometheus 指标，以及生产环境的告警阈值：\n\n`etcd_disk_wal_fsync_duration_seconds`（WAL fsync 耗时）是最重要的指标，直接反映磁盘健康状况。告警规则如下：\n\n```yaml\n# Prometheus 告警规则\n- alert: EtcdHighWALFsyncDuration\n  expr: histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])) > 0.01\n  for: 5m\n  labels:\n    severity: warning\n  annotations:\n    summary: \"etcd WAL fsync P99 延迟超过 10ms，磁盘可能存在性能问题\"\n\n- alert: EtcdHighBackendCommitDuration\n  expr: histogram_quantile(0.99, rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])) > 0.025\n  for: 5m\n  labels:\n    severity: warning\n  annotations:\n    summary: \"etcd boltdb commit P99 延迟超过 25ms\"\n```\n\n`etcd_server_leader_changes_seen_total` 记录了集群历史上发生的 leader 切换次数。这是一个 counter，你关心的是它的增速。如果在 1 小时内增加超过 3 次，说明集群不稳定，需要立即排查：\n\n```yaml\n- alert: EtcdHighNumberOfLeaderChanges\n  expr: increase(etcd_server_leader_changes_seen_total[1h]) > 3\n  labels:\n    severity: critical\n  annotations:\n    summary: \"etcd 1 小时内发生 {{ $value }} 次 leader 选举，集群不稳定\"\n```\n\n`etcd_mvcc_db_total_size_in_bytes` 反映数据库当前大小。当它超过 quota 的 80% 时就要告警，给运维留出足够的处理时间：\n\n```yaml\n- alert: EtcdDatabaseHighFragmentationRatio\n  expr: (etcd_mvcc_db_total_size_in_bytes / etcd_mvcc_db_total_size_in_use_in_bytes) > 1.5\n  labels:\n    severity: warning\n  annotations:\n    summary: \"etcd 数据库碎片率超过 50%，建议执行 defrag\"\n\n- alert: EtcdDatabaseQuotaLowSpace\n  expr: (etcd_mvcc_db_total_size_in_bytes / 8589934592) > 0.8\n  labels:\n    severity: critical\n  annotations:\n    summary: \"etcd 数据库已使用 {{ $value | humanizePercentage }} 的 quota，需要立即压缩并扩容\"\n```\n\n### K8s 场景特有的优化：Events 集群分离\n\n一个经常被忽视但非常有效的优化是：**把 Kubernetes Events 存到独立的 etcd 集群**。\n\nK8s Events 是极高频的写入者。每次 Pod 状态变化、每次调度决策、每次 Probe 失败，都会产生 Event 对象写入 etcd。在 500 节点的集群中，高峰期 Events 的写入 QPS 可以达到数百次每秒，占据 etcd 总写入量的 30%-50%。但 Events 本身的生命周期很短（默认保留 1 小时），丢失了也不影响集群功能。\n\nkube-apiserver 支持通过 `--etcd-servers-overrides` 参数把特定资源路由到不同的 etcd 集群：\n\n```bash\n# kube-apiserver 启动参数，把 Events 路由到独立的 etcd 集群\n--etcd-servers=https://etcd-main-0:2379,https://etcd-main-1:2379,https://etcd-main-2:2379\n--etcd-servers-overrides=/events#https://etcd-events-0:2379,https://etcd-events-1:2379,https://etcd-events-2:2379\n```\n\n这个改动上线后，主 etcd 的写入 QPS 通常能降低 40% 以上，leader 选举频率明显下降，是性价比极高的优化手段。\n\n### 大规模 Watch 优化：Bookmark 机制\n\nK8s 的 Informer 机制依赖 etcd 的 Watch API。在 500 节点集群中，API Server 同时维护着数百个 Watch 连接（来自各种 controller、scheduler、kubelet 的 Informer）。当 etcd 发生 leader 切换时，所有 Watch 连接都会断开，所有 Informer 需要重新建立 Watch，如果 etcd 的 ResourceVersion 版本太旧（被压缩了），Informer 还需要做全量 list，产生大量 etcd 读请求，导致重启后的雪崩效应。\n\nK8s 1.15 引入了 Bookmark 机制（对应 etcd 的 Progress Notification）来缓解这个问题。Bookmark 是 etcd 定期向 Watch 客户端发送的「进度通知」，让客户端知道当前的最新 ResourceVersion，这样即使 Watch 连接断开，客户端也能用最新的 ResourceVersion 重新建立 Watch，避免全量 list。这个特性在 K8s 1.21+ 默认开启，但要让它真正生效，etcd 的 auto-compaction retention 不能太短（不能短过 Watch 重连的时间窗口）。\n\n### 汇总：500 节点 K8s 集群的完整 etcd 调优配置\n\n```bash\netcd \\\n  --name=etcd-0 \\\n  --data-dir=/var/lib/etcd \\\n  # 时序参数：给磁盘抖动留余量\n  --heartbeat-interval=250 \\\n  --election-timeout=2500 \\\n  # 存储参数：8GB quota + 自动压缩\n  --quota-backend-bytes=8589934592 \\\n  --auto-compaction-mode=periodic \\\n  --auto-compaction-retention=1h \\\n  --snapshot-count=200000 \\\n  # 网络参数：支持较大的 K8s 资源对象\n  --max-request-bytes=10485760 \\\n  --grpc-keepalive-min-time=5s \\\n  --grpc-keepalive-interval=2h \\\n  --grpc-keepalive-timeout=20s\n```\n\n结合系统层面的优化：etcd 数据目录使用独立 SSD，设置 ionice 提高 IO 优先级，通过 `--etcd-servers-overrides` 把 K8s Events 路由到独立 etcd 集群，并建立完整的 Prometheus 告警规则覆盖 fsync 延迟、leader 切换频率和 db 使用率三个核心指标。这套方案在业界多个千节点规模的 K8s 集群中得到了验证。",
+      "keyPoints": [
+        "etcd 性能瓶颈的根本原因是 WAL fsync 的串行化开销：每条写请求都必须等待 fdatasync 完成才能向 Follower 复制，磁盘 P99 延迟超过 10ms 就会直接导致 Raft 心跳超时和 leader 选举频繁触发。",
+        "election-timeout 必须是 heartbeat-interval 的 10 倍以上，两者都应以集群节点间的实际网络 RTT 为基准来设置，跨机房场景建议 heartbeat=500ms、election-timeout=5000ms，同机房高负载场景建议 heartbeat=250ms、election-timeout=2500ms。",
+        "auto-compaction-retention=0 表示关闭自动压缩，这是 etcd 数据库持续膨胀最常见的根因；生产环境必须开启 periodic 模式并设置 1h 的保留窗口，同时定期手动执行 defrag 以释放 boltdb 的碎片空间。",
+        "quota-backend-bytes 默认 2GB 对大规模 K8s 集群远远不够，500 节点集群建议设置为 8GB，一旦数据库超过 quota，etcd 进入只读模式，整个 Kubernetes 集群的所有写操作都会失败，是 P0 故障。",
+        "通过 kube-apiserver 的 --etcd-servers-overrides 参数把 K8s Events 路由到独立 etcd 集群，可将主 etcd 写入 QPS 降低 40% 以上，是大规模集群中性价比最高的单点优化措施。",
+        "etcd 数据目录应挂载在独立的 SSD 分区上，不与操作系统或容器 overlay 共享 IO；通过 ionice -c2 -n0 提升 etcd 进程的磁盘 IO 优先级，防止其他进程的 IO 竞争导致 fsync 延迟抖动。",
+        "监控体系的三个核心指标是：etcd_disk_wal_fsync_duration_seconds（P99 > 10ms 告警）、etcd_server_leader_changes_seen_total（1 小时内增加 > 3 次告警）、etcd_mvcc_db_total_size_in_bytes（超过 quota 的 80% 告警），三者缺一不可。",
+        "压缩（compaction）和碎片整理（defrag）是两个独立操作：compaction 清理 MVCC 旧版本但不缩减文件大小，defrag 才会真正缩减文件；defrag 期间节点短暂不可用，生产环境需逐一对每个成员执行，不能并行操作。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-1",
+          "question": "etcd 写请求的性能瓶颈主要来自哪里？",
+          "choices": [
+            { "id": "A", "text": "WAL fsync 的串行 IO 开销，每条写请求都必须等待 fdatasync 完成才能继续" },
+            { "id": "B", "text": "boltdb B+ 树的插入操作需要频繁的页分裂，CPU 开销很高" },
+            { "id": "C", "text": "gRPC 序列化和反序列化 protobuf 消息占用了大量 CPU" },
+            { "id": "D", "text": "Raft 的 Leader 选举过程需要所有节点投票，导致写操作阻塞" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd 的每次写操作都要经历「WAL fsync → 网络复制到 Follower → boltdb commit」的串行流程。其中 WAL fsync（即 fdatasync 系统调用）是等待磁盘物理写入完成的同步操作，在机械硬盘上可达 10ms 以上，是最主要的延迟来源。B 选项的 boltdb 页分裂是存在的，但相比 fsync 开销要小得多。C 选项 protobuf 序列化开销极低，通常在微秒级别。D 选项混淆了 leader 选举和正常写请求的流程，正常写请求不需要 leader 选举，只需要多数节点确认。"
+        },
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-2",
+          "question": "etcd 的 --election-timeout 和 --heartbeat-interval 之间的关系，以下说法正确的是？",
+          "choices": [
+            { "id": "A", "text": "election-timeout 必须是 heartbeat-interval 的至少 10 倍，且两者应基于节点间实际网络 RTT 来设置" },
+            { "id": "B", "text": "election-timeout 只要大于 heartbeat-interval 即可，没有倍数要求" },
+            { "id": "C", "text": "两者的比值越大越好，可以无限增大 election-timeout 来提高稳定性" },
+            { "id": "D", "text": "heartbeat-interval 越小越好，设为 10ms 可以让 leader 选举更快" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd 官方文档明确要求 election-timeout 至少是 heartbeat-interval 的 10 倍，这是因为即使在正常网络环境下，心跳包也可能因为 CPU 调度、GC 停顿等原因出现轻微延迟，10 倍的余量可以避免误触发选举。B 选项的比例不够，容易因网络抖动触发不必要的选举。C 选项虽然 election-timeout 大能减少误选举，但同时意味着在真正需要选举时恢复时间也更长，K8s 集群写操作会阻塞更久。D 选项把 heartbeat 设得太小（10ms）在负载高时 leader 可能因 CPU 繁忙而来不及发送心跳，反而更不稳定。"
+        },
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-3",
+          "question": "etcd 开启 auto-compaction 之后，还需要额外执行什么操作才能真正缩减数据库文件大小？",
+          "choices": [
+            { "id": "A", "text": "执行 etcdctl defrag，对每个成员逐一进行碎片整理" },
+            { "id": "B", "text": "重启 etcd 进程，boltdb 会在启动时自动整理碎片" },
+            { "id": "C", "text": "compaction 会直接缩减文件大小，不需要额外操作" },
+            { "id": "D", "text": "执行 etcdctl snapshot save 备份快照后，旧文件自动清理" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "compaction 和 defrag 是两个独立的操作，容易混淆。compaction 的作用是删除 MVCC 的旧历史版本，把这些空间标记为「可复用」，但 boltdb 的文件大小不会缩减，实际磁盘占用不变。defrag 才是真正把 boltdb 文件重写并收缩的操作，执行后文件大小通常能缩小 30%-50%。需要特别注意的是，defrag 期间该节点会短暂停止服务，生产环境必须逐一对集群成员执行，不能并行对多个节点 defrag，否则会导致集群失去 quorum。B、C、D 选项均为错误认知。"
+        },
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-4",
+          "question": "etcd 的 MVCC 机制如果不开启 auto-compaction，会导致什么后果？",
+          "choices": [
+            { "id": "A", "text": "历史版本无限积累，数据库持续增大，最终触发 quota 限制进入只读模式或 OOM" },
+            { "id": "B", "text": "读性能下降，因为每次读取都需要扫描所有历史版本" },
+            { "id": "C", "text": "写性能下降，因为 boltdb 需要维护更多索引" },
+            { "id": "D", "text": "etcd 会自动在内存中清理旧版本，只有磁盘持久化时才有问题" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "MVCC（多版本并发控制）是 etcd 实现 Watch 和事务语义的基础机制，每次写操作都会追加一个新版本而不是覆盖旧值。如果不定期压缩旧版本，boltdb 文件会持续增大。当文件大小超过 quota-backend-bytes 时，etcd 会拒绝所有写请求并返回 'mvcc: database space exceeded' 错误，整个 K8s 集群进入只读模式。B 选项不准确，etcd 读取时通过版本号索引直接定位，不需要扫描全部历史版本。D 选项是错误的，etcd 不会自动在内存中清理，历史版本会持久化到磁盘。"
+        },
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-5",
+          "question": "以下 etcd 指标中，哪一个最能直接反映磁盘 IO 是否成为了性能瓶颈？",
+          "choices": [
+            { "id": "A", "text": "etcd_disk_wal_fsync_duration_seconds 的 P99 值，超过 10ms 表明磁盘性能不足" },
+            { "id": "B", "text": "etcd_server_proposals_committed_total，commit 速率低说明磁盘慢" },
+            { "id": "C", "text": "etcd_network_client_grpc_sent_bytes_total，发送字节数反映 IO 负载" },
+            { "id": "D", "text": "etcd_server_leader_changes_seen_total，leader 切换频繁说明磁盘慢" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd_disk_wal_fsync_duration_seconds 是直接测量每次 WAL fdatasync 系统调用耗时的指标，P99 > 10ms 是 etcd 官方给出的磁盘告警阈值，超过这个值说明磁盘无法满足 etcd 的 IO 需求，应立即排查或更换存储。B 选项的 proposals_committed_total 是吞吐量指标，受多种因素影响（网络、磁盘、CPU），不能单独反映磁盘问题。C 选项是网络指标，与磁盘 IO 无关。D 选项 leader_changes 虽然磁盘慢是可能原因之一，但网络问题、时序参数配置不当也会导致 leader 频繁切换，不能单独归因于磁盘。"
+        },
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-6",
+          "question": "生产环境中执行 etcdctl defrag 时，以下哪种操作方式是正确的？",
+          "choices": [
+            { "id": "A", "text": "逐一对每个 etcd 成员执行 defrag，等一个节点恢复后再操作下一个" },
+            { "id": "B", "text": "同时对所有 etcd 成员执行 defrag，用 --endpoints 指定所有节点地址，速度更快" },
+            { "id": "C", "text": "只需要对 Leader 执行 defrag，Follower 会自动同步 Leader 的状态" },
+            { "id": "D", "text": "在 etcd 集群完全停止的情况下执行 defrag，避免数据不一致" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "defrag 操作会让目标节点暂时停止服务（持锁重写 boltdb 文件），如果同时对所有成员执行，整个集群会同时失去所有节点，导致无法达成 quorum，集群不可用。正确做法是逐一执行：先对 Follower 操作，等节点恢复并重新加入集群后，再操作下一个；最后操作 Leader（或先手动触发一次 leader transfer 把 leader 切走）。B 选项是最危险的操作，会让三节点集群同时失去三个节点。C 选项错误，defrag 是每个节点的本地存储操作，不会通过 Raft 同步。D 选项会引入更大的停机窗口，生产不可接受。"
+        },
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-7",
+          "question": "Kubernetes 集群中，通过 --etcd-servers-overrides 把 Events 路由到独立 etcd 集群，主要解决的问题是什么？",
+          "choices": [
+            { "id": "A", "text": "Events 写入频率极高但不影响集群功能，分离后可显著降低主 etcd 的写入压力，减少 leader 选举频率" },
+            { "id": "B", "text": "Events 对象体积很大，容易触发 max-request-bytes 限制，独立存储可以使用更大的请求限制" },
+            { "id": "C", "text": "Events 的存储格式与其他 K8s 资源不同，必须使用独立的 etcd 集群" },
+            { "id": "D", "text": "独立的 etcd 集群可以为 Events 提供更高的写入一致性保证" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "K8s Events 是高频写入者，每次 Pod 状态变化、调度决策、健康检查失败都会产生 Event，在大规模集群中 Events 可能占主 etcd 写入量的 30%-50%。但 Events 本身对 K8s 功能是非关键的（丢失 Event 不影响 Pod 运行、Service 路由等核心功能），默认只保留 1 小时。把 Events 路由到独立 etcd 后，主 etcd 压力大幅下降，leader 选举更稳定，API Server 延迟也会改善。B 选项错误，Events 对象通常不大。C 选项完全错误，Events 的存储格式与其他资源相同，都是 protobuf 序列化的 K8s 对象。D 选项逻辑相反，分离后独立集群的写入量更大，一致性保证反而更难维持。"
+        },
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-8",
+          "question": "在 500 节点规模的 K8s 集群中，etcd 数据库大小接近 quota 上限（8GB 中的 7.8GB），此时应该按什么顺序处理？",
+          "choices": [
+            { "id": "A", "text": "立即执行 compaction 压缩旧版本 → 执行 defrag 释放磁盘空间 → 调大 quota-backend-bytes 并重启 etcd" },
+            { "id": "B", "text": "先调大 quota-backend-bytes 并重启 etcd → 再执行 compaction → 最后执行 defrag" },
+            { "id": "C", "text": "直接重启 etcd，etcd 启动时会自动压缩历史版本" },
+            { "id": "D", "text": "删除 etcd 数据目录重新初始化，从 API Server 重新同步数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "处理 etcd quota 告警时，正确顺序是：首先调大 quota 并重启，原因是如果先执行 compaction，但 db 已经超过 quota 导致集群处于只读模式，compaction 命令本身也可能因写入被拒绝而失败（etcdctl compact 需要写入 revision 信息）。调大 quota 重启后，集群恢复读写，再执行 compaction 清理旧版本，最后 defrag 释放物理空间。A 选项在 db 未超 quota 时是可行的，但如果已超 quota 则 compaction 会失败。C 选项错误，etcd 重启不会自动压缩。D 选项是极端方案，会导致大量数据需要从 API Server 重新写入，在集群规模大时几乎不可行。"
+        },
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-9",
+          "question": "etcd 的 --auto-compaction-retention=1h 和 --auto-compaction-retention=5m 相比，设置为 5 分钟对 K8s 集群可能产生什么负面影响？",
+          "choices": [
+            { "id": "A", "text": "K8s Informer 的 Watch 连接重建时可能因 ResourceVersion 被压缩而收到 410 Gone，被迫做全量 list，增加 etcd 读压力" },
+            { "id": "B", "text": "etcd 的压缩操作过于频繁，每 5 分钟一次会严重占用 CPU 资源导致写性能下降" },
+            { "id": "C", "text": "Leader 选举时无法恢复 5 分钟之前的 Raft 日志，新 Leader 上任后集群数据可能不一致" },
+            { "id": "D", "text": "5 分钟的保留时间不够长，etcd 中存储的 K8s 资源对象会被误删" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "K8s 的 list-watch 机制依赖 ResourceVersion 来实现增量同步。当 Watch 连接断开时（如 API Server 重启、网络抖动），Informer 会用上次收到的 ResourceVersion 重新建立 Watch。如果这个 ResourceVersion 已经被 compaction 清除（比如超过 5 分钟没有处理），etcd 会返回 HTTP 410 Gone，Informer 不得不做全量 list，把所有资源一次性拉回来，在大规模集群中这是非常大的读压力。1 小时的 retention 能给 Informer 足够的时间处理背压或重连。B 选项不准确，compaction 的 CPU 开销很小，影响可忽略。C 选项逻辑错误，compaction 清理的是历史版本，不影响 Raft 共识的正确性。D 选项是最大的误解，compaction 只删除旧版本，当前版本（最新数据）始终保留。"
+        },
+        {
+          "id": "ds-etcd-config-tuning-q1-quiz-10",
+          "question": "用 fio 检测 etcd 磁盘性能时，得到如下结果：WAL fsync P99 延迟为 45ms。以下哪个处理措施最有效？",
+          "choices": [
+            { "id": "A", "text": "把 --heartbeat-interval 调大到 500ms，给磁盘更多时间响应，避免触发 leader 选举" },
+            { "id": "B", "text": "更换或独立挂载 SSD，从根本上提升磁盘 IO 性能，同时设置 ionice 提高 etcd 的 IO 优先级" },
+            { "id": "C", "text": "增加 etcd 节点数量到 5 个，通过更多 Follower 分担 fsync 压力" },
+            { "id": "D", "text": "开启 --unsafe-no-fsync 参数跳过 fsync，用性能换取安全性" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "P99 延迟 45ms 意味着每 100 次写入就有 1 次要等待超过 45ms，这已经远超 etcd 10ms 的健康阈值，本质是磁盘 IO 能力不足的问题。A 选项调大 heartbeat 是治标不治本的辅助措施，能减少误选举，但无法解决实际的性能问题，写吞吐量和延迟依然很差。C 选项增加节点反而会加剧问题，因为 Leader 需要等待更多 Follower 确认，网络 RTT 也增加了。D 选项 --unsafe-no-fsync 会完全破坏 etcd 的持久化保证，节点崩溃后数据会丢失，Raft 的正确性无法保证，生产环境绝对禁止使用。正确做法是换 SSD 并独立挂载，同时设置 ionice 避免 IO 竞争，这才能从根本上解决问题。"
+        }
+      ],
+      "references": [
+        "https://etcd.io/docs/v3.5/op-guide/hardware/",
+        "https://etcd.io/docs/v3.5/tuning/",
+        "https://etcd.io/docs/v3.5/op-guide/maintenance/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/",
+        "https://github.com/etcd-io/etcd/blob/main/Documentation/op-guide/performance.md",
+        "https://www.brendangregg.com/blog/2017-08-08/linux-io-scheduler-analysis.html"
+      ]
+    }
+  ]
+}
