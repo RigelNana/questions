@@ -1,0 +1,276 @@
+{
+  "id": "ds-db-unique-idempotent",
+  "name": "数据库唯一约束实现幂等",
+  "domain": "distributed-system",
+  "description": "掌握利用数据库 UNIQUE KEY 实现幂等插入（INSERT IGNORE/ON DUPLICATE KEY UPDATE），以及与 SELECT+INSERT 方案的对比和分布式场景的局限性",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-db-unique-idempotent-q1",
+      "domain": "distributed-system",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["幂等", "唯一约束", "分布式", "MySQL", "PostgreSQL", "接口设计"],
+      "title": "如何用数据库唯一约束实现接口幂等？有哪些局限性？",
+      "content": "在支付、订单等核心业务中，网络抖动会导致客户端重试，同一请求可能到达服务端多次。一个常见的幂等方案是在数据库层面用 UNIQUE KEY 约束来「兜底」——重复请求碰到唯一键冲突直接忽略。\n\n请回答：\n\n1. 数据库唯一约束实现幂等的核心原理是什么？\n2. `INSERT IGNORE`、`ON DUPLICATE KEY UPDATE` 与「先 SELECT 再 INSERT」这三种写法在并发安全性上有何本质区别？\n3. 这个方案在分布式场景下有哪些局限性，什么时候应该换成 Redis 方案？\n\n以下是一段生产代码，看看它有什么问题：\n\n```java\n// 订单服务 - 创建订单接口\npublic OrderResult createOrder(CreateOrderRequest req) {\n    String key = req.getIdempotencyKey();\n    // 先查\n    IdempotentRecord record = db.queryOne(\n        \"SELECT * FROM order_idempotent WHERE idempotency_key = ?\", key\n    );\n    if (record != null) {\n        return parse(record.getResult()); // 直接返回缓存结果\n    }\n    // 再创建订单\n    Order order = orderService.create(req);\n    // 后写\n    db.execute(\n        \"INSERT INTO order_idempotent (idempotency_key, order_id, result) VALUES (?, ?, ?)\",\n        key, order.getId(), serialize(order)\n    );\n    return OrderResult.of(order);\n}\n```\n\n这段代码在 QPS 低时完全正常，但压测一起来就偶发「订单重复创建」。为什么？",
+      "answer": "## 幂等性问题的本质：谁来保证「只做一次」\n\n在分布式系统里，「幂等」这个词被说烂了，但真正搞清楚它的人不多。幂等的定义是：对同一操作执行一次和执行多次，产生的效果完全相同。注意这里说的是「效果」，不是「结果」——重复的 HTTP 200 不代表幂等，重复扣款了才是问题。\n\n实现幂等本质上是在回答一个问题：谁来保证「同一个请求只被处理一次」？答案无非三类：客户端保证（发一次）、应用层保证（去重逻辑）、存储层保证（唯一约束）。客户端没法信任，应用层在多实例部署下需要分布式锁，而存储层的唯一约束是最简单、最可靠的方案——它把「去重」这件事交给了数据库的事务引擎来做，而数据库天生就擅长这个。\n\n## 核心原理：把幂等键变成主键或唯一索引\n\n方案的核心思路是：把客户端传来的「幂等键」（idempotency key，通常是 UUID 或业务流水号）存入一张专门的幂等表，并在这列上建 UNIQUE KEY。重复请求来了，第二次 INSERT 会因为唯一键冲突被数据库拒绝，应用层捕获这个异常，返回第一次的结果——这就是幂等。\n\n幂等表的典型设计如下：\n\n```sql\nCREATE TABLE order_idempotent (\n  idempotency_key VARCHAR(64) PRIMARY KEY,  -- 客户端生成的唯一键，直接当主键\n  order_id        BIGINT NOT NULL,\n  result          JSON,                      -- 第一次的返回结果，重复请求直接返回它\n  created_at      TIMESTAMP DEFAULT NOW(),\n  expires_at      TIMESTAMP NOT NULL         -- 幂等记录不能永久存，设置过期时间\n);\n```\n\n`idempotency_key` 直接作为主键，MySQL InnoDB 的主键本身就是聚簇索引上的唯一约束，冲突时会抛出 `Duplicate entry 'xxx' for key 'PRIMARY'`，即 `SQLState 23000`，对应 Java 的 `DuplicateKeyException`。\n\n## 三种 SQL 写法的并发安全性对比\n\n这里是真正容易踩坑的地方。题目中那段 Java 代码的问题就出在用了「先 SELECT 再 INSERT」这个非原子操作。\n\n**`INSERT IGNORE`（MySQL 推荐写法）**\n\n```sql\nINSERT IGNORE INTO order_idempotent (idempotency_key, order_id, result, expires_at)\nVALUES ('uuid-abc', 10001, '{\"status\":\"success\"}', DATE_ADD(NOW(), INTERVAL 24 HOUR));\n-- 重复执行：affected rows = 0，不报错，不抛异常\n```\n\n`INSERT IGNORE` 在遇到唯一键冲突时静默忽略，返回 affected rows = 0。它是原子的——整个 INSERT 在存储引擎层要么成功要么被跳过，不存在并发窗口。应用层通过判断 affected rows 是 1（首次成功）还是 0（重复请求）来决定下一步。注意一个细节：`INSERT IGNORE` 还会忽略其他类型的错误（如数据截断），所以如果你的表结构严格，偶尔可能掩盖真实的 bug。\n\n**`ON DUPLICATE KEY UPDATE`（需要 no-op 写法）**\n\n```sql\nINSERT INTO order_idempotent (idempotency_key, order_id, result, expires_at)\nVALUES ('uuid-abc', 10001, '{\"status\":\"success\"}', DATE_ADD(NOW(), INTERVAL 24 HOUR))\nON DUPLICATE KEY UPDATE result = result;  -- 重复时什么都不做，维持原值\n```\n\n这里有个常见的误区：很多人写 `ON DUPLICATE KEY UPDATE result = VALUES(result)`，这会在重复时用新值覆盖旧值，破坏幂等语义！正确做法是 `result = result`，让 MySQL 判断新旧值相等，跳过实际写入。这种写法的好处是可以通过 `ROW_COUNT()` 区分首次插入（返回 1）和重复忽略（返回 0），语义比 `INSERT IGNORE` 更精确。\n\n**PostgreSQL 的 `ON CONFLICT DO NOTHING`**\n\n```sql\nINSERT INTO order_idempotent (idempotency_key, order_id)\nVALUES ('uuid-abc', 10001)\nON CONFLICT (idempotency_key) DO NOTHING;\n```\n\nPostgreSQL 的语法比 MySQL 更清晰，`DO NOTHING` 就是字面意思。同样是原子操作，同样通过 affected rows 判断是否重复。\n\n**「先 SELECT 再 INSERT」的并发窗口问题**\n\n现在回到题目中的那段 Java 代码。它的问题在于 SELECT 和 INSERT 是两条独立的 SQL，它们之间存在一个时间窗口。考虑这个场景：\n\n```\n时刻T1: 请求A SELECT，结果为空，继续\n时刻T2: 请求B SELECT，结果为空，继续（请求A还没INSERT）\n时刻T3: 请求A 创建订单，INSERT 成功\n时刻T4: 请求B 创建订单，INSERT 成功（唯一键冲突！）\n                  ↑ 如果这里没有UNIQUE KEY，两笔订单都创建了\n                  ↑ 如果有UNIQUE KEY，请求B的INSERT抛异常，但订单已经创建了！\n```\n\n更微妙的是：请求 B 在「创建订单」之后才执行 INSERT 幂等记录，这意味着订单的创建和幂等记录的写入本身就不是原子的。正确做法是把「创建订单」和「写幂等记录」放在同一个数据库事务里，并用 `INSERT IGNORE` 而不是「先查后插」。\n\n```java\n// 正确做法：事务内原子操作\n@Transactional\npublic OrderResult createOrder(CreateOrderRequest req) {\n    String key = req.getIdempotencyKey();\n    try {\n        // 先尝试插入幂等记录（占位）\n        int rows = db.execute(\n            \"INSERT IGNORE INTO order_idempotent (idempotency_key, order_id, result, expires_at) \"\n          + \"VALUES (?, 0, NULL, DATE_ADD(NOW(), INTERVAL 24 HOUR))\",\n            key\n        );\n        if (rows == 0) {\n            // 重复请求：直接查已有结果返回\n            return db.queryOne(\"SELECT result FROM order_idempotent WHERE idempotency_key = ?\", key);\n        }\n        // 首次请求：执行业务逻辑\n        Order order = orderService.create(req);\n        // 回填结果\n        db.execute(\n            \"UPDATE order_idempotent SET order_id = ?, result = ? WHERE idempotency_key = ?\",\n            order.getId(), serialize(order), key\n        );\n        return OrderResult.of(order);\n    } catch (DuplicateKeyException e) {\n        // 极端并发下的双保险\n        return db.queryOne(\"SELECT result FROM order_idempotent WHERE idempotency_key = ?\", key);\n    }\n}\n```\n\n这个写法先用 `INSERT IGNORE` 抢占幂等槽位，再执行业务逻辑，最后回填结果。「抢占」这一步是原子的，并发安全；整个流程在事务内，如果业务逻辑抛异常，幂等记录也会回滚，不会留下「占了坑但没结果」的脏数据。\n\n## 局限性与适用场景的边界\n\n唯一约束方案并不是万能的，在以下场景会遇到麻烦。\n\n**跨库分布式场景下唯一约束失效。** 如果你的订单数据分库分表（比如按 user_id 分 16 个库），幂等表放在哪个库？如果也分库，同一个 idempotency_key 的两次请求可能路由到不同的库，唯一约束形同虚设。这时要么把幂等表单独放在一个不分库的中心库（成为热点），要么引入 Redis 做跨库幂等检查。\n\n**幂等记录膨胀占用存储。** 每个请求写一条幂等记录，高峰期一天可能写入千万行。虽然可以设置 `expires_at` 定期清理，但清理本身就是额外的 DELETE 压力。Redis 的 TTL 机制天然解决了这个问题。\n\n**数据库成为幂等检查的瓶颈。** 幂等检查发生在每个写请求的关键路径上，当 QPS 上万时，幂等表的 INSERT 会成为热点。InnoDB 的行锁、B+ 树页分裂、redo log 写盘都是开销。Redis 的 `SET NX PX` 在这个场景下延迟低一个数量级（亚毫秒 vs 几毫秒）。\n\n**适合这个方案的场景：** 写入量在每秒几百到几千 QPS、已有 MySQL 不想引入 Redis、最重要的是需要「幂等记录与业务数据同库事务」——比如订单创建和幂等记录必须同时提交或同时回滚。这种强事务性需求是 Redis 方案做不到的，是唯一约束方案最大的优势。\n\n## 面试时怎么答才能加分\n\n大部分候选人回答这道题到「`INSERT IGNORE` 忽略重复」就停了，能拿及格分。真正能加分的点有两个：第一，主动提出「先查后插」的并发窗口问题，说明为什么 `INSERT IGNORE` 比 SELECT+INSERT 更安全；第二，讨论分布式场景下唯一约束的边界，并给出「需要强事务时用唯一约束，需要高性能跨库幂等时用 Redis」的选型判断。这说明你在生产中真的用过这两种方案，而不是纸上谈兵。",
+      "keyPoints": [
+        "数据库 UNIQUE KEY 约束在存储引擎层保证原子性，`INSERT IGNORE` 和 `ON DUPLICATE KEY UPDATE result = result` 都是单条原子 SQL，不存在并发窗口，是比「先 SELECT 再 INSERT」更安全的幂等实现方式。",
+        "「先 SELECT 再 INSERT」在高并发下存在 TOCTOU（Time-Of-Check-Time-Of-Use）窗口，两个并发请求都能通过 SELECT 检查，导致重复执行业务逻辑，即使后续 INSERT 会冲突，业务副作用（如扣款、创建订单）已经发生了两次。",
+        "正确的幂等表实现需要把「写幂等占位记录」和「执行业务逻辑」放在同一个数据库事务内，业务失败时幂等记录一起回滚，避免留下「占了槽但没有结果」的脏记录。",
+        "`ON DUPLICATE KEY UPDATE result = result` 中必须写成「字段等于自身」实现 no-op，写成 `result = VALUES(result)` 会用新值覆盖旧值，破坏幂等语义，这是一个非常高频的生产 bug。",
+        "唯一约束幂等方案的核心优势是「与业务数据同库同事务」，能保证幂等记录和业务数据原子提交；其核心局限是分库分表场景下跨库唯一性无法保证、高 QPS 时数据库成为瓶颈。",
+        "Redis `SET NX PX` 方案延迟比数据库低一个数量级，适合跨库和高 QPS 场景，但无法与关系数据库事务绑定，存在 Redis 写成功但数据库回滚后幂等记录残留的问题，需要额外的补偿机制。",
+        "幂等记录表必须设置 `expires_at` 并定期清理，否则长期运行后记录量膨胀会导致 B+ 树高度增加，查询和写入性能下降，清理策略建议用独立的后台 Job 按批次删除过期记录，避免大事务。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz1",
+          "question": "以下哪种 SQL 写法在高并发下是并发安全的幂等实现？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "先 SELECT 检查是否存在，不存在则 INSERT"
+            },
+            {
+              "id": "B",
+              "text": "INSERT IGNORE INTO idempotent_table (...) VALUES (...)"
+            },
+            {
+              "id": "C",
+              "text": "在应用层加 synchronized 关键字保护 SELECT+INSERT"
+            },
+            {
+              "id": "D",
+              "text": "先加 Redis 分布式锁，再 SELECT 检查，再 INSERT"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 正确。`INSERT IGNORE` 是单条原子 SQL，在 InnoDB 存储引擎层通过行锁和唯一索引保证唯一性，不存在并发窗口。A 选项是经典的 TOCTOU 问题，两个并发请求都能通过 SELECT 检查。C 选项的 `synchronized` 只在单进程内有效，多实例部署下完全失效。D 选项引入了 Redis 分布式锁，逻辑上可以，但在 SELECT+INSERT 外面加锁是对的，然而这比直接用 `INSERT IGNORE` 复杂得多，在这个场景下是过度设计。"
+        },
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz2",
+          "question": "以下 `ON DUPLICATE KEY UPDATE` 的写法，哪个才是正确的幂等 no-op 实现？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "ON DUPLICATE KEY UPDATE result = VALUES(result)"
+            },
+            {
+              "id": "B",
+              "text": "ON DUPLICATE KEY UPDATE result = result"
+            },
+            {
+              "id": "C",
+              "text": "ON DUPLICATE KEY UPDATE id = id + 1"
+            },
+            {
+              "id": "D",
+              "text": "ON DUPLICATE KEY UPDATE created_at = NOW()"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 正确。`result = result` 让 MySQL 将字段值更新为自身，MySQL 检测到新旧值相同会跳过实际的行写入，实现 no-op 语义。A 选项 `result = VALUES(result)` 会用 INSERT 语句中提供的新值覆盖已有的 result，这破坏了幂等性——重复请求会用新的 result 覆盖第一次存储的结果，导致返回值可能不一致。C 选项会修改 id，不是 no-op。D 选项会更新时间戳，也不是 no-op，而且可能导致重复请求返回的结果和首次不一致。"
+        },
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz3",
+          "question": "幂等表的 idempotency_key 列直接作为 PRIMARY KEY，相比普通列加 UNIQUE KEY 有什么优势？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "PRIMARY KEY 不允许 NULL，比 UNIQUE KEY 更严格，能防止 key 为空的异常写入"
+            },
+            {
+              "id": "B",
+              "text": "InnoDB 聚簇索引特性让按 key 查询直接命中叶节点，避免回表，比普通列 UNIQUE KEY 少一次 IO"
+            },
+            {
+              "id": "C",
+              "text": "PRIMARY KEY 的锁粒度比 UNIQUE KEY 更小，并发写入性能更好"
+            },
+            {
+              "id": "D",
+              "text": "PRIMARY KEY 支持分区裁剪，UNIQUE KEY 不支持"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 正确。InnoDB 的聚簇索引把数据行和主键索引存储在一起，按 idempotency_key 查询时直接在 B+ 树叶节点找到完整行数据，无需回表（即不需要先找到主键再去聚簇索引查数据）。如果 idempotency_key 只是普通列加 UNIQUE KEY，那么这个二级索引叶节点存储的是主键值（比如自增 id），查询时需要两次 B+ 树遍历——先查二级索引得到主键，再查聚簇索引得到数据。A 选项说的是正确的事实，但不是「优势」而是约束，且 UNIQUE KEY 也可以设为 NOT NULL。C 和 D 说法错误。"
+        },
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz4",
+          "question": "在事务中先 INSERT IGNORE 写幂等占位记录，再执行业务逻辑，再回填结果。如果业务逻辑抛出异常事务回滚，会发生什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "幂等记录已经写入，事务回滚不影响已提交的 INSERT，下次相同 key 的请求会被当作重复请求"
+            },
+            {
+              "id": "B",
+              "text": "整个事务回滚，幂等记录也一起回滚，下次相同 key 的请求会重新执行"
+            },
+            {
+              "id": "C",
+              "text": "INSERT IGNORE 不参与事务，幂等记录保留，但业务数据回滚，导致幂等记录和业务数据不一致"
+            },
+            {
+              "id": "D",
+              "text": "MySQL 会自动检测到不一致状态并补偿，保证最终一致"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 正确。`INSERT IGNORE` 完全参与 InnoDB 事务，在事务提交前它的写入是不可见的（MVCC 隔离），事务回滚后幂等记录也随之回滚，就好像从未写入过一样。这正是「幂等记录与业务数据同库同事务」的核心价值——任何一方失败，两者一起回滚，不会留下半成品状态。A 选项是对 MySQL 事务的严重误解，`INSERT IGNORE` 并不是 auto-commit 模式执行的。C 和 D 都是错误的，MySQL 没有自动补偿机制，数据一致性完全由应用层的事务设计保证。"
+        },
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz5",
+          "question": "以下关于 `INSERT IGNORE` 返回值的描述，哪项是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "首次插入成功返回 1，重复插入（唯一键冲突被忽略）返回 -1"
+            },
+            {
+              "id": "B",
+              "text": "首次插入成功返回 1，重复插入返回 0"
+            },
+            {
+              "id": "C",
+              "text": "无论成功还是重复，始终返回 1，需要通过 LAST_INSERT_ID() 判断"
+            },
+            {
+              "id": "D",
+              "text": "重复插入时抛出 SQLWarning，affected rows 不确定"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 正确。MySQL `INSERT IGNORE` 在首次插入成功时 affected rows = 1；遇到唯一键冲突被忽略时 affected rows = 0。JDBC 的 `PreparedStatement.executeUpdate()` 直接返回这个值，Java 代码里判断返回值是否为 1 就能区分首次请求和重复请求。A 选项的 -1 在 JDBC 语境中表示「不知道影响了多少行」，不是这个场景。C 选项错误，重复时返回 0 而不是 1。D 选项中 `INSERT IGNORE` 确实会产生 warning（可通过 `SHOW WARNINGS` 查看），但 affected rows 是确定的，不会「不确定」。"
+        },
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz6",
+          "question": "订单服务分库分表，按 user_id 分 16 个库。幂等表放在哪个库最合理？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "按 idempotency_key 分库，和订单表用相同的分库策略"
+            },
+            {
+              "id": "B",
+              "text": "放在一个独立的不分库的中心库，所有分库的写请求都去这个库做幂等检查"
+            },
+            {
+              "id": "C",
+              "text": "每个分库各自维护一份幂等表，按 user_id 路由时同时路由幂等检查"
+            },
+            {
+              "id": "D",
+              "text": "放弃数据库幂等方案，改用 Redis SET NX"
+            }
+          ],
+          "correctAnswer": "D",
+          "explanation": "D 是在分库分表场景下最务实的答案。A 选项如果 idempotency_key 和 user_id 分库策略相同，同一用户的重复请求能路由到同一个库，唯一约束有效，但如果 key 和 user_id 没有绑定关系（如全局流水号），路由可能不一致。B 选项让中心库成为所有请求的热点，高 QPS 下很快成为瓶颈，且中心库单点是风险。C 选项最危险——同一个幂等 key 的两次请求如果路由到不同分库，各自的唯一约束互不感知，幂等完全失效。Redis SET NX 是跨库幂等的标准解法，延迟低、天然 TTL、不受分库影响。当然 B 在 QPS 低时也是可以接受的过渡方案。"
+        },
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz7",
+          "question": "Redis `SET NX PX` 幂等方案与数据库唯一约束幂等方案相比，最根本的局限是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Redis 是内存存储，服务重启后幂等记录丢失，无法保证持久性"
+            },
+            {
+              "id": "B",
+              "text": "Redis 单线程，高 QPS 下性能不如数据库"
+            },
+            {
+              "id": "C",
+              "text": "Redis 的幂等检查与数据库写入不在同一事务，存在「Redis 写成功但数据库回滚」导致幂等记录残留的问题"
+            },
+            {
+              "id": "D",
+              "text": "Redis SET NX 不支持过期时间，幂等记录会永久占用内存"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "C 正确。这是 Redis 幂等方案最根本的问题：Redis 和 MySQL 是两个独立的存储系统，无法在同一个事务里原子提交。典型的失败场景是：Redis SET NX 成功（标记为「已处理」），但随后数据库写入失败触发回滚，结果业务数据没写入，但 Redis 里的幂等标记留下了——后续相同 key 的重试请求会被 Redis 拦截，永远无法成功。需要额外的补偿机制（如 TTL 过期后允许重试）。A 选项中 Redis 有 AOF 持久化，且即使丢失，幂等键过期后可以重试，不是根本局限。B 完全错误，Redis 在这个场景下比 MySQL 快得多。D 错误，`SET key value NX PX 86400000` 是标准用法，支持毫秒级过期。"
+        },
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz8",
+          "question": "幂等表随时间积累了大量过期记录，清理时最需要避免的问题是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "DELETE 语句没有 WHERE 条件导致全表删除"
+            },
+            {
+              "id": "B",
+              "text": "一次性 DELETE 大批量过期记录，产生大事务，undo log 膨胀导致长时间持有行锁影响正常写入"
+            },
+            {
+              "id": "C",
+              "text": "清理任务和业务写入并发执行，导致正在使用的幂等记录被误删"
+            },
+            {
+              "id": "D",
+              "text": "DELETE 后没有立即执行 OPTIMIZE TABLE，导致磁盘空间没有释放"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 正确。大批量 DELETE 是 MySQL 运维中的经典坑。InnoDB 的 DELETE 是事务性操作，删除大量行时会持续积累 undo log，整个删除操作持有大量行锁，期间正常的 INSERT 如果遇到这些行锁会等待甚至超时。正确做法是用分批小事务删除：`DELETE FROM order_idempotent WHERE expires_at < NOW() LIMIT 1000`，每批删 1000 条，循环执行，每批之间 sleep 几毫秒让出 CPU 和锁资源。A 选项可以加适当 WHERE 条件避免。C 选项可以通过 `expires_at < NOW() - INTERVAL 1 HOUR` 留出缓冲时间避免。D 选项中 InnoDB 的空间释放机制不需要 OPTIMIZE TABLE，而且 OPTIMIZE TABLE 会锁全表，生产环境更危险。"
+        },
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz9",
+          "question": "下面这段代码捕获了 DuplicateKeyException 并返回成功，这个做法有什么潜在问题？\n```java\ntry {\n    orderService.createWithIdempotent(key, req);\n    return Result.success();\n} catch (DuplicateKeyException e) {\n    return Result.success(); // 重复请求，视为成功\n}\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "没有问题，这是标准的幂等处理模式"
+            },
+            {
+              "id": "B",
+              "text": "没有区分「幂等表」冲突和「业务表」冲突，业务表（如 order 表）的唯一键冲突也会被吞掉当作幂等成功"
+            },
+            {
+              "id": "C",
+              "text": "DuplicateKeyException 是 checked exception，应该用 throws 声明而不是 catch"
+            },
+            {
+              "id": "D",
+              "text": "应该返回 Result.fail() 而不是 Result.success()，让客户端知道是重复请求"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 正确。这是一个非常隐蔽的生产 bug。假设业务逻辑里往 order 表插入数据，order 表的某个 UNIQUE KEY（比如 trade_no）也发生了冲突（可能是 trade_no 生成算法有 bug 导致碰撞），这个真实的业务错误也会被 catch 块吞掉，返回「幂等成功」，但实际上订单根本没有创建。正确做法是在 catch 里检查异常来源，确认是幂等表的主键冲突而不是其他表的冲突，可以通过 `e.getMessage()` 里的表名或列名来区分，或者把幂等表的 INSERT 和业务表的 INSERT 拆开 try-catch 处理。D 选项说法不对，重复请求视为成功是正确的幂等语义，客户端不需要知道这次是「真正执行」还是「命中幂等缓存」。"
+        },
+        {
+          "id": "ds-db-unique-idempotent-q1-quiz10",
+          "question": "在「幂等表 + 同库事务」方案中，以下哪个场景是这个方案无法覆盖的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "同一个幂等 key 在 10ms 内被并发请求了 100 次"
+            },
+            {
+              "id": "B",
+              "text": "业务逻辑需要调用外部 HTTP 接口（如支付宝收款），外部调用成功但数据库事务回滚了"
+            },
+            {
+              "id": "C",
+              "text": "幂等 key 对应的结果在 24 小时后过期，客户端在 25 小时后重新发起了相同 key 的请求"
+            },
+            {
+              "id": "D",
+              "text": "幂等表的写入 QPS 超过了单机 MySQL 的处理能力"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 正确。这是分布式事务的经典问题：数据库事务只能保证数据库操作的原子性，但对外部系统调用（如支付宝 API、第三方短信接口）无能为力。如果调用支付宝收款成功，但随后数据库写入失败触发回滚，那么幂等记录也回滚了——下次同 key 重试会再次调用支付宝，导致重复收款。解决这类问题需要最终一致性方案：本地消息表、TCC 事务补偿、或者 Saga 模式。A 选项 `INSERT IGNORE` 原子性完全覆盖高并发场景。C 选项过期后允许重试是正常的设计，只要业务能接受「过了 24 小时的重试视为新请求」就没有问题。D 选项是性能问题，可以通过 Redis 方案解决，但不是「无法覆盖」的语义问题。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/insert-on-duplicate.html",
+        "https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT",
+        "https://stripe.com/blog/idempotency",
+        "https://brandur.org/idempotency-keys"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,157 @@
+{
+  "id": "ds-mq-consumer-dedup",
+  "name": "消息消费去重方案",
+  "domain": "distributed-system",
+  "description": "对比 Redis SET NX、数据库唯一键、布隆过滤器三种消息去重方案的性能、可靠性和适用场景",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-mq-consumer-dedup-q1",
+      "domain": "distributed-system",
+      "type": "comparison",
+      "difficulty": 2,
+      "tags": ["消息队列", "幂等性", "去重", "Redis", "布隆过滤器", "分布式系统"],
+      "title": "消息队列消费去重有哪些存储方案，各自的优缺点是什么？",
+      "content": "你的团队正在用 Kafka 构建一个订单下游处理服务，消费到「订单创建」事件后需要给用户发短信通知。上线第一周就出现了用户反馈收到重复短信的投诉。\n\n你排查后发现：Kafka Consumer 在提交 offset 之前服务重启了，导致这批消息被重新消费了一次。这是 Kafka at-least-once 语义的正常表现，但你的业务代码没有做幂等保护。\n\n现在你需要在消费者侧实现消息去重，让同一条消息无论被消费几次，业务逻辑只执行一次。常见的去重存储方案有三种：Redis SET NX、数据库唯一键、布隆过滤器。\n\n请对比这三种方案在**性能、可靠性、适用场景**上的差异，并给出你的选型建议。",
+      "answer": "## 先把问题说清楚：MQ 为什么必然会产生重复消息\n\n很多人在面试中一上来就讲去重方案，但面试官真正想考察的是你有没有真正理解消息重复的根因。Kafka 和 RocketMQ 默认都是 at-least-once 语义，意思是「消息至少被投递一次，可能投递多次」。这不是 Bug，是一个有意识的设计取舍：为了保证消息不丢，系统在某些情况下宁愿多投递一次。\n\n具体来说，重复消费的触发场景主要有三个。第一个是消费者在处理完消息后、提交 offset 前崩溃重启，这批消息会被重新拉取。第二个是消费者处理时间过长超过了 `session.timeout.ms`，Kafka 认为这个消费者挂了，触发 Rebalance，这批消息被重新分配给其他消费者。第三个是网络分区场景，消费者提交 offset 的请求没有被 Broker 确认就超时了，消费者重试提交，但实际上上一次已经提交成功了，所以下次 Fetch 还是会从老的 offset 开始。\n\n理解了这三个场景，你就会明白一件事：exactly-once 在端到端意义上几乎不可能由 MQ 本身完全保证，因为「处理业务逻辑」和「提交 offset」这两个操作不可能组成一个原子操作。Kafka 0.11 之后引入了幂等生产者和事务 API，可以保证生产侧的 exactly-once，但消费侧的业务处理幂等必须由应用自己负责。这就是消费端去重存在的根本原因。\n\n去重的核心思路很简单：每条消息都有一个唯一标识（Kafka 里一般用 `topic + partition + offset` 拼成，或者生产者在 Header 里塞一个业务 UUID），消费者在处理前先查一下这个 ID 有没有被处理过，处理完后记录下来。这个「记录已处理 ID」的存储选型，就是三种方案的核心差异所在。\n\n## Redis SET NX：高性能的首选，但有持久化风险\n\nRedis 的 `SET key value NX PX ttl` 命令是实现去重最常见的方式。NX（Not eXists）的语义是「只有 key 不存在时才设置」，这正好对应我们的需求：第一次消费时写入成功，后续重复消费时写入失败，从而跳过处理。`PX ttl` 设置过期时间，避免 Redis 内存无限增长。\n\n一个典型的 Java 实现如下：\n\n```java\n// Spring Boot + Lettuce 示例\n@Service\npublic class OrderNotifyConsumer {\n\n    private final StringRedisTemplate redisTemplate;\n    private final SmsService smsService;\n\n    // TTL 设置为消息最大重试窗口的 2 倍，通常 24 小时足够\n    private static final long DEDUP_TTL_SECONDS = 86400L;\n\n    @KafkaListener(topics = \"order-created\", groupId = \"notify-group\")\n    public void consume(ConsumerRecord<String, String> record) {\n        // 用 topic + partition + offset 作为唯一 key\n        // 如果生产者在 Header 里塞了业务 UUID，优先用业务 UUID\n        String dedupKey = String.format(\"dedup:order-notify:%s:%d:%d\",\n            record.topic(), record.partition(), record.offset());\n\n        // SET NX PX：原子性「不存在才写入」，返回 true 表示首次处理\n        Boolean isFirstTime = redisTemplate.opsForValue()\n            .setIfAbsent(dedupKey, \"1\", Duration.ofSeconds(DEDUP_TTL_SECONDS));\n\n        if (Boolean.FALSE.equals(isFirstTime)) {\n            // 已经处理过，直接跳过，不要抛异常（让 offset 正常提交）\n            log.info(\"Duplicate message skipped: {}\", dedupKey);\n            return;\n        }\n\n        // 首次处理，执行业务逻辑\n        try {\n            OrderEvent event = JSON.parseObject(record.value(), OrderEvent.class);\n            smsService.sendOrderCreatedSms(event.getUserPhone(), event.getOrderId());\n        } catch (Exception e) {\n            // 业务处理失败，需要删除 dedupKey，否则下次重试会被误判为重复\n            redisTemplate.delete(dedupKey);\n            throw e; // 重新抛出，让 Kafka 重试这条消息\n        }\n    }\n}\n```\n\n这段代码有一个非常重要的细节：`catch` 块里删除了 `dedupKey`。很多人写去重逻辑时忽略这一点，导致业务处理失败后消息被跳过，永远不会重试。正确的做法是：只有业务处理**成功**后，`dedupKey` 才应该保留；处理**失败**后要删除 key，让后续重试能正常进入处理逻辑。\n\nRedis SET NX 的性能非常出色。单次 `SET NX` 命令的延迟通常在 0.5ms 以内，QPS 轻松达到 10 万级别。对于大多数消费者服务来说，去重检查的开销几乎可以忽略不计。\n\n但 Redis 方案有一个本质性的弱点：Redis 的数据持久化有时间窗口。即使开启了 AOF 且配置了 `appendfsync always`，在极端情况下（比如磁盘 IO 满、主从切换期间）仍然可能丢失极少量的去重记录。如果 Redis 集群发生故障重启，某些已处理的消息 ID 可能从去重记录里消失，导致这些消息被重复处理。对于发短信、发邮件这类「重复一次用户会有感知但不会造成资损」的场景，这个风险是可以接受的。但对于转账、扣款这类「重复一次会造成资损」的场景，Redis 方案就不够用了。\n\n## 数据库唯一键：持久化最强，可以和业务同事务\n\n数据库唯一键方案是用一张专门的去重表，对消息 ID 字段加唯一索引，然后用 `INSERT IGNORE`（MySQL）或 `INSERT ... ON CONFLICT DO NOTHING`（PostgreSQL）来实现「首次插入成功，重复插入静默跳过」的语义。\n\n```sql\n-- 去重表 DDL\nCREATE TABLE message_dedup (\n    id          BIGINT AUTO_INCREMENT PRIMARY KEY,\n    message_id  VARCHAR(128) NOT NULL,          -- 消息唯一标识\n    topic       VARCHAR(64)  NOT NULL,           -- 消息来源 topic\n    processed_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    INDEX idx_topic_msgid (topic, message_id)    -- 联合唯一索引\n) ENGINE=InnoDB;\n\n-- 注意：单独的 UNIQUE INDEX 比联合索引更安全，取决于业务是否需要跨 topic 去重\nALTER TABLE message_dedup ADD UNIQUE KEY uk_topic_msgid (topic, message_id);\n```\n\n```java\n// 使用 Spring @Transactional 将去重写入和业务操作绑定在同一事务里\n@Transactional(rollbackFor = Exception.class)\npublic void processWithDedup(String messageId, String topic, Runnable businessLogic) {\n    // INSERT IGNORE：重复时不报错，affected rows = 0\n    int affected = jdbcTemplate.update(\n        \"INSERT IGNORE INTO message_dedup (message_id, topic) VALUES (?, ?)\",\n        messageId, topic\n    );\n\n    if (affected == 0) {\n        // affected rows = 0 说明这条消息已经处理过\n        log.info(\"Duplicate message skipped: {}/{}\", topic, messageId);\n        return;\n    }\n\n    // affected rows = 1 说明首次处理，执行业务逻辑\n    // 因为在同一个事务里，业务操作失败会导致去重记录一起回滚\n    businessLogic.run();\n}\n```\n\n数据库方案最大的优势是：**去重记录和业务数据在同一个事务里**。如果业务操作（比如 UPDATE 订单状态）失败，去重记录也会回滚，下次重试时这条消息会被正常处理。这种「原子性」是 Redis 方案做不到的。\n\n性能上，数据库方案的延迟通常在 1-5ms，比 Redis 慢 5-10 倍，但对于大多数业务场景来说是完全可以接受的。真正的瓶颈不在这条 `INSERT IGNORE`，而在于你的业务逻辑本身。\n\n数据库方案的缺点是存储成本会随时间累积。去重表里的记录需要定期清理，否则表会越来越大，索引扫描越来越慢。常见的做法是给 `processed_at` 字段加上时间分区，或者用定时任务删除超过一定时间窗口的老记录（比如删除 7 天前的记录）。如果消息重试窗口不超过 7 天，那么 7 天前的去重记录就没有保留价值了。\n\n## 布隆过滤器：内存极省，但有假阳性和不可删除的硬伤\n\n布隆过滤器（Bloom Filter）是一种概率型数据结构。它用一个 bit 数组加多个哈希函数来判断一个元素「可能存在」或「一定不存在」。「可能存在」意味着有一定的假阳性率（False Positive），「一定不存在」则是百分之百准确的。\n\n用大白话说：如果布隆过滤器说「这条消息没处理过」，那它一定没处理过；但如果它说「这条消息处理过了」，有 1% 的概率它其实没处理过，只是哈希碰撞了。\n\n布隆过滤器的最大优势是内存效率。存储 100 万个元素的布隆过滤器（1% 假阳性率）只需要约 1.2MB 内存，而同等量级的 Redis SET 需要几十 MB 甚至上百 MB。在消息量巨大（亿级别）的场景下，这个差异非常显著。\n\nRedis 4.0 之后通过 RedisBloom 模块（Redis Stack 的一部分）原生支持布隆过滤器：\n\n```bash\n# 创建布隆过滤器：预期 100 万个元素，1% 假阳性率\nBF.RESERVE dedup:order-notify 0.01 1000000\n\n# 检查并添加（如果不存在则添加，返回 1；如果已存在，返回 0）\nBF.ADD dedup:order-notify \"order-uuid-12345\"\n# 返回 1 表示首次添加（此消息之前未处理过）\n# 返回 0 表示已存在（此消息可能处理过，或发生了哈希碰撞）\n\n# 只检查，不添加\nBF.EXISTS dedup:order-notify \"order-uuid-12345\"\n```\n\n布隆过滤器有两个致命缺陷，让它在大多数业务场景下很难成为主选方案。第一个缺陷是**不支持删除元素**。标准布隆过滤器里，bit 位一旦被置 1 就无法恢复为 0（因为多个元素可能共享同一个 bit 位，删除一个会影响另一个）。这意味着布隆过滤器无法像 Redis 那样通过 TTL 来实现过期清理。虽然有 Counting Bloom Filter 支持删除，但内存开销是标准布隆过滤器的 3-4 倍，优势大打折扣。第二个缺陷是**假阳性会导致消息漏处理**。1% 的假阳性率听起来很低，但在每天消费 100 万条消息的服务里，每天会有约 1 万条消息被误判为「已处理」而跳过。对于发短信这类场景，这意味着每天有 1 万个用户收不到通知。这通常是不可接受的。\n\n因此，布隆过滤器更适合作为「粗粒度预过滤层」，而不是作为单独的去重方案。比如在 Redis 或数据库方案前面加一层布隆过滤器，让大部分「确定没处理过」的消息快速通过，只有「可能处理过」的消息才去查 Redis 或数据库。这样可以减少 99% 的 Redis 查询压力。\n\n## 三种方案的横向对比\n\n| 维度 | Redis SET NX | 数据库唯一键 | 布隆过滤器 |\n|------|-------------|-------------|----------|\n| 延迟 | < 1ms | 1-5ms | < 1ms |\n| 持久化 | 有时间窗口风险 | 强持久化 | 无（内存） |\n| 与业务同事务 | ❌ 不支持 | ✅ 支持 | ❌ 不支持 |\n| 自动过期 | ✅ TTL | 需手动清理 | ❌ 不支持删除 |\n| 假阳性 | 无 | 无 | 有（约 1%） |\n| 内存效率 | 中等 | 低（磁盘） | 极高 |\n| 运维复杂度 | 低 | 低 | 中（需 RedisBloom） |\n\n## 选型建议：根据业务风险等级选择\n\n实际工程中，选型的核心判断标准是「重复处理的代价有多大」。\n\n对于**低风险重复**的场景（发短信、发通知、记录日志），Redis SET NX 是最佳选择。它性能好、运维简单、TTL 自动清理，99.99% 的场景下够用。把 TTL 设置为业务的最大重试窗口时间的两倍（通常 24-48 小时），一般不会有问题。\n\n对于**高风险重复**的场景（扣款、转账、库存扣减），必须用数据库唯一键，并且将去重记录写入和业务操作放在同一个数据库事务里。这是唯一能保证「要么都成功要么都失败」的方案。性能上 1-5ms 的额外开销完全值得换来这份安全感。\n\n对于**超大消息量**的场景（亿级别/天，对假阳性容忍度较高），可以用「布隆过滤器 + Redis SET NX」的组合方案：布隆过滤器负责拦截 99% 以上的「确定没处理过」的正常消息（不需要查 Redis），只有布隆过滤器说「可能处理过」时才查 Redis 精确确认。这样 Redis 的实际查询量可以从 100% 降低到不足 1%，大幅减轻 Redis 的压力。\n\n最后一个值得注意的工程细节：无论选哪种方案，都要确保消息 ID 的设计足够唯一。用 `topic + partition + offset` 拼接是最稳妥的方式，因为这个组合在 Kafka 里本身就是唯一的。如果业务方有自己的 UUID，优先用业务 UUID，因为它在多集群迁移时更稳定。千万不要只用消息 body 的 hash 值作为去重 key，因为不同的消息可能有相同的业务内容（比如用户短时间内下了两张相同商品的订单），hash 碰撞会导致第二张订单被误判为重复。",
+      "keyPoints": [
+        "Kafka/RocketMQ 默认 at-least-once 语义，消费者 crash 后重启、Rebalance 或网络超时重试都会导致消息被重复消费，这是 MQ 的正常行为而非 Bug，消费端必须自己实现幂等保护。",
+        "Redis SET NX 方案延迟 < 1ms，TTL 自动清理内存，适合发短信、发通知等低风险重复场景，但业务处理失败时必须删除去重 key，否则下次重试会被误判为重复而永久跳过。",
+        "数据库唯一键方案通过 INSERT IGNORE 实现去重，最大优势是可以将去重记录写入和业务操作放在同一个数据库事务里，业务失败时去重记录自动回滚，是扣款、转账等高风险场景的唯一可靠选择。",
+        "布隆过滤器内存效率极高（100 万元素仅需约 1.2MB），但有约 1% 的假阳性率会导致正常消息被误判为重复而漏处理，且不支持删除单个元素，通常不单独作为去重方案使用。",
+        "「布隆过滤器 + Redis SET NX」的组合方案适合亿级别消息量场景：布隆过滤器拦截绝大部分确定没处理过的消息，只有可能处理过的消息才精确查询 Redis，可将 Redis 查询量降低 99% 以上。",
+        "消息去重 key 的设计应优先使用生产者生成的业务 UUID，其次是 topic + partition + offset 的组合，切忌用消息 body 的 hash 值，因为不同业务含义相同的消息（如同一商品的两次下单）会产生相同 hash 从而被误判为重复。",
+        "数据库去重表需要定期清理历史记录，可通过给 processed_at 字段加时间分区或定时任务删除超出重试窗口期的记录（通常 7 天），防止表体积无限增长导致索引扫描变慢。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz1",
+          "question": "Kafka at-least-once 语义的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "「提交 offset」和「处理业务逻辑」不是原子操作，处理完未提交时崩溃会导致重新消费"},
+            {"id": "B", "text": "Kafka Broker 存在 Bug，会随机重发已投递的消息"},
+            {"id": "C", "text": "Kafka 的 ISR 副本同步机制导致消息可能被多次写入"},
+            {"id": "D", "text": "消费者组的 Rebalance 算法存在缺陷，会丢失 offset 信息"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "at-least-once 是 Kafka 有意的设计取舍。「处理业务逻辑」和「提交 offset」是两个独立操作，它们之间不可能构成原子事务。当消费者在处理完消息后、提交 offset 前崩溃，或者 session 超时触发 Rebalance，这批消息的 offset 还没有被提交，Kafka 会从上一个已提交的 offset 开始重新投递，导致这批消息被重复消费。B 选项明显错误。C 选项混淆了生产者侧的 ISR 副本写入和消费侧的重复投递，两者是完全不同的机制。D 选项不正确，Rebalance 本身不会丢失 offset，而是会让新的消费者从上一个已提交的 offset 开始消费，已提交的 offset 不会受影响。"
+        },
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz2",
+          "question": "Redis SET NX 去重方案中，当业务处理抛出异常时，正确的做法是什么？",
+          "choices": [
+            {"id": "A", "text": "捕获异常后静默忽略，让 offset 正常提交，避免消息重复消费"},
+            {"id": "B", "text": "删除去重 key 并重新抛出异常，让 Kafka 能在下次重试时正常处理这条消息"},
+            {"id": "C", "text": "不删除 key，等待 TTL 自动过期后重试，避免短时间内重复处理"},
+            {"id": "D", "text": "立即提交 offset，然后发送告警，由人工介入补偿"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "SET NX 的去重 key 只应该在业务**成功处理后**保留。如果业务处理失败（抛出异常），说明这条消息还没有被成功处理，必须删除 key 并重新抛出异常，让 Kafka 能够在下次重试时重新消费这条消息。如果不删除 key，后续重试时 SET NX 会返回 false（key 已存在），消息被误判为「已处理」而跳过，导致业务永久漏处理。A 选项最危险，静默吞掉异常会导致消息既没有成功处理，offset 又被提交，消息永久丢失。C 选项等 TTL 过期意味着这条消息最快也要等 24 小时后才能重试，完全不可接受。D 选项依赖人工介入，不符合自动化运维的最佳实践。"
+        },
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz3",
+          "question": "数据库唯一键去重方案相比 Redis SET NX 最核心的优势是什么？",
+          "choices": [
+            {"id": "A", "text": "延迟更低，单次去重检查在微秒级别"},
+            {"id": "B", "text": "可以将去重记录写入和业务操作放在同一个数据库事务里，业务失败时去重记录自动回滚"},
+            {"id": "C", "text": "不需要设置过期时间，去重记录永久有效"},
+            {"id": "D", "text": "支持分布式部署，天然具备水平扩展能力"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "数据库唯一键方案的核心优势是事务原子性：去重记录写入和业务操作（如扣款、更新订单状态）在同一个数据库事务里，要么一起成功要么一起失败。这保证了「成功处理过的消息有去重记录」和「有去重记录的消息一定成功处理过」这两个方向都是成立的。Redis 方案无法做到这一点——如果业务操作成功但删除 key 的操作失败（或者更新 Redis 成功但更新数据库失败），就会出现数据不一致。A 选项错误，数据库方案延迟通常在 1-5ms，比 Redis 慢。C 选项反而是缺点，永久保留去重记录会导致表体积无限增长。D 选项 Redis 同样支持集群部署，不是数据库方案独有的优势。"
+        },
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz4",
+          "question": "布隆过滤器判断「元素不存在」时，这个结论的准确性是怎样的？",
+          "choices": [
+            {"id": "A", "text": "有约 1% 的误判率，可能误判「存在的元素」为「不存在」"},
+            {"id": "B", "text": "100% 准确，如果布隆过滤器说不存在，那元素一定不存在"},
+            {"id": "C", "text": "准确率取决于哈希函数的数量，通常在 95%-99% 之间"},
+            {"id": "D", "text": "与假阳性率相同，如果设置了 1% 假阳性，则「不存在」判断也有 1% 误判"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "布隆过滤器的工作原理决定了它只会产生「假阳性」（False Positive），不会产生「假阴性」（False Negative）。当一个元素不在过滤器中时，它对应的所有 bit 位一定没有被置为 1，所以判断结果「不存在」是 100% 准确的。而当过滤器说元素「存在」时，才有可能是因为哈希碰撞导致的误判（假阳性）——某些 bit 位是被其他元素设置的，碰巧和这个元素的哈希位置重合了。这个特性非常适合「粗粒度预过滤」：用布隆过滤器快速排除确定没处理过的消息，让它们直接通过，只有「可能处理过」的少数消息才去查 Redis 或数据库精确确认，从而大幅减少后端存储的查询压力。"
+        },
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz5",
+          "question": "以下哪种消息 ID 设计方案存在明显缺陷，可能导致不同业务含义的消息被误判为重复？",
+          "choices": [
+            {"id": "A", "text": "使用 topic + partition + offset 三元组拼接作为去重 key"},
+            {"id": "B", "text": "生产者在消息 Header 里生成 UUID 作为消息 ID"},
+            {"id": "C", "text": "使用消息 body 内容的 MD5 hash 值作为去重 key"},
+            {"id": "D", "text": "使用雪花算法在生产者侧生成全局唯一 ID"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "用消息 body 的 hash 值作为去重 key 的根本问题是：不同的消息可能有相同的业务内容，但它们应该被独立处理。典型场景是：用户短时间内重复下了两张相同商品的订单，这两条消息的 body 几乎完全相同（商品 ID、数量、用户 ID 都一样），hash 值会碰撞，导致第二张订单被误判为重复消息而跳过处理。A 选项是最稳妥的方案，因为 Kafka 保证同一 topic + partition + offset 的组合全局唯一。B 选项中生产者生成的 UUID 也是全局唯一的，并且在多集群迁移时比 offset 更稳定。D 选项雪花算法同样保证全局唯一。只有 C 选项混淆了「消息唯一性」和「消息内容唯一性」，这是一个经典的设计错误。"
+        },
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz6",
+          "question": "在「布隆过滤器 + Redis SET NX」的组合去重方案中，布隆过滤器的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "完全替代 Redis，所有去重判断都由布隆过滤器完成，Redis 只做持久化备份"},
+            {"id": "B", "text": "作为 Redis 的前置粗粒度过滤层，快速排除确定没处理过的消息，减少 Redis 的查询压力"},
+            {"id": "C", "text": "提高去重的准确率，布隆过滤器和 Redis 双重确认可以消除假阳性"},
+            {"id": "D", "text": "降低 Redis 的内存使用，将已过期的去重 key 迁移到布隆过滤器存储"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "组合方案的逻辑是：布隆过滤器说「不存在」时，100% 准确，这条消息直接走正常处理流程，不需要查询 Redis，避免了不必要的 Redis 开销。只有布隆过滤器说「可能存在」时，才去查 Redis 精确确认是否真的处理过（因为布隆过滤器有 1% 的假阳性，需要 Redis 做最终裁决）。在正常流量下，绝大多数消息都是首次消费（可能超过 99%），布隆过滤器能快速判断它们「不存在」，Redis 的实际查询量因此大幅降低。A 选项错误，布隆过滤器的假阳性问题使其不能单独作为去重方案。C 选项错误，组合方案不能消除假阳性，只能通过 Redis 做最终确认。D 选项描述的场景现实中不存在。"
+        },
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz7",
+          "question": "数据库去重表随时间增长会带来性能问题，最合理的解决方式是什么？",
+          "choices": [
+            {"id": "A", "text": "将去重表从 InnoDB 改为 Memory 引擎，提升查询速度"},
+            {"id": "B", "text": "增加更多索引字段，覆盖所有查询条件减少全表扫描"},
+            {"id": "C", "text": "按时间分区并定期清理超出消息最大重试窗口期的历史记录"},
+            {"id": "D", "text": "将去重表拆分到单独的数据库实例，避免影响业务表性能"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "去重记录的有效期只需覆盖消息的最大重试窗口期。如果消息最多重试 7 天，那么 7 天前的去重记录完全没有保留价值——7 天前的消息即使再次出现也已经超出了正常的 MQ 重试范围，应该作为异常处理而非去重处理。给 processed_at 字段加时间分区（MySQL 的 PARTITION BY RANGE），配合定时任务删除过期分区，可以在不影响查询性能的前提下保持表体积可控。A 选项将 InnoDB 改为 Memory 引擎会失去持久化能力，MySQL 重启后数据丢失，完全不可接受。B 选项增加索引不能从根本上解决数据量增长的问题，反而会降低写入性能。D 选项拆分数据库实例会带来分布式事务问题，得不偿失。"
+        },
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz8",
+          "question": "以下哪个业务场景最适合使用数据库唯一键方案而不是 Redis SET NX？",
+          "choices": [
+            {"id": "A", "text": "消费到「用户注册成功」事件后，发送欢迎短信给用户"},
+            {"id": "B", "text": "消费到「商品浏览」事件后，增加商品的浏览计数"},
+            {"id": "C", "text": "消费到「支付成功」事件后，给用户账户增加积分并扣减优惠券余额"},
+            {"id": "D", "text": "消费到「日志上报」事件后，将日志写入 Elasticsearch"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "「给账户增加积分并扣减优惠券余额」是典型的高风险场景：如果重复处理，用户会被重复增加积分或重复扣减优惠券，造成直接的资产损失。这类场景必须将去重记录写入和积分/优惠券的数据库操作放在同一个事务里，保证「要么都成功要么都失败」，只有数据库唯一键方案能做到这一点。A 选项（发短信）重复发一条欢迎短信用户有感知但不造成资损，Redis SET NX 已经足够。B 选项（浏览计数）多计一次几乎无感，可以直接用 Redis 原子计数，甚至不需要去重。D 选项（写日志）重复写一条日志完全可以接受，日志系统本身就要处理重复数据的问题。"
+        },
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz9",
+          "question": "布隆过滤器的假阳性率（False Positive Rate）主要受哪两个因素影响？",
+          "choices": [
+            {"id": "A", "text": "哈希函数的数量和 bit 数组的大小（与预期元素数量的比值）"},
+            {"id": "B", "text": "Redis 的内存大小和 CPU 核心数"},
+            {"id": "C", "text": "消息的 body 大小和消息的到达速率"},
+            {"id": "D", "text": "网络延迟和磁盘 IO 速度"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "布隆过滤器的假阳性率由两个参数决定：bit 数组的大小 m（相对于预期元素数量 n 的比值 m/n）和哈希函数的数量 k。直觉上理解：bit 数组越大，每个元素占用的 bit 位越稀疏，哈希碰撞的概率越低，假阳性率越低。哈希函数数量 k 有一个最优值（k = (m/n) × ln2），既不能太少（覆盖的 bit 位太少，容易碰撞）也不能太多（填满 bit 数组太快）。在实际使用中，通常直接指定预期元素数量和目标假阳性率，工具库会自动计算最优的 m 和 k。例如 100 万元素、1% 假阳性率需要约 9.6MB 的 bit 数组和 7 个哈希函数。B、C、D 选项均与布隆过滤器的数学原理无关。"
+        },
+        {
+          "id": "ds-mq-consumer-dedup-q1-quiz10",
+          "question": "Kafka 0.11 之后引入了幂等生产者（Idempotent Producer），这能否解决消费端的重复消费问题？",
+          "choices": [
+            {"id": "A", "text": "能，幂等生产者保证了 exactly-once 语义，消费端不会收到重复消息"},
+            {"id": "B", "text": "不能，幂等生产者只保证生产侧「同一条消息不会被写入 Kafka 多次」，不保证消费端的业务处理幂等"},
+            {"id": "C", "text": "能，配合 Consumer 的 enable.auto.commit=false 可以完全消除重复消费"},
+            {"id": "D", "text": "不能，因为幂等生产者只在单分区内有效，跨分区仍然会有重复"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "幂等生产者（通过 enable.idempotence=true 开启）解决的是「生产者重试导致消息被写入 Broker 多次」的问题，它通过序列号机制保证同一条消息在同一个 Producer session 内只被写入一次。但这与消费端的重复消费是两个完全不同的问题。消费端的重复消费来源于「提交 offset」和「处理业务逻辑」的非原子性，即使 Broker 里每条消息只有一份，消费者在处理完但未提交 offset 时崩溃，下次还是会重新消费这条消息。Kafka 的事务 API（Transactions）可以做到「生产-消费」链路上的 exactly-once（即消费一条消息、处理后精确投递到下一个 topic 一次），但如果消费端的业务操作是调用外部 HTTP 接口或写数据库，依然需要自己实现幂等。A 选项夸大了幂等生产者的能力范围。C 选项中手动提交 offset 减少了重复窗口，但不能完全消除重复。D 选项是混淆概念，D 描述的是事务 API 的跨分区限制，与幂等生产者无关。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#semantics",
+        "https://kafka.apache.org/documentation/#producerconfigs_enable.idempotence",
+        "https://redis.io/commands/set/",
+        "https://redis.io/docs/data-types/probabilistic/bloom-filter/",
+        "https://en.wikipedia.org/wiki/Bloom_filter"
+      ]
+    }
+  ]
+}
