@@ -252,7 +252,7 @@ export function QuestionDetail() {
 
           {/* Answer */}
           {showAnswer && (
-            <div className="mb-5 p-4 sm:p-6 rounded-xl border border-[var(--color-notion-correct)]/40 bg-[var(--color-notion-correct-light)] animate-slide-up">
+            <div className="mb-5 p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] animate-slide-up">
               <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4">
                 参考答案
               </h3>
