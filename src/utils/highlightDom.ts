@@ -29,6 +29,10 @@ export interface HighlightLike {
 /**
  * 计算 Range 在 container 中对应的纯文本起止偏移。
  * 若 Range 越出 container 或长度为 0 则返回 null。
+ *
+ * 会自动去掉首尾空白（空格、制表符、换行），避免：
+ *   1) 双击/三击选词时浏览器带上的尾随 " " / "\n"
+ *   2) 代码块中选中时尾随的 "\n" 被包进 <mark>，导致视觉上多出一个换行
  */
 export function getRangeOffsets(
   container: HTMLElement,
@@ -44,16 +48,30 @@ export function getRangeOffsets(
   const probe = range.cloneRange();
   probe.selectNodeContents(container);
   probe.setEnd(range.startContainer, range.startOffset);
-  const start = probe.toString().length;
+  const rawStart = probe.toString().length;
 
   probe.setEnd(range.endContainer, range.endOffset);
-  const end = probe.toString().length;
+  const rawEnd = probe.toString().length;
 
-  const text = range.toString();
+  const rawText = range.toString();
+  if (rawEnd <= rawStart) return null;
+  if (rawText.trim().length === 0) return null;
+
+  // 收敛到"真正的可视文本"——去掉首尾的空白符（含 \n \r \t 和普通空格）
+  let leading = 0;
+  while (leading < rawText.length && /\s/.test(rawText[leading])) leading++;
+  let trailing = 0;
+  while (
+    trailing < rawText.length - leading &&
+    /\s/.test(rawText[rawText.length - 1 - trailing])
+  )
+    trailing++;
+
+  const start = rawStart + leading;
+  const end = rawEnd - trailing;
   if (end <= start) return null;
-  if (text.trim().length === 0) return null;
 
-  return { start, end, text };
+  return { start, end, text: rawText.slice(leading, rawText.length - trailing) };
 }
 
 /** 解包所有 data-hl-id 标注，使 container 恢复为纯内容状态。 */

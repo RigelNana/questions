@@ -1,0 +1,168 @@
+{
+  "id": "ds-dist-lock-expiry-debug",
+  "name": "分布式锁过期并发问题排查",
+  "domain": "distributed-system",
+  "description": "排查分布式锁超时失效导致多个进程并发执行的问题，并给出预防和检测方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-dist-lock-expiry-debug-q1",
+      "domain": "distributed-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["分布式锁", "锁过期", "并发问题", "看门狗", "幂等性", "超卖", "Redis", "Redisson"],
+      "title": "分布式锁过期但业务未完成，如何发现和处理这类问题？",
+      "content": "某电商平台举办秒杀活动，商品限量 100 件。技术团队使用 Redis 分布式锁控制库存扣减，加锁命令为 `SET lock:flash-sale:product-001 {uuid} NX EX 30`，即锁的有效期为 30 秒。活动持续 10 分钟，结束后对账发现实际售出 107 件，超卖了 7 件。\n\n初步翻看应用日志，发现部分请求的处理耗时日志打出了超过 30 秒的记录：\n\n```\n2024-01-15 14:02:01.003 INFO  [flash-sale] acquire lock success, uuid=a1b2c3\n2024-01-15 14:02:01.004 INFO  [flash-sale] start deduct inventory\n2024-01-15 14:02:33.187 INFO  [flash-sale] deduct inventory success, cost=32183ms\n2024-01-15 14:02:33.188 INFO  [flash-sale] release lock, result=0  ← 注意这里 result=0 说明 unlock 失败了\n```\n\n`result=0` 说明 Redis DEL 命令没有删掉任何 key，也就是锁在业务完成之前就已经过期消失了。请分析这次超卖的根本原因，描述完整的排查步骤，并给出修复和预防方案。",
+      "answer": "## 第一步：理解分布式锁的本质与它的固有脆弱性\n\n在进入排查之前，需要先对分布式锁的工作机制有清晰认知，否则你会把症状当成根因。\n\n分布式锁本质上是一个「互斥信号量」，存在于共享介质（Redis、Zookeeper、数据库）中，多个进程通过争抢这个信号量来保证同一时刻只有一个进程执行临界区代码。Redis 的实现方式是把锁存储为一个 key，`SET key value NX EX ttl` 的原子性保证了「检查并设置」不会出现竞态。\n\n这个方案的核心前提是：**锁的有效期必须大于业务的最大执行时间**。一旦这个前提被打破，锁的互斥保证就失效了。30 秒的 EX 不是一个随意的数字，它应该是基于对业务 P99 甚至 P99.9 执行时间的充分评估得出的，然后再乘以一个安全倍数。很多团队在设置这个值时凭经验拍脑袋，「库存扣减应该很快，30 秒够了吧」——这就是事故的起点。\n\n分布式锁的使用分三步：获取锁（SET NX EX）、执行业务、释放锁（Lua 脚本保证 GET + DEL 的原子性）。其中最容易被忽视的就是第三步：释放锁时必须先验证锁的 value 是否仍然是自己设置的 UUID，如果不是，说明锁已经过期并被别人重新获取，这时候不能盲目 DEL，否则会把别人的锁给释放掉。日志中 `result=0` 就是这个 Lua 脚本发现锁 key 已不存在（或 value 不匹配）而返回的。\n\n## 第二步：复现超卖的完整时序，确认根因\n\n光看日志只知道「锁过期了」，要真正理解超卖是怎么发生的，需要把时序图画出来：\n\n```\nTimeline（简化，忽略网络延迟）\n\nT=0s:   进程 A  → SET lock NX EX 30，成功，获得锁，UUID=a1b2c3\nT=0.1s: 进程 A  → 开始执行：查库存 → 扣减 → 写订单\nT=28s:  进程 A  → 仍在等待数据库慢查询返回（此时库存还未扣减）\nT=30s:  Redis   → 锁 key TTL 归零，自动删除\nT=30.1s:进程 B  → SET lock NX EX 30，成功，获得锁，UUID=d4e5f6\nT=30.2s:进程 B  → 开始执行：查库存（此时库存=1，A 未扣减）→ 准备扣减\nT=32s:  进程 A  → 数据库返回，扣减库存成功（库存变为 0）\nT=32.1s:进程 A  → GET lock → value=d4e5f6 ≠ a1b2c3，Lua 脚本返回 0，unlock 失败\nT=33s:  进程 B  → 扣减库存（库存已经是 0，如果没有防护直接变 -1）→ 超卖！\n```\n\n这个时序说明了一个关键点：**超卖不是一次事件，而是两个进程同时持有「合法的锁」时各自执行了一次扣减**。进程 A 的锁在业务完成前过期，进程 B 拿到了新锁，但进程 A 并不知道自己已经「越权」执行。\n\n## 第三步：系统性排查——找出耗时超 30 秒的真正原因\n\n知道是锁过期导致的超卖之后，下一步是搞清楚为什么业务会跑超 30 秒。这不是一个简单的答案，需要从多个维度排查。\n\n**1. 确认超卖数量和时间段**\n\n先用 SQL 把超卖的具体情况量化出来，这能帮你判断问题的严重程度和持续时间：\n\n```sql\n-- 查看活动期间的实际成交量，与库存限制 100 对比\nSELECT\n  COUNT(*)                     AS total_orders,\n  MIN(created_at)              AS first_order_time,\n  MAX(created_at)              AS last_order_time,\n  MIN(created_at) + INTERVAL 30 SECOND AS lock_expire_window\nFROM orders\nWHERE activity_id = 'flash-sale-001'\n  AND status NOT IN ('cancelled', 'refunded');\n\n-- 查找库存为负的时间点（如果表里有库存快照）\nSELECT snapshot_time, stock_remaining\nFROM inventory_snapshots\nWHERE product_id = 'product-001'\n  AND snapshot_time BETWEEN '2024-01-15 14:00:00' AND '2024-01-15 14:10:00'\nORDER BY snapshot_time;\n```\n\n如果发现超卖集中在活动的某几秒内，说明是突发性的慢请求导致的，而不是系统性问题。\n\n**2. 从应用日志找慢请求**\n\n应用日志一般会记录请求的总耗时。把耗时超过 30 秒的请求全部捞出来：\n\n```bash\n# 假设日志格式：时间 级别 [模块] 消息 cost=Xms\ngrep 'flash-sale-001' /var/log/app/application.log \\\n  | grep 'deduct inventory success' \\\n  | awk -F'cost=' '{print $2}' \\\n  | sort -n \\\n  | awk 'END{print \"max=\"$0\"ms\"}'\n\n# 找出所有耗时 > 30000ms 的请求的 UUID（用于关联其他日志）\ngrep 'flash-sale-001' /var/log/app/application.log \\\n  | grep -E 'cost=[3-9][0-9]{4}|cost=[0-9]{6}' \\\n  | grep -oP 'uuid=[a-z0-9]+' \\\n  | sort -u\n```\n\n拿到这些 UUID 之后，去查这些请求在执行期间都做了什么，哪一步卡住了。\n\n**3. 数据库慢查询日志**\n\n在大多数秒杀场景下，罪魁祸首是数据库慢查询。并发量一上来，行锁竞争激烈，一个 `UPDATE inventory SET stock = stock - 1 WHERE product_id = ?` 可能因为等锁而阻塞几十秒：\n\n```sql\n-- MySQL 慢查询日志（需要开启 slow_query_log）\nSELECT\n  sql_text,\n  query_time,\n  lock_time,\n  rows_examined,\n  start_time\nFROM mysql.slow_log\nWHERE start_time BETWEEN '2024-01-15 14:00:00' AND '2024-01-15 14:10:00'\n  AND query_time > 10\nORDER BY query_time DESC\nLIMIT 20;\n\n-- 或者直接看 information_schema（活跃连接）\nSELECT\n  id, time, state, info\nFROM information_schema.processlist\nWHERE command != 'Sleep'\n  AND time > 5\nORDER BY time DESC;\n```\n\n如果 `lock_time` 非常大（接近 `query_time`），说明是在等行锁，不是查询本身慢。这种情况下需要排查是否有长事务没有提交，导致行锁一直被持有。\n\n**4. JVM GC 停顿（Java 服务）**\n\nStop-The-World GC 会冻结所有应用线程，包括正在持有分布式锁的线程。在高并发场景下，如果老年代内存不足，Full GC 可能持续几秒甚至几十秒：\n\n```bash\n# 查看 GC 日志中的 STW 停顿时间\ngrep -E 'GC pause|Pause Full' /var/log/app/gc.log \\\n  | awk '{print $NF}' \\\n  | sort -rn \\\n  | head -10\n\n# 找出活动期间的 GC 事件\ngrep '2024-01-15T14:0[0-9]' /var/log/app/gc.log \\\n  | grep -E 'Pause|pause'\n\n# 典型的 G1 GC 输出\n# [2024-01-15T14:02:28.001+0800] GC(42) Pause Full (Ergonomics) 8192M->5120M(10240M) 28.453s\n# ↑ 这里 28.453s 的 Full GC 直接导致了锁过期\n```\n\n如果找到了几十秒的 Full GC，基本可以确认根因。接下来要排查是堆内存配置不合理、内存泄漏，还是 JVM 参数问题。\n\n**5. 外部 HTTP 依赖超时**\n\n有些库存扣减流程会调用外部风控服务、积分服务等。如果这些依赖没有设置合理的超时，一次网络故障可能导致业务线程阻塞数分钟：\n\n```bash\n# 查看 HTTP 客户端的超时配置\ngrep -r 'connectTimeout\\|readTimeout\\|callTimeout' src/\n\n# 在日志里找 HTTP 调用耗时异常的记录\ngrep 'HttpClient\\|RestTemplate\\|OkHttp' /var/log/app/application.log \\\n  | grep -E 'timeout|timed out|connection refused'\n```\n\n## 第四步：修复方案——从根本上消除锁过期问题\n\n排查完根因之后，修复分为两个层面：一是解决锁过期本身，二是增加数据库层面的兜底保护。\n\n**方案一：Redisson 看门狗机制（强烈推荐）**\n\nRedisson 的 `lock.lock()` 不带 leaseTime 参数时，会启动一个「看门狗」（Watchdog）后台线程，默认每 10 秒检查一次锁是否还被当前线程持有，如果是，就把 TTL 续到 30 秒。这样只要业务线程还在跑，锁就不会过期：\n\n```java\nRLock lock = redissonClient.getLock(\"flash-sale:product-001\");\n// 不指定 leaseTime，看门狗自动续期\nlock.lock();\ntry {\n    // 执行库存查询、扣减、订单写入，不用担心锁过期\n    int stock = inventoryMapper.selectStockForUpdate(productId);\n    if (stock <= 0) {\n        throw new OutOfStockException();\n    }\n    inventoryMapper.deductStock(productId);\n    orderService.createOrder(userId, productId);\n} finally {\n    // 业务完成后主动释放，看门狗线程随即停止续期\n    if (lock.isHeldByCurrentThread()) {\n        lock.unlock();\n    }\n}\n```\n\n看门狗的实现原理是：`lock.lock()` 成功后，Redisson 会向 Redis 发送一段 Lua 脚本，同时在 JVM 内部启动一个 `HashedWheelTimer` 定时任务。这个任务每隔 `lockWatchdogTimeout / 3`（默认 10 秒）执行一次续期 Lua 脚本。当 `lock.unlock()` 被调用时，续期任务被取消。整个过程对业务代码完全透明。\n\n需要注意的是，看门狗只在**非** leaseTime 模式下生效。如果你写 `lock.lock(60, TimeUnit.SECONDS)`，Redisson 不会启动看门狗，60 秒到了锁就过期。这是一个常见的误用。\n\n**方案二：数据库乐观锁兜底（必须有）**\n\n不管分布式锁多可靠，数据库层面都应该有兜底保护，防止任何情况下库存变为负数。乐观锁通过版本号保证「读到的版本和写时的版本一致」：\n\n```sql\n-- 查询时带上版本号\nSELECT stock, version FROM inventory WHERE product_id = ? FOR UPDATE;\n\n-- 更新时检查版本号，同时保证 stock > 0\nUPDATE inventory\nSET stock = stock - 1, version = version + 1\nWHERE product_id = ?\n  AND stock > 0          -- 防止负库存\n  AND version = ?;       -- 乐观锁检查\n\n-- 如果 affected rows = 0，说明被并发修改了，回滚并返回失败\n```\n\n或者更简单的方式，直接在 MySQL 字段上加约束（需要 MySQL 8.0+）：\n\n```sql\nALTER TABLE inventory ADD CONSTRAINT chk_stock_non_negative CHECK (stock >= 0);\n```\n\n这样即使分布式锁完全失效，数据库也会拒绝让库存变成负数，插入会抛出约束违反异常，业务层捕获后返回「库存不足」。\n\n**方案三：释放锁时做业务合法性校验**\n\n在分布式锁释放之前，加一个检查：如果锁已经不是自己的了（TTL 归零或被重新获取），说明业务可能在「无锁」状态下执行完成，这时候应该触发回滚而不是静默成功：\n\n```go\nfunc deductInventoryWithLock(ctx context.Context, productID string) error {\n    lockKey := \"lock:flash-sale:\" + productID\n    uuid := generateUUID()\n\n    // 加锁\n    ok, _ := redis.SetNX(ctx, lockKey, uuid, 30*time.Second)\n    if !ok {\n        return ErrLockConflict\n    }\n\n    // 业务执行\n    if err := doDeductInventory(ctx, productID); err != nil {\n        return err\n    }\n\n    // 释放前验证锁还是自己的\n    val, _ := redis.Get(ctx, lockKey)\n    if val != uuid {\n        // 锁已经过期，业务在「无锁」状态下完成了，可能存在并发写\n        log.Error(\"lock expired during business execution, need manual check\", \n            \"product_id\", productID, \"uuid\", uuid)\n        // 触发补偿：检查库存是否合法，如果超卖则回滚订单\n        return compensate(ctx, productID)\n    }\n\n    // 原子释放\n    return releaseLock(ctx, lockKey, uuid)\n}\n```\n\n这个方案不能彻底解决并发问题（因为还是存在窗口期），但能在事后立刻发现异常并触发补偿，减少超卖的数量。\n\n## 第五步：体系化预防——监控和架构层面的根治\n\n**合理设置锁超时**：在上线前对业务的执行时间做压测，找出 P99.9 耗时，然后把锁超时设为这个值的 3 到 5 倍。如果 P99.9 是 5 秒，锁超时设 30 秒是合理的；如果有数据库慢查询导致偶发 20 秒，30 秒就不够了。或者干脆用 Redisson 看门狗，让锁的持有时间动态跟随业务执行时间。\n\n**锁持有时间分布监控**：在每次 unlock 时记录锁持有时长，并推送到 Prometheus：\n\n```java\n// 在 unlock 时记录耗时\nlong holdTimeMs = System.currentTimeMillis() - lockAcquireTime;\nlockHoldTimeHistogram\n    .labels(\"flash-sale\", productId)\n    .observe(holdTimeMs / 1000.0);\n\n// 告警规则：P99 持有时间 > 锁超时的 50% 就告警\n// PromQL:\nhistogram_quantile(0.99, rate(lock_hold_time_seconds_bucket{activity=\"flash-sale\"}[5m]))\n  > (lock_expire_seconds * 0.5)\n```\n\n这样在下次活动出现慢请求时，告警会在超卖发生之前就触发，给你时间扩容数据库或调大锁超时。\n\n**JVM GC 优化**：如果是 Java 服务，Full GC 是导致长时间 STW 的最常见原因。优先使用 G1 或 ZGC，配置合适的堆大小，避免老年代占满触发 Full GC。对于极端低延迟要求的场景，ZGC 的 STW 通常在 1ms 以内，基本不会导致锁过期。\n\n**外部依赖超时治理**：所有外部 HTTP 调用、RPC 调用都必须设置超时，建议连接超时 1 秒、读超时 3-5 秒，并做熔断降级。让任何单个下游依赖的故障都不影响主流程的执行时间。\n\n**幂等性设计**：即使以上所有措施都到位，分布式系统中的「至少一次执行」是无法完全避免的。库存扣减操作必须是幂等的：同一个订单号只能扣减一次库存，通过数据库唯一索引保证。这是终极兜底，让「重复执行」变成「安全的重复执行」。",
+      "keyPoints": [
+        "分布式锁过期的根本触发条件是业务实际执行时间超过了锁的 TTL，常见原因包括数据库行锁竞争导致的慢查询、JVM Full GC 的 STW 停顿、外部 HTTP 依赖超时、以及高并发下线程排队等待 CPU 时间片。",
+        "日志中 `release lock result=0` 是关键告警信号，说明 Lua 脚本执行 GET+DEL 时发现 key 的 value 与自身 UUID 不匹配，锁在业务完成之前已被 Redis 自动清除并可能被其他进程重新获取。",
+        "超卖的本质是锁的互斥保证被打破后，两个进程都以为自己持有合法锁并各自完成了库存扣减，时序图分析显示两次扣减可能相差仅几秒，但都基于相同的「库存 > 0」快照做出决策。",
+        "Redisson 看门狗（Watchdog）机制通过每 `lockWatchdogTimeout/3` 秒（默认 10 秒）执行一次续期 Lua 脚本，使锁的有效期动态跟随业务执行时间，是解决锁过期问题最优雅的方案；但只在不指定 leaseTime 时才会启动，这是极常见的误用陷阱。",
+        "数据库乐观锁（`UPDATE ... WHERE stock > 0 AND version = ?`）或 CHECK 约束（`CHECK (stock >= 0)`）是防止超卖的最终兜底，即使分布式锁完全失效，数据库层面也能拒绝非法的库存扣减操作。",
+        "释放锁时必须用 Lua 脚本原子执行「GET + 验证 UUID + DEL」三步，单独的 DEL 命令可能在锁已过期并被他人重新获取后，误删他人的锁，引发锁「穿透」问题。",
+        "预防体系要从三个维度建立：合理评估并设置锁 TTL（P99.9 耗时的 3-5 倍或使用看门狗）、监控锁持有时间分布并在 P99 > 50% TTL 时告警、以及保证库存扣减操作的幂等性（同一订单号唯一索引）。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz1",
+          "question": "以下哪种情况会导致 Redis SET NX EX 实现的分布式锁失效，进而引发并发安全问题？",
+          "choices": [
+            { "id": "A", "text": "业务处理时间超过锁的 EX 时间，导致锁自动过期后被其他进程获取" },
+            { "id": "B", "text": "Redis 主节点在锁未过期时发生主从切换，新主节点尚未同步该锁" },
+            { "id": "C", "text": "在 Redis Cluster 模式下，锁 key 所在的 slot 发生了节点迁移" },
+            { "id": "D", "text": "以上三种情况都可能导致分布式锁失效" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "A 是本题的核心场景：业务执行超时，锁 TTL 归零后被清除，其他进程获得锁并开始执行，导致并发安全问题。B 也是真实的坑：Redis 主从复制是异步的，主节点宕机时从节点可能还没有收到 SET NX 的写操作，新主节点上该锁 key 不存在，其他进程可以获取，产生「幽灵锁」问题，这是 RedLock 算法诞生的背景。C 在 Cluster 模式下也会发生：slot 迁移期间存在短暂窗口，同一个 key 可能在源节点和目标节点都能被获取。三种失效场景都是生产中真实存在的，面试时能说出 B 和 C 会让面试官眼前一亮。"
+        },
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz2",
+          "question": "排查超卖问题时，日志中出现 `release lock result=0`，这个 result=0 最准确的含义是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis DEL 命令执行失败，可能是 Redis 网络故障" },
+            { "id": "B", "text": "Lua 脚本中 GET 到的 value 与当前进程的 UUID 不匹配，脚本未执行 DEL 并返回 0" },
+            { "id": "C", "text": "锁 key 不存在，DEL 命令返回删除了 0 个 key" },
+            { "id": "D", "text": "B 和 C 都有可能" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "标准的分布式锁释放 Lua 脚本逻辑是：`if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end`。返回 0 有两种情况：一是 GET 拿到的 value 与 ARGV[1]（自己的 UUID）不同，说明锁已被别的进程重新获取，脚本安全地跳过了 DEL；二是 GET 返回 nil（key 不存在），因为 nil ~= ARGV[1] 为 true，同样走 else 返回 0。在本题的超卖场景中，第二种情况更常见：锁在 T=30s 时因 TTL 归零而消失，进程 A 在 T=32s 执行 unlock 时 key 已不存在，所以 result=0。两种情况本质上都说明锁在业务完成前就已经不属于自己了，需要触发告警和补偿。"
+        },
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz3",
+          "question": "Redisson 看门狗（Watchdog）机制在哪种情况下不会自动续期？",
+          "choices": [
+            { "id": "A", "text": "业务线程抛出了未捕获的异常" },
+            { "id": "B", "text": "调用了 lock.lock(60, TimeUnit.SECONDS) 指定了 leaseTime" },
+            { "id": "C", "text": "Redis 连接发生了短暂的网络抖动（<5s）" },
+            { "id": "D", "text": "当前进程的 CPU 使用率超过 80%" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redisson 看门狗只在 leaseTime 为 -1 时启动，即调用 `lock.lock()` 不带任何参数。一旦指定了 leaseTime（如 `lock.lock(60, TimeUnit.SECONDS)`），Redisson 认为业务方明确声明了最大持锁时间，不会启动看门狗，锁在 60 秒后无论业务是否完成都会过期。这是使用 Redisson 时最常见的误用之一：以为设了更长的 leaseTime 就安全了，但其实看门狗并没有启动，只是把「不够用的 30 秒」换成了「可能还是不够用的 60 秒」。正确做法是不带 leaseTime 让看门狗自动管理，或者自己实现续期逻辑。A 选项错误，即使业务线程抛异常，Redisson 的 `unlock()` 一般在 finally 块中调用，unlock 时看门狗会停止。"
+        },
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz4",
+          "question": "在 Java 服务中，哪种 JVM GC 配置最不容易导致长时间 STW 停顿进而引发分布式锁过期？",
+          "choices": [
+            { "id": "A", "text": "Serial GC，单线程收集，配置 -Xmx4g -Xms4g" },
+            { "id": "B", "text": "CMS GC，并发标记，配置 -XX:+UseConcMarkSweepGC" },
+            { "id": "C", "text": "ZGC，亚毫秒级 STW，配置 -XX:+UseZGC" },
+            { "id": "D", "text": "G1 GC，配置 -XX:+UseG1GC -XX:MaxGCPauseMillis=200" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "ZGC 是 JDK 15 正式 GA 的低延迟垃圾收集器，其 STW 停顿时间通常在 1ms 以内（不随堆大小增长），几乎不可能导致分布式锁过期。Serial GC（A）是单线程收集，面对几 GB 的堆会产生秒级 STW，在生产环境中是禁忌。CMS GC（B）的 concurrent mode failure 会触发退化为 Serial Old GC，产生极长的 STW，历史上是很多分布式锁过期事故的元凶。G1 GC（D）的 MaxGCPauseMillis=200 是目标值不是保证值，Mixed GC 阶段依然可能超过这个值，而且 Full GC 回退时停顿可能高达数十秒。对于分布式锁敏感的服务，从 JDK 17 开始建议默认使用 ZGC。"
+        },
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz5",
+          "question": "以下 MySQL 查询在高并发秒杀场景中最可能导致应用端分布式锁超时的是哪条？",
+          "choices": [
+            { "id": "A", "text": "SELECT stock FROM inventory WHERE product_id = 'p001'" },
+            { "id": "B", "text": "UPDATE inventory SET stock = stock - 1 WHERE product_id = 'p001' AND stock > 0" },
+            { "id": "C", "text": "INSERT INTO orders (user_id, product_id) VALUES (?, ?)" },
+            { "id": "D", "text": "SELECT COUNT(*) FROM orders WHERE activity_id = 'flash-sale-001'" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "UPDATE 语句会在 InnoDB 的 `inventory` 表的 `product_id='p001'` 行上加排他行锁（X lock）。在 1000 个请求并发打过来的瞬间，这 1000 个线程都需要依次获取同一行的行锁，形成严重的锁竞争队列。排在后面的线程可能需要等待数十秒才能获取到行锁，加上应用层还有分布式锁，实际上是「双重锁竞争」。这是为什么秒杀架构通常会使用 Redis 原子操作（DECR）做库存预扣减，把扣减操作从 MySQL 移到内存中，再异步落库的原因。A 选项是普通读，不加锁（除非加 FOR UPDATE）。C 和 D 也可能慢，但通常不会慢到导致分布式锁过期的程度。"
+        },
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz6",
+          "question": "以下释放分布式锁的代码有什么问题？\n\n```java\n// 错误写法\nString lockValue = redis.get(lockKey);\nif (myUUID.equals(lockValue)) {\n    redis.del(lockKey);  // 非原子操作\n}\n```",
+          "choices": [
+            { "id": "A", "text": "GET 和 DEL 之间存在竞态窗口：GET 之后、DEL 之前，锁可能恰好过期并被进程 B 重新获取，DEL 会误删进程 B 的锁" },
+            { "id": "B", "text": "redis.get() 没有处理 null 的情况，lockValue 为 null 时调用 equals 会 NPE" },
+            { "id": "C", "text": "应该用 redis.expire() 而不是 redis.del() 来释放锁" },
+            { "id": "D", "text": "UUID 不够安全，应该用更长的随机字符串" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是经典的「TOCTOU」（Time-of-Check-Time-of-Use）竞态条件。GET 验证通过之后、DEL 执行之前，锁的 TTL 恰好归零，Redis 自动删除了 key，然后进程 B 执行 SET NX 成功获取到了锁。此时进程 A 的 DEL 执行，删掉的是进程 B 刚刚设置的锁，进程 B 就在不知情的情况下失去了锁保护。正确做法是用 Lua 脚本把 GET+条件判断+DEL 合并为一个原子操作：`if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end`，Lua 脚本在 Redis 中是原子执行的，不会被其他命令插入。B 是小问题但不是核心。C 和 D 完全错误。"
+        },
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz7",
+          "question": "RedLock 算法使用多个独立的 Redis 节点来提升分布式锁的可靠性，它要求客户端在多数节点（N/2+1）加锁成功才认为获锁成功。以下关于 RedLock 的描述哪个是正确的？",
+          "choices": [
+            { "id": "A", "text": "RedLock 完全解决了主从切换导致锁丢失的问题，是生产环境的标准推荐方案" },
+            { "id": "B", "text": "RedLock 在时钟漂移和 NTP 跳变的情况下可能出现两个客户端同时持有锁的问题" },
+            { "id": "C", "text": "使用 5 个 Redis 节点的 RedLock，允许最多 3 个节点故障" },
+            { "id": "D", "text": "RedLock 的性能与单节点 Redis 锁相当，没有额外开销" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "RedLock 的设计存在争议。Martin Kleppmann 在 2016 年发表了著名的批评文章，指出 RedLock 在以下场景下仍不安全：如果某个节点的系统时钟发生跳变（NTP 校时或时钟漂移），可能导致锁提前过期；或者进程发生 GC 停顿，导致「获锁成功」到「使用锁」之间的时间超过了锁的剩余 TTL。换句话说，RedLock 假设时间是可靠的，但在分布式系统中时间并不可靠。A 错误，RedLock 本身就不是官方推荐的「银弹」，Antirez 和 Kleppmann 有公开的学术辩论。C 错误，5 个节点的 RedLock 只允许 2 个节点故障（需要 3 个节点加锁成功）。D 错误，RedLock 需要向多个节点顺序或并发发送命令，有额外的网络开销。"
+        },
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz8",
+          "question": "假设秒杀服务的库存扣减平均耗时 200ms，P99 耗时 8 秒，偶发 P99.9 耗时 35 秒（原因是数据库慢查询）。不修改业务逻辑的前提下，以下哪种锁策略最合适？",
+          "choices": [
+            { "id": "A", "text": "SET NX EX 10，覆盖 P99 的 8 秒并留有余量" },
+            { "id": "B", "text": "SET NX EX 120，远超 P99.9 的 35 秒，确保绝不过期" },
+            { "id": "C", "text": "Redisson lock() 不带 leaseTime，启用看门狗自动续期，同时修复数据库慢查询" },
+            { "id": "D", "text": "SET NX EX 3600，设置超大超时时间，确保任何情况下都不过期" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "A 选项的 10 秒覆盖不了 P99.9 的 35 秒，超卖问题依然存在。B 选项的 120 秒超时过长，一旦持锁进程崩溃，后续所有请求都需要等待 120 秒才能重新获锁，在秒杀这种高并发场景下这是不可接受的。D 选项的 3600 秒同理，且会让系统在异常时完全不可用。C 是最佳答案：看门狗让锁的持有时间动态匹配业务执行时间，不会因业务慢就过期，也不会因为设了超大 TTL 而在进程崩溃时长时间阻塞后续请求（Redisson 在进程崩溃时，看门狗任务随 JVM 消亡，锁在 30 秒的默认 TTL 后自动释放）。同时还应该修复数据库慢查询，让 P99.9 回到合理范围，看门狗是保险而不是替代优化的理由。"
+        },
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz9",
+          "question": "在超卖复盘中发现：进程 A 完成库存扣减后，数据库的 `stock` 字段变成了 -6（而不是 0）。这说明什么？",
+          "choices": [
+            { "id": "A", "text": "数据库没有 CHECK 约束，且 UPDATE 语句没有 AND stock > 0 的条件，导致多次并发扣减累积" },
+            { "id": "B", "text": "分布式锁完全没有起作用，100 个请求同时执行了扣减" },
+            { "id": "C", "text": "这是正常现象，秒杀活动总是会有少量超卖" },
+            { "id": "D", "text": "MySQL 的事务隔离级别不够高，应该换成 SERIALIZABLE" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "stock=-6 说明有 7 次扣减在「库存为 0 或负数」的情况下依然成功执行了。如果 UPDATE 语句加了 `AND stock > 0` 条件，那么在 stock 变为 0 之后所有后续的扣减都会影响 0 行（affected rows=0），应用层检测到 affected rows=0 就会返回「库存不足」，不会出现负数。stock=-6 说明 UPDATE 语句就是简单的 `SET stock = stock - 1 WHERE product_id = ?`，没有非负检查，7 次并发扣减都成功了。B 选项不对，分布式锁起到了部分作用，只是在锁过期后有 7 次并发逃出了保护窗口，并不是 100 次同时执行。C 完全错误，超卖是需要被彻底消除的 bug。D 选项 SERIALIZABLE 级别会让并发性能极差，且不能解决分布式锁过期后的并发问题。"
+        },
+        {
+          "id": "ds-dist-lock-expiry-debug-q1-quiz10",
+          "question": "以下哪条 Prometheus 告警规则能最有效地在「分布式锁即将过期」问题大规模爆发之前提前预警？",
+          "choices": [
+            { "id": "A", "text": "alert: LockAcquireFailure，条件：lock_acquire_failures_total > 10" },
+            { "id": "B", "text": "alert: LockHoldTimeHigh，条件：histogram_quantile(0.99, lock_hold_time_seconds_bucket) > lock_expire_seconds * 0.5" },
+            { "id": "C", "text": "alert: InventoryNegative，条件：inventory_stock_remaining < 0" },
+            { "id": "D", "text": "alert: OrderCountExceedsLimit，条件：orders_total > inventory_limit" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 是最有预见性的告警规则。它监控的是「锁持有时间的 P99 是否接近锁的过期时间」，当 P99 锁持有时间超过锁超时的 50% 时就告警，说明系统中已经有请求开始变慢，如果趋势持续下去就会发生锁过期。这是一个「前置预警」，在超卖发生之前就能触发。A 选项的获锁失败是正常的并发现象，高并发时总会有请求抢不到锁，这个指标噪音太大。C 和 D 是「事后检测」：库存变负或订单超限时损失已经发生了。好的告警体系应该尽量在问题真正发生之前发出信号，给工程师处置时间；B 选项体现了这种「阈值提前」的思路，是 SRE 工程实践中的黄金法则。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Redisson 官方文档：分布式锁与同步器",
+          "url": "https://redisson.org/docs/data-and-services/locks-and-synchronizers/"
+        },
+        {
+          "title": "Martin Kleppmann：How to do distributed locking",
+          "url": "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"
+        },
+        {
+          "title": "Redis 官方文档：Distributed Locks with Redis",
+          "url": "https://redis.io/docs/latest/develop/use/patterns/distributed-locks/"
+        },
+        {
+          "title": "Antirez：Is Redlock safe?（对 Kleppmann 批评的回应）",
+          "url": "http://antirez.com/news/101"
+        }
+      ]
+    }
+  ]
+}

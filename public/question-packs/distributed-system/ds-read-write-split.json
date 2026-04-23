@@ -1,0 +1,158 @@
+{
+  "id": "ds-read-write-split",
+  "name": "读写分离实践与主从延迟处理",
+  "domain": "distributed-system",
+  "description": "讲解读写分离的架构设计、中间件实现及主从延迟导致读到旧数据的解决方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-read-write-split-q1",
+      "domain": "distributed-system",
+      "type": "practice",
+      "difficulty": 2,
+      "tags": ["读写分离", "主从延迟", "ShardingSphere", "ProxySQL", "MySQL", "一致性", "binlog", "半同步复制"],
+      "title": "读写分离的原理与实现方案是什么？如何处理主从延迟问题？",
+      "content": "你负责一个电商平台的商品详情服务，随着业务增长，MySQL 单节点在大促期间已经撑不住了。监控显示读 QPS 在 8000 左右，写 QPS 只有约 1200，CPU 持续跑在 85% 以上，慢查询日志里出现了大量 SELECT 超过 500ms 的记录。\n\n架构师决定引入读写分离，给主库减压。但开发同学马上提出了一个实际问题：「用户刚下单成功，点刷新页面却看到订单状态还是『未提交』，客服电话立刻就打进来了。」\n\n这个问题在业界有个专有名词，叫「读到旧数据（stale read）」，是主从延迟的直接体现。\n\n请回答：\n1. 读写分离的核心原理是什么？\n2. 有哪些落地实现方案，各有什么优缺点？\n3. 针对主从延迟导致的 stale read 问题，有哪些解决策略？生产环境中你会怎么选？",
+      "answer": "## 读写分离的动机与核心原理\n\n先说一个很实际的数字：在典型的互联网业务里，读写比例通常是 8:2 甚至 9:1。用户浏览商品、查看订单、刷动态，这些都是读操作；而真正的写操作——下单、支付、发帖——相对稀少。问题在于，传统的单主库架构里，所有读写都打到同一个节点，8 成的读请求和 2 成的写请求竞争同样的 CPU、内存、磁盘 I/O，这是一种严重的资源浪费，也是性能瓶颈的根源。\n\n读写分离的核心思路非常直接：**写操作走主库（Primary/Master），读操作走从库（Replica/Slave）**。主库负责处理所有数据变更，并通过 MySQL 的 binlog（二进制日志）机制把变更事件异步复制到一个或多个从库。从库不断回放这些 binlog 事件，最终和主库保持数据一致。这样一来，原本全压在主库上的读流量就被分散到了从库集群，主库得以专注处理写操作。\n\n要理解读写分离的完整工作流程，得先搞清楚 MySQL 的主从复制机制。主库在执行写操作时，会把每一条变更记录写入 binlog（二进制日志）。从库上有一个 IO 线程，它建立到主库的长连接，持续拉取新的 binlog 事件并写入本地的 relay log（中继日志）。另一个 SQL 线程则负责读取 relay log 并回放到从库的存储引擎中。整个过程是异步的——主库提交事务后不等从库确认，这意味着**从库的数据始终可能落后于主库一些时间**，这就是主从延迟的本质来源。\n\n## 实现方案：从应用层到中间件层\n\n### 方案一：应用层硬编码（最简单，也最粗暴）\n\n最直接的做法是在应用代码里维护两个数据源，根据 SQL 的类型手动决定路由：\n\n```go\n// 维护两个连接池\ntype DB struct {\n    primary *sql.DB  // 主库：处理写操作\n    replica *sql.DB  // 从库：处理读操作\n}\n\n// 根据 SQL 前缀判断是否为只读操作\nfunc isReadOnly(query string) bool {\n    upper := strings.ToUpper(strings.TrimSpace(query))\n    return strings.HasPrefix(upper, \"SELECT\") ||\n           strings.HasPrefix(upper, \"SHOW\") ||\n           strings.HasPrefix(upper, \"EXPLAIN\")\n}\n\nfunc (db *DB) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {\n    // 从 context 中读取「强制走主库」标记\n    if forcePrimary, ok := ctx.Value(ctxKeyForcePrimary).(bool); ok && forcePrimary {\n        return db.primary.QueryContext(ctx, query, args...)\n    }\n    if isReadOnly(query) {\n        return db.replica.QueryContext(ctx, query, args...)\n    }\n    return db.primary.QueryContext(ctx, query, args...)\n}\n```\n\n这个方案的优点是透明可控，你能精确决定哪条查询走哪个库，甚至可以根据业务语义而非 SQL 类型来判断（比如「刚写完之后的读」强制走主库）。缺点也很明显：**代码侵入性强**，每个 DAO 层方法都要考虑路由逻辑，稍有不慎就会出现事务内的查询意外跑到从库的 bug（事务必须全程在同一个连接上执行，这一点很容易被忽视）。\n\n### 方案二：数据库中间件（生产推荐）\n\n生产环境里更成熟的做法是在应用和 MySQL 之间插入一个代理层，由代理解析 SQL、做路由决策，应用感知不到读写分离的存在，只需连接到代理的端口即可。\n\n**ProxySQL** 是目前最流行的 MySQL 代理之一。它工作在 MySQL 协议层，能解析每一条 SQL，根据可配置的规则决定路由到哪个 hostgroup（主机组）。配置读写分离的核心是 `mysql_query_rules` 表：\n\n```sql\n-- 连接到 ProxySQL 管理端口（默认 6032）\n-- 规则 1：SELECT 语句路由到 hostgroup 2（从库组）\nINSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply)\nVALUES (1, 1, '^SELECT', 2, 1);\n\n-- 规则 2：SELECT ... FOR UPDATE 是加锁读，必须走主库\nINSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply)\nVALUES (2, 1, '^SELECT.*FOR UPDATE', 1, 1);\n\n-- 规则 3：其他所有语句（INSERT/UPDATE/DELETE/DDL）走主库（hostgroup 1）\nINSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply)\nVALUES (100, 1, '.*', 1, 1);\n\n-- 规则按 rule_id 从小到大匹配，匹配到 apply=1 的规则后立即停止\nLOAD MYSQL QUERY RULES TO RUNTIME;\nSAVE MYSQL QUERY RULES TO DISK;\n```\n\nProxySQL 还内置了连接池复用、后端健康检查、自动剔除异常节点等功能，是一个相当成熟的方案。唯一的代价是多了一个网络跳转，通常会引入 0.1-0.3ms 的额外延迟，对于大多数业务来说完全可以接受。\n\n**ShardingSphere-Proxy** 是另一个常见选择，尤其是在需要同时做读写分离和分库分表的场景里。它的配置通过 YAML 声明：\n\n```yaml\n# config-readwrite-splitting.yaml\nrules:\n  - !READWRITE_SPLITTING\n    dataSources:\n      readwrite_ds:\n        staticStrategy:\n          writeDataSourceName: primary_ds      # 主库\n          readDataSourceNames:\n            - replica_ds_0                     # 从库 0\n            - replica_ds_1                     # 从库 1\n          loadBalancerName: round_robin        # 从库间轮询负载均衡\n    loadBalancers:\n      round_robin:\n        type: ROUND_ROBIN\n```\n\nShardingSphere 的优势在于生态完整，读写分离、分库分表、数据加密可以无缝组合。缺点是配置复杂度比 ProxySQL 高一些，冷启动时间也更长。\n\n## 主从延迟的本质与量化\n\n在引入读写分离之后，主从延迟（replication lag）就成了必须正视的问题。从库上执行 `SHOW SLAVE STATUS\\G`，有几个关键指标值得关注：\n\n```\n-- 在从库执行\nSHOW SLAVE STATUS\\G\n\n*************************** 1. row ***************************\n             Slave_IO_Running: Yes           -- IO 线程是否在运行\n            Slave_SQL_Running: Yes           -- SQL 线程是否在运行\n       Seconds_Behind_Master: 3             -- 从库落后主库的秒数（最直观的延迟指标）\n         Relay_Log_Space: 1073741824        -- relay log 积压大小（超过 1GB 说明 SQL 线程跟不上）\n      Exec_Master_Log_Pos: 12345678        -- 从库已回放到的主库 binlog 位点\n```\n\n`Seconds_Behind_Master` 这个值是从库对比「当前时间」和「正在回放的 binlog 事件的时间戳」计算出来的。它有一个著名的陷阱：当从库的 SQL 线程暂停（比如维护窗口期间停止复制）然后重新启动时，这个值会从 0 突然跳到一个很大的数，然后随着追赶进度逐渐减小。所以不要把它当成实时延迟的精确度量，更好的做法是用 `pt-heartbeat` 之类的工具在主库写一个心跳时间戳，在从库读取并计算差值。\n\n## 主从延迟的解决策略\n\n### 策略一：写后读强制走主库（最常用）\n\n这是处理「用户刚写完立即读」场景的最直接方案。核心思路是：在一次写操作之后的短时间窗口内，把同一个用户的读请求也路由到主库，绕过从库。\n\n```go\n// 写操作完成后，在 context 中打上标记\nfunc (svc *OrderService) CreateOrder(ctx context.Context, order *Order) error {\n    if err := svc.db.ExecContext(ctx, insertSQL, order); err != nil {\n        return err\n    }\n    // 写完后的 5 秒内，同一个请求链路的读操作走主库\n    ctx = context.WithValue(ctx, ctxKeyForcePrimary, time.Now().Add(5*time.Second))\n    // 把这个 ctx 传递下去，后续的 QueryContext 会检查这个标记\n    return nil\n}\n```\n\n更实际的做法是把「强制读主库」的标记存到用户的 Session 里（比如 Redis 里的 `user:{uid}:read_primary`，TTL 设为 5 秒），这样即便是跨请求的连续读（用户下单后跳转到订单列表页）也能正确走主库。\n\nProxySQL 对这个模式有内建支持：在同一个数据库 session 连接内，如果检测到 `COMMIT`（事务结束），后续的读在可配置的毫秒数内会被路由到主库。这个行为通过 `mysql-default_query_delay` 和 session track 机制来实现，不需要改一行应用代码。\n\n### 策略二：半同步复制（Semi-Synchronous Replication）\n\n异步复制是主从延迟的根源，那把它改成同步的呢？MySQL 5.5 引入的半同步复制是一个折中方案：主库在提交事务时，会**等待至少一个从库确认已把 binlog 写入自己的 relay log**，才向客户端返回成功。\n\n```sql\n-- 在主库开启半同步\nINSTALL PLUGIN rpl_semi_sync_master SONAME 'semisync_master.so';\nSET GLOBAL rpl_semi_sync_master_enabled = 1;\n-- 等待超时时间，超时后自动降级为异步复制\nSET GLOBAL rpl_semi_sync_master_timeout = 1000; -- 1000ms\n\n-- 在从库开启半同步\nINSTALL PLUGIN rpl_semi_sync_slave SONAME 'semisync_slave.so';\nSET GLOBAL rpl_semi_sync_slave_enabled = 1;\n```\n\n注意「半同步」的意思：从库只确认「binlog 已写入 relay log」，不代表从库的 SQL 线程已经回放完毕。所以半同步复制能大幅降低数据丢失的风险（主库崩溃时确保至少一个从库有完整的 binlog），但并不能完全消除 stale read。真要消除，得用 MySQL Group Replication 的强一致模式，但那个写入延迟代价就很高了，一般电商业务受不了。\n\n### 策略三：等待从库追上后再读（精确但复杂）\n\nMySQL 5.7 引入了 `WAIT_FOR_EXECUTED_GTID_SET()` 函数。GTID（Global Transaction ID）是给每个事务分配的全局唯一 ID。写操作完成后，你拿到这个事务的 GTID，然后在从库查询前调用这个函数等待从库回放到这个 GTID：\n\n```sql\n-- 主库写完后，记录 GTID\n-- 假设写入事务的 GTID 是 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:100'\n\n-- 从库读之前，先等这个 GTID 被回放（最多等 1 秒）\nSELECT WAIT_FOR_EXECUTED_GTID_SET('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:100', 1);\n-- 返回 0 表示等到了，返回 1 表示超时\n\n-- 等到后再执行业务查询\nSELECT * FROM orders WHERE id = ?;\n```\n\nShardingSphere 5.x 的 `transaction_type=BASE` 模式对这个方案有封装，不需要应用层手动处理 GTID。这个策略的精确度最高，但实现复杂，而且每次读操作都有一个等待开销，不适合 QPS 极高的场景。\n\n### 策略四：读主库兜底（最稳健的降级策略）\n\n上面几个策略都有一定的实现成本。在工程里有时候最实用的做法反而最简单：**对于强一致性要求高的查询，直接走主库，从来不走从库**。比如「查询我的账户余额」「查询订单详情」这类场景，用户心理预期就是看到最新数据，这里走主库是完全合理的。只有「商品列表」「商品详情」这类对延迟不敏感的读请求，才分发到从库。\n\n这种「按业务语义路由」的策略比「按 SQL 类型路由」更精准，也更容易推理。在 ProxySQL 中可以用 `match_digest`（基于 SQL 模版匹配）来实现：特定业务的查询模版走主库，其余走从库。\n\n## 进阶：从库扩展与架构演化\n\n当读 QPS 继续增长时，可以横向扩展从库数量。一主两从是很多中小公司的标配，一主四从在高并发场景下也不少见。从库之间通过 ProxySQL 做轮询或基于权重的负载均衡，横向扩展几乎是线性的。\n\n还有一种叫「级联复制」的拓扑：主库 → 从库 A → 从库 B，从库 B 从从库 A 复制数据，而不直接连主库。这样能减少主库的复制线程数（主库只需维护和从库 A 的连接），在从库数量非常多时很有用。代价是从库 B 的延迟是从库 A 的延迟加上 A→B 的复制延迟，对延迟敏感的读不适合打到级联从库。\n\n从库故障不影响主库写入，这是读写分离相比主主复制的一个重要优势。当某个从库出问题时，只需在 ProxySQL 中把它标记为 OFFLINE，流量自动切走，无需人工干预。ProxySQL 内置的 `mysql_replication_hostgroups` 健康检查机制每隔几秒就会探测从库的 `SHOW SLAVE STATUS`，延迟超过阈值的从库会被自动摘除。\n\n最后提一个很多人忽视的点：**事务内部的查询必须全走主库**。如果事务开始后某条 SELECT 跑到了从库，而那条 SELECT 又被用来计算后续写操作的输入，就可能因为读到旧数据而产生数据不一致。这个 bug 在引入读写分离时非常容易踩，务必在 ORM 层或 DAO 层封装时做好事务感知的路由处理。",
+      "keyPoints": [
+        "读写分离的动机是典型互联网业务读写比例约为 8:2，将读流量分摊到从库可以成倍降低主库 CPU 和 I/O 压力，而不是简单地「加机器」。",
+        "MySQL 主从复制通过 binlog 异步传输实现，主库提交事务后不等从库确认即返回，因此从库数据存在滞后，Seconds_Behind_Master 是衡量延迟的关键指标但并不完全精确。",
+        "应用层直接实现读写分离代码侵入性强且容易在事务场景中犯错，生产环境推荐使用 ProxySQL 或 ShardingSphere-Proxy 等中间件，通过 SQL 规则路由，应用层零感知。",
+        "事务内部的所有操作（包括 SELECT）必须全部路由到主库，否则事务中读到旧数据再写入会造成数据一致性问题，这是引入读写分离时最容易踩到的坑。",
+        "处理「写后立即读旧数据」的最常用方案是写后短期强制读主库，可以通过 context 标记或 Redis TTL key 实现，ProxySQL 也内建了 session 级别的自动主库回退支持。",
+        "半同步复制（rpl_semi_sync）能确保主库崩溃时至少一个从库有完整 binlog，但从库 SQL 线程回放仍有延迟，无法彻底消除 stale read，只是降低了数据丢失风险。",
+        "MySQL 5.7 的 WAIT_FOR_EXECUTED_GTID_SET() 函数允许从库在返回查询结果前等待指定事务被回放，是精确解决 stale read 的技术手段，但有等待开销，适用于一致性要求极高且 QPS 不太高的查询。",
+        "对于余额查询、订单详情等强一致性场景，按业务语义直接路由到主库是最简单可靠的方案，而非依赖延迟补偿机制，「能不读从库就不读」对关键业务来说是合理选择。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-read-write-split-q1-quiz1",
+          "question": "MySQL 默认的主从复制模式是什么？这种模式下主库提交事务后会等待从库确认吗？",
+          "choices": [
+            { "id": "A", "text": "异步复制，主库不等待从库确认，直接向客户端返回成功" },
+            { "id": "B", "text": "同步复制，主库等所有从库都回放完毕才返回成功" },
+            { "id": "C", "text": "半同步复制，主库等至少一个从库确认后返回" },
+            { "id": "D", "text": "组复制（Group Replication），通过 Paxos 保证强一致" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "MySQL 默认采用异步复制（Asynchronous Replication）。主库把变更写入 binlog 后，立即向客户端返回成功，不等待任何从库的确认。从库的 IO 线程异步地从主库拉取 binlog 写入 relay log，SQL 线程再回放 relay log 到存储引擎，这整个过程都在主库提交之后异步进行。这正是主从延迟产生的根本原因。B 选项的同步复制在 MySQL 中并不存在作为默认选项；C 选项的半同步复制（semisync）需要手动安装插件并开启；D 选项的组复制是独立的功能，需要单独配置。"
+        },
+        {
+          "id": "ds-read-write-split-q1-quiz2",
+          "question": "在从库执行 SHOW SLAVE STATUS 时，哪个字段最直观地反映主从延迟的秒数？",
+          "choices": [
+            { "id": "A", "text": "Relay_Log_Space" },
+            { "id": "B", "text": "Exec_Master_Log_Pos" },
+            { "id": "C", "text": "Seconds_Behind_Master" },
+            { "id": "D", "text": "Slave_SQL_Running_State" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Seconds_Behind_Master 字段表示从库当前正在回放的 binlog 事件的时间戳与当前系统时间之差，是最直观的延迟秒数指标。但它有一个陷阱：当 SQL 线程暂停后重启时，这个值会从 0 骤增到很大的数值，并不代表「刚刚发生」的真实延迟。Relay_Log_Space 是 relay log 占用的磁盘空间，反映积压量不是时间延迟。Exec_Master_Log_Pos 是从库回放到的主库 binlog 位点，需要结合主库当前位点才能计算出延迟量。Slave_SQL_Running_State 是 SQL 线程的文字状态描述，不是量化指标。"
+        },
+        {
+          "id": "ds-read-write-split-q1-quiz3",
+          "question": "使用 ProxySQL 实现读写分离时，以下哪条路由规则配置是正确的？",
+          "choices": [
+            { "id": "A", "text": "match_pattern = '^SELECT' 路由到从库 hostgroup，match_pattern = '.*' 路由到主库 hostgroup，SELECT 规则 rule_id 更小" },
+            { "id": "B", "text": "match_pattern = '.*' 路由到从库 hostgroup，match_pattern = '^INSERT|^UPDATE|^DELETE' 路由到主库，INSERT 规则 rule_id 更小" },
+            { "id": "C", "text": "match_pattern = '^SELECT' 路由到主库 hostgroup，match_pattern = '.*' 路由到从库 hostgroup，SELECT 规则 rule_id 更小" },
+            { "id": "D", "text": "不需要配置规则，ProxySQL 会自动识别读写操作并分别路由" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "ProxySQL 的查询规则按 rule_id 从小到大依次匹配，命中 apply=1 的规则后停止。正确做法是：给 SELECT 配置一个较小的 rule_id 路由到从库（hostgroup 2），再配置一个 rule_id 更大的通配规则 '.*' 路由到主库（hostgroup 1）。这样 SELECT 命中第一条规则走从库，INSERT/UPDATE/DELETE 不匹配第一条，向下走到通配规则，进主库。B 选项把通配放在小 rule_id 会导致所有 SQL 都走从库。C 选项把 SELECT 路由到主库，读写分离完全没意义。D 选项是错的，ProxySQL 必须手动配置规则，不会自动路由。"
+        },
+        {
+          "id": "ds-read-write-split-q1-quiz4",
+          "question": "在引入读写分离后，为什么事务内的 SELECT 查询必须路由到主库？",
+          "choices": [
+            { "id": "A", "text": "因为从库不支持事务，SELECT 在从库会报错" },
+            { "id": "B", "text": "因为事务内 SELECT 读到从库的旧数据，再用旧数据做写操作计算，会导致数据一致性问题" },
+            { "id": "C", "text": "因为从库的 SELECT 性能比主库差，事务需要低延迟" },
+            { "id": "D", "text": "因为主库和从库的数据格式不同，SELECT 结果集可能不兼容" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "事务内 SELECT 必须走主库的原因是数据一致性。一个典型的危险场景：事务开始 → SELECT 当前余额（走从库，得到旧值 100 元）→ 计算扣款后余额 → UPDATE 写入 90 元（走主库）。如果主库真实余额只有 50 元了（另一个事务已经扣了 50），这次操作就产生了数据错误。从库并不是不支持事务（InnoDB 从库完全支持事务），问题在于读到旧数据后的计算结果是错的。A、C、D 选项都是错误的技术认知。这个问题在 ORM 框架隐式开启事务的场景里尤其容易踩到。"
+        },
+        {
+          "id": "ds-read-write-split-q1-quiz5",
+          "question": "以下是某从库的 SHOW SLAVE STATUS 输出片段，分析其状态：\n\nSlave_IO_Running: Yes\nSlave_SQL_Running: No\nSeconds_Behind_Master: NULL\nLast_SQL_Error: Error 'Duplicate entry' on query...",
+          "choices": [
+            { "id": "A", "text": "从库一切正常，只是暂时没有新 binlog 需要回放" },
+            { "id": "B", "text": "IO 线程正常在拉取 binlog，但 SQL 线程因回放报错而停止，需要人工介入处理错误后恢复复制" },
+            { "id": "C", "text": "主库连接断开，需要重启从库才能恢复" },
+            { "id": "D", "text": "从库磁盘空间不足，relay log 无法写入" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个典型的主从复制中断场景。Slave_IO_Running: Yes 说明 IO 线程正常，仍在从主库拉取 binlog 并写入 relay log。Slave_SQL_Running: No 说明 SQL 线程已停止，原因就是 Last_SQL_Error 显示的「Duplicate entry」错误——从库回放 INSERT 语句时发现主键冲突，不知道该怎么办，于是停止了。Seconds_Behind_Master 为 NULL 正是因为 SQL 线程不在运行。处理方式通常是：分析错误原因，执行 SET GLOBAL SQL_SLAVE_SKIP_COUNTER = 1 跳过这条语句（或用 GTID 方式跳过），再执行 START SLAVE 恢复复制。这类问题往往是在从库上直接写入数据导致的，生产从库应该设置 read_only=1。"
+        },
+        {
+          "id": "ds-read-write-split-q1-quiz6",
+          "question": "用户下单成功后刷新页面看到订单状态是「未提交」，这个问题最根本的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "应用代码有 bug，查询使用了错误的订单 ID" },
+            { "id": "B", "text": "主库写入失败但返回了成功，数据根本没有提交" },
+            { "id": "C", "text": "写操作走主库，读操作走从库，而此时从库还未回放到最新的 binlog，读到了写入之前的旧数据" },
+            { "id": "D", "text": "浏览器缓存了旧页面，刷新时没有重新请求服务器" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是读写分离环境下经典的 stale read 问题。用户下单时写请求路由到主库，主库写入成功。随后用户刷新页面，读请求路由到从库，但从库由于异步复制的延迟（可能是几十毫秒到几秒），还没有回放到这条 INSERT，查询返回的就是订单不存在或状态为旧值。A 选项在这种场景下不太可能是系统性问题。B 选项如果成立，数据就真的丢了，是更严重的问题，不只是看到旧状态。D 选项是前端问题，和数据库无关。正确答案 C 是引入读写分离后必须处理的基础工程问题。"
+        },
+        {
+          "id": "ds-read-write-split-q1-quiz7",
+          "question": "半同步复制（Semi-Synchronous Replication）和异步复制相比，最主要的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "半同步复制中从库 SQL 线程实时回放，主库提交前等待从库回放完成，彻底消除主从延迟" },
+            { "id": "B", "text": "半同步复制中主库提交事务后等待至少一个从库确认 binlog 已写入其 relay log，才向客户端返回成功，降低数据丢失风险" },
+            { "id": "C", "text": "半同步复制使用全新的复制协议，完全取代 binlog，用 GTID 做实时同步" },
+            { "id": "D", "text": "半同步复制只在主库崩溃时自动切换，正常运行时和异步复制完全相同" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "半同步复制（semisync）的「半」体现在：主库等待的是从库「把 binlog 写入 relay log」这一步骤的确认，而不是从库「把 relay log 回放到存储引擎完毕」的确认。所以半同步复制能保证主库崩溃时数据不会在所有节点上消失（至少一个从库有完整的 binlog 副本），但从库 SQL 线程的回放仍然是异步的，主从数据延迟依然存在，stale read 问题并未消除。A 选项描述的是全同步复制，延迟代价极高。C 选项是错误的技术描述，半同步复制仍基于 binlog。D 选项也是错的，半同步在每个事务提交时都会等待，不只在崩溃时。"
+        },
+        {
+          "id": "ds-read-write-split-q1-quiz8",
+          "question": "电商平台的「账户余额查询」接口，在引入读写分离后应该如何路由？",
+          "choices": [
+            { "id": "A", "text": "路由到从库，因为余额查询是 SELECT，应该走从库以减轻主库压力" },
+            { "id": "B", "text": "路由到主库，因为余额是强一致性场景，用户必须看到最新数据，不能接受 stale read" },
+            { "id": "C", "text": "先查从库，如果从库延迟超过 1 秒则切换到主库" },
+            { "id": "D", "text": "路由到从库，并在结果页面添加「数据可能有 5 秒延迟」的提示" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "余额查询是典型的强一致性场景，绝对不能路由到从库。原因很简单：用户看到余额是 1000 元，于是发起一笔 800 元的支付，但实际上主库里余额只剩 200 元了（另一个设备刚完成了支付），这就造成超额扣款或业务错误。不是所有 SELECT 都应该走从库，「按业务语义路由」比「按 SQL 类型路由」更符合生产实践。在 ProxySQL 中可以用 match_digest 针对特定 SQL 模版配置走主库，其余 SELECT 走从库。C 选项的动态切换逻辑实现复杂且仍有窗口期。D 选项的延迟提示对金融场景来说完全不可接受。"
+        },
+        {
+          "id": "ds-read-write-split-q1-quiz9",
+          "question": "MySQL 5.7 引入的 WAIT_FOR_EXECUTED_GTID_SET() 函数在读写分离场景中解决什么问题，它的工作原理是什么？",
+          "choices": [
+            { "id": "A", "text": "自动检测主从延迟并在延迟过高时停止从库的 SQL 线程" },
+            { "id": "B", "text": "允许在从库执行查询前，等待指定的 GTID 事务被回放完毕，从而实现精确的读后写一致性" },
+            { "id": "C", "text": "在主库上生成全局唯一事务 ID，用于替代 binlog 文件名+位点的复制坐标" },
+            { "id": "D", "text": "让从库的 SQL 线程并行回放 binlog，提升复制速度" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "WAIT_FOR_EXECUTED_GTID_SET('gtid_set', timeout) 是 MySQL 5.7 提供的精确一致性保障函数。其工作流程是：应用完成写操作后，通过 SELECT @@session.last_gtid 或 gtid_executed 拿到这次事务的 GTID；在路由到从库查询之前，先在从库执行 WAIT_FOR_EXECUTED_GTID_SET，等待从库的 gtid_executed 包含这个 GTID；等到了说明从库已经回放了这个事务，此时读到的数据一定是最新的。这种方式精确但有等待开销，适合一致性要求高、QPS 不太高的场景。A 选项描述的是 slave delay 功能。C 选项描述的是 GTID 本身的作用，不是这个函数的作用。D 选项描述的是并行复制（slave_parallel_workers）。"
+        },
+        {
+          "id": "ds-read-write-split-q1-quiz10",
+          "question": "级联复制拓扑（主库 → 从库 A → 从库 B）的主要优势和劣势分别是什么？",
+          "choices": [
+            { "id": "A", "text": "优势：从库 B 的数据和主库完全同步，延迟为零；劣势：配置复杂" },
+            { "id": "B", "text": "优势：减少主库维护的复制连接数量，适合从库数量很多的场景；劣势：从库 B 的延迟是两段延迟之和，数据更旧" },
+            { "id": "C", "text": "优势：从库 A 和从库 B 可以互为备份，任一故障时自动切换；劣势：写入性能下降" },
+            { "id": "D", "text": "优势：所有从库的延迟完全一致；劣势：主库必须开启半同步复制才能使用" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "级联复制（链式复制）的场景是：主库直接维护大量从库连接时，binlog dump 线程本身会消耗主库资源。通过让从库 A 作为「中继节点」，主库只需维护一个到从库 A 的连接，其他从库连接从库 A 拉取，大大减少主库负担。代价是从库 B 的数据需要经过两段复制才能到达：主库→A 的延迟加上 A→B 的延迟，B 的数据比 A 更旧。因此延迟敏感的读请求不应打到级联从库。A 选项「延迟为零」完全错误，级联反而延迟更大。C 选项的互备切换不是级联复制的特性，是另一种拓扑（循环复制或双主）。D 选项错误，级联复制与半同步无强制关联。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/replication.html",
+        "https://proxysql.com/documentation/proxysql-read-write-split-use-case/",
+        "https://shardingsphere.apache.org/document/current/en/user-manual/shardingsphere-proxy/yaml-config/rules/readwrite-splitting/",
+        "https://dev.mysql.com/doc/refman/8.0/en/replication-semisync.html",
+        "https://dev.mysql.com/doc/refman/5.7/en/gtid-functions.html"
+      ]
+    }
+  ]
+}
