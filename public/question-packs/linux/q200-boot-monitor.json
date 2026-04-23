@@ -1,0 +1,168 @@
+{
+  "id": "linux-q200",
+  "name": "Linux 启动流程监控与优化",
+  "domain": "linux",
+  "description": "设计一套系统化的 Linux 启动流程监控与优化方案，涵盖 systemd-analyze 工具使用、慢启动服务识别、CI/CD 回归检测与多环境 SLA 基准",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "linux-q200",
+      "domain": "linux",
+      "type": "project",
+      "difficulty": 4,
+      "tags": ["systemd", "boot-optimization", "systemd-analyze", "node_exporter", "cicd", "sre", "performance"],
+      "title": "设计一套 Linux 启动流程监控与优化方案",
+      "content": "面试官让你「结合项目经验」说说 Linux 启动优化，这道题考的不是你背没背过 `systemd-analyze` 的 man page，而是你有没有在生产环境里真正做过这件事。\n\n你所在的团队维护着一套混合部署的微服务平台：核心交易节点跑在自建机房的裸金属服务器上，弹性计算节点跑在 AWS EC2（c5.xlarge 系列），还有若干嵌入式 Linux 网关设备部署在边缘侧。去年大促前的压测暴露了一个严重问题：Auto Scaling Group 在流量突增时触发扩容，新 EC2 实例从 AMI 启动到通过 ELB health check 平均需要 **92 秒**，导致流量高峰前的 1.5 分钟里，部分请求打到了容量不足的旧实例上，P99 延迟飙升到 800ms。\n\nSRE 团队接到的任务是：把 EC2 工作节点启动时间压到 **15 秒以内**（userspace 到达 multi-user.target），并搭建一套机制防止后续镜像更新引入启动时间回归。\n\n在动手之前，你们做的第一件事不是猜哪个服务慢，而是用工具把现状量化清楚。在一台全新启动的 EC2 实例上运行 `systemd-analyze time`，得到：\n\n```\nStartup finished in 1.203s (kernel) + 44.821s (userspace) = 46.024s\nmulti-user.target reached after 44.791s in userspace\n```\n\n`systemd-analyze blame` 前 8 行：\n\n```\n         22.314s NetworkManager-wait-online.service\n          8.103s cloud-init.service\n          4.207s auditd.service\n          3.891s snapd.service\n          2.104s accounts-daemon.service\n          1.892s postfix.service\n          1.203s sssd.service\n           912ms ModemManager.service\n```\n\n`systemd-analyze critical-chain` 的关键路径：\n\n```\nmulti-user.target @44.791s\n└─NetworkManager-wait-online.service @22.471s +22.314s\n  └─NetworkManager.service @2.203s +182ms\n    └─dbus.service @2.021s +174ms\n      └─basic.target @2.014s\n```\n\n请基于这份真实数据，说说你会如何设计完整的优化方案：从问题识别、逐项优化、到 CI/CD 自动化回归检测，以及不同部署环境（云 VM、裸金属、嵌入式）应该设定什么样的 SLA 目标。",
+      "answer": "## 第一步：理解工具——三个命令背后的底层逻辑\n\nLinux 系统从上电到第一个用户进程能处理请求，要经过 firmware/UEFI → bootloader（GRUB）→ kernel 初始化 → initramfs → systemd（PID 1）→ target 这几个阶段。现代 Linux 几乎都用 systemd 作为 init 系统，所以「启动优化」本质上是在优化 systemd 的 unit 依赖图和激活时序。\n\nsystemd 的核心设计是「最大化并行」。与传统 SysVinit 按顺序跑 shell 脚本不同，systemd 把每个服务的依赖关系编码成有向无环图（DAG），在满足依赖约束的前提下，尽可能同时启动多个 unit。这意味着整个 userspace 的启动时间，取决于依赖图中「关键路径」（critical path）上所有 unit 耗时之和，而不是全部 unit 耗时之和。把这个模型装进脑子里，再看三个命令就清晰多了。\n\n`systemd-analyze time` 输出的是整体时间分解：firmware 阶段（UEFI POST，不在 systemd 控制范围内）、kernel 阶段（从内核解压到 systemd 启动）、userspace 阶段（systemd 接管到目标 target 就绪）。题目中 kernel 只用了 1.2 秒，说明内核本身没问题；userspace 花了 44.8 秒，问题全在 systemd 管理的 unit 里。\n\n`systemd-analyze blame` 按耗时降序列出每个 unit「自身」的激活时间——也就是从 unit 开始启动到其 `active` 状态的时长。这个命令很容易被误用：把 blame 输出里排第一的服务直接干掉，不一定有效果。原因在于，blame 排名第一的 unit 未必在关键路径上——如果它和其他 unit 是并行启动的，它虽然慢，但并没有阻塞任何人。\n\n这就是 `systemd-analyze critical-chain` 的价值所在。critical-chain 展示的是从目标 target 出发，沿最长依赖链逆向追溯的那条路径。`@` 后面的数字是该 unit 变为 active 的时刻，`+` 后面是该 unit 自身的启动耗时。从题目给出的输出可以直接读出：`NetworkManager-wait-online` 在关键路径上，在 22.471 秒时开始启动，自身又花了 22.314 秒，把 `multi-user.target` 一路阻塞到 44.791 秒。这才是最值得处理的瓶颈。\n\n## 第二步：系统化优化——四个层次逐步压时间\n\n**第一层：禁用无用服务**。在一台云 VM 上，`ModemManager.service`（USB 调制解调器管理）、`bluetooth.service`、`avahi-daemon.service`（mDNS/Bonjour 发现）、`auditd.service`（Linux 审计框架，除非有合规要求否则用不到）、`snapd.service`（Snap 包管理，AWS 官方镜像里默认开启）这几个服务基本都是多余的。禁用命令是 `systemctl disable`，它做的事情是从 `/etc/systemd/system/multi-user.target.wants/` 里删除符号链接。注意区分三种操作的语义：`stop` 只停止当前运行实例，重启后恢复；`disable` 从开机自启里移除但仍可手动启动；`mask` 则把 unit 文件链接到 `/dev/null`，即使其他 unit 用 `Requires=` 强制拉起它也无法启动。对于确定不需要的服务用 `mask`，对于「我的服务不用但其他场景可能用到」的用 `disable`。\n\n处理完这一层后，题目里的 `auditd`（4.2s）、`snapd`（3.9s）、`ModemManager`（0.9s）都可以消除，省下约 9 秒。\n\n**第二层：处理 NetworkManager-wait-online**。这是云 VM 启动优化里最常见也最容易误操作的问题。`NetworkManager-wait-online.service` 的作用是等待网络完全就绪（所有接口都拿到 IP、路由表建立完成），它的存在是为了让那些依赖 `network-online.target` 的服务不会过早启动。\n\n处理思路分两种：如果你的服务（微服务 agent、日志收集器等）不需要在启动时就连接网络，直接 `systemctl disable NetworkManager-wait-online.service` 就能省掉 22 秒。如果你的服务确实需要网络（比如 etcd、Consul agent），更精确的做法是在自己的 unit 文件里写具体依赖，而不是等 `network-online.target` 这个大目标：\n\n```ini\n# 精确依赖，只等 eth0 接口就绪，而不是等所有网络\n[Unit]\nAfter=sys-subsystem-net-devices-eth0.device\nBindsTo=sys-subsystem-net-devices-eth0.device\n```\n\n**第三层：收紧 cloud-init**。`cloud-init` 在 AWS 上确实有用——它处理 SSH 公钥注入、hostname 设置、用户数据脚本执行。但默认配置里有大量用不到的 module，比如 `puppet`、`chef`、`salt_minion` 的配置探测，以及 `phone_home`、`final_message` 等。在 `/etc/cloud/cloud.cfg` 里删掉不用的 module，可以把 cloud-init 从 8 秒压到 3 秒以内。如果你的 AMI 已经完成了所有初始化工作，还可以在 packer 构建脚本里用 `cloud-init clean --logs` 清理状态，让下次启动跳过大部分初始化步骤。\n\n**第四层：依赖关系重构**。用 `systemd-analyze dot --to-pattern='*.service' | dot -Tsvg > /tmp/boot.svg` 生成完整依赖图，检查是否存在不必要的串行链。如果 A → B → C 三个服务串行，但 C 对 B 只是软依赖（B 挂了 C 照样能工作），把 unit 文件里的 `Requires=B.service` 改成 `Wants=B.service`，systemd 就不会让 C 等 B 了。`Requires` 和 `Wants` 的区别在于失败语义：`Requires` 里的依赖失败会导致本 unit 也失败，`Wants` 里的依赖失败则被忽略。\n\n经过这四层优化后，题目场景里的结果：NetworkManager-wait-online 禁用省 22s，auditd + snapd + ModemManager mask 省 9s，cloud-init 精简省 5s，合计省下约 36 秒，从 44.8s 压到约 12s，完成目标。\n\n## 第三步：不同环境的 SLA 基准与自动化回归检测\n\n不同部署环境对启动时间的要求差异显著，需要分别制定合理的 SLA 目标。**云 VM** 场景下，userspace 到达 `multi-user.target` 的目标是 **15 秒以内**；加上 kernel 阶段约 1-2 秒、ELB 的 health check 轮询间隔约 10 秒，新实例从 AMI 启动到开始承接流量可以做到 30 秒以内。**裸金属服务器**的 firmware 和 POST 阶段本身就要 30-60 秒，这不在 systemd 的控制范围内。userspace 的目标是 **30 秒以内**，重点优化 `fsck`（对大磁盘可能很慢，考虑改用 `noatime` 挂载选项并调整 fsck 频率）和 RAID 重建等磁盘密集型操作。**嵌入式 Linux**（IoT 网关、工业控制器）要求最严苛，通常从上电到应用就绪要在 **5 秒以内**，这类场景需要裁剪 initramfs、优化内核启动参数（`quiet loglevel=0 rd.udev.log_priority=3`），甚至用 `kexec` 在软重启时跳过 BIOS/UEFI 阶段。\n\n在 CI/CD 流水线中防止启动时间回归，核心思路是：每次 AMI/镜像构建完成后，在 pipeline 里启动一个测试实例，运行 `systemd-analyze` 收集指标，超过阈值就让 pipeline 失败。这里有个实现细节：`systemd-analyze` 必须在目标实例上运行，不能在构建环境里运行。通常做法是 packer 构建 AMI 时，在最后一个 provisioner 里把收集脚本写入实例，在 GitLab CI 或 GitHub Actions 的 test-image stage 里用 Terraform 临时起一台实例，通过 SSM Session Manager 或 SSH 执行脚本并拿回结果：\n\n```bash\n#!/bin/bash\n# ci/scripts/check-boot-time.sh — 在目标实例上执行\nset -euo pipefail\n\n# 等待 systemd 完成启动（防止过早读取）\nsystemctl is-system-running --wait || true\n\nUSERSPACE=$(systemd-analyze time 2>/dev/null \\\n  | grep -oP '[\\d.]+(?=s \\(userspace\\))')\n\nTHRESHOLD=\"${BOOT_TIME_THRESHOLD:-15}\"\n\necho \"Boot userspace time: ${USERSPACE}s (threshold: ${THRESHOLD}s)\"\n\nif awk \"BEGIN { exit !(${USERSPACE} > ${THRESHOLD}) }\"; then\n  echo \"FAIL: Boot time exceeds SLA\"\n  echo \"=== Top 10 slow units ===\"\n  systemd-analyze blame | head -10\n  echo \"=== Critical chain ===\"\n  systemd-analyze critical-chain\n  exit 1\nfi\n\necho \"PASS: Boot time within SLA\"\n```\n\n把这段脚本的退出码映射到 pipeline stage 的成功/失败，就能在镜像合并前自动拦截慢启动。阈值通过环境变量注入，不同环境（cloud/bare-metal/embedded）设置不同的值，一套脚本复用。\n\n在持续监控方面，`node_exporter` 原生的 `node_boot_time_seconds` metric 记录的是系统启动时的 Unix 时间戳，可以计算「已运行时长」，但无法告诉你「启动过程花了多久」。正确做法是用一个 `Type=oneshot` 的 systemd service 在 `multi-user.target` 就绪后立即把 `systemd-analyze time` 的输出写入 node_exporter 的 textfile collector 目录：\n\n```ini\n# /etc/systemd/system/boot-metrics-exporter.service\n[Unit]\nDescription=Export boot timing metrics to Prometheus textfile\nAfter=multi-user.target\nConditionPathExists=!/run/boot-metrics-exported\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/export-boot-metrics.sh\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n```\n\n```bash\n#!/bin/bash\n# /usr/local/bin/export-boot-metrics.sh\nANALYZE=$(systemd-analyze time 2>/dev/null)\nUSERSPACE=$(echo \"$ANALYZE\" | grep -oP '[\\d.]+(?=s \\(userspace\\))')\nKERNEL=$(echo \"$ANALYZE\" | grep -oP '[\\d.]+(?=s \\(kernel\\))')\n\nmkdir -p /var/lib/node_exporter/textfile_collector\ncat > /var/lib/node_exporter/textfile_collector/boot_timing.prom << EOF\n# HELP linux_boot_userspace_seconds Duration of userspace boot phase\n# TYPE linux_boot_userspace_seconds gauge\nlinux_boot_userspace_seconds ${USERSPACE:-0}\n# HELP linux_boot_kernel_seconds Duration of kernel boot phase\n# TYPE linux_boot_kernel_seconds gauge\nlinux_boot_kernel_seconds ${KERNEL:-0}\nEOF\n\ntouch /run/boot-metrics-exported\n```\n\n`ConditionPathExists=!/run/boot-metrics-exported` 确保这个 service 每次开机只跑一次，`/run` 目录在重启后会被清空，所以下次开机会重新执行。在 Grafana 里加一个 `linux_boot_userspace_seconds` 的告警，阈值比 SLA 多留 20% 缓冲，就能在生产实例开始出现启动变慢时提前收到通知，而不是等到扩容延迟已经影响到用户才发现。\n\n整套方案的核心原则是「量化驱动优化」：不靠感觉猜哪个服务慢，先用 `critical-chain` 找关键路径，再用 `blame` 确认耗时来源，优化完后用数据验证效果，最后把验证逻辑嵌入 CI/CD 防止回归。这套流程在任何规模的团队里都能落地，也是面试官真正想听的内容。",
+      "keyPoints": [
+        "`systemd-analyze blame` 只显示各 unit 自身激活耗时，不代表它在关键路径上；必须结合 `systemd-analyze critical-chain` 找到真正阻塞整体启动的依赖链，才能精准定位优化目标",
+        "`systemctl disable` 只删除开机自启的符号链接，服务仍可手动启动；`systemctl mask` 将 unit 文件链接到 `/dev/null`，即使被其他 unit 的 `Requires=` 依赖也无法启动，是彻底禁用的正确姿势",
+        "`NetworkManager-wait-online.service` 是云 VM 启动时最常见的大瓶颈，若微服务本身不依赖启动时网络就绪，直接 disable 可节省 15-25 秒；若确实需要网络，应在 unit 文件里精确指定依赖的网络设备而非等待 `network-online.target` 整体就绪",
+        "systemd 通过依赖图最大化并行启动，整体耗时取决于关键路径而非所有 unit 的总和；将 unit 依赖从 `Requires=` 改为 `Wants=` 可打破不必要的串行约束，让更多 unit 并发启动",
+        "不同环境的启动 SLA 差异显著：云 VM userspace 目标 ≤15s，裸金属 ≤30s（firmware 阶段不在 systemd 控制范围），嵌入式设备要求 ≤5s 需裁剪 initramfs 和内核参数",
+        "在 CI/CD 中防止启动时间回归：每次镜像构建后在测试实例上运行 `systemd-analyze time` 并与阈值比对，超阈值则输出 `blame` 和 `critical-chain` 详情并阻断 pipeline",
+        "`node_exporter` 的 `node_boot_time_seconds` 只记录启动时刻，无法反映启动耗时；需在 `multi-user.target` 后运行 `Type=oneshot` 的 service 把 `systemd-analyze` 输出写入 textfile collector，才能在 Prometheus/Grafana 中持续监控启动耗时趋势",
+        "cloud-init 默认加载大量无用 module（puppet/chef/salt 探测等），在 AMI 构建阶段精简 `/etc/cloud/cloud.cfg` 中的 module 列表，通常可将 cloud-init 耗时从 8s 降至 2-3s"
+      ],
+      "quiz": [
+        {
+          "id": "linux-q200-quiz-1",
+          "question": "`systemd-analyze time` 命令输出「Startup finished in 1.2s (kernel) + 44.8s (userspace) = 46.0s」，其中 userspace 阶段的起止点是什么？",
+          "choices": [
+            {"id": "A", "text": "从 systemd（PID 1）接管控制权，到目标 target（如 multi-user.target）进入 active 状态"},
+            {"id": "B", "text": "从 BIOS/UEFI POST 完成，到第一个用户空间进程启动"},
+            {"id": "C", "text": "从内核解压完成，到 /sbin/init 被调用"},
+            {"id": "D", "text": "从登录提示符出现，到用户完成首次登录"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "systemd-analyze time 将启动划分为三个阶段：firmware（UEFI/BIOS，含 POST 和 bootloader）、kernel（内核解压到 systemd 启动）、userspace（systemd 接管到达目标 target）。userspace 阶段的起点是 systemd 成为 PID 1 开始加载 unit，终点是命令行指定的 target（默认 graphical.target 或 multi-user.target）进入 active 状态。B 选项混淆了 firmware 和 userspace 的边界；C 选项描述的是 kernel 阶段的终点；D 选项是用户登录行为，与系统启动阶段无关。",
+          "relatedConcepts": ["systemd", "boot-phases", "target-unit"]
+        },
+        {
+          "id": "linux-q200-quiz-2",
+          "question": "`systemd-analyze blame` 输出中某服务排名第一（耗时最长），是否就意味着它是导致整体启动慢的根本原因？",
+          "choices": [
+            {"id": "A", "text": "不一定，blame 只反映各 unit 自身激活耗时，若该服务与其他 unit 并行启动且不在关键路径上，它再慢也不会延长整体启动时间"},
+            {"id": "B", "text": "是的，blame 排名第一的 unit 一定是阻塞整体启动的瓶颈，应优先处理"},
+            {"id": "C", "text": "是的，systemd 按 blame 中的顺序串行启动所有服务，排名第一说明它最早开始且耗时最长"},
+            {"id": "D", "text": "不一定，blame 的排名是按字母顺序，与耗时无关"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是使用 systemd-analyze 时最常见的误解。blame 输出按单个 unit 自身耗时降序排列，但 systemd 是并发启动的——如果该 unit 与其他 unit 并行运行，且没有其他 unit 在等待它完成，那么它再慢也不会影响整体启动时间。真正影响整体时间的是「关键路径」上的 unit，需要用 systemd-analyze critical-chain 来找到关键路径。B 选项是错误理解，会导致优化方向偏差；C 选项完全错误，systemd 的核心优势就是最大化并行而不是串行；D 选项明显错误，blame 就是按耗时降序排列的。",
+          "relatedConcepts": ["critical-path", "systemd-analyze", "dependency-graph"]
+        },
+        {
+          "id": "linux-q200-quiz-3",
+          "question": "`systemd-analyze critical-chain` 输出中，`@` 和 `+` 符号分别代表什么含义？",
+          "choices": [
+            {"id": "A", "text": "`@` 是该 unit 变为 active 状态的时刻（从启动算起的绝对时间），`+` 是该 unit 自身从开始到 active 所花的时长"},
+            {"id": "B", "text": "`@` 是该 unit 开始启动的时刻，`+` 是等待依赖项就绪所花的时间"},
+            {"id": "C", "text": "`@` 是 CPU 时间消耗，`+` 是 I/O 等待时间"},
+            {"id": "D", "text": "`@` 是 unit 文件的优先级权重，`+` 是实际分配的启动槽位编号"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "critical-chain 的输出格式是「unit名称 @激活时刻 +自身耗时」。例如「NetworkManager-wait-online.service @22.471s +22.314s」意味着：这个 unit 在系统启动后 22.471 秒时变为 active（完成启动），它自身的启动过程花了 22.314 秒（即从 22.471-22.314=0.157s 时开始启动）。用这两个数字可以推算出每个 unit 的启动开始时刻。B 选项混淆了 @ 的含义；C 选项是完全错误的；D 选项是毫无根据的杜撰。理解这两个符号是正确解读关键路径的前提。",
+          "relatedConcepts": ["systemd-analyze", "critical-chain", "activation-time"]
+        },
+        {
+          "id": "linux-q200-quiz-4",
+          "question": "`systemctl disable` 和 `systemctl mask` 对服务的影响有何本质区别？",
+          "choices": [
+            {"id": "A", "text": "disable 删除开机自启的符号链接，服务仍可手动或被其他 unit 的 Requires= 拉起；mask 将 unit 文件链接到 /dev/null，任何方式都无法启动该服务"},
+            {"id": "B", "text": "disable 停止当前运行的服务实例；mask 同时停止服务并阻止重启"},
+            {"id": "C", "text": "disable 适用于 service 类型的 unit；mask 适用于 timer 和 socket 类型"},
+            {"id": "D", "text": "两者效果相同，都是从开机自启里移除服务，区别只是 mask 会同时删除 unit 文件"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "disable 的实现是从 /etc/systemd/system/[target].wants/ 目录中删除指向 unit 文件的符号链接，相当于取消「开机自启」。但被 disable 的服务仍然可以被 systemctl start 手动启动，也可以被其他 unit 通过 Requires= 或 Wants= 依赖关系拉起。mask 更彻底：它在 /etc/systemd/system/ 下创建一个指向 /dev/null 的同名符号链接，systemd 看到这个链接时会认为该 unit 不存在，无论是手动 start 还是依赖关系触发都会立即失败。对于确认完全不需要的服务（如云 VM 上的 ModemManager、bluetooth），mask 比 disable 更安全。B 选项把 disable 和 stop 混淆了；D 选项完全错误，mask 不删除 unit 文件。",
+          "relatedConcepts": ["systemctl", "unit-masking", "service-management"]
+        },
+        {
+          "id": "linux-q200-quiz-5",
+          "question": "根据题目中的 `systemd-analyze blame` 输出，`NetworkManager-wait-online.service` 耗时 22.3 秒排名第一，以下哪个判断最准确？",
+          "choices": [
+            {"id": "A", "text": "结合 critical-chain 输出确认它在关键路径上后，应优先处理；若下游无服务依赖网络就绪，可直接 disable"},
+            {"id": "B", "text": "blame 第一就是最大瓶颈，立即执行 systemctl mask NetworkManager-wait-online 即可"},
+            {"id": "C", "text": "22 秒是正常现象，NetworkManager-wait-online 必须等到所有网卡都获得 IP 才退出，这个时间无法优化"},
+            {"id": "D", "text": "应该升级 NetworkManager 到最新版本，旧版本存在 bug 导致等待时间过长"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确的分析流程是：blame 给出线索，critical-chain 确认关键路径，然后再决策。题目中 critical-chain 已经确认 NetworkManager-wait-online 在关键路径上，且其 22.3 秒自身耗时直接决定了 multi-user.target 的就绪时间。处理方案取决于业务需求：若上层服务（应用进程）不需要在启动时就有网络，disable 即可节省 22 秒；若需要网络，应精确化依赖而非等待整个 network-online.target。B 选项动作正确但分析过程跳步，mask 也过于激进（若有服务确实需要网络会出问题）；C 选项是错误的，NetworkManager-wait-online 的等待行为是可以绕过或精细化配置的；D 选项是无根据的猜测。",
+          "relatedConcepts": ["NetworkManager", "network-online.target", "boot-optimization"]
+        },
+        {
+          "id": "linux-q200-quiz-6",
+          "question": "systemd unit 文件中 `Requires=B.service` 和 `Wants=B.service` 的核心区别是什么？对启动并行化有何影响？",
+          "choices": [
+            {"id": "A", "text": "Requires 表示强依赖：B 启动失败则当前 unit 也失败；Wants 表示软依赖：B 失败不影响当前 unit 继续启动。两者都不控制启动顺序，需配合 After= 使用"},
+            {"id": "B", "text": "Requires 让两个服务串行启动（先 B 后 A）；Wants 让两个服务并行启动"},
+            {"id": "C", "text": "Requires 适用于 ExecStart 中需要调用 B 的服务；Wants 适用于只在配置文件里引用 B 的服务"},
+            {"id": "D", "text": "两者功能相同，区别仅在于 Requires 在 [Unit] 段声明，Wants 在 [Install] 段声明"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Requires 和 Wants 都只控制依赖关系（B 的失败是否影响 A），都不控制启动顺序。启动顺序由 After=/Before= 控制。所以「Requires=B.service」加「After=B.service」才是「等 B 启动成功再启 A，B 失败则 A 也失败」。只有 Requires 没有 After，A 和 B 会并发启动，只是如果 B 失败了 A 也会被停掉。把 Requires 改为 Wants 的优化效果是：即使 B 启动失败，A 也能正常继续，让 B 的失败不传播——如果 A 实际上不需要 B 成功，这样改可以提高启动的健壮性，同时配合去掉 After= 还能实现并发启动。B 选项是最常见的误解，把依赖语义和顺序语义混淆了。",
+          "relatedConcepts": ["systemd-dependencies", "Requires", "Wants", "After"]
+        },
+        {
+          "id": "linux-q200-quiz-7",
+          "question": "以下对不同部署环境启动时间 SLA 目标的描述，哪项最符合业界实践？",
+          "choices": [
+            {"id": "A", "text": "云 VM（通用型）userspace 目标 ≤15s；裸金属服务器 userspace 目标 ≤30s（firmware 阶段另计）；嵌入式 Linux 从上电到应用就绪目标 ≤5s"},
+            {"id": "B", "text": "三种环境使用统一标准：userspace ≤10s，差异主要靠云厂商 SLA 保证"},
+            {"id": "C", "text": "云 VM 因为有虚拟化层开销，SLA 应该最宽松（≤60s）；裸金属因为直接运行硬件，SLA 最严格（≤5s）"},
+            {"id": "D", "text": "嵌入式设备启动慢是硬件限制，无法用软件手段优化到 5s 以内，通常接受 30s 以上"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 选项反映了业界 SRE 实践中对不同环境的合理基准。云 VM 的 userspace ≤15s 是考虑到 Auto Scaling 扩容场景——15s userspace 加上 ELB health check 轮询间隔（通常 10-30s），可以把整体从 AMI 启动到承接流量控制在 30-45s，满足大多数弹性扩容需求。裸金属的 firmware/POST 阶段本身 30-60s 不在 systemd 控制范围，userspace 30s 是合理目标。嵌入式 ≤5s 虽然要求高，但通过裁剪 initramfs、精简内核模块、使用 BusyBox 替代 systemd、以及 kexec 跳过 firmware，是完全可以实现的。C 选项逻辑相反，云 VM 因为按需启动频繁反而对启动时间要求更高；D 选项错误，嵌入式 Linux 启动优化有完整的技术栈。",
+          "relatedConcepts": ["boot-sla", "auto-scaling", "embedded-linux"]
+        },
+        {
+          "id": "linux-q200-quiz-8",
+          "question": "在 CI/CD 流水线中自动化检测 Linux 启动时间回归，以下哪个方案最完整可靠？",
+          "choices": [
+            {"id": "A", "text": "镜像构建完成后，在 pipeline 里启动测试实例，通过 SSH/SSM 远程执行 systemd-analyze time，解析 userspace 耗时，超过阈值则打印 blame/critical-chain 详情并让 stage 失败"},
+            {"id": "B", "text": "在构建机上直接运行 systemd-analyze time，检测构建机本身的启动时间作为基准"},
+            {"id": "C", "text": "检查 unit 文件数量，新镜像比旧镜像多超过 5 个 unit 则认为可能有启动时间回归"},
+            {"id": "D", "text": "在 /etc/rc.local 里加一行 date 命令记录时间，部署后人工对比时间戳"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 选项是唯一真正在目标环境上测量实际启动时间的方案。systemd-analyze 必须在实际启动完成的实例上运行才能读取到正确数据（它从 systemd 的 journal 中读取启动时序），在构建机上跑得到的是构建机自己的启动时间，毫无意义——这就是 B 选项的错误所在。C 选项的 unit 数量只是粗糙的代理指标，一个服务可能只加了一个 unit 但阻塞了 10 秒，也可能加了很多 unit 但全都并发且很快；D 选项是手工流程，无法集成到自动化流水线，也无法捕获精确的 systemd 启动时序。A 方案的关键是：超阈值时输出 blame 和 critical-chain 作为诊断信息，让工程师不需要手动去排查就能知道是哪个新服务拖慢了启动。",
+          "relatedConcepts": ["cicd", "boot-regression", "systemd-analyze", "ami-testing"]
+        },
+        {
+          "id": "linux-q200-quiz-9",
+          "question": "`node_exporter` 的 `node_boot_time_seconds` metric 能否用来监控 Linux 启动耗时？如果不能，正确的做法是什么？",
+          "choices": [
+            {"id": "A", "text": "不能直接用，node_boot_time_seconds 记录的是系统上次启动的 Unix 时间戳，无法反映启动过程耗时；应用 Type=oneshot 的 systemd service 将 systemd-analyze 输出写入 textfile_collector，暴露自定义 gauge metric"},
+            {"id": "B", "text": "可以直接用，node_boot_time_seconds 就是启动耗时（单位秒），值越小说明启动越快"},
+            {"id": "C", "text": "可以间接用：用当前时间减去 node_boot_time_seconds，如果这个差值很小，说明机器刚启动完且启动很快"},
+            {"id": "D", "text": "node_exporter 没有任何与启动相关的 metric，需要安装专门的 boot-exporter 插件"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "node_boot_time_seconds 的值是一个 Unix 时间戳（如 1704067200），表示「系统是在 2024-01-01 00:00:00 UTC 启动的」，用当前时间减去它得到的是「系统已运行多少秒」，完全不反映启动过程花了多久。这是一个容易被误用的 metric。C 选项的逻辑也是错的——刚启动完的差值小只是说明机器最近才启动，和启动速度无关；差值 5s 不代表启动只用了 5 秒。正确做法是用 textfile collector：systemd 的 Type=oneshot service 在 multi-user.target 后运行，把 systemd-analyze 的解析结果写入 /var/lib/node_exporter/textfile_collector/ 下的 .prom 文件，node_exporter 会自动读取并暴露这些自定义 metric。ConditionPathExists=! 确保每次启动只写一次。",
+          "relatedConcepts": ["node_exporter", "textfile_collector", "prometheus", "boot-metrics"]
+        },
+        {
+          "id": "linux-q200-quiz-10",
+          "question": "一台服务器上某个自定义服务（`Type=simple`）在 `systemd-analyze blame` 中显示耗时 30 秒，但查看该服务的代码逻辑应该在 2 秒内完成。最可能的排查方向是什么？",
+          "choices": [
+            {"id": "A", "text": "检查该 unit 的 After= 依赖是否过宽（如 After=network-online.target）；用 journalctl -u 服务名 --no-pager 查看服务启动过程的详细日志，确认是在等待依赖还是 ExecStartPre 脚本卡住"},
+            {"id": "B", "text": "服务代码有 bug，把服务的 ExecStart 程序重新编译优化即可"},
+            {"id": "C", "text": "systemd-analyze blame 的时间包含服务整个生命周期，30 秒是正常的运行时间，不代表启动慢"},
+            {"id": "D", "text": "Type=simple 类型的服务无法被 systemd-analyze 准确计时，应改为 Type=notify 后重测"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Type=simple 的服务在进程启动后 systemd 就认为其处于 activating 状态，blame 里显示的时间是从 unit 开始激活到它依赖的 unit 链都就绪（即 systemd 的视角里「激活完成」）的时间。30 秒的来源通常有两种：一是 After= 依赖链里有慢 unit（如 After=network-online.target 本身就要等 22 秒），服务虽然很快启动完，但 blame 统计的是依赖就绪的等待时间；二是 ExecStartPre= 里有脚本（如 DB 连通性检查、配置文件渲染）卡住了。用 journalctl -u service-name --no-pager -b 可以看到每一行日志的时间戳，精确定位卡在哪里。B 选项是不经诊断就猜测的错误做法；C 选项对 blame 时间含义的理解是错误的，blame 记录的是激活耗时而非运行时长；D 选项说 Type=simple 无法计时是错误的。",
+          "relatedConcepts": ["systemd-type", "journalctl", "ExecStartPre", "dependency-wait"]
+        }
+      ],
+      "references": [
+        "https://www.freedesktop.org/software/systemd/man/systemd-analyze.html",
+        "https://www.freedesktop.org/software/systemd/man/systemd.unit.html",
+        "https://www.freedesktop.org/software/systemd/man/systemd.service.html",
+        "https://prometheus.io/docs/guides/node-exporter/",
+        "https://cloud-init.io/docs/reference/modules.html"
+      ]
+    }
+  ]
+}
