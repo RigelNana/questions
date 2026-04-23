@@ -20,6 +20,8 @@ export type { Domain, QuestionType, QuestionCategory, Difficulty, QuizChoice, Qu
 export { DOMAIN_LABELS, QUESTION_TYPE_LABELS, QUESTION_TYPE_CATEGORY, DIFFICULTY_LABELS, ALL_DOMAINS } from './question';
 export type { QuizAttempt, QuestionProgress, UserSettings, UserProgress } from './progress';
 export { DEFAULT_SETTINGS, DEFAULT_PROGRESS } from './progress';
+export type { Highlight, HighlightColor, HighlightSection } from './highlight';
+export { HIGHLIGHT_COLORS, HIGHLIGHT_COLOR_LABELS } from './highlight';
 
 /** Lucide icon mapping for each domain */
 export const DOMAIN_ICONS: Record<Domain, LucideIcon> = {

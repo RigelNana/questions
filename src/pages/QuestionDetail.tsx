@@ -2,12 +2,14 @@ import { useEffect, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuestionStore } from '../stores/questionStore';
 import { useProgressStore } from '../stores/progressStore';
+import { useHighlightStore } from '../stores/highlightStore';
 import { MarkdownRenderer } from '../components/ui/MarkdownRenderer';
+import { HighlightableMarkdown } from '../components/question/HighlightableMarkdown';
 import { DifficultyBadge } from '../components/filter/DifficultyBadge';
 import { TypeBadge } from '../components/filter/TypeBadge';
 import { QuizPanel } from '../components/question/QuizPanel';
 import { DOMAIN_LABELS, DOMAIN_ICONS, type Domain, type QuizAttempt } from '../types';
-import { Lightbulb, Star, ChevronUp, ChevronLeft, ChevronRight, BookOpen, ClipboardCheck } from 'lucide-react';
+import { Lightbulb, Star, ChevronUp, ChevronLeft, ChevronRight, BookOpen, ClipboardCheck, Highlighter } from 'lucide-react';
 
 type DetailTab = 'content' | 'quiz';
 
