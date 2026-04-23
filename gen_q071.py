@@ -1,0 +1,308 @@
+import json, os
+
+content = r"""
+`free` 和 `vmstat` 是 Linux 运维日常中最常用的两个内存分析命令，但大多数人对这两个命令的字段含义并不清楚，甚至会因为看到 `free` 列的值很小而误判系统内存不足。
+
+以下是一台 16GB 内存线上服务器的典型输出：
+
+```bash
+$ free -h
+              total        used        free      shared  buff/cache   available
+Mem:           15Gi       8.2Gi       1.3Gi       512Mi       5.5Gi       6.7Gi
+Swap:         2.0Gi       256Mi       1.8Gi
+
+$ vmstat 1 3
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0 262144 1310720 204800 5242880    2   12     8    24  490 1250 36  6 55  3  0
+ 1  0 262144 1298432 204800 5242880    0    0     0    16  510 1350 38  6 54  2  0
+ 0  0 262144 1306624 204800 5242880    0    0     0     4  480 1180 32  4 62  2  0
+```
+
+请回答以下问题：
+
+1. `free` 列只有 1.3Gi，`available` 列却有 6.7Gi，哪个才代表「系统当前可用内存」？它们为什么差这么多？
+2. `buff/cache` 的 5.5Gi 是真正「被占用」的内存吗？如果有新进程需要这部分内存会怎样？
+3. `vmstat` 第一行中 `si=2, so=12`，后两行 `si=0, so=0`——这说明了什么？`vmstat` 的第一行数据有什么特殊性？
+4. `wa` 列的含义是什么？它和内存压力有什么关联？
+""".strip()
+
+answer = r"""
+## free 与 vmstat：Linux 内存分析的两把利器
+
+### 第一步：理解 Linux 内存管理的基础模型
+
+在深入这两个命令之前，有一件事必须先搞清楚：Linux 内核对内存的使用方式，跟直觉上的「用了就是用了，空着就是空着」完全不一样。
+
+Linux 有一个非常激进的内存使用哲学——空闲内存是浪费的内存。内核会主动把所有没人用的物理内存拿来做 page cache（页缓存），用来缓存从磁盘读取的文件数据。当应用程序需要更多内存时，内核会把 page cache 里不太常用的部分回收掉，把物理内存还给应用程序。这个设计让很多运维同学困惑——他们看到「free 只剩 200MB」就开始紧张，以为系统快 OOM 了，其实内核只是在用 5GB 的 page cache 帮你加速文件 I/O，这 5GB 随时可以回收。
+
+`free` 命令和 `vmstat` 命令就是帮你把这些数字看清楚的工具。前者给你一张内存的「静态快照」，后者给你内存的「动态时序」——这个区别很重要，单次 `free` 看不出内存泄漏趋势，但连续的 `vmstat` 可以。
+
+`free` 的基本用法，`-h` 参数让数字以人类可读的单位（GB/MB）显示：
+
+```bash
+$ free -h
+              total        used        free      shared  buff/cache   available
+Mem:           15Gi       8.2Gi       1.3Gi       512Mi       5.5Gi       6.7Gi
+Swap:         2.0Gi       256Mi       1.8Gi
+```
+
+`vmstat` 的基本用法是 `vmstat [interval] [count]`，`interval` 是采样间隔秒数，`count` 是采样次数：
+
+```bash
+# 每秒采样一次，共采样 5 次
+$ vmstat 1 5
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0 262144 1310720 204800 5242880    0    0     2    18  480 1200 35  5 58  2  0
+ 1  0 262144 1298432 204800 5242880    0    0     0    12  510 1350 38  6 54  2  0
+ 0  0 262144 1306624 204800 5242880    0    0     0     4  490 1180 32  4 62  2  0
+```
+
+这里有一个非常重要的细节：**`vmstat` 的第一行是系统启动以来的统计均值，不代表当前状态**。做性能分析时必须忽略第一行，从第二行开始看。这是一个高频踩坑点，很多人拿第一行的 `si`/`so` 数据做判断，结论往往是错的。
+
+### 第二步：逐字段拆解 free 与 vmstat 的输出
+
+**读懂 `free` 的输出**
+
+`free` 输出中最让人困惑的是 `free` 和 `available` 这两个字段的区别。
+
+`free` 字段（上面的 1.3Gi）表示**完全没有被任何用途使用的物理内存**——既没有分配给进程，也没有被内核用来做缓存。这个数字在大多数运行中的 Linux 系统上都会比较小，因为内核积极地把空闲页用作 page cache。在生产服务器上看到 `free` 只有几百 MB 是完全正常的。
+
+`available` 字段（上面的 6.7Gi）才是你真正应该关心的数字。它表示**当前系统实际上还能分配给新进程的内存量**，计算方式大致是 `free + 可回收的 buff/cache + 可回收的 slab`。这意味着，如果你现在启动一个新的应用程序，内核最多能给它 6.7Gi 的物理内存，不会触发 OOM。
+
+`buff/cache` 这一列（5.5Gi）把 buffer 和 cache 合并显示了。如果想分开看，直接读 `/proc/meminfo`：
+
+```bash
+$ grep -E "^(Buffers|Cached|SReclaimable):" /proc/meminfo
+Buffers:         204800 kB   # 块设备元数据缓存（目录树、inode 信息等）
+Cached:         5033984 kB   # 文件内容的 page cache，最大的一块
+SReclaimable:    208896 kB   # 可回收的 slab（dentry cache、inode cache）
+```
+
+`Cached` 是最大的一块，就是通常说的 page cache，存放的是文件内容的缓存。应用程序频繁读取的文件会被缓存在这里，下次读取时直接从内存返回，不用再去磁盘，这是 Linux 文件 I/O 性能的关键来源之一。
+
+**读懂 `vmstat` 的输出**
+
+`vmstat` 的列比较多，挑几个重点讲。
+
+内存区域的 `swpd` 列表示已经被换出到 swap 分区的内存量（单位 KB）。这个数字本身不代表问题——很多系统开机初期会有少量 swap 使用并保持稳定。真正危险的信号是 `si`（swap in，每秒从 swap 换回内存的数据量，KB/s）和 `so`（swap out，每秒从内存换出到 swap 的数据量，KB/s）列持续非零。
+
+如果 `so` 持续大于 0，意味着内核正在主动把进程的内存页换到磁盘，说明物理内存确实已经不够用了。如果 `si` 和 `so` 同时活跃，系统在做「换入换出循环」，技术上叫 thrashing（内存抖动）。这时候性能会急剧下降，因为每次内存访问都可能触发磁盘 I/O，延迟从纳秒级跳到毫秒级——对 Redis 这类服务来说基本等于不可用。
+
+`wa` 这一列在 CPU 区域，但它和内存密切相关。`wa` 表示 CPU 等待 I/O 完成的时间占比（0-100 的百分比）。如果 `wa` 值超过 20% 且 `si`/`so` 同时有活动，基本可以确定是 swap thrashing 导致的系统卡顿。
+
+`r`（runqueue，等待 CPU 的进程数）和 `b`（blocked，等待 I/O 的进程数）是进程队列指标。`b` 列如果持续大于 0，表示有进程卡在 I/O 等待上——在 swap thrashing 场景下，这些进程很可能是在等 swap 磁盘 I/O。
+
+### 第三步：生产环境中的进阶用法与常见陷阱
+
+**不要被小 `free` 值吓到**
+
+生产环境中最常见的误操作是：运维同学看到 `free -h` 显示 `free` 列只有 200MB 就慌了，开始 kill 进程或者加机器。但如果 `available` 还有 8GB，系统根本没有任何内存压力，那 200MB 的 `free` 只是内核充分利用 page cache 的表现，是正常健康的状态。正确的判断基准是：`available < 物理内存的 10%` 才需要开始关注，`available < 物理内存的 5%` 才应该触发告警。
+
+**用 vmstat 追踪内存泄漏趋势**
+
+单次 `free` 看不出内存泄漏，但连续的 `vmstat` 可以。用下面的方式持续监控，同时打印时间戳方便对照：
+
+```bash
+$ vmstat -t 5 | awk '{print strftime("%H:%M:%S"), $0}'
+17:30:00  2  0 262144 1310720 204800 5242880  0  0   2  18  480 1200 35 5 58 2 0
+17:30:05  2  0 294912 1048576 204800 4980736  0 32   0 320  510 1350 38 6 54 2 0
+17:30:10  3  1 327680  786432 204800 4718592  0 64   0 640  620 1480 42 8 48 2 0
+```
+
+如果 `free + buff/cache` 的总和随时间持续下降，`swpd` 持续上升，说明有进程在持续消耗内存却没有释放。配合 `smem -rs pss` 或 `ps aux --sort=-%mem | head -20` 来缩小排查范围。
+
+**swappiness 参数调优**
+
+内核有一个参数控制使用 swap 的激进程度：
+
+```bash
+$ cat /proc/sys/vm/swappiness
+60   # 默认值，内存还剩 40% 时就可能开始换出
+
+# 对延迟敏感的服务（Redis、数据库）推荐设为 1，注意不是 0
+$ sysctl -w vm.swappiness=1
+
+# 永久生效写入 sysctl.d
+$ echo "vm.swappiness=1" >> /etc/sysctl.d/99-memory.conf
+```
+
+为什么推荐 1 而不是 0？因为 Linux 3.5+ 内核中 `swappiness=0` 的语义是「除非 OOM 否则不换出」，这在极端情况下可能让 OOM killer 更激进，反而杀掉重要进程。设为 1 保留了 swap 作为最后一道保险，又把换出行为降到最低。这个建议直接来自 Redis 官方文档。
+
+**OOM 前的预警信号**
+
+根据生产经验，OOM 发生前的典型 `vmstat` 特征是：`so` 持续在 500 KB/s 以上，`wa` 超过 30%，`b` 列有 3 个以上进程持续处于 blocked 状态，同时 `free` 和 `available` 都在快速下降。这时候如果不干预，内核的 OOM killer 会在几分钟内随机杀掉一个进程（通常是内存占用大的进程，不一定是内存泄漏的罪魁祸首）。可以通过 `dmesg | grep -i "out of memory"` 查看 OOM kill 历史。
+
+最后一个面试中常被问到的细节：`free` 和 `vmstat` 的内存数据都来自 `/proc/meminfo`，两个命令本质上是对同一个内核接口的不同格式化展示。理解了 `/proc/meminfo` 的每个字段，就能读懂所有内存分析工具的输出。
+""".strip()
+
+key_points = [
+    "`free` 命令中 `available` 字段才是衡量系统实际可用内存的正确指标，它包含了可回收的 buff/cache 和 slab；`free` 字段仅表示完全未被使用的内存，在大多数运行中的系统上都会很小，不能作为内存压力的判断依据",
+    "Linux 内核积极将空闲物理内存用作 page cache 加速文件 I/O，`buff/cache` 占用的内存在进程需要时会被内核立即回收，不属于真正的「内存压力」，`available < 物理内存 5%` 才是需要告警的阈值",
+    "`vmstat` 的 `si`（swap in）和 `so`（swap out）是判断内存压力的核心指标，持续非零的 `so` 意味着内核正在主动将进程内存换出到磁盘，`si` 与 `so` 同时活跃则是 thrashing（内存抖动）的标志，性能会急剧恶化",
+    "`vmstat` 输出的第一行是系统启动以来的统计均值而非当前状态，做实时性能分析时必须忽略第一行，从第二行开始读数据",
+    "高 `wa`（CPU 等待 I/O 时间占比）配合持续活跃的 `si`/`so` 是 swap thrashing 的典型特征，此时应立即排查内存消耗最大的进程",
+    "`vm.swappiness` 控制内核使用 swap 的激进程度，延迟敏感型服务（Redis、MySQL）应将其设为 1 而非 0——设为 0 在 Linux 3.5+ 可能让 OOM killer 更激进，设为 1 既能抑制换出又保留 swap 作为最后保障",
+    "`free` 和 `vmstat` 的内存数据都来自 `/proc/meminfo`，两者是同一内核接口的不同格式化展示；通过 `grep -E '^(MemFree|MemAvailable|Cached|Buffers|SwapFree):' /proc/meminfo` 可以获取更完整的原始数据"
+]
+
+quiz = [
+    {
+        "id": "linux-q071-quiz-01",
+        "question": "`free -h` 输出中，`free` 列显示 180Mi，`available` 列显示 7.2Gi。哪个数字才代表「系统当前能分配给新进程的内存量」？",
+        "choices": [
+            {"id": "A", "text": "`available` 列的 7.2Gi，它包含了可回收的 buff/cache，是内核对实际可用内存的估算"},
+            {"id": "B", "text": "`free` 列的 180Mi，它表示没有被任何进程或内核使用的纯空闲内存"},
+            {"id": "C", "text": "`total - used` 的结果，即总内存减去已用内存"},
+            {"id": "D", "text": "`buff/cache` 的值，因为这部分内存可以随时释放给进程"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "`available` 是正确答案。`free` 字段只统计完全未使用的内存，在 Linux 上这个值通常很小，因为内核会把空闲内存用来做 page cache，提升文件 I/O 性能。`available` 是内核对「如果分配内存给新进程，最多能提供多少」的估算，包含了 `free` + 可回收的 `buff/cache` + 可回收的 slab，是真正有意义的「可用内存」指标。`total - used` 不正确，因为 `used` 字段在不同版本 `free` 中定义不同，可能包含或不包含 buff/cache。"
+    },
+    {
+        "id": "linux-q071-quiz-02",
+        "question": "一台 32GB 内存的服务器，`free -h` 显示 `buff/cache` 为 18Gi，`available` 为 16Gi。此时启动一个需要 10GB 内存的新进程，最可能发生什么？",
+        "choices": [
+            {"id": "A", "text": "内核从 buff/cache 中回收约 10GB 的 page cache 供新进程使用，文件 I/O 缓存减少但服务正常运行"},
+            {"id": "B", "text": "系统触发 OOM killer，随机杀死一个正在运行的进程腾出空间"},
+            {"id": "C", "text": "新进程无法启动，返回「Cannot allocate memory」错误"},
+            {"id": "D", "text": "内核立即开始大量使用 swap 分区为新进程腾出物理内存"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "正确答案是 A。`available` 为 16Gi 意味着内核认为可以为新进程提供最多 16GB 内存，10GB 完全在这个范围内。Linux 内核会将 buff/cache 中不常用的页面回收掉，把物理内存交给新进程。这正是 Linux page cache 机制的设计目标——缓存随时可以被回收，不是固定占用的内存。OOM killer（B）只在 `available` 接近 0 时才会触发；新进程启动失败（C）也只发生在真正内存耗尽的情况；swap（D）是最后手段，`available` 还有 16Gi 时不会触发。"
+    },
+    {
+        "id": "linux-q071-quiz-03",
+        "question": "`vmstat` 输出中 `si` 和 `so` 两列分别代表什么？",
+        "choices": [
+            {"id": "A", "text": "`si` 是每秒从 swap 换入内存的数据量（KB/s），`so` 是每秒从内存换出到 swap 的数据量（KB/s）"},
+            {"id": "B", "text": "`si` 是系统中断次数（interrupts/s），`so` 是系统调用次数（syscalls/s）"},
+            {"id": "C", "text": "`si` 是 slab 分配器的 inode 缓存大小，`so` 是 slab 的 object 总数"},
+            {"id": "D", "text": "`si` 是共享内存读取速率，`so` 是共享内存写入速率"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "正确答案是 A。`si`（swap in）表示每秒从 swap 分区读回到物理内存的数据量，`so`（swap out）表示每秒从物理内存写到 swap 分区的数据量，单位都是 KB/s。这两个字段是判断系统是否存在内存压力的关键指标。选项 B 把 `si/so` 与中断和系统调用混淆了，中断和系统调用对应的是 `in`（interrupts）和 `cs`（context switches）列。选项 C 和 D 是完全无关的概念，不属于 vmstat 的字段语义。"
+    },
+    {
+        "id": "linux-q071-quiz-04",
+        "question": "`vmstat 1` 连续输出中，某一行显示 `so=1024, wa=42, b=5`。这最可能说明什么问题？",
+        "choices": [
+            {"id": "A", "text": "系统存在 swap thrashing：内存不足导致内核换出进程内存到磁盘，5 个进程阻塞于 swap I/O，CPU 有 42% 的时间在等待 I/O，性能严重恶化"},
+            {"id": "B", "text": "磁盘 I/O 负载很高，是因为有大量文件写入操作，与内存无关"},
+            {"id": "C", "text": "CPU 性能不足，42% 的等待时间说明需要升级 CPU"},
+            {"id": "D", "text": "swap 分区空间即将用完，`so=1024` 是 swap 剩余空间的告警值"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "正确答案是 A。`so=1024 KB/s` 说明内核每秒换出 1MB 到 swap，这是内存不足的直接证明。`b=5` 说明有 5 个进程正在等待 I/O（很可能是等待 swap 换入），`wa=42%` 说明 CPU 有 42% 的时间在空等 I/O 完成。三个指标同时出现是 swap thrashing 的经典特征，此时系统性能会从正常状态急剧下降。选项 B 混淆了文件 I/O 和 swap I/O，文件 I/O 通常不会产生如此高的 `wa`。选项 C 错误，`wa` 高是 I/O 瓶颈而非 CPU 瓶颈。选项 D 错误，`so` 是速率不是剩余容量。"
+    },
+    {
+        "id": "linux-q071-quiz-05",
+        "question": "以下 `vmstat 1` 的连续输出中，哪一行最能说明系统当前存在明显的内存压力？\n\n```\n r  b   swpd    free   buff  cache   si   so  wa\n 0  0  65536 8388608 204800 5242880   0    0   1\n 3  4  65536  512000  40960  819200 512  768  38\n 1  0  98304 7340032 204800 4980736   0    0   2\n```",
+        "choices": [
+            {"id": "A", "text": "第二行：b=4（4 个进程阻塞于 I/O），si=512、so=768（swap 大量换入换出），wa=38，是 thrashing 的典型特征"},
+            {"id": "B", "text": "第一行：swpd=65536 说明 swap 已在使用中，是内存压力的起点"},
+            {"id": "C", "text": "第三行：swpd 从 65536 增加到 98304，说明内存压力在持续恶化"},
+            {"id": "D", "text": "三行都有问题，只要 swpd 非零就说明系统存在内存压力"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "正确答案是 A。第二行同时出现了四个内存压力信号：`b=4`（有进程阻塞在 I/O）、`si=512 KB/s`（从 swap 换回内存）、`so=768 KB/s`（换出到 swap）、`wa=38%`（CPU 大量等待 I/O），同时 `free` 从 8GB 骤降到 512KB，`cache` 也从 5GB 降到 800MB，这是系统正在拼命回收所有缓存的表现。第一行（B）虽然 `swpd` 非零，但 `si=so=0` 说明 swap 没有活跃换入换出，是历史遗留的稳定 swap 使用，不代表当前有压力。第三行（C）虽然 `swpd` 增加，但 `si=so=0` 且 `free` 充足。D 选项的「swpd 非零即有压力」是典型误解。"
+    },
+    {
+        "id": "linux-q071-quiz-06",
+        "question": "运维同学看到 `free -h` 中 `free` 列只有 150Mi，立刻判断「服务器内存不足」，开始 kill 业务进程释放内存。这个操作正确吗？",
+        "choices": [
+            {"id": "A", "text": "不正确，应该先看 `available` 字段；如果 `available` 仍有几 GB，系统完全健康，150Mi 的 `free` 只是内核充分利用 page cache 的表现，不应该 kill 进程"},
+            {"id": "B", "text": "正确，`free` 低于 200Mi 是需要干预的标准阈值"},
+            {"id": "C", "text": "不正确，应该先执行 `echo 3 > /proc/sys/vm/drop_caches` 手动释放缓存，而不是 kill 进程"},
+            {"id": "D", "text": "正确，`free` 字段就是系统可用内存的准确值，低于 500Mi 就应该告警"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "正确答案是 A。`free` 字段表示完全未使用的内存，在 Linux 上这个值小是正常的，甚至是内核工作良好的表现——内核把空闲内存用来做 page cache，提升文件 I/O 性能。真正应该关注的是 `available` 字段，它才代表新进程能获得多少内存。如果 `available` 仍有 8GB，kill 进程只会导致业务中断，不会解决任何问题。选项 C 的 `drop_caches` 是危险操作，生产环境应该避免——清除缓存后文件 I/O 会大量回源磁盘，反而可能引发性能雪崩。"
+    },
+    {
+        "id": "linux-q071-quiz-07",
+        "question": "需要判断一台服务器过去 30 分钟内是否发生过内存泄漏，`free` 命令和 `vmstat` 命令，哪个更适合这个场景？",
+        "choices": [
+            {"id": "A", "text": "`vmstat`，配合 `-t` 参数持续采样并记录时间戳，可以观察 `free`、`swpd` 等指标随时间的变化趋势，识别内存持续下降的模式"},
+            {"id": "B", "text": "`free`，因为 `free -h` 的输出更易读，加上 `-s` 参数定时刷新同样可以追踪趋势"},
+            {"id": "C", "text": "两者等价，都只能看当前时刻的快照，判断内存泄漏需要用 `valgrind` 这类专用工具"},
+            {"id": "D", "text": "`free`，因为它比 `vmstat` 显示更多的内存指标，例如 shared 和 buff/cache 的细分"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "正确答案是 A。`vmstat` 天然支持时序采样：`vmstat -t 5` 每 5 秒输出一行并附带时间戳，可以很直观地看到 `free` 下降、`swpd` 上升的趋势，结合 `awk` 脚本还可以计算变化速率。`free` 虽然有 `-s` 参数可以循环输出，但它没有内置时间戳，输出格式也不利于 grep/awk 处理。值得注意的是，`vmstat` 的内存字段（`free`、`buff`、`cache`）和 `free` 命令的字段来源相同，都读 `/proc/meminfo`，只是 `vmstat` 的时序能力更强。"
+    },
+    {
+        "id": "linux-q071-quiz-08",
+        "question": "一台运行 Redis 的服务器，请求延迟从 1ms 突然飙升到 80ms，用 `vmstat 1` 实时观察，以下哪种输出特征最能证明是内存/swap 问题导致的？",
+        "choices": [
+            {"id": "A", "text": "`so` 列持续在 200 KB/s 以上，`wa` 列稳定在 25% 以上，`b` 列有 2-3 个进程持续处于 blocked 状态"},
+            {"id": "B", "text": "`cs`（上下文切换）列的值从 1000 次/秒升高到 8000 次/秒"},
+            {"id": "C", "text": "`cache` 列的值比平时小了 50%，说明 Redis 的 RDB 快照清除了 page cache"},
+            {"id": "D", "text": "`us`（用户态 CPU）列从 30% 升高到 75%，说明 Redis CPU 压力过大"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "正确答案是 A。Redis 对延迟极度敏感，从 1ms 到 80ms 的跳跃很典型地符合 swap 被触发的症状——一旦 Redis 的内存数据被换到磁盘，读取时触发 swap in，延迟直接从内存访问的纳秒级跳到 HDD 毫秒级或 SSD 数十微秒级。`so > 200 KB/s` + `wa > 25%` + `b > 0` 是 swap 活跃的铁证组合。选项 B 的高上下文切换通常是并发连接数暴增或锁竞争的表现，不直接导致 80ms 级别的延迟。选项 C 的 `cache` 减少对 Redis 影响不大，Redis 数据存在进程自己的堆内存中。选项 D 的 CPU 升高不会导致如此高的延迟倍数。"
+    },
+    {
+        "id": "linux-q071-quiz-09",
+        "question": "执行 `vmstat 1 10` 后，发现**第一行**显示 `si=128, so=256`，但第 2-10 行 `si=0, so=0`。这说明什么？",
+        "choices": [
+            {"id": "A", "text": "第一行是系统启动以来的统计均值，`si=128` 和 `so=256` 反映的是历史平均，不代表当前有 swap 活动；当前系统没有 swap 压力"},
+            {"id": "B", "text": "系统在采样开始时有 swap 活动，之后恢复正常，说明有间歇性内存压力"},
+            {"id": "C", "text": "`vmstat` 的第一行最准确，说明系统有稳定的 swap 使用"},
+            {"id": "D", "text": "第一行和后续行的差异说明 `vmstat` 的数据存在 bug，应该用 `sar -B` 替代"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "正确答案是 A。这是 `vmstat` 的一个经典陷阱：第一行显示的是从系统启动到当前时刻的**累积平均值**（total since boot / uptime），不是上一秒的实际数据。如果服务器运行了 100 天，历史上某次内存高峰时产生了一些 swap 活动，平摊到 100 天的均值后可能得出一个很小但非零的 `si`/`so`。后续行（从第二行起）才是真实的每秒实时采样数据。因此分析 `vmstat` 输出时，标准做法是忽略第一行，只看第二行及以后。这是 vmstat 文档中明确说明的行为，但很多人没有注意到。"
+    },
+    {
+        "id": "linux-q071-quiz-10",
+        "question": "`vmstat 1` 连续 15 分钟显示 `so` 稳定在 1500 KB/s，`wa` 在 35-45%，`b` 列有 4-6 个进程持续 blocked。下一步最合适的应急措施是什么？",
+        "choices": [
+            {"id": "A", "text": "用 `ps aux --sort=-%mem | head -20` 或 `smem -rs pss` 定位内存消耗最大的进程；同时用 `dmesg | grep -i 'out of memory'` 确认是否已有 OOM kill，再决定是重启泄漏进程还是扩容"},
+            {"id": "B", "text": "立即执行 `sync && echo 3 > /proc/sys/vm/drop_caches` 清除所有 page cache，一次性释放大量内存"},
+            {"id": "C", "text": "重启服务器，重启后内存恢复初始状态，是最快的应急手段"},
+            {"id": "D", "text": "通过 `dd` 命令临时扩大 swap 分区，给系统更多换出空间，缓解当前压力"}
+        ],
+        "correctAnswer": "A",
+        "explanation": "正确答案是 A。定位内存消耗最大的进程是最关键的第一步，因为增加 swap（D）只是掩盖问题，内存泄漏进程会持续吃掉更多内存；drop_caches（B）是非常危险的操作，在 swap thrashing 状态下强制清除 page cache 会让所有文件 I/O 立即回源磁盘，引发性能雪崩，生产环境严禁使用；重启服务器（C）虽然能临时解决问题，但找不到根因会反复发作。正确流程是：定位进程 → 确认是否已触发 OOM kill → 评估是重启泄漏进程（如果找到了）还是临时扩容（如果业务不能中断），同时跟进根因分析。"
+    }
+]
+
+references = [
+    "https://www.kernel.org/doc/html/latest/admin-guide/sysctl/vm.html",
+    "https://man7.org/linux/man-pages/man1/free.1.html",
+    "https://redis.io/docs/management/admin/#memory-allocation"
+]
+
+pack = {
+    "id": "linux-q071",
+    "name": "free 与 vmstat 分析内存使用",
+    "domain": "linux",
+    "description": "掌握 free 和 vmstat 命令分析 Linux 内存状态，理解 available、buff/cache、swap in/out、wa 等关键指标的含义与生产实践",
+    "version": "1.0.0",
+    "questions": [
+        {
+            "id": "linux-q071",
+            "domain": "linux",
+            "type": "trivia",
+            "difficulty": 2,
+            "tags": ["free", "vmstat", "memory", "swap", "page-cache", "linux-commands", "performance", "proc-meminfo"],
+            "title": "用 free 和 vmstat 命令分析 Linux 内存使用，各字段分别代表什么？",
+            "content": content,
+            "answer": answer,
+            "keyPoints": key_points,
+            "quiz": quiz,
+            "references": references
+        }
+    ]
+}
+
+output_path = r"C:\Users\RigelShrimp\questions\public\question-packs\linux\q071-free-vmstat.json"
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+with open(output_path, "w", encoding="utf-8") as f:
+    json.dump(pack, f, ensure_ascii=False, indent=2)
+
+print("Written successfully:", output_path)
+print("File size:", os.path.getsize(output_path), "bytes")
