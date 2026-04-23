@@ -1,0 +1,300 @@
+{
+  "id": "linux-q192",
+  "name": "生产环境容器日志收集方案设计",
+  "domain": "linux",
+  "description": "覆盖 Docker 日志驱动选型、DaemonSet 采集架构、多行日志处理、结构化日志推行与 Retention 策略的完整生产方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "linux-q192",
+      "domain": "linux",
+      "type": "project",
+      "difficulty": 4,
+      "tags": [
+        "docker",
+        "logging",
+        "fluentd",
+        "fluent-bit",
+        "log-rotation",
+        "structured-logging",
+        "kubernetes",
+        "elasticsearch",
+        "daemonset",
+        "sidecar"
+      ],
+      "title": "设计生产环境的容器日志收集方案",
+      "content": "你加入一家有 60 个微服务的电商平台，全部跑在自建 Kubernetes 集群（3 个 master、20 个 worker node，每个 node 16 核 64GB）上。现任 SRE 离职留下了一堆技术债：所有容器都使用默认的 `json-file` 日志驱动，完全没有配置任何 rotation 参数。\n\n上周凌晨 3 点，有一台 node 的 `/var/lib/docker/containers` 目录把磁盘 100% 写满，导致该 node 上所有容器直接挂掉。运维人员手动清理日志文件后重新拉起容器，但那段时间的日志全部丢失了。更糟糕的是，事故发生前没有任何告警——因为根本没人监控日志目录的磁盘占用。\n\n排查事故时你发现问题集中在三个地方：\n\n- **多行日志碎片化**：订单服务是 Java 应用，异常堆栈动辄 40 行，日志收集后每行都被当作独立事件处理，在 Kibana 里根本没法关联\n- **格式不统一**：各服务的日志格式混乱，有的打 plaintext，有的打 JSON，ELK 里查不到任何有意义的结构化字段，只能全文搜索\n- **无 Retention 策略**：日志量每天约 500GB，Elasticsearch 集群已有 2 个节点磁盘超过 85%，触发 read-only 保护\n\n总监开会说：「这套日志系统需要全面重设计，下周开始分阶段上线，优先保生产稳定，预算有限。」\n\n**请你设计一套完整的生产环境容器日志收集方案，至少覆盖以下维度：**\n\n1. Docker 日志驱动的选型——`json-file`、`syslog`、`fluentd`、`journald` 各自的适用场景与核心差异\n2. `/etc/docker/daemon.json` 中 `log-opts` 的关键配置项及其含义\n3. Node 级 DaemonSet 采集（Fluent Bit / Fluentd）与 Sidecar 模式的选型依据\n4. 多行日志（Java 堆栈、Python traceback）的合并处理策略\n5. 结构化日志的推行路径\n6. 日志 rotation 与 retention 的完整方案",
+      "answer": "## 先弄清楚 Docker 日志的底层路径\n\n很多人一提到容器日志收集，上来就说「部署一套 ELK 就好了」。这是把问题想简单了。Docker 的日志体系有三层：容器进程的 stdout/stderr → 日志驱动（logging driver）→ 存储或传输目标。大部分生产事故都出在第一层和第二层的衔接上——不是 Elasticsearch 挂了，而是日志根本没到 ES，或者到了但已经是乱的。\n\nDocker daemon 会捕获每个容器的 stdout/stderr 流，然后交给配置的 logging driver 处理。默认的 `json-file` driver 把每条日志以 JSON 格式写入宿主机的 `/var/lib/docker/containers/<container-id>/<container-id>-json.log`。这个文件有一个非常关键的特性：它在宿主机上，容器重启（`docker restart`）后文件依然存在，但容器被删除（`docker rm`）后文件随之消失。这就是为什么你会看到「容器重启日志还在，重新部署（删除旧容器）后日志全没了」的现象。\n\n```json\n// /var/lib/docker/containers/<id>/<id>-json.log 的实际条目格式\n{\"log\":\"2024-01-15 03:42:17 INFO  OrderService - order created: #12345\\n\",\"stream\":\"stdout\",\"time\":\"2024-01-15T03:42:17.382641521Z\"}\n```\n\n每一条日志包含三个字段：`log`（日志内容，含换行符）、`stream`（`stdout` 或 `stderr`）、`time`（纳秒精度的 RFC3339 时间戳）。`json-file` 的致命问题不是格式，而是**默认没有任何 rotation**。不配置 `max-size` 和 `max-file`，一个疯狂打日志的 Java 服务可以在几小时内把节点磁盘写满——你们那台 node 凌晨 3 点的事故就是这么来的。\n\n在了解了 `json-file` 的存储机制之后，再来看其他 driver 的定位就清晰很多了。`journald` driver 把容器日志写入 systemd 的 journal，优点是日志与宿主机系统日志统一管理，`journalctl -u docker` 可以一起查看，适合对 systemd 生态有强依赖的团队，但 journal 的查询性能在日志量大时会明显下降，而且在容器化程度很高的场景下 journal 反而成了瓶颈。`syslog` driver 把日志实时推送到 syslog 服务（本地或远程），延迟低，但如果 syslog 服务不可用，Docker 会直接丢弃日志而不是缓存——这在 syslog 服务重启或网络抖动时是不可接受的。`fluentd` driver 直接把日志以 TCP/UDP 发给 Fluentd 进程，优点是零中间文件，缺点是一旦 Fluentd 进程挂掉，写日志的容器就会阻塞（除非配置了 `async`，但 `async` 模式同样会在缓冲区满时丢日志）。\n\n综合这四种 driver 的特性，**在 Kubernetes 环境下，最稳健的选择依然是 `json-file` 先落本地磁盘，再由 DaemonSet 采集进程异步读取**。这个「先落盘再采集」的架构，让日志采集链路的任何故障都不会影响业务容器本身的正常运行。\n\n## 第一步：用 daemon.json 把地基打稳\n\n应急的第一件事不是部署 Fluentd，而是立刻给每台 node 的 `daemon.json` 加上 rotation 配置：\n\n```json\n// /etc/docker/daemon.json\n{\n  \"log-driver\": \"json-file\",\n  \"log-opts\": {\n    \"max-size\": \"100m\",\n    \"max-file\": \"5\",\n    \"compress\": \"true\",\n    \"tag\": \"{{.Name}}/{{.ID}}\"\n  }\n}\n```\n\n`max-size` 设置单个日志文件的最大体积，这里设为 100MB。达到上限后 Docker 会把当前文件重命名为 `<id>-json.log.1`，重新创建 `<id>-json.log` 继续写入，这就是 rotation。`max-file` 设置最多保留几个轮转文件（含当前文件），这里设为 5，意味着单个容器最多占用 500MB 磁盘。`compress` 设为 `true` 后，被轮转的旧文件（`.log.1`、`.log.2` 等）会被 gzip 压缩，实测对文本日志的压缩率在 70-85%，相当于把保留空间从 500MB 压缩到约 100MB。`tag` 字段给每条日志加上容器名和 ID 的标签，后续采集时用来区分来源。\n\n修改完 `daemon.json` 后需要执行 `systemctl restart docker`。需要注意的是，**已经在运行的容器不会自动继承新配置**，它们仍然按旧配置（无 rotation）写日志，需要滚动重启一遍才能生效。这在 Kubernetes 环境下可以通过 `kubectl rollout restart deployment` 来完成，不需要手动操作。\n\n## 第二步：DaemonSet 采集是正确架构\n\n日志落到宿主机磁盘后，下一步是采集。业界有两种主流模式：在每个 node 上跑一个 DaemonSet 收集该 node 所有容器的日志，或者给每个业务 Pod 注入一个 Sidecar 容器来读取日志。两种我都在生产上用过，结论是：**60 个微服务的规模，毫不犹豫选 DaemonSet**。\n\nDaemonSet 模式下，Fluent Bit 跑在每个 node 上，直接通过 `hostPath` mount `/var/lib/docker/containers` 目录，读取所有容器的日志文件。20 个 node 只需要 20 个 Fluent Bit 实例。Fluent Bit 是用 C 写的，空闲状态下内存占用不超过 30MB，CPU 几乎可以忽略不计。更重要的是，采集进程和业务容器完全解耦——Fluent Bit 挂掉或重启，业务容器的日志照样写入磁盘，等 Fluent Bit 恢复后从上次 offset 继续读取，不会丢日志（Fluent Bit 在 `/var/fluent-bit/tail-db/` 下维护每个文件的读取位置 db）。\n\nSidecar 模式的唯一实质性优势是隔离性——每个 Pod 可以有完全独立的解析配置，适合日志格式差异极大、无法统一的遗留系统。但它的代价是每个 Pod 多运行一个容器，60 个微服务假设每个微服务有 3 个副本，就是 180 个额外的 Sidecar 进程，资源浪费严重，而且 K8s 的调度、监控、资源配额管理都会变复杂。\n\nFluent Bit 的 DaemonSet 核心配置如下：\n\n```ini\n# fluent-bit-configmap.yaml（关键部分）\n[SERVICE]\n    Flush             5\n    Log_Level         info\n    Parsers_File      parsers.conf\n    HTTP_Server       On\n    HTTP_Listen       0.0.0.0\n    HTTP_Port         2020\n\n[INPUT]\n    Name              tail\n    Path              /var/lib/docker/containers/*/*.log\n    Parser            docker\n    Tag               kube.<var_log>\n    Refresh_Interval  5\n    Mem_Buf_Limit     50MB\n    Skip_Long_Lines   On\n    DB                /var/fluent-bit/tail-db/tail-containers-state.db\n\n[FILTER]\n    Name                kubernetes\n    Match               kube.*\n    Kube_URL            https://kubernetes.default.svc:443\n    Merge_Log           On\n    Keep_Log            Off\n    K8S-Logging.Parser  On\n\n[OUTPUT]\n    Name            es\n    Match           *\n    Host            elasticsearch.logging.svc\n    Port            9200\n    Index           fluentbit-%Y.%m.%d\n    Type            _doc\n    Retry_Limit     5\n```\n\n`DB` 参数是关键——它持久化每个日志文件的读取 offset，Fluent Bit 重启后不会从头重读已处理的日志，避免重复消费。`Mem_Buf_Limit` 限制 Fluent Bit 的内存缓冲，防止它在 ES 写入慢时把自己撑爆。`K8S-Logging.Parser` 允许通过 Pod 的 annotation（`fluentbit.io/parser: nginx`）来覆盖解析器，给特殊服务保留灵活性。\n\n## 第三步：多行日志合并是最难啃的骨头\n\nJava 的异常堆栈会被 `json-file` driver 按物理换行符切成几十条独立事件。Fluent Bit 1.8+ 内置了 `multiline` filter，可以把连续的堆栈行合并回一条事件：\n\n```ini\n[FILTER]\n    Name              multiline\n    Match             kube.*java*\n    multiline.key     log\n    multiline.parser  java\n```\n\n内置的 `java` multiline parser 使用正则规则识别「以时间戳开头的行」作为新事件的起始，后续不以时间戳开头的行都归并到上一条事件的 `log` 字段里。Python 的 traceback 也有类似的内置 parser（`python`）。\n\n但更根本的解法是**在应用层就输出单行 JSON**。如果 Java 服务用 Logback 配置 `LogstashEncoder`，异常堆栈会被序列化成单条 JSON 的 `stack_trace` 字段，根本不存在多行问题，同时还顺带把 traceId、spanId 等字段带上，与链路追踪系统直接打通：\n\n```json\n{\"timestamp\":\"2024-01-15T03:42:17.382Z\",\"level\":\"ERROR\",\"logger\":\"com.example.OrderService\",\"message\":\"NullPointerException in processOrder\",\"stack_trace\":\"java.lang.NullPointerException: Cannot invoke getId()\\n\\tat com.example.OrderService.processOrder(OrderService.java:142)...\",\"traceId\":\"4bf92f3577b34da6\",\"spanId\":\"00f067aa0ba902b7\"}\n```\n\n推行结构化日志不能靠口头约定，要靠「基础库封装 + 架构规范」双管齐下：封装一个公司内部的 log 库，默认输出 JSON，统一 `level`、`service`、`traceId` 等字段名，所有新服务强制使用，旧服务按优先级排期迁移。Fluent Bit 的 `Merge_Log On` 配置会把日志内容里的 JSON 自动展开成 ES 的顶层字段，在 Kibana 里就可以直接对 `level`、`service` 等字段做过滤和聚合。\n\n## 第四步：用 ILM 让 Retention 自动化\n\n每天 500GB 日志，不做 Retention，14 天就是 7TB。Elasticsearch 的 ILM（Index Lifecycle Management）是标准答案，配合 Fluent Bit 的按天分索引（`fluentbit-2024.01.15`），可以精确地对整个索引执行生命周期策略：\n\n- **Hot 阶段（0–7 天）**：日志处于活跃查询期，放在有 NVMe SSD 的 hot 节点，保持完整索引和 1 个副本\n- **Warm 阶段（7–30 天）**：查询频率降低，迁移到 warm 节点，执行 `force_merge` 把 segment 合并为 1 个，减少内存占用\n- **Cold 阶段（30–90 天）**：基本只剩审计需求，可以把副本降为 0，挂载到更便宜的 HDD 存储\n- **Delete 阶段（90 天后）**：整个索引直接删除，不需要逐文档扫描\n\nILM 策略把 ES 存储需求从「无限增长」收敛成稳定的 4–5TB 滚动窗口。在此基础上，还需要在 ES 集群上配置 watermark 告警：`cluster.routing.allocation.disk.watermark.low: 75%` 时告警，`85%` 时 ES 自动停止分配新 shard，`90%` 时触发只读保护——你们当前的事故就是因为直接到了 85% 才发现。\n\n## 一个让面试官眼前一亮的补充\n\n大部分候选人说到「Fluent Bit + Elasticsearch」就停了。以下几个进阶点可以体现你在生产上真正踩过坑：第一，在 Fluent Bit 和 ES 之间加一层 Kafka 作为缓冲，Fluent Bit 把日志写到 Kafka topic，另一个消费进程（Logstash 或 Flink）读取后再写 ES。这个缓冲层可以完全隔离 ES 抖动对采集链路的影响，在 ES 维护或扩容期间采集不中断。第二，`json-file` 的 `compress` 选项在 Docker 24.0 之前有一个已知 bug：`docker logs` 命令无法解压并显示被压缩的轮转文件（只能看到当前文件），如果你的运维 SOP 里有 `docker logs` 排障步骤，在升级 Docker 版本之前要谨慎开启 `compress`。第三，Kubernetes 1.28 开始在 kubelet 的配置文件里提供了 `containerLogMaxSize` 和 `containerLogMaxFiles` 参数，可以覆盖 Docker daemon 的 `log-opts` 设置，实现集群级统一管理，比挨台机器修改 `daemon.json` 更规范、更易维护。",
+      "keyPoints": [
+        "Docker 日志驱动有 json-file、journald、syslog、fluentd 四种常用选型，生产环境推荐 json-file 先落本地磁盘再异步采集，这样采集链路故障不会影响业务容器正常运行",
+        "必须在 /etc/docker/daemon.json 中配置 max-size 和 max-file 参数开启日志 rotation，否则默认无上限写入会打满节点磁盘；compress 可进一步节省 70-85% 存储空间",
+        "60 个以上微服务的规模应选择 node 级 DaemonSet 采集（Fluent Bit），资源开销远小于 Sidecar 模式；Fluent Bit 用 DB 参数持久化 offset，保证重启后不重复消费、不丢日志",
+        "多行日志（Java 堆栈）的最终解法是在应用层用 LogstashEncoder 等库输出单行 JSON，把堆栈序列化进 stack_trace 字段；Fluent Bit 的 multiline filter 是过渡期的补救方案",
+        "Fluent Bit 的 Merge_Log On 配置会把 log 字段中的 JSON 自动展开成 ES 顶层字段，推行结构化 JSON 日志后就能在 Kibana 直接对 level、service、traceId 做过滤",
+        "Elasticsearch ILM 配合 Fluent Bit 按天分索引是 Retention 的标准方案，把 Hot→Warm→Cold→Delete 四个阶段的时限配置好，存储需求从无限增长收敛为可控的滚动窗口",
+        "fluentd driver 直接推送到网络时若 Fluentd 进程不可用会阻塞容器写日志，严重时导致容器卡死，这是比 json-file 磁盘写满更危险的故障模式",
+        "Kubernetes 1.28+ 可通过 kubelet 的 containerLogMaxSize 和 containerLogMaxFiles 参数集群级覆盖 Docker daemon 的 log-opts，比每台机器单独维护 daemon.json 更规范"
+      ],
+      "quiz": [
+        {
+          "id": "linux-q192-q1",
+          "question": "Docker 默认的 json-file logging driver 把日志写到宿主机的哪个路径？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "/var/lib/docker/containers/<container-id>/<container-id>-json.log"
+            },
+            {
+              "id": "B",
+              "text": "/var/log/docker/<container-name>.log"
+            },
+            {
+              "id": "C",
+              "text": "/run/docker/logs/<container-id>.log"
+            },
+            {
+              "id": "D",
+              "text": "/tmp/docker/<container-id>/stdout.log"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "json-file driver 把每个容器的日志写入 `/var/lib/docker/containers/<container-id>/<container-id>-json.log`，这是 Docker 的标准存储位置。B 选项 `/var/log/docker/` 是一个很常见的误答，实际上该目录默认不存在，是 systemd 或 journald 管理 docker 服务日志的地方，而非容器日志。C 和 D 都是不存在的路径。了解这个真实路径非常重要，因为 DaemonSet 采集时就是 mount 这个 `hostPath` 读取日志文件，rotation 后的轮转文件（如 `<id>-json.log.1`）也在同一目录下。"
+        },
+        {
+          "id": "linux-q192-q2",
+          "question": "在 /etc/docker/daemon.json 中设置了 json-file 的 max-size 和 max-file 参数后，对已在运行的容器，该配置何时生效？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "修改 daemon.json 后立即对所有容器生效，无需重启"
+            },
+            {
+              "id": "B",
+              "text": "执行 systemctl reload docker 后对新创建的日志文件生效"
+            },
+            {
+              "id": "C",
+              "text": "执行 systemctl restart docker 后，只对新创建的容器生效；已运行的容器需要重启才能继承新配置"
+            },
+            {
+              "id": "D",
+              "text": "需要 docker system prune 清理所有容器后重新部署才能生效"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是生产上非常容易踩的坑。修改 `daemon.json` 后必须 `systemctl restart docker` 让 Docker daemon 重新加载配置，但**已经在运行的容器**不会继承新配置——它们的日志文件句柄在容器启动时已经绑定到旧的 logging driver 配置上了。只有在重启 Docker daemon 后**新创建**的容器才会使用新配置。在 Kubernetes 环境下，通过 `kubectl rollout restart deployment` 滚动重启所有 Pod，让新容器以新配置启动。A 选项完全错误，热重载不影响运行中容器。B 选项的 `reload` 只是让 systemd 重新读取 unit 文件，并不等同于 Docker daemon 重载配置。D 选项会造成不必要的服务中断。"
+        },
+        {
+          "id": "linux-q192-q3",
+          "question": "在 60 个微服务、20 个 K8s worker node 的规模下，选择 DaemonSet 采集而非 Sidecar 采集的最核心理由是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "DaemonSet 支持多行日志合并，Sidecar 模式不支持"
+            },
+            {
+              "id": "B",
+              "text": "DaemonSet 每个 node 只需一个采集进程，资源开销与微服务数量无关；Sidecar 模式下每个 Pod 都有一个采集容器，规模越大浪费越多"
+            },
+            {
+              "id": "C",
+              "text": "DaemonSet 采集的日志不会丢失，Sidecar 采集会因为容器重启丢失日志"
+            },
+            {
+              "id": "D",
+              "text": "Sidecar 模式无法访问 /var/lib/docker/containers 目录，所以无法使用"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "DaemonSet 采集最核心的优势是资源效率与运维复杂度。20 个 node 只需要 20 个 Fluent Bit 实例，每个实例约 30MB 内存，总开销极低，且与业务微服务数量无关——新增微服务不需要任何采集层变更。Sidecar 模式则是 Pod 数量 × 副本数个采集容器，60 个微服务每个 3 个副本就是 180 个额外进程，K8s 的资源配额、调度、监控都会变复杂。A 选项错误，两种模式都支持多行合并。C 选项错误，两种模式在容器重启时的日志保留行为取决于日志是否落盘，与采集模式无关。D 选项也是错误的，Sidecar 是通过共享 Volume 读取日志文件，而不是直接读 docker 目录。"
+        },
+        {
+          "id": "linux-q192-q4",
+          "question": "Fluent Bit 与 Fluentd 在生产环境中最主要的选型差异是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Fluent Bit 只能运行在 Linux，Fluentd 支持 Windows"
+            },
+            {
+              "id": "B",
+              "text": "Fluent Bit 用 C 编写，内存占用约 450KB 核心 + 运行时约 30MB，适合资源受限的 node agent；Fluentd 用 Ruby 编写，内存通常 200-400MB，更适合作为日志聚合层"
+            },
+            {
+              "id": "C",
+              "text": "Fluent Bit 不支持输出到 Elasticsearch，只能输出到 Kafka"
+            },
+            {
+              "id": "D",
+              "text": "Fluentd 性能更好，在高吞吐场景下建议用 Fluentd 替换 Fluent Bit"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Fluentd 生态最重要的架构知识点。Fluent Bit 是轻量级 forwarder，C 语言编写，核心库只有约 450KB，加上运行时内存占用通常在 30MB 以内，非常适合在每个 node 上作为 DaemonSet agent 部署。Fluentd 是 Ruby 编写的聚合层，插件生态更丰富（有 1000+ 插件），但内存占用在 200-400MB 之间，不适合大规模部署在每个 node 上。经典架构是：Fluent Bit（每个 node）→ Kafka/Fluentd 聚合层 → Elasticsearch。A 选项错误，两者都支持多平台。C 选项完全错误，Fluent Bit 有官方的 ES output 插件。D 选项也是错的，Fluent Bit 在单机吞吐上因为 C 实现反而更高效。"
+        },
+        {
+          "id": "linux-q192-q5",
+          "question": "以下 daemon.json 配置中，compress 选项在 Docker 24.0 之前有一个已知 bug，会影响哪个操作？\n\n```json\n{\n  \"log-driver\": \"json-file\",\n  \"log-opts\": {\n    \"max-size\": \"100m\",\n    \"max-file\": \"5\",\n    \"compress\": \"true\"\n  }\n}\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Fluent Bit 无法读取被压缩的 .log.1、.log.2 等轮转文件"
+            },
+            {
+              "id": "B",
+              "text": "docker logs 命令无法显示已被压缩的轮转文件内容，只能查看当前活跃文件"
+            },
+            {
+              "id": "C",
+              "text": "compress 选项会导致 json-file 写入性能下降 50% 以上"
+            },
+            {
+              "id": "D",
+              "text": "compress 选项与 max-file 互斥，同时配置会导致 Docker daemon 启动失败"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个真实存在的 Docker bug（在 Docker 24.0 之前的版本中）。开启 `compress` 后，轮转的旧文件会被 gzip 压缩成 `.log.1.gz`、`.log.2.gz` 等，`docker logs` 命令在 24.0 之前无法解压并展示这些文件的内容——运行 `docker logs <container>` 只能看到当前 `.log` 文件的内容，历史 rotate 文件对 `docker logs` 命令不可见。对于 Fluent Bit 等采集工具来说这不是问题，因为 Fluent Bit 在文件 rotate 时（文件被重命名前）已经通过 inotify 读完了内容。但如果你的运维 SOP 里有用 `docker logs` 命令排查问题的流程，在升级到 Docker 24.0+ 之前要特别注意这一点，或者暂时不开启 compress。"
+        },
+        {
+          "id": "linux-q192-q6",
+          "question": "使用 fluentd logging driver（非 json-file）直接推送日志时，如果 Fluentd 进程重启，容器的日志写入会发生什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Docker 会自动降级到 json-file，Fluentd 恢复后再切回"
+            },
+            {
+              "id": "B",
+              "text": "日志会缓存在容器内存中，Fluentd 恢复后一次性发送"
+            },
+            {
+              "id": "C",
+              "text": "默认配置下，Docker 会阻塞日志写入操作，严重时导致容器应用卡死；配置 async 模式则会在缓冲区满时丢弃日志"
+            },
+            {
+              "id": "D",
+              "text": "日志会写入 /tmp/docker-log-buffer/ 目录，不影响容器运行"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是选用 network-based logging driver（fluentd、syslog 等）时最危险的副作用，也是生产上出过故障的真实案例。当 fluentd driver 无法连接到 Fluentd 进程时，Docker 默认会同步等待，日志写入操作被阻塞。对于 Java 这类日志写入频繁的应用，阻塞的日志写入会迅速传播导致整个应用 hang 住。即使配置了 `fluentd-async: true`，Docker 使用内存缓冲区，缓冲区满（默认 8MB）后也会开始丢弃日志，而不是写盘。相比之下，json-file driver 写本地磁盘，采集层故障对业务容器完全透明，这就是推荐「先落盘再采集」架构的根本原因。A、B、D 都是不存在的自动降级机制，Docker 没有实现这些逻辑。"
+        },
+        {
+          "id": "linux-q192-q7",
+          "question": "Fluent Bit 配置中，DB 参数（如 DB /var/fluent-bit/tail-db/tail-containers-state.db）的主要作用是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "存储 Fluent Bit 的运行时指标，供 Prometheus 抓取"
+            },
+            {
+              "id": "B",
+              "text": "持久化每个日志文件的读取 offset，使 Fluent Bit 重启后从上次位置继续读取，避免重复消费或丢失日志"
+            },
+            {
+              "id": "C",
+              "text": "缓存待发送到 Elasticsearch 的日志数据，ES 不可用时存入 DB 等待重试"
+            },
+            {
+              "id": "D",
+              "text": "记录已经完成 rotation 的旧日志文件路径，避免重复 rotate"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Fluent Bit 的 `tail` input 插件通过 inotify 监听日志文件，并使用 SQLite 数据库文件持久化每个被跟踪文件的 inode、读取位置（offset）和修改时间。当 Fluent Bit 因 OOM 被 K8s 重启，或者节点重启后重新拉起时，它会读取这个 DB 文件，找到每个日志文件上次读到的位置，从那里继续读取——既不会漏掉宕机期间写入的日志，也不会重新读取已经处理过的内容。如果不配置 DB，Fluent Bit 每次重启都从文件末尾开始读（`Read_from_Head Off`），重启期间写入的日志就丢了；如果设置了 `Read_from_Head On` 但不用 DB，则每次重启都从文件开头读，导致大量重复消费。"
+        },
+        {
+          "id": "linux-q192-q8",
+          "question": "Java 服务输出了多行异常堆栈，在 Fluent Bit 使用 multiline filter 之前，每行是作为独立事件处理的根本原因是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Fluent Bit 的 tail 插件默认每次只读 1 个字节，天然按字节分割"
+            },
+            {
+              "id": "B",
+              "text": "json-file driver 在写入日志文件时以换行符（\\n）为分隔符，每行写入一条 JSON 对象，采集时自然每行是一个独立事件"
+            },
+            {
+              "id": "C",
+              "text": "Java 的 Log4j/Logback 框架在写入 stdout 时会给每行加独立的时间戳，导致采集器认为它们是不同事件"
+            },
+            {
+              "id": "D",
+              "text": "Kubernetes 的 kubelet 在转发容器日志时会主动按行分割"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "根本原因在于 json-file driver 的设计：它捕获容器的 stdout/stderr 流时，以换行符作为日志事件的边界，每遇到一个 `\\n` 就把从上个换行符到这里的内容包装成一条 JSON 写入文件。Java 异常堆栈本身有 30-40 行，`json-file` 就会写入 30-40 条独立的 JSON 对象，每条只包含一行内容。Fluent Bit 读取文件时自然按行读取，就得到了 30-40 个独立事件。multiline filter 的工作就是用正则规则识别「这一行是新事件的开头还是上一个事件的延续」，把延续行重新附加到上一个事件的 `log` 字段里，重新合并成一个完整的堆栈。A、C、D 都是对日志碎片化原因的错误理解。"
+        },
+        {
+          "id": "linux-q192-q9",
+          "question": "Elasticsearch ILM（Index Lifecycle Management）策略中，Warm 阶段通常会执行 force_merge 操作，这个操作的主要目的是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "把 ES 索引从 NVMe SSD 节点迁移到 HDD 节点"
+            },
+            {
+              "id": "B",
+              "text": "把索引的多个 Lucene segment 合并为更少的 segment（通常合并为 1 个），减少文件句柄数量和内存占用，提升查询性能"
+            },
+            {
+              "id": "C",
+              "text": "强制触发 ES 对该索引执行快照备份到 S3"
+            },
+            {
+              "id": "D",
+              "text": "把索引的副本数从 1 降为 0，释放磁盘空间"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Elasticsearch 的每个索引在写入阶段会持续产生新的 Lucene segment，segment 越多，每次搜索需要查询的文件越多，内存占用也越大（每个 segment 要在内存中维护倒排索引的部分结构）。对于已经不再写入的历史索引（Warm 阶段），执行 `force_merge` 把所有 segment 合并为 1 个，可以显著减少文件句柄数和内存占用，同时因为只需要读一个 segment，搜索速度也更快。这个操作是 CPU 和 IO 密集的，对正在大量写入的 Hot 阶段索引不适合执行，所以要等到 Warm 阶段才触发。A 选项描述的是 ILM 的节点分配策略（`_tier_preference`），是另一个功能。C 和 D 选项都是 ILM 的其他独立操作，不是 force_merge 的作用。"
+        },
+        {
+          "id": "linux-q192-q10",
+          "question": "生产环境中，Fluent Bit DaemonSet 突然报告 \"No space left on device\" 错误并停止采集，此时最可能的原因和首要排查步骤是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Elasticsearch 磁盘满触发了 read-only 保护，Fluent Bit 无法写入导致报错；首要步骤是检查 ES 集群磁盘使用率"
+            },
+            {
+              "id": "B",
+              "text": "宿主机 /var/lib/docker/containers 目录所在分区磁盘满（通常是 /var/lib/docker 挂载点），日志 rotation 未配置或配置值过大；首要步骤是在 node 上执行 df -h 确认磁盘使用率"
+            },
+            {
+              "id": "C",
+              "text": "Fluent Bit 自身的 DB 文件（tail-db）所在目录磁盘满；首要步骤是查看 /var/fluent-bit 目录大小"
+            },
+            {
+              "id": "D",
+              "text": "容器内部 tmpfs 满了，与宿主机磁盘无关；首要步骤是重启 DaemonSet Pod"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「No space left on device」是操作系统的 ENOSPC 错误，意味着某个文件系统分区已满。在容器日志场景下，最可能的罪魁祸首是 `/var/lib/docker` 所在的分区被日志文件打满——这正是这道题原始事故的复现场景。首要排查步骤：在宿主机上执行 `df -h` 查看各挂载点使用率，再用 `du -sh /var/lib/docker/containers/*` 找到体积最大的容器日志目录，用 `ls -lh /var/lib/docker/containers/<id>/` 确认是否有未受 rotation 限制的超大 `.log` 文件。修复方向：立即手动删除最大的旧 rotate 文件（`.log.1`、`.log.2`）释放空间，然后检查并修复 `daemon.json` 的 rotation 配置。A 选项的 ES read-only 不会导致 Fluent Bit 本地报 ENOSPC。C 选项的 tail-db 是 SQLite 文件，极少超过几 MB，几乎不会是原因。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Docker Logging Drivers 官方文档",
+          "url": "https://docs.docker.com/config/containers/logging/configure/"
+        },
+        {
+          "title": "Fluent Bit 官方文档 — Kubernetes Filter",
+          "url": "https://docs.fluentbit.io/manual/pipeline/filters/kubernetes"
+        },
+        {
+          "title": "Elasticsearch ILM 官方文档",
+          "url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/index-lifecycle-management.html"
+        },
+        {
+          "title": "Fluent Bit Multiline 解析配置",
+          "url": "https://docs.fluentbit.io/manual/pipeline/filters/multiline-stacktrace"
+        }
+      ]
+    }
+  ]
+}
