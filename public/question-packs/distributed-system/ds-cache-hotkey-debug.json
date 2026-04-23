@@ -1,0 +1,169 @@
+{
+  "id": "ds-cache-hotkey-debug",
+  "name": "Redis 热 Key 排查与处理",
+  "domain": "distributed-system",
+  "description": "掌握 Redis 热 Key 的发现手段（monitor、hotkeys、客户端统计），以及本地缓存、key 打散、读写分离等解决方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-cache-hotkey-debug-q1",
+      "domain": "distributed-system",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["redis", "hot-key", "redis-cluster", "performance", "distributed-cache", "debugging"],
+      "title": "双十一大促时 Redis Cluster 某节点 CPU 飙到 90%，其他节点只有 20%，怎么排查？",
+      "content": "双十一大促，你负责的商品服务告警打来：Redis Cluster 中 node-3（`10.10.1.3:7003`）的 CPU 使用率突然飙到 90%，而集群其余 5 个节点都在 20% 左右。与此同时，上游 Nginx 的 upstream 超时率从基线 0.1% 上升到了 5%，用户侧表现为商品详情页白屏概率明显升高。\n\n你的监控截图显示：\n\n```\n[ALERT] Redis Cluster Node CPU\nnode-3 (10.10.1.3:7003): 89.7%  ← 触发告警阈值 80%\nnode-1 (10.10.1.1:7001): 18.2%\nnode-2 (10.10.1.2:7002): 21.4%\nnode-4 (10.10.1.4:7004): 19.8%\nnode-5 (10.10.1.5:7005): 22.1%\nnode-6 (10.10.1.6:7006): 17.6%\n\n[ALERT] Upstream Timeout Rate\nproduct-service → redis: 5.12%  (baseline: 0.08%)\n```\n\n同事 A 说「是不是 node-3 的机器有问题，重启一下」；同事 B 说「应该是缓存雪崩，批量 key 同时过期了」。你会怎么系统地排查和处理这个问题？请给出从现象到止血再到根因的完整思路，包括具体的命令和预期输出。",
+      "answer": "## 第一步：先建立对 Redis Cluster 和热 Key 问题的认知框架\n\nRedis Cluster 是 Redis 官方提供的分布式方案，它把整个 key 空间划分为 16384 个哈希槽（hash slot），每个节点负责其中一部分。当你写入一个 key 时，Redis 对 key 名（或 `{}` 包裹的 key tag）做 CRC16 取模，得到一个 0-16383 的槽号，然后路由到对应的主节点写入。理想情况下，如果 key 分布均匀，各节点承载的请求量应该大致相同。\n\n热 Key（Hot Key）问题的本质是「数据倾斜导致的请求倾斜」。某一个或某几个特定的 key 被极高频率访问，而这些 key 恰好都映射到同一个哈希槽，落在同一个节点上。Redis 是单线程处理命令的（6.0 的 I/O 多线程只处理网络读写，命令执行仍是单线程），一旦某个节点每秒要处理 15 万次 GET 命令，CPU 自然会被打满。典型的热 Key 场景：大促期间的爆款商品 ID（全平台几十万用户同时刷同一件商品）、热门话题 ID、热门直播间 ID。`product:flash-sale:10086` 这类 key 在大促高峰每秒被读取几十万次，完全正常。\n\n这道题有个关键的前置判断：同事 B 说的「缓存雪崩」是指大批 key 同时过期，导致请求全部打到数据库，那应该表现为数据库压力飙升、Redis 命中率下降，而不是 Redis 某个节点 CPU 飙升。眼下的现象是 Redis 内部各节点负载极度不均衡，这是热 Key 的典型症状。同事 A 说的「重启节点」不能解决问题，重启后 key 还在那个节点，流量一来 CPU 立刻再次飙升。\n\n## 第二步：系统排查——从确认问题到定位根因\n\n**第一关：确认是节点请求不均，而非机器硬件问题**\n\n最快的办法是对比各节点的实时 ops/sec，直接连到每个节点查 `info stats`：\n\n```bash\n# 对 6 个节点逐一执行（或写个 for 循环）\nfor node in 10.10.1.1:7001 10.10.1.2:7002 10.10.1.3:7003 10.10.1.4:7004 10.10.1.5:7005 10.10.1.6:7006; do\n  echo -n \"$node → \"\n  redis-cli -h ${node%:*} -p ${node#*:} info stats | grep instantaneous_ops_per_sec\ndone\n\n# 预期输出：\n# 10.10.1.1:7001 → instantaneous_ops_per_sec:18420\n# 10.10.1.2:7002 → instantaneous_ops_per_sec:21038\n# 10.10.1.3:7003 → instantaneous_ops_per_sec:152847  ← 超出其他节点 7 倍\n# 10.10.1.4:7004 → instantaneous_ops_per_sec:19234\n# 10.10.1.5:7005 → instantaneous_ops_per_sec:22109\n# 10.10.1.6:7006 → instantaneous_ops_per_sec:17683\n```\n\nnode-3 的 ops/sec 是其他节点的 7 倍，这直接排除了「机器硬件问题」的可能——硬件问题不会导致请求量异常高，只会让处理能力下降。现在可以确定：node-3 收到的请求量远超正常水平，是请求倾斜，不是机器问题。\n\n**第二关：找出热 Key 是谁**\n\n定位热 Key 有三种手段，生产环境要按场景选择。\n\n**方法一：`redis-cli --hotkeys`（Redis 4.0+，需配合 LFU 淘汰策略）**\n\nRedis 4.0 引入了 LFU（Least Frequently Used）淘汰策略，在 LFU 模式下，每个 key 的元数据里会记录访问频率。`--hotkeys` 命令就是基于这个频率计数扫描整个 keyspace 找出热 key：\n\n```bash\n# 前提：redis.conf 中 maxmemory-policy 设置为 allkeys-lfu 或 volatile-lfu\nredis-cli -h 10.10.1.3 -p 7003 --hotkeys\n\n# 预期输出：\n# ===  Scanning the entire keyspace to find hot keys ===\n# [00.00%] Hot key 'product:flash-sale:10086' found so far with counter 8923847\n# [12.34%] Hot key 'product:flash-sale:10086' found so far with counter 8923847\n# -------- summary -------\n# Sampled 284719 keys in the keyspace!\n# hot key found with counter: 8923847    keyname: product:flash-sale:10086\n# hot key found with counter: 1823441    keyname: product:flash-sale:20234\n```\n\n频率计数 8923847 意味着这个 key 在 LFU 时间窗口内被访问了近 900 万次，与其他 key 相比高出 4 个数量级，热 Key 一目了然。\n\n不过这个方法有个前提：必须开启 LFU 淘汰策略。如果线上用的是 `allkeys-lru` 或没有配置淘汰策略，`--hotkeys` 扫描出来的结果没有意义，所有 key 的计数都是 0。这时要用方法二或方法三。\n\n**方法二：`monitor` 命令采样（生产环境谨慎使用）**\n\n`monitor` 会把 Redis 实例收到的所有命令实时输出到终端。它的优点是不需要任何前置配置，缺点是会消耗大量 CPU 和网络带宽——在高 QPS 节点上执行 `monitor`，Redis 本身的性能会下降 30%-50%。所以生产上用 `monitor` 必须快进快出，采样 1000 条就够了：\n\n```bash\n# 采样 1000 条命令，统计 key 频率\nredis-cli -h 10.10.1.3 -p 7003 monitor | head -n 1000 | \\\n  grep -oP '\"[^\"]+\"' | awk 'NR%2==0' | \\\n  sort | uniq -c | sort -rn | head -20\n\n# 预期输出（第一列是出现次数，第二列是 key 名）：\n# 892 \"product:flash-sale:10086\"\n#  71 \"product:flash-sale:20234\"\n#  43 \"user:session:xxxxxxxx\"\n#  ...\n```\n\n在 1000 条采样中，`product:flash-sale:10086` 出现了 892 次，占比接近 90%，这个 key 就是元凶。\n\n**方法三：客户端埋点统计（最推荐的生产方案）**\n\n方法一和方法二都是事后诊断，只能在出问题后去查。更好的做法是在 Redis 客户端封装层做实时计数。以 Java Lettuce 客户端为例，可以实现一个 `CommandLatencyCollector` 或者在 AOP 切面里统计每个 key 的访问次数，每 30 秒上报 Top 100 热 Key 到监控系统：\n\n```java\n// 简化版客户端埋点：用 ConcurrentHashMap 做滑动窗口计数\npublic class HotKeyDetector {\n    // 使用 LongAdder 避免高并发下的 CAS 竞争\n    private final ConcurrentHashMap<String, LongAdder> counter = new ConcurrentHashMap<>();\n    private static final int TOP_N = 100;\n    private static final long REPORT_INTERVAL_MS = 30_000;\n\n    public void record(String key) {\n        // computeIfAbsent 确保线程安全地初始化计数器\n        counter.computeIfAbsent(key, k -> new LongAdder()).increment();\n    }\n\n    // 定时任务：每 30 秒 dump 一次 Top 100，然后清零\n    @Scheduled(fixedDelay = REPORT_INTERVAL_MS)\n    public void reportAndReset() {\n        counter.entrySet().stream()\n            .sorted((a, b) -> Long.compare(b.getValue().sum(), a.getValue().sum()))\n            .limit(TOP_N)\n            .forEach(e -> metrics.gauge(\"redis.hotkey\", e.getValue().sum(),\n                Tags.of(\"key\", e.getKey())));\n        counter.clear(); // 清零，开始下一个统计窗口\n    }\n}\n```\n\n这种方式不依赖 Redis 端的任何配置，零侵入，而且可以在问题出现前就感知到热 Key 的趋势，做到提前预警。\n\n**第三关：确认热 Key 来自哪个业务**\n\n找到热 Key 名称 `product:flash-sale:10086` 之后，还需要知道是谁在读它，不然解决方案可能会遗漏某条访问路径。两个手段：一是在代码仓库中全局搜索 `flash-sale` 找到所有读写这个 key 的代码路径；二是通过调用链追踪（如 SkyWalking、Jaeger）在 Trace 里找到携带这个 key 操作的 Span，定位到具体的服务名和接口名。大促场景下通常是商品详情接口、购物车接口、活动页聚合接口三个地方在高频读。\n\n## 第三步：应急止血——先让系统活下来\n\n排查过程不超过 5 分钟，找到热 Key 之后，最优先的事情是止血，让超时率降下来，而不是急着改代码重新发布。\n\n**方案一：本地缓存（最快，分钟级生效）**\n\n在应用服务器上加一层 JVM 内存缓存（Caffeine），TTL 设 3-5 秒，热 Key 的读请求先打本地缓存，未命中才回 Redis。商品大促场景下，商品信息 3 秒内不变完全可以接受：\n\n```java\n// 引入 Caffeine 依赖（Maven/Gradle）\n// com.github.ben-manes.caffeine:caffeine:3.1.8\n\n@Service\npublic class ProductCacheService {\n    // 本地热 Key 缓存：最多 500 个 entry，写入 5 秒后过期\n    private final Cache<String, Product> localCache = Caffeine.newBuilder()\n        .maximumSize(500)\n        .expireAfterWrite(5, TimeUnit.SECONDS)\n        .recordStats()  // 开启统计，用于监控命中率\n        .build();\n\n    public Product getProduct(String productId) {\n        String redisKey = \"product:flash-sale:\" + productId;\n        // 先查本地缓存\n        Product cached = localCache.getIfPresent(redisKey);\n        if (cached != null) {\n            return cached;  // 命中本地缓存，不走 Redis\n        }\n        // 本地未命中，查 Redis\n        Product product = redisTemplate.opsForValue().get(redisKey);\n        if (product != null) {\n            localCache.put(redisKey, product);  // 回填本地缓存\n        }\n        return product;\n    }\n}\n```\n\n假设集群有 20 台应用服务器，每台服务器 5 秒内的重复请求全部走本地缓存，Redis 上的 QPS 可以直接降低 90% 以上。这个方案代码改动最小，热发布后几分钟内见效。\n\n**方案二：Key 打散（Redis 侧，效果持久）**\n\nKey 打散的思路是把一个热 Key 复制成 N 份，强制分散到不同的哈希槽和节点。由于 Redis Cluster 的哈希槽是根据 key 名计算的，只要 key 名不同，就会落到不同的节点：\n\n```java\n// 写入时：把热 Key 打散成 10 个分片，写入所有分片\npublic void setHotKey(String key, Product value, long ttl) {\n    int shardCount = 10;\n    for (int i = 0; i < shardCount; i++) {\n        // key:0, key:1, ..., key:9 会哈希到不同的节点\n        String shardedKey = key + \":shard:\" + i;\n        redisTemplate.opsForValue().set(shardedKey, value, ttl, TimeUnit.SECONDS);\n    }\n}\n\n// 读取时：随机选一个分片读（利用请求的随机性均摊到所有节点）\npublic Product getHotKey(String key) {\n    int shardCount = 10;\n    // 用 ThreadLocalRandom 避免多线程竞争 Random 实例\n    int shardIndex = ThreadLocalRandom.current().nextInt(shardCount);\n    String shardedKey = key + \":shard:\" + shardIndex;\n    return redisTemplate.opsForValue().get(shardedKey);\n}\n```\n\n打散 10 份后，原来集中在 node-3 的 15 万 QPS 会分散到 6 个节点，每个节点分到 2-3 万 QPS，完全在正常范围内。这个方案的代价是写入成本变为原来的 10 倍，适合读多写少的热 Key。如果是写热 Key（比如计数器），就不适合打散，应该考虑本地累积后批量写。\n\n**方案三：读写分离（Lettuce 原生支持）**\n\nRedis Cluster 默认所有读写都发往 Master 节点，Slave（Replica）只做数据同步。可以配置 Lettuce 客户端优先从 Replica 读热 Key，把读压力分摊到 Replica 上：\n\n```java\n// Lettuce 客户端配置：优先从副本读\nLettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()\n    .readFrom(ReadFrom.REPLICA_PREFERRED)  // 优先副本，副本不可用时 fallback 到 Master\n    .build();\n```\n\n注意：从 Replica 读有数据延迟（通常 <1ms，但在极端写压力下可能到几十 ms）。如果业务对一致性要求严格（比如库存数量），不能用这个方案。商品详情、活动信息这类容忍短暂延迟的场景，读写分离非常合适。\n\n## 第四步：事后复盘与长期预防\n\n止血之后要做根因分析，不然下次大促还会再犯。热 Key 问题在大促场景里几乎是必然出现的，关键是要把它变成「可预期、可应对的问题」，而不是每次都在凌晨被告警叫醒。\n\n长期预防有三个层面。第一是识别层：在上线前的大促演练中，用压测流量模拟真实访问模式，提前用客户端埋点统计识别潜在的热 Key，加上告警：当某个 key 的访问频率超过节点平均水平的 5 倍时，就触发告警而不是等到 CPU 飙满。第二是隔离层：凡是识别为热 Key 的，一律在架构设计上强制走本地缓存，把 Redis 作为「兜底」而不是「主要来源」。这不仅能解决热 Key 问题，还能降低 Redis 整体压力。第三是监控层：在 Grafana 上配置各节点 ops/sec 的差异比率（max/min），超过 3 倍告警，而不是等到 CPU 到了 80% 才发现问题。\n\n最后一个真实经验：大促期间最常见的热 Key 不一定是你预期的那个爆款商品，而是「活动页的公共配置 Key」，比如 `activity:banner:config`，被活动页所有接口、首页、搜索结果页共享读取，QPS 叠加起来反而比单个商品 ID 还高。这类 Key 往往更新很少，TTL 可以设得很短（1-2 秒）配合本地缓存，几乎不影响数据一致性。",
+      "keyPoints": [
+        "Redis Cluster 按 CRC16 % 16384 将 key 分配到哈希槽，热 Key 导致单槽请求量远超其他槽，从而使对应节点 CPU 被单线程命令处理打满，出现节点间负载严重不均衡。",
+        "通过对比各节点 `info stats` 的 `instantaneous_ops_per_sec` 可以快速确认是请求倾斜（热 Key）还是机器硬件问题，节点 ops/sec 差异超 5 倍即可判断为热 Key。",
+        "`redis-cli --hotkeys` 依赖 LFU 淘汰策略（Redis 4.0+），需提前配置 `maxmemory-policy allkeys-lfu` 才能生效，否则扫描结果无意义。",
+        "`monitor` 命令可以不依赖任何配置找出热 Key，但在高 QPS 节点上会导致 Redis 性能下降 30%-50%，生产使用必须快进快出（采样 1000 条后立即中断）。",
+        "客户端埋点统计（ConcurrentHashMap + LongAdder + 定时上报）是生产环境最推荐的热 Key 检测方案，不影响 Redis 性能，还能在问题出现前预警。",
+        "本地缓存（Caffeine，TTL=3-5s）是最快的止血方案，20 台应用服务器同时缓存后可将 Redis QPS 降低 90% 以上，分钟级生效无需等待完整发布。",
+        "Key 打散（在 key 名中加随机后缀，复制成 N 份）可将热 Key 强制分散到多个节点，适合读多写少场景，写入成本会翻 N 倍，不适合高频写 Key。",
+        "活动页公共配置 Key（如 `activity:banner:config`）被所有接口共用，访问频率叠加后往往比单个爆款商品 ID 还高，是大促期间最容易被忽视的隐性热 Key。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz1",
+          "question": "Redis Cluster 中一个 key 具体落在哪个节点，是由什么决定的？",
+          "choices": [
+            { "id": "A", "text": "对 key 名做 CRC16 运算，结果对 16384 取模得到哈希槽号，再根据槽号找到对应主节点" },
+            { "id": "B", "text": "对 key 名做 MD5 哈希，结果对节点总数取模，直接找到节点" },
+            { "id": "C", "text": "客户端随机选择一个节点，由目标节点决定是否保存或转发" },
+            { "id": "D", "text": "按 key 名的字典序范围划分，类似 HBase 的 Region" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 使用 CRC16 + 16384 槽的一致性哈希变体。先对 key 名（若有 `{}` 则只取大括号内的部分，称为 hash tag）做 CRC16，结果对 16384 取模得到槽号（0-16383），再查槽-节点映射表找到对应主节点。这一设计使得热 Key 问题本质上是「单槽高频访问」问题。B 选项的 MD5 直接对节点数取模是一致性哈希的一种形式，但 Redis 不是这样做的，而且节点数变化时需要大量重新映射。C 选项是无状态负载均衡的做法，Redis Cluster 不使用。D 选项是 HBase/BigTable 的范围分区策略，Redis 未采用。"
+        },
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz2",
+          "question": "题目场景中，同事 B 认为是「缓存雪崩」。请问缓存雪崩的典型症状与热 Key 最根本的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "缓存雪崩表现为 Redis 内部某节点 CPU 飙高，热 Key 表现为 Redis 整体命中率下降" },
+            { "id": "B", "text": "缓存雪崩表现为大量请求穿透到数据库导致数据库 QPS 飙升，而热 Key 表现为 Redis 集群内部某节点负载远高于其他节点" },
+            { "id": "C", "text": "缓存雪崩和热 Key 的症状完全相同，只是触发原因不同" },
+            { "id": "D", "text": "缓存雪崩只在 Redis 单节点模式下出现，热 Key 只在 Redis Cluster 下出现" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "缓存雪崩是指大批 key 同时过期（或 Redis 整体宕机），导致请求全部穿透到下游数据库，典型症状是数据库 QPS 暴涨、Redis 命中率骤降，Redis 自身各节点负载反而会下降（因为请求都绕过它了）。热 Key 问题是 Redis 内部的负载倾斜：Redis 还在正常服务，但集群内某个节点因为特定 key 被超高频访问而 CPU 被打满。两者的影响链路完全不同，混淆这两个概念在生产排查时会走弯路。A 选项把两者的症状描述反了。C 和 D 选项的判断均不正确。"
+        },
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz3",
+          "question": "`redis-cli --hotkeys` 命令在什么情况下会输出有意义的结果？",
+          "choices": [
+            { "id": "A", "text": "只要 Redis 版本 ≥ 4.0，无需任何额外配置，直接运行即可得到准确的热 Key 列表" },
+            { "id": "B", "text": "需要 Redis 版本 ≥ 4.0，且 maxmemory-policy 设置为 LFU 模式（allkeys-lfu 或 volatile-lfu），否则所有 key 的频率计数为 0" },
+            { "id": "C", "text": "需要先执行 `CONFIG SET activerehashing yes` 才能启用热 Key 统计" },
+            { "id": "D", "text": "需要在 redis.conf 中设置 `hotkey-tracking yes` 参数" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`--hotkeys` 依赖 Redis 4.0 引入的 LFU（Least Frequently Used）淘汰策略的频率计数元数据。只有 `maxmemory-policy` 设置为 `allkeys-lfu` 或 `volatile-lfu` 时，Redis 才会在 key 的元数据中维护访问频率计数，`--hotkeys` 扫描的就是这个计数字段。如果用的是 LRU 策略（默认值 `noeviction` 或 `allkeys-lru`），每个 key 的频率字段均为初始值 0，`--hotkeys` 输出没有任何参考价值。A 选项忽略了 LFU 策略前提。C 和 D 选项是不存在的配置。"
+        },
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz4",
+          "question": "生产环境执行 `redis-cli monitor` 抓热 Key 时，以下哪个操作最能降低对 Redis 性能的影响？",
+          "choices": [
+            { "id": "A", "text": "只连 Slave 节点执行 monitor，不影响 Master 性能" },
+            { "id": "B", "text": "采样到足够样本后立即 Ctrl+C 中断，配合 head -n 1000 限制采集量" },
+            { "id": "C", "text": "在 monitor 输出中加 --latency 参数限制输出速率" },
+            { "id": "D", "text": "monitor 本身不消耗 Redis CPU，可以长时间运行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`monitor` 的性能开销来自两方面：Redis 主线程需要把每条命令序列化后发送给 monitor 客户端，以及网络带宽消耗。在 15 万 QPS 的节点上长时间运行 monitor 会导致 Redis CPU 再增加 30%-50%，反而可能加速节点崩溃。最安全的做法是用 `head -n 1000` 或 `timeout 5` 限制采集量，采样结束后立即断开连接。A 选项有一定道理（Slave 上 monitor 影响较小）但 Slave 不能代表 Master 的实际 key 分布（Slave 只做数据复制，客户端请求仍发往 Master）。C 选项的 `--latency` 是测延迟的参数与 monitor 无关。D 选项是错误的，monitor 有明显性能开销。"
+        },
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz5",
+          "question": "以下是两个节点的 `info stats` 输出片段，从中能得出什么结论？\n\n```\n# node-3\ninstantaneous_ops_per_sec:152847\ntotal_commands_processed:8923847392\nrejected_connections:4821\n\n# node-1\ninstantaneous_ops_per_sec:18420\ntotal_commands_processed:1102938821\nrejected_connections:0\n```",
+          "choices": [
+            { "id": "A", "text": "node-3 的 total_commands_processed 更高说明它存储的数据更多，需要迁移部分槽到其他节点" },
+            { "id": "B", "text": "node-3 的 instantaneous_ops_per_sec 是 node-1 的 8 倍多，且出现了 4821 次连接拒绝，说明 node-3 正在承受热 Key 压力并已开始限流，需要立即处理" },
+            { "id": "C", "text": "node-3 的连接数被拒绝说明它的 maxclients 配置过低，调高 maxclients 就能解决" },
+            { "id": "D", "text": "两个节点的 total_commands_processed 差异正常，因为 node-3 运行时间更长" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`instantaneous_ops_per_sec` 是当前每秒处理的命令数，node-3 的 152847 比 node-1 的 18420 高出 8 倍，这是请求倾斜的直接证据，不是数据量差异（数据量差异看 `dbsize`）。`rejected_connections:4821` 说明 node-3 的连接队列已经溢出，Redis 开始主动拒绝新连接，这正是上游服务出现超时的直接原因——服务拿不到 Redis 连接，请求只能等超时。A 选项混淆了 ops 和数据量。C 选项错在 `rejected_connections` 不只是 maxclients 导致，更根本的是 CPU 被打满导致连接处理变慢，仅调高 maxclients 无法解决根因。"
+        },
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz6",
+          "question": "将热 Key `product:flash-sale:10086` 打散为 `product:flash-sale:10086:shard:0` 到 `product:flash-sale:10086:shard:9` 共 10 个分片后，以下哪个说法是错误的？",
+          "choices": [
+            { "id": "A", "text": "10 个分片 key 会被 Redis Cluster 哈希到不同的槽，从而分散到不同节点" },
+            { "id": "B", "text": "读取时随机选取一个分片，可以将读请求均摊到持有不同分片的节点上" },
+            { "id": "C", "text": "打散后写入一次业务操作需要同时更新 10 个 key，写成本变为原来的 10 倍" },
+            { "id": "D", "text": "可以用 Redis Cluster 的 hash tag（花括号语法）确保所有分片落在同一个节点，方便统一管理" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "Hash tag 的作用是把用 `{}` 包裹同一内容的 key 强制映射到同一个哈希槽（例如 `{product:10086}:shard:0` 和 `{product:10086}:shard:1` 会落在同一个槽）。这与 Key 打散的目的完全相反——打散的核心就是要让分片落在不同节点，如果用 hash tag 把所有分片强制放到同一节点，热 Key 问题丝毫没有缓解。A、B、C 的描述均正确：不同名字的分片 key 确实会哈希到不同槽；读时随机选分片能均摊读压力；写成本确实会乘以分片数，这是打散方案的主要代价，所以打散只适合读多写少场景。"
+        },
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz7",
+          "question": "以下关于 Lettuce 客户端 `ReadFrom.REPLICA_PREFERRED` 读写分离配置的说法，哪个最准确？",
+          "choices": [
+            { "id": "A", "text": "所有读操作都强制走 Replica，Master 只处理写操作，实现完全的读写分离" },
+            { "id": "B", "text": "优先从 Replica 读，若 Replica 不可用则自动 fallback 到 Master；但 Replica 有数据复制延迟，一致性要求高的场景不适用" },
+            { "id": "C", "text": "ReadFrom.REPLICA_PREFERRED 等价于 ReadFrom.MASTER，在 Redis Cluster 模式下行为相同" },
+            { "id": "D", "text": "只要配置了读写分离，Redis Cluster 的热 Key 问题就会自动解决，无需其他处理" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`ReadFrom.REPLICA_PREFERRED` 的语义是「优先 Replica，不可用则 Master」，而 `ReadFrom.REPLICA` 才是强制 Replica。读写分离能把读流量分摊到 Replica 节点，减轻 Master 压力，但它有两个重要局限：第一，Replica 通过异步复制同步数据，有 replication lag（通常 <1ms，但极端情况下可达几十 ms），读到旧数据的风险真实存在；第二，读写分离只是把一部分读请求转移到 Replica，如果 Replica 数量也有限而热 Key 访问量极大，Replica 同样可能被打满。所以读写分离是缓解热 Key 的手段之一，不能单独依赖它解决所有情况，需要和本地缓存配合使用。"
+        },
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz8",
+          "question": "在应用服务器上加 Caffeine 本地缓存（TTL=5s，maxSize=500）来缓解热 Key，以下哪个潜在风险需要重点关注？",
+          "choices": [
+            { "id": "A", "text": "Caffeine 是堆内缓存，大量缓存数据可能导致 JVM Full GC 压力增大，需要关注 GC 指标" },
+            { "id": "B", "text": "本地缓存的 TTL=5s 意味着数据更新后最多有 5 秒的不一致窗口，如果商品价格在秒杀期间变更，可能短暂出现展示旧价格的情况" },
+            { "id": "C", "text": "Caffeine 不是线程安全的，需要手动加锁才能在多线程环境中使用" },
+            { "id": "D", "text": "本地缓存会导致 Redis 命中率统计出现偏差，影响 Redis 监控面板的准确性" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "A 和 B 都是真实风险，但 B 是在业务层面更需要「重点关注」的风险——Caffeine 的堆内存占用（500 个商品对象通常只有几 MB）对 GC 的影响微乎其微，但 5 秒的数据不一致窗口在大促场景下可能是个业务问题：如果秒杀价格在这 5 秒内调整了（虽然这种情况极少），用户看到的是旧价格，可能引发客诉。这也是为什么实际落地时要跟产品确认业务容忍的最大延迟，然后再设 TTL。C 选项是错误的，Caffeine 的所有操作（get、put）都是线程安全的。D 选项是真实存在的监控偏差，但不是「需要重点关注」的风险，而是一个监控数据的副效应。"
+        },
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz9",
+          "question": "以下客户端埋点统计热 Key 的代码片段中，为什么用 `LongAdder` 而不是 `AtomicLong`？\n\n```java\nConcurrentHashMap<String, LongAdder> counter = new ConcurrentHashMap<>();\ncounter.computeIfAbsent(key, k -> new LongAdder()).increment();\n```",
+          "choices": [
+            { "id": "A", "text": "LongAdder 支持原子操作而 AtomicLong 不支持，所以在多线程场景下必须用 LongAdder" },
+            { "id": "B", "text": "LongAdder 在高并发写入时将计数分散到多个 Cell（分段累加），减少 CAS 失败重试，比 AtomicLong 在高竞争场景下吞吐量更高" },
+            { "id": "C", "text": "LongAdder 比 AtomicLong 消耗更少的内存，所以在存储大量 key 的 Map 中更合适" },
+            { "id": "D", "text": "AtomicLong 不能放在 ConcurrentHashMap 中，所以只能用 LongAdder" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`AtomicLong` 通过 CAS（Compare-And-Swap）实现原子性，在并发竞争激烈时大量线程会反复重试 CAS 操作，导致「自旋浪费 CPU」。`LongAdder` 是 Java 8 引入的改进方案（来自 `java.util.concurrent.atomic` 包），它的核心思想是「分段累加」：内部维护一个 `base` 值和一个 `Cell[]` 数组，高并发时不同线程写入不同的 Cell，读取时（调用 `sum()`）才把所有 Cell 加总。在热 Key 场景下，某个热 key 对应的 `LongAdder.increment()` 会被大量线程并发调用，`LongAdder` 的吞吐量比 `AtomicLong` 高数倍。代价是 `sum()` 不是强一致的（读取时可能有轻微误差），但对热 Key 计数这种场景完全可以接受。A 和 D 选项均错误，`AtomicLong` 完全支持原子操作且可以放入 `ConcurrentHashMap`。"
+        },
+        {
+          "id": "ds-cache-hotkey-debug-q1-quiz10",
+          "question": "大促备战时，以下哪个措施能最有效地「在热 Key 产生流量冲击前」就发现并处理它？",
+          "choices": [
+            { "id": "A", "text": "大促当天安排值班人员实时盯监控，发现告警后立即执行 redis-cli --hotkeys 排查" },
+            { "id": "B", "text": "大促前基于历史访问日志分析 Top N 高频 key，对可能的热 Key 提前配置本地缓存或打散策略；同时在客户端埋点统计中设置预警阈值，在 ops 差异超过均值 3 倍时提前告警" },
+            { "id": "C", "text": "大促前将 Redis Cluster 的节点数量翻倍，通过增加节点来分散热 Key 压力" },
+            { "id": "D", "text": "大促前将所有 key 的 TTL 设置为 1 秒，强制高频刷新，避免单个 key 长期占据热点" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 是唯一能做到「事前预防」的方案。大促流量模式往往可预测：历史日志里销量 Top 100 的商品在大促时大概率是热 Key，活动页配置 key、首页轮播 key 等也是可提前识别的候选。提前针对这些 key 配置好本地缓存策略，大促流量来了就能直接扛住，不需要在 CPU 飙满时手忙脚乱地改代码发布。A 选项是被动响应，发现告警时往往已经有大量用户受影响。C 选项翻倍节点并不能解决热 Key 问题——热 Key 还是落在同一个节点，除非重新迁移槽位（而迁移槽位在大促前是高风险操作）。D 选项将 TTL 设为 1 秒会导致 Redis 每秒都要重建大量缓存，反而增加 Redis 写入压力，是典型的反优化做法。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Redis Cluster Specification — Hash Slots",
+          "url": "https://redis.io/docs/reference/cluster-spec/"
+        },
+        {
+          "title": "Redis CLIENT NO-EVICT and LFU Hot Key Detection",
+          "url": "https://redis.io/commands/object-freq/"
+        },
+        {
+          "title": "Lettuce ReadFrom API — Read Preference in Cluster Mode",
+          "url": "https://lettuce.io/core/release/api/io/lettuce/core/ReadFrom.html"
+        },
+        {
+          "title": "Caffeine Cache — High Performance Java Caching Library",
+          "url": "https://github.com/ben-manes/caffeine"
+        }
+      ]
+    }
+  ]
+}

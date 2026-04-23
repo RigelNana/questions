@@ -1,0 +1,157 @@
+{
+  "id": "ds-cache-hitrate-tuning",
+  "name": "缓存命中率调优",
+  "domain": "distributed-system",
+  "description": "掌握 Redis 缓存命中率的监控方法、影响命中率的关键因素，以及 TTL 策略、缓存容量规划等调优手段",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-cache-hitrate-tuning-q1",
+      "domain": "distributed-system",
+      "type": "tuning",
+      "difficulty": 2,
+      "tags": ["redis", "cache", "hit-rate", "ttl", "eviction", "performance"],
+      "title": "Redis 缓存命中率从 95% 跌到 78%，今天下班前怎么恢复？",
+      "content": "你负责一个电商平台的商品详情服务，技术栈是 Java + Spring Boot + Redis 6.2（单实例，maxmemory 8GB，淘汰策略 allkeys-lru）。这个服务每天承载 3000 万次商品页面请求，架构是「先查 Redis，未命中再查 MySQL」的标准 Cache Aside 模式。\n\n周一早上你打开监控大盘，发现以下数据：\n\n```\n指标             上周均值    今天当前值\n---------------------------------\nRedis 命中率     95.2%       78.4%\nMySQL QPS        5,200       12,300\n接口 P99 延迟    18ms        82ms\nRedis 内存使用   5.8GB       7.9GB\n```\n\n告警群里老板已经发了消息：「商品详情页响应变慢，用户投诉增多，今天下班前必须恢复。」\n\n你打开 Redis 监控，看到 evicted_keys 计数器在过去 6 小时里增加了 42 万。与此同时，你的同事提醒你，上周五刚上线了一批新品，新增了约 8 万个 SKU。另外，他还提到一周前有人把商品详情的缓存 TTL 从 1 小时改成了 30 秒，理由是「要保证价格实时性」。\n\n面对这个局面，你的排查思路是什么？哪个原因是主因？紧急止血方案和后续长期优化各是什么？",
+      "answer": "## 第一步：先搞清楚「命中率」到底是怎么算出来的\n\nRedis 的命中率不是一个魔法黑盒，它背后就两个计数器：`keyspace_hits` 和 `keyspace_misses`。每次 GET 命中了存在的 key，hits 加一；每次 GET 访问的 key 不存在或已过期，misses 加一。命中率就是 `hits / (hits + misses)`。这两个数字可以直接从 INFO 命令拿到：\n\n```bash\nredis-cli info stats | grep -E \"keyspace_hits|keyspace_misses\"\n# keyspace_hits:8734521\n# keyspace_misses:2341234\n# 当前命中率 = 8734521 / (8734521 + 2341234) ≈ 78.8%\n```\n\n需要注意的是，这两个计数器是从 Redis 启动后累计的，所以如果你想看「最近 5 分钟」的命中率，需要做差值计算，而不是直接用总量除。生产环境通常在 Prometheus 里用 `rate(redis_keyspace_hits_total[5m])` 除以两个 rate 之和来得到滑动窗口内的命中率。\n\n明白了计算方式，再来看题目里的 78.4%。命中率从 95% 掉到 78%，相当于每 100 次请求里从 5 次 miss 变成了 22 次 miss，miss 量增长了 4 倍多。这额外的 miss 流量全打到了 MySQL，所以 MySQL QPS 从 5200 飙到 12300，涨幅正好也差不多是 4 倍——数字对上了，说明问题的确就在缓存层。\n\n## 第二步：逐一排查命中率下降的原因\n\n题目里给出了三条关键线索：evicted_keys 增加了 42 万、新增 8 万 SKU、TTL 从 1 小时改成了 30 秒。这三个因素共同造成了今天的局面，但贡献比例是不同的，搞清楚主因才能正确排优先级。\n\n**原因一：TTL 改短是最大的元凶**\n\n这个改动最容易被忽视，但影响是最根本的。把 TTL 从 3600 秒改成 30 秒意味着什么？一个商品详情 key 每 30 秒就会过期一次，而大多数商品一天只会被访问几次，两次访问之间的间隔轻松超过 30 秒。也就是说，对于中低热度的商品，这个 key 几乎永远处于「刚好过期」的状态，每次访问都是 miss。\n\n可以用 TTL 命令随机抽查几个 key 来验证这个判断：\n\n```bash\n# 随机采样 100 个 key，看 TTL 分布\nfor i in $(seq 1 20); do\n  key=$(redis-cli randomkey)\n  ttl=$(redis-cli ttl \"$key\")\n  echo \"$key => TTL: $ttl\"\ndone\n\n# 典型输出（TTL 改短后）：\n# product:detail:10091 => TTL: 12   （马上过期）\n# product:detail:10092 => TTL: -2   （已经过期，key 不存在）\n# product:detail:10093 => TTL: 28\n# product:detail:10094 => TTL: -2\n```\n\n`-2` 表示 key 已过期被 Redis 惰性删除，说明相当比例的 key 处于「名义上还在 TTL 范围内但实际上已过期」的状态。一旦你看到大量 `-2`，就能确认 TTL 过短是主因。\n\n**原因二：内存满了，Key 被大量驱逐**\n\n第二条线索是 evicted_keys 在 6 小时内增加了 42 万，同时 Redis 内存使用已经到了 7.9GB（上限 8GB）。这是典型的「内存压满导致热 key 被误杀」场景。\n\n```bash\nredis-cli info memory | grep -E \"used_memory_human|maxmemory_human\"\n# used_memory_human:7.90G\n# maxmemory_human:8.00G    ← 只剩 0.1GB 余量\n\nredis-cli info stats | grep evicted_keys\n# evicted_keys:420000      ← 6 小时内被驱逐了 42 万个 key\n```\n\nallkeys-lru 淘汰策略的逻辑是「优先删除最久未访问的 key」，听起来合理，但在 TTL 只有 30 秒的前提下，key 存活时间本来就很短，LRU 链表里全是「生命周期极短的 key」，淘汰效果近乎随机。原本应该长期缓存的热点商品也可能被驱逐。新写入 8 万个新品 key 更是直接加速了老 key 被淘汰的速度。\n\n**原因三：新品冷启动带来短期命中率下降**\n\n8 万个新品 SKU 上线时，它们在 Redis 里还没有缓存，初始全是 miss。这 8 万个 key 需要经历至少一次 miss + 回源写入 Redis 之后，命中率才会回升。如果 TTL 还是 30 秒，这些 key 根本没机会积累「热」状态，每次过期后又得重新 miss 一次。\n\n所以综合来看：**TTL 改短是根本原因，内存不足放大了问题，新品上线是导火索**。三者叠加，命中率从 95% 跌到 78% 完全可以解释。\n\n## 第三步：紧急止血 + 长期治理两条线并行\n\n既然今天下班前要恢复到 90%，必须区分哪些操作可以在 30 分钟内见效，哪些是根治方案但需要时间。\n\n**立即止血（30 分钟内可以做完）**\n\n第一件事是把 TTL 改回来，但不能一刀切地改回 3600 秒。「要保证价格实时性」这个诉求本身是合理的，问题在于用一个 TTL 覆盖所有字段太粗糙了。正确的做法是按数据变更频率分级：\n\n```java\n// TTL 分级策略，不同字段的数据新鲜度要求不同\npublic class CacheTTLPolicy {\n    // 商品基础信息：名称、图片、分类、描述 —— 变化极少，可以缓存 1 小时\n    public static final int PRODUCT_BASIC    = 3600;\n    // 商品价格：促销时会变，允许 5 分钟延迟，配合 Canal 主动失效\n    public static final int PRODUCT_PRICE    = 300;\n    // 商品库存：变化频繁，30 秒已是极限，实时库存建议直接查 DB 或走本地缓存\n    public static final int PRODUCT_STOCK    = 30;\n    // 商品详情页聚合数据（含评价数、销量）：10 分钟\n    public static final int PRODUCT_DETAIL   = 600;\n}\n```\n\n这样改之后，每次查询商品详情的主体数据（名称、图片、描述）TTL 从 30 秒变回 3600 秒，命中率立刻会反弹。价格和库存字段走独立的 key，TTL 依然可以保持短，不影响数据新鲜度的诉求。\n\n第二件事是立刻给 Redis 扩容或者临时调高 maxmemory。如果是云上实例，可以在控制台把规格从 8GB 升到 16GB，或者临时用 CONFIG SET 命令把 maxmemory 调高（需要确认宿主机内存够用）：\n\n```bash\n# 临时调高 maxmemory（需要宿主机有足够物理内存）\nredis-cli config set maxmemory 12gb\n\n# 确认修改生效\nredis-cli config get maxmemory\n# 1) \"maxmemory\"\n# 2) \"12884901888\"\n```\n\n第三件事是对 Top 1000 热门商品做预热，把它们从 MySQL 提前加载到 Redis，避免等到流量打来再做回源：\n\n```bash\n# 用脚本批量预热热门商品（Python 示例）\npython3 warmup.py --source mysql --target redis --limit 1000 \\\n  --query \"SELECT id FROM products ORDER BY view_count DESC LIMIT 1000\"\n```\n\n这三步做完，命中率基本可以在 1 小时内从 78% 回升到 90% 以上，因为主因（TTL 过短）已经被修复，内存瓶颈也已缓解。\n\n**长期治理：让命中率不再靠运气**\n\n止血之后，更重要的是建立长效机制，避免下次再出现同样的事故。首先要在监控层面补上命中率告警——命中率低于 90% 触发 P2 告警，低于 85% 触发 P1 告警。Prometheus + Alertmanager 的规则大概是这样：\n\n```yaml\n# prometheus alert rule\n- alert: RedisCacheHitRateLow\n  expr: |\n    rate(redis_keyspace_hits_total[5m])\n    / (\n      rate(redis_keyspace_hits_total[5m]) +\n      rate(redis_keyspace_misses_total[5m])\n    ) < 0.90\n  for: 5m\n  labels:\n    severity: warning\n  annotations:\n    summary: \"Redis 命中率低于 90%，当前值 {{ $value | humanizePercentage }}\"\n```\n\n其次要监控 evicted_keys 的速率，正常生产环境里这个数字应该接近 0 或保持极低。一旦每分钟 evicted_keys 增量超过 1000，就说明内存开始吃紧，需要提前扩容，而不是等到命中率真的下降才行动。容量规划的经验法则是：**当 used_memory 达到 maxmemory 的 75% 时就开始准备扩容，不要等到 95%**。内存在 75% 的时候 LRU 淘汰尚未大量触发，扩容操作还有充裕的时间窗口。\n\n最后，「TTL 策略」这件事应该被文档化，成为团队的 ADR（Architecture Decision Record），明确每类数据的 TTL 范围和调整审批流程。避免再次出现「有人觉得要保证实时性就随手把 TTL 改成 30 秒」这种没有经过充分评估的操作。\n\n## 命中率与一致性的本质权衡\n\n这道题背后其实是一个无法完全消除的张力：TTL 越长，命中率越高，数据越陈旧；TTL 越短，数据越新鲜，命中率越低，DB 压力越大。工程实践中没有银弹，但有一个被反复验证有效的组合拳——**「长 TTL + 主动失效」**。\n\n具体来说，商品详情的 TTL 可以设成 1 小时，但同时用 Canal 监听 MySQL binlog，一旦商品表有 UPDATE 事件，Canal consumer 立刻向 Redis 发一条 DEL 命令，把对应的 key 删掉。这样就能在「高命中率（99% 以上）」和「数据及时性（秒级更新）」之间两全其美，而不是用降低 TTL 这种钝刀来换实时性。这个方案的前提是你能容忍在 Canal 消费延迟期间（通常 < 1 秒）的短暂不一致，对电商商品详情来说完全可以接受。",
+      "keyPoints": [
+        "Redis 命中率 = keyspace_hits / (keyspace_hits + keyspace_misses)，生产环境应用 rate() 函数计算滑动窗口内的实时命中率，而非累计值",
+        "TTL 过短是本题命中率下降的根本原因——TTL 30 秒远低于大多数商品两次被访问的间隔，导致 key 几乎总处于已过期状态",
+        "evicted_keys 大量增加（6 小时 42 万）说明 Redis 内存已满并开始淘汰 key，allkeys-lru 在 key 生命周期普遍极短时效果近乎随机",
+        "新品冷启动会造成短期命中率下降，因为这些 key 在首次访问前尚未缓存，在 TTL 过短的前提下还无法积累热态",
+        "TTL 分级策略是解决「命中率 vs 一致性」矛盾的关键——商品基础信息 TTL 1 小时，价格 5 分钟，库存 30 秒，按数据变更频率分别设置",
+        "「长 TTL + Canal 主动失效」组合可以同时实现 99% 以上命中率和秒级数据更新，比单纯缩短 TTL 更优雅",
+        "容量规划应在 used_memory 达到 maxmemory 的 75% 时就触发扩容准备，而不是等 evicted_keys 飙升后才响应",
+        "命中率告警（< 90% P2 告警，< 85% P1 告警）和 evicted_keys 速率监控是防止此类事故反复发生的长效机制"
+      ],
+      "quiz": [
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz1",
+          "question": "Redis 的命中率是通过哪两个指标计算的？",
+          "choices": [
+            {"id": "A", "text": "keyspace_hits 和 keyspace_misses，命中率 = hits / (hits + misses)"},
+            {"id": "B", "text": "connected_clients 和 total_commands_processed，命中率 = clients / commands"},
+            {"id": "C", "text": "used_memory 和 maxmemory，命中率 = 1 - used_memory / maxmemory"},
+            {"id": "D", "text": "expired_keys 和 evicted_keys，命中率 = 1 - (expired + evicted) / total_keys"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 在 INFO stats 输出中提供 keyspace_hits（命中次数）和 keyspace_misses（未命中次数）两个计数器，命中率 = hits / (hits + misses)。B 选项的 connected_clients 和 total_commands_processed 是连接和命令统计，与命中率无关。C 选项混淆了内存使用率和命中率，这是两个完全不同的指标。D 选项的 expired_keys 是过期删除次数，evicted_keys 是因内存不足被驱逐的次数，都不能直接反映命中率。"
+        },
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz2",
+          "question": "题目场景中，MySQL QPS 从 5200 涨到 12300，增幅约 2.4 倍，与命中率从 95% 降到 78% 的关系是什么？",
+          "choices": [
+            {"id": "A", "text": "miss 量从 5% 涨到 22%，增长了 4.4 倍，与 MySQL QPS 涨幅基本吻合，说明额外 DB 请求就是 miss 带来的回源"},
+            {"id": "B", "text": "命中率下降与 MySQL QPS 上涨没有直接因果关系，可能是 MySQL 自身出现了慢查询"},
+            {"id": "C", "text": "命中率下降 17 个百分点，MySQL QPS 应该也只涨 17%，4.4 倍的 miss 增长说法不对"},
+            {"id": "D", "text": "Redis 命中率下降时，MySQL QPS 不应该上涨，因为 Cache Aside 模式下 miss 请求会走本地缓存而不是 DB"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Cache Aside 模式下，miss 请求会直接落到 MySQL。原来 95% 命中率时 miss 率为 5%，现在 78% 命中率时 miss 率为 22%，miss 量增长了 22/5 = 4.4 倍。以总请求量约 3000 万/天换算，每秒额外产生约 7000 次 miss，这些 miss 全部回源 MySQL，正好解释了 DB QPS 增加约 7100 的现象。B 选项虽然 MySQL 慢查询也可能导致 QPS 上涨，但在命中率同步下降的情况下，缓存 miss 是最直接的解释。C 选项混淆了百分点差值和 miss 倍率，命中率的百分点变化不等于 miss 量的变化倍率。"
+        },
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz3",
+          "question": "redis-cli TTL 命令返回 -2 表示什么？",
+          "choices": [
+            {"id": "A", "text": "该 key 存在但没有设置过期时间（永不过期）"},
+            {"id": "B", "text": "该 key 不存在或已经过期被删除"},
+            {"id": "C", "text": "该 key 的 TTL 还剩 2 秒"},
+            {"id": "D", "text": "Redis 实例连接超时，无法获取 TTL"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis TTL 命令有三种返回值：正整数表示剩余秒数，-1 表示 key 存在但没有设置过期时间（永久有效），-2 表示 key 不存在——可能从未被设置，也可能已过期被 Redis 删除（惰性删除或定期删除后）。在题目场景中看到大量 -2 是一个强烈信号，说明 TTL 过短导致 key 在两次访问间隔内就已过期。A 选项描述的是返回 -1 的情况，-1 和 -2 很容易搞混。C 选项把返回值误解为剩余时间量，D 选项是凭空杜撰，TTL 命令本身不会因连接超时返回 -2。"
+        },
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz4",
+          "question": "Redis 配置 maxmemory-policy 为 allkeys-lru 时，当内存打满后的行为是什么？",
+          "choices": [
+            {"id": "A", "text": "拒绝所有写入操作，返回 OOM error，直到有 key 过期释放空间"},
+            {"id": "B", "text": "从所有 key 中淘汰最近最少访问（LRU）的 key，为新 key 腾出空间"},
+            {"id": "C", "text": "只淘汰设置了 TTL 的 key 中最近最少访问的，没有 TTL 的 key 不会被淘汰"},
+            {"id": "D", "text": "随机淘汰任意 key，不区分访问频率"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "allkeys-lru 策略会在内存达到 maxmemory 时，从「所有 key」（包括没有设置 TTL 的 key）中找出最近最少使用的 key 并将其驱逐，为新写入腾出空间。注意 Redis 实现的是近似 LRU 而非精确 LRU——它随机采样一批 key，从中选出最旧的那个驱逐，默认采样数为 5（可通过 maxmemory-samples 调整）。A 选项描述的是 noeviction 策略。C 选项描述的是 volatile-lru 策略，只淘汰设置了过期时间的 key。D 选项描述的是 allkeys-random 策略。在 TTL 普遍只有 30 秒的场景下，allkeys-lru 的淘汰对象大多是刚写入不久就过期的 key，热点保护效果退化。"
+        },
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz5",
+          "question": "以下哪条命令可以查看 Redis 实例当前的内存使用量和上限？",
+          "choices": [
+            {"id": "A", "text": "redis-cli info memory | grep -E \"used_memory_human|maxmemory_human\""},
+            {"id": "B", "text": "redis-cli info keyspace | grep memory"},
+            {"id": "C", "text": "redis-cli debug object memory"},
+            {"id": "D", "text": "redis-cli config get used_memory"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "redis-cli info memory 输出包含丰富的内存相关指标，其中 used_memory_human 是当前内存使用量的人类可读格式（如「7.90G」），maxmemory_human 是配置的内存上限。通过 grep 过滤出这两个字段可以快速判断内存压力。B 选项的 info keyspace 输出的是各数据库的 key 数量和过期 key 数量，没有内存信息。C 选项的 debug object 是查看单个 key 的编码和引用信息。D 选项的 config get 是查询配置参数，used_memory 是 info memory 的指标而非 config 参数，该命令不会返回有效结果。"
+        },
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz6",
+          "question": "把商品详情页的全部缓存 TTL 统一设置为 30 秒的最大隐患是什么？",
+          "choices": [
+            {"id": "A", "text": "30 秒 TTL 会触发 Redis 的特殊限流机制，导致写入速度下降"},
+            {"id": "B", "text": "对于访问间隔普遍超过 30 秒的中低热度商品，缓存几乎永远处于已过期状态，等于没有缓存"},
+            {"id": "C", "text": "TTL 低于 60 秒时，Redis 会禁用 LRU 淘汰策略，导致内存无法被有效管理"},
+            {"id": "D", "text": "TTL 短会导致 Redis 主从同步延迟增大，从节点上的命中率会更低"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "缓存命中率的本质是「缓存 key 的有效存活时间 vs 两次请求之间的间隔」。如果 TTL 是 30 秒，但某个商品平均每 5 分钟才被访问一次，那么这个商品的每次访问几乎都会面对一个已经过期的 key，缓存形同虚设。这正是题目里命中率暴跌的根本原因。高热度商品（每秒被访问多次）不受影响，但中低热度商品（电商平台商品数量通常是千万级，大多数商品访问频率很低）全部变成了穿透流量。A 选项纯属杜撰。C 选项错误，TTL 长短与 LRU 策略无关。D 选项混淆了 TTL 和主从同步，两者没有直接关联。"
+        },
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz7",
+          "question": "「长 TTL + Canal 主动失效」方案与「短 TTL 保证实时性」方案相比，最核心的优势是什么？",
+          "choices": [
+            {"id": "A", "text": "Canal 方案实现更简单，不需要修改业务代码"},
+            {"id": "B", "text": "短 TTL 方案在数据更新时会有短暂的脏数据问题，Canal 方案可以完全避免"},
+            {"id": "C", "text": "Canal 方案在数据真正变更时才失效缓存，实现了高命中率和秒级数据更新两个目标同时达成"},
+            {"id": "D", "text": "Canal 方案可以避免缓存雪崩，因为 key 不会同时过期"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "短 TTL 方案的逻辑是「定时过期来保证数据不太旧」，但这会让大量没有发生变更的 key 也白白过期，造成无意义的 miss 和 DB 回源。Canal 通过监听 MySQL binlog，只有当数据库里真的发生了 UPDATE/DELETE 时才向 Redis 发 DEL 命令，不变的数据可以一直保留在 Redis 里，命中率自然极高（接近 99%）。数据变更从 binlog 写入到 Canal 消费通常在 1 秒以内，实时性也有保障。A 选项相反，Canal 方案引入了新的基础设施，实现成本更高。B 选项的「脏数据问题」两种方案都存在，Canal 方案在消费延迟窗口内同样会返回旧数据。D 选项说的是缓存雪崩的解法，不是这里的核心优势。"
+        },
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz8",
+          "question": "生产环境 Redis 的容量规划，什么时候应该开始准备扩容？",
+          "choices": [
+            {"id": "A", "text": "当 evicted_keys 开始出现非零值时，说明内存已满，立即扩容"},
+            {"id": "B", "text": "当 used_memory 达到 maxmemory 的 75% 时，开始准备扩容流程"},
+            {"id": "C", "text": "当命中率低于 90% 时，说明内存不足导致 key 被驱逐，立即扩容"},
+            {"id": "D", "text": "当 Redis 内存使用率达到 100% 并开始返回 OOM error 时，才需要扩容"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "容量规划的黄金法则是「提前行动，而不是救火」。在 used_memory 达到 maxmemory 的 75% 时，evicted_keys 通常还没有大量出现，命中率还未受影响，这时候有充裕的时间走完扩容申请、审批、变更流程（通常需要数小时到数天）。A 选项描述的时机已经太晚——evicted_keys 出现说明内存已经满了，命中率已经在下降，属于事故响应而不是容量规划。C 选项的判断依据不准确，命中率下降有多种原因，不一定是内存问题。D 选项是最坏情况，等到返回 OOM error 才扩容意味着业务已经完全中断。"
+        },
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz9",
+          "question": "在 Prometheus 中，以下哪条 PromQL 表达式能正确计算 Redis 最近 5 分钟的滑动窗口命中率？",
+          "choices": [
+            {"id": "A", "text": "redis_keyspace_hits_total / (redis_keyspace_hits_total + redis_keyspace_misses_total)"},
+            {"id": "B", "text": "rate(redis_keyspace_hits_total[5m]) / (rate(redis_keyspace_hits_total[5m]) + rate(redis_keyspace_misses_total[5m]))"},
+            {"id": "C", "text": "increase(redis_keyspace_hits_total[5m]) / increase(redis_keyspace_misses_total[5m])"},
+            {"id": "D", "text": "avg_over_time(redis_keyspace_hits_total[5m]) / avg_over_time(redis_keyspace_misses_total[5m])"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "keyspace_hits 和 keyspace_misses 是单调递增的计数器（counter），直接相除得到的是「从 Redis 启动到现在的历史总命中率」，这个数字变化非常慢，对实时监控没有价值。rate() 函数计算的是每秒的增长速率，rate(hits[5m]) / (rate(hits[5m]) + rate(misses[5m])) 反映的是最近 5 分钟内新发生的请求的命中率，这才是运维需要关注的实时指标。A 选项用原始计数器直接相除，是累计值而非滑动窗口。C 选项的计算是「命中次数 / 未命中次数」而非「命中次数 / 总次数」，分母错了。D 选项的 avg_over_time 对 counter 类型指标没有意义，counter 只应使用 rate() 或 increase() 计算变化率。"
+        },
+        {
+          "id": "ds-cache-hitrate-tuning-q1-quiz10",
+          "question": "新品上线导致 8 万个 SKU 冷启动，在 TTL 30 秒和 TTL 3600 秒两种配置下，命中率恢复速度有何不同？",
+          "choices": [
+            {"id": "A", "text": "两种 TTL 下命中率恢复速度相同，因为冷启动 miss 与 TTL 无关，只取决于首次访问完成的速度"},
+            {"id": "B", "text": "TTL 30 秒时，key 首次写入后 30 秒就过期，下次访问又是 miss，冷启动 miss 持续循环；TTL 3600 秒时 key 写入后可以稳定命中 1 小时，命中率迅速恢复"},
+            {"id": "C", "text": "TTL 越短命中率恢复越快，因为短 TTL 会触发更频繁的缓存刷新，数据更快达到稳态"},
+            {"id": "D", "text": "冷启动只影响新 key，旧 key 不受影响，所以整体命中率不会因为新品上线而持续下降"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "冷启动效应本身是暂时的——首次访问 miss 之后，key 被写入 Redis，后续访问就能命中。但在 TTL 只有 30 秒的情况下，对于访问频率低于每 30 秒一次的商品，「写入 → 过期 → miss → 写入 → 过期」的循环会一直持续，冷启动 miss 变成了永久性的问题，而不是短暂的抖动。TTL 3600 秒时，key 写入后在接下来 1 小时内可以被正常命中，冷启动的影响仅限于首次访问那一次 miss，之后命中率就稳定了。A 选项错误地认为 TTL 与冷启动恢复无关。C 选项逻辑颠倒，短 TTL 只会让 miss 反复出现而不是加速达到稳态。D 选项低估了新品上线的流量占比影响。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/info/",
+        "https://redis.io/docs/latest/develop/reference/eviction/",
+        "https://redis.io/docs/latest/commands/ttl/",
+        "https://redis.io/docs/latest/operate/rs/references/metrics/database-operations/"
+      ]
+    }
+  ]
+}
