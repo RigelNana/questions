@@ -7,7 +7,7 @@ import {
   useState,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { MessageSquarePlus, Trash2, X, Check, Palette } from 'lucide-react';
+import { MessageSquarePlus, Trash2, X, Check } from 'lucide-react';
 import { MarkdownRenderer } from '../ui/MarkdownRenderer';
 import { useHighlightStore } from '../../stores/highlightStore';
 import {
@@ -60,6 +60,10 @@ export function HighlightableMarkdown({
   const [toolbar, setToolbar] = useState<ToolbarState>(null);
   const [noteDraft, setNoteDraft] = useState<string>('');
   const [noteMode, setNoteMode] = useState<boolean>(false);
+  // 悬停态：记录当前鼠标悬停的 <mark> id 与矩形。用于动画呈现批注 tooltip。
+  const [hoveredMark, setHoveredMark] = useState<
+    { id: string; rect: DOMRect } | null
+  >(null);
 
   // 每次 highlights / content 变化，重新在 DOM 中铺设 <mark>。
   useLayoutEffect(() => {
@@ -99,6 +103,40 @@ export function HighlightableMarkdown({
   const handleTouchEnd = useCallback(() => {
     setTimeout(captureSelection, 50);
   }, [captureSelection]);
+
+  // 悬停进入 <mark>：记录当前悬停目标（配合 onMouseOut 清除）。
+  const handleMouseOver = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement;
+      const mark = target.closest(`[${HL_ATTR}]`) as HTMLElement | null;
+      if (!mark) return;
+      const id = mark.getAttribute(HL_ATTR);
+      if (!id) return;
+      setHoveredMark((prev) =>
+        prev && prev.id === id ? prev : { id, rect: mark.getBoundingClientRect() },
+      );
+    },
+    [],
+  );
+
+  const handleMouseOut = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement;
+      const mark = target.closest(`[${HL_ATTR}]`) as HTMLElement | null;
+      if (!mark) return;
+      const related = e.relatedTarget as Node | null;
+      // 鼠标仍在同一 mark 的子节点内（比如 inline 文本节点），不清。
+      if (related && mark.contains(related)) return;
+      setHoveredMark(null);
+    },
+    [],
+  );
+
+  // highlights 变化时，若悬停目标已被删除/失效，主动清理。
+  useEffect(() => {
+    if (!hoveredMark) return;
+    if (!highlights.some((h) => h.id === hoveredMark.id)) setHoveredMark(null);
+  }, [highlights, hoveredMark]);
 
   // 点击已有 <mark> 打开编辑态
   const handleContainerClick = useCallback(
@@ -211,9 +249,20 @@ export function HighlightableMarkdown({
         onMouseUp={handleMouseUp}
         onTouchEnd={handleTouchEnd}
         onClick={handleContainerClick}
+        onMouseOver={handleMouseOver}
+        onMouseOut={handleMouseOut}
       >
         <MarkdownRenderer content={content} />
       </div>
+      {(() => {
+        if (!hoveredMark) return null;
+        const h = highlights.find((x) => x.id === hoveredMark.id);
+        if (!h?.note) return null;
+        // 若同一条 highlight 已经在编辑态的 toolbar 中，则不再悬浮展示，避免双层弹层。
+        if (toolbar?.kind === 'edit' && toolbar.highlight.id === h.id)
+          return null;
+        return <NoteTooltip rect={hoveredMark.rect} note={h.note} />;
+      })()}
       {toolbar && (
         <HighlightToolbar
           state={toolbar}
@@ -304,9 +353,6 @@ function HighlightToolbar({
     left = Math.max(margin, Math.min(left, window.innerWidth - w - margin));
     setPos({ top, left });
   }, [state, noteMode]);
-
-  const hasNote =
-    state.kind === 'edit' && !!state.highlight.note && !noteMode;
 
   return createPortal(
     <div
@@ -405,24 +451,55 @@ function HighlightToolbar({
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
-          {hasNote && state.kind === 'edit' && (
-            <div className="max-w-[min(22rem,calc(100vw-2rem))] border-t border-[var(--color-notion-border)] px-3 py-2">
-              <div className="mb-1.5 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-notion-text-secondary)]">
-                <Palette className="w-3 h-3" /> 批注
-              </div>
-              <p className="whitespace-pre-wrap text-xs leading-relaxed text-[var(--color-notion-text)]">
-                {state.highlight.note}
-              </p>
-              <button
-                onClick={onRequestNote}
-                className="mt-1.5 text-[11px] text-[var(--color-notion-accent)] hover:underline"
-              >
-                编辑
-              </button>
-            </div>
-          )}
         </div>
       )}
+    </div>,
+    document.body,
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 悬浮批注 Tooltip（Portal → document.body，纯展示、无交互）
+// ────────────────────────────────────────────────────────────────────────────
+
+function NoteTooltip({ rect, note }: { rect: DOMRect; note: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number; placement: 'above' | 'below' } | null>(null);
+
+  useLayoutEffect(() => {
+    if (!ref.current) return;
+    const el = ref.current;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const margin = 8;
+    const placement: 'above' | 'below' =
+      rect.top >= h + margin + 4 ? 'above' : 'below';
+    const top =
+      placement === 'above'
+        ? rect.top - h - margin
+        : Math.min(rect.bottom + margin, window.innerHeight - h - margin);
+    let left = rect.left + rect.width / 2 - w / 2;
+    left = Math.max(margin, Math.min(left, window.innerWidth - w - margin));
+    setPos({ top, left, placement });
+  }, [rect]);
+
+  return createPortal(
+    <div
+      ref={ref}
+      data-hl-note-tooltip
+      data-placement={pos?.placement ?? 'above'}
+      style={{
+        position: 'fixed',
+        top: pos?.top ?? -9999,
+        left: pos?.left ?? -9999,
+        zIndex: 55,
+        visibility: pos ? 'visible' : 'hidden',
+      }}
+      className="hl-note-tooltip pointer-events-none max-w-[min(22rem,calc(100vw-2rem))] rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-3 py-2 shadow-md shadow-black/5 dark:shadow-black/40"
+    >
+      <p className="whitespace-pre-wrap text-xs leading-relaxed text-[var(--color-notion-text)]">
+        {note}
+      </p>
     </div>,
     document.body,
   );
