@@ -1,0 +1,158 @@
+{
+  "id": "linux-q172",
+  "name": "高并发场景下 Linux 内核参数调优",
+  "domain": "linux",
+  "description": "覆盖文件描述符上限、连接队列、TIME_WAIT 复用、中断亲和性、NUMA 拓扑等内核参数，结合 10 万以上并发连接真实调优场景。",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "linux-q172",
+      "domain": "linux",
+      "type": "tuning",
+      "difficulty": 4,
+      "tags": ["sysctl", "高并发", "内核参数", "TCP调优", "文件描述符", "TIME_WAIT", "IRQ亲和性", "NUMA", "连接队列", "网络调优"],
+      "title": "高并发场景下 Linux 内核参数的调优方向",
+      "content": "## 场景背景\n\n你加入了一个在线直播平台的后端团队，负责接管一台「消息推送网关」服务器。这台机器规格是 48 核 / 256 GB RAM / 万兆网卡，跑的是 Nginx + 自研的 WebSocket 长连接服务。业务高峰期预计会有 **15 万条并发 WebSocket 长连接**，每条连接的消息推送频率约 2 条/秒。\n\n然而，压测刚到 3 万并发时服务就开始报错，日志里出现了以下几类问题：\n\n```bash\n# 应用日志\n[ERROR] accept: too many open files\n[ERROR] dial tcp: lookup ...: cannot assign requested address\n[WARN]  connection reset by peer (大量出现)\n\n# 系统日志 (dmesg)\n[1234567.890] TCP: request_sock_TCP: Possible SYN flooding on port 443. Sending cookies.\n[1234568.123] nf_conntrack: table full, dropping packet.\n```\n\n运维同学 `ss -s` 查看连接状态，发现 TIME_WAIT 连接堆积到了 **62000** 条，而系统的 `ulimit -n` 只有 **1024**。\n\n```bash\n$ ss -s\nTotal: 68234 (kernel 70011)\nTCP:   65890 (estab 28443, closed 34891, orphaned 127, synrecv 0, timewait 34012)\n\n$ ulimit -n\n1024\n\n$ cat /proc/sys/net/core/somaxconn\n128\n```\n\n**问题**：请系统性地描述你会从哪些维度入手调整 Linux 内核参数，使这台机器能稳定承载 15 万并发连接。要求覆盖：文件描述符上限、连接队列深度、TIME_WAIT 优化、中断亲和性（IRQ Affinity）、NUMA 拓扑感知，并给出关键的 `sysctl` 参数值及其背后的原理。",
+      "answer": "## 第一步：理解 Linux 高并发网络的基础模型\n\n在动手改参数之前，有必要先建立一个清晰的认知：Linux 处理网络连接的全链路到底经过了哪些资源门槛。一个新连接从客户端 SYN 包到达网卡，到应用程序调用 `accept()` 拿到文件描述符，中间要穿越至少五道「阀门」：**网卡中断 → 内核协议栈 → SYN 半连接队列 → accept 全连接队列 → 文件描述符表**。这五道阀门任何一个卡住，外面的连接全都进不来，而且每道阀门卡住时的报错现象完全不同。上面那台压测机的日志其实已经很清晰地告诉我们：文件描述符（`too many open files`）、SYN 队列（`SYN flooding`）、conntrack 表（`table full`）同时撞墙了。\n\nLinux 内核参数调优的核心思路不是「改大所有数字」，而是在每一层资源上找到真正的瓶颈，再有针对性地扩容并调整其工作模式。下面按照连接生命周期的顺序，逐层讲解调优策略。\n\n## 第二步：五个核心调优维度\n\n### 一、文件描述符上限——最容易忽略的第一道门\n\n`too many open files` 这个报错出现在 3 万并发时，根因是进程级 `nofile` 上限只有 1024。Linux 的 fd 限制分为三层，很多人只改了一层：\n\n```bash\n# 第一层：内核全局上限（所有进程共享的总 fd 数）\nfs.file-max = 6553600\n\n# 第二层：单进程上限（/etc/security/limits.conf 或 systemd unit 里配置）\n# /etc/security/limits.conf\n* soft nofile 1048576\n* hard nofile 1048576\n# 注意：root 用户需要单独加一行，否则不生效\nroot soft nofile 1048576\nroot hard nofile 1048576\n\n# 第三层：systemd 托管的服务，limits.conf 不生效，需要在 unit 文件里写\n# /etc/systemd/system/nginx.service.d/override.conf\n[Service]\nLimitNOFILE=1048576\n```\n\n很多人改了 `limits.conf` 发现没用，是因为服务是 systemd 启动的，systemd 默认会忽略 PAM 的 limits 配置。`systemctl show nginx | grep LimitNOFILE` 看到 65535 就说明没改到位。改完之后 `cat /proc/<pid>/limits` 确认实际生效值。\n\n一个 WebSocket 长连接占用一个 fd，15 万连接就需要进程至少有 15 万 + 一些余量（日志文件、配置文件、库文件等每个也占 fd）。设置到 100 万是安全做法，内存开销可以忽略不计（每个 fd 只是内核 fd 表里的一个指针，约 8 字节）。\n\n### 二、连接队列深度——SYN 风暴时的缓冲器\n\n内核中每个监听 socket 有两个队列：**SYN 队列**（半连接，三次握手还没完成）和 **accept 队列**（全连接，等应用 accept）。两个队列都满时，内核会直接丢弃新连接或发送 RST。\n\n```bash\n# SYN 队列（半连接队列）最大长度\nnet.ipv4.tcp_max_syn_backlog = 65536\n\n# accept 队列的系统级上限\n# listen() 的 backlog 参数取 min(应用传入的 backlog, somaxconn)\nnet.core.somaxconn = 65536\n\n# 开启 SYN Cookies（防止 SYN 队列被打满后新连接全部被丢弃）\n# SYN Cookies 的原理：队列满时不分配 TCB，把序列号编码进 Cookie 发回，\n# 收到 ACK 后再验证，相当于无状态的半连接处理\nnet.ipv4.tcp_syncookies = 1\n\n# 每个网卡的接收队列深度（网卡中断到内核协议栈之间的缓冲）\nnet.core.netdev_max_backlog = 262144\n```\n\n注意 `somaxconn` 只是系统级上限，应用层也要配合修改。Nginx 的 `listen 443 backlog=65536;`，Java 的 `new ServerSocket(port, 65536)` ——两边都要改，取较小值生效。很多同学只改了内核参数，Nginx 的 backlog 还是默认 511，队列还是满的。\n\n`dmesg | grep -i 'syn flooding'` 报警时并不意味着真的在被攻击，高并发下正常连接也会触发，这时候把 `tcp_max_syn_backlog` 和 `somaxconn` 都调大，配合 `tcp_syncookies = 1` 就能解决。\n\n### 三、TIME_WAIT 优化——消灭 6 万个僵尸连接\n\n压测时发现 TIME_WAIT 堆积到 6 万，这是高并发短连接场景的经典问题。TIME_WAIT 的存在有其道理：它保证了网络中游荡的旧包不会被新连接误收。默认持续时间是 2 * MSL（Maximum Segment Lifetime），Linux 内核硬编码为 **60 秒**，无法直接修改。但我们有几个策略可以缓解：\n\n```bash\n# 允许 TIME_WAIT 状态的 socket 被复用（用于发起新连接，即客户端侧）\n# 注意：tcp_tw_reuse 只对客户端 connect() 有效，服务端 accept 进来的不受影响\nnet.ipv4.tcp_tw_reuse = 1\n\n# 增大本地端口范围，避免「cannot assign requested address」\n# 这个报错的直接原因是可用端口耗尽，默认只有 32768-60999 约 2.8 万个\nnet.ipv4.ip_local_port_range = 10000 65535\n\n# TIME_WAIT socket 最大数量，超出后直接回收（有风险，慎用）\n# 建议只在连接方（而非服务端）配置，值对应你预期最大并发数的 1.5 倍\nnet.ipv4.tcp_max_tw_buckets = 262144\n\n# FIN_WAIT2 状态超时时间，默认 60s，可以适当缩短\nnet.ipv4.tcp_fin_timeout = 15\n```\n\n这里有一个重要认知纠正：**`tcp_tw_recycle` 在 Linux 4.12 之后已经被彻底移除**。老的博文里经常推荐 `tcp_tw_recycle = 1`，在 NAT 网络后面（这几乎是所有云环境的标配）它会导致大量连接被莫名其妙 RST 掉，因为 NAT 后面的多台客户端时间戳不连续。如果你的机器是 3.x 内核而且真的还有这个参数，**不要开**。\n\n对于 WebSocket 长连接服务来说，TIME_WAIT 大量出现本身就说明连接没有被正确地「长连接复用」——业务侧应该优先排查为什么连接会断开重连。内核参数只是治标。\n\n### 四、中断亲和性（IRQ Affinity）——让网卡不再争抢 CPU\n\n万兆网卡在 15 万并发 + 30 万 pps（每秒包数）的场景下，网卡中断的处理开销非常可观。默认情况下 `irqbalance` 服务会自动将中断分散到所有 CPU 核心，听起来很合理，但在高性能服务器上这往往不是最优策略。\n\n问题在于：**NUMA 架构下，网卡直接内存访问（DMA）通常只连接到某个特定的 NUMA 节点**。如果中断被 `irqbalance` 分配到了另一个 NUMA 节点的 CPU，每次处理中断都需要跨 NUMA 节点访问内存，延迟会从约 100ns 跳到 300ns 以上，而且会造成 QPI/UPI 总线拥堵。\n\n正确的做法是：\n\n```bash\n# 第一步：确认网卡连接的 NUMA 节点\n$ cat /sys/class/net/eth0/device/numa_node\n0   # 说明这张网卡的 DMA 内存在 NUMA node 0\n\n# 第二步：找到网卡的中断号列表\n$ grep eth0 /proc/interrupts | awk '{print $1}' | tr -d ':'\n120\n121\n122\n...  # 多队列网卡每个队列一个中断\n\n# 第三步：把这些中断绑定到 NUMA node 0 的 CPU（假设 node 0 是 CPU 0-23）\n# CPU 掩码：0-23 号 CPU = 0x000000FFFFFF\n$ for irq in $(grep eth0 /proc/interrupts | awk '{print $1}' | tr -d ':'); do\n    echo ffffff > /proc/irq/$irq/smp_affinity\n  done\n\n# 第四步：关闭 irqbalance（让手动配置不被覆盖）\n$ systemctl stop irqbalance\n$ systemctl disable irqbalance\n```\n\n与此同时，网卡的发送/接收队列数量要匹配 CPU 核数：\n\n```bash\n# 查看当前队列数量\n$ ethtool -l eth0\nChannel parameters for eth0:\nPre-set maximums:\nRX:     48\nTX:     48\nCombined: 48\n\nCurrent hardware settings:\nCombined: 8  # 只用了 8 个，浪费了 40 个核的并行处理能力\n\n# 把队列数调到和 NUMA 节点上的物理核数相同\n$ ethtool -L eth0 combined 24\n```\n\n### 五、NUMA 拓扑感知——消除跨节点内存访问\n\n48 核服务器几乎一定是双路或四路 NUMA 架构。NUMA（Non-Uniform Memory Access，非一致性内存访问）的含义是：每个 CPU socket 有自己的本地内存，访问本地内存约 100ns，访问另一个 socket 的内存要通过 QPI/UPI 总线，延迟约 300-400ns，带宽也更低。\n\n```bash\n# 查看 NUMA 拓扑\n$ numactl --hardware\navailable: 2 nodes (0-1)\nnode 0 cpus: 0 1 2 ... 23\nnode 0 size: 128000 MB\nnode 1 cpus: 24 25 26 ... 47\nnode 1 size: 128000 MB\nnode distances:\nnode   0   1\n  0:  10  21\n  1:  21  10\n\n# 把 WebSocket 服务绑定到和网卡同一个 NUMA 节点上运行\n$ numactl --cpunodebind=0 --membind=0 ./ws-gateway\n\n# 或者通过 systemd unit 配置（更稳定，重启后保持）\n# [Service]\n# ExecStart=numactl --cpunodebind=0 --membind=0 /usr/local/bin/ws-gateway\n```\n\n内核层面也有 NUMA 相关的参数需要关注：\n\n```bash\n# 允许内核在本地 NUMA 节点内存不足时才去分配远端内存（默认行为）\n# 设置为 0 表示严格本地，会 OOM 也不跨节点（对延迟最友好）\n# 设置为 1 允许在本地内存紧张时跨节点（对内存利用率友好）\nvm.zone_reclaim_mode = 0  # 高并发网络服务建议设 0，避免 zone reclaim 引入毛刺\n\n# 透明大页（THP）在大内存场景下可以减少 TLB 缺失，但也可能带来 compaction 延迟\n# 建议先设为 madvise，让对 THP 有感知的应用自己决定\n$ echo madvise > /sys/kernel/mm/transparent_hugepage/enabled\n```\n\n## 第三步：完整的调优 sysctl 配置与验证\n\n把上面所有参数整理成一份可以直接 apply 的配置文件：\n\n```bash\n# /etc/sysctl.d/99-highconn-tuning.conf\n\n# ── 文件描述符 ──\nfs.file-max = 6553600\nfs.nr_open = 2097152\n\n# ── 网络核心 ──\nnet.core.somaxconn = 65536\nnet.core.netdev_max_backlog = 262144\nnet.core.rmem_max = 134217728\nnet.core.wmem_max = 134217728\nnet.core.rmem_default = 262144\nnet.core.wmem_default = 262144\n\n# ── TCP 连接队列与握手 ──\nnet.ipv4.tcp_max_syn_backlog = 65536\nnet.ipv4.tcp_syncookies = 1\nnet.ipv4.tcp_abort_on_overflow = 0\n\n# ── TIME_WAIT 与端口复用 ──\nnet.ipv4.tcp_tw_reuse = 1\nnet.ipv4.tcp_fin_timeout = 15\nnet.ipv4.tcp_max_tw_buckets = 262144\nnet.ipv4.ip_local_port_range = 10000 65535\n\n# ── TCP 缓冲区自动调整 ──\nnet.ipv4.tcp_rmem = 4096 87380 134217728\nnet.ipv4.tcp_wmem = 4096 65536 134217728\nnet.ipv4.tcp_mem = 786432 1048576 26777216\n\n# ── 连接追踪（conntrack）──\n# WebSocket 长连接服务如果不做 NAT，可以关闭 conntrack 提升性能\n# 如果必须保留，调大表大小\nnet.netfilter.nf_conntrack_max = 2097152\nnet.netfilter.nf_conntrack_tcp_timeout_established = 3600\nnet.netfilter.nf_conntrack_tcp_timeout_time_wait = 30\n\n# ── TCP keepalive（对 WebSocket 长连接尤其重要）──\nnet.ipv4.tcp_keepalive_time = 60      # 60s 无数据后发探测\nnet.ipv4.tcp_keepalive_intvl = 10     # 探测包间隔 10s\nnet.ipv4.tcp_keepalive_probes = 3     # 连续 3 次无响应断开\n\n# ── NUMA / 内存 ──\nvm.zone_reclaim_mode = 0\nvm.swappiness = 0\n```\n\n```bash\n# 一次性 apply 所有参数\n$ sysctl -p /etc/sysctl.d/99-highconn-tuning.conf\n\n# 验证关键参数\n$ sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog\nnet.core.somaxconn = 65536\nnet.ipv4.tcp_max_syn_backlog = 65536\n\n# 验证 fd 上限\n$ cat /proc/sys/fs/file-max\n6553600\n```\n\n调优后再次压测，用 `watch -n1 'ss -s'` 实时观察连接状态分布，用 `sar -n DEV 1` 观察网卡 PPS 和带宽是否成为新瓶颈。一台配置得当的 48 核万兆机器，承载 15 万 WebSocket 长连接完全是正常水平，有些优化过的机器（关闭 conntrack、使用 DPDK 或 XDP 旁路内核协议栈）可以做到 100 万连接以上。\n\n## 进阶：conntrack 是隐藏的性能杀手\n\n很多调优文章忽略了 `nf_conntrack`，这是我们这个案例里 `dmesg` 已经明确报出来的问题。conntrack 是 Linux 用于追踪所有 TCP/UDP 连接状态的内核模块，iptables 的 NAT、状态匹配（`-m state`）都依赖它。\n\n问题在于：15 万并发连接 × 双向 = conntrack 表里至少要维护 15 万条目。默认表大小通常只有 65536（`sysctl net.netfilter.nf_conntrack_max`），溢出后内核会直接丢包，`dmesg` 里出现 `table full, dropping packet` 就是这个原因。\n\n如果你的服务不需要 iptables NAT（比如纯七层代理），最干净的解法是直接卸载 conntrack 模块：`rmmod nf_conntrack`。少了这层开销，高并发下 CPU 软中断处理时间可以降低 20% 以上。如果 iptables 规则里有 `-m state` 或 `-m conntrack`，卸载后这些规则会失效，需要先清理。",
+      "keyPoints": [
+        "Linux fd 限制分三层：内核全局 `fs.file-max`、进程级 `limits.conf` 的 nofile、以及 systemd 托管服务的 `LimitNOFILE`，三层必须同时修改，遗漏任何一层都会导致调优无效",
+        "监听 socket 有 SYN 半连接队列和 accept 全连接队列两级，`tcp_max_syn_backlog` 控制前者，`somaxconn` 控制后者上限，应用层 `listen()` 的 backlog 参数取两者中的较小值，两端都要改",
+        "`tcp_tw_recycle` 在 Linux 4.12 之后已被彻底移除，在 NAT 网络后开启它会导致大量合法连接被 RST；应使用 `tcp_tw_reuse = 1` + 扩大 `ip_local_port_range` 来缓解 TIME_WAIT 问题",
+        "NUMA 架构下网卡 DMA 内存只属于某一个 NUMA 节点，网卡中断应通过 `/proc/irq/*/smp_affinity` 绑定到同一 NUMA 节点的 CPU，避免跨节点内存访问将延迟从 100ns 推高到 300ns 以上",
+        "`nf_conntrack` 模块是高并发场景下的隐藏瓶颈，表满会直接丢包（dmesg 报 `table full, dropping packet`），需要调大 `nf_conntrack_max` 或在不需要 NAT 的服务端卸载该模块",
+        "WebSocket 长连接服务需要配置 TCP keepalive 三参数（`tcp_keepalive_time` / `tcp_keepalive_intvl` / `tcp_keepalive_probes`）来主动探活，否则死连接长期占用 fd 和内存资源",
+        "`vm.zone_reclaim_mode = 0` 在高并发网络服务下应设为 0，避免内核在 NUMA 本地内存紧张时触发 zone reclaim 造成毫秒级延迟毛刺，这对 P99 延迟敏感的服务影响明显"
+      ],
+      "quiz": [
+        {
+          "id": "linux-q172-quiz-1",
+          "question": "一台 Linux 服务器的 `ulimit -n` 已经设置为 1048576，但通过 systemd 启动的 Nginx 进程实际可用的文件描述符上限仍然只有 65535。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "需要重启系统才能让 ulimit 改动生效"},
+            {"id": "B", "text": "systemd 托管的服务不读取 PAM 的 limits.conf，需要在 service unit 里单独配置 LimitNOFILE"},
+            {"id": "C", "text": "内核的 fs.file-max 没有同步调大，限制了单进程上限"},
+            {"id": "D", "text": "Nginx 的 worker_rlimit_nofile 指令覆盖了系统级 ulimit 设置"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "systemd 在启动服务时会创建一个独立的 cgroup 和资源限制上下文，默认不会继承 `/etc/security/limits.conf` 中 PAM 设置的值。`ulimit -n` 只影响当前 shell 会话及其子进程，systemd fork 出来的服务进程走的是完全不同的代码路径。正确做法是在 unit 文件的 `[Service]` 段添加 `LimitNOFILE=1048576`，或创建 `/etc/systemd/system/nginx.service.d/override.conf`。A 选项不正确，`limits.conf` 和 `ulimit` 的改动对新启动的 shell 或 PAM 登录会话立即生效，不需要重启。C 选项不正确，`fs.file-max` 是所有进程共享的内核全局上限，不是单进程上限的直接限制因素。D 选项 `worker_rlimit_nofile` 确实存在，但它只能在 `LimitNOFILE` 允许的范围内进一步限制，不会反过来突破 systemd 设置的上限。"
+        },
+        {
+          "id": "linux-q172-quiz-2",
+          "question": "执行 `cat /proc/sys/net/core/somaxconn` 返回 65536，但压测发现客户端连接仍然被大量拒绝，且 `ss -lnt` 显示 Recv-Q 持续为 0。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "net.ipv4.tcp_max_syn_backlog 没有同步调大，SYN 队列先满了"},
+            {"id": "B", "text": "somaxconn 不会立即生效，需要重启监听进程"},
+            {"id": "C", "text": "应用层 listen() 调用的 backlog 参数比 somaxconn 小，实际 accept 队列上限取较小值"},
+            {"id": "D", "text": "Recv-Q 为 0 说明 accept 队列是空的，瓶颈在应用层处理速度不够快"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Linux 内核对 accept 全连接队列长度的计算是 `min(应用传入的 backlog, net.core.somaxconn)`，两者取较小值。`somaxconn` 改到 65536，但如果 Nginx 的 `listen 80 backlog=511;` 没有同步修改，实际 accept 队列只有 511 个槽位。`ss -lnt` 的 Recv-Q 字段对于监听状态的 socket 表示当前 accept 队列里积压的连接数，为 0 说明应用消费得很快，这反而说明问题不在这里——结合题目「连接被大量拒绝」，更可能是队列满溢时内核已经丢弃或 RST 了大量连接，Recv-Q 瞬间满了又被清空。A 选项也可能是原因，但题目问的是「somaxconn 已经设置了 65536」这个前提下仍有问题，C 选项是更直接的解释。D 选项判断方向有误，Recv-Q 持续为 0 对监听 socket 说明处理速度跟得上，不是问题所在。"
+        },
+        {
+          "id": "linux-q172-quiz-3",
+          "question": "以下关于 `net.ipv4.tcp_tw_reuse` 的描述，哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "开启后 TIME_WAIT 的等待时间从 60 秒缩短为 1 秒，加快端口释放"},
+            {"id": "B", "text": "对服务端 accept() 进来的连接和客户端 connect() 发出的连接都有效"},
+            {"id": "C", "text": "只对发起连接的一侧有效，允许客户端复用 TIME_WAIT 状态的四元组来建立新连接"},
+            {"id": "D", "text": "在 NAT 网络后面开启会导致大量连接被 RST，应避免使用"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "`tcp_tw_reuse` 只对调用 `connect()` 发起连接的一侧生效，即允许本机作为客户端时，在满足一定时间条件（距上次连接使用 TCP 时间戳确认至少 1 秒过去）的前提下，复用处于 TIME_WAIT 状态的本地端口和四元组。对服务端 `accept()` 进来的方向没有任何效果，这是 A 和 B 选项错误的原因。A 选项描述的是另一个行为：TIME_WAIT 的等待时间是内核硬编码的 2*MSL（约 60s），`tcp_tw_reuse` 并不缩短这个时间，只是在时间戳验证通过的前提下允许「复用」。D 选项描述的是 `tcp_tw_recycle` 的危险行为，该参数在 Linux 4.12 之后已被移除，`tcp_tw_reuse` 的安全性要高很多，在非 NAT 场景下开启没有已知的安全问题。"
+        },
+        {
+          "id": "linux-q172-quiz-4",
+          "question": "在一台双路 NUMA 服务器上，万兆网卡的 `numa_node` 为 0，但 `irqbalance` 将网卡中断分配到了 NUMA node 1 的 CPU 上。这会带来什么主要性能影响？",
+          "choices": [
+            {"id": "A", "text": "只影响 CPU 利用率分布，对网络延迟没有显著影响"},
+            {"id": "B", "text": "会导致 CPU cache miss 增加和跨 NUMA 节点内存访问，网络处理延迟从约 100ns 上升到 300ns 以上"},
+            {"id": "C", "text": "会使网卡驱动崩溃，因为 DMA 地址和 CPU 不在同一 NUMA 节点"},
+            {"id": "D", "text": "只影响发送方向，接收方向的中断处理对 NUMA 不敏感"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "NUMA 架构中，网卡通过 DMA 写入内存时，数据落在与网卡直连的 NUMA 节点（这里是 node 0）的内存页上。如果处理网卡中断的 CPU 在 node 1，每次中断处理都需要通过 QPI/UPI 总线跨节点读取这些内存数据，访问延迟从本地的约 100ns 跳升到 300ns 以上，而且会占用 QPI 总线带宽，影响其他跨节点通信。A 选项低估了影响，在高 pps 场景下延迟增加 3 倍是非常显著的。C 选项不正确，DMA 可以写入任意物理地址，只要 IOMMU 映射正确就不会崩溃，但性能会下降。D 选项不正确，接收方向更依赖中断处理，NUMA 感知对接收方向的影响尤为明显。解决方案是关闭 `irqbalance` 并手动通过 `/proc/irq/*/smp_affinity` 将网卡中断绑定到 node 0 的 CPU。"
+        },
+        {
+          "id": "linux-q172-quiz-5",
+          "question": "线上服务器 `dmesg` 中出现 `nf_conntrack: table full, dropping packet`，`sysctl net.netfilter.nf_conntrack_max` 显示为 131072。当前 `ss -s` 显示 established 连接约 10 万，TIME_WAIT 约 3 万。以下哪个方案最合适？",
+          "choices": [
+            {"id": "A", "text": "把 nf_conntrack_max 调大到 300 万，同时缩短 nf_conntrack_tcp_timeout_established 到 30 秒"},
+            {"id": "B", "text": "调大 nf_conntrack_max 到 400000，并根据业务需要评估是否可以卸载 nf_conntrack 模块"},
+            {"id": "C", "text": "重启 iptables 服务清空 conntrack 表"},
+            {"id": "D", "text": "关闭 SYN Cookies，减少内核状态追踪开销"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "连接数（established 10 万 + TIME_WAIT 3 万）已经超过 `nf_conntrack_max` 的 131072，调大上限是必须的。300 万（A 选项）对这台机器过于激进，每个 conntrack 条目约占 320 字节，300 万条目需要约 960MB 专用内存，而合理值通常是最大并发连接数的 1.5-2 倍即可，400000 更合理。A 选项还建议把 established 超时缩短到 30 秒，这对长连接服务（如 WebSocket）是灾难性的，连接会被 conntrack 提前清理导致数据包被丢弃。B 选项同时提到评估卸载 `nf_conntrack` 模块——如果服务不依赖 iptables 的状态匹配（DNAT、SNAT 等），卸载模块可以彻底消除这个性能瓶颈，每个包省掉一次哈希表查找开销，在高 pps 下 CPU 软中断时间可降低 15-25%。C 选项重启 iptables 只是暂时清空表，根本原因没解决。D 选项与问题无关，SYN Cookies 是半连接队列满时的保护机制，不影响 conntrack 开销。"
+        },
+        {
+          "id": "linux-q172-quiz-6",
+          "question": "以下哪个 sysctl 参数在 Linux 4.12+ 内核上已经被完全移除，设置它会被静默忽略甚至导致写入 /proc/sys 报错？",
+          "choices": [
+            {"id": "A", "text": "net.ipv4.tcp_tw_reuse"},
+            {"id": "B", "text": "net.ipv4.tcp_syncookies"},
+            {"id": "C", "text": "net.ipv4.tcp_tw_recycle"},
+            {"id": "D", "text": "net.ipv4.tcp_fin_timeout"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "`tcp_tw_recycle` 在 Linux 4.12 版本（2017 年发布）中被彻底从内核代码中删除，参见内核 commit `4396e46187ca5070219b81773c4e65088dac50cc`。它原本的作用是让服务端也能快速回收 TIME_WAIT socket，但实现上依赖 per-host 的 TCP 时间戳记录，在 NAT 后面的多客户端场景下，同一 IP 来自不同主机的包时间戳不连续，内核会误判为重播攻击并丢弃，在云环境和企业网络中造成大量生产事故。4.12 之后在这个路径写入值会直接报 `sysctl: cannot stat /proc/sys/net/ipv4/tcp_tw_recycle: No such file or directory`。A、B、D 这三个参数在现代内核中都是有效的参数，分别用于 TIME_WAIT 复用、SYN Cookies 防护、FIN_WAIT2 超时控制。很多网上流传的「Linux 高并发优化脚本」还在用 `tcp_tw_recycle = 1`，这些脚本要么是老版本，要么在新系统上会静默失效。"
+        },
+        {
+          "id": "linux-q172-quiz-7",
+          "question": "对于一个承载 WebSocket 长连接的服务端，设置 `net.ipv4.tcp_keepalive_time = 7200`（默认值）的主要风险是什么？",
+          "choices": [
+            {"id": "A", "text": "7200 秒的探活间隔导致内核频繁发送探测包，浪费网络带宽"},
+            {"id": "B", "text": "客户端断网或崩溃后，服务端需要 2 小时以上才能感知到死连接，期间 fd 和内存资源持续被占用"},
+            {"id": "C", "text": "keepalive 探测包会打断 WebSocket 的心跳机制，导致应用层超时误判"},
+            {"id": "D", "text": "7200 秒内连接不会进入 TIME_WAIT 状态，导致端口长期被占用"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "TCP keepalive 的 `tcp_keepalive_time` 参数定义了「连接空闲多久后开始发送探活包」。默认 7200 秒意味着：如果一个客户端手机突然断网（没有发送 FIN 或 RST，直接断开），服务端要等整整 2 个小时才会开始发探测包，再等 `tcp_keepalive_probes × tcp_keepalive_intvl`（默认 9 × 75 = 675 秒）才彻底断开。也就是说一个死连接可能霸占服务器资源超过 2 个小时。对于 WebSocket 服务，客户端掉线是常态，应该将 `tcp_keepalive_time` 设为 60 秒左右（1 分钟无数据就开始探），配合 `intvl = 10`、`probes = 3`，最多 90 秒就能清理死连接。A 选项方向相反，7200 秒是「少发」探测包。C 选项是误解，TCP keepalive 在应用层完全透明，不会影响 WebSocket 应用层心跳。D 选项对 keepalive 的机制理解有误，keepalive 是检测死连接，与 TIME_WAIT 进入条件无关。"
+        },
+        {
+          "id": "linux-q172-quiz-8",
+          "question": "在压测承载 10 万并发 WebSocket 连接的服务时，发现每当并发数超过 28000 时，客户端出现大量 `connection refused`，但此时 `ss -lnt` 中目标端口的 Recv-Q 为 0，accept 队列并不满。最可能的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "服务进程的文件描述符已经耗尽，accept() 系统调用返回 EMFILE 错误，新连接被拒绝"},
+            {"id": "B", "text": "SYN 队列（tcp_max_syn_backlog）满了，但由于开启了 SYN Cookies，错误表现为 connection refused 而不是丢包"},
+            {"id": "C", "text": "网卡 TX 队列满了，导致回包无法发出"},
+            {"id": "D", "text": "conntrack 表满了，三次握手的 ACK 被丢弃，客户端超时后报 connection refused"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Recv-Q 为 0 说明 accept 全连接队列没有积压，应用层在正常消费连接，但新连接仍然被拒绝。当 `accept()` 因为进程 fd 耗尽返回 `EMFILE`（Too many open files）时，内核已经完成了三次握手并将连接放入 accept 队列，但应用拿到这个连接后立即因 fd 不足关闭，发送 RST，客户端看到的是 `connection refused`。28000 这个数字接近某些系统默认的 `nofile = 32768` 减去系统本身占用的 fd 后的实际可用量（日志文件、配置文件、标准输入输出等大约占用几百个 fd）。验证方法：`cat /proc/<pid>/limits | grep 'open files'` 查看进程实际 fd 上限，`ls /proc/<pid>/fd | wc -l` 查看当前打开的 fd 数量。B 选项：SYN Cookies 满时会静默丢包或发 RST，不是 connection refused 的原因，而且 SYN 队列满时 Recv-Q 不会为 0。"
+        },
+        {
+          "id": "linux-q172-quiz-9",
+          "question": "在 48 核双路 NUMA 服务器上，将 WebSocket 网关服务用 `numactl --cpunodebind=0 --membind=0` 绑定到 NUMA node 0，但实际测试发现内存分配有时仍然发生在 node 1。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "numactl 命令在 Linux 5.x 内核上已经不再有效"},
+            {"id": "B", "text": "node 0 的可用内存不足，内核因 vm.zone_reclaim_mode 默认值触发了 zone reclaim 并从 node 1 分配内存"},
+            {"id": "C", "text": "--membind 只限制用户态堆内存，内核为进程分配的内核栈和 socket 缓冲区不受约束"},
+            {"id": "D", "text": "进程使用了 mmap 分配内存，mmap 不受 numactl 约束"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`--membind=0` 会在正常情况下强制所有内存分配在 node 0，但当 node 0 的可用内存不足时，内核的行为取决于 `vm.zone_reclaim_mode`。在默认值 0（实际上某些发行版默认是 1）的情况下，内核可以选择在本地内存紧张时去 node 1 分配，这违反了 `--membind` 的意图。将 `vm.zone_reclaim_mode = 0` 明确设置后，内核会更倾向于从远端节点分配而不是触发 zone reclaim（zone reclaim 会扫描本地内存，代价是引入延迟毛刺）——但这反而说明内存规划不足。根本解决方案是确保 node 0 有足够内存，或者改用 `--interleave` 分散内存压力。A 选项不正确，numactl 工具通过系统调用 `set_mempolicy` 实现，在现代内核中完全有效。C 选项部分正确但不是这里的原因，`--membind` 通过内存策略（memory policy）实现，影响所有用户态内存分配，但内核内存（如 socket 缓冲区）由内核侧策略控制。D 选项不正确，mmap 分配的匿名页同样受 `mbind/set_mempolicy` 约束。"
+        },
+        {
+          "id": "linux-q172-quiz-10",
+          "question": "调优完成后，对服务器进行压测验证。压测工具报告 10 万并发连接稳定建立，但 `sar -n DEV 1` 显示网卡 rxpck/s（每秒接收包数）达到 4.2 百万 pps，CPU 软中断（`sar -u` 中的 `%soft`）在部分核上达到 95%，其余核接近 0%。最合适的下一步优化是什么？",
+          "choices": [
+            {"id": "A", "text": "把 net.core.netdev_max_backlog 从 262144 再翻倍到 524288，增大接收缓冲"},
+            {"id": "B", "text": "开启网卡多队列（ethtool -L eth0 combined N）并设置 RPS/RFS 将软中断均衡分发到多个 CPU 核"},
+            {"id": "C", "text": "升级内核到最新版本，新版本的软中断调度更均衡"},
+            {"id": "D", "text": "降低压测并发数，4.2M pps 已经超出万兆网卡的处理能力"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "软中断集中在少数核上（95%），而其余核接近 0%，这是典型的网卡队列数量不足或中断绑定不当导致的负载不均衡。万兆网卡支持多队列（Receive Side Scaling, RSS），每个队列绑定一个中断，一个中断只在一个 CPU 核上处理。如果队列数只有 8（网卡出厂默认值），即使服务器有 48 核，也只有 8 个核在处理网卡软中断，造成热点。解决步骤：`ethtool -L eth0 combined 24`（绑定到 node 0 的 24 核），然后重新配置 `/proc/irq/*/smp_affinity`，并配置 RFS（Receive Flow Steering，`rps_sock_flow_entries`）让软中断处理和应用处理尽量在同一核上完成，减少缓存失效。4.2M pps 对万兆网卡来说是合理水平（万兆网卡理论极限约 14.88M pps for 64B packets），A 选项调大接收队列深度解决的是突发包堆积问题，不解决 CPU 均衡问题。C 选项空泛，升级内核不能解决中断亲和性配置问题。D 选项判断有误，万兆网卡处理 4.2M pps 完全在能力范围内，问题是 CPU 负载不均。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html",
+        "https://www.kernel.org/doc/html/latest/admin-guide/sysctl/net.html",
+        "https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/monitoring_and_managing_system_status_and_performance/tuning-the-network-performance_monitoring-and-managing-system-status-and-performance",
+        "https://blog.cloudflare.com/the-story-of-one-latency-spike/",
+        "https://github.com/torvalds/linux/commit/4396e46187ca5070219b81773c4e65088dac50cc"
+      ],
+      "relatedQuestions": []
+    }
+  ]
+}

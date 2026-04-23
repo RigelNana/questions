@@ -1,0 +1,159 @@
+{
+  "id": "linux-q174",
+  "name": "数据库服务器系统层面的调优要点",
+  "domain": "linux",
+  "description": "覆盖 NUMA、大页内存、swappiness、I/O 调度器、脏页回写、文件系统选型、CPU 性能模式等数据库宿主机调优核心知识点",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "linux-q174",
+      "domain": "linux",
+      "type": "open-ended",
+      "difficulty": 4,
+      "tags": ["numa", "hugepages", "swappiness", "io-scheduler", "dirty-ratio", "xfs", "ext4", "noatime", "cpu-governor", "postgresql", "mysql", "oracle", "tuning"],
+      "title": "给一台跑 MySQL 或 PostgreSQL 的数据库服务器做系统级调优，你会从哪些维度入手？",
+      "content": "你刚接手一台新采购的物理机，配置是 2 路 Intel Xeon Gold 6330（每路 28 核，共 56 核 112 线程），512 GB DDR4 ECC 内存，4 块 Samsung PM983 1.92 TB NVMe SSD 组 RAID-10，操作系统是 CentOS 7.9。这台机器要部署 PostgreSQL 14 作为核心 OLTP 数据库，预期 QPS 约 8 万，P99 延迟要求 < 5 ms。\n\n`uname -r` 输出 `3.10.0-1160.el7.x86_64`，`numactl --hardware` 输出如下：\n\n```\navailable: 2 nodes (0-1)\nnode 0 cpus: 0-27 56-83\nnode 0 size: 257892 MB\nnode 0 free: 246512 MB\nnode 1 cpus: 28-55 84-111\nnode 1 size: 258048 MB\nnode 1 free: 247203 MB\nnode distances:\nnode   0   1\n  0:  10  21\n  1:  21  10\n```\n\n`cat /sys/block/nvme0n1/queue/scheduler` 输出 `noop [deadline] cfq`，`cat /proc/sys/vm/swappiness` 输出 `60`，`cat /proc/sys/vm/dirty_ratio` 输出 `20`。\n\n你的任务：在不修改 PostgreSQL 自身配置参数（`postgresql.conf` 不在本题范围内）的前提下，仅通过操作系统层面的调整让这台服务器达到最佳数据库性能。请说明你会做哪些调整、每项调整的原理是什么、调整后如何验证效果，并给出一份可以直接执行的生产级调优 checklist。",
+      "answer": "## 第一步：认清「数据库服务器调优」的本质是什么\n\n数据库性能调优分两个层次：一是数据库软件自身的参数调优（`shared_buffers`、`work_mem`、`wal_buffers` 这类），二是宿主机操作系统层面的调优。很多工程师把 80% 的时间花在第一层，却忽视了第二层——但实际上，一台没有做过操作系统调优的服务器，无论 PostgreSQL 参数配得多精妙，都会被操作系统的默认行为拖后腿。本题聚焦第二层：如何让 Linux 内核的内存管理、I/O 子系统、CPU 调度配合数据库的工作模式。\n\n数据库服务器的工作特征是：长期驻留大量热数据于内存（Buffer Pool / Shared Buffers），I/O 模式以随机小块读写为主（8 KB ~ 16 KB page），CPU 需要稳定的算力而非突发峰值，对延迟抖动极度敏感（GC pause、内存 swap 都是灾难）。理解了这些特征，操作系统调优的每一条都是有据可查的。\n\n## 第二步：NUMA 策略 — 最容易被忽视的性能杀手\n\nNUMA（Non-Uniform Memory Access，非一致内存访问）是多路服务器的物理特性：每颗 CPU 有自己「本地」的内存控制器，访问本地内存延迟约 70 ns，访问另一颗 CPU 下挂载的「远端」内存延迟约 150 ns，差距超过 2 倍。从题目中 `numactl --hardware` 输出可以看到，`node distances` 里本地访问是 10，跨 NUMA 访问是 21，差距明显。\n\nLinux 默认的 NUMA 策略是 `interleave`（交叉分配），会让进程内存均匀分布在两个 NUMA node 上。对于普通应用这没问题，但对数据库来说是灾难——PostgreSQL 的 Shared Buffers 会被分散到两个 NUMA node，每次 Buffer Pool 命中有接近 50% 的概率触发跨 NUMA 远程内存访问，造成稳定的 2 倍延迟损耗。\n\n正确做法是以 `numactl --interleave=all` 启动 PostgreSQL（让内存分配在两个 node 之间交叉，减少热点），同时关闭内核的自动 NUMA balancing（它会在运行时迁移内存页，引发周期性延迟抖动）：\n\n```bash\n# 关闭自动 NUMA 页迁移，避免运行时抖动\necho 0 > /proc/sys/kernel/numa_balancing\n\n# 写入 sysctl 持久化\necho 'kernel.numa_balancing = 0' >> /etc/sysctl.d/99-db-tuning.conf\n\n# 以 interleave 模式启动 PostgreSQL（在 systemd unit 的 ExecStart 前加）\nnumactl --interleave=all /usr/bin/postgres -D /var/lib/pgsql/14/data\n```\n\nOracle 和 MySQL 的处理方式类似，但 MySQL 8.0 可以通过 `innodb_numa_interleave=ON`（需要编译时开启 `WITH_NUMA`）在数据库层面处理，PostgreSQL 目前没有内置 NUMA 感知，必须在启动命令层面处理。\n\n## 第三步：大页内存（HugePage）— 从 TLB 角度理解为什么重要\n\nTLB（Translation Lookaside Buffer，页表缓存）是 CPU 内部的一块硬件缓存，用于加速虚拟地址到物理地址的翻译。TLB 容量极其有限，典型 L1 TLB 只有 64 个条目。使用默认 4 KB 小页时，512 GB 内存需要 1.34 亿个页表条目，而 TLB 装不下这么多，频繁的 TLB miss 会触发「page table walk」（多级页表遍历），每次需要 3-5 次内存访问，对于访问热路径非常频繁的 Buffer Pool 来说，TLB miss 的累积开销非常可观。\n\n使用 2 MB 大页（HugePage）之后，同样 512 GB 内存只需要约 26 万个页表条目，TLB miss 率直线下降，实测在 Oracle 和 MySQL 上大页能带来 5%~15% 的性能提升，在内存访问密集的 OLAP 场景可以超过 20%。\n\n```bash\n# 计算需要多少个 2MB 大页\n# 假设 PostgreSQL shared_buffers 设置为 128 GB\n# 128 * 1024 MB / 2 MB = 65536 个大页，留 10% 余量\necho 72000 > /proc/sys/vm/nr_hugepages\n\n# 持久化\necho 'vm.nr_hugepages = 72000' >> /etc/sysctl.d/99-db-tuning.conf\n\n# PostgreSQL 使用大页需要在 postgresql.conf 设置 huge_pages = on\n# 同时需要设置 /etc/security/limits.conf 允许 postgres 用户锁定内存\necho 'postgres soft memlock unlimited' >> /etc/security/limits.conf\necho 'postgres hard memlock unlimited' >> /etc/security/limits.conf\n\n# 验证：启动后检查大页使用情况\ngrep -i hugepage /proc/meminfo\n# 输出应该类似：\n# HugePages_Total: 72000\n# HugePages_Free:   6000  ← 被 PostgreSQL 占用了 66000 个 = 132 GB\n# HugePages_Rsvd:    512\n# Hugepagesize:     2048 kB\n```\n\n注意：Oracle 强烈推荐使用大页（官方文档明确说明 HugePages 对 SGA 是必须的），MySQL InnoDB 从 5.5 开始支持 `large_pages=ON`，PostgreSQL 从 9.4 开始支持 `huge_pages = on`。\n\n## 第四步：swappiness — 为什么数据库服务器要设置成 1 而不是 0\n\n`vm.swappiness` 控制内核将内存页换出到 swap 的倾向，范围 0-100，默认 60。很多人知道数据库服务器要调低这个值，但不知道为什么是 1 而不是 0。\n\n设置为 0 在 Linux 3.5 之前意味着「永远不 swap」，但从 3.5 开始语义改了：0 的含义是「除非内存耗尽否则不 swap」，这在 OOM（内存耗尽）场景下反而更危险——内核会立刻触发 OOM killer 杀进程，而不是优先把不活跃的文件缓存页面推到 swap。设置为 1 是「尽量不 swap 但允许在极端情况下少量 swap」，这给了内核一个逃生通道，避免 OOM killer 直接杀掉数据库进程。\n\n```bash\necho 1 > /proc/sys/vm/swappiness\necho 'vm.swappiness = 1' >> /etc/sysctl.d/99-db-tuning.conf\n```\n\n## 第五步：I/O 调度器 — NVMe SSD 不需要调度\n\nLinux 的 I/O 调度器（elevator）最初是为机械硬盘设计的，目的是把随机 I/O 合并、排序成顺序 I/O，减少磁头寻道时间。NVMe SSD 没有机械磁头，寻道延迟接近 0，让调度器「优化」反而会增加额外的软件层延迟。\n\n对于 NVMe SSD，应该使用 `none`（内核 4.12+）或 `noop`（较老内核）调度器，直接把 I/O 请求传递给设备，不做排序合并：\n\n```bash\n# CentOS 7.9 内核 3.10 只支持 noop/deadline/cfq\n# 对所有 NVMe 设备设置 noop\nfor dev in /sys/block/nvme*/queue/scheduler; do\n  echo noop > \"$dev\"\ndone\n\n# 持久化（通过 udev rule）\ncat > /etc/udev/rules.d/60-nvme-scheduler.rules << 'EOF'\nACTION==\"add|change\", KERNEL==\"nvme[0-9]*\", ATTR{queue/scheduler}=\"noop\"\nEOF\n\n# 验证\ncat /sys/block/nvme0n1/queue/scheduler\n# 输出：[noop] deadline cfq\n```\n\n如果是 SATA SSD，可以考虑 `deadline`（有队列深度限制时比 noop 更公平），对于机械硬盘则保持 `deadline` 或 `cfq`。内核 5.x 以上引入了 `mq-deadline`、`bfq`、`kyber` 等多队列调度器，NVMe 设备应使用 `none`。\n\n## 第六步：脏页回写参数 — 避免周期性 I/O 风暴\n\n`vm.dirty_ratio`（默认 20%）是脏页占总内存的比例上限，超过后内核开始「强制」回写并阻塞所有写 I/O。`vm.dirty_background_ratio`（默认 10%）是后台 flusher 线程开始回写的阈值。\n\n问题在于：512 GB 内存的 20% 是 102 GB 脏页。当 flusher 开始回写 102 GB 数据时，会产生一波持续数秒的 I/O 风暴，期间数据库的 WAL 写入和 checkpoint 写入都会受到影响，表现为周期性的延迟抖动。\n\n数据库服务器应该把这两个值调低，让脏页尽早以更平滑的方式回写：\n\n```bash\n# dirty_background_ratio: 后台刷新触发阈值，调低让 flusher 更早、更频繁地工作\n# dirty_ratio: 强制同步写入上限，调低避免积累大量脏页\nsysctl -w vm.dirty_background_ratio=3\nsysctl -w vm.dirty_ratio=10\nsysctl -w vm.dirty_expire_centisecs=500   # 脏页 5 秒后必须刷盘（默认 3000 = 30 秒）\nsysctl -w vm.dirty_writeback_centisecs=100  # flusher 每 1 秒唤醒一次（默认 500 = 5 秒）\n\n# 持久化\ncat >> /etc/sysctl.d/99-db-tuning.conf << 'EOF'\nvm.dirty_background_ratio = 3\nvm.dirty_ratio = 10\nvm.dirty_expire_centisecs = 500\nvm.dirty_writeback_centisecs = 100\nEOF\n```\n\n## 第七步：文件系统选型 — ext4 vs XFS\n\next4 是 Linux 默认文件系统，稳定可靠，但在高并发大文件场景下存在两个已知弱点：第一，ext4 使用单一的 `jbd2` 日志线程，并发写入时日志提交是串行的，在 NVMe 高 IOPS 场景下会成为瓶颈；第二，ext4 的 `extent` 树在文件碎片化后性能下降比较明显。\n\nXFS 是 RHEL/CentOS 7+ 的默认文件系统，为高并发大文件读写优化，日志是多线程的，inode 分配算法对数据库的多文件并发写入更友好。PostgreSQL 官方文档推荐在 Linux 上使用 XFS，MySQL/InnoDB 也受益于 XFS 的并发写入性能。\n\n**数据目录的挂载参数同样重要**。`atime` 是文件访问时间，每次读文件都会触发一次 inode 更新写入，对数据库的高频 page read 来说是纯开销。`noatime` 挂载选项可以彻底关掉 atime 更新：\n\n```bash\n# /etc/fstab 示例（数据库数据目录挂载在 /var/lib/pgsql）\n# noatime: 读文件不更新 atime\n# nodiratime: 读目录不更新 atime\n# nobarrier: NVMe SSD 有电容保护，可以关闭写屏障（传统 HDD/SATA SSD 不要用）\n# discard: SSD TRIM，按需决定是否启用（高写入场景建议用 fstrim 定期执行而不是实时 discard）\nUUID=xxxxx /var/lib/pgsql xfs defaults,noatime,nodiratime,nobarrier 0 2\n\n# 验证 atime 是否生效\nstat /var/lib/pgsql/14/data/PG_VERSION\n# Access 时间不会因为读操作而更新\n```\n\n## 第八步：CPU 性能模式 — 不要让 CPU 省电模式影响延迟\n\nLinux 默认的 CPU 调频策略是 `ondemand` 或 `powersave`，CPU 会根据负载动态降频，从 3.6 GHz 降到 1.2 GHz 只需要几毫秒，但从低频爬升回高频也需要几毫秒——这对 5 ms P99 的数据库来说是不可接受的抖动源。\n\n```bash\n# 查看当前 governor\ncpupower frequency-info | grep governor\n\n# 设置为 performance 模式（所有核心保持最高频率）\ncpupower frequency-set -g performance\n\n# 持久化（CentOS 7 通过 cpupower 服务）\nsystemctl enable cpupower\necho 'CPUPOWER_START_OPTS=\"frequency-set -g performance\"' >> /etc/sysconfig/cpupower\n\n# 同时关闭 C-State 深度睡眠（BIOS 层面推荐一并设置，这里是内核层面）\nfor cpu in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do\n  echo 1 > \"$cpu\"\ndone 2>/dev/null || true\n\n# 验证\ncat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor\n# 输出：performance\n```\n\n还有一项常被忽视的设置：关闭透明大页的 `defrag`。透明大页（THP）的碎片整理会在后台合并 4 KB 小页为 2 MB 大页，这个过程会短暂 stall 应用线程。数据库（尤其是 Oracle、MongoDB）明确要求关闭 THP：\n\n```bash\necho never > /sys/kernel/mm/transparent_hugepage/enabled\necho never > /sys/kernel/mm/transparent_hugepage/defrag\n\n# 持久化（写入 /etc/rc.local 或 systemd unit）\ncat > /etc/systemd/system/disable-thp.service << 'EOF'\n[Unit]\nDescription=Disable Transparent Huge Pages\nAfter=sysinit.target\n\n[Service]\nType=oneshot\nExecStart=/bin/bash -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'\nExecStart=/bin/bash -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'\n\n[Install]\nWantedBy=multi-user.target\nEOF\nsystemctl enable --now disable-thp\n```\n\n## 第九步：生产级调优 Checklist\n\n以下是可以直接用于生产的完整执行顺序：\n\n```bash\n#!/bin/bash\n# db-tuning.sh — 数据库服务器系统级调优脚本\n# 适用：CentOS 7/8, RHEL 7/8，NVMe SSD，PostgreSQL/MySQL\n# 执行前请 review 每一行，特别是大页数量需根据实际 shared_buffers/innodb_buffer_pool_size 计算\n\nset -euo pipefail\n\nSYSCTL_CONF=/etc/sysctl.d/99-db-tuning.conf\n\n# 1. 关闭自动 NUMA balancing\necho 'kernel.numa_balancing = 0' >> $SYSCTL_CONF\n\n# 2. 内存管理\ncat >> $SYSCTL_CONF << 'EOF'\nvm.swappiness = 1\nvm.dirty_background_ratio = 3\nvm.dirty_ratio = 10\nvm.dirty_expire_centisecs = 500\nvm.dirty_writeback_centisecs = 100\nvm.overcommit_memory = 2\nvm.overcommit_ratio = 90\nEOF\n\n# 3. 大页（根据实际 buffer pool 大小调整数量）\necho 'vm.nr_hugepages = 72000' >> $SYSCTL_CONF\n\n# 4. 网络（连接密集型数据库服务器）\ncat >> $SYSCTL_CONF << 'EOF'\nnet.core.somaxconn = 65535\nnet.ipv4.tcp_max_syn_backlog = 65535\nnet.ipv4.tcp_fin_timeout = 15\nEOF\n\nsysctl -p $SYSCTL_CONF\n\n# 5. I/O 调度器\nfor dev in /sys/block/nvme*/queue/scheduler; do\n  echo noop > \"$dev\"\ndone\ncat > /etc/udev/rules.d/60-nvme-scheduler.rules << 'EOF'\nACTION==\"add|change\", KERNEL==\"nvme[0-9]*\", ATTR{queue/scheduler}=\"noop\"\nEOF\n\n# 6. 关闭 THP\necho never > /sys/kernel/mm/transparent_hugepage/enabled\necho never > /sys/kernel/mm/transparent_hugepage/defrag\n\n# 7. CPU governor\ncpupower frequency-set -g performance\n\n# 8. 文件句柄限制\ncat >> /etc/security/limits.conf << 'EOF'\npostgres soft nofile 65535\npostgres hard nofile 65535\npostgres soft nproc  65535\npostgres hard nproc  65535\npostgres soft memlock unlimited\npostgres hard memlock unlimited\nEOF\n\necho \"系统调优完成，建议 reboot 后验证以下指标：\"\necho \"  grep -i hugepage /proc/meminfo\"\necho \"  cat /sys/block/nvme0n1/queue/scheduler\"\necho \"  cat /proc/sys/vm/swappiness\"\necho \"  cat /sys/kernel/mm/transparent_hugepage/enabled\"\necho \"  cpupower frequency-info | grep governor\"\n```\n\n## 验证与基准测试\n\n调优之后要用数据说话，而不是靠主观感受。推荐用 `pgbench`（PostgreSQL 自带）做调优前后的对比基准：\n\n```bash\n# 初始化 pgbench，scale 1000 约 15 GB 数据\npgbench -i -s 1000 postgres\n\n# 调优前跑一次，记录结果\npgbench -c 64 -j 8 -T 300 -P 10 postgres > before-tuning.txt\n\n# 调优后重跑，对比 tps 和平均延迟\npgbench -c 64 -j 8 -T 300 -P 10 postgres > after-tuning.txt\n\ndiff before-tuning.txt after-tuning.txt\n```\n\n典型的调优收益：在 NVMe SSD + 大内存机器上，完整的系统调优（关闭 THP、大页、NUMA interleave、noop 调度器、swappiness=1、performance governor）相比默认配置，pgbench TPS 提升 20%~40%，P99 延迟从 12ms 降到 4ms 的案例在生产中并不罕见。",
+      "keyPoints": [
+        "NUMA 双路服务器必须关闭 `kernel.numa_balancing`，并以 `numactl --interleave=all` 启动数据库进程，否则跨 NUMA 内存访问延迟是本地访问的 2 倍以上",
+        "大页（HugePage）通过减少页表条目数量降低 TLB miss 率，512 GB 内存使用 2 MB 大页后页表条目从 1.34 亿减少到 26 万，数据库 Buffer Pool 访问热路径延迟可降低 5%~15%",
+        "`vm.swappiness = 1` 而非 0：Linux 3.5+ 内核中 0 的语义变为「禁止 swap 直到 OOM」，会导致 OOM killer 直接杀进程，而 1 保留极端情况下的少量 swap 通道",
+        "NVMe SSD 应使用 `noop`（内核 3.x）或 `none`（内核 5.x）I/O 调度器，I/O 排序逻辑对没有机械磁头的 SSD 是纯开销，去掉后可减少调度器引入的软件延迟",
+        "`vm.dirty_ratio` 从默认 20% 降至 10%，在 512 GB 内存的机器上避免一次性积累 100 GB 脏页再集中回写，消除周期性 I/O 风暴导致的延迟抖动",
+        "数据库数据目录挂载应使用 XFS 文件系统并加 `noatime,nodiratime` 参数，XFS 的多线程日志比 ext4 的单线程 jbd2 在 NVMe 高并发写入场景下吞吐更高，`noatime` 消除每次读 page 触发的 inode 写操作",
+        "透明大页（THP）的后台碎片整理（defrag）会短暂 stall 应用线程，必须设置为 `never`；Oracle、MongoDB 官方文档明确要求关闭 THP，PostgreSQL 和 MySQL 也建议关闭",
+        "CPU governor 设置为 `performance` 模式，避免 `ondemand`/`powersave` 的动态降频在突发查询时引入毫秒级的频率爬升延迟，对 P99 < 5ms 的 SLA 要求尤为关键"
+      ],
+      "quiz": [
+        {
+          "id": "linux-q174-q1",
+          "question": "在双路 NUMA 服务器上，Linux 默认的内存分配策略对数据库性能有什么影响？",
+          "choices": [
+            {"id": "A", "text": "默认策略会将内存均匀分配到所有 NUMA node，导致 Buffer Pool 中约 50% 的访问触发跨 NUMA 远程内存访问，延迟增加约 2 倍"},
+            {"id": "B", "text": "默认策略会将内存优先分配到 node 0，导致 node 1 的 CPU 资源无法被利用"},
+            {"id": "C", "text": "Linux 会自动检测数据库进程并绑定到同一个 NUMA node，默认配置不需要调整"},
+            {"id": "D", "text": "默认策略是 local 模式，内存总是分配在发起请求的 CPU 所在 node，不存在跨 NUMA 访问"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Linux 默认的 NUMA 策略对大多数应用是 local 优先，但内核自动 NUMA balancing（`numa_balancing=1`）会在运行时迁移内存页，而数据库的 Shared Buffer Pool 在多个 worker 进程并发访问时，内存页会因 balancing 被迁移到不同 node，最终导致大量跨 NUMA 访问。B 选项描述的是 `--membind 0` 的行为。C 选项是错的，Linux 没有针对数据库进程的特殊识别逻辑。D 选项描述的是 local 策略，但默认策略加上 balancing 后效果并非如此简单。正确解法是关闭 `numa_balancing` 并以 `numactl --interleave=all` 启动，让内存按轮询方式跨 node 分配，使两颗 CPU 都能就近访问数据。"
+        },
+        {
+          "id": "linux-q174-q2",
+          "question": "为什么数据库服务器要设置 `vm.swappiness = 1` 而不是 `vm.swappiness = 0`？",
+          "choices": [
+            {"id": "A", "text": "swappiness = 0 性能比 1 更差，因为内核需要花更多 CPU 判断是否 swap"},
+            {"id": "B", "text": "Linux 3.5+ 内核中 swappiness = 0 的语义是「内存耗尽才 swap」，在 OOM 场景下会触发 OOM killer 杀进程而非缓慢 swap，1 保留了极端情况下的少量 swap 通道"},
+            {"id": "C", "text": "swappiness = 0 会导致 Page Cache 无法使用，影响文件 I/O 性能"},
+            {"id": "D", "text": "两者没有实质区别，都是「尽量不 swap」，设置哪个都可以"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个版本相关的细节。Linux 3.5 之前，swappiness=0 确实意味着「永远不 swap（除非内存用完）」，行为是合理的。但 3.5 之后语义改变：0 表示「禁止在有 file cache 可以回收时进行 swap」，在内存真正耗尽时仍可能 swap，但这也意味着内核在 OOM 压力下会更激进地触发 OOM killer 而不是通过少量 swap 来缓解压力。设置为 1 是业界在数据库服务器上的共识，既能最大程度避免 swap，又给了内核在极端情况下的逃生通道，防止因为一瞬间的内存峰值导致数据库进程被 OOM kill。A、C、D 均为错误理解。"
+        },
+        {
+          "id": "linux-q174-q3",
+          "question": "使用大页（HugePage）对数据库性能提升的核心原理是什么？",
+          "choices": [
+            {"id": "A", "text": "大页减少了 OS 的物理内存碎片，使内存分配更快"},
+            {"id": "B", "text": "大页跳过了内存分配器（glibc malloc），直接使用 mmap，减少了系统调用次数"},
+            {"id": "C", "text": "2 MB 大页比 4 KB 小页需要更少的页表条目，TLB 命中率更高，减少了 page table walk 的次数"},
+            {"id": "D", "text": "大页使用连续物理内存，减少了 DMA 操作的内存复制开销"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "HugePage 的核心价值在于 TLB 效率。TLB（Translation Lookaside Buffer）是 CPU 内部用于缓存虚拟地址到物理地址映射的硬件结构，容量非常有限（L1 TLB 通常只有 64 个条目）。使用 4 KB 小页时，512 GB 内存需要 1.34 亿个页表条目，TLB 频繁 miss，每次 miss 需要遍历多级页表（3-5 次内存访问）。换成 2 MB 大页后只需要约 26 万个条目，TLB 命中率大幅提升。数据库 Buffer Pool 的工作负载是高频随机内存访问，正是 TLB miss 最严重的场景，因此受益最明显。A、B、D 虽然听起来有道理，但都不是 HugePage 性能提升的主要原因。"
+        },
+        {
+          "id": "linux-q174-q4",
+          "question": "对于 NVMe SSD，为什么应该将 I/O 调度器设置为 `noop` 或 `none`？",
+          "choices": [
+            {"id": "A", "text": "noop 调度器会启用 NVMe 的原生队列（NVMe Queue），绕过 Linux 通用块层，性能最高"},
+            {"id": "B", "text": "I/O 调度器最初是为减少机械磁头寻道时间设计的，NVMe SSD 没有寻道延迟，调度器的排序合并逻辑只会增加软件层延迟而无收益"},
+            {"id": "C", "text": "noop 调度器能更好地利用 NVMe 的 PCIe 带宽，其他调度器会限制带宽"},
+            {"id": "D", "text": "deadline 和 cfq 调度器在 NVMe 上会导致内核 panic，因此必须用 noop"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Linux 的 I/O 调度器（电梯算法）的设计初衷是把随机 I/O 请求重新排序，使磁头按一个方向扫描从而减少寻道时间——这对机械硬盘非常有效。NVMe SSD 的随机读写延迟约 70~100 μs，与顺序读写延迟相差无几，不需要调度器来「优化」I/O 顺序。保留调度器反而会在软件层增加队列管理、排序、合并的 CPU 开销，在高 IOPS 场景下（NVMe 可以达到百万 IOPS）这些开销会积累成可观的延迟增加。A 选项描述的是 Linux 5.x 的多队列块层架构特性，与调度器选择不是同一个维度。C、D 均为错误描述。"
+        },
+        {
+          "id": "linux-q174-q5",
+          "question": "以下哪条命令可以验证透明大页（THP）的碎片整理功能已被成功关闭？",
+          "choices": [
+            {"id": "A", "text": "`grep AnonHugePages /proc/meminfo` 输出为 0"},
+            {"id": "B", "text": "`cat /sys/kernel/mm/transparent_hugepage/defrag` 输出包含 `[never]`"},
+            {"id": "C", "text": "`cat /proc/sys/vm/nr_hugepages` 输出不为 0"},
+            {"id": "D", "text": "`grep HugePages_Total /proc/meminfo` 输出大于 0"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "THP 的 defrag 策略通过 `/sys/kernel/mm/transparent_hugepage/defrag` 文件控制，文件内容会显示当前生效的策略，生效的选项用方括号 `[]` 包裹。`echo never > /sys/kernel/mm/transparent_hugepage/defrag` 执行后，`cat` 该文件应显示 `always defer defer+madvise [never]`。A 选项的 `AnonHugePages` 是内核已经分配的匿名 THP 数量，不反映 defrag 状态。C 和 D 选项测的是静态大页（HugePage）的配置，与 THP（动态大页）是两套完全不同的机制，不要混淆：静态大页需要预先分配 `nr_hugepages`，THP 是动态合并，两者可以同时存在。"
+        },
+        {
+          "id": "linux-q174-q6",
+          "question": "在一台 512 GB 内存的数据库服务器上，保持 `vm.dirty_ratio = 20`（默认值）可能导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "脏页比例达到 20% 时内核会触发 OOM killer，数据库进程可能被杀"},
+            {"id": "B", "text": "脏页可以积累到约 102 GB，当强制回写触发时产生持续数秒的 I/O 风暴，期间 WAL 写入被阻塞，导致周期性延迟抖动"},
+            {"id": "C", "text": "dirty_ratio 超过 10% 会导致 PostgreSQL 的 checkpoint 无法正常工作"},
+            {"id": "D", "text": "20% 的 dirty_ratio 是数据库服务器的推荐值，不需要修改"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在小内存机器（如 8 GB）上，dirty_ratio=20% 意味着 1.6 GB 脏页上限，回写压力可控。但在 512 GB 的数据库服务器上，20% 等于 102 GB，内核的 background flusher 会允许脏页积累到这个量级才密集回写，一次回写 100+ GB 会产生持续 3~10 秒的 I/O 高峰，期间数据库的 WAL 顺序写入和 checkpoint 随机写入都会和 flusher 竞争 I/O 带宽，造成明显的延迟毛刺。解法是将 dirty_background_ratio 降到 3% 让 flusher 更早唤醒，将 dirty_ratio 降到 10% 减少单次最大回写量，让脏页以更小批次平滑写出。"
+        },
+        {
+          "id": "linux-q174-q7",
+          "question": "数据库数据目录应选择 XFS 还是 ext4？以下哪个判断最准确？",
+          "choices": [
+            {"id": "A", "text": "ext4 更稳定，在所有场景下都应优先选择 ext4"},
+            {"id": "B", "text": "XFS 在高并发小文件（< 4 KB）场景下比 ext4 更快，但数据库的数据文件通常是大文件，ext4 更合适"},
+            {"id": "C", "text": "XFS 的多线程日志比 ext4 的单线程 jbd2 在高 IOPS NVMe 环境下并发写入性能更好，PostgreSQL 官方文档推荐在 Linux 上使用 XFS"},
+            {"id": "D", "text": "两者性能没有显著差异，选哪个都可以，主要考虑运维团队的熟悉程度"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这道题的核心知识点是 ext4 和 XFS 的日志架构差异。ext4 的日志由单一的 jbd2 线程管理，所有元数据写入必须串行通过这个线程提交，在 NVMe SSD 的高 IOPS 场景下，jbd2 成为瓶颈（可以用 `iostat -x` 看到 `await` 很低但吞吐上不去）。XFS 的日志支持多线程并发提交，更好地利用了 NVMe 的并行特性。PostgreSQL 官方文档在 Linux 文件系统建议部分明确提到 XFS 通常比 ext4 更适合数据库工作负载。RHEL/CentOS 7+ 也将 XFS 作为默认文件系统。A 选项的「稳定性」描述过时，XFS 在 Linux 5.x 内核上非常成熟。B 选项的判断逻辑反了。"
+        },
+        {
+          "id": "linux-q174-q8",
+          "question": "你的 PostgreSQL 服务 P99 延迟在业务低峰期会出现周期性尖刺（每隔 5 分钟出现一次 20 ms 的延迟高峰），其他时间延迟稳定在 2 ms 以内。最可能的系统层原因是什么？",
+          "choices": [
+            {"id": "A", "text": "PostgreSQL 的 autovacuum 触发了全表扫描，消耗大量 CPU"},
+            {"id": "B", "text": "vm.dirty_writeback_centisecs 默认值导致 flusher 每 5 秒批量回写积累的脏页，产生 I/O 风暴"},
+            {"id": "C", "text": "服务器的 CPU governor 处于 ondemand 模式，每 5 分钟触发一次频率调整"},
+            {"id": "D", "text": "NVMe SSD 的 GC（Garbage Collection）在低峰期触发，占用 I/O 带宽"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "「每隔固定时间出现的周期性延迟尖刺」是脏页回写风暴的典型特征。`vm.dirty_writeback_centisecs` 默认值是 500（5 秒），意味着内核的 flusher 线程每 5 秒唤醒一次，检查是否有脏页超过 `dirty_expire_centisecs`（默认 3000，即 30 秒）需要回写。在内存大、写入量大的数据库服务器上，5 秒一次的批量回写会在短时间内对 I/O 产生冲击。解法是降低 dirty_writeback_centisecs 为 100（1 秒）让 flusher 更频繁但每次工作量更小。A 选项的 autovacuum 也可能造成性能问题，但不会呈现精确的 5 秒周期。C 选项的降频通常在负载变化时触发，不会有固定周期。D 选项的 NVMe GC 在企业级 SSD 上通常不会造成可见的延迟。"
+        },
+        {
+          "id": "linux-q174-q9",
+          "question": "在使用静态大页（HugePage）时，以下哪种配置错误会导致 PostgreSQL 启动失败或回退到小页？",
+          "choices": [
+            {"id": "A", "text": "没有设置 vm.nr_hugepages 或大页数量不足，PostgreSQL 在 huge_pages=on 时会拒绝启动"},
+            {"id": "B", "text": "postgres 用户的 memlock 限制（/etc/security/limits.conf）小于 shared_buffers 的大小，无法锁定足够内存"},
+            {"id": "C", "text": "大页必须在系统启动时通过内核参数 hugepages= 预留，运行时设置 vm.nr_hugepages 无效"},
+            {"id": "D", "text": "同时启用了 THP 和静态 HugePage，两者冲突导致大页无法分配"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个高频生产踩坑点。使用大页的进程需要将分配的大页内存锁定（mlock），防止被 swap 出去。Linux 对每个用户的可锁定内存量有限制，通过 `ulimit -l` 查看（默认值通常是 64 KB 或类似的小值）。如果 postgres 用户的 soft/hard memlock 限制小于 PostgreSQL 试图分配的 shared_buffers 大小，mmap 调用会失败，PostgreSQL 要么回退到小页（huge_pages=try 时），要么直接报错退出（huge_pages=on 时）。正确做法是在 /etc/security/limits.conf 中设置 postgres 的 memlock 为 unlimited。A 选项也会导致问题，但准确描述是「大页不足时 huge_pages=on 会失败，huge_pages=try 会回退」。C 选项是错的，运行时设置 nr_hugepages 完全有效（只要内存碎片不严重）。D 选项是错的，两者可以共存。"
+        },
+        {
+          "id": "linux-q174-q10",
+          "question": "调优完成后，用 `pgbench -c 64 -j 8 -T 300 postgres` 做基准测试，发现 TPS 比预期低，`iostat -x 1` 显示 NVMe 的 `%util` 长期在 95% 以上，`await` 约 0.3 ms。下一步最应该检查什么？",
+          "choices": [
+            {"id": "A", "text": "检查 PostgreSQL 的 shared_buffers 是否足够大，Buffer Pool 命中率是否达到 99% 以上"},
+            {"id": "B", "text": "检查是否启用了大页，TLB miss 率过高会导致 CPU 成为瓶颈而非 I/O"},
+            {"id": "C", "text": "`%util=95%` 说明磁盘已达到饱和，但 NVMe SSD 的 `%util` 指标是单队列利用率，并不代表磁盘饱和，应检查 `avgqu-sz`（平均队列深度）是否合理，以及是否充分利用了 NVMe 的多队列（Multi-Queue）特性"},
+            {"id": "D", "text": "检查网络带宽是否成为瓶颈，pgbench 客户端与服务器之间的网络延迟会影响 TPS"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 NVMe SSD 运维的一个常见认知误区。传统机械硬盘的 `%util` 反映磁盘繁忙程度，接近 100% 说明磁盘饱和。但 NVMe SSD 支持多队列（NVMe 规范支持最多 64K 队列，每队列 64K 深度），单个队列的 `%util` 满并不代表整个 SSD 达到瓶颈——可能只用了 1/16 的 I/O 能力。正确的判断指标是 `avgqu-sz`（平均 I/O 队列深度）和 `r/s + w/s`（实际 IOPS）。如果 IOPS 远低于 SSD 规格（Samsung PM983 随机读约 800K IOPS），说明上层有其他瓶颈（如 CPU 处理、锁竞争、PostgreSQL 配置问题）。A 选项是 PostgreSQL 层面的优化，不在本题范围内但确实重要。B 选项与 TLB 无直接关联。D 选项在本机测试中不适用。"
+        }
+      ],
+      "references": [
+        "https://www.postgresql.org/docs/14/kernel-resources.html",
+        "https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/performance_tuning_guide/sect-red_hat_enterprise_linux-performance_tuning_guide-memory-configuring-huge-pages",
+        "https://dev.mysql.com/doc/refman/8.0/en/large-page-support.html",
+        "https://www.kernel.org/doc/html/latest/admin-guide/mm/hugetlbpage.html",
+        "https://access.redhat.com/solutions/17610"
+      ],
+      "relatedQuestions": []
+    }
+  ]
+}
