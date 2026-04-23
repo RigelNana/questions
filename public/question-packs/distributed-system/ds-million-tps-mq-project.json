@@ -1,0 +1,173 @@
+{
+  "id": "ds-million-tps-mq-project",
+  "name": "百万 TPS 消息系统设计",
+  "domain": "distributed-system",
+  "description": "结合 Kafka 生产经验，设计支持百万级 TPS 的消息系统，覆盖集群规划、分区设计、生产者/消费者调优、监控体系",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-million-tps-mq-project-q1",
+      "domain": "distributed-system",
+      "type": "project",
+      "difficulty": 4,
+      "tags": ["kafka", "消息队列", "高吞吐", "架构设计", "分区设计", "容量规划"],
+      "title": "设计一个支持百万级 TPS 的消息系统架构",
+      "content": "你所在的团队负责一个互联网广告平台的数据采集基础设施。广告平台每天有数亿次广告曝光、点击和转化事件需要被实时采集并下游消费。在大促活动期间（比如双十一），峰值流量可以达到 **100 万 TPS**，每条用户行为消息平均大小约 200 字节，包含 user_id、ad_id、event_type（click/impression/conversion）、timestamp、设备信息等核心字段。\n\n这些消息数据需要同时被三类消费方使用：**实时计费系统**（扣广告主的余额，延迟敏感，要求端到端 < 100ms）、**用户画像更新服务**（更新用户兴趣标签，吞吐优先，允许秒级延迟）、**日志归档服务**（写 HDFS/S3 做离线分析，只要求最终一致性）。\n\n业务方对这套系统提出了三个核心 SLA：**消息不丢失**（生产者发出的消息必须被持久化，不能因 Broker 宕机丢失）、**端到端延迟 < 100ms**（从采集客户端发出到实时计费消费者拿到消息）、**支持 7 天回放**（任意消费者组可以从任意时间点重新消费最近 7 天的消息，用于数据修正或新服务上线时的历史数据初始化）。\n\n你来主导这套消息系统的架构设计。请从 Kafka 集群规划、Topic 和分区设计、生产者端调优、消费者端差异化配置、Broker 关键参数、以及监控告警体系六个维度，给出完整的技术方案。",
+      "answer": "## 第一步：理解 Kafka 的吞吐上限，从数字倒推架构规模\n\nKafka 是当前业界在消息队列领域吞吐最高的选择，但很多人对它的吞吐能力只有模糊的概念，面试时说「Kafka 很快」却说不出具体数字。做架构设计首先要建立数量级认知。\n\nKafka 的高吞吐来自两个底层机制：**顺序写磁盘**和 **Zero Copy**。顺序写的意思是 Kafka 的 segment 文件只追加写（append-only），操作系统的 page cache 对顺序写有极强的优化，实际写入速度接近内存速度，现代 SSD 顺序写可以达到 500MB/s 以上。Zero Copy 则是 Kafka 在向消费者发数据时，通过 `sendfile` 系统调用直接让内核把数据从 page cache 搬到网卡，跳过了从内核态到用户态再回内核态的两次内存拷贝，大幅降低了 CPU 开销。有了这两个机制，一个配置合理的 Kafka Broker（32 核 / 128GB / 10TB SSD）理论写入吞吐可以达到 **100~200 MB/s**。\n\n现在回到业务需求：100 万 TPS，每条消息 200 字节，那么写入带宽是 `100万 × 200 = 200 MB/s`。乍看只需要 1~2 个 Broker 就够了，但这是裸写入的需求。真实环境下还要考虑三个放大因素：**副本复制**（3 副本意味着每条消息要写 3 次，Broker 间的同步流量是写入流量的 2 倍）、**消费者读取**（三个消费者组各自从 Broker 拉数据，消费带宽接近写入带宽的 3 倍）、以及**留 30% 的水位用于应对突发和滚动重启**。综合下来，实际需要的集群能力大约是写入需求的 6~8 倍，也就是 `200 MB/s × 6 = 1200 MB/s`，对应 **8~10 个 Broker**。这就是为什么生产环境不能只按写入 TPS 来规划集群规模。\n\n## 第二步：完整架构设计\n\n### 集群规划：硬件选型不是越贵越好\n\n最终的集群规划如下：Kafka 部署 **10 个 Broker**，每台规格为 32C/128G/10TB SSD（两块 5TB 做 RAID-0，或者直接用两块独立磁盘挂载两个 log.dirs，Kafka 多磁盘可以并行写，建议后者）。ZooKeeper 独立部署 3 节点（如果是 Kafka 3.x 新部署，可以直接用 KRaft 模式，省掉 ZooKeeper 的运维成本）。\n\n硬件选型上有一个常见的错误决策：用昂贵的网络存储（SAN/NAS）替代本地 SSD。Kafka 的顺序写性能对存储延迟极其敏感，NAS 的网络 IO 抖动会直接影响 Kafka 的 produce 延迟，生产上见过因为 NAS 抖动导致 Kafka produce 延迟从 5ms 飙到 200ms 的事故。一定要用本地 SSD，NVMe 更佳。\n\n### Topic 和分区设计：分区数是架构中最重要的决策\n\nTopic 设计上，这个场景应该设计 **1 个主 Topic**：`user-behavior-topic`，分区数 **100 个**，副本数 **3**。\n\n分区数为什么是 100？计算逻辑：每个分区在写入端受制于 Leader Broker 的单分区顺序写能力和单 Consumer 的消费能力，实际每个分区可以稳定承载 **1~2 万 TPS**，取保守值 `100万 TPS ÷ 1万 TPS/分区 = 100 个分区`。分区数决定了消费者的最大并行度——如果你有 100 个分区，消费者组最多可以部署 100 个 Consumer 实例，超过 100 个实例会有 Consumer 空转（分配不到分区）。\n\n分区数有一个容易被忽视的坑：**分区数只能增加不能减少**，增加分区会打破 key-based 的顺序保证（因为 key 的 hash 会路由到不同的分区）。所以要一次性把分区数设足，不要等到性能瓶颈出现再扩。100 个分区在 10 个 Broker 上均匀分布，每个 Broker 承载 10 个 Leader 分区和 20 个 Follower 分区，负载均匀。\n\n副本数为 3，`min.insync.replicas` 设为 2。这意味着至少有 2 个副本同步完成才会向 Producer 确认写入成功，允许 1 个副本宕机而不影响写入可用性，容忍 1 个 Broker 宕机而不丢数据。\n\n### Producer 端调优：采集客户端是性能瓶颈的第一关\n\n广告平台的采集链路通常是：用户行为 → 客户端 SDK → 数据网关（Gateway）→ Kafka。生产者是数据网关，Java 实现，关键配置如下：\n\n```java\nProperties props = new Properties();\nprops.put(\"bootstrap.servers\", \"kafka1:9092,kafka2:9092,kafka3:9092\");\n\n// acks=1：只等 Leader 写入确认，不等 Follower 同步\n// 这是性能和可靠性的权衡点：acks=all 吞吐约降 30%，但消息更安全\n// 广告点击事件少量丢失业务可接受，选 acks=1\nprops.put(\"acks\", \"1\");\n\n// batch.size：同一个分区的消息凑满 64KB 才发一批\n// 默认 16KB 太小，在高吞吐场景下频繁发小批次，网络 RTT 是瓶颈\nprops.put(\"batch.size\", 65536);       // 64KB\n\n// linger.ms：即使批次没凑满，等 5ms 也要发出去\n// 高峰期 100万 TPS 时，5ms 内一个批次轻松凑满；低谷期保证延迟不超过 5ms\nprops.put(\"linger.ms\", 5);\n\n// LZ4 压缩：压缩率约 60%，压缩/解压 CPU 开销小，适合高吞吐场景\n// 不要用 gzip（压缩率高但 CPU 开销大），snappy 也是不错的选择\nprops.put(\"compression.type\", \"lz4\");\n\n// 发送缓冲区 64MB，防止突发流量把 buffer 打满触发 RecordTooLargeException\nprops.put(\"buffer.memory\", 67108864);  // 64MB\n\n// 单连接最多 5 个 in-flight 请求，提高吞吐\n// 注意：如果开启了幂等生产者（enable.idempotence=true），此值最大只能为 5\nprops.put(\"max.in.flight.requests.per.connection\", 5);\n```\n\n一个关于 `acks` 的延伸讨论：很多系统选 `acks=all` 是为了「消息不丢失」，但要注意这只保证消息被 ISR 中的所有副本写入，如果 ISR 缩减到只剩 Leader 一个节点（比如其他 Broker 都在重启），`acks=all` 实际上等同于 `acks=1`。真正不丢消息的保证需要 `acks=all` + `min.insync.replicas=2` + `unclean.leader.election.enable=false` 三者联动，缺一不可。\n\n### Consumer 端差异化配置：三个消费者组，三种策略\n\n这个架构中最有意思的设计是消费者的差异化策略。三个消费者组有完全不同的 SLA 目标，不能用同一套配置：\n\n**实时计费消费者组**（`billing-consumer-group`）的核心诉求是低延迟，有数据就立刻消费：\n\n```java\n// 有 1 个字节就立刻发送给 Consumer，不等凑批\nprops.put(\"fetch.min.bytes\", 1);\n// 最多等 10ms，不管有没有数据都要返回\nprops.put(\"fetch.max.wait.ms\", 10);\n// 每次 poll 最多 500 条，处理完快速再 poll，保持低 lag\nprops.put(\"max.poll.records\", 500);\n// Consumer 实例数 = 分区数 = 100，满配\n```\n\n**用户画像消费者组**（`profile-consumer-group`）的核心诉求是高吞吐，允许秒级延迟：\n\n```java\n// 至少凑 64KB 才取，减少网络 RTT 次数\nprops.put(\"fetch.min.bytes\", 65536);\n// 最多等 100ms，等待凑批\nprops.put(\"fetch.max.wait.ms\", 100);\n// 每次最多拉 5000 条，批量更新画像，减少数据库写次数\nprops.put(\"max.poll.records\", 5000);\n// Consumer 实例数可以是 20~50，不需要满配\n```\n\n**日志归档消费者组**（`archive-consumer-group`）只需要保证最终写入，吞吐越大越好：\n\n```java\n// 至少 1MB 才取，大批次写 HDFS 效率高\nprops.put(\"fetch.min.bytes\", 1048576);\nprops.put(\"fetch.max.wait.ms\", 500);\nprops.put(\"max.poll.records\", 10000);\n// Consumer 实例数可以少，10~20 个足够\n```\n\n### Broker 端关键配置：持久化和吞吐的平衡\n\n```properties\n# server.properties\n\n# IO 线程数建议等于磁盘数，磁盘 IO 是 Kafka 的核心瓶颈\nnum.io.threads=16\n# 网络线程数建议是 IO 线程的一半\nnum.network.threads=8\n\n# 7 天消息保留，满足回放需求\nlog.retention.hours=168\n# 每个 segment 文件 512MB，避免单文件过大影响删除效率\nlog.segment.bytes=536870912\n\n# 每 10000 条消息强制刷盘一次（fsync）\n# 这是吞吐 vs 可靠性的核心权衡：设为 1 则每条消息都 fsync，吞吐骤降 10 倍\n# 实际上 Kafka 依赖副本机制保证数据安全，不需要每条都 fsync\nlog.flush.interval.messages=10000\n\n# 副本同步每次最多传 10MB，避免单次同步太大影响网络\nreplica.fetch.max.bytes=10485760\n\n# 关闭非 ISR Leader 选举，防止脏选举导致消息丢失\nunclean.leader.election.enable=false\n\n# auto.create.topics.enable 关闭，禁止自动创建 Topic（生产环境必须关）\nauto.create.topics.enable=false\n```\n\n### 监控体系：告警规则比仪表盘更重要\n\n监控工具链选择：**Prometheus JMX Exporter** 采集 Kafka Broker 的 JMX 指标 → **Prometheus** 存储 → **Grafana** 可视化 + **AlertManager** 告警。\n\n核心监控指标分四类：\n\n第一类是**流量类**，包括 `kafka.server:type=BrokerTopicMetrics,name=BytesInPerSec`（入流量）和 `BytesOutPerSec`（出流量）。正常峰值入流量约 220 MB/s（200MB + 压缩后的开销），出流量约 600 MB/s（3 个消费者组）。\n\n第二类是**延迟类**，最重要的是 `kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce` 的 P99 值，这个值应该 < 10ms；另一个是 Consumer 侧的端到端延迟，需要在业务层打点计算，不是 Kafka 自身的指标。\n\n第三类是**Consumer Lag**，这是最关键的业务健康指标。`kafka.consumer:type=consumer-fetch-manager-metrics,client-id=xxx,topic=xxx,partition=xxx` 下有 `records-lag` 指标。告警规则：实时计费消费者组 Lag > **5万**立即告警（P1）；用户画像消费者组 Lag > **50万**告警（P2）。Lag 持续增长意味着消费者处理能力跟不上，需要立刻扩容消费者实例。\n\n第四类是**ISR 健康度**，`kafka.server:type=ReplicaManager,name=IsrShrinksPerSec` 每秒 ISR 收缩次数，正常应为 0，一旦大于 0 立即告警，这意味着有副本跟不上 Leader 的写入速度，可能是 Follower 所在 Broker 负载过高或网络抖动。\n\n## 第三步：容量规划、扩容策略与生产陷阱\n\n### 存储容量计算\n\n很多工程师设计消息系统时忘记算存储，到上线前几周才发现磁盘不够。正确的算法：\n\n```\n消息速率：100万 条/秒\n单条大小：200 字节（压缩后 LZ4 约 80 字节，取压缩比 0.4）\n保留时间：7 天 = 604800 秒\n副本数：3\n\n单副本存储 = 100万 × 80字节 × 604800秒 = 约 48 TB\n总存储（含副本）= 48 TB × 3 = 144 TB\n\n但这是平均流量，峰值是平均值的 3 倍，加上 50% 水位预留：\n规划总容量 = 144 TB × 3 × 1.5 ≈ 648 TB ≈ 每台 Broker 约 65 TB\n```\n\n我们最初规划的 10TB/台 × 10 台 = 100 TB 是不够的。这里有两种解决方案：一是把磁盘扩大到 10 台 × 32TB（NVMe 单盘 8TB × 4）；二是对历史数据做分级存储，7 天以内保留原始 segment，7 天以外通过 Kafka Tiered Storage（Kafka 2.8+ 支持）归档到对象存储，磁盘只保留热数据。生产上我们选择了后者，磁盘成本降低了 80%。\n\n### 水平扩容：分区迁移是危险操作\n\n当 Broker 负载增长到需要新增节点时，加 Broker 只是第一步，还需要把现有分区的部分 Leader 迁移到新 Broker 上才能真正分摊负载。这通过 `kafka-reassign-partitions.sh` 完成：\n\n```bash\n# 生成迁移计划\nkafka-reassign-partitions.sh --bootstrap-server kafka1:9092 \\\n  --topics-to-move-json-file topics.json \\\n  --broker-list \"1,2,3,4,5,6,7,8,9,10,11\" \\\n  --generate\n\n# 执行迁移（会触发大量副本同步，必须在业务低谷期执行）\nkafka-reassign-partitions.sh --bootstrap-server kafka1:9092 \\\n  --reassignment-json-file reassignment.json \\\n  --execute\n\n# 监控迁移进度\nkafka-reassign-partitions.sh --bootstrap-server kafka1:9092 \\\n  --reassignment-json-file reassignment.json \\\n  --verify\n```\n\n这个操作有一个坑：迁移过程中副本同步会占用大量 Broker 带宽，轻则导致 Producer 延迟上升，重则触发 ISR 收缩甚至 Leader 切换。务必设置 `--throttle` 参数限制迁移带宽，比如 `50MB/s`：`--throttle 52428800`。容量告警建议设置在磁盘使用率 **70%** 触发，留足时间扩容，不要等到 90% 再行动。\n\n### 消息不丢失的完整保障链\n\n「消息不丢失」是一个端到端的保证，需要 Producer、Broker、Consumer 三端联动。Producer 端：`acks=all`（或 `acks=1` 加业务重试）+ 失败重试 + 幂等生产者（`enable.idempotence=true`，防止重试导致重复）。Broker 端：`min.insync.replicas=2` + `unclean.leader.election.enable=false` + 定期检查 ISR 健康。Consumer 端：先处理消息，再提交 offset（手动 commit），不要用 `enable.auto.commit=true`——自动提交会在消息被 poll 出来但还没处理完时就提交 offset，一旦 Consumer 挂掉，这批消息就永久丢失了。\n\n端到端延迟 < 100ms 的保障：生产者 `linger.ms=5` + Consumer `fetch.max.wait.ms=10`，加上 Broker 的请求处理时间约 5ms，整个链路理论延迟约 20ms，有充足余量。实测中偶尔会有 50~80ms 的尾延迟，通常是 GC 暂停导致的，给 Kafka Broker 分配充足的堆内存（32~64GB）并调优 G1GC 参数可以将 GC 停顿控制在 20ms 以内。",
+      "keyPoints": [
+        "Kafka 单 Broker 理论写入吞吐约 100~200 MB/s（顺序写 + Zero Copy），100万 TPS × 200 字节 = 200 MB/s，但考虑 3 副本复制和多消费者读取，实际需要 8~10 个 Broker 才能承载全部流量",
+        "分区数是架构中最核心的不可逆决策，分区数只增不减，100万 TPS ÷ 每分区 1 万 TPS = 100 个分区，分区数决定了消费者的最大并行度上限",
+        "Producer 调优三要素：batch.size 从默认 16KB 调大到 64KB、linger.ms 设 5ms 凑批、compression.type 选 lz4，三者联动可将吞吐提升 3~5 倍同时降低 60% 网络带宽",
+        "三个消费者组应使用完全不同的 fetch 策略：实时计费组用 fetch.min.bytes=1 追求低延迟，用户画像组用 fetch.min.bytes=64KB 追求高吞吐，日志归档组用 fetch.min.bytes=1MB 追求大批次效率",
+        "消息不丢失是端到端保证，需要 Producer 的 acks=all + Broker 的 min.insync.replicas=2 + unclean.leader.election.enable=false + Consumer 的手动提交 offset 四者联动，任何一环缺失都可能丢消息",
+        "7 天回放的存储容量容易算错，正确算法是「TPS × 压缩后单条大小 × 保留秒数 × 副本数 × 峰值倍数 × 预留水位」，通常比裸数据量大 10~20 倍，建议结合 Tiered Storage 做分级存储降本",
+        "Consumer Lag 是最重要的业务健康指标，实时计费消费者组 Lag > 5万条应立即 P1 告警，Lag 持续增长意味着消费能力跟不上，需要扩容 Consumer 实例数（上限为分区数 100）",
+        "分区迁移（kafka-reassign-partitions.sh）必须在业务低谷期执行并设置 --throttle 限速，不加限速的迁移会抢占 Broker 带宽，导致生产者延迟上升和 ISR 收缩"
+      ],
+      "quiz": [
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz1",
+          "question": "一个 Kafka Broker（32C/128G/10TB SSD）单机理论写入吞吐大约是多少？",
+          "choices": [
+            { "id": "A", "text": "10~20 MB/s，受限于 Kafka 的单线程写入模型" },
+            { "id": "B", "text": "100~200 MB/s，得益于顺序写磁盘和 Zero Copy 机制" },
+            { "id": "C", "text": "1~2 GB/s，现代 NVMe SSD 的顺序写速度就有这么高" },
+            { "id": "D", "text": "50 MB/s，受限于 Kafka 网络线程数默认值 3" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的高吞吐来自两个核心机制：顺序写（append-only segment 文件充分利用 OS page cache，接近内存速度）和 Zero Copy（sendfile 系统调用让内核直接把数据从 page cache 搬到网卡，跳过两次用户态内存拷贝）。配置合理的高规格 Broker 理论写入可达 100~200 MB/s。A 选项错误是因为 Kafka 并非单线程写，有多个 IO 线程。C 选项混淆了「磁盘硬件速度」和「Kafka 实际吞吐」，Kafka 还有网络、序列化等开销。D 选项网络线程数是可以调整的，且不是主要瓶颈。"
+        },
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz2",
+          "question": "100万 TPS 的 Kafka 集群，为什么不能只按写入带宽 200 MB/s 来规划 Broker 数量？",
+          "choices": [
+            { "id": "A", "text": "因为 Kafka 的分区数限制，单 Broker 不能承载超过 50 个分区" },
+            { "id": "B", "text": "因为 3 副本复制和多个消费者组读取会让实际带宽需求放大 6~8 倍" },
+            { "id": "C", "text": "因为 Kafka 的 ZooKeeper 协调开销，单 Broker 吞吐会衰减 50%" },
+            { "id": "D", "text": "因为 Kafka 不支持单 Broker 承载超过 1000 个分区" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "带宽需求被放大主要有三个原因：第一，3 副本配置下每条消息要从 Leader 同步到 2 个 Follower，副本同步流量是写入流量的 2 倍；第二，三个消费者组（计费、画像、归档）各自独立从 Broker 拉数据，消费总带宽接近写入带宽的 3 倍；第三，还需要预留 30% 的水位用于应对突发和滚动重启。综合来看，实际需要的集群带宽能力约是写入需求的 6~8 倍。A 和 D 关于分区数的限制说法是错误的，单 Broker 可以承载数千个分区。C 中 ZooKeeper 开销说法也是错误的，ZooKeeper 主要负责元数据管理，不在数据写入路径上。"
+        },
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz3",
+          "question": "在 Kafka Producer 配置中，batch.size=65536 和 linger.ms=5 的组合是为了解决什么问题？",
+          "choices": [
+            { "id": "A", "text": "防止单条消息超过 Broker 的 max.message.bytes 限制" },
+            { "id": "B", "text": "通过凑批发送减少网络 RTT 次数，提升吞吐同时降低带宽消耗" },
+            { "id": "C", "text": "保证同一个 key 的消息路由到同一个分区，维护消息顺序" },
+            { "id": "D", "text": "防止 Producer 的 buffer.memory 被打满触发 RecordTooLargeException" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "batch.size 控制同一分区的消息凑满多少字节才发送，linger.ms 控制即使没凑满也最多等多久就发送。两者配合的目标是「凑批」：把多条小消息打包成一个大的网络请求发出，减少 TCP 包数量和往返次数（RTT），显著提升网络利用率。在高 TPS 场景下，5ms 内通常能凑满 64KB，既不牺牲延迟又提升了吞吐。如果还开启了 lz4 压缩，大批次的压缩比也更好。A 选项关于 max.message.bytes 的说法无关。C 中的顺序性是由分区键决定的，与 batch 配置无关。D 中的 RecordTooLargeException 是单条消息过大的错误，与 batch 配置也无关。"
+        },
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz4",
+          "question": "acks=all、min.insync.replicas=2、unclean.leader.election.enable=false 这三个配置需要同时设置，缺少哪一个会导致什么问题？",
+          "choices": [
+            { "id": "A", "text": "缺少 acks=all 时，即使其他两个配置正确，消息也会在 ISR 收缩时丢失" },
+            { "id": "B", "text": "缺少 min.insync.replicas=2 时，acks=all 的 ISR 可能缩减到只有 Leader，等同于 acks=1" },
+            { "id": "C", "text": "缺少 unclean.leader.election.enable=false 时，落后的 Follower 可能当选 Leader 并对外提供旧状态" },
+            { "id": "D", "text": "以上三种说法都正确，三个配置必须同时设置才能真正保证消息不丢失" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "消息不丢失需要三层保障联动。acks=all 保证 Producer 只在 ISR 全部写入后才认为成功；但如果 ISR 因为 Follower 跟不上而收缩到只剩 1 个节点（Leader），acks=all 就退化成 acks=1——这时需要 min.insync.replicas=2 来阻止写入（向 Producer 抛出 NotEnoughReplicasException），迫使业务感知到风险；而 unclean.leader.election.enable=false 则防止数据落后的 Follower 被选为 Leader——如果允许脏选举，一个落后了 10 万条消息的 Follower 当选 Leader 后，这 10 万条数据就永久丢失了。三者缺一不可，各自填补不同的漏洞。"
+        },
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz5",
+          "question": "监控发现实时计费消费者组（billing-consumer-group）的 Consumer Lag 在过去 10 分钟从 0 持续增长到 80 万条，最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Kafka Broker 磁盘写满，新消息无法写入导致积压" },
+            { "id": "B", "text": "消费者处理能力不足（业务逻辑变慢或实例数不够），追不上生产速度" },
+            { "id": "C", "text": "Topic 的副本数从 3 降为 1，导致消费者无法正常连接" },
+            { "id": "D", "text": "Producer 的 acks 从 1 改为 all，导致生产速度骤降" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Consumer Lag 持续增长意味着消费速率 < 生产速率。Lag 从 0 增长到 80 万条说明系统在生产高峰期消费跟不上，最常见的原因是：消费者实例数不够（当前并行度低于分区数 100，有分区没有被消费）、业务逻辑变慢（比如调用了一个超时的下游数据库）、或者 GC 停顿导致 Consumer 暂时停止 poll。排查步骤：先看 Consumer 实例数是否等于分区数，再看单个消费者的 poll 时间和业务处理耗时。A 选项（磁盘写满）会影响生产，但 Lag 来自消费侧，而且磁盘满会触发 Broker 错误日志和告警。C 和 D 的说法都不会导致 Lag 持续增长。"
+        },
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz6",
+          "question": "Consumer 端为什么强烈建议关闭 enable.auto.commit，改用手动提交 offset？",
+          "choices": [
+            { "id": "A", "text": "自动提交会降低消费吞吐，手动提交性能更好" },
+            { "id": "B", "text": "自动提交会在消息 poll 出来但尚未处理完时提交 offset，Consumer 崩溃后这批消息会永久丢失" },
+            { "id": "C", "text": "自动提交与 acks=all 不兼容，会触发 Kafka Broker 端错误" },
+            { "id": "D", "text": "自动提交只在 Consumer 正常关闭时触发，无法保证实时 offset 更新" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "enable.auto.commit=true 的默认行为是每 5 秒（auto.commit.interval.ms）自动提交一次 offset，提交的是上一次 poll 返回的最后一条消息的 offset——不管这批消息有没有被业务代码处理完。如果 Consumer 在 poll 了 1000 条消息、只处理了 300 条时崩溃，那 300~1000 条之间的消息 offset 可能已经被自动提交，重启后就找不回来了，造成消息丢失。手动提交（commitSync 或 commitAsync）在业务代码确认处理完成后才提交，可以精确控制「至少一次」（at-least-once）语义。A 选项手动提交性能开销可以忽略。C 选项说法完全错误。D 选项也是错误的，auto.commit 是定时触发，不是只在关闭时触发。"
+        },
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz7",
+          "question": "为什么不建议在生产环境中对 Kafka 使用网络存储（SAN/NAS）而非本地 SSD？",
+          "choices": [
+            { "id": "A", "text": "NAS 不支持 Kafka 的顺序写模式，只能随机写" },
+            { "id": "B", "text": "NAS 的网络 IO 延迟和抖动会影响 Kafka 的顺序写性能，导致 produce 延迟从毫秒级飙升到百毫秒级" },
+            { "id": "C", "text": "Kafka 官方文档不支持 NAS，使用 NAS 会导致数据损坏" },
+            { "id": "D", "text": "NAS 的带宽上限是 1Gbps，无法满足高吞吐需求" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka 的顺序写性能对存储延迟极其敏感。本地 SSD 的写入延迟通常在 50~200 微秒，而 NAS 在网络稳定时延迟约 1~5ms，抖动时可能达到数十毫秒。Kafka 的 produce 请求延迟 = 消息写入 Leader 的时间 + 等待 ISR 同步的时间，存储层的抖动会直接传导到 produce 延迟。生产上见过 NAS 网络抖动导致 Kafka produce P99 延迟从 5ms 飙到 200ms 的事故，这会触发 Producer 端的超时重试，进一步加重系统压力。A 选项错误，NAS 支持顺序写。C 选项说数据损坏过于绝对。D 选项 NAS 的带宽限制虽然存在，但现代 NAS 可以达到 10GbE，不是主要问题。"
+        },
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz8",
+          "question": "执行 kafka-reassign-partitions.sh 进行分区迁移时，不加 --throttle 参数会导致什么问题？",
+          "choices": [
+            { "id": "A", "text": "迁移会失败，--throttle 是必选参数" },
+            { "id": "B", "text": "副本同步会占用大量 Broker 带宽，导致 Producer 延迟上升和 ISR 收缩" },
+            { "id": "C", "text": "迁移会在 60 秒后自动超时，需要重新执行" },
+            { "id": "D", "text": "不加 --throttle 反而速度更快，因为不受限速约束" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "分区迁移本质上是把数据从旧 Broker 复制到新 Broker，这个过程需要大量的磁盘读和网络写。如果不加 --throttle 限速，迁移会以 Broker 的最大带宽进行，可能占用 80% 以上的网络和磁盘 IO。这会导致正常的 Producer 写入和 Follower 同步请求排队等待，produce 延迟上升；Follower 追不上 Leader 写入速度就会触发 ISR 收缩；ISR 收缩严重时可能导致 min.insync.replicas 无法满足，Producer 开始收到 NotEnoughReplicasException。建议设置为当前 Broker 峰值带宽的 20~30%，比如 50MB/s（--throttle 52428800），在低谷期操作，并全程监控 ISR 指标。"
+        },
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz9",
+          "question": "Kafka 的 Tiered Storage（分级存储）主要解决什么问题？从哪个版本开始支持？",
+          "choices": [
+            { "id": "A", "text": "解决消息乱序问题，从 Kafka 2.0 开始支持" },
+            { "id": "B", "text": "解决本地磁盘成本问题，把冷数据自动归档到对象存储，从 Kafka 2.8 开始早期支持" },
+            { "id": "C", "text": "解决跨数据中心同步问题，从 Kafka 3.0 开始支持" },
+            { "id": "D", "text": "解决消费者 Lag 过高的问题，通过缓存加速消费，从 Kafka 1.0 开始支持" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kafka Tiered Storage（KIP-405）的核心目标是解耦「存储容量」和「计算节点数量」。在没有分级存储之前，如果需要保留 90 天的消息，就必须给所有 Broker 配置足够大的本地磁盘，而本地 NVMe SSD 是最贵的存储形式。Tiered Storage 允许 Kafka 把超过一定时间的 segment 文件自动上传到对象存储（S3、GCS、OSS），本地只保留最近几天的热数据，Consumer 透明地访问冷数据时会自动从对象存储取回。这一特性在 Kafka 2.8 中以早期预览形式引入，Kafka 3.6 后趋于稳定。对于需要 7 天以上数据保留的场景，可以大幅降低存储成本。"
+        },
+        {
+          "id": "ds-million-tps-mq-project-q1-quiz10",
+          "question": "ISR（In-Sync Replicas）收缩告警触发后，第一步应该排查什么？",
+          "choices": [
+            { "id": "A", "text": "立即重启所有 Follower Broker，强制触发 Leader 重新选举" },
+            { "id": "B", "text": "检查落后 Follower 所在 Broker 的磁盘 IO、网络带宽和 GC 日志，定位跟不上的原因" },
+            { "id": "C", "text": "增加 Topic 的副本数从 3 到 5，提高容错能力" },
+            { "id": "D", "text": "调大 replica.lag.time.max.ms，让 Kafka 对 Follower 落后更宽容，减少 ISR 收缩" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ISR 收缩意味着某个 Follower 在 replica.lag.time.max.ms（默认 30 秒）内没有跟上 Leader 的写入进度，被踢出了 ISR。这时不应该马上操作，而应该先定位根因：用 kafka-topics.sh --describe 找出哪个 Broker 的哪些分区副本不在 ISR；再登录那台 Broker 查看磁盘 IO 使用率（iostat -x 1）、网络带宽（sar -n DEV 1）、以及 GC 日志（jstat 或 GC log 文件）。常见原因包括：磁盘 IO 打满（其他操作占用）、网络带宽被分区迁移占用、GC 停顿过长导致 Follower fetch 线程暂停。找到根因再处理，盲目重启或调大容忍参数只会掩盖问题。A 选项重启可能加重问题。C 增加副本数治标不治本。D 调大容忍时间会延迟感知真正的副本故障。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Kafka 官方文档 - Broker 配置参数",
+          "url": "https://kafka.apache.org/documentation/#brokerconfigs"
+        },
+        {
+          "title": "Kafka 官方文档 - Producer 配置参数",
+          "url": "https://kafka.apache.org/documentation/#producerconfigs"
+        },
+        {
+          "title": "Kafka 官方文档 - Consumer 配置参数",
+          "url": "https://kafka.apache.org/documentation/#consumerconfigs"
+        },
+        {
+          "title": "KIP-405: Kafka Tiered Storage",
+          "url": "https://cwiki.apache.org/confluence/display/KAFKA/KIP-405%3A+Kafka+Tiered+Storage"
+        },
+        {
+          "title": "Confluent 博客 - Kafka 分区数如何选择",
+          "url": "https://www.confluent.io/blog/how-choose-number-topics-partitions-kafka-cluster/"
+        }
+      ]
+    }
+  ]
+}
