@@ -1,0 +1,160 @@
+{
+  "id": "linux-q186",
+  "name": "cgroup 容器资源限制",
+  "domain": "linux",
+  "description": "cgroup 在 Docker/K8s 容器资源限制中的作用、参数映射与生产调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "linux-q186",
+      "domain": "linux",
+      "type": "tuning",
+      "difficulty": 4,
+      "tags": ["cgroup", "docker", "kubernetes", "资源限制", "OOM", "CPU 限速", "内存管理", "systemd"],
+      "title": "cgroup 在容器资源限制中的作用与配置方法",
+      "content": "## 场景背景\n\n你们团队把 8 个 Java 微服务部署在同一台 16 核 64GB 的 K8s 节点上。最近 QA 反映，在压测某个核心服务时，旁边的服务也会明显变慢——典型的「嘈杂邻居」问题。与此同时，运维反映 `inventory-service` 频繁出现 `OOMKilled`，但开发团队坚持说「代码里没有内存泄漏，本地跑完全正常」。\n\n你登上节点，用 `kubectl top pod` 查看资源使用：\n\n```\nNAME                      CPU(cores)   MEMORY(bytes)\norder-service-7d9f-xxx    1850m        1.8Gi\npayment-service-6b4c-xxx  450m         890Mi\ninventory-service-5a2b-xxx  2100m      2.3Gi   ← 频繁 OOMKilled\nuser-service-8e1d-xxx     120m         340Mi\n```\n\n再看这几个 Pod 的资源配置片段：\n\n```yaml\n# order-service\nresources:\n  requests:\n    cpu: \"500m\"\n    memory: \"512Mi\"\n  limits:\n    cpu: \"2\"\n    memory: \"2Gi\"\n\n# inventory-service（开发说「不知道该填多少，就没写」）\nresources:\n  requests:\n    cpu: \"1\"\n    memory: \"1Gi\"\n  # limits 字段完全缺失\n```\n\n你想登上节点直接查 cgroup 参数，却发现节点是 Ubuntu 22.04（内核 5.15），路径和你印象中的完全不同——`/sys/fs/cgroup/cpu/docker/` 根本不存在。\n\n请从底层回答以下问题：\n\n1. Docker 和 K8s 是如何把 `--cpus`、`--memory` 这些参数映射到 cgroup 文件系统的？\n2. `cpu.shares` 和 `cpu.cfs_quota_us` 到底有什么区别，为什么单靠 requests 无法防止「嘈杂邻居」？\n3. `memory.limit_in_bytes` 和 `memory.memsw.limit_in_bytes` 各控制什么，OOM killer 在容器里是怎么工作的？\n4. `inventory-service` 没有设 limits，为什么还会 OOMKilled？\n5. 如何从 cgroup 虚拟文件系统里读出「CPU 被限速了多少次」「内存 OOM 发生了几次」这类诊断数据？",
+      "answer": "## cgroup 是什么，容器为什么离不开它\n\ncgroup（Control Group）是 Linux 内核从 2.6.24 版本开始提供的进程分组资源控制机制。它的核心思路是把一批进程划入同一个 cgroup，然后对这个 cgroup 施加资源配额——CPU 时间、内存用量、磁盘 IO、网络带宽。容器技术的本质是两个内核特性的组合：namespace 提供隔离视图（让容器看不见其他容器的进程、网络、文件系统），cgroup 提供资源配额（让容器用不到超出允许的 CPU 和内存）。没有 cgroup，Docker 和 K8s 的资源限制就是一纸空文。\n\ncgroup 发展出了两个版本，理解这一点能解释你在 Ubuntu 22.04 节点上找不到熟悉路径的根本原因。cgroup v1 采用「每个子系统独立层级」的设计：`/sys/fs/cgroup/cpu/`、`/sys/fs/cgroup/memory/`、`/sys/fs/cgroup/blkio/` 各自是独立的树状目录，一个进程可以同时挂在不同子系统层级的不同位置。这种设计灵活但碎片化，语义容易不一致。cgroup v2 从 Linux 4.5 引入，5.2 后趋于成熟，Ubuntu 22.04 LTS（内核 5.15）默认完全切换到 cgroup v2，将所有控制器整合到一棵统一的树下，根节点就是 `/sys/fs/cgroup/`，没有独立的 `cpu/`、`memory/` 子目录。K8s 的 Pod cgroup 路径变成了类似 `/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/docker-<container-id>.scope/` 这样的形式。\n\n## CPU 限制：shares 是软配额，quota 才是硬上限\n\n理解「嘈杂邻居」问题的关键，在于搞清楚 `cpu.shares` 和 CFS 带宽控制的本质区别。\n\n`cpu.shares`（cgroup v2 里对应 `cpu.weight`）是相对权重，默认值 1024。它的语义是「当多个 cgroup 在争抢 CPU 时，按权重比例分配」。K8s 的 `resources.requests.cpu` 就是映射到这个值：请求 1000m（1 个核）对应 1024 shares，500m 对应 512 shares。**问题在于**，shares 只在 CPU 资源紧张时才生效。如果节点 CPU 空闲，一个只有 512 shares 的容器完全可以把所有 CPU 核心跑满——shares 不是上限，而是「争抢时的话语权」。这就是为什么光靠 requests 无法防止嘈杂邻居：压测的服务在 CPU 空闲时可以无限制地吃 CPU，挤压其他服务。\n\n真正的硬上限依赖 CFS（Completely Fair Scheduler）带宽控制，参数是 `cpu.cfs_quota_us` 和 `cpu.cfs_period_us`。它们的语义是「在每个 period 微秒的调度周期内，这个 cgroup 最多能累积消耗 quota 微秒的 CPU 时间」。quota 除以 period 就是允许使用的核数。Docker 的 `--cpus=0.5` 会被翻译成 `cpu.cfs_quota_us=50000`、`cpu.cfs_period_us=100000`，即每 100ms 周期最多跑 50ms，精确限制半个核。K8s 的 `resources.limits.cpu: \"2\"` 对应 `quota=200000`、`period=100000`。在 cgroup v2 里，这两个值合并成一个文件 `cpu.max`，内容格式为「quota period」，`-1 100000` 表示不限制。\n\n你可以在节点上直接验证 order-service 的 CPU 限制：\n\n```bash\n# 先找到容器对应的 cgroup scope\nCONTAINER_ID=$(crictl ps | grep order-service | awk '{print $1}')\nfind /sys/fs/cgroup/kubepods.slice -name \"cpu.max\" | xargs grep -l . | head -5\n\n# 查看具体的 cpu.max\ncat /sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/\\\nkubepods-burstable-pod<pod-uid>.slice/docker-${CONTAINER_ID}.scope/cpu.max\n# 输出：200000 100000  ← limits.cpu=2 的硬限制\n```\n\n诊断 CPU 被限速的最直接方法是读 `cpu.stat`：\n\n```bash\ncat /sys/fs/cgroup/.../cpu.stat\n# usage_usec 58432190123\n# user_usec  41203948201\n# system_usec 17228241922\n# nr_periods   2847392      ← 总共经历了多少个 CFS 调度周期\n# nr_throttled  183421      ← 被限速的周期数\n# throttled_usec 4839201983 ← 累计被限速时长（微秒）\n```\n\n`nr_throttled / nr_periods` 超过 5% 就值得关注，超过 20% 说明 CPU limits 配置过紧，服务在显著受限，Java 服务的 GC 停顿时间会被限速放大，P99 延迟随之飙升。这是 Java 服务延迟抖动的第一排查点。\n\n## 内存限制：limit_in_bytes、memsw 与 OOM killer\n\n`memory.limit_in_bytes`（cgroup v2 对应 `memory.max`）设定的是容器能使用的最大内存量，包含进程 RSS 和内核分配给该 cgroup 的 page cache。一旦用量触及这个上限，内核立即触发 OOM killer，在 cgroup 内部挑选 `oom_score` 最高的进程杀掉——`oom_score` 基于进程的内存占用比例计算，容器内通常是 PID 1 得分最高，于是容器主进程被直接杀死，K8s 看到的退出原因就是 `OOMKilled`，`kubectl describe pod` 里会显示 `Last State: OOMKilled`。\n\n`memory.memsw.limit_in_bytes` 控制的是内存与 swap 的总量上限。如果只设了 `memory.limit_in_bytes=2Gi` 却没有设 `memsw`，容器打满内存后内核可能开始使用 swap，容器不会立刻挂掉，但磁盘 IO 的延迟是内存的几千倍，服务会陷入极度缓慢但又不崩溃的僵死状态——这比 OOMKilled 更难发现。生产环境通常将 `memory.memsw.limit_in_bytes` 设置为与 `memory.limit_in_bytes` 相同的值，彻底禁止容器使用 swap。Docker 的 `--memory-swap` 参数控制这个值，设为与 `--memory` 相同时等价于禁 swap，设为 `-1` 则不限 swap。K8s 在 1.28 之前没有官方途径设置 memsw，通常依赖节点级别关闭 swap（`swapoff -a`）来规避这个问题。\n\n调试内存问题的关键文件（cgroup v2）：\n\n```bash\n# 当前内存使用量（实时）\ncat /sys/fs/cgroup/.../memory.current\n\n# 详细内存分解：RSS、page cache、swap 用量等\ncat /sys/fs/cgroup/.../memory.stat\n\n# OOM 事件统计——这是最重要的诊断文件\ncat /sys/fs/cgroup/.../memory.events\n# low   0          ← 触碰 memory.low 软水位的次数\n# high  0          ← 触碰 memory.high 软上限的次数\n# max   847        ← 触碰 memory.max 硬限制的次数\n# oom   3          ← OOM killer 被调用 3 次\n# oom_kill 3       ← 实际 kill 掉进程 3 次\n\n# 内核日志里的 OOM 详情\ndmesg | grep -E \"oom|killed|Out of memory\" | tail -30\n```\n\n## 为什么没有 limits 的服务反而 OOMKilled\n\n`inventory-service` 没有设 limits，K8s 会把它归类为 **BestEffort QoS**（既没有 requests 也没有 limits 的 Pod 是 BestEffort；只有 requests 没有 limits 是 Burstable；requests 等于 limits 是 Guaranteed）。但你的 `inventory-service` 其实有 requests 但没有 limits，所以它是 **Burstable** QoS——这意味着它的 `memory.limit_in_bytes` 是「节点可分配内存」而不是某个固定值，实际上等于无限制。\n\n问题来了：没有内存上限约束，`inventory-service` 可以把节点内存消耗殆尽。当节点整体内存压力升高，Linux 内核的全局 OOM killer 被触发，它会根据 `oom_score_adj` 和内存占用在**整个节点**范围内选择受害者，这时候其他 Pod 里内存占用较大的进程也可能被杀——凶手是 `inventory-service`，受害者可能是旁边的 `order-service`。K8s 的 Eviction Manager 会在内存压力下优先驱逐 BestEffort Pod，但驱逐有延迟，等驱逐来得及之前内核 OOM killer 已经动手了。\n\n解法是强制给 `inventory-service` 设置 limits，或者至少把节点的 kubelet 配置 `--enforce-node-allocatable=pods` 让 kubelet 在整个 pods cgroup 层级上设上限，防止任意 Pod 打爆节点。\n\n## K8s QoS 与 cgroup 层级的对应关系\n\nkubelet 在节点上按 QoS 类型创建不同的 cgroup 层级：Guaranteed Pod 放在 `kubepods.slice/kubepods-guaranteed.slice/` 下，Burstable 放在 `kubepods-burstable.slice/`，BestEffort 放在 `kubepods-besteffort.slice/`。内核在全局 OOM 时倾向于先杀 besteffort 里的进程，kubelet Eviction 也优先驱逐 BestEffort，再是 Burstable，最后才是 Guaranteed。对于核心服务，把 requests 和 limits 设成相同值（Guaranteed QoS）是最高级别的保障，也是生产环境的标准做法。\n\n## systemd slice 直接配置 cgroup\n\n如果服务通过 systemd unit 文件直接运行（常见于物理机或 VM 上的服务），systemd 会自动创建并管理对应的 cgroup。你可以在 unit 文件的 `[Service]` 段直接配置：\n\n```ini\n[Service]\nCPUQuota=150%          # 等价于 cfs_quota，最多用 1.5 个核\nCPUWeight=200          # cgroup v2 cpu.weight，默认 100，范围 1-10000\nMemoryMax=2G           # 等价于 memory.max，触顶触发 OOM killer\nMemoryHigh=1800M       # 软上限，超过时内核开始回收内存但不 kill\nMemorySwapMax=0        # 禁止 swap 使用\nTasksMax=512           # 限制线程数，对应 pids.max，防止 fork 炸弹\n```\n\n修改后执行 `systemctl daemon-reload && systemctl restart <service>` 生效。`systemd-cgtop` 命令可以实时查看各 slice 的资源消耗，体验类似 `top` 但按 cgroup 层级分组显示。\n\n## 一个高频踩坑：Java JVM 看不见 cgroup 内存限制\n\nJava 8u191 之前，JVM 默认读取 `/proc/meminfo` 的 `MemTotal` 来决定堆的初始大小和最大值，完全不感知 cgroup 的 `memory.limit_in_bytes`。一个容器限制了 2GB 内存，但节点有 64GB——JVM 以为自己有 64GB 可以用，在高负载下把堆扩到十几个 GB，然后被 OOM killer 静默杀死，日志里没有任何 `java.lang.OutOfMemoryError` 异常，只有容器重启。从 Java 8u191 和 Java 10 开始，JVM 默认开启 `-XX:+UseContainerSupport`，会正确读取 cgroup 限制。但如果你还在使用老版本 JDK，必须手动加 `-XX:MaxRAMPercentage=75.0`（留 25% 给堆外内存和 JVM 自身开销）来防止 JVM 吃超。这在 2018-2020 年间是极其高频的线上事故根因，即便现在仍有团队在踩。",
+      "keyPoints": [
+        "「cpu.shares」（K8s requests.cpu 映射值）是 CPU 争抢时的相对权重软配额，在节点 CPU 空闲时不生效，单靠它无法防止嘈杂邻居；「cpu.cfs_quota_us / cpu.max」才是硬上限，对应 K8s limits.cpu 和 Docker --cpus",
+        "CFS 带宽限速程度可用 cpu.stat 中的「nr_throttled / nr_periods」量化，超过 5% 值得关注，超过 20% 意味着 limits 配置过紧，Java 服务的 GC 停顿和 P99 延迟都会随之恶化",
+        "memory.limit_in_bytes（cgroup v2: memory.max）触顶会立即触发 OOM killer 杀死 cgroup 内 oom_score 最高的进程，在容器里通常直接干掉 PID 1 导致容器重启",
+        "不设 memory.memsw.limit_in_bytes 会允许容器在打满内存后使用 swap，造成服务极度缓慢但不崩溃的僵死状态，比 OOMKilled 更难发现；生产环境应将其设置为与 memory.limit_in_bytes 相同",
+        "K8s 中只有 requests 没有 limits 的 Pod 属于 Burstable QoS，memory.limit_in_bytes 实际等于节点可分配总量，可以把节点内存消耗殆尽，触发全局 OOM killer 殃及其他 Pod",
+        "cgroup v2（Ubuntu 22.04 / kernel 5.15+ 默认）将所有控制器整合到统一层级，路径从 /sys/fs/cgroup/cpu/docker/<id>/ 变为 /sys/fs/cgroup/kubepods.slice/.../<id>.scope/，cpu.cfs_quota_us+period 合并为 cpu.max 文件",
+        "Java 8u191 之前的 JVM 不读取 cgroup 内存限制，会依据节点总内存决定堆大小，容器限制 2GB 但节点有 64GB 时 JVM 堆会扩到十几 GB 被静默 OOM kill，需手动加 -XX:MaxRAMPercentage=75.0",
+        "systemd 通过 unit 文件的 CPUQuota、MemoryMax、MemoryHigh 直接管理 cgroup v2 配置，systemd-cgtop 是对应的实时资源监控工具，memory.events 中的 oom_kill 计数是内存问题的最直接诊断入口"
+      ],
+      "quiz": [
+        {
+          "id": "linux-q186-q1",
+          "question": "在 K8s 中，`resources.requests.cpu: \"500m\"` 最终会映射到 cgroup 的哪个参数？",
+          "choices": [
+            {"id": "A", "text": "cpu.shares，值为 512（与默认值 1024 的比例对应 500m/1000m）"},
+            {"id": "B", "text": "cpu.cfs_quota_us，值为 50000（500ms 配额）"},
+            {"id": "C", "text": "cpu.max，值为 500000 100000"},
+            {"id": "D", "text": "cpu.weight，值为 50（按百分比换算）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "K8s 的 requests.cpu 映射到 cpu.shares（cgroup v1）或 cpu.weight（cgroup v2），用于调度时的相对权重分配。1000m 对应 1024 shares，500m 对应 512 shares。这是软配额，只在 CPU 争抢时起作用，不构成硬上限。B 和 C 描述的是 limits.cpu 的映射（CFS 带宽控制硬限制）。D 的换算方式不对，cgroup v2 的 cpu.weight 默认值是 100，K8s 对其换算公式是 `max(2, min(262144, (milliCPU * 1024) / 1000))`，500m 约对应 512，而非 50。"
+        },
+        {
+          "id": "linux-q186-q2",
+          "question": "Docker 命令 `docker run --cpus=1.5` 会在 cgroup v1 中写入什么值？",
+          "choices": [
+            {"id": "A", "text": "cpu.shares=1536（1024 × 1.5）"},
+            {"id": "B", "text": "cpu.cfs_quota_us=150000，cpu.cfs_period_us=100000"},
+            {"id": "C", "text": "cpu.cfs_quota_us=1500000，cpu.cfs_period_us=1000000"},
+            {"id": "D", "text": "cpu.cfs_quota_us=150000，cpu.cfs_period_us=1000000"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Docker --cpus 参数映射到 CFS 带宽控制的硬限制。默认 period 是 100000 微秒（100ms），quota = cpus × period = 1.5 × 100000 = 150000 微秒。这意味着每 100ms 周期内最多消耗 150ms 的 CPU 时间，即可以使用 1.5 个核的 CPU 算力。A 是 --cpu-shares 参数的效果，不是 --cpus。C 和 D 的 period 设置不对，Docker 默认 period 是 100000us 而非 1000000us。"
+        },
+        {
+          "id": "linux-q186-q3",
+          "question": "以下哪个 cpu.stat 读数说明该容器正在受到严重的 CPU 限速？",
+          "choices": [
+            {"id": "A", "text": "nr_periods=10000，nr_throttled=100，throttled_usec=5000000"},
+            {"id": "B", "text": "nr_periods=10000，nr_throttled=3000，throttled_usec=90000000"},
+            {"id": "C", "text": "nr_periods=10000，nr_throttled=0，throttled_usec=0"},
+            {"id": "D", "text": "nr_periods=10000，nr_throttled=500，throttled_usec=25000000"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "判断 CPU 限速程度的核心指标是 nr_throttled / nr_periods 比值。B 的比值是 3000/10000 = 30%，远超 20% 的严重告警阈值，说明容器有大量时间在等待 CPU 配额补充，服务延迟必然受到显著影响。A 的比值是 1%，属于正常范围。D 的比值是 5%，处于值得观察但尚未严重的临界点。C 的比值是 0%，说明 CPU 限制完全没有生效（或者 limits 设得足够宽松）。"
+        },
+        {
+          "id": "linux-q186-q4",
+          "question": "cgroup v2 中，`memory.events` 文件里的哪个字段直接告诉你「OOM killer 已经杀死了多少次进程」？",
+          "choices": [
+            {"id": "A", "text": "max 字段，记录触碰 memory.max 上限的次数"},
+            {"id": "B", "text": "oom 字段，记录 OOM killer 被调用的次数"},
+            {"id": "C", "text": "oom_kill 字段，记录 OOM killer 实际杀死进程的次数"},
+            {"id": "D", "text": "high 字段，记录超过 memory.high 软上限的次数"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "memory.events 中有多个相关字段但含义不同：max 是触碰硬上限的次数（不一定杀进程，可能触发内存回收）；oom 是 OOM killer 被内核调用的次数；oom_kill 才是 OOM killer 实际成功杀死进程的次数——这是最能直接反映「是否真的发生了 OOM kill」的字段。high 是超过软上限 memory.high 的次数，内核会在这个阶段开始主动回收内存，不会立即 kill 进程。诊断 OOM 问题应该看 oom_kill 是否大于 0。"
+        },
+        {
+          "id": "linux-q186-q5",
+          "question": "在 Ubuntu 22.04（cgroup v2）节点上，一个 Docker 容器的 CPU 限制配置文件路径是？",
+          "choices": [
+            {"id": "A", "text": "/sys/fs/cgroup/cpu/docker/<container-id>/cpu.cfs_quota_us"},
+            {"id": "B", "text": "/sys/fs/cgroup/system.slice/docker-<container-id>.scope/cpu.max"},
+            {"id": "C", "text": "/proc/<pid>/cgroup 中记录的路径下的 cpu.cfs_quota_us"},
+            {"id": "D", "text": "/sys/fs/cgroup/unified/docker/<container-id>/cpu.max"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "cgroup v2 统一层级下，Docker 容器的 cgroup 路径是 /sys/fs/cgroup/system.slice/docker-<full-container-id>.scope/。在这个目录下，CPU 限制参数为 cpu.max（格式：quota period），内存限制为 memory.max。A 是 cgroup v1 的路径，在纯 cgroup v2 系统上已不存在。C 的方法可以查到 cgroup 路径，但路径本身不对（v1 和 v2 的格式不同）。D 的路径 /sys/fs/cgroup/unified/ 是 systemd 在混合模式（v1+v2）下挂载 v2 的位置，Ubuntu 22.04 纯 v2 模式下不是这个路径。"
+        },
+        {
+          "id": "linux-q186-q6",
+          "question": "以下哪种情况下，`cpu.shares` 设置会完全不起作用？",
+          "choices": [
+            {"id": "A", "text": "多个容器同时达到 CPU 使用上限，激烈竞争 CPU 资源"},
+            {"id": "B", "text": "节点 CPU 利用率只有 20%，各容器都能得到足够的 CPU"},
+            {"id": "C", "text": "容器没有设置 cpu.cfs_quota_us，只有 cpu.shares"},
+            {"id": "D", "text": "容器运行 CPU 密集型任务，持续 100% CPU"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "cpu.shares 的本质是相对权重，只在 CPU 资源紧张、多个 cgroup 竞争时才有意义。当节点 CPU 利用率只有 20% 时，所有容器都能按需获得 CPU 时间，没有竞争，shares 配置形同虚设——哪怕某个容器只有 256 shares，它也能用满自己需要的 CPU 时间。这就是「嘈杂邻居」问题的根因：压测服务在空闲节点上不受 shares 约束。只有设置了 cpu.cfs_quota_us（K8s limits.cpu）才能真正限制容器的 CPU 用量上限，无论节点是否空闲都生效。"
+        },
+        {
+          "id": "linux-q186-q7",
+          "question": "K8s 中哪种 QoS 类别的 Pod 在节点内存压力时最先被驱逐，且 OOM killer 优先杀其进程？",
+          "choices": [
+            {"id": "A", "text": "Guaranteed：requests == limits 的 Pod"},
+            {"id": "B", "text": "Burstable：有 requests 但 limits > requests 的 Pod"},
+            {"id": "C", "text": "BestEffort：没有任何 requests 和 limits 的 Pod"},
+            {"id": "D", "text": "三种 QoS 类别在内存压力下优先级相同，按 Pod 创建时间先后驱逐"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "K8s 定义了三级 QoS 保护：Guaranteed（requests == limits）受最高保护，几乎不会被驱逐；Burstable 居中；BestEffort（无 requests 和 limits）优先级最低，在节点 MemoryPressure 下第一批被驱逐。内核 OOM killer 通过 oom_score_adj 实现同样的优先级：kubelet 会给 BestEffort Pod 的进程设置 oom_score_adj=1000（最高被杀优先级），Burstable Pod 根据资源使用比例设置 2-999，Guaranteed Pod 设置为 -997（最低被杀优先级）。因此核心服务必须设置为 Guaranteed QoS。"
+        },
+        {
+          "id": "linux-q186-q8",
+          "question": "一个容器设置了 `--memory=2g` 但没有设置 `--memory-swap`，以下哪种描述是正确的？",
+          "choices": [
+            {"id": "A", "text": "容器内存使用超过 2GB 后立即 OOMKilled，不会使用 swap"},
+            {"id": "B", "text": "容器可以额外使用最多 2GB swap，总可用内存变为 4GB"},
+            {"id": "C", "text": "容器可以使用无限制的 swap，可能导致服务严重变慢但不立刻崩溃"},
+            {"id": "D", "text": "Docker 默认禁止 swap，--memory-swap 不影响实际行为"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Docker 的 --memory-swap 默认值是 --memory 的两倍，即 memory + swap = 2 × --memory。所以 --memory=2g 不设 --memory-swap 时，swap 可以额外使用 2GB，容器总可用（内存+swap）是 4GB。要完全禁止 swap，需要设置 --memory-swap 等于 --memory（即 --memory-swap=2g）；设置为 -1 表示不限制 swap。C 描述的「无限 swap」是 --memory-swap=-1 的行为。A 的「不会使用 swap」是错误的，默认行为允许 swap。理解这个机制对诊断「容器不崩但极度缓慢」的问题非常关键。"
+        },
+        {
+          "id": "linux-q186-q9",
+          "question": "Java 服务部署在内存限制为 4GB 的容器中，使用 Java 8u151（早于 8u191），以下哪种现象最有可能发生？",
+          "choices": [
+            {"id": "A", "text": "JVM 正确读取 cgroup 限制，将最大堆设为约 1GB（25% 的 4GB）"},
+            {"id": "B", "text": "JVM 读取节点总内存（如 64GB），将默认最大堆设为约 16GB，容器最终被 OOM kill 且无 Java OOM 日志"},
+            {"id": "C", "text": "JVM 启动失败，报错无法读取内存限制"},
+            {"id": "D", "text": "JVM 将最大堆设为 4GB，耗尽容器内存后抛出 java.lang.OutOfMemoryError"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Java 8u191 之前的 JVM 不感知 cgroup 内存限制，通过读取 /proc/meminfo 的 MemTotal 来决定堆大小。JVM 默认最大堆是可用内存的 25%（-XX:MaxRAMFraction=4），64GB 节点上的默认最大堆约为 16GB。容器在高负载下 JVM 堆扩展超过 cgroup 的 memory.limit_in_bytes（4GB），被内核 OOM killer 直接杀死——由于不是 Java 层面的内存溢出，不会产生任何 java.lang.OutOfMemoryError 日志，只有容器突然重启。修复方法是升级到 8u191+ 或手动加 -XX:MaxRAMPercentage=75.0。这是 2018-2020 年间极高频的容器化 Java 服务故障根因。"
+        },
+        {
+          "id": "linux-q186-q10",
+          "question": "用 systemd unit 文件部署的服务，想要限制其最多使用 2 个 CPU 核并禁止使用 swap，正确的配置是？",
+          "choices": [
+            {"id": "A", "text": "CPUShares=2048 和 MemorySwapMax=0"},
+            {"id": "B", "text": "CPUQuota=200% 和 MemorySwapMax=0"},
+            {"id": "C", "text": "CPUQuota=200% 和 MemorySwapLimit=0"},
+            {"id": "D", "text": "CPUMax=2 和 MemorySwapMax=0"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "systemd 的 CPUQuota 对应 cgroup 的 CFS 带宽硬限制，格式是百分比，200% 表示最多使用 2 个 CPU 核（每个核 100%）。MemorySwapMax=0 对应 memory.swap.max=0，即禁止该 unit 使用 swap。A 中 CPUShares 是相对权重软配额（对应 cpu.shares），不是硬上限，2048 shares 只代表竞争时能拿到较多资源。C 中 MemorySwapLimit 不是有效的 systemd 参数，正确参数是 MemorySwapMax。D 中 CPUMax 不是有效的 systemd unit 参数，实际参数是 CPUQuota（cgroup v1 用法）或通过 systemd 的统一接口 CPUQuota 自动适配 v2。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html",
+        "https://docs.docker.com/config/containers/resource_constraints/",
+        "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/quality-service-pod/",
+        "https://systemd.io/CGROUP_DELEGATION/",
+        "https://www.freedesktop.org/software/systemd/man/systemd.resource-control.html",
+        "https://openjdk.org/jeps/238"
+      ]
+    }
+  ]
+}

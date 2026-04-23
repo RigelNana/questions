@@ -1,0 +1,296 @@
+{
+  "id": "linux-q188",
+  "name": "容器与虚拟机的本质区别（从 Linux 内核角度）",
+  "domain": "linux",
+  "description": "从 Linux 内核 namespace/cgroup 与 hypervisor 硬件虚拟化角度，深度对比容器与虚拟机的隔离机制、syscall 路径差异、安全权衡，以及 gVisor/Kata Containers 混合方案的生产适用场景",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "linux-q188",
+      "domain": "linux",
+      "type": "requirement",
+      "difficulty": 4,
+      "tags": ["container", "namespace", "cgroup", "hypervisor", "kvm", "gvisor", "kata-containers", "syscall", "isolation", "security", "pci-dss"],
+      "title": "容器和虚拟机到底有什么本质区别，生产上怎么选",
+      "content": "你是某金融科技公司的基础设施负责人。公司有 50 个微服务跑在裸机上的 Docker 容器里，安全团队刚发来一份漏洞评估报告：\n\n> 容器共享宿主机内核，CVE-2022-0185（Linux 内核堆溢出）和 CVE-2022-0847（Dirty Pipe）均可在特权容器内实现宿主机逃逸。建议对支付相关服务迁移到虚拟机隔离。\n\n与此同时，云架构师建议把所有服务都迁移到 KVM 虚拟机。研发团队则表示「每天 30+ 次部署，VM 启动要 30 秒我们受不了」。\n\n**当前环境概况：**\n\n| 指标 | 数值 |\n|------|------|\n| 微服务数量 | 50 个 |\n| 平均容器内存 | 512MB RSS |\n| 裸机配置 | 4 台 × 128GB RAM |\n| 容器冷启动 | ~200ms |\n| 合规要求 | PCI-DSS Level 1（支付服务）|\n| 部署频率 | 30+ 次/天 |\n\n**需要你回答的问题：**\n\n1. 从 Linux 内核角度，容器和虚拟机的隔离机制有什么本质差异？为什么说容器「共享内核」是安全边界更弱的根本原因？\n2. syscall 在容器和虚拟机里分别经过哪些层级才到达硬件？这个路径差异如何影响性能和安全性？\n3. gVisor 和 Kata Containers 各用什么机制来弥补容器的安全短板？它们引入了哪些新的代价？\n4. 针对这家公司的 50 个服务，给出一个具体的分层隔离策略，说明哪些服务用容器、哪些用 VM 或混合方案，以及理由。",
+      "answer": "## 第一步：先把「容器」和「虚拟机」的本质说清楚\n\n大多数工程师听到这个问题会给出一个标准答案：「容器是进程级隔离，虚拟机是硬件级隔离」。这句话本身不错，但完全不够用来做生产决策。真正理解两者的区别，必须从 Linux 内核的视角看清楚它们分别在操作系统的哪一层实现隔离，以及这一层的选择带来什么代价。\n\n虚拟机的本质是「在硬件层模拟一套完整的计算机」。KVM（Kernel-based Virtual Machine）是 Linux 内核自 2.6.20 起内置的虚拟化模块，它配合 QEMU 利用 CPU 的硬件虚拟化扩展（Intel VT-x / AMD-V）让 Guest OS 的代码直接在物理 CPU 上运行，不需要逐条翻译指令。每个虚拟机都有自己完整的内核：独立的内核镜像、独立的页表、独立的驱动栈。Hypervisor 在两个内核之间充当硬件仲裁者，VM 里的进程要访问真实硬件，必须经过 Guest Kernel → Hypervisor → Host Kernel 这三层。这道硬件强制的边界，就是 VM 安全隔离的根本来源。\n\n容器的本质则完全不同。Docker 和 containerd 底层依赖的是 Linux 内核的两个原生机制：**namespace** 实现视图隔离，**cgroup** 实现资源限制。从 2002 年 Linux 2.4.19 引入第一个 mount namespace，到 Linux 3.8 引入 user namespace，内核逐步完善了 8 种 namespace：`mnt`（挂载点）、`pid`（进程树）、`net`（网络栈）、`ipc`（IPC 对象）、`uts`（主机名）、`user`（用户 ID）、`cgroup`（cgroup 视图）、`time`（系统时钟）。当你执行 `docker run` 时，containerd 调用 `clone(2)` 系统调用并传入 `CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS` 等标志，内核就为新进程创建一批独立的 namespace——这个「容器进程」在自己的视角里看到的是私有进程树、私有网络栈、私有根文件系统。但实际上，宿主机内核从来只有一个，namespace 不过是内核在同一套数据结构上玩的「视图把戏」。\n\ncgroup（Control Groups）负责资源限制这一层。cgroup v2 在 Linux 5.2 后成为默认，通过 `/sys/fs/cgroup/` 虚拟文件系统暴露接口。`docker run --memory=512m --cpus=2` 本质上是在 cgroup 树里写入：\n\n```bash\n# 限制内存上限（cgroup v2 memory controller）\necho $((512 * 1024 * 1024)) > /sys/fs/cgroup/system.slice/docker-<id>.scope/memory.max\n\n# 限制 CPU 配额（period=100ms，quota=200ms，即 2 核）\necho \"200000 100000\" > /sys/fs/cgroup/system.slice/docker-<id>.scope/cpu.max\n```\n\n内核的 OOM Killer 和 CFS 调度器会尊重这些限制，在容器进程越界时介入。\n\n## 第二步：syscall 路径是安全差异的核心\n\n理解了「容器共享内核」之后，下一个关键问题是：当容器里的进程调用 `read(fd, buf, n)` 这个系统调用时，和 VM 里的进程调用同一个 syscall，路径有什么不同？\n\n容器里的 syscall 路径极短：**用户进程 → `syscall` 指令 → CPU 切换到 ring 0 → 宿主机 Linux 内核直接处理**。没有任何额外的虚拟化层，syscall 直接命中宿主机内核的 `sys_read()` 实现。这是容器性能优越的根本原因——`getpid()` 这类轻量 syscall 耗时约 100~200ns，和在宿主机上直接调用无异。但这也是安全隔离弱的根本原因：容器里的代码和宿主机代码面对同一份内核实现。CVE-2022-0185 的 `legacy_parse_param()` 堆溢出、Dirty Pipe（CVE-2022-0847）的管道页面写权限绕过，恶意容器进程可以直接触发这些路径，一旦成功就能拿到 ring 0 权限并逃逸到宿主机。\n\nVM 里的 syscall 路径则多了关键几跳：**Guest 用户进程 → Guest `syscall` 指令 → Guest Kernel 处理 → 如需访问真实硬件 → CPU 触发 VM Exit → Hypervisor 接管 → Host Kernel 处理 → 返回 Hypervisor → 返回 Guest Kernel → 返回 Guest 进程**。VM Exit 是 Intel VT-x 的硬件机制：当 Guest 执行特权操作或访问受控资源时，CPU 自动保存 Guest 状态、切换到 Hypervisor 上下文。这个切换是硬件强制的，即使 Guest Kernel 被完全攻陷，攻击者仍然面对 Hypervisor 这道墙。一次涉及 virtio 磁盘 I/O 的 syscall，因为 VM Exit 的上下文切换，开销比容器高 2~5 倍——这就是 VM 安全性换来的代价。\n\n可以用 `lsns` 验证容器的 namespace 隔离是否生效：\n\n```bash\n# 宿主机上查看所有网络 namespace\n$ lsns -t net\n        NS TYPE  NPROCS   PID USER    COMMAND\n4026531992 net      210     1 root    /sbin/init\n4026532210 net        3 18432 root    nginx  # 容器内进程，独立 net namespace\n\n# 进入容器查看其路由表（只能看到自己的网络栈）\n$ nsenter -t 18432 -n ip route\ndefault via 172.17.0.1 dev eth0\n172.17.0.0/16 dev eth0 proto kernel\n```\n\n## 第三步：gVisor 和 Kata Containers 的混合方案\n\n理解了以上差异，就能看懂 gVisor 和 Kata Containers 为什么存在，以及各自的工程取舍。\n\n**gVisor** 是 Google 于 2018 年开源的用户态内核。它的核心思想是：在容器进程和宿主机内核之间插入一个用 Go 语言实现的「Sentry」进程。容器内的 syscall 不再直接命中宿主机内核，而是被 gVisor 的运行时（`runsc`）通过 `ptrace` 后端或 KVM 后端拦截，转交给 Sentry 处理。Sentry 实现了大部分 Linux syscall 语义，再用极少量经过审计的宿主机 syscall 完成实际工作。这样即使容器里的代码触发了某个 syscall 漏洞，它命中的是 Sentry 的 Go 实现，而不是宿主机内核。实际代价是：syscall 密集型工作负载性能下降 20~50%；截至 2024 年约有 30 个 syscall 未完整实现；GPU 直通和高性能网络（DPDK）无法使用。\n\n**Kata Containers** 走的是「轻量级 VM」路线。每个容器实际上跑在一个专用的微型 KVM 虚拟机里，使用经过裁剪的 kata-kernel（基于 Linux 5.15+，去掉大部分驱动模块），冷启动约 100~300ms。容器镜像通过 virtio-fs 挂载进 VM，containerd 通过 `kata-shim` 适配 CRI 接口，Kubernetes 完全可以透明地调度 Kata 容器，就像调度普通容器一样。由于每个容器都有独立内核，隔离性等同于 KVM 虚拟机。代价是内存 overhead 约 100~150MB/容器（独立内核常驻），以及 virtio 层带来的 I/O 性能损耗约 10~15%。\n\n两者定位的本质差异：gVisor 减少了攻击面（容器 syscall 不直接触达宿主机内核），但 Sentry 自身可能引入新漏洞；Kata 则是在更高维度上直接引入硬件隔离边界，更接近 VM 的安全模型，审计合规也更容易通过。\n\n## 第四步：分层隔离策略的落地建议\n\n回到这家公司的具体场景，按工作负载的安全等级分三层是最务实的方案。\n\n**第一层：支付服务（PCI-DSS scope 内的约 8 个服务）**，使用 Kata Containers。PCI-DSS Level 1 要求持卡人数据环境中的组件必须有可审计的隔离边界，共享内核的容器在 QSA 审计中通常难以说清楚。Kata 提供 VM 级内核隔离，同时冷启动约 200~300ms，完全不影响 30+ 次/天的部署频率。4 台 128GB 裸机上，Kata 容器的内存 overhead 约 1.2GB（8 个容器 × 150MB），占总内存不足 1%，完全可接受。\n\n**第二层：内部 API 服务和数据处理管道（约 35 个服务）**，使用标准 runc 容器配合 seccomp + AppArmor 加固。这些服务不处理持卡人数据，安全要求相对低，启动速度和资源密度优先。关键配置是：用严格的 seccomp profile 屏蔽高危 syscall（Docker 默认 profile 已屏蔽约 44 个，如 `ptrace`、`perf_event_open`、`mount`），启用 AppArmor 做 MAC 强制访问控制，同时加上 `--read-only --no-new-privileges --cap-drop ALL --cap-add NET_BIND_SERVICE` 等标志最小化权限面。\n\n**第三层：有状态服务（PostgreSQL、Redis 等约 7 个服务）**，保留传统 KVM 虚拟机，原因不是安全，而是资源独占性——数据库需要独占 NUMA 节点、独占磁盘 I/O 优先级，cgroup 在极端负载下的干扰仍然难以完全消除，而 VM 的硬件隔离可以给数据库一个可预测的性能基线。\n\n这个分层方案让同一批裸机上的 50 个服务各得其所：支付服务满足 PCI-DSS 合规审计，普通服务保持高密度和快速部署，有状态服务得到稳定的硬件独占。没有哪个方案能让你「鱼与熊掌兼得」，工程决策本质上是在安全、性能和运维复杂度之间找到那个对具体业务最合适的平衡点。",
+      "keyPoints": [
+        "容器隔离依赖 Linux namespace（视图隔离）和 cgroup（资源限制），宿主机内核始终只有一个，是「同一份内核代码上的视图把戏」而非真正的隔离边界",
+        "VM 通过 KVM + CPU 硬件虚拟化（Intel VT-x/AMD-V）让每个 Guest OS 拥有独立内核，Hypervisor 和 Guest 之间由 CPU 硬件 VM Exit 机制强制隔离，即使 Guest 内核被攻陷也难以跨越到宿主机",
+        "容器 syscall 直接命中宿主机内核（100~200ns），VM syscall 需经过 Guest Kernel → VM Exit → Hypervisor → Host Kernel 多跳（I/O 类 syscall 开销高 2~5 倍），这是容器性能优势与安全短板的同一根源",
+        "CVE-2022-0185、Dirty Pipe 等内核漏洞可以在未加固的容器内直接触发，是因为容器进程的 syscall 没有任何额外防护层，而在 VM 内触发同一漏洞只能攻陷 Guest Kernel，无法直接越过 Hypervisor",
+        "gVisor 通过用户态 Sentry 进程拦截容器 syscall，减少对宿主机内核的直接暴露，代价是 syscall 密集场景性能下降 20~50%，且约 30 个 syscall 未完整支持",
+        "Kata Containers 为每个容器启动独立的轻量级 KVM 实例（冷启动 100~300ms），提供等同于 VM 的内核级隔离，同时对上层 containerd/Kubernetes 完全透明，memory overhead 约 150MB/容器",
+        "生产分层原则：PCI-DSS 合规场景用 Kata Containers，普通微服务用 runc + seccomp/AppArmor 最小权限加固，有状态数据库用 KVM 虚拟机保证资源独占可预测性"
+      ],
+      "quiz": [
+        {
+          "id": "linux-q188-quiz-1",
+          "question": "下列哪个说法最准确地描述了容器和虚拟机在内核层面的本质区别？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "容器通过 namespace 和 cgroup 在同一宿主机内核上实现视图隔离和资源限制，VM 通过 hypervisor 运行独立 Guest 内核，隔离边界由 CPU 硬件（VT-x/AMD-V）强制保证"
+            },
+            {
+              "id": "B",
+              "text": "容器和 VM 都运行独立的内核，只是容器的内核经过裁剪更轻量，所以启动更快"
+            },
+            {
+              "id": "C",
+              "text": "VM 通过软件模拟 CPU 指令集，所有指令都要翻译，所以比容器慢；容器直接使用硬件，所以快"
+            },
+            {
+              "id": "D",
+              "text": "容器的安全隔离与 VM 等同，只是资源占用更低、启动更快"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 是精确描述。容器的关键特征是「共享内核」——namespace 只是让进程看到受限的视图，宿主机内核始终唯一，所以内核漏洞对所有容器都有影响。VM 的关键特征是 CPU 硬件强制的隔离边界（VM Exit 机制），即使 Guest Kernel 被攻陷也很难跨越 Hypervisor 到宿主机。B 错在容器没有独立内核。C 描述的是早期纯软件模拟（如 QEMU TCG 模式），现代 KVM 借助 VT-x 让 Guest 代码直接在 CPU 上运行，不需要逐条翻译。D 是最常见的危险误解，容器安全隔离远弱于 VM，这正是本题的核心考点。"
+        },
+        {
+          "id": "linux-q188-quiz-2",
+          "question": "Linux 容器依赖的多种 namespace 中，哪种 namespace 负责让容器内的 init 进程「认为自己的 PID 是 1」？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "uts namespace"
+            },
+            {
+              "id": "B",
+              "text": "pid namespace"
+            },
+            {
+              "id": "C",
+              "text": "ipc namespace"
+            },
+            {
+              "id": "D",
+              "text": "net namespace"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "pid namespace 负责进程树的视图隔离。在新的 pid namespace 中，第一个进程的 PID 为 1，它看不到宿主机或其他容器的进程。但在宿主机上用 `ps aux` 可以看到这个进程的真实 PID（如 18432），因为宿主机处于根 pid namespace。uts namespace 负责主机名和域名的隔离（`hostname` 命令的结果），这就是为什么不同容器可以有不同的主机名。ipc namespace 隔离 SystemV IPC 和 POSIX 消息队列。net namespace 给容器独立的网络栈（网卡、路由表、iptables）。这四种 namespace 是面试必考知识点，要能说清楚每种隔离的是什么资源。"
+        },
+        {
+          "id": "linux-q188-quiz-3",
+          "question": "当一个普通 Docker 容器（非 --privileged 模式）内的进程执行 `read(fd, buf, 4096)` 系统调用时，这个 syscall 最终由谁处理？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "容器的 init 进程（PID 1）代理处理后返回给调用进程"
+            },
+            {
+              "id": "B",
+              "text": "Docker daemon（dockerd）拦截并转发给内核"
+            },
+            {
+              "id": "C",
+              "text": "containerd 的 shim 进程在用户态处理"
+            },
+            {
+              "id": "D",
+              "text": "宿主机 Linux 内核直接处理，没有任何额外的中间层"
+            }
+          ],
+          "correctAnswer": "D",
+          "explanation": "这是容器和 VM 的最根本差异之一。容器进程执行 syscall 时，`syscall` 指令让 CPU 从 ring 3 切换到 ring 0，直接进入宿主机内核的 syscall 处理函数（如 `sys_read()`）。dockerd 和 containerd 只在容器的生命周期管理阶段介入（创建、启动、销毁），容器进程运行期间 dockerd 根本不在 syscall 路径上。这也是为什么内核漏洞对容器有效——容器进程可以直接触发宿主机内核的有漏洞代码路径，不像 VM 那样有 Hypervisor 隔离。"
+        },
+        {
+          "id": "linux-q188-quiz-4",
+          "question": "cgroup v2 中，容器的 `memory.max` 设置为 512MB，当容器进程申请内存超过这个限制时，内核的处理流程是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "直接返回 ENOMEM 给调用进程，分配立即失败"
+            },
+            {
+              "id": "B",
+              "text": "先触发该 cgroup 内的页面回收（page reclaim），回收不足时 OOM Killer 终止 cgroup 内占用最多内存的进程"
+            },
+            {
+              "id": "C",
+              "text": "暂停容器内所有进程直到其他 cgroup 释放内存"
+            },
+            {
+              "id": "D",
+              "text": "自动扩大 memory.max 限制并发出告警，不会杀进程"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "内核处理 cgroup 内存超限的流程是分步骤的，不会立即 ENOMEM 或直接 OOM。首先内核会尝试在该 cgroup 作用域内回收可回收的内存（page cache、swap 等），这个过程对进程透明。只有在回收之后仍然不能满足内存请求时，才会触发 cgroup 级别的 OOM Killer，按 `oom_score_adj` 选择 cgroup 内的目标进程并发送 SIGKILL。可以通过 `memory.events` 文件中的 `oom_kill` 计数器监控这个事件。A 是只有在系统全局内存不足时才会发生的情况。C 是错的，内核不会挂起进程等内存。D 在生产中是危险的误解，memory.max 是硬上限，内核不会自动扩展。"
+        },
+        {
+          "id": "linux-q188-quiz-5",
+          "question": "以下 `lsns` 输出显示容器进程 PID 18432 的 net namespace 与宿主机 PID 1 不同，这意味着什么？\n```\n        NS TYPE  NPROCS   PID USER COMMAND\n4026531992 net      210     1 root /sbin/init\n4026532210 net        3 18432 root nginx\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "容器内的 nginx 完全无法访问宿主机网络，两者网络完全隔离无法通信"
+            },
+            {
+              "id": "B",
+              "text": "容器有独立的网络栈（网卡、路由表、iptables），通过 veth pair 与宿主机 bridge 桥接，NS 编号不同确认了网络隔离已生效"
+            },
+            {
+              "id": "C",
+              "text": "容器内进程会绕过宿主机 iptables 防火墙，存在安全风险"
+            },
+            {
+              "id": "D",
+              "text": "这说明容器运行在 --privileged 模式，安全隔离已被禁用"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "net namespace 的作用是给容器一套独立的网络栈，包括网卡（通常是 eth0，由 veth pair 实现）、路由表、iptables 规则、socket 列表。NS 编号（4026532210 vs 4026531992）不同就是隔离已生效的直接证据。容器和宿主机之间通过 veth pair + docker0 bridge 通信，不是「完全无法通信」（A 错）。容器有自己的 iptables namespace，不会绕过宿主机的防火墙规则（C 错）。--privileged 模式会给容器几乎所有的 Linux capabilities，但本输出中 net namespace 不同，正好说明不是 --privileged（--privileged 会让容器和宿主机共享网络 namespace）（D 错）。"
+        },
+        {
+          "id": "linux-q188-quiz-6",
+          "question": "关于容器安全隔离，以下哪个说法是最常见、也最危险的误解？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "默认 Docker 容器的 syscall 可以被 seccomp profile 过滤，减少攻击面"
+            },
+            {
+              "id": "B",
+              "text": "启用 user namespace 后，容器内的 root 用户在宿主机上只映射为普通用户，权限受限"
+            },
+            {
+              "id": "C",
+              "text": "只要不用 --privileged 标志，容器就无法逃逸到宿主机，隔离强度等同于 VM"
+            },
+            {
+              "id": "D",
+              "text": "AppArmor 和 SELinux 可以为容器提供强制访问控制（MAC），是纵深防御的重要一层"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "C 是最危险的误解。不用 --privileged 只是不开放所有 Linux capabilities，但容器进程仍然直接面对宿主机内核的全部 syscall 接口。历史上大量容器逃逸漏洞（CVE-2022-0185、CVE-2019-5736 runc 漏洞、Dirty Pipe）不需要 --privileged 就能利用，只需要内核漏洞加上特定的 capability（如 CAP_SYS_ADMIN）或文件描述符条件。VM 的隔离是 CPU 硬件边界，两者根本不在一个量级上。A、B、D 都是正确的安全加固手段，它们共同构成容器安全的纵深防御体系，但任何单一措施都不等同于 VM 级隔离。"
+        },
+        {
+          "id": "linux-q188-quiz-7",
+          "question": "相比 KVM 虚拟机，容器在 syscall 性能上的优势主要来自哪里？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "容器的 Linux 内核对 syscall 做了特殊优化，代码路径比 VM 的 Guest Kernel 更短"
+            },
+            {
+              "id": "B",
+              "text": "容器 syscall 直接命中宿主机内核，没有 VM Exit 的上下文切换开销；VM 中涉及硬件访问的 syscall 需要 Guest Kernel → VM Exit → Hypervisor → Host Kernel 的多跳路径"
+            },
+            {
+              "id": "C",
+              "text": "容器不使用虚拟内存，页表切换开销为零"
+            },
+            {
+              "id": "D",
+              "text": "Docker daemon 对高频 syscall 做了用户态缓存，减少了实际进入内核的次数"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "VM Exit 是 KVM 虚拟机 I/O 性能开销的核心来源。每当 Guest 需要访问真实硬件（磁盘、网卡）时，CPU 必须保存完整的 Guest 寄存器状态、切换到 Host 模式，这个切换本身耗时约 1000~3000 个 CPU 周期。对于纯计算的 syscall（如 `getpid()`、`clock_gettime()` 带 vDSO 优化）VM 和容器差距不大；但对于磁盘 I/O 密集的场景，virtio 驱动 + VM Exit 会带来 2~5 倍的 latency 差距。A 错，两者都跑同样的 Linux 内核代码。C 错，容器完全使用虚拟内存。D 错，dockerd 不在 syscall 路径上。"
+        },
+        {
+          "id": "linux-q188-quiz-8",
+          "question": "某支付公司需要通过 PCI-DSS Level 1 审计，安全合规要求持卡人数据环境（CDE）中的容器必须具备内核级别的隔离。以下哪个方案最合适？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "给所有支付容器添加严格的 seccomp profile 和 AppArmor policy，满足 PCI-DSS 要求"
+            },
+            {
+              "id": "B",
+              "text": "使用 Kata Containers 运行支付服务，每个容器在独立的轻量级 KVM 实例中运行，通过 containerd CRI 接口管理，兼顾 VM 级内核隔离与容器化部署效率"
+            },
+            {
+              "id": "C",
+              "text": "将支付服务迁移到 gVisor，通过 Sentry 拦截所有 syscall，提供足够的隔离强度"
+            },
+            {
+              "id": "D",
+              "text": "在支付容器内运行完整的 Ubuntu 发行版并启动 systemd，通过嵌套隔离达到 VM 级安全"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kata Containers 是这个场景的最优解。它为每个容器启动独立的 KVM 实例，隔离边界完全等同于 VM，QSA 审计师可以核查每个工作负载有独立的 Guest Kernel，满足 PCI-DSS 对 CDE 隔离的要求。同时对上层保持 containerd/Kubernetes 兼容，启动时间约 200~300ms，不影响频繁部署。A（seccomp + AppArmor）是好的加固措施，但在 PCI-DSS 审计中「共享内核」这一点很难说服审计师，它不等同于内核隔离。C（gVisor）的隔离原理是减少 syscall 暴露面，不是提供独立内核，且 Sentry 本身的安全性尚无成熟的合规框架支撑。D 在容器内运行完整 OS 会带来巨大的安全和运维问题，这不是 VM 级隔离。"
+        },
+        {
+          "id": "linux-q188-quiz-9",
+          "question": "gVisor 的 Sentry 组件拦截容器 syscall，相比直接运行在宿主机内核上，它的核心安全优势和引入的新攻击面分别是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "优势：消除所有 syscall 漏洞风险；新攻击面：Go runtime 的内存管理机制引入新型漏洞"
+            },
+            {
+              "id": "B",
+              "text": "优势：容器 syscall 命中 Sentry 的 Go 实现而非宿主机内核，宿主机内核漏洞（如堆溢出）无法被容器直接触发；新攻击面：Sentry 自身的 syscall 实现可能存在漏洞，且 Sentry 需要少量宿主机 syscall 权限，这部分接口成为新的攻击面"
+            },
+            {
+              "id": "C",
+              "text": "优势：所有 syscall 性能比 Linux 内核高 30%；新攻击面：多一个进程占用额外内存"
+            },
+            {
+              "id": "D",
+              "text": "优势：gVisor 完整模拟了所有 Linux 硬件驱动；新攻击面：GPU 驱动直通失效"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "gVisor 的安全模型是「缩减宿主机内核的直接暴露面」，而不是「消除所有漏洞」（A 夸大了）。Sentry 处理容器 syscall 的过程中，只需要向宿主机内核发出约 55 个经过审计的 syscall（通过 seccomp 白名单限制），攻击者即使攻陷容器也只能触发这 55 个 syscall，大幅减少了内核攻击面。新攻击面是 Sentry 本身：作为一个 15 万行 Go 代码实现的「内核」，Sentry 的 syscall 实现可能存在逻辑漏洞。2023 年确实发现过 gVisor Sentry 的内存映射漏洞（CVE-2023-1829 相关路径）。B 是准确描述。C 错，gVisor 的 syscall 性能反而比原生慢 20~50%。D 错，gVisor 不模拟硬件驱动。"
+        },
+        {
+          "id": "linux-q188-quiz-10",
+          "question": "安全审计发现某容器进程通过写入宿主机的 `/proc/sys/kernel/core_pattern` 成功实现了宿主机逃逸（写入了一个 `|/tmp/evil.sh` 的路径）。这个逃逸路径的前提条件是什么？最有效的防御手段是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "前提：容器使用了 bridge 网络模式；防御：改为 host 网络模式可以防御"
+            },
+            {
+              "id": "B",
+              "text": "前提：容器拥有 CAP_SYS_ADMIN capability，且 `/proc/sys` 对容器可写；防御：`--cap-drop ALL` 最小化 capability，并用 seccomp profile 限制 `write` 系统调用对 `/proc/sys` 路径的访问，同时使用 read-only 挂载"
+            },
+            {
+              "id": "C",
+              "text": "前提：容器必须以 --privileged 模式运行；防御：禁止任何容器使用 --privileged 即可"
+            },
+            {
+              "id": "D",
+              "text": "前提：这是宿主机内核漏洞，只能升级内核修复，运行时无法防御"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "写入 `/proc/sys/kernel/core_pattern` 需要 CAP_SYS_ADMIN capability，这不是 --privileged 独有的——某些容器镜像会在启动时保留 CAP_SYS_ADMIN 做 sysctl 配置。攻击者让 core_pattern 指向恶意脚本，当宿主机任何进程 coredump 时就会以宿主机权限执行该脚本，完成逃逸。防御要从多个层面入手：用 `--cap-drop ALL --cap-add <最小必要>` 去掉 CAP_SYS_ADMIN；在 seccomp profile 中屏蔽不需要的 syscall；使用 AppArmor profile 限制对 `/proc/sys` 的写访问；以及 `--read-only` 加 `--tmpfs /tmp` 减少可写路径。C 错，--privileged 是最坏情况，但 CAP_SYS_ADMIN 单独就足以触发此攻击。D 错，这个技术不依赖内核漏洞，是 capability 滥用。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Linux Namespaces — man 7 namespaces",
+          "url": "https://man7.org/linux/man-pages/man7/namespaces.7.html"
+        },
+        {
+          "title": "Linux Control Groups v2 — Kernel Documentation",
+          "url": "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html"
+        },
+        {
+          "title": "gVisor Architecture Guide",
+          "url": "https://gvisor.dev/docs/architecture_guide/"
+        },
+        {
+          "title": "Kata Containers Architecture",
+          "url": "https://katacontainers.io/learn/"
+        },
+        {
+          "title": "CVE-2022-0185 — Linux Kernel Heap Overflow via Legacy Filesystem Mount",
+          "url": "https://nvd.nist.gov/vuln/detail/CVE-2022-0185"
+        },
+        {
+          "title": "NCC Group: Understanding and Hardening Linux Containers",
+          "url": "https://research.nccgroup.com/2016/03/01/whitepaper-understanding-and-hardening-linux-containers/"
+        }
+      ]
+    }
+  ]
+}

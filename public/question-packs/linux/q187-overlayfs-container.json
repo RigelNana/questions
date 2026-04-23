@@ -1,0 +1,169 @@
+{
+  "id": "linux-q187",
+  "name": "OverlayFS 在容器镜像分层中的应用",
+  "domain": "linux",
+  "description": "深入解析 OverlayFS 联合文件系统如何支撑 Docker 镜像分层机制，涵盖四目录模型、写时复制语义、层缓存优化及生产性能注意事项",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "linux-q187",
+      "domain": "linux",
+      "type": "open-ended",
+      "difficulty": 4,
+      "tags": ["overlayfs", "docker", "container", "filesystem", "copy-on-write", "linux-kernel", "overlay2"],
+      "title": "overlay filesystem 在容器镜像分层中是怎么工作的",
+      "content": "你的团队刚刚把所有微服务迁移到 Docker，CI/CD 流水线跑起来了，但磁盘使用情况引起了你的注意：同样是基于 ubuntu:22.04 的镜像，团队里十几个服务共享同一个基础层，宿主机上的磁盘占用却远小于「每个镜像大小之和」。新来的实习生问你：「Docker 说镜像是分层的，这个分层到底是什么意思？容器启动的时候文件系统是怎么拼起来的？」\n\n你打开一台运行中的 Docker 宿主机，找到正在跑的一个 Nginx 容器，执行 `cat /proc/mounts | grep overlay`，看到了这样的输出：\n\n```\noverlay /var/lib/docker/overlay2/7f3abc/merged overlay rw,relatime,\n  lowerdir=/var/lib/docker/overlay2/l/MN3:/var/lib/docker/overlay2/l/KQ7:/var/lib/docker/overlay2/l/AB2,\n  upperdir=/var/lib/docker/overlay2/7f3abc/diff,\n  workdir=/var/lib/docker/overlay2/7f3abc/work 0 0\n```\n\n同时查看 `/var/lib/docker/overlay2` 目录结构，发现如下布局：\n\n```\n/var/lib/docker/overlay2/\n├── 7f3abc/               # 运行中容器的可写层\n│   ├── diff/             # upperdir：容器写入的所有文件\n│   ├── work/             # workdir：内核原子操作暂存区\n│   ├── merged/           # 最终挂载点：容器进程看到的文件系统\n│   └── link              # 内容为该层在 l/ 目录下的短链接名\n├── a1b2c3d4e5f6.../      # 镜像层（只读）\n│   ├── diff/             # 该层实际存储的文件\n│   ├── link\n│   └── lower             # 父层的 lowerdir 路径列表\n└── l/                    # 短符号链接目录\n    ├── MN3 -> ../7f3abc/diff\n    ├── KQ7 -> ../a1b2c3d4e5f6.../diff\n    └── AB2 -> ../другой.../diff\n```\n\n请深入回答：OverlayFS 的四个目录（lowerdir / upperdir / workdir / merged）各自承担什么职责？Docker 镜像的每一层是如何映射到这些目录的？写时复制（COW）在这里具体是怎么发生的，粒度是块级别还是文件级别？`l/` 这个短链接目录的存在有什么意义？生产环境中 overlay2 有哪些容易踩的性能陷阱？",
+      "answer": "## OverlayFS 是什么，为什么 Docker 要用它\n\nOverlayFS 是 Linux 内核从 3.18 版本（2014 年底）正式合入主线的联合文件系统（union filesystem）。在此之前，Docker 一直用 AUFS 作为默认存储驱动，但 AUFS 长期游离于内核主线之外，各大发行版对它的支持参差不齐——Ubuntu 默认打包，但 RHEL/CentOS 完全不带。OverlayFS 的合入彻底终结了这个局面，它实现更简洁、性能更好，从 Docker 1.12 开始成为所有支持内核版本的 Linux 上的默认存储驱动（overlay2）。\n\n联合文件系统要解决的核心问题是：把多个目录「叠加」成一个统一的视图，让用户进程看到的是一个完整的文件系统，而底层实际上是多层独立的目录。要理解这是怎么做到的，最好的方式是亲自挂载一次：\n\n```bash\nmkdir -p /srv/lower1 /srv/lower2 /srv/upper /srv/work /srv/merged\n\necho \"base config v1\" > /srv/lower2/config.conf\necho \"shared library\" > /srv/lower2/libfoo.so\necho \"app binary\"     > /srv/lower1/app\n\n# lowerdir 冒号左边的层优先级更高\nmount -t overlay overlay \\\n  -o lowerdir=/srv/lower1:/srv/lower2,upperdir=/srv/upper,workdir=/srv/work \\\n  /srv/merged\n\nls /srv/merged\n# 输出：app  config.conf  libfoo.so\n```\n\nmerged 目录里同时出现了两个 lowerdir 的文件，这就是联合的含义。容器进程在 merged 里看到的是一个完整的文件系统，完全感知不到底层的分层结构。\n\n## 四个目录的精确职责\n\n**lowerdir** 是只读的层叠栈。它可以是用冒号分隔的多个目录，查找文件时内核从最左边（优先级最高）的层开始依次向右搜索，找到就返回，找不到才继续往下。在 Linux 4.x 内核中最多支持 2 层 lowerdir，到了 5.2 内核这个限制放宽到了 500 层。Docker 镜像的每一个只读层（image layer）对应一个 lowerdir 条目。一个拉取了 10 层的镜像，内核挂载时会看到 9 个 lowerdir（最底层是 FROM 基础镜像，最顶层是最后一条 Dockerfile 指令产生的层）。\n\n**upperdir** 是容器专属的可写层。每个运行中的容器都有一个独立的 upperdir，位于 `/var/lib/docker/overlay2/<container-id>/diff`。容器启动时这个目录是空的，所有写操作都落在这里。这也是为什么容器删除后数据消失——upperdir 被清空了。如果执行 `docker commit`，本质上就是把 upperdir 里的内容打包成一个新的只读层追加到镜像里。\n\n**workdir** 的存在感很低，但不可缺少。它必须和 upperdir 位于同一个文件系统上，作用是让内核用来实现原子写操作。当容器内的进程修改一个文件，内核先在 workdir 里完成修改，再通过 `rename()` 系统调用原子地移入 upperdir。这样即使写操作中途掉电，也不会在 upperdir 里留下半写状态的文件。workdir 对用户进程完全透明，日常运维几乎不需要碰它。\n\n**merged** 是最终的挂载点，容器进程看到的文件系统根目录就是这里。它不存储任何实际数据，只是内核把 lowerdir 栈和 upperdir 投影出来的一个统一视图。\n\n## 写时复制的真实粒度——一个重要的认知纠正\n\n很多人以为 OverlayFS 的 COW 是块级别的，类似 BTRFS 或 ZFS 那种写时复制。实际上 **OverlayFS 的 COW 是文件级别的**，这一点在性能敏感场景下影响巨大。\n\n当容器内的进程第一次打开 lowerdir 中的某个文件并准备写入，内核会把这个文件从 lowerdir **整个复制**到 upperdir，然后再在 upperdir 里修改。不管你只想修改文件的最后一个字节，OverlayFS 都会先完整复制整个文件。这意味着，如果容器里跑着 MySQL 并且数据文件在 lowerdir（比如你用 `docker commit` 保存了数据状态），那么第一次写入这个数据文件时，整个几十 GB 的文件会被复制到 upperdir——这是为什么生产环境里数据库绝对不能跑在容器的 overlay 层上，必须用 volume 挂载。\n\n删除 lowerdir 中的文件也是同理，OverlayFS 不会真的删除只读层里的文件，而是在 upperdir 里创建一个同名的「白障文件」（whiteout file）——一个主设备号和次设备号都是 0 的字符设备文件：\n\n```bash\n# 在容器里删除 /etc/hostname 之后，到宿主机观察 upperdir：\nls -la /var/lib/docker/overlay2/7f3abc/diff/etc/\n# c--------- 1 root root 0, 0 Jan 15 03:21 hostname\n# c 开头 = 字符设备，设备号 0,0 = whiteout 标记\n```\n\n内核在遍历文件时，如果在 upperdir 里碰到 whiteout 文件，就认为该文件已被删除，不再继续往 lowerdir 里找。如果删除的是一个目录，则用「不透明目录」（opaque directory）标记替代——在目录的 xattr 里设置 `trusted.overlay.opaque=y`。\n\n## `/var/lib/docker/overlay2` 目录结构解剖\n\n每个只读镜像层目录包含三个关键文件：`diff/` 存放该层实际的文件内容；`link` 是一个纯文本文件，记录该层在 `l/` 目录下对应的 26 字符短链接名；`lower` 是一个文本文件，内容是该层所有父层的 lowerdir 路径（全部用 `l/` 短链接表示，用冒号分隔）。\n\n运行中的容器层额外多出 `merged/`（挂载点）和 `work/`（暂存区）。\n\n`l/` 目录里存放的是指向各层 `diff/` 目录的符号链接，链接名是 26 个字符的随机大写字母。这是一个实用的工程技巧：内核挂载 OverlayFS 时，lowerdir 参数是把所有路径拼成一个字符串传递的。如果直接使用完整的 64 字符哈希路径，一个 50 层的镜像拼出来的字符串会超过内核页大小（4096 字节），导致 `mount()` 系统调用返回 `ENAMETOOLONG` 错误。用 26 字符短链接可以将每层的路径长度压缩到约 50 字节，支持约 70-80 层镜像而不触发这个限制。\n\n## 层缓存与 Dockerfile 构建顺序\n\n理解了 OverlayFS 的分层机制，就能真正理解为什么 Dockerfile 的指令顺序如此重要。构建时，Docker 对每条指令计算一个缓存 key（基于父层哈希 + 指令内容），命中则直接复用现有层，不命中则重新执行。一旦某层缓存失效，其后的所有层都必须重新构建。\n\n一个典型的 Python 服务反模式：\n\n```dockerfile\n# 反模式：先复制全部代码，再装依赖\nCOPY . /app\nRUN pip install -r requirements.txt  # 每次改一行业务代码都要重新 pip install\n```\n\n正确做法是把变化最慢的层放最前面：\n\n```dockerfile\nFROM python:3.12-slim\n# 第一层：系统依赖（几乎不变）\nRUN apt-get update && apt-get install -y libpq-dev && rm -rf /var/lib/apt/lists/*\n# 第二层：Python 依赖（依赖版本变更才失效）\nCOPY requirements.txt /app/\nRUN pip install --no-cache-dir -r /app/requirements.txt\n# 第三层：业务代码（每次提交都变）\nCOPY . /app\n```\n\n这样日常迭代只需要重建最后一层，前两层持续命中缓存，CI 构建时间可以从 5 分钟降到 30 秒。\n\n## 生产环境的性能陷阱\n\n**inode 耗尽**是 overlay2 在 ext4 上最常见的坑。ext4 的 inode 数量在格式化时就固定了，overlay2 的分层结构会产生大量小文件和硬链接，高密度容器环境下 inode 耗尽的速度远超预期。症状是 `df -h` 显示磁盘还有 40% 空间，但写文件报 `No space left on device`。用 `df -i /var/lib/docker` 才能发现 inode 使用率已达 100%。应对方法有两种：一是格式化时指定小文件优化参数 `mkfs.ext4 -T small /dev/sdb`，可以提升 4 倍 inode 密度；二是把 `/var/lib/docker` 单独挂到 XFS 分区上，XFS 的 inode 是动态分配的，理论上不存在耗尽问题。\n\n**XFS 的 d_type 陷阱**在 CentOS 7 时代造成过大量故障。CentOS 7 默认用 XFS 作为根文件系统，但其默认格式化参数是 `ftype=0`（不存储目录项类型信息），而 overlay2 强依赖 d_type 特性。在 `ftype=0` 的 XFS 上启动 Docker，overlay2 会初始化失败，Docker 自动降级到 vfs 驱动——vfs 驱动在每个容器启动时完整复制整个镜像文件树，性能比 overlay2 差一到两个数量级。检测方法：`xfs_info /var/lib/docker | grep ftype`，看到 `ftype=0` 就需要重新格式化（`mkfs.xfs -n ftype=1 /dev/sdb`）。这个坑在 RHEL 8 / CentOS 8 之后已默认修复，但存量 CentOS 7 系统仍需注意。\n\n**深层镜像的 open() 性能衰减**是第三个隐性陷阱。每次打开一个文件，内核的 VFS 层需要从 upperdir 开始逐层遍历 lowerdir 来查找文件。一个有 60 层的镜像和一个有 3 层的镜像相比，每次 `open()` 的开销相差明显，在高 IOPS 的 Java 应用启动阶段（大量 `.class` 文件查找）会被显著放大。建议用多阶段构建（multi-stage build）压缩最终镜像层数，生产镜像控制在 10 层以内。\n\n**大文件频繁修改**是第四个坑，本质上是 OverlayFS 文件级 COW 的代价。数据库文件、日志文件、大型缓存文件都不适合放在 overlay 层里，应该通过 `-v` 或 `--mount` 挂载宿主机目录或具名卷，绕过 overlay2，直接走底层文件系统的 IO 路径。",
+      "keyPoints": [
+        "OverlayFS 从 Linux 3.18 合入主线，Docker overlay2 驱动基于它实现镜像分层，lowerdir 对应只读镜像层，upperdir 对应容器可写层，workdir 提供原子写保障，merged 是进程看到的统一文件系统视图",
+        "Docker 镜像的每一个只读层（image layer）对应一个 lowerdir 条目，多层用冒号分隔，优先级从左到右递减，内核查找文件时从最高优先级层依次向下遍历",
+        "OverlayFS 的写时复制是文件级别而非块级别，修改 lowerdir 中任意大小的文件都会先将整个文件复制到 upperdir 再修改，大文件频繁写入时性能极差",
+        "删除 lowerdir 中的文件会在 upperdir 创建设备号 0:0 的字符设备文件（whiteout），删除目录则在 xattr 中设置 trusted.overlay.opaque=y 标记不透明目录",
+        "l/ 目录存放 26 字符短符号链接指向各层 diff/ 目录，避免 lowerdir 参数拼接后超过内核页大小（4096 字节）触发 ENAMETOOLONG 错误",
+        "Dockerfile 指令顺序决定层缓存效率，变化最慢的层（系统依赖、第三方库）应放最前，变化最频繁的层（业务代码）放最后，可将 CI 构建时间缩短数倍",
+        "XFS 格式化时必须指定 ftype=1 才能使用 overlay2，CentOS 7 默认 ftype=0 会导致 Docker 降级到 vfs 驱动，性能差一到两个数量级",
+        "ext4 上 inode 耗尽是高密度容器环境的常见故障，df -h 显示磁盘有空间但写入报错时应用 df -i 检查 inode 使用率，可通过 mkfs.ext4 -T small 或改用 XFS 解决"
+      ],
+      "quiz": [
+        {
+          "id": "linux-q187-q1",
+          "question": "在 Docker overlay2 存储驱动中，容器内进程写入的所有新文件和修改后的文件最终保存在哪个目录？",
+          "choices": [
+            {"id": "A", "text": "upperdir，即 /var/lib/docker/overlay2/<container-id>/diff/"},
+            {"id": "B", "text": "merged，即 /var/lib/docker/overlay2/<container-id>/merged/"},
+            {"id": "C", "text": "lowerdir，即镜像层的 diff/ 目录"},
+            {"id": "D", "text": "workdir，即 /var/lib/docker/overlay2/<container-id>/work/"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "upperdir 是容器专属的可写层，路径为 /var/lib/docker/overlay2/<container-id>/diff/。容器内所有的写操作（新建文件、修改文件、删除文件的 whiteout 标记）都落在这里。merged 只是内核投影出来的统一视图，本身不存储数据；lowerdir 是只读的镜像层，内核不允许向其写入；workdir 是内核用于原子操作的暂存区，用户数据不会停留在那里。理解这一点对排查容器磁盘使用问题至关重要——docker diff 命令看到的就是 upperdir 和初始状态的差异。"
+        },
+        {
+          "id": "linux-q187-q2",
+          "question": "在 OverlayFS 中，当容器进程修改一个来自 lowerdir 的 200MB 文件的最后 1 个字节时，实际发生了什么？",
+          "choices": [
+            {"id": "A", "text": "只有被修改的那个磁盘块（通常 4KB）被复制到 upperdir，其余部分保持引用"},
+            {"id": "B", "text": "整个 200MB 文件被完整复制到 upperdir，然后在 upperdir 中修改"},
+            {"id": "C", "text": "修改直接写入 lowerdir，OverlayFS 会为 lowerdir 创建一个差量日志"},
+            {"id": "D", "text": "OverlayFS 在 merged 视图中创建一个差量补丁文件记录变化"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "OverlayFS 的 COW 是文件级别的，不是块级别的。这是 OverlayFS 和 BTRFS/ZFS 最重要的区别。不管修改多小，只要触碰 lowerdir 中的文件，内核就会先将整个文件完整复制（copy-up）到 upperdir，再在 upperdir 中执行修改。这对大文件来说性能代价很高。BTRFS 和 ZFS 的 COW 是块级别的，只复制被修改的块，所以它们对数据库工作负载更友好。选项 A 描述的是块级 COW，是 BTRFS 的行为，不是 OverlayFS。"
+        },
+        {
+          "id": "linux-q187-q3",
+          "question": "在容器内执行 `rm /etc/resolv.conf` 后，OverlayFS 如何处理这个删除操作？",
+          "choices": [
+            {"id": "A", "text": "直接从 lowerdir 的镜像层中删除 /etc/resolv.conf 文件"},
+            {"id": "B", "text": "在 upperdir 中创建一个名为 resolv.conf 的普通空文件作为删除标记"},
+            {"id": "C", "text": "在 upperdir 中创建一个名为 resolv.conf 的字符设备文件（主次设备号均为 0），作为 whiteout 标记"},
+            {"id": "D", "text": "在 workdir 中记录一条删除日志，等容器停止时统一清理"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "OverlayFS 无法修改只读的 lowerdir，所以删除 lowerdir 中的文件时，它在 upperdir 中创建一个同名的「白障文件」（whiteout file）——一个主设备号和次设备号都是 0 的字符设备文件（可以用 ls -la 看到 c 开头，设备号为 0, 0）。内核在查找文件时，如果在 upperdir 中遇到 whiteout 文件，就认为该文件已被删除，不再继续往 lowerdir 找。这就是为什么在容器里删了文件，但镜像层仍然包含这个文件——whiteout 只是掩盖它，并没有真的删除，这也是为什么 `RUN rm -rf` 不能真正减小镜像大小。"
+        },
+        {
+          "id": "linux-q187-q4",
+          "question": "Docker overlay2 驱动在 /var/lib/docker/overlay2/ 下创建了一个 l/ 目录，存放指向各层 diff/ 的短符号链接。这个设计的主要目的是什么？",
+          "choices": [
+            {"id": "A", "text": "提升文件查找性能，短路径比长路径的目录遍历更快"},
+            {"id": "B", "text": "避免 lowerdir 参数字符串过长超过内核页大小（4096 字节）导致挂载失败"},
+            {"id": "C", "text": "实现硬链接去重，多个镜像共享同一层时避免重复存储"},
+            {"id": "D", "text": "满足 SELinux 的文件标签要求，短路径更容易应用安全策略"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "内核挂载 OverlayFS 时，lowerdir 参数是把所有层的路径用冒号拼接成一个字符串传给 mount() 系统调用的。每个镜像层的完整路径大约是 /var/lib/docker/overlay2/<64字符哈希>/diff，约 80 个字符。如果一个镜像有 40 层，直接拼接就是 3200+ 字节，超过内核页大小（4096 字节）后 mount() 会返回 ENAMETOOLONG 错误。l/ 目录里的短链接只有 26 个字母，每层路径约 45 字节，支持约 70-80 层而不触发限制。这是一个纯粹的工程实用主义设计，和性能、安全、去重都没有关系。"
+        },
+        {
+          "id": "linux-q187-q5",
+          "question": "以下哪个命令可以正确查看一台 Linux 宿主机上某个运行中容器的 OverlayFS 挂载参数（lowerdir/upperdir/workdir）？",
+          "choices": [
+            {"id": "A", "text": "docker inspect <container-id> --format '{{.GraphDriver}}'"},
+            {"id": "B", "text": "cat /proc/mounts | grep overlay"},
+            {"id": "C", "text": "mount | grep <container-id>"},
+            {"id": "D", "text": "以上选项 A、B、C 都正确，只是输出格式不同"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "三种方法都能获取容器的 OverlayFS 挂载信息，只是输出格式不同。docker inspect 返回结构化 JSON，GraphDriver 字段包含 Data.LowerDir、Data.UpperDir、Data.WorkDir、Data.MergedDir 四个路径；cat /proc/mounts | grep overlay 显示内核实际的挂载参数，是最原始的数据来源，可以看到完整的 lowerdir 参数字符串；mount | grep overlay 输出类似 /proc/mounts 但格式略有不同。在排查问题时，/proc/mounts 是最可靠的来源，因为它直接反映内核维护的挂载表状态。"
+        },
+        {
+          "id": "linux-q187-q6",
+          "question": "在 CentOS 7 系统上，执行 `xfs_info /var/lib/docker | grep ftype` 显示 `ftype=0`，这会导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "Docker 无法启动，直接报错退出"},
+            {"id": "B", "text": "overlay2 驱动初始化失败，Docker 自动降级到 vfs 驱动，性能极差"},
+            {"id": "C", "text": "镜像分层功能失效，所有镜像层合并成一层存储"},
+            {"id": "D", "text": "只有写操作性能下降，读操作不受影响"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "overlay2 强依赖目录项类型信息（d_type），这需要底层文件系统在 XFS 格式化时设置 ftype=1。CentOS 7 默认 XFS 格式化参数是 ftype=0，不存储目录项类型信息。在这种情况下，Docker 启动时会检测到 overlay2 不可用（可以在 /var/log/docker 日志里看到警告），自动降级到 vfs 存储驱动。vfs 驱动没有任何分层复用能力，每个容器启动时都会把整个镜像完整复制一份，磁盘占用和 IO 性能都极差。解决方案是重新格式化：mkfs.xfs -n ftype=1 /dev/sdb，然后重新挂载 /var/lib/docker。RHEL 8 之后默认已修复为 ftype=1。"
+        },
+        {
+          "id": "linux-q187-q7",
+          "question": "一台 Docker 宿主机磁盘使用率只有 60%，但执行 `docker pull` 或容器内写文件时报 `No space left on device` 错误，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Docker daemon 的内存不足，OOM Killer 杀死了存储相关进程"},
+            {"id": "B", "text": "ext4 文件系统的 inode 耗尽，磁盘块空间有余但 inode 已满"},
+            {"id": "C", "text": "overlay2 的 lowerdir 层数超过了内核限制（500 层）"},
+            {"id": "D", "text": "/var/lib/docker/overlay2/l/ 目录下的符号链接数量达到上限"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 overlay2 在 ext4 上最经典的故障场景。ext4 的 inode 数量在格式化时固定（默认每 16KB 存储空间分配一个 inode），高密度容器环境中大量小文件（Python 包、Node.js 模块、Go 二进制文件的各层文件）会快速耗尽 inode，而磁盘块空间可能还剩很多。诊断命令是 `df -i /var/lib/docker`，如果 IUse% 显示 100% 就是这个问题。解决方案：短期用 docker system prune 清理悬空层；长期解决方案是格式化时用 `mkfs.ext4 -T small` 提升 inode 密度，或者把 /var/lib/docker 迁移到 XFS（动态 inode 分配，没有此限制）。"
+        },
+        {
+          "id": "linux-q187-q8",
+          "question": "以下哪个 Dockerfile 写法能最大化利用 Docker 的层缓存，减少每次代码变更后的重新构建时间？",
+          "choices": [
+            {"id": "A", "text": "COPY . /app\nRUN pip install -r /app/requirements.txt\nRUN python setup.py install"},
+            {"id": "B", "text": "COPY requirements.txt /app/\nRUN pip install -r /app/requirements.txt\nCOPY . /app/"},
+            {"id": "C", "text": "RUN pip install flask requests sqlalchemy\nCOPY . /app/"},
+            {"id": "D", "text": "COPY . /app/\nRUN pip install flask requests sqlalchemy"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 是正确的分层策略：先只复制 requirements.txt，运行 pip install，再复制完整代码。这样只要 requirements.txt 不变，pip install 那一层就会持续命中缓存，即使业务代码每次都变，也只需要重建最后一层 COPY . 。选项 A 和 D 先复制了全部代码，任何代码改动都会使 pip install 层缓存失效，每次都要重新下载安装依赖，把 5 分钟的 CI 变成 5 分钟的必然。选项 C 把依赖硬编码在 RUN 里而不读取 requirements.txt，依赖版本变更时缓存不会自动失效，反而会造成依赖漂移的问题。"
+        },
+        {
+          "id": "linux-q187-q9",
+          "question": "一个 Docker 镜像在 Dockerfile 里用了 `RUN rm -rf /var/cache/apt/archives/` 来清理 apt 缓存，为什么这个 RUN 指令无法真正减小最终镜像的大小？",
+          "choices": [
+            {"id": "A", "text": "rm 命令在容器内没有权限删除系统缓存目录"},
+            {"id": "B", "text": "apt 缓存目录受 OverlayFS lowerdir 的写保护，rm 操作被静默忽略"},
+            {"id": "C", "text": "rm 操作产生 whiteout 文件写入 upperdir，但之前安装 apt 包的那一层 lowerdir 依然包含完整缓存文件，两层都被打包进镜像"},
+            {"id": "D", "text": "Docker 会自动保留所有中间层用于调试，rm 操作只影响运行时视图"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 OverlayFS 分层机制造成的一个常见的镜像膨胀问题。当 `RUN apt install` 产生了大量缓存文件（比如 100MB），这些文件被记录在那个 RUN 指令对应的 lowerdir 层里。下一条 `RUN rm -rf` 只是在它自己的 upperdir（最终成为另一个 lowerdir 层）里创建了 whiteout 标记文件。两层都会被打包进最终镜像：第一层 100MB 的实际文件 + 第二层几字节的 whiteout 标记。`docker history <image>` 可以看到每层的大小，会发现删除操作并没有减少前一层的大小。正确做法是把安装和清理合并在同一条 RUN 指令里：`RUN apt install -y xxx && rm -rf /var/cache/apt/archives/*`，这样两个操作都落在同一层，清理真正生效。"
+        },
+        {
+          "id": "linux-q187-q10",
+          "question": "在 Linux 5.2+ 内核上，OverlayFS 最多支持多少个 lowerdir 条目（即镜像层数）？",
+          "choices": [
+            {"id": "A", "text": "最多 2 层，这是 OverlayFS 设计上的硬限制"},
+            {"id": "B", "text": "最多 128 层，由 Docker 的软件实现决定"},
+            {"id": "C", "text": "最多 500 层，由内核的 OVERLAY_MAX_STACK 常量定义"},
+            {"id": "D", "text": "没有硬性层数限制，只受磁盘空间约束"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Linux 内核在 OverlayFS 实现里定义了 OVERLAY_MAX_STACK 常量，在 5.2 版本中这个值是 500。这意味着一个 OverlayFS 挂载最多可以有 500 个 lowerdir 条目（加上 upperdir 共 501 层）。在 4.x 内核时代，这个限制只有 2 层（只支持一个 lowerdir），Docker 不得不用多层嵌套 OverlayFS 来模拟多层，性能和复杂度都很差。overlay2 驱动（区别于早期的 overlay 驱动）就是专门利用了内核对多 lowerdir 的支持。实际上 Docker 官方建议单个镜像不超过 127 层，这个数字来自早期内核的 PAGE_SIZE 和路径长度的综合约束，而不是 OVERLAY_MAX_STACK 的限制。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Linux Kernel Documentation: Overlay Filesystem",
+          "url": "https://www.kernel.org/doc/html/latest/filesystems/overlayfs.html"
+        },
+        {
+          "title": "Docker Documentation: Use the OverlayFS storage driver",
+          "url": "https://docs.docker.com/storage/storagedriver/overlayfs-driver/"
+        },
+        {
+          "title": "Docker Documentation: About storage drivers",
+          "url": "https://docs.docker.com/storage/storagedriver/"
+        },
+        {
+          "title": "Miklos Szeredi: overlayfs and containers (Linux Plumbers Conference)",
+          "url": "https://www.linuxplumbersconf.org/event/2/contributions/71/attachments/18/25/overlayfs.pdf"
+        }
+      ]
+    }
+  ]
+}
