@@ -1,0 +1,157 @@
+{
+  "id": "linux-q125",
+  "name": "用 cgroups 限制进程资源",
+  "domain": "linux",
+  "description": "如何通过 cgroups 对进程的 CPU 和内存使用设置硬性上限，涵盖 v1/v2 接口操作与生产实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "linux-q125",
+      "domain": "linux",
+      "type": "modification",
+      "difficulty": 3,
+      "tags": ["cgroups", "cpu-limit", "memory-limit", "linux-kernel", "resource-isolation", "container"],
+      "title": "如何用 cgroups 限制进程的 CPU 和内存使用？",
+      "content": "你们公司有一台 8 核 32GB 的物理机，上面跑着多个业务进程。其中一个数据处理脚本 `data-worker.py`（PID 为 12345）负责批量解析日志文件，平时表现正常，但每天凌晨 2 点进入高峰处理窗口时，它会把所有 8 个 CPU 核心全部吃满，内存占用也会飙到 20GB 以上，持续 30 分钟到 1 小时。\n\n问题在于这台机器上还跑着核心 API 服务，高峰期监控显示 API 的 P99 延迟从正常的 8ms 抖升到 200ms 以上，直接影响了线上用户体验。运维排查后确认是 `data-worker.py` 抢占资源导致的，但短期内无法拆机或做业务级限流改造。\n\n运维同学提出用 Linux cgroups 来给这个脚本套上资源上限，具体要求是：**CPU 使用率不超过 200%（等效 2 个核心），内存硬上限 4GB，超出立即被 OOM kill，不允许使用 swap 绕过限制**。系统是 CentOS 7，使用 cgroups v1。\n\n请问应该如何操作？需要创建哪些 cgroup，写入哪些控制文件，写什么值？把进程加入 cgroup 的正确命令是什么？完成后如何验证 CPU 和内存的限制确实生效了，又如何监控进程是否在被频繁 throttle？",
+      "answer": "## cgroups 是什么，为什么它能限制资源\n\ncgroups（Control Groups）是 Linux 内核从 2.6.24 版本开始提供的一种机制，它允许你把若干进程组织成一个「组」，然后对这个组统一施加资源配额。它的核心设计思想是：通过一套虚拟文件系统（挂载在 `/sys/fs/cgroup/`）来暴露内核的资源控制接口，用户态程序只需要向这些特殊文件写入数值，内核就会在调度和分配时强制执行对应的限制。\n\ncgroups 目前有 v1 和 v2 两个版本，在 RHEL 7 / Ubuntu 18.04 及更早的系统上默认是 v1，Ubuntu 20.04+ 和 RHEL 9+ 默认已切换到 v2 统一层级。两者的文件名和路径略有差异，但核心概念是相同的。本文以 cgroups v1 为主线讲解，最后说明 v2 的对应写法。\n\n## 第一步：创建 cgroup，把进程挂入\n\n先确认系统上 cpu 和 memory 子系统已经挂载：\n\n```bash\n# 查看所有子系统的挂载点\nmount -t cgroup\n# 输出示例\n# cgroup on /sys/fs/cgroup/cpu,cpuacct type cgroup (rw,nosuid,nodev,noexec,relatime,cpu,cpuacct)\n# cgroup on /sys/fs/cgroup/memory type cgroup (rw,nosuid,nodev,noexec,relatime,memory)\n```\n\n接下来在 cpu 和 memory 子系统下各创建一个新 cgroup，名字叫 `data-worker`：\n\n```bash\n# 创建 cpu cgroup（mkdir 即可，内核自动生成控制文件）\nmkdir /sys/fs/cgroup/cpu/data-worker\n\n# 创建 memory cgroup\nmkdir /sys/fs/cgroup/memory/data-worker\n```\n\n执行完之后，`/sys/fs/cgroup/cpu/data-worker/` 目录下会自动出现 `cpu.cfs_quota_us`、`cpu.cfs_period_us`、`tasks` 等文件。这些文件不在磁盘上，它们是内核通过 cgroupfs 动态生成的，读写它们就是在直接和内核的资源控制模块对话。\n\n## 第二步：设置 CPU 限制\n\nLinux CFS（Completely Fair Scheduler，完全公平调度器）使用「配额 + 周期」模型来实现 CPU 限速。`cpu.cfs_period_us` 定义了一个时间窗口的长度（默认 100000 微秒，即 100ms），`cpu.cfs_quota_us` 定义在这个窗口内该 cgroup 的进程累计最多能使用多少 CPU 时间。\n\n如果你想让进程最多使用 2 个核心等效的 CPU（即 200%），计算方式很直接：2 个核心 × 100ms 周期 = 200ms 配额，换算成微秒就是 200000：\n\n```bash\n# 确认周期是 100ms（通常不需要修改）\ncat /sys/fs/cgroup/cpu/data-worker/cpu.cfs_period_us\n# 100000\n\n# 写入配额：200000us = 200ms，等效 2 个核心\necho 200000 > /sys/fs/cgroup/cpu/data-worker/cpu.cfs_quota_us\n```\n\n这个机制的关键在于「硬限速」。当 cgroup 内的进程在一个 100ms 窗口内用完了 200ms 的配额，内核会把这个 cgroup 里的所有线程全部挂起（throttle），直到下一个周期开始才恢复运行。用 `cat /sys/fs/cgroup/cpu/data-worker/cpu.stat` 可以看到被限速的次数：\n\n```bash\ncat /sys/fs/cgroup/cpu/data-worker/cpu.stat\n# nr_periods 1523          # 总周期数\n# nr_throttled 312         # 被限速的周期数\n# throttled_time 31200000  # 累计被挂起的纳秒数\n```\n\n如果 `nr_throttled / nr_periods` 的比例很高（比如超过 20%），说明进程经常撞到配额上限，可能需要调大配额或做业务层面的限流。\n\n## 第三步：设置内存限制\n\n内存限制写入 `memory.limit_in_bytes`。4GB 换算成字节是 4294967296：\n\n```bash\n# 设置内存硬上限 4GB\necho 4294967296 > /sys/fs/cgroup/memory/data-worker/memory.limit_in_bytes\n\n# 验证写入成功（内核可能会向上取整到页对齐值）\ncat /sys/fs/cgroup/memory/data-worker/memory.limit_in_bytes\n# 4294967296\n```\n\n还需要注意一个坑：默认情况下 `memory.memsw.limit_in_bytes`（内存 + swap 的总上限）是没有设置的，这意味着即使 RSS 超过了 4GB，进程可以把数据 swap 到磁盘继续运行，并不会被 OOM kill。如果你的要求是「超出 4GB 立即 OOM kill，不允许 swap」，需要同时把 swap 上限设为和内存上限一样：\n\n```bash\n# 禁止使用 swap（memsw 上限 = 内存上限）\necho 4294967296 > /sys/fs/cgroup/memory/data-worker/memory.memsw.limit_in_bytes\n```\n\n当进程真的触到内存上限，内核的 OOM killer 会在这个 cgroup 内部选择一个进程杀掉（通常是内存占用最大的那个）。被 OOM kill 的事件会写入 `memory.oom_control`：\n\n```bash\ncat /sys/fs/cgroup/memory/data-worker/memory.oom_control\n# oom_kill_disable 0    # 是否关闭 OOM kill（默认 0 即不关闭，保持开启）\n# under_oom 0           # 当前是否处于 OOM 状态\n# oom_kill 3            # 累计触发 OOM kill 次数（初始为 0）\n```\n\n## 第四步：把目标进程挂入 cgroup\n\n光创建 cgroup 还不够，需要把 PID 12345 写入每个 cgroup 的 `tasks` 文件（v1）或 `cgroup.procs` 文件（v2）：\n\n```bash\n# 将进程挂入 cpu cgroup\necho 12345 > /sys/fs/cgroup/cpu/data-worker/tasks\n\n# 将进程挂入 memory cgroup\necho 12345 > /sys/fs/cgroup/memory/data-worker/tasks\n```\n\n写入 `tasks` 是线程级别的，写入 `cgroup.procs` 是进程级别的（会把整个进程的所有线程一起迁移）。对于 Python 多线程进程，推荐写 `cgroup.procs` 以确保所有线程都受到限制：\n\n```bash\necho 12345 > /sys/fs/cgroup/cpu/data-worker/cgroup.procs\necho 12345 > /sys/fs/cgroup/memory/data-worker/cgroup.procs\n```\n\n## 第五步：验证限制生效\n\n验证 CPU 限制最直观的方式是让脚本跑起来，然后用 `top` 或 `htop` 观察该 PID 的 CPU 使用率是否稳定在 200% 以下。更精确的方式是读 `cpuacct.stat`：\n\n```bash\n# 等几秒后读取 CPU 累计使用时间（单位 jiffies）\ncat /sys/fs/cgroup/cpu/data-worker/cpuacct.stat\n# user 84521\n# system 3201\n```\n\n内存限制可以用 `memory.usage_in_bytes` 实时监控当前使用量：\n\n```bash\ncat /sys/fs/cgroup/memory/data-worker/memory.usage_in_bytes\n# 3872563200  ≈ 3.6GB，还没触顶\n```\n\n也可以用 `cgget` 工具一次性查看所有配置（需要安装 `cgroup-tools` 包）：\n\n```bash\ncgget -g cpu,memory:data-worker\n```\n\n## cgroups v2 的写法\n\n在使用 v2 的系统（Ubuntu 22.04、Debian 11+、RHEL 9+）上，所有子系统合并到 `/sys/fs/cgroup/` 单一层级，文件名也有变化。CPU 配额通过 `cpu.max` 文件设置，格式是 `quota period`：\n\n```bash\n# v2：创建 cgroup\nmkdir /sys/fs/cgroup/data-worker\n\n# v2：CPU 限制，格式为 \"配额(us) 周期(us)\"，等效 2 核\necho \"200000 100000\" > /sys/fs/cgroup/data-worker/cpu.max\n\n# v2：内存上限\necho 4294967296 > /sys/fs/cgroup/data-worker/memory.max\n\n# v2：挂入进程\necho 12345 > /sys/fs/cgroup/data-worker/cgroup.procs\n```\n\nv2 还引入了 `memory.high`（软上限，超过后触发积极回收但不 OOM）和 `memory.max`（硬上限，超过才 OOM kill），比 v1 的控制粒度更细。\n\n## 生产环境的常见坑\n\n直接操作 `/sys/fs/cgroup/` 的方式在机器重启后会丢失，因为 cgroupfs 是内存文件系统。生产环境通常有三种持久化方式：用 systemd 的 `MemoryMax=` 和 `CPUQuota=` 指令（这本质上就是 systemd 帮你管理 cgroup），用 `cgconfig.conf` 和 `cgrules.conf`（来自 `libcgroup` 包），或者干脆把应用容器化——Docker 的 `--cpus` 和 `--memory` 参数底层就是在操作这些文件。\n\n另一个坑是：对于 Java 应用，JVM 在 Docker/cgroup 环境下在 JDK 8u191 之前不识别容器内存限制，会按宿主机内存来设 Heap 大小，导致实际 RSS 远超 cgroup 上限，进程被反复 OOM kill。JDK 11+ 默认已修复，JDK 8 需要加 `-XX:+UseContainerSupport` 参数。",
+      "keyPoints": [
+        "cgroups 通过 cgroupfs 虚拟文件系统暴露内核资源控制接口，向控制文件写入数值即可约束对应 cgroup 内所有进程的资源使用",
+        "CPU 限速依赖 CFS 的「配额 + 周期」模型：cpu.cfs_quota_us 定义每个周期内最多可用的 CPU 时间，超出后该 cgroup 的所有线程被 throttle 直到下一周期",
+        "限制 2 个核心等效的 CPU 使用率，应将 cpu.cfs_quota_us 设为 cpu.cfs_period_us 的 2 倍（如 period=100000，quota=200000）",
+        "memory.limit_in_bytes 只限制物理内存，若不同时设置 memory.memsw.limit_in_bytes，进程超限后可 swap 到磁盘而不会被 OOM kill",
+        "进程必须通过写入 cgroup.procs 文件才会加入 cgroup，对多线程进程应写 cgroup.procs 而非 tasks，以确保所有线程一起受到约束",
+        "cpu.stat 中的 nr_throttled/nr_periods 比率是判断 CPU 配额是否过紧的关键指标，比率持续高于 20% 需要评估是否调整配额",
+        "cgroups v2 使用 cpu.max（格式 \"quota period\"）和 memory.max 替代 v1 的分散接口，还新增了 memory.high 软上限用于触发积极回收而不直接 OOM",
+        "直接操作 cgroupfs 的配置在重启后丢失，生产环境应通过 systemd 的 CPUQuota= / MemoryMax= 指令或容器运行时来持久化 cgroup 限制"
+      ],
+      "quiz": [
+        {
+          "id": "linux-q125-q1",
+          "question": "要把一个进程限制为最多使用 1.5 个 CPU 核心的算力，应该怎么设置 cpu.cfs_quota_us？（假设 cpu.cfs_period_us = 100000）",
+          "choices": [
+            {"id": "A", "text": "echo 150000 > cpu.cfs_quota_us"},
+            {"id": "B", "text": "echo 15000 > cpu.cfs_quota_us"},
+            {"id": "C", "text": "echo 1500 > cpu.cfs_quota_us"},
+            {"id": "D", "text": "echo 100000 > cpu.cfs_quota_us，并设置 cpu.shares = 150"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "CFS 配额的计算方式是：目标核心数 × period = quota。1.5 个核心 × 100000us = 150000us。B 和 C 都是错误的数量级，B 只有 0.15 个核心，C 更小。D 混淆了两种完全不同的 CPU 控制机制：cpu.cfs_quota_us 是硬限制（超出被 throttle），而 cpu.shares 是软权重（资源紧张时按比例分配，空闲时不限制），两者不能互换使用。"
+        },
+        {
+          "id": "linux-q125-q2",
+          "question": "执行 `echo 12345 > /sys/fs/cgroup/memory/data-worker/tasks` 之后，PID 12345 进程的内存限制是否立即生效？",
+          "choices": [
+            {"id": "A", "text": "立即生效，但只对写入后新分配的内存有效"},
+            {"id": "B", "text": "立即生效，内核会同时清点当前存量内存，若已超限则触发 OOM"},
+            {"id": "C", "text": "需要重启进程才能生效"},
+            {"id": "D", "text": "需要重新挂载 memory 子系统才能生效"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "把进程加入 cgroup 后，内核会立刻将该进程的现有内存计入这个 cgroup 的统计，并与 memory.limit_in_bytes 对比。如果进程当前内存使用量已经超过设定的上限，内核会立即触发 OOM 流程。因此在生产环境中应先设好合理的上限（略大于进程当前用量），再把进程加入 cgroup，避免加入的瞬间就触发 OOM。A 的说法不正确，cgroup 会对全部内存（包括存量）进行统计和限制。"
+        },
+        {
+          "id": "linux-q125-q3",
+          "question": "设置了 memory.limit_in_bytes = 4GB 后，发现进程内存超过 4GB 依然没有被 OOM kill，进程还在运行。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "memory.limit_in_bytes 设置错误，单位应该是 MB"},
+            {"id": "B", "text": "没有同时设置 memory.memsw.limit_in_bytes，进程超出物理内存后使用了 swap"},
+            {"id": "C", "text": "需要在 memory.oom_control 中手动开启 OOM kill"},
+            {"id": "D", "text": "cgroup v1 不支持内存限制，需要升级到 v2"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "memory.limit_in_bytes 只约束物理内存（RSS），一旦物理内存达到上限，内核会尝试把该 cgroup 的页面 swap 到磁盘，只要 swap 空间够用，进程就不会被 OOM kill，而是继续运行（但变慢）。如果希望进程使用量超过 4GB 就被杀死，必须同时将 memory.memsw.limit_in_bytes 也设为 4GB，这样物理内存 + swap 的总使用量不能超过 4GB。C 不正确，oom_kill_disable 默认是 0（即 OOM kill 默认是开启的）。"
+        },
+        {
+          "id": "linux-q125-q4",
+          "question": "在 cgroups v2 的系统上，等效「限制进程最多使用 2 个 CPU 核心」的正确命令是？",
+          "choices": [
+            {"id": "A", "text": "echo 200000 > /sys/fs/cgroup/data-worker/cpu.cfs_quota_us"},
+            {"id": "B", "text": "echo \"200000 100000\" > /sys/fs/cgroup/data-worker/cpu.max"},
+            {"id": "C", "text": "echo 2 > /sys/fs/cgroup/data-worker/cpu.weight"},
+            {"id": "D", "text": "echo \"2.0\" > /sys/fs/cgroup/data-worker/cpu.max"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "cgroups v2 将 CPU 配额接口改为 cpu.max，格式是「quota period」两个值写在同一行，用空格分隔。不再有独立的 cpu.cfs_quota_us 和 cpu.cfs_period_us 文件（选项 A 在 v2 系统上文件不存在）。cpu.weight 是 v2 的软权重控制（类似 v1 的 cpu.shares），取值 1-10000，和配额限速是完全不同的概念。选项 D 的格式不正确，v2 不接受浮点数。"
+        },
+        {
+          "id": "linux-q125-q5",
+          "question": "以下是一个 cgroup 的 cpu.stat 输出，如何解读 nr_throttled 字段？\n\n```\nnr_periods 1000\nnr_throttled 600\nthrottled_time 60000000000\n```",
+          "choices": [
+            {"id": "A", "text": "进程在 60% 的时间段内被限速，CPU 配额可能设置得过低"},
+            {"id": "B", "text": "进程在 600ms 内使用了 60% 的 CPU，属于正常状态"},
+            {"id": "C", "text": "表示进程共被调度了 600 次"},
+            {"id": "D", "text": "throttled_time 表示进程总共运行了 60 秒"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "nr_periods=1000 表示总共经历了 1000 个 CFS 调度周期（默认每周期 100ms，即总计约 100 秒）。nr_throttled=600 表示其中有 600 个周期，进程在周期内用完了配额、被内核强制挂起等待下一周期。throttled_time 是累计被挂起的纳秒数，60000000000ns = 60 秒。60% 的周期都被 throttle，说明 CPU 配额设得太低，进程需要的 CPU 远超配额，这会导致明显的性能下降和延迟抖动。"
+        },
+        {
+          "id": "linux-q125-q6",
+          "question": "为什么对多线程进程应该写入 cgroup.procs 而不是 tasks？",
+          "choices": [
+            {"id": "A", "text": "tasks 文件在现代内核中已废弃，只有 cgroup.procs 可用"},
+            {"id": "B", "text": "写入 tasks 是线程级别的迁移，多线程进程可能有部分线程未被加入 cgroup；写入 cgroup.procs 会原子性地将整个进程的所有线程迁入"},
+            {"id": "C", "text": "tasks 只对 cpu 子系统有效，memory 子系统只认 cgroup.procs"},
+            {"id": "D", "text": "cgroup.procs 的性能更好，写入速度更快"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "tasks 文件接受的是线程 ID（TID），写入一个 TID 只会把那一个线程加入 cgroup；如果进程有 20 个线程，你只写入了主线程 TID，其余 19 个线程仍在原来的 cgroup 中，不受资源限制。cgroup.procs 接受进程 ID（PID），写入后内核会把这个进程下的所有线程全部原子性地迁移到目标 cgroup，确保约束完整覆盖。在实际操作中，混用 tasks 写法很容易留下漏网线程，导致限制看似生效但实际效果打折。"
+        },
+        {
+          "id": "linux-q125-q7",
+          "question": "直接向 /sys/fs/cgroup/ 写入的 cgroup 配置，在服务器重启后会发生什么？",
+          "choices": [
+            {"id": "A", "text": "配置会自动持久化到磁盘，重启后恢复"},
+            {"id": "B", "text": "配置会全部丢失，因为 cgroupfs 是内存文件系统，重启后重新初始化"},
+            {"id": "C", "text": "进程 cgroup 成员关系丢失，但资源限制数值会保留"},
+            {"id": "D", "text": "重启后只有 memory 子系统的配置丢失，cpu 子系统会保留"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "cgroupfs 挂载在 /sys/fs/cgroup/，这是一个完全基于内存的虚拟文件系统（类似 /proc 和 /sys），所有数据都存在内核内存中，机器重启后完全清空，没有任何持久化。这就是为什么生产环境不推荐直接操作 cgroupfs，而是通过 systemd 单元文件配置（CPUQuota=、MemoryMax= 等指令），或者通过 libcgroup 的 cgconfig.conf，让这些工具负责在系统启动时重建 cgroup 配置。容器化方案也是同理，Docker/containerd 在每次启动容器时都会重新创建 cgroup。"
+        },
+        {
+          "id": "linux-q125-q8",
+          "question": "用 systemd 管理的服务，等效于 cgroup CPU 限制 50%（0.5 核心）的 systemd 配置是？",
+          "choices": [
+            {"id": "A", "text": "CPUShares=512"},
+            {"id": "B", "text": "CPUQuota=50%"},
+            {"id": "C", "text": "CPULimit=0.5"},
+            {"id": "D", "text": "cpu.cfs_quota_us=50000"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "systemd 通过 CPUQuota= 指令设置 CPU 硬配额，格式是百分比字符串，100% 等于 1 个核心，50% 等于 0.5 个核心。底层 systemd 会自动换算并写入对应 cgroup 的 cpu.cfs_quota_us。CPUShares= 是软权重（基于 cgroup v1 的 cpu.shares），控制的是资源竞争时的分配比例，不是绝对上限。CPULimit 不是有效的 systemd 指令。直接指定内核文件名（选项 D）不是 systemd 单元文件的配置方式。"
+        },
+        {
+          "id": "linux-q125-q9",
+          "question": "一个 Java 服务（JDK 8u181）部署在容器中，容器设置了 --memory=2g，但 JVM 启动后 Heap 设置为 8GB（宿主机内存的 25%），导致容器频繁 OOM。根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "-Xmx 参数被覆盖了，实际 Heap 没有按配置生效"},
+            {"id": "B", "text": "JDK 8u191 之前的 JVM 不识别 cgroup 内存限制，ErgoHeap 按宿主机总内存计算，需要加 -XX:+UseContainerSupport 或显式指定 -Xmx"},
+            {"id": "C", "text": "Docker 的 --memory 参数只限制物理内存，JVM 使用的 swap 不受限制"},
+            {"id": "D", "text": "cgroups 的内存限制对 JVM 进程无效，需要用 ulimit 来限制"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "JDK 8u191（以及 JDK 10+）之前，JVM 的 Ergonomics（自动调优）机制读取的是 /proc/meminfo 中的宿主机总内存来计算默认 Heap 大小（通常是总内存的 25%），完全不知道自己跑在 cgroup 内存限制的容器里。这是容器化早期一个非常经典的坑。修复方案是：JDK 8u191+ 添加了 -XX:+UseContainerSupport（默认开启），会正确读取 cgroup 的 memory.limit_in_bytes 来设定 Heap；或者在任何版本下显式指定 -Xmx，不依赖 Ergonomics。"
+        },
+        {
+          "id": "linux-q125-q10",
+          "question": "想监控某个 cgroup 当前的内存使用量，以下哪个文件提供的是「当前实时使用量（字节）」？",
+          "choices": [
+            {"id": "A", "text": "memory.limit_in_bytes"},
+            {"id": "B", "text": "memory.usage_in_bytes"},
+            {"id": "C", "text": "memory.stat"},
+            {"id": "D", "text": "memory.oom_control"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "memory.usage_in_bytes 是该 cgroup 当前实际使用的内存字节数（包含 page cache），读取即可得到实时值。memory.limit_in_bytes 是你设置的上限，不是当前用量。memory.stat 包含更详细的内存分类统计（rss、cache、swap 等），适合做深度分析，但格式是多行键值对而非单一数字。memory.oom_control 记录 OOM 相关状态（是否禁用 OOM kill、当前是否处于 OOM 状态、历史 OOM kill 次数），不反映当前内存用量。生产监控脚本通常轮询 memory.usage_in_bytes 并与 memory.limit_in_bytes 对比，当比值超过 80% 时告警。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v1/memory.html",
+        "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html",
+        "https://docs.kernel.org/scheduler/sched-bwc.html",
+        "https://systemd.io/CGROUP_DELEGATION/"
+      ]
+    }
+  ]
+}
