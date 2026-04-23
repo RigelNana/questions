@@ -1,0 +1,173 @@
+{
+  "id": "ds-idempotency-design",
+  "name": "分布式幂等性设计实践",
+  "domain": "distributed-system",
+  "description": "系统梳理分布式场景下防重复提交和接口幂等的多种实现方案及其适用场景",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-idempotency-design-q1",
+      "domain": "distributed-system",
+      "type": "practice",
+      "difficulty": 2,
+      "tags": ["幂等性", "防重", "分布式锁", "Token", "数据库唯一键", "消息消费", "状态机", "乐观锁"],
+      "title": "分布式系统中如何设计幂等性？常见方案有哪些？",
+      "content": "你们的支付服务上线了一个促销活动，流量是平时的十倍。运维在高峰期收到告警：数据库里出现了大量重复订单，同一个用户在同一时刻被扣了两笔钱，客服电话被打爆了。\n\n排查之后发现，问题来自三个方向同时爆发：第一，移动端网络不稳定，SDK 在没收到响应时自动重试了请求；第二，消息队列的消费者因为 GC 停顿导致消费超时，Kafka broker 把消息重新投递给了另一个消费者实例；第三，前端页面在网络慢的时候用户会连续点击「确认支付」按钮好几次。任何一个单独发生都能接受，但三个叠加在一起，系统就乱了。\n\n这不是一个极端的假设场景——这是分布式系统的常态。网络重试、消息队列的 at-least-once 语义、用户双击，这三件事每天都在发生，只是平时流量小看不出来。\n\n**在你的系统中，如何设计接口和服务的幂等性？针对上述三种场景，分别应该采用什么方案？请结合具体实现来说明。**",
+      "answer": "## 幂等性：分布式系统的基础设施，不是可选项\n\n在讲方案之前，先把概念说清楚。幂等性（Idempotency）这个词来自数学：一个操作执行一次和执行多次，产生的效果完全相同。在 HTTP 协议里，GET、PUT、DELETE 被设计为天然幂等的——无论你 GET 同一个资源多少次，服务器状态不变；PUT 用同样的数据更新同一条记录多少次，结果也不变。但 POST 不是幂等的，因为它通常意味着「创建一个新资源」，重复提交就会创建多个。\n\n但光知道 HTTP 语义没用，真实的分布式系统里，问题远比 HTTP 规范复杂。你的订单服务可能用 POST 接受支付请求，支付成功后再通过消息队列通知下游扣库存。这条链路上有三处重复风险：客户端重试打到你的 POST 接口，消息队列把同一条消息投递两次给消费者，下游服务在处理过程中崩溃重启后再次处理同一条消息。要保证整条链路只执行一次，需要在每一层都做幂等防护。\n\n幂等性的核心诉求只有一个：同一个业务操作，无论到达多少次，最终只执行一次，多余的请求要么被静默忽略，要么返回第一次执行的结果。理解了这一点，下面每种方案的设计思路就都能推导出来，不需要死记硬背。\n\n---\n\n## 五种主流方案：从简单到复杂\n\n### 方案一：数据库唯一键——最简单最可靠\n\n如果你的业务场景里有天然的业务唯一标识（订单号、支付流水号、第三方回调的交易号），数据库唯一键是成本最低的幂等方案。原理极其简单：在表上建一个唯一索引，重复插入时数据库直接报 `Duplicate entry` 错误，在代码层处理这个异常就好了。\n\n```sql\n-- 1. 在订单表上建复合唯一索引，以业务唯一键防重\nCREATE TABLE orders (\n  id          BIGINT       PRIMARY KEY AUTO_INCREMENT,\n  order_no    VARCHAR(64)  NOT NULL COMMENT '业务唯一单号，如 ORD-20240101-UUID',\n  user_id     BIGINT       NOT NULL,\n  amount      DECIMAL(10,2) NOT NULL,\n  status      VARCHAR(16)  NOT NULL DEFAULT 'pending',\n  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  UNIQUE KEY uk_order_no (order_no)  -- 这个唯一键是幂等的保证\n);\n\n-- 2. 写入时用 INSERT IGNORE 或 ON DUPLICATE KEY UPDATE\n-- 重复请求到来时，INSERT IGNORE 不报错，静默忽略，affected rows = 0\nINSERT IGNORE INTO orders (order_no, user_id, amount)\nVALUES ('ORD-20240101-001', 123, 100.00);\n\n-- 或者用 ON DUPLICATE KEY UPDATE 保持幂等的同时可以返回已有记录\nINSERT INTO orders (order_no, user_id, amount)\nVALUES ('ORD-20240101-001', 123, 100.00)\nON DUPLICATE KEY UPDATE id = id;  -- 不做任何修改，等于 no-op\n```\n\n在代码层，你需要区分「唯一键冲突」和「真正的写入错误」：\n\n```go\nfunc CreateOrder(ctx context.Context, req *CreateOrderRequest) (*Order, error) {\n    order := &Order{\n        OrderNo: req.OrderNo,  // 由客户端生成或由前一层服务传递的幂等键\n        UserID:  req.UserID,\n        Amount:  req.Amount,\n    }\n    err := db.WithContext(ctx).Create(order).Error\n    if err != nil {\n        // MySQL 错误码 1062 = 唯一键冲突\n        // 这不是真正的错误，而是重复请求的正常路径\n        if isDuplicateKeyError(err) {\n            // 查询已有记录并返回，保持幂等\n            return db.Where(\"order_no = ?\", req.OrderNo).First(&Order{}).Error\n        }\n        return nil, fmt.Errorf(\"create order failed: %w\", err)\n    }\n    return order, nil\n}\n\nfunc isDuplicateKeyError(err error) bool {\n    var mysqlErr *mysql.MySQLError\n    return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062\n}\n```\n\n这个方案的优点是零额外依赖，数据库的事务能力保证了原子性，不会出现「幂等键检查通过，但写入失败」的中间态。缺点是依赖业务唯一键的存在，如果业务上就没有唯一标识（比如「查看首页」这种无状态操作），就得换方案。\n\n### 方案二：Token 机制——表单防重的标准做法\n\nToken 机制专门解决「前端表单防重复提交」的问题。流程分两步：第一步，前端在渲染提交页面时，调用后端的 `/api/idempotency-token` 接口拿一个一次性令牌，后端把这个 Token 存入 Redis 并设置过期时间（通常 10 分钟，对应用户思考和填写表单的最长时间）；第二步，用户提交表单时携带这个 Token，后端在处理业务逻辑之前先用原子操作检查并删除 Token，如果 Token 不存在（已被消费或已过期），则拒绝请求。\n\n```go\n// 第一步：生成 Token，在渲染页面时调用\nfunc GenerateIdempotencyToken(ctx context.Context, userID int64) (string, error) {\n    token := uuid.New().String()\n    key := fmt.Sprintf(\"idem:token:%s\", token)\n    // 存入 Redis，10 分钟过期\n    // 值存 userID 是为了在消费时校验 Token 归属，防止 Token 盗用\n    err := redis.Set(ctx, key, userID, 10*time.Minute).Err()\n    if err != nil {\n        return \"\", fmt.Errorf(\"generate token failed: %w\", err)\n    }\n    return token, nil\n}\n\n// 第二步：消费 Token，在处理业务之前调用\n// 注意：检查和删除必须是原子操作，否则两个并发请求都可能通过检查\nfunc ConsumeToken(ctx context.Context, token string, userID int64) error {\n    key := fmt.Sprintf(\"idem:token:%s\", token)\n    // 使用 Lua 脚本保证「检查+删除」的原子性\n    // 如果 Redis 里 Lua 不熟，也可以用 WATCH + 事务，但 Lua 更简洁\n    script := `\n        local val = redis.call('GET', KEYS[1])\n        if val == false then\n            return 0  -- Token 不存在\n        end\n        if val ~= ARGV[1] then\n            return -1  -- Token 归属不符\n        end\n        redis.call('DEL', KEYS[1])\n        return 1  -- 消费成功\n    `\n    result, err := redis.Eval(ctx, script, []string{key}, strconv.FormatInt(userID, 10)).Int()\n    if err != nil {\n        return fmt.Errorf(\"consume token failed: %w\", err)\n    }\n    switch result {\n    case 0:\n        return ErrTokenNotFound  // 重复提交或 Token 已过期\n    case -1:\n        return ErrTokenMismatch  // 可能是跨用户的 Token 盗用攻击\n    }\n    return nil\n}\n```\n\nToken 机制有一个隐藏的缺陷值得重视：Token 的消费（`DEL`）和业务逻辑的执行（`INSERT`）之间不是原子的。如果 Token 消费成功但随后业务执行失败（比如数据库挂了），这个 Token 已经被删除，用户重试时会得到「Token 不存在，请勿重复提交」的错误，但实际上业务根本没有执行。正确的做法是：在业务执行失败时，把 Token 重新写回 Redis（带有原来的 TTL），或者在业务执行前先检查 Token 存在但不删除，业务成功后再删除。具体选哪种，取决于你愿意接受的风险：前者可能导致极端情况下的双执行，后者可能导致重复提交检查不生效。生产中我更倾向于后者，配合数据库唯一键做兜底。\n\n### 方案三：Redis SETNX 幂等键——接口级防重的通用方案\n\n当没有天然业务唯一键，也不想做 Token 机制的前后端配合时，Redis SETNX（SET if Not eXists）是最灵活的方案。客户端在发起请求时生成一个请求级别的唯一 ID（通常叫 `X-Request-ID` 或 `Idempotency-Key`），服务端用这个 ID 做幂等检查。\n\n```go\n// 支付接口处理函数，使用请求 ID 做幂等键\nfunc HandlePayment(ctx context.Context, req *PaymentRequest) (*PaymentResult, error) {\n    // requestID 由客户端生成并通过 HTTP Header 传递：X-Request-ID\n    // 格式建议：业务前缀 + UUID，如 \"pay:550e8400-e29b-41d4-a716-446655440000\"\n    idempotencyKey := fmt.Sprintf(\"idem:pay:%s\", req.RequestID)\n\n    // 尝试设置幂等键，NX = 仅当键不存在时才设置，EX = 过期时间\n    // 10 分钟足够一次支付的处理周期，同时避免永久占用内存\n    ok, err := redis.SetNX(ctx, idempotencyKey, \"processing\", 10*time.Minute).Result()\n    if err != nil {\n        // Redis 故障时的降级策略：放行请求，依靠数据库唯一键兜底\n        // 不要因为 Redis 挂了就让整个支付功能不可用\n        log.Warnf(\"redis setnx failed, fallback to db unique key: %v\", err)\n    } else if !ok {\n        // 键已存在，说明是重复请求\n        // 可以选择查询第一次请求的结果并返回，而不是直接报错\n        cached, _ := redis.Get(ctx, idempotencyKey).Bytes()\n        if len(cached) > 0 && string(cached) != \"processing\" {\n            var result PaymentResult\n            if json.Unmarshal(cached, &result) == nil {\n                return &result, nil  // 返回缓存的第一次执行结果\n            }\n        }\n        return nil, ErrDuplicateRequest\n    }\n\n    // 执行业务逻辑\n    result, err := doPayment(ctx, req)\n    if err != nil {\n        // 业务失败时删除幂等键，允许客户端修正请求后重试\n        // 注意：如果是「已支付」这类不可重试错误，不要删除键\n        if isRetryableError(err) {\n            redis.Del(ctx, idempotencyKey)\n        }\n        return nil, err\n    }\n\n    // 将执行结果写入幂等键，供重复请求查询\n    // 覆盖之前的 \"processing\" 值，并重置过期时间\n    resultBytes, _ := json.Marshal(result)\n    redis.Set(ctx, idempotencyKey, resultBytes, 10*time.Minute)\n\n    return result, nil\n}\n```\n\n这个方案的关键设计有两处：第一，幂等键的值不只是占位符，而是存储了第一次执行的结果，这样重复请求能得到和第一次相同的响应，而不是「请求重复」的错误——对于客户端的重试逻辑来说，这两种响应应该被等价对待；第二，Redis 故障降级到数据库唯一键，保证 Redis 不成为单点故障。\n\n### 方案四：状态机防重——有状态业务的首选\n\n对于有明确状态流转的业务（支付、订单、审批流），状态机本身就是天然的幂等屏障。核心思路是：操作只有在当前状态符合前置条件时才能执行，否则直接拒绝，而不需要额外的幂等键。\n\n举个例子：支付操作的前置条件是「订单处于 pending 状态」。如果订单已经是 paid 状态，重复的支付请求会被「状态检查」拦截，根本不会走到扣款逻辑。这需要配合数据库乐观锁来实现「检查和更新原子化」：\n\n```sql\n-- 乐观锁实现状态机幂等更新\n-- 条件：只更新 status = 'pending' 的记录，并发时只有一个请求能更新成功\nUPDATE orders\nSET status = 'paid',\n    paid_at = NOW(),\n    version = version + 1  -- version 字段用于乐观锁，每次更新递增\nWHERE id = ?\n  AND status = 'pending'   -- 前置状态检查\n  AND version = ?;          -- 乐观锁版本号检查，防止 ABA 问题\n\n-- 检查 affected rows：\n-- = 1 表示更新成功（第一个到达的请求）\n-- = 0 表示状态不符或版本冲突（重复请求或并发冲突）\n```\n\n在 Go 代码里，处理乐观锁的模式通常是这样的：\n\n```go\nfunc PayOrder(ctx context.Context, orderID int64, version int) error {\n    result := db.WithContext(ctx).Model(&Order{}).Where(\n        \"id = ? AND status = ? AND version = ?\",\n        orderID, \"pending\", version,\n    ).Updates(map[string]interface{}{\n        \"status\":  \"paid\",\n        \"paid_at\": time.Now(),\n        \"version\": gorm.Expr(\"version + 1\"),\n    })\n\n    if result.Error != nil {\n        return fmt.Errorf(\"db error: %w\", result.Error)\n    }\n\n    if result.RowsAffected == 0 {\n        // affected rows = 0 有两种可能：\n        // 1. 订单已经支付（重复请求）→ 查一下当前状态，如果是 paid 就幂等返回成功\n        // 2. 版本冲突（并发竞争）→ 应该重试\n        var order Order\n        db.First(&order, orderID)\n        if order.Status == \"paid\" {\n            return nil  // 幂等：已经支付过了，返回成功\n        }\n        return ErrVersionConflict  // 并发冲突，调用方可以重试（重新获取 version）\n    }\n    return nil\n}\n```\n\n状态机方案的优雅之处在于：它不需要引入额外的存储（没有幂等键表，没有 Redis），幂等性是业务逻辑本身的自然推论。但它只适用于有状态的业务——对于无状态的操作（发短信、调用三方 API），这个方案帮不上忙。\n\n### 方案五：消息消费幂等——Kafka at-least-once 的正确解法\n\nKafka 默认保证 at-least-once 语义，也就是说同一条消息可能被消费多次（网络问题、消费者 rebalance、提交 offset 前崩溃都会触发重投）。消费者端的幂等通常用「消息记录表」来实现：\n\n```sql\n-- 消息处理记录表，message_id 建唯一索引\nCREATE TABLE message_records (\n  id          BIGINT      PRIMARY KEY AUTO_INCREMENT,\n  message_id  VARCHAR(128) NOT NULL COMMENT 'Kafka 消息的唯一 ID（Topic+Partition+Offset 或业务 ID）',\n  topic       VARCHAR(64)  NOT NULL,\n  status      VARCHAR(16)  NOT NULL DEFAULT 'processed',\n  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  UNIQUE KEY uk_message_id (message_id)\n);\n```\n\n```go\nfunc ConsumePaymentSuccessMessage(ctx context.Context, msg *kafka.Message) error {\n    // 用 Topic + Partition + Offset 构造全局唯一的消息 ID\n    messageID := fmt.Sprintf(\"%s:%d:%d\", msg.Topic, msg.Partition, msg.Offset)\n\n    // 开启数据库事务，把「记录消费」和「执行业务」放在同一个事务里\n    // 这是关键：两步必须原子化，否则记录成功但业务失败（或反之）都会出问题\n    return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {\n        // 尝试插入消息记录，如果已存在则表示已处理，直接跳过\n        err := tx.Exec(\n            \"INSERT IGNORE INTO message_records (message_id, topic) VALUES (?, ?)\",\n            messageID, msg.Topic,\n        ).Error\n        if err != nil {\n            return err\n        }\n\n        // 检查是否真正插入（affected rows = 0 表示已处理过，幂等跳过）\n        var count int64\n        tx.Raw(\"SELECT ROW_COUNT()\").Scan(&count)\n        if count == 0 {\n            log.Infof(\"message %s already processed, skipping\", messageID)\n            return nil  // 幂等返回，不重复执行业务\n        }\n\n        // 在同一个事务里执行业务逻辑（如通知库存服务扣减库存）\n        return notifyInventoryDeduction(tx, msg)\n    })\n}\n```\n\n这个方案里最重要的一句话是「把消息记录和业务执行放在同一个数据库事务里」。很多实现会把这两步分开：先插入记录，再执行业务，这样如果业务执行失败，消息记录已经存在，下次重试会被误判为「已处理」。同一事务的写法保证了原子性，要么两者都成功，要么都不成功。\n\n---\n\n## 五种方案对比速查\n\n| 方案 | 适用场景 | 依赖组件 | 原子性保证 | 主要限制 |\n|------|----------|----------|------------|----------|\n| 数据库唯一键 | 有天然业务唯一 ID | 数据库 | 强（DB 事务） | 需要业务唯一键 |\n| Token 机制 | 前端表单防重提交 | Redis | 弱（Token 消费与业务分离） | 需要前后端配合 |\n| Redis SETNX | 接口级通用幂等 | Redis | 中（依赖 DB 兜底） | Redis 故障需降级 |\n| 状态机 + 乐观锁 | 有状态的业务流程 | 数据库 | 强（DB 事务） | 只适合有状态操作 |\n| 消息记录表 | 消息队列消费端 | 数据库 | 强（DB 事务） | 需要事务支持 |\n\n---\n\n## 进阶：幂等设计的坑和最佳实践\n\n幂等设计在生产中最常见的坑，是「幂等键和业务操作不在同一个原子边界内」。典型案例：先用 Redis `SETNX` 设置幂等键（成功），然后执行数据库写入（失败），然后代码里忘记删除幂等键——结果是业务没有执行，但幂等键还在，客户端带着同一个 `requestID` 重试时被拒绝，用户永远无法完成这笔支付。解决方法是：业务执行失败时必须主动删除幂等键（可重试错误）或标记为「失败」（不可重试错误），而不是让键自然过期。\n\n第二个坑是 TTL 设置不合理。幂等键的 TTL 应该覆盖「客户端可能重试的最长时间窗口」。支付场景通常 10-30 分钟，跨行清算场景可能需要 24 小时。TTL 太短会导致超时后的重试被错误放行；TTL 太长会导致 Redis 内存浪费。一个实用的原则是：TTL = 业务的超时时间 × 最大重试次数 × 2。\n\n第三个坑是在使用乐观锁时错误处理了「version 冲突」和「状态不符」两种情况。前者（`version` 对但被其他请求先更新了）应该重试；后者（`status` 不是 pending）应该返回幂等成功（如果已经是目标状态）或业务错误（如果是不可达状态）。很多实现把两种情况都当作错误抛出，导致重复请求触发了不必要的报警。\n\n如果你在使用 Seata 这类分布式事务框架，AT 模式内置了 XID 级别的幂等支持，全局事务 ID 天然作为幂等键。但需要注意的是，Seata 的幂等保护范围是分布式事务边界内的操作，跨越事务边界的调用（如通知三方支付平台）仍然需要自己实现幂等。\n\n最后一个高频考察点：幂等性和并发安全是两个不同的维度。幂等保证的是「同一请求多次到达结果相同」，并发安全保证的是「多个不同请求同时到达时数据不错乱」。两者通常需要同时设计，幂等键 + 乐观锁/悲观锁的组合是最常见的生产落地形态。",
+      "keyPoints": [
+        "幂等性的本质是：同一业务操作无论执行多少次，产生的副作用与执行一次相同；分布式系统中网络重试、消息队列 at-least-once 和用户重复提交三类场景都必须由幂等机制兜底。",
+        "数据库唯一键是成本最低的幂等方案，利用数据库事务的原子性保证「检查+写入」不可分割，适用于有天然业务唯一 ID（订单号、流水号）的场景，需在代码层区分唯一键冲突（MySQL 错误码 1062）和真实写入错误。",
+        "Token 机制用于表单防重提交，核心是「生成一次性令牌+原子消费」；Token 检查（Redis DEL）和业务逻辑之间非原子，必须在业务失败时将 Token 写回 Redis，否则用户无法重试。",
+        "Redis SETNX 幂等键是接口级通用方案，幂等键的值应存储第一次执行的结果而非占位符，重复请求可直接返回缓存结果；Redis 故障时应降级到数据库唯一键，不能让 Redis 成为单点。",
+        "状态机 + 数据库乐观锁适合有状态业务（订单、审批流），通过 `WHERE status = 'pending'` 前置条件和 `version` 字段的 CAS 更新实现原子状态转换，affected rows 为 0 时需区分「已是目标状态（幂等成功）」和「版本冲突（应重试）」两种情况。",
+        "消息队列消费端幂等的关键是「消息记录插入」和「业务逻辑执行」必须在同一个数据库事务中，分开执行会导致「记录成功但业务失败」或「业务成功但未记录」的不一致，消息 ID 建议用 Topic+Partition+Offset 三元组构造全局唯一标识。",
+        "幂等键的 TTL 应覆盖「最大重试时间窗口」而非随意设置，建议 TTL = 业务超时时间 × 最大重试次数 × 2；业务执行失败时必须主动删除或标记幂等键，不能依赖自然过期，否则可重试的错误会变成永久失败。",
+        "幂等性与并发安全是两个正交的设计维度：幂等防重复，并发锁防数据竞争；生产中通常需要组合使用，典型落地模式是「Redis SETNX 幂等键 + 数据库乐观锁」或「消息记录表 + 数据库事务」双重保障。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-idempotency-design-q1-quiz1",
+          "question": "以下哪种 HTTP 方法在 RFC 7231 规范中被定义为非幂等的？",
+          "choices": [
+            { "id": "A", "text": "GET" },
+            { "id": "B", "text": "PUT" },
+            { "id": "C", "text": "POST" },
+            { "id": "D", "text": "DELETE" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "POST 在 HTTP 语义上是非幂等的，因为它通常表示「创建资源」或「提交数据」，多次调用会产生多个资源或多次副作用。GET 是幂等的（只读，不改变状态），PUT 是幂等的（用相同数据反复更新同一资源，结果不变），DELETE 是幂等的（删除一个不存在的资源与删除成功的状态相同，RFC 7231 把返回 404 的情况也视为幂等）。注意：幂等性说的是「服务器状态」不变，而不是「响应码」不变。"
+        },
+        {
+          "id": "ds-idempotency-design-q1-quiz2",
+          "question": "在支付场景中，为什么说「数据库唯一键」是成本最低的幂等方案？",
+          "choices": [
+            { "id": "A", "text": "因为数据库查询速度比 Redis 快" },
+            { "id": "B", "text": "因为唯一键约束由数据库事务保证原子性，不需要引入额外存储组件，且「检查+写入」天然不可分割" },
+            { "id": "C", "text": "因为唯一键可以防止所有类型的幂等问题，包括跨数据库的场景" },
+            { "id": "D", "text": "因为不需要在代码层处理冲突，数据库会自动忽略重复插入" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "成本低体现在两点：架构上不需要引入 Redis 等额外组件，减少了系统复杂度；原子性上依托数据库事务，「检查唯一键是否存在」和「写入记录」是同一个原子操作，不存在两步操作之间的竞争窗口。A 选项错误，数据库唯一键写入通常比 Redis SETNX 慢。C 选项错误，跨数据库或涉及外部调用（短信、三方 API）时无法用 DB 唯一键兜底。D 选项错误，代码层必须区分 1062 唯一键冲突和其他真实错误，否则真实写入失败也会被静默吞掉。"
+        },
+        {
+          "id": "ds-idempotency-design-q1-quiz3",
+          "question": "Token 机制中，为什么「Token 检查」和「删除 Token」必须是原子操作？",
+          "choices": [
+            { "id": "A", "text": "为了减少 Redis 网络往返次数，提升性能" },
+            { "id": "B", "text": "因为 Redis 单线程，普通 GET 后 DEL 已经是原子的" },
+            { "id": "C", "text": "防止两个并发请求都通过 GET 检查发现 Token 存在，然后都各自 DEL，导致两个请求都被放行" },
+            { "id": "D", "text": "防止 Token 在检查和删除之间被 TTL 到期删除" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是经典的「TOCTOU（Time-of-Check to Time-of-Use）」竞争条件问题。如果用 GET 检查 + DEL 两步操作，请求 A 执行 GET 发现 Token 存在，请求 B 也执行 GET 发现 Token 存在，然后 A 执行 DEL，B 也执行 DEL——两个请求都通过了检查，防重失效。必须用 Lua 脚本或 Redis 原子命令把检查和删除变成单一原子操作。A 和 D 描述的需求是真实的，但不是「必须原子」的核心原因。B 是错误的理解：Redis 单线程保证的是命令本身的原子性，但两个独立命令之间仍然可以被其他客户端的命令插入。"
+        },
+        {
+          "id": "ds-idempotency-design-q1-quiz4",
+          "question": "使用 Redis SETNX 做幂等键时，正确的业务失败处理策略是？",
+          "choices": [
+            { "id": "A", "text": "任何错误都不删除幂等键，让 TTL 自然过期" },
+            { "id": "B", "text": "任何错误都立即删除幂等键，允许客户端重试" },
+            { "id": "C", "text": "可重试错误（如超时、数据库暂时不可用）删除幂等键，不可重试错误（如参数非法、已处理）保留幂等键并标记为失败" },
+            { "id": "D", "text": "将幂等键的 TTL 延长为 24 小时，等待人工处理" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "业务失败分两种情况：可重试错误（超时、数据库临时不可用）意味着这次请求没有产生任何副作用，客户端有权重试，此时应删除幂等键让相同 requestID 的重试请求得以通过；不可重试错误（幂等键已存在、参数校验失败、业务规则不允许）意味着即使重试也无法成功，此时保留幂等键并写入失败原因，重复请求可以直接返回缓存的失败结果。A 会导致可重试场景中用户在整个 TTL 内无法完成操作。B 会导致「已经产生部分副作用」的失败被重试，可能造成数据不一致。"
+        },
+        {
+          "id": "ds-idempotency-design-q1-quiz5",
+          "question": "以下 SQL 使用乐观锁更新订单状态，执行后 `affected rows = 0`，应该如何处理？\n```sql\nUPDATE orders SET status='paid', version=version+1\nWHERE id=100 AND status='pending' AND version=5;\n```",
+          "choices": [
+            { "id": "A", "text": "直接返回「更新失败」错误，让调用方感知" },
+            { "id": "B", "text": "直接重试，重新执行相同 SQL 直到 affected rows = 1" },
+            { "id": "C", "text": "查询当前记录：若 status 已为 'paid' 则幂等返回成功；若 version 不符但 status 仍为 'pending' 则重试获取最新 version 后重试" },
+            { "id": "D", "text": "因为 affected rows = 0 说明记录不存在，应该先创建订单再更新" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "affected rows = 0 有两种完全不同的原因：1）status 不是 pending（可能是已被其他请求更新为 paid），这种情况是幂等的——订单已经支付，当前请求的目标已达到，应返回成功；2）version 不符（并发冲突，有另一个请求抢先更新了 version），这种情况应该重新 SELECT 获取最新的 version 字段，然后重试 UPDATE。把两种情况都当作「更新失败」会导致幂等请求被误报错，把两种情况都重试会导致「已 paid 的订单」被不断重试最终因无法匹配条件而一直失败报错。"
+        },
+        {
+          "id": "ds-idempotency-design-q1-quiz6",
+          "question": "Kafka 消费端做幂等时，「消息记录插入」和「业务逻辑执行」为什么必须在同一个数据库事务中？",
+          "choices": [
+            { "id": "A", "text": "因为数据库事务可以提升消息处理的吞吐量" },
+            { "id": "B", "text": "防止「消息记录插入成功但业务执行失败」导致后续重试被误判为已处理，或「业务执行成功但记录未插入」导致重复处理" },
+            { "id": "C", "text": "因为 Kafka 消费者必须依赖数据库事务才能提交 offset" },
+            { "id": "D", "text": "为了利用数据库的 MVCC 机制，避免消费者之间的读写冲突" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "事务的目的是「原子性」：两步要么都成功，要么都失败。如果分开执行：先插入消息记录（成功），再执行业务（失败）——下次重试时发现记录已存在，跳过业务执行，导致这条消息永远不会被处理；先执行业务（成功），再插入消息记录（失败）——消息被消费但未记录，下次重投后业务会被重复执行。放在同一事务里，业务执行失败时消息记录的插入也会回滚，确保重试时两步重新执行；消息记录插入失败时业务也回滚，确保一致性。A 和 D 都是无关原因，C 是错误的，offset 提交由 Kafka consumer 客户端控制，与数据库事务无关。"
+        },
+        {
+          "id": "ds-idempotency-design-q1-quiz7",
+          "question": "以下哪种场景最适合使用「状态机 + 乐观锁」方案，而不是 Redis SETNX？",
+          "choices": [
+            { "id": "A", "text": "用户注册发送欢迎短信（调用第三方短信 API）" },
+            { "id": "B", "text": "订单从 pending → paid → shipped → delivered 的状态流转" },
+            { "id": "C", "text": "前端表单防止用户多次点击提交按钮" },
+            { "id": "D", "text": "Kafka 消费支付成功消息后通知仓库出库" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "状态机 + 乐观锁适合有明确状态流转的有状态业务：每个状态转换本身就自带前置条件检查（只有 pending 才能变 paid），不需要额外的幂等键，业务逻辑即幂等保证。A（发短信）是无状态的外部调用，没有本地状态可以检查，需要 Redis SETNX 或消息记录表。C（前端防重提交）是 Token 机制的典型场景。D（消息消费）适合消息记录表方案，因为需要配合数据库事务保证原子性。状态机方案的最大优势是不引入外部依赖，但只能保护「有本地可查状态」的操作，对于需要调用外部服务的幂等，仍然需要其他方案配合。"
+        },
+        {
+          "id": "ds-idempotency-design-q1-quiz8",
+          "question": "生产环境中，Redis SETNX 幂等键的 TTL 应该如何设置？一个支付接口超时时间 30s，最多重试 3 次，应该设置多长？",
+          "choices": [
+            { "id": "A", "text": "30 秒，和接口超时保持一致，超时后自动清理" },
+            { "id": "B", "text": "永不过期，防止过期后重复请求被放行" },
+            { "id": "C", "text": "约 3-5 分钟（TTL = 超时时间 × 最大重试次数 × 安全系数），覆盖最长可能的重试窗口" },
+            { "id": "D", "text": "1 小时，越长越安全" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "TTL 的设计目标是覆盖「客户端可能重试的最长时间窗口」，同时不过长地占用 Redis 内存。以 30s 超时 + 最多 3 次重试为例，最坏情况下客户端会重试到第 3 次约 90-120 秒后放弃，加上指数退避的间隔可能到 3-5 分钟。设置 TTL = 超时时间 × 最大重试次数 × 2 ≈ 3 分钟是合理的安全系数。A（30 秒）在第一次超时后 TTL 就到期，第二次重试会被放行，幂等失效。B（永不过期）会导致内存持续增长，最终 Redis OOM。D（1 小时）过于保守，对于高频接口会浪费大量 Redis 内存，且用户体验差（同一笔支付在 1 小时内都无法重试）。"
+        },
+        {
+          "id": "ds-idempotency-design-q1-quiz9",
+          "question": "Kafka 消费端用 `Topic + Partition + Offset` 作为消息唯一 ID，相比直接用消息体里的业务 ID，这种方式有什么优缺点？",
+          "choices": [
+            { "id": "A", "text": "优点是无需解析消息体，任何消息都能生成唯一 ID；缺点是同一条业务消息在不同 Topic 中重发时无法去重" },
+            { "id": "B", "text": "优点是天然排序，可以保证消息的有序消费；缺点是 Offset 不是全局唯一的" },
+            { "id": "C", "text": "优点是可以跨集群去重；缺点是构造复杂，需要三个字段拼接" },
+            { "id": "D", "text": "两种方式完全等价，选哪种都没有实质区别" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Topic+Partition+Offset 三元组在单个 Kafka 集群内是全局唯一的，不需要消息生产者在消息体里携带唯一 ID，消费者无需解析消息内容即可生成幂等键，适用于任何格式的消息。但其缺点是：如果同一笔业务消息被发送到了两个不同的 Topic（如从 DLQ/死信队列重新投递到原始 Topic），Offset 不同，会被认为是两条不同的消息，导致业务被重复处理。业务 ID 方案的优点是跨 Topic 去重（因为业务 ID 代表业务语义），缺点是依赖消息生产者在消息体中携带唯一 ID，需要规范化约束。B 选项错误，Offset 不影响有序消费，有序消费由 Partition 分配决定。"
+        },
+        {
+          "id": "ds-idempotency-design-q1-quiz10",
+          "question": "某支付服务上线后发现，偶发性地有用户投诉「支付按钮点了好几次，结果一直提示『请求重复，请勿重试』，但支付根本没有成功」。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis TTL 设置太长，导致历史请求的幂等键一直存在" },
+            { "id": "B", "text": "Redis SETNX 幂等键在业务执行失败后没有被删除（或标记失败），导致可重试的错误变成了永久失败" },
+            { "id": "C", "text": "数据库唯一键冲突被错误地当作成功处理" },
+            { "id": "D", "text": "Kafka 消费者的幂等消息记录表没有建唯一索引，导致重复插入" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Redis SETNX 幂等方案最经典的生产故障：SETNX 成功（幂等键写入 Redis），业务逻辑执行失败（如数据库超时），代码里没有在失败路径上删除幂等键，幂等键在 TTL 到期前一直存在。用户后续所有带相同 requestID 的重试请求都被 SETNX 拦截，返回「重复请求」错误，但业务实际上从未成功执行。修复方式是在可重试错误的处理代码里主动执行 `redis.Del(idempotencyKey)`，或将其标记为「failed」并在下次请求时判断为可重试状态。A 是 TTL 过长的问题，症状是内存浪费而非「成功但被拒」。C 和 D 与题目描述的症状不符。"
+        }
+      ],
+      "references": [
+        {
+          "title": "RFC 7231 - HTTP/1.1 Semantics and Content: Idempotent Methods",
+          "url": "https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.2"
+        },
+        {
+          "title": "Stripe API: Idempotent Requests",
+          "url": "https://stripe.com/docs/api/idempotent_requests"
+        },
+        {
+          "title": "Redis SETNX documentation",
+          "url": "https://redis.io/docs/latest/commands/setnx/"
+        },
+        {
+          "title": "Kafka at-least-once delivery guarantees",
+          "url": "https://kafka.apache.org/documentation/#semantics"
+        },
+        {
+          "title": "AWS re:Invent: Idempotency in distributed systems",
+          "url": "https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/"
+        }
+      ]
+    }
+  ]
+}

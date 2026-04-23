@@ -30,9 +30,17 @@ export function QuestionDetail() {
     getQuestionProgress,
     setLastVisited,
   } = useProgressStore();
-  const questionHighlights = useHighlightStore((s) =>
-    questionId ? s.getHighlightsByQuestion(questionId) : [],
-  );
+  // 必须返回稳定的原始值（number），否则每次 render 都会产生新数组引用，
+  // 触发 useSyncExternalStore 的 Object.is 判定为"变化"，造成无限循环 (React #185)。
+  const questionHighlightCount = useHighlightStore((s) => {
+    if (!questionId) return 0;
+    const prefix = `${questionId}::`;
+    let total = 0;
+    for (const k of Object.keys(s.byKey)) {
+      if (k.startsWith(prefix)) total += s.byKey[k].length;
+    }
+    return total;
+  });
   const clearForQuestion = useHighlightStore((s) => s.clearForQuestion);
 
   const [showAnswer, setShowAnswer] = useState(false);
@@ -194,13 +202,13 @@ export function QuestionDetail() {
           <div className="mb-5 flex items-center justify-between gap-2 text-xs text-[var(--color-notion-text-secondary)]">
             <span className="inline-flex items-center gap-1.5">
               <Highlighter className="w-3.5 h-3.5 text-[var(--color-notion-accent)]" />
-              {questionHighlights.length > 0 ? (
-                <>已有 <span className="font-semibold text-[var(--color-notion-text)]">{questionHighlights.length}</span> 条划线批注 · 选中文字可继续划线</>
+              {questionHighlightCount > 0 ? (
+                <>已有 <span className="font-semibold text-[var(--color-notion-text)]">{questionHighlightCount}</span> 条划线批注 · 选中文字可继续划线</>
               ) : (
                 <>选中文字即可划线批注 · 点击划线可编辑</>
               )}
             </span>
-            {questionHighlights.length > 0 && (
+            {questionHighlightCount > 0 && (
               <button
                 onClick={() => {
                   if (!questionId) return;
