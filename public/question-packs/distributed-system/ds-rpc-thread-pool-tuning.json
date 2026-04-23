@@ -1,0 +1,155 @@
+{
+  "id": "ds-rpc-thread-pool-tuning",
+  "name": "RPC 线程池调优",
+  "domain": "distributed-system",
+  "description": "掌握 Dubbo/gRPC 服务端线程模型，理解 IO 线程与业务线程的分工，根据 CPU 密集型/IO 密集型场景计算合理的线程池参数",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-rpc-thread-pool-tuning-q1",
+      "domain": "distributed-system",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["Dubbo", "线程池", "调优", "IO密集型", "Netty", "RPC"],
+      "title": "Dubbo 服务压测 TPS 只有预期 30%，线程池利用率 95%，怎么调优？",
+      "content": "## 故障场景\n\n某电商平台的商品查询服务上线后进行压测，目标 TPS 是 3000，但实测只有 900 左右，只达到预期的 30%。查看 Dubbo Admin 监控面板，发现业务线程池活跃线程数长期维持在 190/200，同时队列等待数持续攀升，部分请求开始出现 `Thread pool is EXHAUSTED` 的报错。\n\n服务的基本情况如下：该接口是一个纯查询接口，每次请求会查询一次 MySQL 商品详情表（基于主键，走索引，查询耗时约 20ms），查询结果做简单的字段映射后返回给调用方，业务代码本身没有复杂计算，纯 Java 对象操作耗时不超过 2ms。部署环境是一台 32 核物理机，JVM 堆设置为 16GB，当前 Dubbo 协议配置为 `threads=200`，`queues=200`，`iothreads` 未显式配置（使用 Dubbo 默认值）。\n\n压测工具是 JMeter，并发线程数设置为 500，持续打压 5 分钟。在压测过程中，通过 `jstack` 抓取线程快照，发现大量名为 `DubboServerHandler` 的线程处于 `TIMED_WAITING` 状态，等待的调用栈指向 MySQL 驱动的 socket read。\n\n请分析：当前配置为什么会导致 TPS 只有预期的 30%？Dubbo 的线程模型是怎样的，IO 线程和业务线程各自的职责是什么？如何根据当前场景（IO 密集型、32 核、MySQL 查询 20ms）计算合理的业务线程数？`queues=200` 这个配置又存在什么隐患？给出完整的调优方案，包括 Dubbo 配置、监控指标、以及不重启服务的动态调整手段。",
+      "answer": "## 先把问题搞清楚：为什么 200 个线程撑不住 3000 TPS？\n\n很多人看到「线程池利用率 95%」就立刻想着「把线程数加到 400」，但这种直觉跳过了一个关键问题：为什么 200 个线程跑不出 3000 TPS？理解这个问题，才能知道调多少才够、以及后面还有哪些坑。\n\n先做个简单的数学。每个请求占用一个线程的时间是多少？MySQL 查询 20ms，业务逻辑 2ms，总共约 22ms。那么 200 个线程理论上每秒能处理多少请求？`200 ÷ 0.022s ≈ 9090 TPS`。理论值远超 3000，但实测只有 900，这说明线程数本身不是瓶颈，线程没有被充分利用。\n\n问题出在哪？出在等待。MySQL 查询的 20ms 里，线程在干什么？它在阻塞等待 socket 数据返回，什么 CPU 都不消耗，就这么挂着。操作系统把这个线程标记为 `TIMED_WAITING`，这正是 `jstack` 里看到的状态。也就是说，200 个线程里，大部分时间有 180 多个都在睡觉等 MySQL，真正在 CPU 上跑的寥寥无几。\n\n但等等，既然线程都在等，TPS 怎么还跑不上去呢？矛盾在于队列满了。当并发请求超过 200 时，新请求进入 queues=200 的等待队列。队列一满，后续请求就直接被拒绝（`Thread pool is EXHAUSTED`）。所以问题的本质是：**线程配置太少导致大量请求进入队列，队列满了导致请求被拒绝，实际处理的请求量远低于到达量。** 加线程数到正确的值，才能让服务真正吃得下 3000 TPS。\n\n## Dubbo 的两级线程模型：IO 线程和业务线程的职责边界\n\nDubbo 底层依赖 Netty 做网络通信，Netty 使用的是 Reactor 网络模型，这决定了 Dubbo 必然是两级线程架构。第一级是 IO 线程，对应 Netty 的 `EventLoopGroup`，负责 TCP 连接的建立和断开、数据包的读写、以及 RPC 协议的编解码（把字节流解码成 Java 对象，或者把 Java 对象编码成字节流）。IO 线程的数量默认等于 CPU 核数，在 32 核机器上就是 32 个，这个数字通常不需要修改。IO 线程有一条铁律：**绝对不能在 IO 线程里做任何阻塞操作。** 如果你在 IO 线程里查一次 DB，那这个 EventLoop 就被阻塞了，它负责的所有连接的 IO 都会停摆，哪怕只阻塞 20ms 都会造成大面积延迟。\n\n第二级是业务线程池，对应 Dubbo 配置里的 `threads` 参数。IO 线程解码完请求之后，会把它提交给业务线程池，由业务线程执行真正的服务方法——查数据库、调下游、做业务计算。业务线程可以随意阻塞，因为它一个线程阻塞了不影响其他线程处理别的请求。\n\n这里有一个容易踩的坑：Dubbo 的 `dispatcher` 配置决定了哪些事件在 IO 线程处理、哪些派发给业务线程。默认值是 `all`，意思是所有事件（连接、断开、请求、响应、心跳）都派发给业务线程处理。更好的选择是 `message`，只把请求和响应事件派发给业务线程，连接和断开事件直接在 IO 线程处理，因为连接/断开处理本身很快，没必要占用业务线程。`dispatcher=message` 能减少业务线程池的压力，是 Dubbo 官方推荐的生产配置。\n\n## IO 密集型场景下的线程数公式\n\n明确了线程模型之后，回到核心问题：业务线程数配多少合适？工程上有一个被广泛验证的公式，它来自 Brian Goetz 在《Java Concurrency in Practice》中的推导：\n\n```\n最优线程数 = CPU核数 × (1 + 等待时间 / 计算时间)\n```\n\n这个公式的逻辑是：当一个线程在等待 IO 的时候，CPU 是空闲的，可以让另一个线程来用。「等待时间 / 计算时间」这个比值（也叫阻塞系数）告诉你平均每个 CPU 周期需要几个线程来「填满」它。\n\n代入当前数据：CPU 32 核，MySQL 查询 20ms（等待时间），业务逻辑 2ms（计算时间）：\n\n```\n阻塞系数 = 20ms ÷ 2ms = 10\n最优线程数 = 32 × (1 + 10) = 352\n```\n\n考虑到公式给的是理论值，实际生产中会留 10-20% 的余量，同时要考虑 GC 暂停期间所有线程都暂停、峰值流量比压测高等因素，取整到 400 是合理的。也就是说，`threads=200` 只配了合理值的一半，这就是 TPS 只有预期 50%（再加上队列满导致的拒绝）的根本原因。\n\n值得注意的是，这个公式的使用前提是**所有请求的 IO 耗时相对稳定**。如果你的服务同时有快请求（1ms）和慢请求（500ms），需要分别估算，或者考虑对不同服务方法设置 `executes` 上限（单个方法的最大并发数），防止慢请求把线程池打满拖垮快请求。\n\n## 完整调优配置\n\n```yaml\n# application.yml (Dubbo 3.x 配置)\ndubbo:\n  protocol:\n    name: dubbo\n    port: 20880\n    threads: 400          # 业务线程数：按 IO 密集型公式计算 32×(1+10)≈400\n    iothreads: 32         # IO 线程数：固定等于 CPU 核数，不要超过这个值\n    accepts: 1000         # 最大连接数：根据调用方实例数和连接池大小估算\n    queues: 0             # 关键改动：队列长度设为 0（直接拒绝策略）\n    threadpool: fixed     # 线程池类型：fixed 适合大流量稳定场景\n    dispatcher: message   # 只把请求/响应派发给业务线程，连接事件在 IO 线程处理\n  provider:\n    timeout: 3000         # 服务端超时：超过 3s 主动中断，避免线程被慢请求永久占用\n    executes: 50          # 单方法最大并发：防止某个慢接口独占整个线程池\n```\n\n`queues=0` 这个改动需要重点解释，因为它和直觉相反——难道不应该有队列来缓冲突发流量吗？\n\n在 RPC 服务端，队列是双刃剑。当流量突发超出线程处理能力时，请求进入队列等待。问题是：进入队列的请求会在队列里等多久？如果队列长度是 200，线程处理速率是 1000 TPS，那最后一个进队列的请求需要等 `200÷1000 = 200ms` 才能被处理，加上自身处理时间，总延迟至少 220ms。调用方设置的超时通常是 1-3s，流量持续打进来的情况下队列会越积越深，延迟指数级增长，最终调用方超时、重试、重试又超时，形成雪崩。`queues=0` 的策略是：超出处理能力的请求立刻返回 `ThreadPoolExhaustedException`，调用方立即感知并触发熔断，而不是在一个越来越深的队列里慢慢等死。用快速失败替代慢性死亡，这是对调用方更负责任的行为。\n\n当然，这要求调用方有完善的熔断降级策略（Sentinel 或 Hystrix），否则快速失败会直接暴露给用户。\n\n## 监控指标与 Arthas 实时诊断\n\n调优之后需要验证效果，以下是关键监控指标：业务线程池活跃数与总数的比值（保持在 60-80% 之间是健康的，持续超过 90% 说明需要扩容或限流）、队列等待数（配置 `queues=0` 后这个指标应该长期为 0）、GC 频率和 GC 停顿时间（线程越多，创建的对象越多，YGC 越频繁）。\n\n在不重启服务的情况下，可以用 Arthas 实时查看线程池状态：\n\n```bash\n# 接入目标 JVM 进程\n$ java -jar arthas-boot.jar\n# 选择 Dubbo 服务进程后进入交互界面\n\n# 查看最消耗 CPU 的 10 个线程，找出是否有异常线程\n[arthas@pid]$ thread -n 10\n\n# 查看所有 DubboServerHandler 线程状态，确认 WAITING/RUNNABLE 分布\n[arthas@pid]$ thread | grep DubboServerHandler\n\n# 通过 OGNL 直接访问 Dubbo 线程池对象，读取实时参数\n[arthas@pid]$ ognl '#executor=@com.alibaba.dubbo.remoting.transport.dispatcher.all.AllChannelHandler@executor, \"activeCount=\" + #executor.getActiveCount() + \" poolSize=\" + #executor.getPoolSize() + \" queueSize=\" + #executor.getQueue().size()'\n```\n\n最后一条 OGNL 命令可以直接读出当前活跃线程数、线程池大小和队列深度，是压测期间实时观测的利器。\n\n如果需要在不重启的情况下调整线程数，Dubbo 2.7+ 配合 Nacos 或 Apollo 配置中心，可以通过推送新的配置动态刷新 `threads` 值。但要注意：Dubbo 的 `fixed` 线程池不支持动态扩缩，需要把 `threadpool` 改为 `cached`（空闲超时自动回收）或 `eager`（优先扩线程而不是进队列）才能热生效。`eager` 类型在突发流量场景下特别有用：它的策略是「先把线程数扩到 max，再排队」，而 `fixed` 的策略是「先排队，队满了再扩线程或拒绝」——对于延迟敏感的查询接口，`eager` 通常表现更好。",
+      "keyPoints": [
+        "Dubbo 采用两级线程模型：Netty IO 线程（数量=CPU核数）负责编解码和网络读写，业务线程池负责执行服务方法；IO 线程绝对不能做任何阻塞操作，否则会冻结该 EventLoop 上所有连接的 IO 处理",
+        "IO 密集型场景的线程数计算公式：最优线程数 = CPU核数 × (1 + 等待时间/计算时间)；32 核机器查 MySQL 20ms、计算 2ms 时，理论值为 32×(1+10)=352，生产上取 400 并预留余量",
+        "当前 threads=200 配置严重不足的根本原因不是 CPU 不够，而是线程大量阻塞在 MySQL socket read，导致请求被迫进入等待队列，队列满了之后后续请求全部被拒绝，最终 TPS 只有预期的 30%",
+        "queues=0（直接拒绝策略）在 RPC 服务端优于 queues>0：队列积压会导致延迟随深度线性增长，流量持续的情况下极易形成雪崩，而快速失败能让调用方立即触发熔断，用可控的报错替代不可控的超时",
+        "Dubbo 的 dispatcher 推荐配置为 message 而非默认的 all：message 模式只把请求/响应事件派发到业务线程池，连接/断开事件直接在 IO 线程处理，减少业务线程池压力",
+        "executes 参数（单方法最大并发数）是防止「一个慢接口拖垮整个线程池」的关键手段，应当针对每个服务方法按预期并发量单独配置，与线程池总数形成两级限流",
+        "使用 Arthas 的 OGNL 表达式可以在不重启的情况下实时读取 Dubbo 线程池的 activeCount/poolSize/queueSize，是压测期间最直接的线程池状态观测手段"
+      ],
+      "quiz": [
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz1",
+          "question": "Dubbo 的 IO 线程（Netty EventLoopGroup）默认线程数是多少？",
+          "choices": [
+            { "id": "A", "text": "等于 CPU 核数" },
+            { "id": "B", "text": "固定为 200，与业务线程池一致" },
+            { "id": "C", "text": "等于 CPU 核数 × 2" },
+            { "id": "D", "text": "默认为 8，不随 CPU 核数变化" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Netty 的 NioEventLoopGroup 默认线程数等于 CPU 核数（通过 `Runtime.getRuntime().availableProcessors()` 获取）。这个设计基于 Reactor 模型的理论：IO 线程做的是纯 CPU 工作（select/epoll、编解码），不存在阻塞等待，所以 CPU 核数个线程刚好能把 CPU 跑满，多了只会增加上下文切换开销。B 选项是把业务线程池参数与 IO 线程混淆了。C 选项「核数×2」是 Netty 某些版本对 boss+worker 双组的总和，单组仍然是核数。D 选项是错误的固定值。"
+        },
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz2",
+          "question": "在 Dubbo 中，以下哪种操作绝对不能在 IO 线程中执行？",
+          "choices": [
+            { "id": "A", "text": "RPC 请求的反序列化（将字节流解码成 Java 对象）" },
+            { "id": "B", "text": "查询 MySQL 数据库（通过 JDBC）" },
+            { "id": "C", "text": "读取 TCP 缓冲区中的数据包" },
+            { "id": "D", "text": "向 TCP 发送缓冲区写入响应数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "IO 线程的核心职责是网络 IO 和编解码，这些操作本身不阻塞（使用非阻塞 NIO）。查询 MySQL 通过 JDBC 的同步阻塞调用会导致线程在 socket.read() 上阻塞 20ms 甚至更长，在此期间这个 EventLoop 无法处理任何其他连接上的 IO 事件，等效于整个 IO 线程「假死」。A、C、D 都是 IO 线程本身应该做的事：A 的反序列化虽然消耗 CPU，但它不阻塞，可以在 IO 线程处理（`dispatcher=execution` 模式）；C 和 D 是标准的网络 IO 操作。"
+        },
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz3",
+          "question": "32 核机器，某 RPC 接口每次调用需等待 Redis 40ms，自身业务逻辑耗时 2ms，按 IO 密集型公式计算最优业务线程数约为？",
+          "choices": [
+            { "id": "A", "text": "约 33（CPU核数+1，近似 CPU 密集型公式）" },
+            { "id": "B", "text": "约 672（32×(1+40/2)）" },
+            { "id": "C", "text": "约 336（32×(1+40/2)=672，取一半保守值）" },
+            { "id": "D", "text": "约 200（经验固定值，不需要公式计算）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "按公式「最优线程数 = CPU核数 × (1 + 等待时间/计算时间)」，代入 32 核、等待 40ms、计算 2ms：阻塞系数 = 40÷2 = 20，最优线程数 = 32×(1+20) = 672。这个数字看起来很大，但它的含义是：每 2ms 的 CPU 时间对应 40ms 的 IO 等待，需要 21 个线程轮流使用 1 个 CPU 核，32 个核就需要 672 个线程才能让所有核都保持忙碌。A 选项用的是 CPU 密集型公式，完全不适合这个场景。C 选项无依据随意减半。D 选项忽视了场景差异。"
+        },
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz4",
+          "question": "Dubbo 的 `dispatcher` 配置项设置为 `message` 时，连接建立和断开事件由谁处理？",
+          "choices": [
+            { "id": "A", "text": "业务线程池，与请求/响应事件统一处理" },
+            { "id": "B", "text": "IO 线程直接处理，不派发给业务线程池" },
+            { "id": "C", "text": "单独的连接管理线程池处理" },
+            { "id": "D", "text": "丢弃不处理，连接建立由客户端轮询确认" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "dispatcher=message 模式的含义是：只把「请求消息」和「响应消息」这两类事件派发给业务线程池，其余事件（connected、disconnected、caught）直接在 IO 线程上处理。连接建立/断开事件本身处理很快（更新连接注册表、记录日志），在 IO 线程处理既不会阻塞也不会成为瓶颈，可以减少业务线程的调度开销。与之对比，默认的 all 模式把所有事件都派发给业务线程，会不必要地消耗业务线程资源，在连接数多的场景下尤为明显。"
+        },
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz5",
+          "question": "压测期间通过 jstack 看到大量 DubboServerHandler 线程处于 TIMED_WAITING 状态，调用栈指向 `java.net.SocketInputStream.read()`，这最可能说明什么？",
+          "choices": [
+            { "id": "A", "text": "Dubbo IO 线程被阻塞，需要增加 iothreads 数量" },
+            { "id": "B", "text": "业务线程正在等待 JDBC/MySQL 返回查询结果，属于正常的 IO 阻塞等待" },
+            { "id": "C", "text": "线程死锁，所有业务线程互相等待对方释放资源" },
+            { "id": "D", "text": "JVM GC 导致所有线程暂停，属于 STW 现象" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "DubboServerHandler 是业务线程池中线程的命名前缀，不是 IO 线程。`SocketInputStream.read()` 是 JDBC 驱动通过 TCP socket 等待 MySQL 服务器返回查询结果时的调用栈，TIMED_WAITING 说明线程在设置了超时的阻塞等待，这是 IO 密集型服务的正常状态。A 选项混淆了 IO 线程和业务线程的命名；Netty IO 线程名为 `nioEventLoopGroup`，不叫 DubboServerHandler。C 选项死锁通常表现为多线程互相等待同一把锁，调用栈会出现 `java.lang.Object.wait` 或 lock 相关方法。D 选项 STW 期间所有线程暂停，jstack 根本采集不到线程状态。"
+        },
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz6",
+          "question": "将 Dubbo 业务线程池的 `queues` 从 200 改为 0，会产生什么效果？",
+          "choices": [
+            { "id": "A", "text": "关闭了线程池的任务缓冲，流量超出线程数上限时立即抛出 RejectedExecutionException" },
+            { "id": "B", "text": "线程池变为无界队列，可以无限缓冲等待请求，彻底解决 EXHAUSTED 问题" },
+            { "id": "C", "text": "Dubbo 将自动扩展线程数到无限，直到 OOM 为止" },
+            { "id": "D", "text": "queues=0 为非法配置，Dubbo 会回退到默认值 0" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "queues=0 意味着线程池没有任务等待队列，当所有线程都在工作时新来的任务直接触发拒绝策略（Dubbo 封装后抛出 Thread pool is EXHAUSTED 错误）。这不是坏事，而是对调用方更诚实的行为：调用方立刻收到失败响应，可以触发熔断或降级，而不是在队列里等待一个不知道多久才能被处理的请求，最终以超时告终。B 选项描述的是 queues=Integer.MAX_VALUE（无界队列），会导致请求在 OOM 前无限积压、延迟无限增长。C 选项的「无限扩线程」不会发生，线程数由 threads 参数硬性限制。D 选项是错误的，queues=0 是合法且推荐的配置。"
+        },
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz7",
+          "question": "Dubbo `threadpool` 类型中，`eager` 与 `fixed` 的核心区别是什么？",
+          "choices": [
+            { "id": "A", "text": "eager 优先扩线程到 max 再排队，fixed 优先排队再扩线程（达到 max 后拒绝）" },
+            { "id": "B", "text": "eager 线程有超时自动回收，fixed 线程永久存活" },
+            { "id": "C", "text": "eager 适合 CPU 密集型，fixed 适合 IO 密集型" },
+            { "id": "D", "text": "两者本质相同，只是配置名称不同，底层实现一致" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Dubbo 线程池类型里最容易混淆的对比。Java 标准 ThreadPoolExecutor 的扩线程策略是：core 线程用满 → 任务进队列 → 队列满了 → 扩线程到 max → max 也满了 → 拒绝。这意味着如果队列设置了较大值，线程数可能长期停在 core，不会主动扩容。Dubbo 的 `eager` 类型修改了这个优先级：线程数优先扩到 max，再排队，适合延迟敏感场景（不希望请求排队等待）。`fixed` 的 core 和 max 相同，线程数固定不变，适合稳定大流量。B 描述的是 `cached` 类型（空闲线程超时回收）。C 的选型建议完全相反。D 是错误的，实现完全不同。"
+        },
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz8",
+          "question": "生产环境某 Dubbo 服务有两个方法：getProductDetail（平均 20ms，高频）和 batchSyncInventory（平均 2000ms，低频）。如果不加额外限制，batchSyncInventory 的偶发流量高峰会如何影响 getProductDetail？",
+          "choices": [
+            { "id": "A", "text": "完全不影响，Dubbo 会自动按方法优先级调度，快请求优先获得线程" },
+            { "id": "B", "text": "batchSyncInventory 可能占满整个业务线程池，导致 getProductDetail 排队甚至超时" },
+            { "id": "C", "text": "batchSyncInventory 会触发背压机制，自动降速以保护 getProductDetail" },
+            { "id": "D", "text": "Dubbo 为每个服务方法分配独立线程池，方法间完全隔离" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Dubbo 默认情况下所有方法共用同一个业务线程池，没有方法级别的资源隔离。如果 batchSyncInventory 每次耗时 2000ms，且有 10 个并发请求，就占用了 10 个线程 2 秒，在这 2 秒内这 10 个线程对 getProductDetail 不可用。如果线程池总数是 200，batchSyncInventory 占了 190 个，getProductDetail 只剩 10 个线程，TPS 立刻从正常水位骤降。解决方案是给 batchSyncInventory 配置 `executes=5`（方法级最大并发数），防止其独占线程池。A 选项 Dubbo 没有这样的自动优先级调度。C 的背压机制不存在。D 是错误的，方法隔离需要手动通过 executes 或独立 ThreadPool 实现。"
+        },
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz9",
+          "question": "将 Dubbo 业务线程数从 200 扩展到 800，除了 TPS 提升之外，以下哪个副作用需要特别关注？",
+          "choices": [
+            { "id": "A", "text": "线程上下文切换开销增加，以及每个线程默认 1MB 栈内存导致内存占用显著上升" },
+            { "id": "B", "text": "Netty IO 线程数会自动同比例增加，导致 IO 线程过多" },
+            { "id": "C", "text": "JVM 会自动提高 GC 暂停时间阈值，导致 GC 停顿变短" },
+            { "id": "D", "text": "MySQL 连接池默认会随线程数自动扩容，数据库连接数不受影响" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "线程数翻 4 倍带来两个主要代价。第一是内存：Java 线程默认栈大小 `-Xss` 通常是 512KB 到 1MB，800 个线程光栈内存就需要 400-800MB，16GB 堆的机器还好，但如果跑多个服务实例就需要规划。第二是 GC 压力：更多线程意味着更多并发对象分配，Young GC 频率上升，极端情况下 GC 停顿会反向抵消线程增多带来的吞吐提升。因此调优后要密切观察 GC 指标（`jstat -gcutil`）。B 选项 IO 线程数由 iothreads 独立配置，不会随业务线程数变化。C 选项 JVM 不会自动调整 GC 暂停阈值。D 选项 MySQL 连接池（如 HikariCP）有自己的 `maximumPoolSize` 限制，线程增多后连接竞争会更激烈，需要同步扩容数据库连接池，否则线程多了但都在等连接。"
+        },
+        {
+          "id": "ds-rpc-thread-pool-tuning-q1-quiz10",
+          "question": "通过 Arthas 执行 `thread | grep DubboServerHandler` 发现 400 个业务线程中有 380 个处于 RUNNABLE 状态，但服务 TPS 并没有预期那么高，这最可能是什么原因？",
+          "choices": [
+            { "id": "A", "text": "RUNNABLE 不等于真正在用 CPU，线程可能在等待 IO（JDBC socket read）时也显示为 RUNNABLE" },
+            { "id": "B", "text": "线程数不够，需要继续增加到 600 以上" },
+            { "id": "C", "text": "Arthas 的 thread 命令存在 bug，显示的状态不准确" },
+            { "id": "D", "text": "服务遇到了 GC STW，所有线程暂停但 jstack 仍显示为 RUNNABLE" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个非常重要的 JVM 线程状态认知误区。Java 的 RUNNABLE 状态并不等同于「正在消耗 CPU」，它表示线程处于「可运行或正在运行」的状态，包含了线程正在等待 IO 完成但没有调用 Object.wait/sleep/park 的情况。JDBC 通过 native socket read 等待 MySQL 响应时，线程处于内核级的阻塞（`recv()` 系统调用），但在 JVM 层面仍然表现为 RUNNABLE。要区分「真正在跑 CPU」还是「阻塞在 IO」，需要结合 top -H 查看每个线程的 CPU 使用率，或者用 async-profiler 做 CPU 采样 profile。如果 CPU 利用率只有 20% 但线程全是 RUNNABLE，那就是 IO 等待，不是 CPU 瓶颈。"
+        }
+      ],
+      "references": [
+        "https://dubbo.apache.org/zh/docs/advanced/thread-model/",
+        "https://netty.io/wiki/thread-model.html",
+        "https://arthas.aliyun.com/doc/thread.html"
+      ]
+    }
+  ]
+}

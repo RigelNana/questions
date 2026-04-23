@@ -1,0 +1,168 @@
+{
+  "id": "ds-rpc-timeout-retry",
+  "name": "RPC 超时与重试策略",
+  "domain": "distributed-system",
+  "description": "设计合理的 RPC 超时传递机制和重试策略，避免超时风暴、重试放大、级联故障等分布式系统常见问题",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-rpc-timeout-retry-q1",
+      "domain": "distributed-system",
+      "type": "requirement",
+      "difficulty": 3,
+      "tags": ["RPC", "超时", "重试", "Deadline", "幂等", "指数退避", "重试预算", "gRPC", "分布式系统"],
+      "title": "电商调用链中 RPC 超时设置不合理导致库存异常，如何设计健壮的超时传递和重试策略？",
+      "content": "## 故障场景\n\n大促当天，你负责的电商系统出现了一个诡异的问题：用户下单失败，但库存却被扣减了。\n\n事后复盘发现，调用链是这样的：\n\n```\nAPI网关 (timeout=5s)\n  └─ 订单服务 (timeout=5s)\n       └─ 库存服务 (timeout=5s)\n            └─ 商品服务 (timeout=5s)\n```\n\n大促期间，库存服务因为一条慢查询（全表扫描了一张 3000 万行的流水表），响应时间达到了 4.9s。此时整条调用链发生了什么？API 网关等了 5s 没有收到响应，直接返回超时错误给用户，用户看到「下单失败」。但实际上，库存服务的扣减操作在 4.9s 时已经成功执行并提交事务，只是响应还没来得及传回来。于是出现了「用户看到失败、库存已被占用」的数据不一致状态。\n\n这个问题的根源不只是那条慢查询，更深层的原因是：**每一层服务各自独立计时，互相不知道整条链路的剩余时间**。即使库存服务只花了 4.9s，但当这个响应传回订单服务时，订单服务已经超时了；当订单服务的响应传到 API 网关时，API 网关也已经超时了。每一层的超时窗口都是独立的 5s，一条链路的总超时实际上可以累积到 15s 甚至更长，完全违背了最初「5s 内响应用户」的设计意图。\n\n更糟糕的是，运维同学发现问题后，在 API 网关加了重试逻辑：超时就重试 3 次。这反而让情况变得更坏——同一个用户的下单请求被重复发送，库存被扣减了 3 次，而用户依然看到的是失败。\n\n**现在需要你设计一套健壮的 RPC 超时传递和重试策略，要求：**\n\n1. 保证整条调用链的端到端超时不超过 5s，不依赖各层「自觉」设置合理的超时值\n2. 下游服务能够提前感知剩余时间不足，在无意义的工作开始前就快速失败\n3. 重试策略必须不会放大后端压力，不会导致写操作被重复执行\n4. 异常情况下能快速失败而不是无限等待，整个系统要有自我保护能力",
+      "answer": "## 先搞清楚：Timeout 和 Deadline 不是一回事\n\n大多数工程师混用这两个词，但它们在分布式系统里有本质区别，而这个区别正是上面那个故障的根本原因。\n\n**Timeout 是相对时长**，它的语义是「从现在起，我愿意等 X 秒」。问题在于，每一层服务收到请求时，它只知道「我设置了 5s 超时」，完全不知道上游已经等了多久。订单服务等了 4.9s 才收到库存服务的响应，它自己的 5s timeout 还没到，所以它认为一切正常，继续往上传。但 API 网关的 5s 早就到了。每层 Timeout 独立计时，整条链路的实际等待时间可以是各层超时的叠加。\n\n**Deadline 是绝对截止时间点**，它的语义是「这个请求必须在 Unix 时间 T 之前完成，否则就不用做了」。关键不同在于：Deadline 可以跨服务传递，下游拿到的是同一个截止时间，而不是一个新的倒计时。API 网关创建一个「截止到当前时间 + 5s」的 Deadline，传给订单服务；订单服务不创建新 Deadline，直接把这个时间戳透传给库存服务；库存服务收到时，剩余时间可能只有 3s 了，它就只有 3s 可以用。整条链路共用同一个截止时间，无论经过多少层，端到端的总时间都被严格控制在 5s 内。\n\ngRPC 天然使用 Deadline 机制——客户端设置的 `timeout` 在协议层被转化为绝对时间戳，通过 `grpc-timeout` header 传递给服务端，服务端的 `ctx` 自动携带这个 Deadline。Dubbo 和大多数自研 RPC 框架默认只传递相对 timeout，**不会自动扣减已耗费的时间**，这是很多团队踩坑的根源。\n\n## 超时传递的正确实现\n\n用 Go 举个最直接的例子。下面这段代码是错误的：\n\n```go\n// 错误做法：每层独立创建 5s timeout，总时间最长 15s+\nfunc (s *OrderService) CreateOrder(parentCtx context.Context, req *CreateOrderReq) (*CreateOrderResp, error) {\n    // 抛弃上游传来的 ctx，自己重新创建一个 5s timeout\n    // 这意味着 API 网关的 5s 和这里的 5s 是并行计时的\n    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)\n    defer cancel()\n    return s.inventoryClient.Reserve(ctx, &ReserveReq{ItemID: req.ItemID})\n}\n```\n\n`context.Background()` 是问题所在。正确做法是从上游传来的 `ctx` 派生，或者直接透传：\n\n```go\n// 正确做法：透传上游 ctx，Deadline 自动扣减\nfunc (s *OrderService) CreateOrder(ctx context.Context, req *CreateOrderReq) (*CreateOrderResp, error) {\n    // 检查剩余时间，不足 200ms 直接拒绝，避免无意义的下游调用\n    if deadline, ok := ctx.Deadline(); ok {\n        remaining := time.Until(deadline)\n        if remaining < 200*time.Millisecond {\n            return nil, status.Errorf(codes.DeadlineExceeded,\n                \"insufficient deadline: %v remaining\", remaining)\n        }\n    }\n\n    // 直接传递 ctx，库存服务收到的 Deadline 就是 API 网关设置的那个\n    // 如果此时 API 网关已经过了 3s，库存服务只有 2s 可用\n    resp, err := s.inventoryClient.Reserve(ctx, &ReserveReq{\n        ItemID:         req.ItemID,\n        Quantity:       req.Quantity,\n        IdempotencyKey: req.IdempotencyKey, // 幂等 token，后面会讲\n    })\n    if err != nil {\n        return nil, fmt.Errorf(\"inventory reserve failed: %w\", err)\n    }\n    return &CreateOrderResp{OrderID: resp.OrderID}, nil\n}\n```\n\n「不足 200ms 直接拒绝」这一步非常重要。如果剩余时间只有 50ms，发起一次网络调用几乎必然超时，但在超时之前，下游可能已经开始执行了一半逻辑，白白消耗 CPU 和数据库连接。提前检查剩余时间并快速失败，能让系统在压力下更优雅地降级，而不是把每一层都压到极限。\n\n## 重试放大效应：三层乘法带来的雪崩\n\n上面那个故障里，运维同学加的重试让事情更坏了。这背后有一个数学问题：**重试在调用链上是乘法关系，不是加法**。\n\n假设调用链三层，每层独立重试 3 次，入口 QPS 是 1000。那么：\n\n- 第一层（API网关）的实际请求数：1000 × 3 = 3000\n- 第二层（订单服务）的实际请求数：3000 × 3 = 9000\n- 第三层（库存服务）的实际请求数：9000 × 3 = 27000\n\n入口 1000 QPS 打到数据库层变成了 27000 QPS，是原来的 27 倍。这就是为什么一个轻微的超时抖动会触发数据库雪崩——不是流量变大了，是每一层的重试叠加起来产生了指数级放大。\n\n解决重试放大的根本思路是：**只在调用链的最外层重试，内层服务不重试**。API 网关或 BFF 层是唯一有权限做重试的地方，因为它是距离用户最近的一层，也是最了解请求语义的地方（它知道这是不是一个只读操作，知道客户端的期望）。\n\n但只在外层重试还不够，还需要两个配套机制：**指数退避加随机抖动（Jitter）**，以及**重试预算（Retry Budget）**。\n\n指数退避的原理是：第一次重试等 100ms，第二次等 200ms，第三次等 400ms，以此类推，每次等待时间翻倍。这样做是为了给下游服务喘息的时间——如果下游是因为短暂过载而超时，立即重试只会让它更难恢复。但纯指数退避有一个问题：如果大量请求同时失败，它们会在同一时刻一起重试，造成「重试风暴」（thundering herd）。\n\n加入随机 Jitter 可以打散重试时机：\n\n```go\nfunc retryWithBackoff(ctx context.Context, fn func() error) error {\n    base := 100 * time.Millisecond\n    maxDelay := 2 * time.Second\n\n    for attempt := 0; attempt < 3; attempt++ {\n        err := fn()\n        if err == nil {\n            return nil\n        }\n        // 只重试特定错误码，参数错误、业务逻辑错误不重试\n        if !isRetryable(err) {\n            return err\n        }\n\n        if attempt == 2 {\n            return err // 最后一次失败直接返回\n        }\n\n        // 指数退避 + 随机抖动：delay = min(base * 2^n + rand(0, base), maxDelay)\n        delay := time.Duration(float64(base)*math.Pow(2, float64(attempt))) +\n            time.Duration(rand.Int63n(int64(base)))\n        if delay > maxDelay {\n            delay = maxDelay\n        }\n\n        select {\n        case <-time.After(delay):\n        case <-ctx.Done():\n            return ctx.Err()\n        }\n    }\n    return nil\n}\n\nfunc isRetryable(err error) bool {\n    code := status.Code(err)\n    // UNAVAILABLE（服务不可达）和 RESOURCE_EXHAUSTED（限流）可以重试\n    // DEADLINE_EXCEEDED（超时）谨慎重试，要检查是否还有足够剩余时间\n    // INVALID_ARGUMENT（参数错误）、NOT_FOUND、PERMISSION_DENIED 绝不重试\n    return code == codes.Unavailable || code == codes.ResourceExhausted\n}\n```\n\n**重试预算**是另一个生产中经常被忽略的机制。它的思路是：限制重试请求在总流量中的占比，比如「重试请求不能超过总请求的 10%」。一旦超过这个比例，新来的失败请求直接返回错误，不再重试。这个机制保证了即使在大量请求失败的极端情况下，系统的实际负载也不会超过正常值的 1.1 倍。可以用 Token Bucket 或者滑动窗口来实现重试预算统计。\n\n## 幂等设计：重试的前提条件\n\n所有关于重试的讨论，有一个隐含前提：**被重试的操作必须是幂等的**。幂等的意思是，对同一个操作执行 N 次和执行 1 次的最终结果是一样的。\n\n读操作天然是幂等的，可以随意重试。写操作默认是非幂等的——重复扣库存会导致库存多扣，重复插入订单会产生重复订单。要让写操作可以安全重试，必须在协议层加入幂等 Token：\n\n```go\n// 请求结构体必须包含幂等 token\ntype CreateOrderReq struct {\n    IdempotencyKey string `json:\"idempotency_key\"` // 客户端生成的 UUID，同一次用户操作使用同一个 key\n    UserID         int64  `json:\"user_id\"`\n    Items          []Item `json:\"items\"`\n}\n\n// 服务端用 Redis SET NX 实现去重\nfunc (s *OrderService) CreateOrder(ctx context.Context, req *CreateOrderReq) (*CreateOrderResp, error) {\n    if req.IdempotencyKey == \"\" {\n        return nil, status.Error(codes.InvalidArgument, \"idempotency_key is required\")\n    }\n\n    // 尝试获取幂等锁，NX 表示 key 不存在时才设置，EX 是过期时间\n    // 返回 true 表示这是第一次执行，false 表示是重试\n    key := fmt.Sprintf(\"idem:create_order:%s\", req.IdempotencyKey)\n    isFirst, err := s.redis.SetNX(ctx, key, \"processing\", 10*time.Minute).Result()\n    if err != nil {\n        return nil, status.Errorf(codes.Internal, \"idempotency check failed: %v\", err)\n    }\n\n    if !isFirst {\n        // 不是第一次，查询之前的执行结果并返回\n        // 注意：如果之前的请求还在执行中，这里需要等待或返回 \"pending\" 状态\n        return s.getIdempotentResult(ctx, req.IdempotencyKey)\n    }\n\n    // 第一次执行，正常处理业务逻辑\n    result, err := s.doCreateOrder(ctx, req)\n    if err != nil {\n        // 失败了也要删除 key，让下次重试可以重新执行\n        s.redis.Del(ctx, key)\n        return nil, err\n    }\n\n    // 成功后把结果存入 Redis，供后续重试查询\n    s.redis.Set(ctx, fmt.Sprintf(\"idem:result:%s\", req.IdempotencyKey),\n        marshalResult(result), 10*time.Minute)\n    return result, nil\n}\n```\n\n幂等 Token 应该由客户端（或 API 网关）在第一次发起请求时生成，重试时使用同一个 Token。这样服务端就能区分「这是新请求」还是「这是之前失败请求的重试」，对重试直接返回上次的结果，不重复执行业务逻辑。\n\n## 生产级 gRPC 重试配置\n\ngRPC 支持通过 Service Config 在客户端声明式地配置重试策略，不需要在代码里手写重试逻辑：\n\n```json\n{\n  \"methodConfig\": [{\n    \"name\": [\n      {\"service\": \"order.OrderService\", \"method\": \"CreateOrder\"},\n      {\"service\": \"order.OrderService\", \"method\": \"QueryOrder\"}\n    ],\n    \"timeout\": \"4.5s\",\n    \"retryPolicy\": {\n      \"maxAttempts\": 3,\n      \"initialBackoff\": \"0.1s\",\n      \"maxBackoff\": \"1s\",\n      \"backoffMultiplier\": 2.0,\n      \"retryableStatusCodes\": [\"UNAVAILABLE\", \"RESOURCE_EXHAUSTED\"]\n    },\n    \"waitForReady\": true\n  }]\n}\n```\n\n注意这里 `timeout` 设置的是 4.5s 而不是 5s——给网络传输和序列化留出了 500ms 的余量。`retryableStatusCodes` 只包含 `UNAVAILABLE` 和 `RESOURCE_EXHAUSTED`，不包含 `DEADLINE_EXCEEDED`，因为超时重试意味着已经快没时间了，大概率重试也会超时，反而浪费剩余的少量时间。\n\n`waitForReady: true` 是一个容易被忽略的配置。它的作用是：当连接暂时不可用时（比如服务刚在重启），gRPC 不立即返回错误，而是等待连接就绪。在滚动发布场景下，这个配置能避免大量短暂的连接失败触发重试风暴。\n\n**最后说一个「黄金法则」**，这是生产经验总结出来的，记住它能避免大多数重试相关的事故：`UNAVAILABLE` 可以重试（服务临时不可达），`RESOURCE_EXHAUSTED` 可以重试（限流，等一下再试），`DEADLINE_EXCEEDED` 谨慎重试（检查剩余时间），`INVALID_ARGUMENT`、`NOT_FOUND`、`ALREADY_EXISTS`、`PERMISSION_DENIED` 永远不重试（重试没有意义）。写操作除非携带经过验证的幂等 Token，否则绝对不重试——这是不可违背的原则，因为一旦写操作被重复执行，数据修复的代价远比请求失败要大得多。",
+      "keyPoints": [
+        "Timeout 是每层独立的相对倒计时，调用链多层后总等待时间会叠加放大；Deadline 是绝对截止时间戳，跨服务透传时自动扣减已耗费时间，是控制端到端超时的正确机制。",
+        "gRPC 通过 grpc-timeout header 传递绝对 Deadline，服务端 ctx 自动感知剩余时间；Dubbo 等框架默认只传递相对 timeout，需要手动实现剩余时间传递逻辑。",
+        "每层服务收到请求后应检查 ctx 中的剩余时间，低于阈值（如 200ms）时应立即拒绝请求并返回 DeadlineExceeded，避免在注定超时的情况下仍然启动下游调用和数据库事务。",
+        "重试放大效应在 N 层调用链上是指数级的：每层重试 M 次则后端承受流量是入口的 M^N 倍；解决方案是只在调用链最外层（API Gateway / BFF）做重试，内层服务不重试。",
+        "指数退避配合随机 Jitter 可以打散重试时机，避免大量请求同时失败后在同一时刻集中重试；重试预算（如重试流量不超过总流量 10%）是防止极端情况下系统因重试自我压垮的最后防线。",
+        "所有写操作的重试都必须以幂等 Token 为前提，客户端生成 UUID 作为 idempotency_key，服务端用 Redis SET NX 实现去重，相同 key 的重复请求直接返回上次结果，不重复执行业务逻辑。",
+        "gRPC Service Config 的 retryableStatusCodes 应只包含 UNAVAILABLE 和 RESOURCE_EXHAUSTED，DEADLINE_EXCEEDED 不应加入，因为超时后剩余时间通常已不足以完成重试；INVALID_ARGUMENT 等业务错误码永远不重试。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz1",
+          "question": "以下关于 Timeout 与 Deadline 的描述，哪项是正确的？",
+          "choices": [
+            {"id": "A", "text": "Deadline 是绝对截止时间戳，在调用链中透传时下游自动获得剩余时间，整条链路的总超时受到严格控制"},
+            {"id": "B", "text": "Timeout 和 Deadline 本质上一样，只是叫法不同，gRPC 内部会自动转换"},
+            {"id": "C", "text": "Deadline 比 Timeout 更精准，但开销更大，只适合对延迟敏感的场景"},
+            {"id": "D", "text": "每层服务独立设置 5s Timeout，三层调用链的端到端超时不会超过 5s"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Timeout 是相对时长，每层从自己收到请求的那一刻开始倒计时，三层各 5s 意味着总时间可达 15s 甚至更长。Deadline 是绝对的 Unix 时间戳，API 网关设置「截止到 T+5s」并透传，下游收到时自动知道自己只有剩余 X 秒可用。B 选项是最常见的误解，gRPC 确实使用 Deadline 机制但它不是简单的 Timeout 换名；C 选项混淆了概念，Deadline 的开销与 Timeout 相当，适用于所有场景；D 选项是导致本题故障的根本原因——每层独立 5s 会让端到端超时叠加远超 5s。"
+        },
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz2",
+          "question": "在 Go 中，以下哪种 context 用法能正确实现 Deadline 跨服务传递？",
+          "choices": [
+            {"id": "A", "text": "每层服务用 context.WithTimeout(context.Background(), 5*time.Second) 创建新的 context"},
+            {"id": "B", "text": "每层服务直接透传上游传来的 ctx，或用 context.WithTimeout(parentCtx, ...) 从父 ctx 派生"},
+            {"id": "C", "text": "在 HTTP header 中手动传递 X-Deadline 字段，服务端解析后重新创建 context"},
+            {"id": "D", "text": "使用全局变量存储 Deadline，各层服务从全局变量读取"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "关键在于 context.Background()。Background() 是一个空 context，没有任何 Deadline 信息，用它派生的新 context 会从零开始计时，完全丢失上游的超时信息——这正是错误做法 A 的问题所在。正确做法是透传 ctx 或从 parentCtx 派生：Go 的 context 是树形结构，子 context 的 Deadline 不会晚于父 context，因此从父 ctx 派生时，子 ctx 自动继承并遵守父级的 Deadline。C 和 D 虽然理论上可行，但都是反模式，C 需要手动处理时区和时钟同步问题，D 在并发场景下有数据竞争风险。"
+        },
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz3",
+          "question": "调用链三层，每层独立重试 3 次，入口 QPS 为 1000，最坏情况下最底层服务承受的 QPS 是多少？",
+          "choices": [
+            {"id": "A", "text": "3000 QPS，因为只有最外层的重试影响底层"},
+            {"id": "B", "text": "9000 QPS，三层叠加是 1000 × 3 × 3 = 9000"},
+            {"id": "C", "text": "27000 QPS，三层乘法叠加是 1000 × 3 × 3 × 3 = 27000"},
+            {"id": "D", "text": "4000 QPS，因为不是每次重试都会失败，平均放大 4 倍"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "重试放大是乘法效应，不是加法。第一层重试 3 次，每次失败的请求都到达第二层；第二层对每个失败请求也重试 3 次；第三层同理。计算过程：1000 × 3（第一层重试）= 3000 到达第二层，3000 × 3 = 9000 到达第三层，9000 × 3 = 27000。这是最坏情况，也就是每次重试都失败的场景。A 选项误解了调用链的传递机制；B 选项漏算了一层；D 选项试图用平均值掩盖最坏情况，但系统设计必须考虑最坏情况，否则会在压力高峰时崩溃。"
+        },
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz4",
+          "question": "指数退避算法中加入随机 Jitter 的主要目的是什么？",
+          "choices": [
+            {"id": "A", "text": "减少总的重试等待时间，让请求更快得到响应"},
+            {"id": "B", "text": "打散重试时机，避免大量失败请求在同一时刻集中重试造成 thundering herd"},
+            {"id": "C", "text": "提高随机性让测试更难复现，增加系统健壮性"},
+            {"id": "D", "text": "兼容不同精度的系统时钟，防止时间精度差异导致的同步问题"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是经典的 thundering herd（雷群）问题。假设 10000 个请求同时超时，纯指数退避会让它们全部在 100ms 后同时重试，瞬间产生 10000 QPS 的冲击，很可能又导致全部超时，然后又在 200ms 后全部重试，形成周期性冲击。加入随机 Jitter（通常是 ±50% 的随机扰动）后，这 10000 个重试请求会均匀分散在 50ms 到 150ms 的时间窗口内，后端看到的是平滑的流量而不是脉冲，能够正常消化。A 选项是误解，Jitter 实际上会让部分请求等待更长时间；C、D 是无关答案。"
+        },
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz5",
+          "question": "以下哪个 gRPC 状态码的错误，在有幂等保证的前提下也不应该重试？",
+          "choices": [
+            {"id": "A", "text": "UNAVAILABLE — 服务暂时不可达"},
+            {"id": "B", "text": "RESOURCE_EXHAUSTED — 服务端限流"},
+            {"id": "C", "text": "INVALID_ARGUMENT — 请求参数非法"},
+            {"id": "D", "text": "DEADLINE_EXCEEDED — 请求超时"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "INVALID_ARGUMENT 表示请求本身有问题，比如缺少必填字段、参数格式不对、业务规则校验失败。这类错误不是暂时性的，重试不会改变结果——请求还是同一个错误的请求，服务端还是会以同样的原因拒绝。即使请求带了幂等 Token，重试也毫无意义，只会浪费网络和计算资源。UNAVAILABLE 和 RESOURCE_EXHAUSTED 是典型的可重试错误，因为它们是暂时性的系统状态。DEADLINE_EXCEEDED 比较特殊，如果剩余时间充足可以谨慎重试，但通常意味着时间已经很紧张，需要先检查剩余 Deadline。"
+        },
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz6",
+          "question": "重试预算（Retry Budget）的核心思想是什么？",
+          "choices": [
+            {"id": "A", "text": "为每个服务分配固定的重试次数配额，超出配额的服务不允许重试"},
+            {"id": "B", "text": "限制重试请求在总请求中的占比（如不超过 10%），超出占比时新的失败请求直接返回错误不重试"},
+            {"id": "C", "text": "按照成本为重试请求分配优先级，高价值请求可以重试更多次"},
+            {"id": "D", "text": "在 API 网关记录所有重试请求的费用，超出预算后停止整个服务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "重试预算是 Google SRE 实践中提出的概念。核心问题是：当大量请求同时失败时，全部重试会让后端压力翻倍甚至更高，反而阻碍系统恢复。重试预算通过限制比例来解决这个问题——用滑动窗口统计最近 N 秒的总请求数和重试请求数，如果重试占比超过 10%，新的失败请求就直接返回错误而不重试。这样做保证了即使在最坏情况下，后端看到的流量也不超过正常流量的 1.1 倍。A 选项是固定配额机制，不够灵活；C、D 都不是技术界对这个概念的标准定义。"
+        },
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz7",
+          "question": "实现订单创建接口的幂等性，使用 Redis SET NX 存储 idempotency_key 时，以下哪种处理方式是正确的？",
+          "choices": [
+            {"id": "A", "text": "业务执行失败时保留 key 不删除，让后续重试时直接返回失败结果"},
+            {"id": "B", "text": "业务执行失败时删除 key，让后续重试能够重新执行业务逻辑"},
+            {"id": "C", "text": "无论成功失败都永久保留 key，用 key 的存在性判断是否重试"},
+            {"id": "D", "text": "业务执行成功后删除 key，释放 Redis 空间，因为不再需要去重"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考察幂等实现的细节。SET NX 设置 key 后开始执行业务，如果业务逻辑中途失败（比如数据库写入失败、网络超时等），此时 key 已经存在但没有对应的成功结果。如果不删除 key，下次重试时 SET NX 会返回 false（key 已存在），服务端尝试查询上次结果但找不到，进退两难。正确做法是业务失败时删除 key，让重试能够重新走完整的执行流程。业务成功后要把结果写入 Redis 并保留 key（通常设置 10 分钟过期），供后续重试查询结果。D 选项是大忌——删除 key 后如果客户端重试，会被当作全新请求重复执行写操作。"
+        },
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz8",
+          "question": "gRPC Service Config 中将 timeout 设置为 4.5s 而非 5s，以及 waitForReady: true 的作用分别是什么？",
+          "choices": [
+            {"id": "A", "text": "4.5s 是为了留出 500ms 给网络传输和序列化；waitForReady 让 gRPC 等待连接就绪而不是立即报错，适合滚动发布场景"},
+            {"id": "B", "text": "4.5s 是 gRPC 协议的默认超时限制；waitForReady 表示等待所有 ready 状态的实例处理完再返回"},
+            {"id": "C", "text": "4.5s 比 5s 更节省网络资源；waitForReady 表示等待服务端准备好数据再发送请求"},
+            {"id": "D", "text": "4.5s 与 5s 效果相同，只是习惯写法；waitForReady 是开启 HTTP/2 的 PING 心跳检测"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "超时值设为 4.5s 而非 5s 是工程细节。API 网关设置了 5s 端到端超时，但这 5s 包含了 gRPC 的连接建立、请求序列化、网络传输、响应反序列化等环节。如果 client timeout 也设为 5s，很容易因为网络抖动导致 client 端刚好超时但服务端已经在处理，产生不一致。留出 500ms 余量是常见的工程实践。waitForReady 的作用在滚动发布时特别重要：新 Pod 启动时 gRPC 连接短暂不可用，waitForReady=true 会让客户端等待几百毫秒直到连接就绪，而不是立即返回 UNAVAILABLE 然后触发重试，大幅减少发布期间的错误率。"
+        },
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz9",
+          "question": "服务 A 调用服务 B，检测到 ctx 中剩余时间只有 80ms，此时最合理的处理方式是什么？",
+          "choices": [
+            {"id": "A", "text": "继续发起调用，让 gRPC 自动处理超时，客户端会在 80ms 后取消请求"},
+            {"id": "B", "text": "将超时时间延长到 200ms 再发起调用，给下游服务足够的时间"},
+            {"id": "C", "text": "直接返回 DeadlineExceeded 错误，避免发起必然超时的下游调用"},
+            {"id": "D", "text": "将请求放入本地队列，等待下一个请求周期再处理"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是「提前失败」原则的体现。如果剩余时间只有 80ms，而一次 RPC 调用的网络 RTT 通常就需要 1-10ms，加上服务端处理时间，80ms 几乎必然不够用。如果仍然发起调用：下游服务可能已经开始执行业务逻辑（比如开始数据库事务），80ms 后被强制取消，留下一个未完成的操作；同时还白白消耗了下游服务的 goroutine、数据库连接等资源。提前检测剩余时间并直接返回错误，能让上游更快感知超时，也避免了下游做无用功。B 选项试图「延长」Deadline 是错误的，因为 Deadline 是上游设定的，你不能单方面修改；A 选项虽然最终结果相同但浪费了资源。"
+        },
+        {
+          "id": "ds-rpc-timeout-retry-q1-quiz10",
+          "question": "在大促场景下，以下哪种重试策略组合最能有效防止级联故障？",
+          "choices": [
+            {"id": "A", "text": "每层服务独立重试 3 次 + 固定等待 100ms + 无重试预算限制"},
+            {"id": "B", "text": "只在 API 网关层重试 + 指数退避加 Jitter + 重试预算限制 10% + 写操作必须携带幂等 Token"},
+            {"id": "C", "text": "只在数据库层重试 + 线性退避 + 不限次数直到成功为止"},
+            {"id": "D", "text": "每层服务重试 1 次 + 固定等待 1s + 超时设置为 30s 确保最终成功"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题综合考察本题的所有核心知识点。A 选项是级联故障的经典配方：每层重试叠加产生指数放大，无预算限制在极端情况下会无限放大压力。C 选项数据库层重试是反模式，数据库本身通常不需要应用层重试，而且不限次数会让故障中的数据库更难恢复。D 选项 30s 超时对用户完全不可接受，而且每层重试 1 次仍然有 N 层乘法问题。B 选项的组合体现了最佳实践：外层统一重试消除乘法效应，Jitter 打散重试时机，预算限制保护后端，幂等 Token 保证写操作安全性。这是 Google、Netflix 等大规模分布式系统经过验证的模式。"
+        }
+      ],
+      "references": [
+        {
+          "title": "gRPC Deadlines — gRPC 官方文档",
+          "url": "https://grpc.io/docs/guides/deadlines/"
+        },
+        {
+          "title": "Retry Design Patterns — AWS Architecture Blog",
+          "url": "https://aws.amazon.com/cn/blogs/architecture/exponential-backoff-and-jitter/"
+        },
+        {
+          "title": "Google SRE Book — Chapter 22: Addressing Cascading Failures",
+          "url": "https://sre.google/sre-book/addressing-cascading-failures/"
+        },
+        {
+          "title": "gRPC Service Config — 客户端重试配置规范",
+          "url": "https://github.com/grpc/grpc/blob/master/doc/service_config.md"
+        }
+      ]
+    }
+  ]
+}
