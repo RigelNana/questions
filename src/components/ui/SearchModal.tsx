@@ -73,14 +73,11 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
 
   return (
     <div className="fixed inset-0 z-[100] flex items-start justify-center pt-[8vh] sm:pt-[15vh]">
-      {/* Backdrop — fades in so the modal doesn't appear over a harsh cut. */}
-      <div
-        className="absolute inset-0 bg-black/50 backdrop-blur-sm animate-fade-in"
-        onClick={onClose}
-      />
+      {/* Backdrop */}
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
 
-      {/* Modal — reveal-up catches the eye without feeling abrupt. */}
-      <div className="relative w-full max-w-lg mx-3 sm:mx-4 bg-[var(--color-notion-bg)] rounded-xl shadow-2xl shadow-black/20 border border-[var(--color-notion-border)] overflow-hidden animate-reveal-up">
+      {/* Modal */}
+      <div className="relative w-full max-w-lg mx-3 sm:mx-4 bg-[var(--color-notion-bg)] rounded-xl shadow-2xl shadow-black/20 border border-[var(--color-notion-border)] overflow-hidden animate-scale-in">
         {/* Search input */}
         <div className="flex items-center gap-3 px-4 py-3.5 border-b border-[var(--color-notion-border)]">
           <Search className="w-4 h-4 text-[var(--color-notion-accent)] flex-shrink-0" />
@@ -108,34 +105,18 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
             ) : (
               results.map((item, index) => {
                 const Icon = DOMAIN_ICONS[item.domain as Domain];
-                const selected = index === selectedIndex;
                 return (
                   <button
                     key={item.id}
                     onClick={() => handleSelect(index)}
                     onMouseEnter={() => setSelectedIndex(index)}
-                    className={`group relative w-full text-left px-4 py-2.5 flex items-center gap-3 transition-[background-color] duration-200 ${
-                      selected
+                    className={`w-full text-left px-4 py-2.5 flex items-center gap-3 transition-all duration-150 ${
+                      index === selectedIndex
                         ? 'bg-[var(--color-notion-accent-light)]'
                         : 'hover:bg-[var(--color-notion-bg-hover)]'
                     }`}
                   >
-                    {/* Selection edge bar — grows in from the left when a row
-                        becomes selected, tweened with back ease for a tactile
-                        snap. Keyboard nav now feels spatial, not binary. */}
-                    <span
-                      aria-hidden="true"
-                      className={`pointer-events-none absolute left-0 top-1.5 bottom-1.5 w-[3px] rounded-r-sm bg-[var(--color-notion-accent)] transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] origin-top ${
-                        selected ? 'scale-y-100' : 'scale-y-0'
-                      }`}
-                    />
-                    <Icon
-                      className={`w-4 h-4 flex-shrink-0 transition-all duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] ${
-                        selected
-                          ? 'text-[var(--color-notion-accent)] scale-110'
-                          : 'text-[var(--color-notion-text-secondary)]'
-                      }`}
-                    />
+                    <Icon className={`w-4 h-4 flex-shrink-0 ${index === selectedIndex ? 'text-[var(--color-notion-accent)]' : 'text-[var(--color-notion-text-secondary)]'}`} />
                     <div className="flex-1 min-w-0">
                       <div className="text-sm text-[var(--color-notion-text)] truncate">
                         {item.title}
@@ -144,11 +125,9 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
                         {DOMAIN_LABELS[item.domain]} · {item.tags.slice(0, 3).join(', ')}
                       </div>
                     </div>
-                    <ArrowRight
-                      className={`w-3.5 h-3.5 text-[var(--color-notion-accent)] flex-shrink-0 transition-all duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] ${
-                        selected ? 'opacity-100 translate-x-0' : 'opacity-0 -translate-x-1'
-                      }`}
-                    />
+                    {index === selectedIndex && (
+                      <ArrowRight className="w-3.5 h-3.5 text-[var(--color-notion-accent)] flex-shrink-0" />
+                    )}
                   </button>
                 );
               })

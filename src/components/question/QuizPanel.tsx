@@ -130,7 +130,7 @@ export function QuizPanel({
             <button
               key={q.id}
               onClick={() => jumpTo(i)}
-              className={`compact-control group flex h-7 w-7 items-center justify-center rounded-full hover-press transition-colors duration-200 ${
+              className={`compact-control group flex h-7 w-7 items-center justify-center rounded-full transition-all duration-200 ${
                 isCurrent
                   ? 'bg-[var(--color-notion-accent-light)]'
                   : 'hover:bg-[var(--color-notion-bg-hover)]'
@@ -139,7 +139,7 @@ export function QuizPanel({
               aria-label={`跳转到第 ${i + 1} 题`}
             >
               <span
-                className={`block h-2.5 w-2.5 rounded-full transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] ${dotColor} ${
+                className={`block h-2.5 w-2.5 rounded-full transition-transform duration-200 ${dotColor} ${
                   isCurrent ? 'scale-150' : 'group-hover:scale-125'
                 }`}
               />
@@ -174,21 +174,13 @@ export function QuizPanel({
               choiceStyle = 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)] shadow-sm shadow-[var(--color-notion-accent)]/10';
             }
 
-            // When a choice is the user's correct selection, give it a one-off
-            // ring-pulse burst to confirm the answer visually.
-            const confirmBurst =
-              isAnswered && isSelected && isCorrectChoice ? ' animate-ring-pulse' : '';
-
             return (
               <button
                 key={choice.id}
                 onClick={() => !isAnswered && setSelectedAnswer(choice.id)}
                 disabled={isAnswered}
-                style={{ ['--ring-color' as string]: 'rgba(163, 190, 140, 0.45)' }}
-                className={`w-full text-left px-3.5 sm:px-4 py-2.5 sm:py-3 rounded-lg border flex items-start gap-2.5 sm:gap-3 ${choiceStyle}${confirmBurst} ${
-                  isAnswered
-                    ? 'cursor-default transition-colors duration-300'
-                    : 'cursor-pointer hover-press transition-[background-color,border-color,box-shadow,transform] duration-200'
+                className={`w-full text-left px-3.5 sm:px-4 py-2.5 sm:py-3 rounded-lg border transition-all duration-200 flex items-start gap-2.5 sm:gap-3 ${choiceStyle} ${
+                  isAnswered ? 'cursor-default' : 'cursor-pointer'
                 }`}
               >
                 <span className={`text-sm font-medium flex-shrink-0 mt-0.5 ${isSelected && !isAnswered ? 'text-[var(--color-notion-accent)]' : 'text-[var(--color-notion-text-secondary)]'}`}>
@@ -211,7 +203,7 @@ export function QuizPanel({
             <button
               onClick={handleSubmit}
               disabled={!selectedAnswer}
-              className="hover-press w-full rounded-lg bg-[var(--color-notion-accent)] px-5 py-2.5 text-sm font-medium text-white shadow-sm shadow-[var(--color-notion-accent)]/30 hover:shadow-md hover:shadow-[var(--color-notion-accent)]/40 disabled:cursor-not-allowed disabled:opacity-30 disabled:shadow-none sm:w-auto"
+              className="w-full rounded-lg bg-[var(--color-notion-accent)] px-5 py-2.5 text-sm font-medium text-white transition-all duration-200 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30 sm:w-auto"
             >
               提交答案
             </button>
@@ -221,14 +213,10 @@ export function QuizPanel({
           </div>
         )}
 
-        {/* Explanation — reveal panel slides up with back-ease. A correct
-            answer pops its check icon; a wrong answer shakes its X icon. */}
+        {/* Explanation */}
         {isAnswered && (
           <div
-            // `key` here forces remount per question, so the reveal animation
-            // replays when the user navigates between quizzes.
-            key={currentQuiz.id}
-            className={`mt-4 p-3.5 sm:p-4 rounded-xl border animate-reveal-up ${
+            className={`mt-4 p-3.5 sm:p-4 rounded-xl border animate-slide-up ${
               isCorrect
                 ? 'border-[var(--color-notion-correct)]/40 bg-[var(--color-notion-correct-light)]'
                 : 'border-[var(--color-notion-error)]/40 bg-[var(--color-notion-error-light)]'
@@ -236,21 +224,13 @@ export function QuizPanel({
           >
             <div className="flex items-center gap-2 mb-2.5">
               <span className={`text-sm font-semibold flex items-center gap-1.5 ${isCorrect ? 'text-[var(--color-notion-correct)]' : 'text-[var(--color-notion-error)]'}`}>
-                {isCorrect ? (
-                  <>
-                    <CheckCircle className="w-4 h-4 animate-check-pop" /> 回答正确
-                  </>
-                ) : (
-                  <>
-                    <XCircle className="w-4 h-4 animate-shake" /> 回答错误
-                  </>
-                )}
+                {isCorrect ? <><CheckCircle className="w-4 h-4" /> 回答正确</> : <><XCircle className="w-4 h-4" /> 回答错误</>}
               </span>
             </div>
             <MarkdownRenderer content={currentQuiz.explanation} className="text-sm" />
             {!isCorrect && (
               <div className="mt-2.5 pt-2 border-t border-[var(--color-notion-border)] text-xs text-[var(--color-notion-text-secondary)]">
-                正确答案: <span className="font-semibold text-[var(--color-notion-correct)] animate-pop inline-block">{currentQuiz.correctAnswer}</span>
+                正确答案: <span className="font-semibold text-[var(--color-notion-correct)]">{currentQuiz.correctAnswer}</span>
               </div>
             )}
           </div>
@@ -261,19 +241,19 @@ export function QuizPanel({
           <button
             onClick={handlePrev}
             disabled={currentIndex === 0}
-            className="group flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-colors duration-200 disabled:hover:text-[var(--color-notion-text-secondary)]"
+            className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
           >
-            <ChevronLeft className="w-4 h-4 transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] group-hover:-translate-x-1 group-disabled:group-hover:translate-x-0" /> 上一题
+            <ChevronLeft className="w-4 h-4" /> 上一题
           </button>
-          <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono tabular-nums">
+          <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono">
             {currentIndex + 1} / {quizzes.length}
           </span>
           <button
             onClick={handleNext}
             disabled={currentIndex === quizzes.length - 1}
-            className="group flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-colors duration-200 disabled:hover:text-[var(--color-notion-text-secondary)]"
+            className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
           >
-            下一题 <ChevronRight className="w-4 h-4 transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] group-hover:translate-x-1 group-disabled:group-hover:translate-x-0" />
+            下一题 <ChevronRight className="w-4 h-4" />
           </button>
         </div>
       </div>

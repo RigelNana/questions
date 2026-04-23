@@ -16,26 +16,20 @@ interface SidebarProps {
 export function Sidebar({ isOpen, onClose }: SidebarProps) {
   return (
     <>
-      {/* Mobile overlay — explicit fade-in avoids the backdrop flashing. */}
+      {/* Mobile overlay */}
       {isOpen && (
         <div
-          className="fixed inset-0 bg-black/30 backdrop-blur-sm z-40 lg:hidden animate-fade-in"
+          className="fixed inset-0 bg-black/30 backdrop-blur-sm z-40 lg:hidden"
           onClick={onClose}
         />
       )}
 
-      {/*
-        Mobile slide-in uses back-ease so the panel feels like it catches itself
-        at the edge instead of smacking flat against the gutter.
-        Duration is ~420ms: long enough to see the overshoot settle, short
-        enough to feel responsive.
-      */}
       <aside
         className={`
           fixed top-0 left-0 z-50 h-full w-64 bg-[var(--color-notion-bg-secondary)]
           border-r border-[var(--color-notion-border)] flex flex-col
-          transition-transform duration-[420ms] ease-[cubic-bezier(0.34,1.32,0.64,1)]
-          lg:translate-x-0 lg:static lg:z-auto lg:transition-none
+          transition-transform duration-250 ease-out
+          lg:translate-x-0 lg:static lg:z-auto
           ${isOpen ? "translate-x-0" : "-translate-x-full"}
         `}
       >
@@ -63,7 +57,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
               end
               onClick={onClose}
               className={({ isActive }) =>
-                `group flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-[background-color,color,transform] duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] hover:translate-x-0.5 ${
+                `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                   isActive
                     ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
                     : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
@@ -90,7 +84,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
                     to={`/domains/${domain}`}
                     onClick={onClose}
                     className={({ isActive }) =>
-                      `group flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-[background-color,color,transform] duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] hover:translate-x-0.5 ${
+                      `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                         isActive
                           ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
                           : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
@@ -116,7 +110,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
               to="/review"
               onClick={onClose}
               className={({ isActive }) =>
-                `group flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-[background-color,color,transform] duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] hover:translate-x-0.5 ${
+                `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                   isActive
                     ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
                     : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
@@ -130,7 +124,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
               to="/progress"
               onClick={onClose}
               className={({ isActive }) =>
-                `group flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-[background-color,color,transform] duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] hover:translate-x-0.5 ${
+                `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                   isActive
                     ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
                     : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
@@ -144,7 +138,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
               to="/settings"
               onClick={onClose}
               className={({ isActive }) =>
-                `group flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-[background-color,color,transform] duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] hover:translate-x-0.5 ${
+                `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
                   isActive
                     ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
                     : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"

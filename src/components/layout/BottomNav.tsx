@@ -18,30 +18,15 @@ export function BottomNav() {
             to={to}
             end={end}
             className={({ isActive }) =>
-              `group touch-target flex min-w-0 flex-col items-center justify-center gap-0.5 rounded-xl px-2 py-1.5 no-underline transition-[background-color,color] duration-200 active:scale-95 ${
+              `touch-target flex min-w-0 flex-col items-center justify-center gap-0.5 rounded-xl px-2 py-1.5 no-underline transition-all duration-200 ${
                 isActive
                   ? 'text-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)]'
                   : 'text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
               }`
             }
-            style={{ transition: 'background-color .2s, color .2s, transform .2s var(--ease-out-back)' }}
           >
-            {({ isActive }) => (
-              <>
-                <Icon
-                  className={`w-[18px] h-[18px] transition-transform duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] ${
-                    isActive ? 'scale-110' : 'group-hover:scale-105'
-                  }`}
-                />
-                <span
-                  className={`truncate text-[10px] leading-none transition-all duration-300 ease-[cubic-bezier(0.34,1.32,0.64,1)] ${
-                    isActive ? 'font-semibold' : 'font-medium'
-                  }`}
-                >
-                  {label}
-                </span>
-              </>
-            )}
+            <Icon className="w-[18px] h-[18px]" />
+            <span className="truncate text-[10px] leading-none font-medium">{label}</span>
           </NavLink>
         ))}
       </div>
