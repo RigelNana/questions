@@ -3,7 +3,6 @@ import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuestionStore } from '../stores/questionStore';
 import { useProgressStore } from '../stores/progressStore';
 import { useHighlightStore } from '../stores/highlightStore';
-import { MarkdownRenderer } from '../components/ui/MarkdownRenderer';
 import { HighlightableMarkdown } from '../components/question/HighlightableMarkdown';
 import { DifficultyBadge } from '../components/filter/DifficultyBadge';
 import { TypeBadge } from '../components/filter/TypeBadge';
@@ -31,6 +30,10 @@ export function QuestionDetail() {
     getQuestionProgress,
     setLastVisited,
   } = useProgressStore();
+  const questionHighlights = useHighlightStore((s) =>
+    questionId ? s.getHighlightsByQuestion(questionId) : [],
+  );
+  const clearForQuestion = useHighlightStore((s) => s.clearForQuestion);
 
   const [showAnswer, setShowAnswer] = useState(false);
   const [activeTab, setActiveTab] = useState<DetailTab>('content');
@@ -178,9 +181,36 @@ export function QuestionDetail() {
       {/* Tab: Content */}
       {activeTab === 'content' && (
         <div className="animate-fade-in">
-          {/* Content */}
-          <div className="p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] mb-5">
-            <MarkdownRenderer content={question.content} />
+          {/* Content (可划线批注) */}
+          <div className="p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] mb-3">
+            <HighlightableMarkdown
+              content={question.content}
+              questionId={question.id}
+              section="content"
+            />
+          </div>
+
+          {/* Highlight hint / summary */}
+          <div className="mb-5 flex items-center justify-between gap-2 text-xs text-[var(--color-notion-text-secondary)]">
+            <span className="inline-flex items-center gap-1.5">
+              <Highlighter className="w-3.5 h-3.5 text-[var(--color-notion-accent)]" />
+              {questionHighlights.length > 0 ? (
+                <>已有 <span className="font-semibold text-[var(--color-notion-text)]">{questionHighlights.length}</span> 条划线批注 · 选中文字可继续划线</>
+              ) : (
+                <>选中文字即可划线批注 · 点击划线可编辑</>
+              )}
+            </span>
+            {questionHighlights.length > 0 && (
+              <button
+                onClick={() => {
+                  if (!questionId) return;
+                  if (window.confirm('确认清除本题全部划线批注？')) clearForQuestion(questionId);
+                }}
+                className="text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-error)] transition-colors"
+              >
+                清除全部
+              </button>
+            )}
           </div>
 
           {/* Action buttons */}
@@ -231,7 +261,11 @@ export function QuestionDetail() {
                 </div>
               )}
 
-              <MarkdownRenderer content={question.answer} />
+              <HighlightableMarkdown
+                content={question.answer}
+                questionId={question.id}
+                section="answer"
+              />
 
               {/* References */}
               {question.references && question.references.length > 0 && (

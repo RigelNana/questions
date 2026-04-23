@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Highlight, HighlightColor, HighlightSection } from '../types';
+import type { Highlight, HighlightSection } from '../types';
 import { loadFromStorage, saveToStorage } from '../utils/storage';
 
 const STORAGE_KEY = 'sre-quiz-highlights';
@@ -115,16 +115,3 @@ export const useHighlightStore = create<HighlightState>((set, get) => {
   };
 });
 
-// Helper hook-style selector to subscribe to a specific section's highlights.
-export function selectSectionHighlights(
-  questionId: string,
-  section: HighlightSection,
-) {
-  return (s: HighlightState): Highlight[] => s.byKey[keyOf(questionId, section)] ?? [];
-}
-
-export function _keyOf(qid: string, section: HighlightSection) {
-  return keyOf(qid, section);
-}
-
-export type { HighlightColor };
