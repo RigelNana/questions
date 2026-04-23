@@ -1,0 +1,165 @@
+{
+  "id": "ds-cache-db-consistency",
+  "name": "缓存与数据库双写一致性",
+  "domain": "distributed-system",
+  "description": "分析缓存与数据库双写场景下的数据不一致问题，掌握先删缓存/先写DB/延迟双删/Canal 订阅等主流方案的原理与适用场景",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-cache-db-consistency-q1",
+      "domain": "distributed-system",
+      "type": "modification",
+      "difficulty": 2,
+      "tags": ["缓存一致性", "Cache-Aside", "Redis", "双写", "延迟双删", "Canal", "分布式"],
+      "title": "线上出现缓存价格比数据库低 10 元的 Bug，如何根治双写一致性问题？",
+      "content": "你们团队负责一个电商平台的商品服务，日均 PV 约 800 万，读写比大约 20:1。缓存层用 Redis 6.2，数据库用 MySQL 8.0，缓存策略是经典的 Cache-Aside 模式。\n\n写操作的逻辑非常直接：运营在后台修改商品价格，服务先执行 `UPDATE products SET price = ? WHERE id = ?`，成功后调用 `redis.del(\"product:\" + id)` 删掉对应的缓存 key。下次有用户请求这个商品时，Cache Miss，从 MySQL 重新读取最新价格写入缓存，后续请求命中缓存。教科书级别的 Cache-Aside。\n\n然而某天早上，客服收到几十个用户反馈：已经涨价的商品，在 App 里显示的价格比实际结算价低了整整 10 元。你在后台验证：MySQL 里的价格是正确的，但 Redis 里这个 key 缓存的值是旧价格。\n\n你翻阅了代码，逻辑没有问题，也没有任何代码路径会写入旧价格。但监控显示，这个 key 大约在价格变更后 30 秒内就已经存储了旧值，而并不是因为 TTL 过期被动失效后又被老数据填回去的。\n\n经过一番排查，你复现了问题场景。写请求 W1 在完成 `UPDATE products` 之后、执行 `redis.del` 之前，存在一个短暂的时间窗口——就在这个窗口里，读请求 R2 发现缓存不存在（之前另一次变更已经把缓存删掉了），于是去 MySQL 读到了 W1 还没提交完的旧值（或读到了旧事务隔离版本），并把这个旧值写入了 Redis。紧接着 W1 的 `redis.del` 执行成功，缓存被清空了——但 R2 的 `SET` 在 `DEL` 之后才到达 Redis，把旧价格又写了回去。\n\n这就是「写 DB 后删 Redis」方案最经典的并发漏洞：`DEL` 和「读旧值后 SET」之间的竞态。问题不是必然复现，但在写操作执行时间较长（网络抖动、MySQL 响应慢）、读并发较高的情况下，概率会显著上升。\n\n**问题**：这个场景下，Cache-Aside 的双写竞态为什么无法通过简单加锁解决？有哪些方案可以从根本上缓解甚至消除这类不一致问题？各方案的实现成本与适用边界是什么？",
+      "answer": "## 第一步：先把 Cache-Aside 这个模式本身讲透\n\nCache-Aside（旁路缓存）是分布式系统中最常用的缓存模式，没有之一。它的核心思想是：缓存不是数据库的镜像，而是应用程序自己管理的一张「热数据索引表」。读流程是先查缓存，Miss 了再查数据库，然后把结果写进缓存；写流程是先更新数据库，然后让缓存失效（删 key，而不是更新 key）。\n\n为什么写操作要「删缓存」而不是「更新缓存」？Facebook 早在 2013 年的那篇论文《Scaling Memcache at Facebook》里就讲清楚了：更新缓存面临两个问题——第一，如果有多个写操作并发到来，「写 DB 后更新缓存」这两步之间没有原子性，两次写的 DB 顺序和 Cache 顺序可能不一致，最终缓存里存的是更早那次写的旧值；第二，缓存里的数据往往需要聚合多张表的结果（比如商品详情 = 基础信息 + 价格 + 库存），单次 DB 写入后很难立刻重新计算并写入缓存，删 key 让下次读请求自己重建更简单。所以主流实践是「写 DB，删缓存」，不是「写 DB，写缓存」。\n\n明白了这个背景，再来看为什么「先写 DB，再删缓存」还会出现一致性问题。\n\n## 第二步：把竞态条件的根源说清楚\n\n任何「写 DB + 操作缓存」方案的一致性问题，本质上都来自同一个根源：这两步操作不是原子的，中间有时间窗口。这是分布式系统里无法通过单纯加锁消除的，原因如下。\n\n你可能会想：在「写 DB」和「删缓存」之间加一把分布式锁，让这个窗口对外不可见，不就行了？听起来合理，但做不到。读请求在 Cache Miss 之后需要去 DB 读数据，然后把数据写回缓存。如果「写 DB + 删缓存」全程持有锁，那读请求的「读 DB + 写缓存」也必须持有同一把锁才能保证原子性。这意味着每次读 Miss 都要抢锁——而你们的读写比是 20:1，这把锁会成为灾难级别的性能瓶颈，TP99 直接爆。\n\n更根本的原因是：你对 Redis 和 MySQL 的操作永远不在同一个事务里。即便你让「写 DB + 删缓存」变得足够快，在高并发下，总有某个读请求能挤进 DB 写完和缓存删完之间的微小窗口里，把旧值（或者还未提交的版本）读出来写进缓存，然后你的 `DEL` 先到达了 Redis，读请求的 `SET` 后到达，旧值就被钉死在缓存里了。\n\n这就是经典的「ABA 问题」在缓存双写场景下的变体：缓存先被删（A → 空），然后被旧数据填回（空 → A），但数据库里已经是新值 B 了，两边出现了永久性分裂。\n\n## 第三步：四种主流方案逐一拆解\n\n### 方案一：先删缓存，再写 DB（❌ 不要用）\n\n先删 Redis，然后写 MySQL。直觉上，删完缓存再写 DB，缓存里不会有脏数据了。但这个顺序的问题更严重：删完缓存后，MySQL 还没写完，这段时间里所有 Cache Miss 的读请求都会去 MySQL 读，读到的是旧值，并且把旧值写进 Redis。等 MySQL 写完，Redis 里存的全是刚刚被大量读请求灌进去的旧数据。这个方案的不一致概率比「先写 DB 再删缓存」高得多，因为 MySQL 的写操作比 Redis 的 DEL 慢得多，时间窗口更长。放弃这个方案。\n\n### 方案二：先写 DB，再删缓存（✅ 大多数场景足够）\n\n这是 Facebook 论文推荐的方案，也是目前业界最普遍的做法。在大多数情况下，这个顺序是安全的。原因是：写 DB 完成后，读请求即便在这一瞬间触发 Cache Miss，它从 DB 读到的是新值，写进缓存的也是新值，不存在问题。只有一种极小概率的情况才会出 bug：\n\n```\n时间线：\nT1: 写请求 W1 执行 UPDATE（MySQL 写）\n    ← 就在这里，另一次写操作已经把缓存删掉了，缓存 key 不存在\nT2: 读请求 R2 Cache Miss，去 MySQL 读 → 读到 W1 还没提交的旧值（RR 隔离级别下的 MVCC 快照）\nT3: W1 提交事务，执行 redis.del(key)\nT4: R2 把旧值 SET 进 Redis  ← 此时 key 已经被 DEL 过了，旧值被重新写入\n```\n\n这个问题的必要条件极其苛刻：W1 的 MySQL 事务执行时间必须足够长（导致 MVCC 快照读到旧版本），并且 R2 的「读 DB → 写 Redis」两步必须跨越 W1 的 `DEL` 操作。在实践中，如果给缓存设置合理的 TTL（比如 60 秒），就算出现了脏数据，最长 60 秒后也会自然失效，损失可控。对于大多数非金融类业务，「先写 DB 再删缓存 + 合理 TTL」已经足够。\n\n### 方案三：延迟双删（✅ 低成本提升一致性）\n\n延迟双删是在「先写 DB，再删缓存」基础上的一个补丁：写完 DB 删一次缓存之后，异步等待一段时间（通常 500ms 到 1s），再删一次缓存。这样即便中间有读请求把旧值写进了缓存，第二次删除也能把它清掉。\n\n```java\n// 写操作示例\npublic void updateProductPrice(long id, BigDecimal newPrice) {\n    // 第一步：写 DB（事务提交后才继续）\n    productMapper.updatePrice(id, newPrice);\n    \n    // 第二步：第一次删缓存\n    redisTemplate.delete(\"product:\" + id);\n    \n    // 第三步：异步延迟再删一次\n    // 延迟时间 = 业务读操作的最大 RT + 一点余量\n    // 这里 500ms 能覆盖绝大多数读请求的 DB + 网络 RT\n    asyncExecutor.schedule(\n        () -> redisTemplate.delete(\"product:\" + id),\n        500, TimeUnit.MILLISECONDS\n    );\n}\n```\n\n延迟时间怎么定？理论上要大于「读请求从 Cache Miss 到完成 SET Redis」的最大耗时。通常这个值 = MySQL 读 RT + 网络来回 + Redis SET RT，一般不超过 200ms。选 500ms 是给了足够的余量，即便 MySQL 响应慢，也能覆盖绝大多数情况。\n\n延迟双删的缺点是：这个「延迟 500ms」是个经验值，不同的业务、不同的负载下这个值可能不一样；另外，延迟期间仍然可能有读请求读到旧数据（虽然 500ms 后会被修正）。这个方案解决了大部分并发问题，但在极端高并发下仍有小概率脏窗口。\n\n### 方案四：Canal 订阅 binlog（✅ 大型系统的彻底解法）\n\nCanal 是阿里开源的 MySQL binlog 订阅组件，它模拟一个 MySQL Slave 的行为，从 MySQL 的 binlog 里读取所有数据变更事件。整个架构如下：\n\n```\nMySQL（写操作提交 → binlog 写入）\n    ↓\nCanal Server（模拟 Slave，订阅 binlog，解析 ROW 格式事件）\n    ↓\nKafka Topic（change_events）\n    ↓\nCache Invalidation Consumer（消费变更事件，执行 redis.del）\n    ↓\nRedis（缓存失效）\n```\n\n业务代码里的写操作只需要操心写 DB，完全不用管缓存。只要 MySQL 的事务提交了，binlog 就一定会被 Canal 读到，然后通过 Kafka 流到缓存失效消费者，自动删除 Redis 里对应的 key。\n\nCanal 方案的核心优势有三点：第一，业务代码和缓存失效逻辑完全解耦，即便有人写了一个不删缓存的 SQL 直接改了 DB（比如 DBA 的紧急修复），binlog 也会兜底触发缓存失效；第二，binlog 是严格有序的，同一行数据的多次变更在 binlog 里是顺序的，不会出现「新值先到 Consumer、旧值后到 Consumer」导致缓存被旧值覆盖的乱序问题；第三，Kafka 的消费者端可以做幂等和重试，Canal 的 position 机制保证 binlog 不丢失，整体可靠性远高于应用层的两次网络调用。\n\n缺点也很明显：Canal + Kafka 是额外的基础设施，运维成本不低；binlog 消费是异步的，从 MySQL 提交到 Redis key 被删，通常有 500ms 到 1s 的延迟，这段时间里读到旧数据的可能性依然存在。Canal 并不是「强一致」方案，它是「最终一致」方案，只是把不一致窗口控制到了更小、更可预测的范围内。\n\n## 第四步：方案选型建议\n\n回到你们商品服务的实际问题：出现的那次 Bug，根本原因是写操作的 MySQL 事务执行时间偶发性变长（可能是 MySQL 主从延迟或锁竞争），导致并发读请求读到了 MVCC 旧快照。最低成本的修复是延迟双删，把异步删缓存的延迟设为 1 秒，把单次写操作的「覆盖率」提高到接近 100%。\n\n如果你们的业务规模继续增长，商品价格变更频繁，或者有多个服务（商品服务、促销服务、价格服务）都会写同一份商品数据，那就该认真考虑 Canal 方案了。多服务写同一数据是延迟双删处理不了的场景，因为每个服务都需要独立维护「删缓存」逻辑，任何一个遗漏就会出 bug。Canal 的统一消费者把这个职责集中到一处，是更工程化的解法。\n\n至于加分布式锁的方案——除非你的业务对一致性要求到了金融级别（比如实时余额展示），且有专门的强一致性 SLA，否则不要走这条路。分布式锁对 Redis 本身的依赖加上锁竞争的延迟代价，往往得不偿失。金融场景下更推荐的做法是绕开缓存，对敏感数据直接读 DB，或者用 Read-Through 模式配合 Leaderboard 做读取控流。\n\n最后一个生产小技巧：无论选哪种方案，给缓存设置合理的 TTL 是必须的兜底手段。TTL 不是性能优化的工具，而是数据一致性的最后防线。就算所有的删缓存逻辑都因为某个极端 Bug 失效了，TTL 过期后数据总会自动恢复正确。对于商品详情这类数据，TTL 设 5 分钟到 30 分钟是合理范围。",
+      "keyPoints": [
+        "Cache-Aside 模式的写操作应该「先写 DB，再删缓存」而不是「先写 DB，再更新缓存」，原因是多次并发写时缓存更新顺序可能比 DB 更新顺序乱，「删 key」比「写 key」更安全。",
+        "「先写 DB，再删缓存」仍存在低概率竞态：当读请求的 Cache Miss 触发「读 DB + 写缓存」这两步跨越了写请求的 `DEL` 操作时，旧值会被写回缓存形成永久脏数据。",
+        "「先删缓存，再写 DB」是更差的方案，因为写 DB 比删 Redis 慢得多，时间窗口更长，期间所有读请求都会把旧值灌入缓存，不一致概率更高。",
+        "延迟双删通过在「写 DB + 第一次删缓存」之后异步延迟 500ms 至 1s 再删一次缓存，覆盖「旧值回填」的竞态窗口，是低改造成本下最实用的优化方案。",
+        "Canal 订阅 MySQL binlog 是大型系统的彻底解法：业务代码只管写 DB，Canal 模拟 Slave 接收 binlog 变更事件，通过 Kafka 异步触发缓存失效，业务与缓存逻辑完全解耦。",
+        "binlog 的严格顺序性保证了 Canal 方案不会出现「新值先到消费者、旧值后到消费者」的乱序覆盖问题，这是应用层延迟双删无法保证的特性。",
+        "所有缓存双写方案（包括 Canal）本质上都是最终一致性，不是强一致性；给缓存设置合理 TTL（如 5-30 分钟）是任何方案都应该叠加的兜底手段，是数据一致性的最后防线。",
+        "当多个微服务都会写同一份数据（如商品价格同时被「商品服务」和「促销服务」修改）时，延迟双删因为需要每个服务独立维护删缓存逻辑而极易遗漏，Canal 统一消费者是这种场景下唯一可靠的方案。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-cache-db-consistency-q1-quiz1",
+          "question": "Cache-Aside 模式中，写操作推荐「删缓存」而不是「更新缓存」，最核心的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "删操作比写操作消耗更少的 Redis 内存" },
+            { "id": "B", "text": "多次并发写时，写 DB 和更新缓存各自都是两步操作，两步之间没有原子性，并发场景下缓存更新顺序可能与 DB 写入顺序不一致，导致缓存存储了更旧的写结果" },
+            { "id": "C", "text": "Redis SET 命令存在性能瓶颈，高并发下写缓存容易超时" },
+            { "id": "D", "text": "缓存更新后需要通知其他服务，消息传递有延迟" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "A、C、D 都是无关或错误的理由。核心原因是并发写的顺序一致性问题：假设有 W1 和 W2 两个并发写操作，W1 先写 DB（新值 v1），W2 后写 DB（新值 v2），理论上最终 DB 里是 v2。但如果 W1 先更新缓存（写 v1），W2 后更新缓存（写 v2），缓存最终是 v2，看起来没问题。但如果由于网络抖动，W2 的「更新缓存」先到（写 v2），W1 的「更新缓存」后到（写 v1），缓存最终是 v1，而 DB 是 v2，两边永久分裂。「删 key」没有这个问题，因为谁最后删都是删，缓存是空的，下次读请求会从 DB 重建出最新值。"
+        },
+        {
+          "id": "ds-cache-db-consistency-q1-quiz2",
+          "question": "「先删缓存，再写 DB」和「先写 DB，再删缓存」相比，哪个方案的不一致概率更高？为什么？",
+          "choices": [
+            { "id": "A", "text": "两个方案概率相同，不一致都是由并发读写引起的" },
+            { "id": "B", "text": "「先写 DB，再删缓存」的概率更高，因为 DB 写操作比 Redis 操作慢，时间窗口更长" },
+            { "id": "C", "text": "「先删缓存，再写 DB」的概率更高，因为删缓存后 DB 写完之前的时间窗口更长，期间所有读请求都触发 Cache Miss 并把旧值写进缓存" },
+            { "id": "D", "text": "「先删缓存，再写 DB」更安全，因为删缓存后再写 DB，缓存里不会存在脏数据" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "「先删缓存，再写 DB」的问题在于：删完缓存后，MySQL 的写操作还没有完成（MySQL 写通常需要几毫秒到几十毫秒），在这段时间里，所有触发 Cache Miss 的读请求都会去 MySQL 读旧值并写进 Redis。等 MySQL 写完，Redis 已经被大量旧值填满了，而且这些 key 有 TTL 保护，短时间内不会再次失效。相比之下，「先写 DB，再删缓存」的竞态条件要求读请求的 SET Redis 必须在 DEL Redis 之后到达，这需要非常精确的时序巧合，概率远低于前者。D 选项是常见误解，删了缓存不代表 DB 里是新值，写 DB 期间读到的仍是旧值。"
+        },
+        {
+          "id": "ds-cache-db-consistency-q1-quiz3",
+          "question": "延迟双删中，第二次删缓存的延迟时间应该如何设定？",
+          "choices": [
+            { "id": "A", "text": "固定 100ms，足够覆盖大多数网络延迟" },
+            { "id": "B", "text": "等于 Redis 的 TTL 时间" },
+            { "id": "C", "text": "大于「读请求从 Cache Miss 到完成 SET Redis」的最大耗时，即 MySQL 读 RT + 网络来回时间 + Redis SET RT 的总和，通常取 500ms 到 1s" },
+            { "id": "D", "text": "等于 MySQL 主从同步延迟时间" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "延迟双删的目的是覆盖「读请求把旧值写回缓存」的竞态窗口。这个窗口的长度是：从写请求执行 `redis.del`（第一次删）的那一刻起，到最晚一个能读到旧值的读请求完成 `redis.set` 的时刻止。这个时间等于「读请求从 Cache Miss 开始，经过读 MySQL、网络传输、写 Redis 的全程耗时」。通常 MySQL 读操作 20-50ms，网络来回加上 Redis SET 50-100ms，总计不超过 200ms，选 500ms 到 1s 给了充足余量。A 选项 100ms 在 MySQL 响应慢时可能不够；B 和 D 选项与延迟目的无关。"
+        },
+        {
+          "id": "ds-cache-db-consistency-q1-quiz4",
+          "question": "Canal 模拟 MySQL Slave 的本质原理是什么？",
+          "choices": [
+            { "id": "A", "text": "Canal 通过轮询 MySQL 的 information_schema 来感知数据变化" },
+            { "id": "B", "text": "Canal 向 MySQL 注册为一个 Slave 节点，通过 MySQL 复制协议接收 binlog 事件流，解析 ROW 格式的变更记录" },
+            { "id": "C", "text": "Canal 通过代理 MySQL 的所有 SQL 请求来拦截写操作" },
+            { "id": "D", "text": "Canal 读取 MySQL 的 redo log 来获取变更信息" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Canal 的核心机制是伪装成 MySQL 的 Slave 节点：它向 MySQL 发送 `SHOW MASTER STATUS` 获取当前 binlog 位置，然后发送 `COM_BINLOG_DUMP` 命令，让 MySQL 把后续的 binlog 事件像向真实 Slave 同步那样推送过来。Canal 解析这些事件，把 ROW 格式的二进制日志还原成「某表某行从旧值变为新值」的结构化事件。A 选项的轮询方式性能差且不实时；C 选项的 SQL 代理是另一类方案（如 Vitess），与 Canal 无关；D 选项 redo log 是 InnoDB 内部的崩溃恢复日志，MySQL 没有提供外部订阅 redo log 的接口，binlog 才是对外的变更日志。"
+        },
+        {
+          "id": "ds-cache-db-consistency-q1-quiz5",
+          "question": "下面这段代码想实现「先写 DB，再删缓存」，它存在什么潜在问题？\n\n```java\npublic void updateProduct(Product p) {\n    db.update(p);          // 写 MySQL\n    cache.set(\"product:\" + p.getId(), p);  // 直接写缓存（不是删）\n}\n```",
+          "choices": [
+            { "id": "A", "text": "代码没有问题，直接写缓存比删缓存更高效，减少了下一次读请求的 Cache Miss" },
+            { "id": "B", "text": "存在并发写乱序问题：W1 和 W2 并发执行时，如果 W2 先完成 cache.set，W1 后完成 cache.set，缓存最终存储的是 W1 的旧值，而 DB 里是 W2 的新值" },
+            { "id": "C", "text": "cache.set 会占用过多内存" },
+            { "id": "D", "text": "只有在网络超时的情况下才会出现问题" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题直接考「为什么写操作要删缓存而不是写缓存」。并发写场景下，假设 W1（写旧值 v1）和 W2（写新值 v2）同时发起：DB 层有事务保护，最终 DB 里是 v2（W2 后提交）。但 cache.set 是两个独立的非原子操作，如果 W2 的 cache.set 先执行完（写入 v2），然后 W1 的 cache.set 后执行完（写入 v1），缓存最终是旧值 v1。这种乱序在并发高时完全可能发生，而且缓存里的 v1 会一直存在直到 TTL 过期，整个过期期间所有读请求都拿到错误数据。改为 `cache.del` 就没有这个问题，因为无论谁先谁后删，缓存都是空的，不存在乱序覆盖。"
+        },
+        {
+          "id": "ds-cache-db-consistency-q1-quiz6",
+          "question": "Canal + Kafka 的缓存失效方案中，即使消费者消费延迟了 2 秒，也不会出现「旧值覆盖新值」的问题。这是因为什么？",
+          "choices": [
+            { "id": "A", "text": "Kafka 消费者使用了幂等消费机制" },
+            { "id": "B", "text": "消费者只执行 redis.del 而不是 redis.set，删除操作没有旧值和新值的区分，无论延迟多久，删除的结果都是缓存为空，下次读请求会从 DB 重建最新值" },
+            { "id": "C", "text": "Canal 会对 binlog 事件做去重处理，防止重复消费" },
+            { "id": "D", "text": "Kafka 的 offset 机制保证了消息的有序性" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考察对「为什么是删缓存而不是写缓存」的深层理解。Canal 消费者执行的是 `redis.del(key)`，而不是 `redis.set(key, value)`。DEL 操作没有值的概念——无论什么时候执行 DEL，结果都是 key 不存在，下次读请求触发 Cache Miss 后从 DB 读取的一定是当前最新值。相比之下，如果消费者执行的是 `redis.set`，那延迟了 2 秒后 set 进去的值就是 2 秒前的旧值，会覆盖可能已经被更新的新值。A 选项的幂等消费是防止重复删除，不是防乱序；D 选项 Kafka 顺序性是消息消费的基础，但不是本题核心原因。"
+        },
+        {
+          "id": "ds-cache-db-consistency-q1-quiz7",
+          "question": "以下哪个场景下，延迟双删方案不够用，必须考虑 Canal 方案？",
+          "choices": [
+            { "id": "A", "text": "单个服务写单张表，QPS 约 500/s" },
+            { "id": "B", "text": "业务逻辑比较复杂，缓存 TTL 需要设置得比较短" },
+            { "id": "C", "text": "有多个不同的微服务（如商品服务、促销服务、价格服务）都会修改同一份数据，每个服务都需要独立维护「写 DB 后删缓存」的逻辑，极易遗漏" },
+            { "id": "D", "text": "需要跨多个 Redis 实例做缓存失效" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "延迟双删的局限性在于：它把「删缓存」这个职责分散在每个执行写操作的业务代码里。当只有单个服务时，维护这个逻辑不难。但当多个微服务都能修改同一份数据时，问题就来了——每个服务的开发者都需要知道「写完 DB 还要删这些缓存 key」，只要有一个人漏掉，或者有人直接写 SQL 绕过了服务层（比如 DBA 的紧急修复），缓存就会出现永久不一致。Canal 方案把「删缓存」这个职责从业务代码里抽出来，放到一个独立的 Consumer 服务里，任何修改 DB 的操作（不管走不走业务代码）都会被 binlog 兜底捕获，这是架构层面的根本解耦。A 和 B 场景延迟双删完全可以覆盖；D 场景与选型维度无关。"
+        },
+        {
+          "id": "ds-cache-db-consistency-q1-quiz8",
+          "question": "在「先写 DB，再删缓存」方案中，如果 redis.del 因为网络异常失败了，最好的处理方式是什么？",
+          "choices": [
+            { "id": "A", "text": "捕获异常，打印错误日志，不做任何处理，等待 TTL 自然过期" },
+            { "id": "B", "text": "把失败的 key 推送到消息队列，由后台消费者做重试删除；同时缓存设置合理 TTL 作为兜底" },
+            { "id": "C", "text": "立即重试 10 次，直到成功为止" },
+            { "id": "D", "text": "回滚 DB 的写操作，保持数据一致" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "A 选项依赖 TTL 过期，期间用户看到旧数据，且如果 TTL 设得比较长（如 1 小时），用户体验很差；但作为最低成本的兜底方案，TTL 是必须设的，只是不能作为唯一处理方式。C 选项在当前请求上下文里同步重试 10 次：首先会显著增加接口 RT；其次如果 Redis 故障，10 次重试全部超时，会拖垮整个写操作。D 选项是根本错误的，DB 的写已经成功提交，回滚代价极高且破坏数据一致性。B 选项的消息队列重试是生产最佳实践：它把「保证缓存最终失效」这个责任从实时请求链路里解耦出来，重试在后台异步完成，不影响主链路 RT；加上 TTL 兜底，即便消息队列也出故障，数据最终也会自动修正。"
+        },
+        {
+          "id": "ds-cache-db-consistency-q1-quiz9",
+          "question": "Canal 方案中，为什么 MySQL 的 binlog 必须配置为 ROW 格式，而不能用 STATEMENT 格式？",
+          "choices": [
+            { "id": "A", "text": "ROW 格式的 binlog 体积更小，传输更快" },
+            { "id": "B", "text": "STATEMENT 格式只记录 SQL 语句，Canal 解析 SQL 需要重放执行才能知道实际影响了哪些行，对于 `UPDATE products WHERE category = 'phone'` 这类语句无法直接知道影响的 row ID；ROW 格式直接记录每行变更前后的数据，Canal 可以直接读取受影响的主键，精准触发缓存失效" },
+            { "id": "C", "text": "STATEMENT 格式不支持主从复制" },
+            { "id": "D", "text": "ROW 格式支持事务，STATEMENT 格式不支持" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "STATEMENT 格式 binlog 记录的是原始 SQL 语句，比如 `UPDATE products SET price = 100 WHERE category = 'phone'`。Canal 拿到这条语句后，无法在不执行这条 SQL 的情况下知道具体哪些 row 被更新了（category = 'phone' 可能匹配几百行）。如果要确定影响的行，Canal 就需要连接到 MySQL 重放这个查询，这既复杂又不可靠。ROW 格式则直接在 binlog 里记录了「product:1001 从 price=90 变为 price=100」、「product:1002 从 price=85 变为 price=95」……Canal 直接读取这些记录，精准拿到所有受影响行的主键，触发对应的 `redis.del(\"product:1001\")`、`redis.del(\"product:1002\")`。A 选项相反，ROW 格式因为记录了行数据，体积通常比 STATEMENT 更大；C 和 D 均为错误说法。"
+        },
+        {
+          "id": "ds-cache-db-consistency-q1-quiz10",
+          "question": "对于金融级别的余额展示场景，以下哪个方案是最合适的？",
+          "choices": [
+            { "id": "A", "text": "延迟双删，把延迟时间调到 5 秒以上，保证缓存里一定是最新余额" },
+            { "id": "B", "text": "Canal + Kafka，利用 binlog 的顺序性保证缓存最终一致" },
+            { "id": "C", "text": "对余额这类强一致性要求的数据，直接读 DB 而不经过缓存，或者配合读写锁确保查询到的是已提交的最新值" },
+            { "id": "D", "text": "写操作加 Redis 分布式锁，锁住期间不允许任何读操作" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "延迟双删（A）和 Canal（B）都是最终一致性方案，Canal 方案从 binlog 写入到缓存失效有 500ms 以上的窗口。在这个窗口里，余额展示可能仍然是旧值——对于一笔刚完成的转账，用户刷新页面看到余额没变，这在金融场景下是不可接受的。D 选项的分布式锁思路本身有方向，但「锁住期间不允许读」会导致系统可用性极低，且分布式锁本身也有超时、宕机释放等可靠性问题。C 选项「绕开缓存直接读 DB」是金融场景的标准做法：余额、已用额度、冻结金额这类强一致性数据，牺牲部分读性能换取数据准确性，并在数据库层利用行锁、MVCC 的 RC 隔离级别确保读到已提交的最新值。如果读 DB 的性能不够，可以在 DB 层做读写分离或使用读副本，而不是引入缓存。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Scaling Memcache at Facebook (NSDI 2013)",
+          "url": "https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf"
+        },
+        {
+          "title": "Canal - Alibaba MySQL Binlog Subscriber",
+          "url": "https://github.com/alibaba/canal"
+        },
+        {
+          "title": "缓存更新的套路 - 左耳朵耗子",
+          "url": "https://coolshell.cn/articles/17416.html"
+        }
+      ]
+    }
+  ]
+}
