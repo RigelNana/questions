@@ -1,0 +1,157 @@
+{
+  "id": "ds-storage-rebalance-requirement",
+  "name": "存储扩容数据再均衡策略",
+  "domain": "distributed-system",
+  "description": "分析分布式存储系统扩容时的数据迁移需求，对比固定分片、一致性哈希、范围分片的再均衡代价，掌握在线迁移的工程实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-storage-rebalance-requirement-q1",
+      "domain": "distributed-system",
+      "type": "requirement",
+      "difficulty": 3,
+      "tags": ["redis", "redis-cluster", "rebalancing", "hash-slot", "horizontal-scaling", "distributed-storage"],
+      "title": "Redis Cluster 从 6 节点扩容到 10 节点，如何规划在线数据迁移？",
+      "content": "你负责维护一套 Redis Cluster 集群，当前配置如下：\n\n```\n节点数量：6 个 Master（每个 Master 带 1 个 Replica）\n单节点内存：64GB（maxmemory 56GB，留 8GB 给系统和碎片）\n集群总可用容量：6 × 56GB = 336GB\n当前数据量：约 307GB（使用率 91%）\n业务类型：用户 Session 存储 + 热点商品缓存，读写比约 7:3\n```\n\n最近两周数据量以每天 5GB 的速度在增长，按当前趋势，6 天后就会打满。你决定扩容到 10 个 Master 节点。\n\n运维约束如下：业务高峰期（每天 10:00–22:00）不能执行任何影响性能的操作；迁移期间服务不能中断，QPS 抖动不能超过 10%；数据不能丢失，迁移失败要能回滚。\n\n请你给出完整的扩容规划：包括扩容前的准备工作、迁移执行步骤、迁移过程中的数据路由机制、速度控制策略，以及迁移完成后的验证方法。",
+      "answer": "## 第一步：理解分布式存储的再均衡本质\n\nRedis Cluster 是一个典型的分布式存储系统，在回答这道题之前，有必要先把「数据再均衡」这件事的本质讲清楚，这样后面的每一个操作决策才有根据，而不是「照着命令行抄一遍」。\n\n分布式存储系统在设计之初就面临一个根本矛盾：数据要分散到多个节点上存放（这样才能突破单机容量上限），但同时客户端发来一个 key 的请求，系统必须能快速判断「这个 key 在哪个节点上」。解决这个问题的方法就是分片策略（Sharding），而最典型的三种策略——固定哈希分片、一致性哈希、范围分片——在扩容时的代价截然不同。\n\n固定哈希分片（`hash(key) % N`）在节点数 N 变化时会导致几乎所有 key 的路由发生变化，极端情况下需要迁移全量数据，这是最暴力也最不可用的方式。一致性哈希通过引入虚拟节点环，把扩容时的迁移量控制在 `1/N` 左右——加入第 N+1 个节点时，理论上只需要迁移约 `1/(N+1)` 的数据。Redis Cluster 采用的是哈希槽（Hash Slot）方案，本质上是一种介于两者之间的「显式分片」策略：把 key 空间固定切成 16384 个槽，节点和槽的映射关系存储在集群元数据里，扩容时只需要把部分槽从旧节点迁移到新节点，迁移量精确可控。\n\n为什么是 16384 这个数字？Redis 作者 antirez 解释过：16384 个槽的元数据用位图表示只需要 2KB，在节点间传递 gossip 消息时开销可接受；同时 16384 已经远大于实际部署的节点数（上千节点的 Redis Cluster 在工程上不现实），所以每个节点至少能分到几十个槽，粒度足够细。这个设计决策影响了后续所有的运维操作，所以值得先理解清楚。\n\n再均衡（Rebalancing）这个过程的核心挑战不是「移动数据」本身，而是「移动过程中保证读写正确性」。在槽 X 从节点 A 迁移到节点 B 的过程中，有些 key 已经到了 B，有些还在 A，客户端的请求随时可能打来，系统必须能正确处理两种情况。Redis Cluster 用 MIGRATING/IMPORTING 状态和 ASK 重定向机制解决了这个问题，后面会详细展开。\n\n## 第二步：扩容前的准备工作\n\n很多工程师看到「容量快打满了」就立刻开始执行扩容，这是大忌。我见过不止一次「边扩容边触发 OOM，迁移到一半集群崩溃」的事故。正确姿势是先把风险降到最低，再动手。\n\n**评估迁移数据量**。当前 307GB 数据分布在 6 个节点，扩容后变成 10 个节点，每节点均摊约 30.7GB。但这 307GB 不会均匀分布——有些节点可能存了 60GB，有些只有 40GB。先用以下命令摸底每个节点的实际数据量：\n\n```bash\n# 查看每个节点的 used_memory 和槽数量\nredis-cli -h 10.0.0.1 -p 7001 cluster nodes | \\\n  awk '{print $2, $9}' | sort -k2 -n\n\n# 查看集群整体内存情况\nredis-cli --cluster check 10.0.0.1:7001 2>&1 | \\\n  grep -E \"(slots|M slots|used_memory)\"\n```\n\n预期输出类似：\n\n```\n10.0.0.1:7001 slots:[0-2730] (2731 slots) master\n  1 additional replica(s)\n  used_memory: 52428800000  # ~48.8GB\n10.0.0.2:7002 slots:[2731-5460] (2730 slots) master\n  used_memory: 54975488000  # ~51.2GB\n# ... 依此类推\n```\n\n**准备新节点**。4 台新机器需要提前部署好 Redis 进程，配置要与现有节点完全一致，特别注意 `maxmemory`、`maxmemory-policy`、`cluster-enabled yes`、`cluster-config-file`。新节点启动后先不加入集群，用 `redis-cli ping` 确认可达性，用 `redis-cli -h new-node info replication` 确认是独立实例。\n\n**设置迁移速率上限**。在所有现有节点上提前配置迁移速度限制，避免迁移流量在夜间把内网带宽打满，影响 Replica 的同步：\n\n```bash\n# 在每个源节点上执行（10MB/s 是夜间安全值）\nfor host in 10.0.0.1 10.0.0.2 10.0.0.3 10.0.0.4 10.0.0.5 10.0.0.6; do\n  redis-cli -h $host -p 7001 config set \\\n    cluster-migration-barrier 1\n  # cluster-migration-barrier=1 确保每个节点至少留1个replica\ndone\n```\n\n**验证当前集群健康状态**。只有集群完全健康才能开始扩容。`cluster info` 输出中 `cluster_state:ok` 且 `cluster_slots_fail:0` 是最低要求：\n\n```bash\nredis-cli -h 10.0.0.1 -p 7001 cluster info | \\\n  grep -E \"(cluster_state|cluster_slots_fail|cluster_known_nodes)\"\n# 期望输出：\n# cluster_state:ok\n# cluster_slots_fail:0\n# cluster_known_nodes:12  # 6 master + 6 replica\n```\n\n## 第三步：执行扩容——哈希槽迁移的完整流程\n\n扩容分三个阶段：加入新节点、规划槽迁移、执行迁移。每个阶段都有可以中断的检查点。\n\n**阶段一：添加新节点**\n\n```bash\n# 将 4 个新 Master 节点加入集群\n# add-node 的参数：新节点地址 + 集群中任意一个现有节点地址\nredis-cli --cluster add-node 10.0.0.7:7007 10.0.0.1:7001\nredis-cli --cluster add-node 10.0.0.8:7008 10.0.0.1:7001\nredis-cli --cluster add-node 10.0.0.9:7009 10.0.0.1:7001\nredis-cli --cluster add-node 10.0.0.10:7010 10.0.0.1:7001\n```\n\n新节点加入后处于「无槽」状态，此时它们不会接收任何业务请求，对线上完全无影响。用 `cluster nodes` 确认 4 个新节点已出现，且槽范围显示为空：\n\n```\n<new-node-id> 10.0.0.7:7007@17007 master - 0 ... 0 connected\n# connected 后面没有槽范围，说明是空节点\n```\n\n**阶段二：规划槽分配**\n\n当前 6 个节点各约 2730 个槽，扩容到 10 个节点后每节点约 1638 个槽，每个旧节点需要迁出约 1092 个槽。`rebalance --cluster-simulate` 可以预演这个分配方案而不实际执行：\n\n```bash\nredis-cli --cluster rebalance 10.0.0.1:7001 \\\n  --cluster-use-empty-masters \\\n  --cluster-simulate\n```\n\n输出会列出每一步的槽迁移计划，例如「从节点 A 迁移 1092 个槽到节点 G」。这份计划要仔细确认，确保迁移后数据量均衡，没有单个节点承接过多迁移流量。\n\n**阶段三：在低谷期（22:00–次日 10:00）执行迁移**\n\n实际执行用 `reshard` 命令，逐节点逐批次迁移：\n\n```bash\n# 将节点 7001 的 1092 个槽迁移到新节点 7007\n# --cluster-from 指定源节点 ID\n# --cluster-to 指定目标节点 ID\n# --cluster-slots 指定迁移槽数量\nredis-cli --cluster reshard 10.0.0.1:7001 \\\n  --cluster-from a3b8c... \\\n  --cluster-to d4e9f... \\\n  --cluster-slots 1092 \\\n  --cluster-yes\n```\n\n每次 reshard 只操作一对「源节点→目标节点」，建议分批次执行，每批执行后检查集群状态再继续。6 个旧节点各迁出 1092 个槽到 4 个新节点，总计需要执行多轮 reshard（具体几轮取决于迁移方案，通常 6–8 次）。\n\n## 第四步：迁移期间的数据路由机制——ASK 重定向的完整流程\n\n这是整个扩容方案中最容易被面试者跳过的部分，但也是理解「为什么在线迁移不丢数据」的关键。\n\n当槽 X 开始从节点 A 迁移到节点 B 时，A 对槽 X 的状态标记为 MIGRATING，B 对槽 X 的状态标记为 IMPORTING。这两个状态告诉集群：「这个槽正在搬家，要特殊处理」。\n\n此时客户端来了一个 `GET user:123` 请求，假设 `user:123` 属于槽 X，路由逻辑如下：客户端根据本地路由表把请求发给 A。如果 `user:123` 这个 key 还没被迁走，A 正常处理并返回结果，和平时没有任何区别。如果 `user:123` 已经被迁移到 B，A 发现本地找不到这个 key，但槽 X 还处于 MIGRATING 状态，于是 A 返回 `ASK 3 10.0.0.8:7008`——注意是 ASK 而不是 MOVED，这两者语义不同。\n\n客户端收到 ASK 响应后，先向 B 发送一个 `ASKING` 命令（这是关键），然后再发送原始的 `GET user:123`。B 收到 ASKING 命令后，知道接下来的这一条命令要特殊处理：即使槽 X 的 IMPORTING 状态还没结束，也允许这条命令访问。这样 `user:123` 就成功从 B 返回了。\n\n为什么要区分 ASK 和 MOVED？MOVED 是永久性重定向，客户端收到后会更新本地路由表，以后这个槽的请求都发给新节点。ASK 是临时重定向，只对这一次请求有效，客户端不更新路由表——因为槽 X 的迁移还没完成，下一个请求过来时这个 key 可能还在 A 上，不能把整个槽的路由都切走。等到槽 X 的所有 key 都迁移完毕，集群会把槽 X 的归属正式改为 B，此后客户端访问槽 X 才会收到 MOVED 重定向并更新路由表。\n\n对业务代码来说，只要使用的 Redis 客户端库支持 cluster-aware 模式（Jedis、Lettuce、go-redis 等主流库都支持），这整个过程对应用层完全透明，应用代码不需要改任何一行。\n\n## 第五步：迁移速度控制——让业务延迟不抖动\n\n迁移速度的核心矛盾是：太慢了天亮前迁不完，太快了会抢占业务带宽导致延迟抖动。从实际操作经验来看，10–50MB/s 是夜间迁移的安全区间，不同时段动态调整：\n\n```bash\n# 22:00 开始迁移，先用 10MB/s 热身，观察集群延迟\n# 通过 redis-cli CONFIG SET 动态调整，不需要重启\nredis-cli -h source-node -p 7001 config set \\\n  proto-max-bulk-len 10485760   # 单次传输最大 10MB\n\n# 确认延迟正常后（P99 < 5ms），提速到 50MB/s\nredis-cli -h source-node -p 7001 config set \\\n  proto-max-bulk-len 52428800   # 50MB\n\n# 早上 9:30 提前 30 分钟降速，防止迁移流量影响高峰前的预热\nredis-cli -h source-node -p 7001 config set \\\n  proto-max-bulk-len 5242880    # 5MB，迁不完就明晚继续\n```\n\n监控指标要持续盯着两个：`redis-cli --latency -h source-node -p 7001` 实时监控命令延迟；`INFO stats` 里的 `total_commands_processed` 对比迁移前后是否有明显下降。如果延迟突破 10ms 或者 QPS 下降超过 10%，立刻暂停迁移（直接 Ctrl+C 中断 reshard 命令，槽会保持 MIGRATING 状态，可以安全暂停）。\n\n**监控迁移进度**：\n\n```bash\n# 查看各节点槽分配的当前状态\nredis-cli --cluster check 10.0.0.1:7001 2>&1 | \\\n  grep -E \"(M slots|slots)\" | sort\n\n# 实时监控正在迁移的槽\nwatch -n 5 \"redis-cli -h source-node -p 7001 cluster slots | \\\n  grep -A3 'MIGRATING'\"\n```\n\n## 第六步：迁移完成后的验证与收尾\n\n所有槽迁移完成后，不能直接宣告「扩容成功」，还需要几个验证步骤。\n\n首先验证集群状态：`cluster info` 显示 `cluster_state:ok`、`cluster_slots_ok:16384`（全部 16384 个槽都有归属）、`cluster_slots_fail:0`。\n\n然后验证数据完整性。从业务角度抽样验证：抽取 1000 个已知 key，确认所有 key 都能正常读取。如果迁移前有做 key 数量统计（`dbsize` 对每个节点求和），迁移后的总 dbsize 应该与迁移前一致，误差不超过正常的 key 过期淘汰量。\n\n最后给新节点各添加一个 Replica，完善高可用配置：\n\n```bash\n# 添加 Replica 时指定要跟随的 Master 节点 ID\nredis-cli --cluster add-node 10.0.0.11:7011 10.0.0.1:7001 \\\n  --cluster-slave \\\n  --cluster-master-id <new-master-node-id>\n```\n\n扩容完成后，10 个节点每节点约 30.7GB，总可用容量提升到 560GB，使用率降到约 55%，按每天 5GB 的增速，理论上还能撑 45 天——这是下次扩容前充裕的缓冲时间。\n\n## 扩展：其他存储系统的再均衡对比\n\n理解了 Redis Cluster 的扩容机制，再横向对比几个常见系统，面试时能体现出系统性思维。\n\nMySQL 分库分表扩容是公认最复杂的。假设用 `hash(user_id) % 4` 分了 4 张表，现在要扩到 8 张，`%4` 和 `%8` 的路由结果完全不同，几乎所有数据都需要迁移。生产上通常用双写方案：新表和旧表同时写，用 `pt-online-schema-change` 或自研工具做存量数据迁移，验证一致后切流，整个过程以天计，风险极高。这也是为什么 MySQL 分库分表要「一次分够，宁多勿少」。\n\nKafka 的分区扩容有个反直觉的限制：Topic 的分区数只能增加不能减少（减少会导致部分分区数据不可访问）。而且新增的分区不会自动接收历史数据，只接收新写入的消息。如果需要均衡历史数据，要用 `kafka-reassign-partitions.sh` 手动指定迁移方案，迁移期间 Broker 磁盘 IO 会有明显压力，同样要在低谷期操作。\n\nElasticsearch 在这方面做得最自动化：新节点加入集群后，ES 的 Cluster Reroute 机制会自动触发 Shard Rebalancing，把 Primary Shard 和 Replica Shard 重新分配到新节点上，不需要人工介入。但自动不代表无代价——大量 Shard 迁移会给集群带来显著的 I/O 压力。通过 `cluster.routing.allocation.node_concurrent_recoveries`（默认 2）可以限制每个节点同时迁移的 Shard 数量，生产环境建议设为 1，宁可迁慢点也不要影响查询性能。\n\n一个通用的血泪教训：不要等到使用率超过 85% 才开始考虑扩容。扩容准备（采购机器、评估方案、申请变更）本身就需要时间，迁移执行又只能在低谷期进行，留给你的窗口比想象中窄得多。我们内部的经验值是：使用率达到 70% 就启动扩容评估，80% 就要开始执行。",
+      "keyPoints": [
+        "Redis Cluster 使用固定的 16384 个哈希槽作为分片单元，扩容时只需迁移部分槽，迁移量精确可控，而非像固定哈希分片（hash % N）那样需要迁移几乎全量数据",
+        "槽迁移期间源节点标记为 MIGRATING、目标节点标记为 IMPORTING，已迁移的 key 由源节点返回 ASK 重定向（临时，不更新路由表），与迁移完成后的 MOVED 重定向（永久，更新路由表）语义不同",
+        "客户端收到 ASK 重定向后必须先发送 ASKING 命令再发送原始请求，ASKING 命令告知目标节点「这次请求要特殊处理，即使槽还在 IMPORTING 状态也允许访问」，这是在线迁移不丢数据的关键机制",
+        "迁移执行前必须验证集群完全健康（cluster_state:ok、cluster_slots_fail:0），并在所有节点上预设速度限制，夜间迁移速度控制在 10–50MB/s，临近高峰期前 30 分钟降到 5MB/s",
+        "MySQL 分库分表扩容代价最高，因为 hash % N 的路由在 N 变化时几乎所有 key 都需要迁移，生产上通常采用双写方案，迁移周期以天计；Redis Cluster 的哈希槽方案大幅降低了这个代价",
+        "Kafka 分区数只能增加不能减少，且新增分区不接收历史数据，存量数据迁移需要手动执行 kafka-reassign-partitions.sh；Elasticsearch 扩容最自动化但需要通过 node_concurrent_recoveries 控制迁移并发数防止压垮集群",
+        "实际操作中 reshard 命令可以随时 Ctrl+C 中断，槽保持在 MIGRATING 状态不会影响服务，等下一个低谷期继续执行；这种「可暂停」的特性是在线迁移方案设计的核心要求之一",
+        "使用率达到 70% 就应启动扩容评估、80% 时开始执行，留足采购、评估、审批和实际迁移的时间窗口；等到 90% 以上才扩容，迁移期间极易因写入压力触发 OOM，导致迁移失败和数据风险"
+      ],
+      "quiz": [
+        {
+          "id": "ds-storage-rebalance-q1-quiz1",
+          "question": "Redis Cluster 的哈希槽总数是多少？这个数字的设计依据是什么？",
+          "choices": [
+            {"id": "A", "text": "16384 个，位图表示只需 2KB，在节点间传递 gossip 消息时开销可接受，同时粒度足够细"},
+            {"id": "B", "text": "65536 个，与 TCP 端口号范围一致，便于网络层路由"},
+            {"id": "C", "text": "4096 个，是 2 的 12 次幂，便于位运算"},
+            {"id": "D", "text": "32768 个，是常见的分库分表数量的整数倍"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 固定使用 16384（2^14）个哈希槽。antirez 在邮件列表中解释过这个选择：16384 个槽的成员关系位图只需要 2KB 内存，在节点间传递 cluster gossip 消息时带宽开销可以接受；而 65536 个槽的位图需要 8KB，对于 Redis 集群的 gossip 协议而言偏大。另一个考量是：实际部署的 Redis Cluster 节点数很少超过几百个，16384 个槽已经远大于节点数，每个节点平均分配到的槽粒度足够细，能保证数据分布均匀。B、C、D 的数字都是编造的，与 Redis 无关。"
+        },
+        {
+          "id": "ds-storage-rebalance-q1-quiz2",
+          "question": "Redis Cluster 的哈希槽如何确定一个 key 属于哪个槽？",
+          "choices": [
+            {"id": "A", "text": "CRC16(key) % 16384，若 key 包含 {} 则只对括号内的字符串计算哈希"},
+            {"id": "B", "text": "MD5(key) % 16384，使用 MD5 保证分布均匀"},
+            {"id": "C", "text": "hash(key) % 节点数，节点数变化时重新计算"},
+            {"id": "D", "text": "key 的字典序排序后按范围分配到各槽"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 用 `CRC16(key) & 16383`（等价于 % 16384）计算槽号。特别重要的是 HashTag 机制：如果 key 中包含 `{}`，则只对 `{}` 内的子字符串计算 CRC16，例如 `user:{1001}:profile` 和 `user:{1001}:orders` 会落到同一个槽，这样这两个 key 一定在同一个节点上，可以使用 MGET、MULTI/EXEC 等需要 key 同槽的命令。不理解 HashTag 是 Redis Cluster 迁移到集群模式时最常见的踩坑点。B 选项的 MD5 说法错误，C 选项是固定哈希分片（非 Cluster 的方案），D 选项是范围分片的思路。"
+        },
+        {
+          "id": "ds-storage-rebalance-q1-quiz3",
+          "question": "当一个槽正在从节点 A 迁移到节点 B 时，客户端访问该槽中已经迁移到 B 的 key，节点 A 会返回什么？",
+          "choices": [
+            {"id": "A", "text": "返回 ASK 重定向，客户端向 B 发送 ASKING 命令后再发送原始请求"},
+            {"id": "B", "text": "返回 MOVED 重定向，客户端直接向 B 发送原始请求并更新路由表"},
+            {"id": "C", "text": "返回 nil，客户端认为 key 不存在"},
+            {"id": "D", "text": "阻塞等待，直到迁移完成后再返回结果"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "迁移过程中，若被访问的 key 已经迁移到目标节点，源节点返回 ASK 重定向而非 MOVED。这两者的语义区别至关重要：MOVED 是永久重定向，客户端收到后会更新本地路由表，以后该槽的所有请求都发给新节点；ASK 是临时重定向，只对这一次请求有效，客户端不更新路由表。临时性是关键——因为槽还在迁移中，下一个请求的 key 可能还在 A 上，不能把整个槽的路由都切走。客户端收到 ASK 后，必须先发 ASKING 命令到 B，告知 B「这是一次临时访问，请特殊处理」，否则 B 会拒绝访问处于 IMPORTING 状态的槽。C 和 D 都是错的，Redis Cluster 迁移过程不会让 key「消失」也不会阻塞。"
+        },
+        {
+          "id": "ds-storage-rebalance-q1-quiz4",
+          "question": "执行 `redis-cli --cluster reshard` 命令时，如果在迁移过程中按 Ctrl+C 中断，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "已迁移的 key 停留在目标节点，槽保持 MIGRATING/IMPORTING 状态，下次可以继续执行"},
+            {"id": "B", "text": "所有已迁移的 key 自动回滚到源节点，集群恢复到迁移前的状态"},
+            {"id": "C", "text": "槽进入异常状态，集群不可用，必须执行 cluster fix 修复"},
+            {"id": "D", "text": "已迁移的 key 丢失，需要从 Replica 节点重新同步"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "reshard 中断是安全的。Redis Cluster 的迁移是以 key 为粒度逐个执行的（MIGRATE 命令），每个 key 迁移完成后目标节点即持久化。中断后，已迁移的 key 已经在目标节点上，未迁移的 key 还在源节点，源节点的槽状态保持 MIGRATING、目标节点保持 IMPORTING。这两种状态下集群依然可以正常提供服务，客户端通过 ASK 重定向可以正确路由到两个节点上的 key。下次重新执行 reshard 时，只需要继续迁移剩余的 key 即可。这种「可暂停、可恢复」的特性是在线迁移设计的核心要求，使得夜间低谷期分批次执行成为可能。注意如果槽状态卡在 MIGRATING/IMPORTING 太久，可以用 `redis-cli --cluster fix` 强制修复。"
+        },
+        {
+          "id": "ds-storage-rebalance-q1-quiz5",
+          "question": "执行以下命令的目的是什么？`redis-cli --cluster rebalance 10.0.0.1:7001 --cluster-use-empty-masters --cluster-simulate`",
+          "choices": [
+            {"id": "A", "text": "模拟演算槽迁移方案，显示各节点之间的槽移动计划，但不实际执行迁移"},
+            {"id": "B", "text": "在模拟环境中测试集群性能，不影响生产数据"},
+            {"id": "C", "text": "立即执行槽均衡迁移，--simulate 参数表示使用模拟退火算法优化迁移顺序"},
+            {"id": "D", "text": "检查集群当前的槽分配是否均衡，发现不均衡时发出告警"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`--cluster-simulate` 参数让 rebalance 命令只计算并打印迁移方案，而不真正发起任何数据迁移。这是扩容前的必要步骤：先看清楚系统打算怎么移动槽，确认方案合理（迁移量均匀、不会出现单个节点同时作为多个迁移的源或目标导致过载）再正式执行。`--cluster-use-empty-masters` 参数告诉 rebalance「新加入的空节点也要参与均衡计算」，否则 rebalance 默认不会给空节点分配槽。C 选项对 --simulate 的理解完全错误，它就是字面意思「模拟」；D 选项描述的是 check 命令的功能而非 rebalance。"
+        },
+        {
+          "id": "ds-storage-rebalance-q1-quiz6",
+          "question": "以下关于 Redis Cluster 哈希槽迁移与一致性哈希的对比，哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "哈希槽是一种显式分片方案，迁移量由运维人员精确控制；一致性哈希的理论迁移量是 1/(N+1)，但实际依赖虚拟节点数量"},
+            {"id": "B", "text": "两者在扩容时的数据迁移量完全相同，都是总数据量的 1/N"},
+            {"id": "C", "text": "一致性哈希比哈希槽更适合 Redis Cluster，只是 Redis 历史原因没有采用"},
+            {"id": "D", "text": "哈希槽方案扩容时必须迁移全量数据，而一致性哈希只需迁移部分数据"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "哈希槽和一致性哈希都是为了解决「固定哈希分片在 N 变化时需要迁移几乎全量数据」的问题，但设计思路不同。一致性哈希通过虚拟节点环让新节点只「接管」环上相邻区间的数据，理论迁移量约为 1/(N+1)，但实际效果高度依赖虚拟节点数量，虚拟节点太少会导致数据分布不均。哈希槽方案把分片单元固定为 16384 个槽，节点和槽的映射显式存储，扩容时运维人员精确控制「从哪个节点迁多少个槽到哪个节点」，可预测性更强。D 选项完全颠倒了，哈希槽和一致性哈希都是部分迁移，固定哈希分片才可能需要全量迁移。C 选项是臆测，Redis 作者明确说明了选择哈希槽而非一致性哈希的原因。"
+        },
+        {
+          "id": "ds-storage-rebalance-q1-quiz7",
+          "question": "在迁移 Redis Cluster 槽的过程中，以下哪个监控命令能实时看到各节点当前的槽分配情况？",
+          "choices": [
+            {"id": "A", "text": "redis-cli --cluster check 10.0.0.1:7001"},
+            {"id": "B", "text": "redis-cli -h 10.0.0.1 -p 7001 info keyspace"},
+            {"id": "C", "text": "redis-cli -h 10.0.0.1 -p 7001 config get maxmemory"},
+            {"id": "D", "text": "redis-cli -h 10.0.0.1 -p 7001 debug sleep 0"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`redis-cli --cluster check` 会连接集群并汇总所有节点的槽分配情况、节点角色（master/slave）、数据量（key 数量和内存使用），是监控迁移进度的首选命令。输出格式类似「10.0.0.1:7001 (a3b8c...) -> 2730 slots | 12458 keys | 1 slaves」，能直观看到每个节点当前的槽数量变化趋势。B 选项的 `info keyspace` 只显示各 database 的 key 数量，不包含槽分配信息。C 选项查的是内存配置。D 选项是让 Redis 睡眠用于测试延迟，与监控完全无关。除了 check，`cluster nodes` 命令也能看到槽分配，但输出格式没有 check 直观。"
+        },
+        {
+          "id": "ds-storage-rebalance-q1-quiz8",
+          "question": "MySQL 分库分表从 4 张分片扩容到 8 张分片，最主要的技术挑战是什么？",
+          "choices": [
+            {"id": "A", "text": "hash(id) % 4 和 hash(id) % 8 路由结果不兼容，几乎所有数据都需要迁移，且必须保证迁移期间业务不中断"},
+            {"id": "B", "text": "MySQL 不支持在线扩容，必须停机后才能执行数据迁移"},
+            {"id": "C", "text": "分表数量增加后，所有 SQL 语句必须重写，无法复用现有代码"},
+            {"id": "D", "text": "新增的分片表默认没有索引，需要手动为每张新表重建索引"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "MySQL 分库分表用 `hash(id) % N` 路由时，N 从 4 变成 8，路由结果完全不同——一条原本在分片 2（hash=10, 10%4=2）的记录，按新路由应该去分片 2（10%8=2）或分片 0（假设 hash=8, 8%8=0），但两种情况都不能直接推断，必须对每条记录重新计算路由并搬移。这就是为什么 MySQL 分库分表扩容被称为「最痛苦的数据迁移」，通常的解决方案是「提前做 2 的幂次方分片（8、16、32）」，这样从 4 扩到 8 时，原来分片 0 的数据只会分裂到新的分片 0 和分片 4，迁移量是一半而非全量。B 选项不对，用 pt-online-schema-change 或业务双写方案可以在线迁移。C 选项夸大了影响，分片数变化通常只影响路由层，不需要重写 SQL。D 选项是无关信息。"
+        },
+        {
+          "id": "ds-storage-rebalance-q1-quiz9",
+          "question": "Elasticsearch 新节点加入后，集群自动触发 Shard Rebalancing。如果想限制迁移对查询性能的影响，应该调整哪个参数？",
+          "choices": [
+            {"id": "A", "text": "cluster.routing.allocation.node_concurrent_recoveries，限制每个节点同时并发的分片迁移数量"},
+            {"id": "B", "text": "index.number_of_replicas，减少副本数来降低迁移数据量"},
+            {"id": "C", "text": "cluster.routing.rebalance.enable 设为 none，禁止自动均衡"},
+            {"id": "D", "text": "indices.recovery.max_bytes_per_sec，控制恢复时的网络带宽上限"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`cluster.routing.allocation.node_concurrent_recoveries`（默认值 2）控制每个节点同时作为迁移源或目标的分片数，生产环境建议降到 1，让迁移串行化，避免多个分片同时迁移时磁盘 I/O 和网络带宽被打满。需要说明的是，D 选项的 `indices.recovery.max_bytes_per_sec` 也是有效的限速手段，控制迁移时的网络传输速率上限（默认 40mb），两者通常配合使用。B 选项减少副本数会降低高可用性，不是正确思路。C 选项直接禁用自动均衡会导致新节点永远处于空载状态，失去扩容意义；如果确实需要手动控制迁移节奏，可以用 `cluster.routing.rebalance.enable: new_primaries` 只对新主分片进行均衡，而不是全量禁用。"
+        },
+        {
+          "id": "ds-storage-rebalance-q1-quiz10",
+          "question": "Redis Cluster 扩容完成后，如何验证 16384 个哈希槽全部已有节点负责（没有「无主槽」）？",
+          "choices": [
+            {"id": "A", "text": "执行 `redis-cli --cluster check` 确认输出中 cluster_slots_ok:16384 且 cluster_slots_fail:0"},
+            {"id": "B", "text": "执行 `redis-cli cluster info` 确认 cluster_state:ok 就足够了，ok 状态意味着所有槽都有归属"},
+            {"id": "C", "text": "向每个槽写入一个测试 key，确认所有写入都成功返回 OK"},
+            {"id": "D", "text": "重启所有节点，集群重启时会自动检测并修复无主槽"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`redis-cli --cluster check` 是扩容后验证的标准命令，会输出集群级别的汇总信息包括 `[OK] All nodes agree about slots configuration`、各节点的槽数量，以及最关键的 `[OK] 16384 slots covered`——只有看到这行输出才说明全部 16384 个槽都有 Master 节点负责。B 选项不完全准确：`cluster_state:ok` 确实是集群健康的必要条件，但不是充分条件——如果只有少数槽处于无主状态，cluster_state 可能显示 fail 而非 ok，但反过来 ok 并不 100% 保证 slots_ok 等于 16384，应该直接检查 `cluster_slots_ok` 的值。C 选项的写测试 key 方法无法覆盖所有 16384 个槽，操作成本极高。D 选项重启节点是危险操作，扩容后应避免不必要的重启。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/",
+        "https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/",
+        "https://redis.io/commands/cluster-setslot/",
+        "https://github.com/redis/redis/issues/2576"
+      ]
+    }
+  ]
+}

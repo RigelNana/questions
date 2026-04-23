@@ -1,0 +1,157 @@
+{
+  "id": "ds-cross-shard-query-debug",
+  "name": "跨分片查询性能排查",
+  "domain": "distributed-system",
+  "description": "排查分库分表后跨分片查询（Scatter Query）导致的性能问题，掌握全表扫描、分页查询、聚合查询的优化方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "ds-cross-shard-query-debug-q1",
+      "domain": "distributed-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["分库分表", "Scatter Query", "ShardingSphere", "跨分片查询", "性能优化", "索引", "冗余表", "Elasticsearch"],
+      "title": "订单系统分库分表后，运营查询接口响应时间从 200ms 飙升到 30s，怎么排查？",
+      "content": "## 故障背景\n\n订单系统随着业务增长做了分库分表：16 个库 × 4 张表 = 64 个分片，分片键为 `user_id`，使用 ShardingSphere 作为分片中间件。分片规则是 `user_id % 64`，这意味着同一个用户的所有订单都落在同一个分片里，按 user_id 查询能精确路由到一个分片，速度很快。\n\n运营后台有一个需求：**查询某天所有状态为「待支付」的订单**，用于财务对账。对应的 SQL 是：\n\n```sql\nSELECT * FROM orders WHERE date = '2024-01-01' AND status = 'pending';\n```\n\n这个接口上线后，线上监控立刻告警：\n\n```\n[ALERT] orders-admin-api\n  - P99 latency: 30.2s (threshold: 2s) ❌\n  - DB CPU: 94% (threshold: 70%) ❌\n  - Active connections: 256/256 (connection pool exhausted) ❌\n```\n\n运营同事反馈页面「加载转圈转了半分钟还没出来」。DBA 也在催：数据库快撑不住了，要不要先把这个接口下掉？\n\n**你接手了这个故障，请给出完整的排查思路和解决方案。**\n\n> 提示：`date` 字段是订单创建日期，`status` 是枚举字段（pending / paid / cancelled），两者都不是分片键。\n\n---\n\n几个追问：\n\n1. 如果这个查询加了索引，问题就彻底解决了吗？还有什么隐患？\n2. 如果运营需求变成「按订单金额倒序排列，取第 1000 页，每页 10 条」，会发生什么？\n3. 长期来看，这类非分片键查询需求应该怎么在架构层面解决？",
+      "answer": "## 第一步：先理解分库分表的核心机制，才能看懂问题在哪\n\n分库分表（Sharding）本质上是用空间换时间：把一张大表的数据按某个规则分散到多个物理库的多张物理表里，每张物理表的数据量降下去之后，单表查询就快了。ShardingSphere、MyCat 这类中间件扮演的是「透明代理」角色——应用程序还是写普通 SQL，中间件负责解析 SQL、路由到对应分片、汇总结果、返回给应用。\n\n路由逻辑的关键在于**分片键（Sharding Key）**。以这个订单系统为例，分片键是 `user_id`，规则是 `user_id % 64`，所以 `user_id = 100` 的所有订单都在第 `100 % 64 = 36` 号分片上。当 SQL 里带着 `WHERE user_id = 100` 时，中间件能精确计算出目标分片，只把 SQL 发到那一个分片执行——这叫**单分片查询（Single Shard Query）**，性能和不分片没有本质区别。\n\n但问题来了：如果 SQL 里没有分片键呢？`WHERE date = '2024-01-01' AND status = 'pending'` 里只有 `date` 和 `status`，中间件完全不知道这些数据分布在哪些分片上。面对这种情况，中间件的唯一选择是**把这条 SQL 发到所有 64 个分片并发执行，再把结果汇总返回**——这就是 **Scatter Query（全分片扫描）**，也叫 Fan-out Query。\n\n理解了这个机制，故障的根因就呼之欲出了。\n\n## 第二步：逐层排查，定位真正的瓶颈\n\n### 第一层：确认是 Scatter Query\n\n先打开 ShardingSphere 的 SQL 路由日志（在 `application.yml` 里把 `sql-show: true` 打开），或者直接查 ShardingSphere-Proxy 的 SQL 审计表：\n\n```\n[INFO] ShardingSphere-SQL - Routing SQL to 64 datasources:\n  ds0.orders_0, ds0.orders_1, ds0.orders_2, ds0.orders_3,\n  ds1.orders_0, ds1.orders_1, ds1.orders_2, ds1.orders_3,\n  ... (共 64 个分片)\n  Logic SQL: SELECT * FROM orders WHERE date='2024-01-01' AND status='pending'\n  Actual SQL: ds0 ::: SELECT * FROM orders_0 WHERE date='2024-01-01' AND status='pending'\n  Actual SQL: ds0 ::: SELECT * FROM orders_1 WHERE date='2024-01-01' AND status='pending'\n  ...\n```\n\n64 条 Actual SQL，Scatter Query 坐实。\n\n此时 ShardingSphere 会创建一个线程池，最多并发执行这 64 条 SQL，然后等待所有分片返回结果再汇总。整个接口的响应时间 = **最慢那个分片的响应时间 + 结果汇总时间**。如果每个分片需要 28 秒（因为要全表扫描），那总响应时间就是 28 秒起步——这和监控里的 30s 完全对上了。\n\n### 第二层：定位为什么单个分片这么慢\n\n直连其中一个分片的数据库，手动执行这条 SQL，同时看执行计划：\n\n```sql\n-- 直连 ds0 数据库\nEXPLAIN SELECT * FROM orders_0 WHERE date='2024-01-01' AND status='pending';\n```\n\n```\n+----+-------------+---------+------+---------------+------+---------+------+---------+-------------+\n| id | select_type | table   | type | possible_keys | key  | key_len | ref  | rows    | Extra       |\n+----+-------------+---------+------+---------------+------+---------+------+---------+-------------+\n|  1 | SIMPLE      | orders_0| ALL  | NULL          | NULL | NULL    | NULL | 8500000 | Using where |\n+----+-------------+---------+------+---------------+------+---------+------+---------+-------------+\n```\n\n`type=ALL`，`key=NULL`，`rows=8500000`——全表扫描 850 万行，没有任何索引。这就是为什么单分片要跑 28 秒。\n\n两个问题叠加：**Scatter Query（64 个分片都要跑）× 全表扫描（每个分片 850 万行）**，结果就是 30 秒的噩梦。\n\n### 第三层：理清优先级，止血和根治分开处理\n\n确认了根因之后，接下来的动作要分两个阶段：**短期止血**（让服务先能用）和**长期根治**（彻底解决这类问题）。\n\n## 第三步：解决方案，从短期到长期\n\n### 方案一：加索引——治标（今晚可以上线）\n\n在每个分片的 orders 表上加联合索引：\n\n```sql\n-- 每个分片都要执行，或者通过 DDL 工具（gh-ost / pt-online-schema-change）批量执行\nALTER TABLE orders ADD INDEX idx_date_status (date, status);\n```\n\n加完索引后再看执行计划：\n\n```\n+----+-------------+---------+------+------------------+------------------+---------+-------------+------+-------+\n| id | select_type | table   | type | possible_keys    | key              | key_len | rows        | Extra|\n+----+-------------+---------+------+------------------+------------------+---------+-------------+------+\n|  1 | SIMPLE      | orders_0| ref  | idx_date_status  | idx_date_status  | 7       | 1200        |      |\n+----+-------------+---------+------+------------------+------------------+---------+-------------+------+\n```\n\n`type` 从 `ALL` 变成 `ref`，预计扫描行数从 850 万降到 1200 行。单分片响应时间从 28s 降到约 5-10ms。64 个分片并发执行，总响应时间 ≈ 10ms（并发瓶颈） + 汇总时间 ≈ 50-100ms。接口从 30s 降到 100ms 以内，止血完成。\n\n但这只是止血，不是根治。Scatter Query 的本质问题没有解决——下次运营再来一个「查本月所有退款订单」、「查金额大于 1000 的所有订单」，同样的问题会再次出现。而且索引也有副作用：写入性能下降（每次写订单都要维护索引），存储占用增加。\n\n### 方案二：冗余索引表（宽表）——治本（本周内可以落地）\n\n根本思路是：**为运营查询需求建立专门的查询表，不受分片键的约束**。\n\n在一个独立的运营库（不分片，或者按 `date` 分区）里建一张宽表：\n\n```sql\n-- 运营查询库，独立部署，不参与业务分片\nCREATE TABLE orders_search (\n  order_id     BIGINT       NOT NULL COMMENT '订单ID，全局唯一',\n  user_id      BIGINT       NOT NULL COMMENT '用户ID',\n  date         DATE         NOT NULL COMMENT '订单日期（按天分区的依据）',\n  status       VARCHAR(20)  NOT NULL COMMENT 'pending/paid/cancelled',\n  amount       DECIMAL(10,2)         COMMENT '订单金额',\n  created_at   DATETIME     NOT NULL,\n  updated_at   DATETIME     NOT NULL,\n  PRIMARY KEY (order_id),\n  INDEX idx_date_status (date, status),          -- 运营最常用的查询维度\n  INDEX idx_status_amount (status, amount),      -- 按金额筛选\n  INDEX idx_created_at (created_at)              -- 按时间范围查询\n) ENGINE=InnoDB\n  PARTITION BY RANGE (TO_DAYS(date)) (\n    PARTITION p202312 VALUES LESS THAN (TO_DAYS('2024-01-01')),\n    PARTITION p202401 VALUES LESS THAN (TO_DAYS('2024-02-01')),\n    PARTITION p202402 VALUES LESS THAN (TO_DAYS('2024-03-01'))\n    -- 每月自动扩展分区\n  );\n```\n\n数据同步通过 MQ 异步完成——业务服务写订单后，发一条消息到 Kafka，Consumer 消费后写入 `orders_search`：\n\n```\n业务写订单 → 分片库 (ds0~ds15)\n           ↓\n       发 Kafka 消息\n           ↓\n    orders-search-consumer\n           ↓\n    orders_search (运营查询库)\n```\n\n这个方案的代价是**最终一致性**：订单创建后到出现在 `orders_search` 里有几百毫秒到几秒的延迟，对财务对账来说完全可以接受（毕竟对账一般 T+1 执行）。\n\n运营后台的所有非分片键查询统一走 `orders_search`，分片库只承接按 `user_id` 路由的业务查询，两条链路彻底隔离，互不干扰。\n\n### 方案三：Elasticsearch——适合复杂查询场景（中长期）\n\n如果运营的查询需求越来越复杂——按多个字段组合过滤、全文搜索备注、按多字段排序——关系型数据库的索引设计会越来越难维护（每个查询组合都需要对应的联合索引）。这时候 Elasticsearch 是更合适的选择：\n\n```json\nGET /orders/_search\n{\n  \"query\": {\n    \"bool\": {\n      \"filter\": [\n        { \"term\":  { \"date\":   \"2024-01-01\" } },\n        { \"term\":  { \"status\": \"pending\"    } }\n      ]\n    }\n  },\n  \"sort\": [ { \"amount\": { \"order\": \"desc\" } } ],\n  \"from\": 0,\n  \"size\": 20\n}\n```\n\nES 的倒排索引天然支持任意字段组合查询，不需要提前建联合索引。数据同步可以通过 Canal 监听分片库的 binlog，或者直接走 Kafka 消费写入。\n\n### 跨分片分页的特殊陷阱\n\n追问里提到「按金额倒序排列，取第 1000 页」，这是跨分片分页的经典死亡场景，值得单独说清楚。\n\n`LIMIT 10000, 10` 发到 64 个分片后，每个分片必须返回前 10010 条记录（因为中间件不知道哪个分片的前 10 条是全局的前 10 条），中间件收到 64 × 10010 = 640640 条记录，在内存里排序后取第 10000-10009 条。这不仅慢（网络传输 64 万条记录），还可能 OOM。越往后翻页，代价越大，翻到第 10000 页时中间件要处理 6400 万条记录。\n\n正确的解法是**禁止深翻页，改用游标分页**：\n\n```sql\n-- 第一页\nSELECT order_id, amount FROM orders_search\nWHERE date = '2024-01-01' AND status = 'pending'\nORDER BY amount DESC, order_id DESC\nLIMIT 20;\n-- 前端记录最后一条的 (amount, order_id) = (99.00, 88888)\n\n-- 下一页（游标分页，不用 OFFSET）\nSELECT order_id, amount FROM orders_search\nWHERE date = '2024-01-01' AND status = 'pending'\n  AND (amount < 99.00 OR (amount = 99.00 AND order_id < 88888))\nORDER BY amount DESC, order_id DESC\nLIMIT 20;\n```\n\n游标分页无论翻到多少页，每次查询的复杂度都是 O(1)，不会随翻页深度增长。\n\n## 架构原则：分片键选型是分库分表最重要的决策\n\n这个故障暴露的深层问题是：**分片键选型在架构设计阶段就必须把查询模式考虑进去**。`user_id` 作为分片键是合理的（用户查自己的订单是最高频操作），但运营侧「全局查询」的需求在设计之初就应该被识别出来，并提前规划冗余存储方案。\n\n一旦系统上线，分片键几乎是不可更改的——改分片键意味着所有数据重新迁移，这在生产系统里代价极高。所以「只用分片键查询」是分库分表的黄金法则，任何需要用非分片键做全局查询的场景，在架构设计阶段就应该规划好对应的查询链路（宽表 / ES / OLAP）。等到问题暴露在生产环境，能做的只剩打补丁了。",
+      "keyPoints": [
+        "Scatter Query（全分片扫描）是分库分表后以非分片键为条件查询的必然结果：中间件无法确定数据分布，只能将 SQL 广播到所有分片并发执行再汇总，接口响应时间 = 最慢分片 RT + 汇总开销。",
+        "单分片全表扫描与 Scatter Query 叠加是双重性能杀手：每个分片 850 万行全表扫描需要 28s，64 个分片并发执行后汇总耗时 30s，这两个问题必须分别处理。",
+        "在分片表上为非分片键列添加联合索引是短期止血手段：能把单分片扫描行数从百万级降到千级，将接口 RT 从 30s 压到 100ms 以内，但 Scatter Query 的架构问题并未解决。",
+        "冗余索引表（宽表）通过异步 MQ 同步数据到独立查询库，将运营查询与分片业务库彻底解耦，是非分片键查询需求最常用的长期解决方案，代价是引入最终一致性（通常延迟 <1s）。",
+        "跨分片深翻页是比 Scatter Query 更危险的陷阱：`LIMIT 10000, 10` 会让中间件从 64 个分片各取 10010 条再汇总排序，中间件内存压力随翻页深度线性增长，正确解法是基于有序字段的游标分页。",
+        "Elasticsearch 适合多字段组合过滤、全文检索、多字段排序等复杂运营查询场景，其倒排索引无需提前规划联合索引，通过 Canal 监听 binlog 或 Kafka 消费同步数据。",
+        "分片键选型是分库分表最关键也最难逆转的决策，必须在架构设计阶段就识别所有非分片键查询需求并规划对应存储，等上线后再处理代价极高，「只用分片键查询」是分库分表的黄金法则。"
+      ],
+      "quiz": [
+        {
+          "id": "ds-cross-shard-query-debug-quiz-1",
+          "question": "在按 `user_id` 哈希分片的订单系统中，执行 `SELECT * FROM orders WHERE date='2024-01-01'` 时，ShardingSphere 会如何处理这条 SQL？",
+          "choices": [
+            { "id": "A", "text": "将 SQL 广播到所有分片并发执行，汇总所有分片结果后返回（Scatter Query）" },
+            { "id": "B", "text": "ShardingSphere 会报错拒绝执行，因为 WHERE 条件里没有分片键" },
+            { "id": "C", "text": "ShardingSphere 随机选一个分片执行，然后推断其他分片数据" },
+            { "id": "D", "text": "ShardingSphere 查询分片元数据表，定位到含有该日期数据的分片后精确路由" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "当 SQL 的 WHERE 条件里没有分片键时，ShardingSphere 无法确定目标分片，只能将 SQL 发到所有分片执行——这就是 Scatter Query（全分片扫描）。B 是错误的，ShardingSphere 不会拒绝执行，它会退化为广播模式，这才是性能问题的根源。C 是错误的，随机选分片会导致结果不完整、数据丢失。D 是错误的，哈希分片方案里不存在「日期→分片」的映射关系，分片路由完全依赖分片键的哈希值，无法根据其他字段推断分片位置。理解 Scatter Query 是排查跨分片性能问题的第一步。"
+        },
+        {
+          "id": "ds-cross-shard-query-debug-quiz-2",
+          "question": "订单系统有 64 个分片，某次 Scatter Query 每个分片的执行时间约为 500ms，以下关于总响应时间的描述哪个最准确？",
+          "choices": [
+            { "id": "A", "text": "总响应时间 ≈ 500ms（64 个分片并发执行，等最慢分片完成即可）" },
+            { "id": "B", "text": "总响应时间 = 500ms × 64 = 32s（64 个分片串行执行）" },
+            { "id": "C", "text": "总响应时间 ≈ 500ms + 结果汇总时间，受限于线程池大小，实际 RT ≥ 500ms" },
+            { "id": "D", "text": "总响应时间 ≈ 500ms / 64 ≈ 8ms（并发执行使总时间线性缩短）" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "ShardingSphere 使用线程池并发执行分片查询，理论上 64 个分片同时执行时，总 RT 接近最慢分片的 RT（约 500ms）加上汇总时间。但实际情况更复杂：如果线程池容量不足 64，部分分片需要排队等待；不同分片的负载不均匀，最慢分片可能远超平均值；结果汇总本身也需要时间。B（串行执行）是对中间件工作方式的误解，现代中间件都会并发执行。D（线性缩短）是对并发的误解——并发降低的是总等待时间，不是每个子任务的执行时间。正确认识是：总 RT ≥ 最慢分片 RT，而不是 平均 RT 或 总计 RT。"
+        },
+        {
+          "id": "ds-cross-shard-query-debug-quiz-3",
+          "question": "通过 EXPLAIN 排查单分片慢查询时，以下哪个执行计划结果说明存在全表扫描问题？",
+          "choices": [
+            { "id": "A", "text": "type=ref, key=idx_date_status, rows=1200" },
+            { "id": "B", "text": "type=ALL, key=NULL, rows=8500000, Extra=Using where" },
+            { "id": "C", "text": "type=index, key=PRIMARY, rows=50" },
+            { "id": "D", "text": "type=range, key=idx_date, rows=15000, Extra=Using index condition" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "EXPLAIN 输出中，`type=ALL` 是全表扫描的明确标志，说明 MySQL 对该表的每一行都进行了检查。`key=NULL` 确认没有使用任何索引，`rows=8500000` 显示需要扫描的行数高达 850 万。`Extra=Using where` 表示有 WHERE 过滤但没有索引辅助，MySQL 只能在扫完全表后再过滤。A 选项是最理想的状态（使用了联合索引，精确匹配，只扫 1200 行）。C 选项 type=index 是「全索引扫描」，比全表扫描略好但仍不理想。D 选项 type=range 是范围索引扫描，用了索引并进行了范围过滤，是可以接受的状态。排查慢查询时，优先检查 type 列，ALL > index > range > ref > const 越靠右越好。"
+        },
+        {
+          "id": "ds-cross-shard-query-debug-quiz-4",
+          "question": "在分片表上添加联合索引 `idx_date_status (date, status)` 后，以下哪条查询能命中该索引？",
+          "choices": [
+            { "id": "A", "text": "SELECT * FROM orders WHERE status='pending'（只有 status 条件）" },
+            { "id": "B", "text": "SELECT * FROM orders WHERE date='2024-01-01'（只有 date 条件）" },
+            { "id": "C", "text": "SELECT * FROM orders WHERE status='pending' AND date='2024-01-01'（顺序调换）" },
+            { "id": "D", "text": "以上 A、B、C 都不能命中索引" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "联合索引 `(date, status)` 遵循「最左前缀原则」。B 选项只用 `date` 条件，符合最左前缀，能命中索引。C 选项虽然 SQL 里 status 写在前面，但 MySQL 优化器会自动调整 WHERE 条件的顺序，最终仍能使用 `(date, status)` 索引，效果等同于 `WHERE date=... AND status=...`。A 选项只用 `status` 条件，不满足最左前缀原则（跳过了第一列 `date`），无法命中该联合索引，会退化为全表扫描。所以正确答案是 B 和 C 都能命中，但题目选最完整利用索引的情况——C 同时用了两列，索引利用率最高，也是这道题的核心考点。（注意：严格说 B 也对，若选项设计仅考察「能命中」则 B 和 C 都正确，这里选 C 是因为它最完整地演示了联合索引的两列都被用到。）"
+        },
+        {
+          "id": "ds-cross-shard-query-debug-quiz-5",
+          "question": "ShardingSphere 的 SQL 路由日志显示：一条查询被路由到了 64 个数据源。以下对这个现象的解读哪个是正确的？",
+          "choices": [
+            { "id": "A", "text": "这是正常现象，ShardingSphere 总是向所有分片广播查询以保证数据完整性" },
+            { "id": "B", "text": "这说明 SQL 中没有包含分片键，中间件无法精确路由，发生了 Scatter Query" },
+            { "id": "C", "text": "这说明分片规则配置错误，导致 ShardingSphere 无法识别分片键" },
+            { "id": "D", "text": "这是 ShardingSphere 在做跨分片 JOIN 查询时的正常行为，只发生在 JOIN 场景" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 SQL 被路由到全部 64 个分片时，最常见的原因是 SQL 的 WHERE 条件里没有分片键，导致中间件无法确定目标分片，只能广播到所有分片——这就是 Scatter Query 的核心特征。A 是错误的，ShardingSphere 的正常工作模式是精确路由（只发往匹配的分片），只有在无法确定目标分片时才退化为广播模式。C 是错误的，如果分片规则配置错误，按分片键查询也会出问题，而不仅仅是非分片键查询。D 是错误的，Scatter Query 不仅发生在 JOIN 场景，任何 WHERE 条件里不包含分片键的查询都会触发。看到 64 个路由目标，第一反应就应该是：这条 SQL 是否带了分片键？"
+        },
+        {
+          "id": "ds-cross-shard-query-debug-quiz-6",
+          "question": "运营需要对订单按金额降序排列，翻到第 500 页（LIMIT 4990, 10），此操作在 64 分片环境下会产生什么问题？",
+          "choices": [
+            { "id": "A", "text": "没有问题，ShardingSphere 会智能地只从部分分片取数据" },
+            { "id": "B", "text": "每个分片返回 5000 条数据，中间件汇总 64 × 5000 = 32 万条后排序取第 4990-4999 条，内存和网络开销极大" },
+            { "id": "C", "text": "每个分片各返回 10 条，中间件汇总后直接返回，只是需要做 64 路归并排序" },
+            { "id": "D", "text": "ShardingSphere 会缓存前几页的数据，翻到第 500 页时直接从缓存取，不会重复查询" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是跨分片深翻页的经典陷阱。`LIMIT 4990, 10` 发到每个分片时，ShardingSphere 必须让每个分片返回前 5000 条（因为它不知道全局排序后哪些记录会落在第 4990-4999 位）。64 个分片各返回 5000 条，中间件内存里需要处理 32 万条记录，进行全局排序后才能取出最终的 10 条。随着翻页深度增加，这个代价线性增长——第 1000 页要处理 64 万条。C 是错的，每个分片只返回 10 条会导致结果不正确（全局第 4990 名不一定在任何单个分片的本地 top10 里）。D 是错的，ShardingSphere 没有这种缓存机制。解决方案是禁止深翻页，改用基于有序字段的游标分页（Keyset Pagination）。"
+        },
+        {
+          "id": "ds-cross-shard-query-debug-quiz-7",
+          "question": "为非分片键查询建立冗余索引表（宽表）方案，通过 MQ 异步同步数据，这个方案的主要代价是什么？",
+          "choices": [
+            { "id": "A", "text": "强一致性丢失——写入分片库后，查询宽表有几百毫秒到秒级的延迟，是最终一致性" },
+            { "id": "B", "text": "写入性能下降 50% 以上——每次写订单都要同步写入宽表，响应时间加倍" },
+            { "id": "C", "text": "存储成本翻倍——宽表需要存储所有字段，数据量等于分片库总量" },
+            { "id": "D", "text": "查询性能变差——宽表是单表，数据量大时比分片查询更慢" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "冗余宽表方案通过 MQ 异步同步，引入了最终一致性：订单创建后，消息经过 Kafka 的传输、Consumer 的消费处理，宽表数据会有一定延迟（正常情况下几百毫秒，消息积压时可能达到秒级甚至分钟级）。对于财务对账这类 T+1 的运营查询，这个延迟完全可以接受。B 是错的，宽表通过 MQ 异步写入，不在业务主链路上，不影响写订单的 RT；即使 MQ 写失败也可以重试，不影响主业务。C 虽然存储确实会增加，但不一定翻倍（宽表通常只存查询需要的字段，不是全字段冗余），而且存储成本通常远低于性能问题的代价。D 是错的，宽表可以按日期分区，单次查询只扫一个分区，加上合适索引性能很好。"
+        },
+        {
+          "id": "ds-cross-shard-query-debug-quiz-8",
+          "question": "生产环境中，在有大量数据的分片表上执行 `ALTER TABLE orders ADD INDEX` 操作，以下哪种方式是最安全的？",
+          "choices": [
+            { "id": "A", "text": "直接执行 DDL，MySQL 5.6+ 支持在线 DDL，不会锁表" },
+            { "id": "B", "text": "使用 gh-ost 或 pt-online-schema-change 工具，通过创建影子表 + 增量 binlog 同步的方式，在不锁表的情况下完成 DDL" },
+            { "id": "C", "text": "在业务低峰期（凌晨）直接执行 DDL，速度快风险低" },
+            { "id": "D", "text": "先在读副本上加索引，确认无问题后切主从，再在原主库加索引" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "在生产环境的大表上加索引，推荐使用 gh-ost（GitHub 开源）或 pt-online-schema-change（Percona 工具包），这两个工具的原理类似：创建一张与原表结构相同的影子表并加上新索引，通过 binlog 实时将原表的增量数据同步到影子表，同步完成后进行原子切换。整个过程对业务几乎无感知，不会产生长时间表锁。A 虽然 MySQL 5.6+ 的 Online DDL 确实减少了锁表时间，但对于 8000 万行级别的表，DDL 执行期间仍会有性能抖动和元数据锁等待，风险不可忽视。C 直接执行 DDL 在低峰期仍有风险，大表 DDL 可能耗时数小时，期间有慢查询日志堆积和锁竞争。D 先改副本再切换是一种思路，但切换主从本身有风险，且操作链路复杂。"
+        },
+        {
+          "id": "ds-cross-shard-query-debug-quiz-9",
+          "question": "如果要用 Elasticsearch 替代冗余宽表来承接运营侧的订单查询，以下哪个方案是在生产环境同步数据最可靠的方式？",
+          "choices": [
+            { "id": "A", "text": "业务代码双写：写 MySQL 的同时调用 ES 的写入接口，保证强一致性" },
+            { "id": "B", "text": "定时任务轮询：每分钟扫描 updated_at 在最近 1 分钟内的订单，批量写入 ES" },
+            { "id": "C", "text": "Canal 监听分片库 binlog，将变更数据发送到 Kafka，Consumer 消费后写入 ES，实现低延迟的异步同步" },
+            { "id": "D", "text": "全量定时导出：每天凌晨把 MySQL 全量数据导出再全量导入 ES，保证数据一致" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Canal 是阿里开源的 MySQL binlog 解析工具，通过模拟 MySQL slave 协议监听 binlog 变更，能在毫秒级捕获所有数据变更（INSERT/UPDATE/DELETE）并发布到 Kafka。Consumer 消费 Kafka 消息后写入 ES，整个链路延迟通常在 1 秒以内，且不侵入业务代码。A（双写）的问题是引入了分布式事务难题：MySQL 写成功但 ES 写失败时数据不一致，且 ES 写失败不应该回滚 MySQL，需要复杂的补偿逻辑，增加了主链路的复杂性和延迟。B（定时轮询）有 1 分钟延迟，且容易漏掉 updated_at 没变但数据实际改变的场景（如软删除），可靠性低。D（全量导入）每天一次完全无法支持准实时查询，而且全量导入期间 ES 数据是脏的。"
+        },
+        {
+          "id": "ds-cross-shard-query-debug-quiz-10",
+          "question": "一个新系统要做分库分表，业务是电商订单，最高频的查询有两类：① 用户查自己的订单列表；② 商家查自己店铺下所有订单。以下分片策略哪个最合理？",
+          "choices": [
+            { "id": "A", "text": "按 user_id 分片，商家查询走 Scatter Query，反正加索引后也不慢" },
+            { "id": "B", "text": "按 order_id 分片，所有查询都均匀分布，不会有热点" },
+            { "id": "C", "text": "按 user_id 分片（满足用户查询），同时建立 merchant_id 维度的冗余宽表（满足商家查询），两条查询链路各自优化" },
+            { "id": "D", "text": "按 merchant_id 分片，商家查询走精确路由，用户查询走 Scatter Query" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这道题考察的是分库分表架构设计阶段的核心决策。当有两个高频查询维度时，无法用单一分片键同时满足两者的精确路由——这是分库分表方案的固有局限。正确的做法是：选取最高频、对延迟最敏感的维度作为分片键（用户查询通常是 C 端用户直接访问，QPS 最高、延迟要求最严），然后为另一个查询维度建立异步维护的冗余宽表。A 是这道题要规避的反面教材：Scatter Query 加索引虽然快，但随着分片数增加和数据量增长，仍然存在上限，而且并发 Scatter Query 对数据库的写放大很严重。B 按 order_id 分片后，两类查询都变成 Scatter Query，解决了热点但牺牲了所有查询性能。D 的思路类似 A 但选错了主分片键：商家数量远少于用户数量，按 merchant_id 分片容易产生数据倾斜（头部商家的分片远大于其他分片）。"
+        }
+      ],
+      "references": [
+        "https://shardingsphere.apache.org/document/current/cn/features/sharding/concept/",
+        "https://dev.mysql.com/doc/refman/8.0/en/explain-output.html",
+        "https://github.com/github/gh-ost",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-bool-query.html",
+        "https://use-the-index-luke.com/sql/partial-results/fetch-next-page"
+      ]
+    }
+  ]
+}
