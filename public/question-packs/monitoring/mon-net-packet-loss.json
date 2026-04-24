@@ -1,0 +1,289 @@
+{
+  "id": "monitoring-q119",
+  "name": "网络丢包率异常检测与告警",
+  "domain": "monitoring",
+  "description": "如何通过 Prometheus 指标、Blackbox Exporter、eBPF 等手段检测和告警网络丢包率异常",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q119",
+      "domain": "monitoring",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["网络监控", "丢包", "Prometheus", "Blackbox Exporter", "eBPF", "CNI", "TCP重传"],
+      "title": "如何检测和告警网络丢包率异常？",
+      "content": "你负责一套部署在 Kubernetes 上的微服务平台，最近两周陆续有业务反馈接口偶发超时，错误率在高峰期会短暂升到 0.3%，但应用日志里既看不到明显的报错，也看不到慢查询。你打开 Grafana，服务的 P99 延迟正常，CPU/内存也没有压力，一切看起来都很「正常」。\n\n有经验的同事看了一眼说：「可能是丢包，去查 TCP 重传率。」你打开 Prometheus，输入 `node_netstat_Tcp_RetransSegs` 想看重传情况，却发现不知道该用哪个表达式，也不知道多少算异常。更让人困惑的是，`node_network_receive_drop_total` 在某些节点上有读数，但你不确定这个 drop 和业务的丢包是不是同一回事。\n\n现在的问题是：\n\n1. 如何用 Prometheus 指标全面覆盖网络丢包的检测点，包括内核级 drop、TCP 重传、外部连通性探测？\n2. 告警阈值怎么定？重传率超过多少该触发 warning，超过多少该触发 critical？\n3. 当告警触发后，如何快速定位是哪条网络路径出了问题？在 K8s 环境下，CNI 插件引发的丢包又该怎么排查？",
+      "answer": "## 第一步：理解「丢包」在监控体系里的多个层次\n\n说到网络丢包，大部分人脑子里第一反应是 `ping` 丢了几个包。但在生产环境里，「丢包」这个词指的是至少三个不同层次的事情，混淆它们是排查时最大的陷阱。\n\n第一个层次是**内核网卡层 drop**，对应的指标是 `node_network_receive_drop_total` 和 `node_network_transmit_drop_total`。这个 drop 发生在网卡驱动把数据包从环形缓冲区（ring buffer）往内核协议栈送的时候。如果入包速率超过了协议栈的处理速度，或者 ring buffer 配置得太小，多余的包就会在这里被直接丢弃。这种丢包操作系统完全知情，数据包甚至没有机会到达 socket 层，应用程序感知到的是 TCP 层面的超时和重传，而不是直接的 errno。\n\n第二个层次是 **TCP 重传**，对应的指标是 `node_netstat_Tcp_RetransSegs`。TCP 是可靠传输协议，它本身会重传丢失的数据段，所以「有重传」不等于业务出错，但重传率过高会直接拉高延迟——每次重传至少需要等待一个 RTT，默认初始 RTO 是 1 秒，如果触发指数退避，第二次重传要等 2 秒。这就是为什么丢包严重时 P99 会从几十毫秒突然跳到几秒的原因。\n\n第三个层次是**应用层感知到的连通性中断**，这才是 Blackbox Exporter 的 ICMP 探测要覆盖的。前两个层次都是「这台机器自己的包」，而 Blackbox Exporter 模拟的是一个真实用户从外部访问你的服务，探测的是端到端的连通性。\n\n建立了这三个层次的认知之后，你才知道为什么一套完整的丢包监控需要三类指标配合，缺一不可。\n\n## 第二步：用 Prometheus 构建丢包检测的完整指标体系\n\n### TCP 重传率：最直接的业务丢包信号\n\nTCP 重传率是最贴近业务影响的指标。计算方式是用重传段数除以总发出段数，在 Prometheus 里写成速率比：\n\n```promql\n# TCP 重传率（每秒重传占总发送的比例）\nrate(node_netstat_Tcp_RetransSegs[5m])\n/ rate(node_netstat_Tcp_OutSegs[5m])\n```\n\n这个表达式给出的是一个 0 到 1 之间的小数，乘以 100 就是百分比。正常情况下这个值应该在 0.01%（0.0001）以下。当它超过 0.1%（0.001）时，说明网络已经有明显的丢包；超过 1% 时，用户感知到的超时会非常明显。\n\n这里有一个细节很多人不知道：`node_netstat_Tcp_RetransSegs` 来自 `/proc/net/snmp` 的 `RetransSegs` 字段，它统计的是**所有重传的 TCP 段**，包括正常的拥塞控制触发的快速重传（Fast Retransmit）和超时重传（RTO Timeout）。如果你想区分这两种，需要用 `node_netstat_TcpExt_TCPRetransFail`（真正的超时重传失败）和 `node_netstat_TcpExt_TCPFastRetrans`（快速重传，通常是拥塞窗口缩减触发的）。超时重传比快速重传更严重，因为它意味着发送方等了至少 RTO 时间才确认包丢了。\n\n### 内核 drop：区分拥塞丢包和真实链路丢包\n\n内核层 drop 和 TCP 重传率是互补的信号。如果 TCP 重传率高但内核 drop 为零，说明问题可能在链路中间（交换机、路由器或者对端服务器），不是本机网卡的问题。如果两者同时升高，说明本机就是瓶颈。\n\n```promql\n# 网卡接收 drop 速率（按网卡接口分）\nrate(node_network_receive_drop_total{device!~\"lo|veth.*|docker.*\"}[5m])\n\n# 网卡发送 drop 速率\nrate(node_network_transmit_drop_total{device!~\"lo|veth.*|docker.*\"}[5m])\n```\n\n注意这里要过滤掉 `lo`（本地回环）、`veth`（K8s Pod 虚拟网卡）和 `docker` 网桥，否则这些虚拟接口的 drop 会产生大量噪音。真正关心的是物理网卡（通常是 `eth0`、`ens3`、`bond0` 等）的 drop。\n\n值得一提的是，在 K8s 环境里，`veth` 接口的 drop 有时候反映的是 CNI 插件的问题，不能一概而论。这个后面会单独讲。\n\n除了网卡层 drop，还要关注 socket 层 drop，对应 `/proc/net/snmp` 里的 `UdpInErrors` 和 TCP 层的 `node_netstat_TcpExt_ListenDrops`（TCP listen 队列满导致的连接 drop）：\n\n```promql\n# TCP listen 队列溢出（accept backlog 满）\nrate(node_netstat_TcpExt_ListenDrops[5m])\n\n# SYN 队列溢出（SYN flood 或高并发连接时）\nrate(node_netstat_TcpExt_ListenOverflows[5m])\n```\n\n`ListenDrops` 增长通常意味着应用处理连接的速度跟不上新连接进来的速度，这时候应该调大 `net.core.somaxconn` 和应用的 backlog 参数。\n\n### Blackbox Exporter：外部视角的端到端探测\n\nBlackbox Exporter 的 ICMP 探测是从「第三方视角」看你的服务是否可达。它的部署方式是在集群外（或跨可用区）部署一个或多个探针，周期性地向目标发送 ICMP echo，记录成功率和 RTT。\n\n配置示例：\n\n```yaml\n# blackbox.yml\nmodules:\n  icmp_check:\n    prober: icmp\n    timeout: 5s\n    icmp:\n      preferred_ip_protocol: ip4\n      payload_size: 56  # 标准 ping 包大小\n      ttl: 64\n```\n\n```yaml\n# prometheus.yml scrape config\n- job_name: 'blackbox_icmp'\n  metrics_path: /probe\n  params:\n    module: [icmp_check]\n  static_configs:\n    - targets:\n      - 10.0.1.10   # 目标节点 IP\n      - 10.0.1.11\n  relabel_configs:\n    - source_labels: [__address__]\n      target_label: __param_target\n    - source_labels: [__param_target]\n      target_label: instance\n    - target_label: __address__\n      replacement: blackbox-exporter:9115\n```\n\n核心指标是 `probe_success`（0 或 1，探测是否成功）和 `probe_duration_seconds`（探测延迟）。计算丢包率用 `1 - avg_over_time(probe_success[5m])` 即可得到 5 分钟窗口内的探测失败率。\n\nICMP 探测主要覆盖「节点到节点」的连通性，它无法探测到 TCP 端口级别的问题。如果要检测 HTTP 接口是否可达，需要换用 `http_2xx` 模块。\n\n## 第三步：告警规则的阈值设定与分级\n\n告警阈值不是拍脑袋定的，需要结合业务 SLA 反推。如果业务允许 0.1% 的请求失败，而一次 TCP 超时重传对应一次请求失败，那么 TCP 重传率超过 0.1% 就该触发 warning。\n\n```yaml\n# Prometheus alerting rules\ngroups:\n- name: network_packet_loss\n  rules:\n\n  # TCP 重传率告警\n  - alert: HighTCPRetransmitRate\n    expr: |\n      rate(node_netstat_Tcp_RetransSegs[5m])\n      / rate(node_netstat_Tcp_OutSegs[5m]) > 0.001\n    for: 3m\n    labels:\n      severity: warning\n    annotations:\n      summary: \"节点 {{ $labels.instance }} TCP 重传率过高\"\n      description: \"当前重传率 {{ $value | humanizePercentage }}，超过 0.1% 阈值，持续 3 分钟\"\n\n  - alert: CriticalTCPRetransmitRate\n    expr: |\n      rate(node_netstat_Tcp_RetransSegs[5m])\n      / rate(node_netstat_Tcp_OutSegs[5m]) > 0.01\n    for: 2m\n    labels:\n      severity: critical\n    annotations:\n      summary: \"节点 {{ $labels.instance }} TCP 重传率严重异常\"\n      description: \"当前重传率 {{ $value | humanizePercentage }}，超过 1% 阈值，网络质量严重下降\"\n\n  # 网卡 drop 告警\n  - alert: NetworkInterfaceDropping\n    expr: |\n      rate(node_network_receive_drop_total{\n        device!~\"lo|veth.*|docker.*|cali.*|tunl.*\"\n      }[5m]) > 100\n    for: 2m\n    labels:\n      severity: warning\n    annotations:\n      summary: \"节点 {{ $labels.instance }} 网卡 {{ $labels.device }} 丢包\"\n      description: \"每秒 drop {{ $value }} 个包\"\n\n  # Blackbox ICMP 探测失败\n  - alert: ICMPProbePacketLoss\n    expr: |\n      1 - avg_over_time(probe_success{job=\"blackbox_icmp\"}[5m]) > 0.1\n    for: 2m\n    labels:\n      severity: warning\n    annotations:\n      summary: \"ICMP 探测到节点 {{ $labels.instance }} 丢包\"\n      description: \"5 分钟窗口内探测失败率 {{ $value | humanizePercentage }}\"\n```\n\n`for: 3m` 这个等待时间很重要。网络抖动经常是短暂的（1-2 分钟内自愈），如果没有 `for` 直接告警会产生大量无意义的 flapping 告警。3 分钟能过滤掉大多数短暂抖动，同时保证真正持续的问题在 5 分钟内告警到人。\n\n## 第四步：告警触发后的排查路径\n\n告警触发之后，真正的排查才开始。一个有条理的排查流程能把 MTTR 从 2 小时压缩到 20 分钟。\n\n**第一步：确认丢包的范围。**先看告警是一台节点还是多台同时触发。如果是多台同时出现，说明问题可能在上游交换机或跨可用区的网络链路；如果只有一台，问题可能在这台机器本身的网卡、驱动，或者是某条特定的路由路径。\n\n**第二步：用 mtr 做路径分析。**`mtr`（My Traceroute）是 traceroute 和 ping 的组合，能实时显示从源到目的地每一跳的丢包率和延迟。在问题节点上执行：\n\n```bash\n# -n 不做 DNS 解析（加速），-r 报告模式，-c 发 100 个包\nmtr -n -r -c 100 10.0.2.50\n\n# 输出示例\nHost                        Loss%   Snt   Last   Avg  Best  Wrst StDev\n1. 10.0.1.1                  0.0%   100    0.3   0.4   0.2   1.2   0.1\n2. 192.168.0.1               0.0%   100    1.1   1.2   0.9   2.1   0.2\n3. 10.10.0.254              12.0%   100   45.2  44.8  43.1  48.3   1.1  ← 这一跳开始丢包\n4. 10.0.2.50                12.0%   100   45.5  45.1  43.5  49.0   1.2\n```\n\n从输出可以看到：第 3 跳（`10.10.0.254`，通常是核心交换机或路由器）开始出现 12% 的丢包，后续跳数丢包率相同，说明问题在第 3 跳这台设备上，而不是目标主机本身。这个信息可以直接传给网络团队定位设备。\n\n**第三步：K8s 环境下的 CNI 专项排查。**在 Kubernetes 里，数据包从 Pod 出来之后要经过 `veth pair` → `cbr0`（或 `cni0`）→ 物理网卡，中间每一层都可能丢包。Calico 的 IPIP/VXLAN 隧道、Flannel 的 UDP 封包都会增加额外的 overhead 和丢包风险。\n\n```bash\n# 查看 CNI 网桥的 drop\nip -s link show cni0\n# 或者\nethtool -S eth0 | grep -i drop\n\n# 查看 conntrack 表是否满了（满了会导致新连接被 drop）\ncat /proc/sys/net/netfilter/nf_conntrack_count\ncat /proc/sys/net/netfilter/nf_conntrack_max\n# 如果 count 接近 max，conntrack 表满，需要调大或者排查连接泄漏\n\n# 查看 iptables 规则是否有 DROP（Calico 的网络策略通过 iptables 实现）\niptables -L -n -v | grep DROP\n```\n\nCalico 最常见的 CNI 丢包原因是网络策略配置错误——`NetworkPolicy` 写错了规则，或者 Pod 的 label 没对上，导致 Calico 在 iptables 里 DROP 了本不该丢的包。这种情况的特征是：`node_network_receive_drop_total` 的 `veth` 接口有 drop，但物理网卡没有。\n\n**第四步：用 eBPF 做内核级精准追踪。**当 Prometheus 指标告诉你「有丢包」但不知道具体在哪个内核路径丢的时候，`dropwatch` 或者 BCC 工具集里的 `droptrace` 能精确定位到内核函数级别。\n\n```bash\n# 使用 BCC 的 droptrace（需要安装 bcc-tools）\n/usr/share/bcc/tools/droptrace\n\n# 输出示例\nTIME     CPU    LOST_BYTES STACK\n12:34:01   3        1460   ip_forward\n                           nf_hook_slow      ← iptables 规则触发 drop\n                           ip_rcv\n\n# 或者使用 perf 追踪 kfree_skb（内核释放 skb 时的 tracepoint）\nperf trace -e skb:kfree_skb -- sleep 5\n```\n\n`kfree_skb` 是内核释放 socket buffer 的函数，正常释放不会触发 tracepoint，只有因为错误（丢包）才会。用 eBPF/perf 追踪这个 tracepoint，可以看到每个 drop 的调用栈，直接定位是 iptables、conntrack、路由还是 QDisc（流量整形队列）导致的丢包。\n\n## 第五步：区分真实丢包与拥塞控制引起的「正常」drop\n\n最后要强调一个容易误判的场景：**拥塞控制本身会触发 TCP 重传，但这不是网络链路有问题**。当发送方检测到拥塞（收到三个重复 ACK），会触发快速重传并缩小拥塞窗口，这在 `node_netstat_Tcp_RetransSegs` 里会体现出来，但网络本身是好的，只是某条流的带宽打满了。\n\n区分方式：对比 `node_netstat_TcpExt_TCPFastRetrans`（快速重传，通常是拥塞）和 `node_netstat_TcpExt_TCPTimeouts`（超时重传，通常是链路问题）。如果快速重传多而超时重传少，大概率是带宽问题；如果超时重传多，说明包真的在链路上丢了。\n\n一个完整的排查故事：某次值班凌晨 2 点，告警触发，TCP 重传率从 0.05% 涨到 0.8%，持续了 15 分钟后自愈。Blackbox ICMP 探测没有失败，说明节点间连通性正常。`mtr` 显示所有跳数丢包都是 0。最后通过 eBPF 的 `kfree_skb` 追踪，发现是 `tc_action` 触发的丢包——原来是 Calico 的 eBPF dataplane 做流量限速时误把某个 Pod 的出向流量限死了，更新了 Calico 配置后恢复正常。这种问题如果没有 eBPF 追踪，光靠 Prometheus 指标几乎无法定位。",
+      "keyPoints": [
+        "TCP 重传率 = rate(node_netstat_Tcp_RetransSegs[5m]) / rate(node_netstat_Tcp_OutSegs[5m])，超过 0.1% 触发 warning，超过 1% 触发 critical，是最贴近业务影响的丢包信号",
+        "node_network_receive_drop_total 反映的是内核网卡层 drop（ring buffer 溢出等），需过滤 veth/lo/docker 等虚拟接口才能看到真实物理网卡的丢包情况",
+        "Blackbox Exporter ICMP 探测提供外部视角的端到端连通性数据，用 1 - avg_over_time(probe_success[5m]) 计算探测失败率，覆盖单靠节点自身指标无法发现的链路故障",
+        "超时重传（TCPTimeouts）比快速重传（TCPFastRetrans）更严重：快速重传通常是拥塞控制触发，超时重传意味着包真的在链路上丢了，RTO 从 1 秒起步且指数退避",
+        "K8s 环境中 CNI 丢包常见原因是 NetworkPolicy 规则配置错误导致 Calico/iptables DROP，特征是 veth 接口有 drop 但物理网卡没有 drop",
+        "conntrack 表满（nf_conntrack_count 接近 nf_conntrack_max）会导致新连接直接被 DROP，这种丢包在网卡层不可见，需要单独监控 conntrack 使用率",
+        "mtr -n -r -c 100 <目标 IP> 能逐跳显示丢包率，从第几跳开始丢包就能快速定位是哪台网络设备有问题，有效缩短网络故障的 MTTR",
+        "eBPF 追踪 kfree_skb tracepoint 可以精确定位内核函数级别的丢包原因（iptables、conntrack、QDisc 等），是 Prometheus 指标无法替代的深度诊断手段"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q119-q1",
+          "question": "以下哪个 Prometheus 表达式能正确计算 TCP 重传率？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "rate(node_netstat_Tcp_RetransSegs[5m]) / rate(node_netstat_Tcp_OutSegs[5m])"
+            },
+            {
+              "id": "B",
+              "text": "node_netstat_Tcp_RetransSegs / node_netstat_Tcp_OutSegs"
+            },
+            {
+              "id": "C",
+              "text": "rate(node_netstat_Tcp_RetransSegs[5m]) / rate(node_netstat_Tcp_InSegs[5m])"
+            },
+            {
+              "id": "D",
+              "text": "increase(node_netstat_Tcp_RetransSegs[5m])"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：重传率 = 重传段速率 / 发出段速率，分母用 OutSegs（本机发出的 TCP 段总数），反映本机发送时的重传情况。B 错误：直接用累计值相除，由于 counter 会持续增长，这个比值会随时间趋近于一个稳定但无意义的历史比例，无法反映当前状况；必须用 rate() 转为速率再相除。C 错误：分母用了 InSegs（接收段数），而重传是发送侧的行为，用接收量做分母逻辑上不正确。D 错误：increase() 只给出绝对增量，没有归一化，无法判断「占比是否异常」。",
+          "relatedConcepts": ["TCP重传", "Prometheus rate函数", "node_exporter"]
+        },
+        {
+          "id": "monitoring-q119-q2",
+          "question": "node_network_receive_drop_total 指标中，以下哪个过滤条件是监控物理网卡丢包时的最佳实践？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "{device!~\"lo|veth.*|docker.*|cali.*\"}"
+            },
+            {
+              "id": "B",
+              "text": "{device=\"eth0\"}"
+            },
+            {
+              "id": "C",
+              "text": "不需要过滤，所有接口都要监控"
+            },
+            {
+              "id": "D",
+              "text": "{device=~\"eth.*\"}"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：用正则排除法过滤掉已知虚拟接口（lo 本地回环、veth 容器虚拟网卡、docker 网桥、cali Calico 接口），保留真实的物理/绑定网卡，能适应不同命名规范（eth0、ens3、bond0 等）。B 错误：硬编码 eth0 在云主机上可能是 ens3 或 ens5，在裸金属上可能是 bond0，这种写法可移植性差，容易漏掉目标接口。C 错误：veth 接口在 K8s 环境下有大量 drop 是正常现象（CNI 流量整形），不过滤会产生持续的误报噪音。D 错误：正则 eth.* 同样存在命名假设，不能覆盖 ens/enp/bond 等命名模式。",
+          "relatedConcepts": ["node_exporter", "网卡接口", "K8s网络"]
+        },
+        {
+          "id": "monitoring-q119-q3",
+          "question": "Blackbox Exporter ICMP 探测的核心指标 probe_success 取值为 0 时，以下哪种说法最准确？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "表示探测超时或 ICMP echo reply 未收到，目标节点不可达或路径中有丢包"
+            },
+            {
+              "id": "B",
+              "text": "表示目标节点的 TCP 端口不通"
+            },
+            {
+              "id": "C",
+              "text": "表示目标节点的 HTTP 服务返回了非 2xx 状态码"
+            },
+            {
+              "id": "D",
+              "text": "表示 DNS 解析失败"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：Blackbox Exporter 的 ICMP 模块发送 ICMP echo request，probe_success=0 意味着在超时时间内没有收到 echo reply，原因可以是目标主机不可达、路径中某跳丢了 ICMP 包，或者目标主机的防火墙屏蔽了 ICMP。B 错误：TCP 端口连通性检测需要使用 tcp_connect 模块，不是 ICMP 模块的功能。C 错误：HTTP 状态码检测需要使用 http_2xx 模块，ICMP 不涉及 HTTP。D 错误：如果使用域名作为探测目标，DNS 解析失败确实会导致 probe_success=0，但通常 Blackbox 探测配置的是 IP 地址，且 DNS 失败有单独的 probe_dns_lookup_time_seconds 指标可以区分。",
+          "relatedConcepts": ["Blackbox Exporter", "ICMP", "网络探测"]
+        },
+        {
+          "id": "monitoring-q119-q4",
+          "question": "node_netstat_TcpExt_TCPTimeouts 增长而 node_netstat_TcpExt_TCPFastRetrans 没有明显变化，这通常说明什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "网络链路质量下降，数据包在传输过程中真实丢失，发送方等待 RTO 超时才触发重传"
+            },
+            {
+              "id": "B",
+              "text": "发送方带宽打满，触发了 TCP 拥塞控制的快速重传机制"
+            },
+            {
+              "id": "C",
+              "text": "接收方的 ACK 延迟发送（Delayed ACK）导致发送方误判超时"
+            },
+            {
+              "id": "D",
+              "text": "TCP 的 Nagle 算法在合并小包，导致发送延迟"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：TCPTimeouts 统计的是发送方等待 RTO（Retransmission Timeout，初始值约 1 秒）超时后触发的重传，说明 ACK 迟迟未到，通常是网络链路丢包导致数据包或 ACK 包在路途中丢失。B 错误：快速重传由收到三个重复 ACK 触发，说明对端收到了后续包但没收到这个包，这是乱序/轻微拥塞场景，体现在 TCPFastRetrans 上，而不是 TCPTimeouts。C 错误：Delayed ACK 会让 ACK 延迟约 40-200ms，在绝大多数情况下不会超过 RTO（1s），不会触发 TCPTimeouts；而且 Delayed ACK 是系统内的正常行为，不算丢包。D 错误：Nagle 算法是发送侧合并小包的机制，影响的是发送延迟，与重传无关。",
+          "relatedConcepts": ["TCP重传", "RTO", "拥塞控制"]
+        },
+        {
+          "id": "monitoring-q119-q5",
+          "question": "mtr -n -r -c 100 10.0.2.50 的输出显示第 3 跳丢包率为 15%，第 4 跳（目标）丢包率也为 15%，这说明什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "问题在第 3 跳设备，第 4 跳的丢包是第 3 跳丢包的累积效应，目标主机本身正常"
+            },
+            {
+              "id": "B",
+              "text": "问题在第 4 跳（目标主机），第 3 跳的丢包率是误报"
+            },
+            {
+              "id": "C",
+              "text": "第 3 跳和第 4 跳各自独立丢了 15% 的包，总丢包率接近 30%"
+            },
+            {
+              "id": "D",
+              "text": "第 3 跳丢包是因为 ICMP 限速（rate limiting），不代表真实的数据包丢失"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：mtr 的丢包率是从源端累积测量的。如果第 3 跳开始丢 15%，后续所有跳数都会继承这个丢包——因为被第 3 跳丢掉的包永远不会到达第 4 跳，所以第 4 跳看到的 15% 丢包实际上是第 3 跳造成的，目标主机本身收到包后响应是正常的。定位规则：找到最早出现丢包且后续跳数丢包率相近的那一跳，就是故障点。B 错误：如果是目标主机的问题，应该是前面各跳丢包率都是 0%，只有最后一跳丢包。C 错误：网络丢包是串联的，不是并联叠加的，后续跳数的丢包是上游丢包的结果，不能简单相加。D 错误：D 选项的说法在某些中间路由器上确实存在（ICMP 限速会导致中间跳丢包显示偏高但实际数据包不丢），但那种情况下后续跳数丢包率会低于或等于中间跳，不会一致。",
+          "relatedConcepts": ["mtr", "traceroute", "网络路径分析"]
+        },
+        {
+          "id": "monitoring-q119-q6",
+          "question": "在 K8s 集群中，发现某 Pod 的出向流量被丢包，node_network_receive_drop_total 在对应的 veth 接口上有增长，但物理网卡没有 drop。最可能的原因是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Calico/iptables 的 NetworkPolicy 规则 DROP 了这个 Pod 的流量"
+            },
+            {
+              "id": "B",
+              "text": "物理网卡的 ring buffer 满了"
+            },
+            {
+              "id": "C",
+              "text": "TCP 连接数超过了 net.core.somaxconn 限制"
+            },
+            {
+              "id": "D",
+              "text": "节点的内存不足导致内核无法分配 skb"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：在 K8s 里数据包从 Pod 出来先经过 veth pair，再经过 CNI 的 iptables/eBPF 规则，最后才到物理网卡。如果 NetworkPolicy 规则匹配到这个 Pod 并执行了 DROP，数据包在 iptables 层就被丢弃了，物理网卡根本看不到这些包，但 veth 接口的 drop 计数器会增长。排查方法是 `iptables -L -n -v | grep DROP` 查看规则命中计数，或者用 eBPF 追踪 kfree_skb 看调用栈里有没有 nf_hook_slow（iptables 回调）。B 错误：ring buffer 满是物理网卡层的问题，会体现在物理网卡的 drop 上，而不是 veth。C 错误：somaxconn 超限影响的是 TCP listen 队列（ListenDrops），是接受新连接时的丢弃，不是通用的出向丢包。D 错误：内存不足时 skb 分配失败会影响所有接口，不会只表现在 veth 上。",
+          "relatedConcepts": ["Calico", "NetworkPolicy", "iptables", "CNI"]
+        },
+        {
+          "id": "monitoring-q119-q7",
+          "question": "告警规则里 for: 3m 这个参数的主要作用是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "过滤短暂的网络抖动，避免 flapping 告警，只有持续 3 分钟以上的问题才触发"
+            },
+            {
+              "id": "B",
+              "text": "设置 Prometheus 的数据采集间隔为 3 分钟"
+            },
+            {
+              "id": "C",
+              "text": "控制告警通知的发送频率，每 3 分钟最多发送一次"
+            },
+            {
+              "id": "D",
+              "text": "设置告警的自动恢复等待时间"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：Prometheus 的 `for` 参数要求告警条件持续满足指定时长后才从 Pending 状态变为 Firing 状态，主要目的是抑制瞬时抖动产生的误报。网络环境里短暂的 1-2 分钟抖动很常见（BGP 路由收敛、设备短暂过载），加了 for: 3m 后这类自愈的抖动不会打扰 oncall 工程师。B 错误：采集间隔由 prometheus.yml 的 scrape_interval 控制（通常是 15s 或 30s），与告警规则无关。C 错误：通知频率由 Alertmanager 的 repeat_interval 控制，而不是 Prometheus 规则里的 for。D 错误：告警恢复后从 Firing 变回 Normal 是立即的（下一次评估周期），没有额外的等待时间，这与 for 参数无关。",
+          "relatedConcepts": ["Prometheus告警", "for参数", "flapping"]
+        },
+        {
+          "id": "monitoring-q119-q8",
+          "question": "conntrack 表满（nf_conntrack_count 达到 nf_conntrack_max）会导致什么现象？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "新建连接的 SYN 包被 DROP，表现为客户端连接超时，但已有连接不受影响"
+            },
+            {
+              "id": "B",
+              "text": "所有已有连接立即断开，出现大规模连接重置"
+            },
+            {
+              "id": "C",
+              "text": "只影响 UDP 连接，TCP 连接不受 conntrack 限制"
+            },
+            {
+              "id": "D",
+              "text": "系统自动扩大 conntrack 表，连接不受影响"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：当 conntrack 表满时，内核无法为新连接创建跟踪条目，因此新建连接的第一个包（SYN）会被 DROP，客户端看到的是连接超时（connect timeout）。关键特性是「存量不影响」：已经建立的连接有对应的 conntrack 条目，不受影响；但新的连接请求全部失败，这在高并发服务上会造成大规模新连接失败而已有长连接正常的奇特现象。监控命令：`watch -n 1 'cat /proc/sys/net/netfilter/nf_conntrack_count'`。B 错误：conntrack 表满不会主动断开已有连接，只影响新建连接。C 错误：conntrack 同时追踪 TCP 和 UDP（以及 ICMP），不是只针对 UDP。D 错误：conntrack 最大值是硬限制，内核不会自动扩展；需要手动调大 nf_conntrack_max 或者排查连接泄漏减少条目数。",
+          "relatedConcepts": ["conntrack", "netfilter", "连接追踪"]
+        },
+        {
+          "id": "monitoring-q119-q9",
+          "question": "使用 eBPF 追踪 kfree_skb tracepoint 定位丢包时，以下哪个调用栈说明丢包是由 iptables 规则触发的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "kfree_skb → nf_hook_slow → ip_forward → ip_rcv"
+            },
+            {
+              "id": "B",
+              "text": "kfree_skb → __netif_receive_skb → netif_receive_skb → napi_gro_receive"
+            },
+            {
+              "id": "C",
+              "text": "kfree_skb → tcp_v4_rcv → tcp_rcv_established → tcp_data_queue"
+            },
+            {
+              "id": "D",
+              "text": "kfree_skb → sock_queue_rcv_skb → __sock_queue_rcv_skb → sk_filter"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：`nf_hook_slow` 是 Netfilter hook 的执行函数，当 iptables 规则链（如 FORWARD 链的 DROP 规则）命中时，数据包会通过 nf_hook_slow 被丢弃，然后调用 kfree_skb 释放 skb。调用栈里看到 nf_hook_slow 就是 iptables/netfilter 规则触发的 DROP 的典型特征。B 错误：这个调用栈是正常的包接收路径（NAPI 轮询 → 网卡驱动 → 协议栈），出现在这里的 kfree_skb 说明可能是 ring buffer 溢出或驱动层问题。C 错误：这是 TCP 层的接收路径，kfree_skb 出现在这里可能是 socket 接收缓冲区满或者 RST 场景，不是 iptables 问题。D 错误：sk_filter 是 socket filter（BPF 程序）的执行点，出现这里说明是 socket 级别的 BPF 程序丢包，与 iptables 规则不同。",
+          "relatedConcepts": ["eBPF", "kfree_skb", "iptables", "netfilter"]
+        },
+        {
+          "id": "monitoring-q119-q10",
+          "question": "线上服务告警显示 TCP 重传率从 0.05% 升到 0.9%，但 Blackbox ICMP 探测全部成功，mtr 各跳丢包率为 0，node_network_receive_drop_total 物理网卡无增长。下一步最有效的排查手段是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "用 eBPF 追踪 kfree_skb，查看丢包发生在哪个内核路径，重点检查 CNI/iptables 层"
+            },
+            {
+              "id": "B",
+              "text": "重启节点，观察是否自愈"
+            },
+            {
+              "id": "C",
+              "text": "扩容增加节点，分散流量压力"
+            },
+            {
+              "id": "D",
+              "text": "联系数据中心运维检查物理交换机端口"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 正确：已知信息是「TCP 重传率高但链路层看起来正常」，这个矛盾指向的是内核软件层面的丢包，最可能是 iptables/conntrack/QDisc 等路径。此时 ICMP 探测正常是因为 ICMP 和 TCP 走不同的内核路径，iptables 可以只 DROP TCP 特定端口的流量而不影响 ICMP。eBPF 的 kfree_skb 追踪能精确显示每个被丢弃的包的内核函数调用栈，是这种「Prometheus 指标异常但物理链路正常」场景下最有效的诊断工具。B 错误：重启是最后手段，在没有定位根因之前重启只是暂时掩盖问题，无法确认是否真的解决了，且会造成不必要的服务中断。C 错误：重传率高不等于流量过大，扩容在这里是无效动作，且浪费资源。D 错误：mtr 已经确认各跳丢包率为 0，物理交换机正常，联系运维检查交换机是方向错误的。",
+          "relatedConcepts": ["eBPF", "kfree_skb", "故障排查", "TCP重传"]
+        }
+      ],
+      "references": [
+        "https://prometheus.io/docs/guides/node-exporter/",
+        "https://github.com/prometheus/blackbox_exporter",
+        "https://www.brendangregg.com/blog/2018-03-22/tcp-tracepoints.html",
+        "https://docs.tigera.io/calico/latest/network-policy/",
+        "https://man7.org/linux/man-pages/man8/mtr.8.html"
+      ],
+      "relatedQuestions": []
+    }
+  ]
+}
