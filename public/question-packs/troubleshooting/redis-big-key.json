@@ -1,0 +1,157 @@
+{
+  "id": "redis-big-key",
+  "name": "Redis 大 Key 问题排查与处理",
+  "domain": "troubleshooting",
+  "description": "识别和处理 Redis 大 Key 的完整方法，避免阻塞和带宽突增问题",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-big-key-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["redis", "bigkey", "memory", "unlink", "scan", "slowlog", "hash"],
+      "title": "Redis 出现大 Key 导致命令耗时高和带宽突增，如何发现和处理大 Key？",
+      "content": "## 故障背景\n\n你们团队维护一套用户画像服务，后端用 Redis 5.0 存储用户的行为标签和属性数据，线上部署的是一个 3 主 3 从的 Redis Cluster，每个节点 16GB 内存。最近 QA 在回归测试时反馈用户画像接口偶尔出现 200ms 以上的响应时间，但并不是每次都复现，大概每隔 3~5 分钟出现一次毛刺。\n\n你登上监控平台，发现以下异常：\n\n- 用户画像服务的 P99 延迟从平时的 8ms 偶发性飙到 180~220ms\n- Redis 集群中有一个节点（node-2）的网络出带宽，每隔几分钟就出现一次 30~50MB/s 的短暂突增，而其他节点带宽平稳在 2~5MB/s\n- Redis Cluster 三个主节点的 used_memory 分别是：node-1: 4.2GB，node-2: 11.8GB，node-3: 3.9GB，内存极度不均衡\n\n你想到先查 slow log，执行 `SLOWLOG GET 20`，发现其中有这样一条记录：\n\n```\n1) 1) (integer) 142\n   2) (integer) 1701234567\n   3) (integer) 98234        ← 执行耗时，单位微秒，约 98ms\n   4) 1) \"HGETALL\"\n      2) \"user:profile:2847193\"\n   5) \"10.0.1.23:54321\"\n   6) \"\"\n```\n\n一条 `HGETALL` 命令耗时 98ms，这在 Redis 里几乎是不可思议的。Redis 是单线程处理命令的，这 98ms 期间所有其他命令都被阻塞了，这正好解释了为什么所有接口都会出现毛刺。\n\n现在问题指向了 `user:profile:2847193` 这个 Hash 类型的 key。请问：\n\n1. 大 key 的定义标准是什么？它会带来哪些具体的危害？\n2. 如何系统性地发现 Redis 中的大 key？有哪些工具和方法？\n3. 针对这个 Hash 大 key，以及不同类型的大 key，分别应该怎么处理？\n4. 删除这个大 key 时需要注意什么？\n5. 如何从根本上防止大 key 问题再次出现？",
+      "answer": "## 第一步：真正理解「大 Key」是什么\n\nRedis 大 key（Big Key）是一个在生产环境中极为常见、危害却经常被低估的问题。在回答「怎么排查」之前，必须先建立清晰的概念：什么样的 key 算大 key，大 key 为什么危险。\n\nRedis 的数据结构分为两大类：一是单值类型（String），二是集合类型（Hash、List、Set、ZSet）。对于 String 类型，业界通行的标准是 value 大小超过 10KB 就算大 key，超过 1MB 则属于严重大 key。对于集合类型，判断标准要从两个维度看：一是 field/element 数量，Hash 或 ZSet 的 field 超过 5000 个、List 或 Set 的元素超过 5000 个，就需要重点关注；二是总大小，集合类型的 value 总大小超过 10MB 就属于严重大 key。这两个维度任一超标，都意味着潜在风险。\n\n为什么大 key 这么危险？这要从 Redis 的单线程模型说起。Redis 处理命令时用单线程的事件循环（event loop），一个命令执行期间，其他所有命令都在排队等待。当你对一个有 50 万个 field 的 Hash 执行 `HGETALL` 时，Redis 需要将这 50 万个 field-value 对全部序列化然后通过网络返回，这个过程可能耗时数十毫秒甚至上百毫秒，而在这期间，其他客户端的 `GET`、`SET` 等命令全部被阻塞。这就是 slow log 里那条 98ms 的 `HGETALL` 能让整个服务出现毛刺的根本原因。\n\n除了阻塞，大 key 还会带来严重的网络带宽问题。一次 `HGETALL` 返回 20MB 的数据，在千兆网卡上就需要消耗约 160ms 的带宽，这与监控里观察到的 node-2 网络突增完全吻合——那个节点上有大 key，每次被访问都会产生大量出流量。在 Redis Cluster 模式下，大 key 还会导致数据倾斜，node-2 的 11.8GB 内存使用量远超其他节点的 4GB，不仅浪费资源，还可能在大 key 节点上触发内存淘汰，或者在 RDB 快照和 AOF rewrite 时因为需要处理这个超大结构而导致 fork 子进程耗时异常。\n\n## 第二步：系统性地发现大 Key\n\n知道了大 key 的危害，现在来看如何找到它们。发现大 key 有几种工具，各有适用场景，要根据实际情况选择。\n\n**redis-cli --bigkeys**：这是最常用的快速扫描工具，直接连接 Redis 实例后执行，它会用 `SCAN` 命令遍历所有 key，对每种数据类型分别找出占用内存或 element 数量最多的那个。命令如下：\n\n```bash\n# 连接指定节点扫描（Cluster 模式需要加 -c 参数连接任意节点，但 --bigkeys 本身只扫描当前节点）\nredis-cli -h 10.0.1.x -p 6379 -a yourpassword --bigkeys\n\n# 加上 -i 0.1 可以让每次 SCAN 后休眠 100ms，避免对生产实例造成压力\nredis-cli -h 10.0.1.x -p 6379 --bigkeys -i 0.1\n```\n\n典型输出如下：\n\n```\n# Scanning the entire keyspace to find biggest keys as well as\n# average sizes per key type.  You can use -i 0.1 to sleep 0.1 sec\n# per 100 SCAN commands (not usually needed).\n\n[00.00%] Biggest string found so far '\"session:abc123\"' with 512 bytes\n[13.42%] Biggest hash   found so far '\"user:profile:2847193\"' with 487293 fields\n[27.18%] Biggest hash   found so far '\"user:profile:2847193\"' with 487293 fields\n\n-------- summary -------\n\nSampled 1842934 keys in the keyspace!\nTotal key length in bytes is 48293847 (avg len 26.21)\n\nBiggest   string found '\"session:abc123\"' has 512 bytes\nBiggest     hash found '\"user:profile:2847193\"' has 487293 fields\nBiggest     list found '\"event:queue:global\"' has 823 items\nBiggest      set found '\"tag:active_users\"' has 12847 members\nBiggest     zset found '\"rank:score:daily\"' has 98234 members\n\n487293 fields is the max number of fields for hashes\n```\n\n这个输出直接告诉我们：`user:profile:2847193` 有将近 49 万个 field，这就是罪魁祸首。但要注意 `--bigkeys` 的局限性：**它只能找到每种类型中 element 数量最多的那一个**，如果有多个 field 数量差不多的大 key，除了最大的那个，其他都不会出现在结果里。\n\n**MEMORY USAGE 命令**：确定了嫌疑 key 后，用 `MEMORY USAGE` 查看它实际占用的内存字节数（Redis 4.0+）：\n\n```bash\n127.0.0.1:6379> MEMORY USAGE user:profile:2847193\n(integer) 48293847\n\n127.0.0.1:6379> MEMORY USAGE user:profile:2847193 SAMPLES 0\n# SAMPLES 0 表示对集合类型采样所有 field，结果更精确但开销更大\n(integer) 48301234\n```\n\n`48293847` 字节，约 46MB。一个 Hash 占了 46MB，这已经是严重的大 key 了。相比之下，`DEBUG OBJECT key` 命令返回的是序列化大小（serialized length），是在网络传输时的压缩表示，比实际内存占用要小，两者都有参考价值但含义不同。\n\n**RDB 离线分析**：`--bigkeys` 的在线扫描会给 Redis 带来额外压力，而且找不到「第二大」。更彻底的方案是对 RDB 文件做离线分析。工具推荐 `rdb`（[github.com/sripathikrishnan/redis-rdb-tools](https://github.com/sripathikrishnan/redis-rdb-tools)）或更现代的 `rdb-tools`（Go 实现，速度更快）：\n\n```bash\n# 安装 redis-rdb-tools\npip install rdbtools python-lzf\n\n# 生成 CSV 报告，分析所有 key 的大小\nrdb --command memory /var/lib/redis/dump.rdb > memory_report.csv\n\n# 按 key 大小降序排列，找出 Top 20\nsort -t',' -k4 -rn memory_report.csv | head -20\n```\n\n输出示例（CSV 格式，字段依次为 database, type, key, size_in_bytes, encoding, num_elements, len_largest_element）：\n\n```\n0,hash,user:profile:2847193,48301234,ziplist,487293,256\n0,hash,user:profile:9182736,31204891,hashtable,312048,256\n0,string,raw_html_cache:homepage,8421304,raw,1,8421304\n```\n\nRDB 分析的好处是完全离线、不影响生产，而且能找到所有大 key，而不只是每种类型最大的那一个。缺点是需要一份最新的 RDB 文件，而且当 RDB 文件本身很大时分析也需要时间。\n\n## 第三步：处理大 Key——不同类型有不同方案\n\n发现了大 key，接下来要解决它。不同类型的大 key，处理思路不同。\n\n**处理 Hash 大 key**：`user:profile:2847193` 这种情况，最常用的方案是「按 field 前缀拆分」。把一个巨大的 Hash 拆分成多个小 Hash，每个小 Hash 只存一类数据：\n\n```\n# 拆分前：一个 Hash 存了所有用户属性\nuser:profile:2847193  →  { base_name: \"张三\", base_age: 28, tag_sport: 1, tag_music: 1, ...(49万个field) }\n\n# 拆分后：按业务分类存到多个 Hash\nuser:profile:2847193:base   →  { name: \"张三\", age: 28, city: \"北京\" }  # 基础属性，小而稳定\nuser:profile:2847193:tags   →  { sport: 1, music: 1, travel: 0 }       # 兴趣标签\nuser:profile:2847193:stats  →  { login_count: 234, last_active: 1701234567 }  # 统计数据\n```\n\n这样每个 Hash 只有几百个 field，`HGETALL` 返回的数据量可控。如果某类数据还是太多，可以进一步按 field 名称做 hash 分片（field 名 % N），将数据分散到 N 个 Hash 中。\n\n**处理 String 大 key**：如果 String 的 value 是一个 JSON 或序列化对象，优先考虑压缩。用 gzip 或 snappy 压缩后存储，读取时解压。一个 8MB 的 JSON 用 gzip 压缩后通常能缩小到 1~2MB。如果压缩后仍然很大，则需要考虑是否真的需要把整个对象存到 Redis——很多时候这是设计问题，应该存到 MySQL 或对象存储，Redis 只存 ID 或摘要信息。\n\n**处理 List 大 key**：List 大 key 通常是日志流或消息队列的设计问题，用了 LPUSH 不断追加但没有及时消费或清理。分段存储是一个思路：`list:events:0`、`list:events:1`……每段控制在 1000 个元素以内。但更根本的方案是考虑换用 Kafka 或 Redis Stream（Redis 5.0+ 的 XADD/XREAD 原生支持消费组和自动截断）。\n\n**处理 Set/ZSet 大 key**：不要用 `SMEMBERS` 或 `ZRANGE 0 -1` 一次性取出所有成员，改用游标迭代：`SSCAN key cursor COUNT 100` 每次取 100 个，分批处理。这样单次命令的耗时就是可控的，不会阻塞 Redis。如果需要持久化这份数据，考虑用 HSCAN/SSCAN 迁移到关系型数据库，Redis 只保留最近 N 天的活跃数据加上 TTL。\n\n**最关键：如何安全删除大 Key**。这是很多人踩坑的地方。**绝对不能用 DEL 命令删除大 key**。`DEL` 是同步操作，删一个有 49 万个 field 的 Hash，Redis 需要同步释放所有内存，这可能阻塞 Redis 数百毫秒，比 `HGETALL` 还严重。正确的做法是用 `UNLINK` 命令（Redis 4.0+）：\n\n```bash\n127.0.0.1:6379> UNLINK user:profile:2847193\n(integer) 1\n```\n\n`UNLINK` 是异步的：它先把 key 从 keyspace 中摘除（这一步是同步的，极快），然后把实际的内存释放工作交给后台线程去做。对于调用方来说，`UNLINK` 返回后 key 就已经不可见了，但内存可能在后台继续释放一段时间。这个设计和操作系统的 `unlink` 系统调用如出一辙——先删目录项，inode 引用计数归零后才真正释放磁盘块。\n\n如果需要渐进式删除（比如要先把数据迁走再删），可以对集合类型用 HSCAN/SSCAN 分批 HDEL/SREM，每批删 100~500 个 field，每批之间 sleep 1~5ms，把删除操作的压力分散到更长时间内。\n\n## 扩展：从根本上防止大 Key 再次出现\n\n处理完这次的大 key 只是「救火」，更重要的是找到它为什么会产生，然后从设计上杜绝。`user:profile:2847193` 有 49 万个 field，这绝对不是正常的用户画像数据结构，很可能是业务代码在用 `HSET user:profile:{uid} {event_id} {payload}` 记录用户每次行为事件，把 Redis Hash 当成了无限追加的行为日志——这是一个设计错误，行为日志应该放时序数据库或消息队列，而不是 Redis Hash。\n\n大 key 产生的根本原因通常有两类：一是「无界追加」，业务只写不清理，Hash/List/Set 随时间无限增长；二是「大对象直接序列化存储」，把一个包含嵌套数组的复杂对象直接 JSON 序列化后 SET 进 Redis，完全没有考虑大小。针对这两类问题，团队需要建立业务规范：写 Redis 的代码必须考虑数据的 TTL 和上限，集合类型的 key 必须有最大 element 数量的限制（可以用 Lua 脚本实现原子性的「写入 + 超长截断」逻辑）。\n\n在 Redis Cluster 模式下，大 key 的内存倾斜问题尤为明显。当某个 slot 上有一个 46MB 的大 key，而整个 cluster 的 key 数量又在那个节点上集中时，就会出现 node-2 内存 11.8GB 而其他节点只有 4GB 的情况。除了解决大 key 本身，还需要关注 slot 分布是否均匀（`redis-cli --cluster check` 可以查看）。\n\n在监控层面，建议对 RDB 文件大小设置环比增长告警（比如单次增幅超过 20% 就告警），RDB 大小异常增长往往是大 key 出现的早期信号。同时在 APM 中对 Redis 命令按 key 统计耗时分布，一旦某个 key 的 P99 开始超过 10ms 就触发告警，而不是等到 slow log 里出现 100ms 再反应。定期（比如每周）用 `rdb --command memory dump.rdb` 分析一次 RDB，把 Top 20 大 key 的列表输出到监控面板，做到持续可见。",
+      "keyPoints": [
+        "大 key 的判断标准：String 类型 value 超过 10KB 需关注、超过 1MB 属严重；Hash/List/Set/ZSet 的 element 数量超过 5000 或总大小超过 10MB 均需处理。",
+        "Redis 单线程模型导致大 key 直接阻塞所有其他命令：对 49 万 field 的 Hash 执行 HGETALL 可能耗时 100ms，期间所有客户端请求全部阻塞，这是毛刺的直接原因。",
+        "redis-cli --bigkeys 通过 SCAN 遍历 keyspace 找出每种类型中 element 数量最多的 key，加 -i 0.1 参数可以控制扫描速率避免对生产实例造成压力，但只能找到每种类型「最大的那一个」。",
+        "MEMORY USAGE key 命令（Redis 4.0+）返回该 key 实际占用的内存字节数，是判断大 key 内存影响最直接的指标；RDB 离线分析（redis-rdb-tools）可以找出所有大 key 而不仅是每种类型最大的那个。",
+        "删除大 key 必须用 UNLINK 而非 DEL：DEL 是同步释放内存，会阻塞 Redis 数百毫秒；UNLINK 先从 keyspace 摘除 key，再由后台线程异步释放内存，对主线程几乎无影响。",
+        "Hash 大 key 的最佳处理方案是按 field 业务语义拆分为多个小 Hash（如 user:profile:{uid}:base、user:profile:{uid}:tags），而不是把所有 field 塞进一个 Hash；List/Set 大 key 则应用 SSCAN/LRANGE 分批读取，结合 UNLINK 渐进删除。",
+        "大 key 产生的根本原因是「无界追加不清理」或「大对象直接序列化」，需在业务层建立 TTL 和 element 数量上限规范，并通过每周 RDB 分析定期检查 Top 大 key，而不是等到 slow log 爆出问题才处理。"
+      ],
+      "quiz": [
+        {
+          "id": "redis-big-key-q1",
+          "question": "根据业界通行标准，以下哪种情况属于 Redis 大 key？",
+          "choices": [
+            { "id": "A", "text": "一个 String 类型的 key，value 大小为 15KB" },
+            { "id": "B", "text": "一个 Hash 类型的 key，有 3000 个 field，总大小 2MB" },
+            { "id": "C", "text": "一个 List 类型的 key，有 200 个元素，每个元素 10 字节" },
+            { "id": "D", "text": "一个 ZSet 类型的 key，有 100 个 member，总大小 50KB" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "业界通行标准：String 类型 value 超过 10KB 即为大 key，15KB 已超过阈值，A 是正确答案。B 中 Hash 虽然有 3000 个 field，但 field 数量需要超过 5000 才算大 key（总大小 2MB 也未超过 10MB 的阈值）。C 中 List 只有 200 个元素，远未达到 5000 的阈值，几乎可以忽略。D 中 ZSet 只有 100 个 member，总大小 50KB，两个维度都在安全范围内。理解大 key 的判断标准要从「元素数量」和「总大小」两个维度同时考量，单独看某一维度容易误判。"
+        },
+        {
+          "id": "redis-big-key-q2",
+          "question": "Redis 大 key 会导致「偶发性全服务毛刺」的根本原因是什么？",
+          "choices": [
+            { "id": "A", "text": "大 key 会触发 Redis 的 LRU 淘汰机制，导致 CPU 使用率飙升" },
+            { "id": "B", "text": "Redis 是单线程处理命令，读写大 key 的命令执行期间所有其他命令都被阻塞" },
+            { "id": "C", "text": "大 key 会导致 Redis 主从复制积压，从库延迟增加" },
+            { "id": "D", "text": "大 key 占用过多内存，触发操作系统的 OOM Killer 杀死 Redis 进程" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 使用单线程的事件循环（event loop）处理所有客户端命令。当某个命令在处理大 key 时（比如 HGETALL 一个有 49 万 field 的 Hash），该命令可能执行 100ms 以上，在这期间，其他所有客户端的命令请求都在等待队列中阻塞，导致所有接口同时出现延迟毛刺。A 中 LRU 淘汰确实消耗 CPU，但不是「命令级阻塞」的原因。C 的主从复制延迟是大 key 的次生影响，不是毛刺的直接原因。D 的 OOM 是内存耗尽后才会触发的极端情况，不是「偶发性毛刺」的解释。"
+        },
+        {
+          "id": "redis-big-key-q3",
+          "question": "`redis-cli --bigkeys` 命令的工作方式和局限性，以下描述正确的是？",
+          "choices": [
+            { "id": "A", "text": "直接读取 RDB 文件做离线分析，不会对 Redis 实例造成压力" },
+            { "id": "B", "text": "用 KEYS * 命令一次性获取所有 key 后逐一检查大小" },
+            { "id": "C", "text": "用 SCAN 命令渐进式遍历，但每种数据类型只报告 element 数量最多的那一个 key" },
+            { "id": "D", "text": "只能检查 String 和 Hash 类型，无法检查 List 和 ZSet" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "redis-cli --bigkeys 通过 SCAN 命令渐进式遍历整个 keyspace，SCAN 不会像 KEYS * 那样阻塞 Redis（B 的描述是错误的危险做法，生产环境绝对禁止 KEYS *）。--bigkeys 的关键局限是：对每种数据类型，它只追踪并报告当前遍历中 element 数量最多的那一个，如果你有 3 个 field 数量相近的大 Hash key，结果里只会出现最大的那一个，其余两个不会显示。A 中描述的是 rdb 离线工具的工作方式，不是 --bigkeys。D 是错误的，--bigkeys 支持 String、Hash、List、Set、ZSet 五种类型。"
+        },
+        {
+          "id": "redis-big-key-q4",
+          "question": "执行 `MEMORY USAGE user:profile:2847193` 返回 `(integer) 48293847`，这个数字代表什么？",
+          "choices": [
+            { "id": "A", "text": "该 key 的 field 数量是 48,293,847 个" },
+            { "id": "B", "text": "该 key 名称的字符串长度是 48,293,847 字节" },
+            { "id": "C", "text": "该 key 及其 value 占用的内存字节数约为 46MB" },
+            { "id": "D", "text": "该 key 序列化后的网络传输大小是 48,293,847 字节" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "MEMORY USAGE 命令（Redis 4.0+ 引入）返回的是该 key 在 Redis 内存中实际占用的字节数，包括 key 名称、value 本身的内存，以及 Redis 内部数据结构的开销（如 dictEntry、sds header 等）。48,293,847 字节 ÷ 1024 ÷ 1024 ≈ 46MB，这是内存视角的占用量。D 描述的是 DEBUG OBJECT 返回的 serializedlength（序列化大小），通常比 MEMORY USAGE 小，因为序列化时会压缩表示。A 和 B 都是对返回值含义的错误理解，field 数量要用 HLEN 命令查询，key 名称长度要用 STRLEN（仅适用于 String 类型）。"
+        },
+        {
+          "id": "redis-big-key-q5",
+          "question": "以下 redis-cli --bigkeys 输出片段，可以得出哪个结论？\n```\nBiggest hash found '\"user:profile:2847193\"' with 487293 fields\n```",
+          "choices": [
+            { "id": "A", "text": "集群中所有 Hash 类型 key 里，user:profile:2847193 的 field 数量最多，但可能还有其他 field 数量接近的大 Hash 未被报告" },
+            { "id": "B", "text": "整个 Redis 实例里只有这一个大 key，其他 key 都是安全的" },
+            { "id": "C", "text": "487293 个 field 说明这个 Hash 占用的内存一定超过 1GB" },
+            { "id": "D", "text": "这个扫描结果是通过 KEYS * 获取所有 key 后逐一用 HLEN 检查得到的" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "--bigkeys 只报告每种类型中「当前扫描到的最大的那一个」，不代表其他 Hash key 都是安全的。如果存在另一个有 400000 个 field 的 Hash，它不会出现在输出里——因为 487293 > 400000，它不是最大的。所以 --bigkeys 的结果应该理解为「至少有这一个大 key 需要处理」，而非「除了它之外都安全」。B 的结论过于草率，需要配合 RDB 离线分析全面排查。C 是不能直接推断的：field 数量和内存占用取决于每个 field 和 value 的平均大小，需要用 MEMORY USAGE 命令确认实际内存。D 错误，--bigkeys 用的是 SCAN 而非 KEYS *。"
+        },
+        {
+          "id": "redis-big-key-q6",
+          "question": "需要删除一个有 50 万个 field 的大 Hash key，以下操作哪个是正确的？",
+          "choices": [
+            { "id": "A", "text": "直接执行 `DEL user:profile:2847193`，速度最快" },
+            { "id": "B", "text": "先用 HSCAN 分批 HDEL 所有 field，最后再 DEL 这个 key" },
+            { "id": "C", "text": "执行 `UNLINK user:profile:2847193`，由后台线程异步释放内存" },
+            { "id": "D", "text": "执行 `EXPIRE user:profile:2847193 1` 让 key 自然过期，Redis 会自动处理" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "UNLINK（Redis 4.0+）是删除大 key 的正确方式。它分两步：先同步地将 key 从 keyspace（字典树）中摘除，这一步极快；然后把实际的内存释放操作投递给后台的 lazyfree 线程异步处理。整个过程对 Redis 主线程的阻塞极短。DEL（A）是同步删除，释放 50 万个 field 的内存需要遍历整个 Hash 结构，可能阻塞主线程数百毫秒，比执行 HGETALL 还严重。B 的做法可行但繁琐，适用于需要先备份数据的场景；分批 HDEL 每批 100~500 个 field 效果类似 UNLINK，但操作复杂得多。D 中 EXPIRE 到期后 Redis 用的是惰性删除（lazy expiration），到期触发删除时同样可能阻塞，在 Redis 4.0 以前这是严重问题，4.0 后对过期 key 也引入了 lazyfree 机制，但仍不如直接 UNLINK 可控。"
+        },
+        {
+          "id": "redis-big-key-q7",
+          "question": "redis-cli --bigkeys 和 rdb 离线分析工具相比，以下说法正确的是？",
+          "choices": [
+            { "id": "A", "text": "--bigkeys 能找出所有大 key，rdb 只能找出每种类型最大的一个" },
+            { "id": "B", "text": "rdb 需要 Redis 实例处于运行状态，--bigkeys 可以离线使用" },
+            { "id": "C", "text": "--bigkeys 通过 SCAN 在线扫描，只报告每种类型最大的 key；rdb 离线解析 dump.rdb，可以找出所有大 key" },
+            { "id": "D", "text": "两种工具的扫描结果完全相同，只是执行方式不同" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是两种工具最核心的区别。--bigkeys 是在线工具，对运行中的 Redis 用 SCAN 命令遍历，扫描时只保留「当前见过的最大值」，所以结果里每种类型只有一个 key。rdb 工具（如 redis-rdb-tools 或 rdb-go）是离线工具，它解析 dump.rdb 文件的二进制格式，遍历每一个 key 并统计其内存占用，可以输出一个完整的 CSV 报告，按大小排序后能看到 Top N 大 key，覆盖所有大 key 而不只是最大的那个。A 把两者描述反了。B 也反了：rdb 需要 dump.rdb 文件（离线分析），--bigkeys 需要连接到 Redis 实例（在线）。D 是错误的，两者的结果集有根本差异。"
+        },
+        {
+          "id": "redis-big-key-q8",
+          "question": "在 Redis Cluster 环境下，发现某个节点内存占用远高于其他节点（如 11.8GB vs 4GB），最可能的原因是？",
+          "choices": [
+            { "id": "A", "text": "该节点负责的 slot 范围更广，存储了更多的 key" },
+            { "id": "B", "text": "该节点上存在大 key，单个或少数几个 key 占用了大量内存，导致节点间数据倾斜" },
+            { "id": "C", "text": "Redis Cluster 的 slot 迁移不均匀，需要重新执行 rebalance" },
+            { "id": "D", "text": "该节点的 maxmemory 配置比其他节点大" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis Cluster 通过 CRC16(key) % 16384 计算 key 所属的 slot，16384 个 slot 尽量均匀分配给各节点，正常情况下各节点的 key 数量和内存占用应该相对均衡。当出现某个节点内存是其他节点 3 倍的极端不均衡时，几乎可以断定是大 key 问题：某个或某几个大 key 恰好被哈希到这个节点的 slot 上，单个大 key 就能占用数十 GB 内存。A 描述的 slot 数量不均衡确实可能导致轻微的内存差异，但不会造成 11.8GB vs 4GB 这种量级的差距。C 的 rebalance 是一个操作，不是原因。D 中 maxmemory 是上限配置，不影响实际占用量的差异——如果已经达到上限会触发淘汰，反而不会出现超高占用。"
+        },
+        {
+          "id": "redis-big-key-q9",
+          "question": "为了避免一次性用 SMEMBERS 读取 Set 大 key，应该用哪个命令分批读取？",
+          "choices": [
+            { "id": "A", "text": "SRANDMEMBER key count，每次随机取出一批" },
+            { "id": "B", "text": "SSCAN key cursor COUNT 100，用游标分批迭代" },
+            { "id": "C", "text": "SUNIONSTORE dest key，先把数据合并再分段读取" },
+            { "id": "D", "text": "SORT key LIMIT offset count，用 SORT 的 LIMIT 子句分页" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SSCAN 是 Redis 的游标式迭代命令（Redis 2.8+），使用方式为：第一次调用传 cursor=0，之后每次用上一次返回的 cursor 继续，直到返回的 cursor 为 0 表示迭代完成。COUNT 参数是一个 hint（提示值），告诉 Redis 每次大约返回多少个元素，实际返回数量可能多一点或少一点，但不会一次返回全部。SSCAN 的关键优点是每次命令的执行时间有上界，不会阻塞 Redis。SRANDMEMBER（A）每次随机取，可能重复取到相同的元素，无法保证遍历完整。SUNIONSTORE（C）是 Set 求并集操作，语义完全不同。SORT LIMIT（D）可以实现分页，但 SORT 命令本身在大 Set 上开销很大（需要临时排序），而且需要额外的内存存储排序结果。"
+        },
+        {
+          "id": "redis-big-key-q10",
+          "question": "排查到 `user:profile:2847193` 是大 key 后，分析发现它是由业务代码用 `HSET user:profile:{uid} {event_id} {payload}` 无限追加用户行为事件导致的。以下哪种处理方案最合理？",
+          "choices": [
+            { "id": "A", "text": "把这个 Hash 按 uid 的奇偶性拆分为 user:profile:even 和 user:profile:odd 两个 Hash" },
+            { "id": "B", "text": "用 UNLINK 删除该 key，然后在业务代码中加上 EXPIRE 设置 7 天 TTL，7 天后数据自动消失" },
+            { "id": "C", "text": "用 UNLINK 删除大 key，同时修改业务架构：行为事件写入 Kafka 或 Redis Stream，Redis Hash 只保留最近 N 条摘要数据并设置上限" },
+            { "id": "D", "text": "对该 key 调大所在节点的 maxmemory，给大 key 分配更多内存空间" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这道题考查的是「治标还是治本」的工程判断力。A 按奇偶拆分没有解决根本问题：两个 Hash 仍然会随时间无限增长，只是增长速度减半，迟早还会成为大 key。B 加 TTL 确实能防止无限增长，但 7 天后数据全部消失，业务上可能无法接受，而且这个方案还是把行为事件存在 Redis Hash 里，设计上就是错的。D 调大 maxmemory 是鸵鸟策略，治标不治本，大 key 阻塞问题依然存在。C 才是真正的根治方案：用 UNLINK 先解决线上问题（异步删除不阻塞），同时从架构上纠正「用 Redis Hash 存无界行为日志」的设计错误——行为事件流应该写 Kafka 或 Redis Stream（天然支持消费组和消息保留策略），Redis Hash 只存最近 N 条摘要并通过业务逻辑维护上限。这是大 key 排查中「发现问题→处理问题→从根本上避免问题」的完整闭环。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/latest/commands/memory-usage/",
+        "https://redis.io/docs/latest/commands/unlink/",
+        "https://redis.io/docs/latest/commands/scan/",
+        "https://github.com/sripathikrishnan/redis-rdb-tools",
+        "https://redis.io/docs/latest/commands/slowlog-get/"
+      ]
+    }
+  ]
+}

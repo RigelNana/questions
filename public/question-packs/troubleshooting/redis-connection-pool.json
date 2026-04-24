@@ -1,0 +1,157 @@
+{
+  "id": "redis-connection-pool",
+  "name": "Redis 连接池配置与调优",
+  "domain": "troubleshooting",
+  "description": "Redis 客户端连接池耗尽的排查方法与 Jedis/Lettuce 连接池参数最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-connection-pool-1",
+      "domain": "troubleshooting",
+      "type": "env-config",
+      "difficulty": 2,
+      "tags": ["redis", "connection-pool", "jedis", "lettuce", "maxTotal", "troubleshooting"],
+      "title": "Redis 客户端连接池耗尽报错，如何排查和调优连接池配置？",
+      "content": "你们的电商后端服务是一个 Java Spring Boot 应用，使用 Jedis 作为 Redis 客户端，Redis 部署在独立服务器上，内存 16GB，日常 QPS 约 3000。某天下午促销活动开始后，应用日志开始出现大量报错：\n\n```\nredis.clients.jedis.exceptions.JedisConnectionException:\n  Could not get a resource from the pool\n  at redis.clients.jedis.JedisPool.getResource(JedisPool.java:234)\n  at com.example.service.CacheService.get(CacheService.java:45)\n  ...\nCaused by: java.util.NoSuchElementException:\n  Timeout waiting for idle object\n  at org.apache.commons.pool2.impl.GenericObjectPool.borrowObject(GenericObjectPool.java:449)\n```\n\n值班工程师登上 Redis 服务器，用 `redis-cli INFO server` 查看，Redis 进程正常，内存使用 4.2GB，CPU 使用率约 15%，看起来 Redis 服务端完全正常。于是他把 Redis 重启了一次，报错短暂消失，但 10 分钟后故障重现。\n\n此时你接手排查。应用的 Redis 连接池配置如下：\n\n```yaml\nspring:\n  redis:\n    host: 10.0.1.55\n    port: 6379\n    jedis:\n      pool:\n        max-active: 8       # maxTotal：最大连接数\n        max-idle: 8         # maxIdle：最大空闲连接数\n        min-idle: 0         # minIdle：最小空闲连接数\n        max-wait: -1        # 等待超时，-1 表示无限等待\n```\n\n这是服务上线时按照网上一篇博客抄来的配置，从来没有认真调过。另外，同事告诉你代码里有一处历史遗留逻辑：某个定时任务在循环中执行 Redis 操作，但由于写法问题，`Jedis` 实例从池子里借出来后，在某些异常分支里没有执行 `close()`。\n\n**请回答以下问题：**\n\n1. 这个报错的根本原因是什么？Redis 服务端正常、重启后短暂恢复，为什么还是会出现这个错误？\n2. 当前配置中哪些参数存在明显问题？`max-wait: -1` 意味着什么风险？\n3. 如何通过 `redis-cli` 命令快速诊断连接池和服务端的连接状态？\n4. 如果要把这套配置调整为适合促销高峰期（峰值 QPS 约 8000，平均响应时间约 20ms）的参数，应该怎么算？\n5. 如果把客户端从 Jedis 换成 Spring Boot 默认的 Lettuce，连接池的工作方式会有什么本质不同？",
+      "answer": "## 第一步：先搞清楚 Redis 连接是什么\n\n在讨论连接池之前，要先理解一个 Redis 连接在服务端意味着什么代价。Redis 是单线程处理命令的，但它可以同时维持大量 TCP 连接——每一个客户端连接在服务端对应一个文件描述符（file descriptor，操作系统分配给每个打开的 socket 的整数句柄）和一块内存缓冲区，大约占用 20-50KB。当你运行 `redis-cli INFO clients` 时，能看到这样的输出：\n\n```\n# Clients\nconnected_clients:247\ncluster_connections:0\nmaxclients:10000\nclient_recent_max_input_buffer:20480\nclient_recent_max_output_buffer:0\nblocked_clients:3\ntracking_clients:0\nclients_in_timeout_table:0\n```\n\n`connected_clients` 是当前建立的连接总数，`blocked_clients` 是正在执行 `BLPOP`、`BRPOP` 等阻塞命令的连接数。Redis 的 `maxclients` 默认是 10000，这是服务端允许的最大连接数上限。\n\n建立一条 TCP 连接需要三次握手，大约消耗 1-3ms 的网络往返时间，这对于一个 QPS 3000 的应用来说是完全不可接受的开销。连接池（connection pool）的核心价值就是「借用-归还」模型：应用启动时预先建立一批连接放在池里，每次需要操作 Redis 时从池中借一条连接，用完归还，而不是每次都新建和关闭 TCP 连接。Jedis Pool 底层基于 Apache Commons Pool 2 实现，管理的是 `Jedis` 对象，每个 `Jedis` 对象持有一条 TCP 长连接。\n\n## 第二步：为什么会出现「连接池耗尽」\n\n搞清楚连接池的模型之后，`Could not get a resource from the pool` 这个错误就很好理解了：所有连接都被借出去了，没有空闲连接可用，新来的请求在等待队列里等不到连接。\n\n### 原因一：maxTotal 本身就太小\n\n当前配置的 `max-active: 8` 意味着整个应用实例最多只能同时持有 8 条 Redis 连接。对于一个日常 QPS 3000 的服务来说，这个数字严重低估了需求。一条连接在「执行命令 → 等待响应」期间处于占用状态，如果 Redis 平均响应时间是 1ms，那么理论上一条连接每秒能处理 1000 个请求，8 条连接能支撑 8000 QPS。听起来够用，但这是理想状态——现实中有慢命令、网络抖动、GC 暂停，实际每条连接的吞吐远低于理论值。\n\n估算 `maxTotal` 有一个常用公式：**maxTotal = 峰值 QPS × 平均响应时间（秒） × 安全系数**。例如峰值 QPS 为 8000，平均响应时间 20ms（0.02s），安全系数取 1.2：\n\n```\nmaxTotal = 8000 × 0.02 × 1.2 = 192\n```\n\n也就是说，这个场景下 `maxTotal` 应该配置在 200 左右，而不是 8。\n\n### 原因二：连接泄漏\n\n更严重的问题是代码里的连接泄漏。正确的 Jedis 使用姿势是用 try-with-resources，让 `Jedis` 对象在 `close()` 时自动归还连接到池中：\n\n```java\n// 正确：try-with-resources 保证 jedis.close() 必然执行\ntry (Jedis jedis = jedisPool.getResource()) {\n    return jedis.get(key);\n} // 这里自动调用 jedis.close()，连接归还到池中\n\n// 错误：异常分支没有归还连接\nJedis jedis = jedisPool.getResource();\ntry {\n    return jedis.get(key);\n} catch (Exception e) {\n    // 某些异常路径走到这里，忘了 jedis.close()\n    throw e;\n    // jedis 对象泄漏！连接永远不会归还池中\n}\n```\n\n题目中的定时任务在循环里不断借出连接，某些异常分支没有归还，导致池中连接被慢慢「吃掉」。这就是为什么重启 Redis 后短暂恢复——重启后应用重建了连接池，8 条新连接暂时够用，但定时任务的泄漏逻辑没有修复，10 分钟后连接又耗尽了。\n\n### 原因三：max-wait: -1 的危险\n\n`max-wait: -1` 表示当连接池耗尽时，请求线程会**无限期等待**，直到有连接归还。这意味着所有业务线程都会卡住，进而导致线程池也耗尽，服务完全不响应——从用户视角看就是整个服务宕机。正确的做法是设置一个合理的超时时间（比如 3000ms），让等待超时的请求快速失败，而不是无限阻塞。\n\n### 快速诊断命令\n\n登上 Redis 服务器，先执行 `INFO clients` 查看连接总数和阻塞连接数。如果 `connected_clients` 异常高，或者接近 `maxclients`，说明连接堆积严重。再执行 `CLIENT LIST` 查看各连接的详细状态：\n\n```\n127.0.0.1:6379> CLIENT LIST\nid=10421 addr=10.0.2.33:52104 fd=17 name= age=3825 idle=3821 flags=N db=0 sub=0 psub=0 multi=-1 qbuf=0 qbuf-free=0 obl=0 oll=0 omem=0 events=r cmd=get\nid=10422 addr=10.0.2.33:52106 fd=18 name= age=3820 idle=3820 flags=N db=0 sub=0 psub=0 multi=-1 qbuf=0 qbuf-free=0 obl=0 oll=0 omem=0 events=r cmd=get\n...\n```\n\n重点关注 `idle` 字段：它表示这条连接上一次执行命令到现在过了多少秒。如果有大量连接 `idle` 时间很长（比如几千秒），说明这些连接被借出去后没有归还，就是泄漏的连接。在应用侧，可以通过 JMX 或 Actuator 暴露的 metrics 查看连接池的 `NumActive`（当前借出的连接数）和 `NumIdle`（当前空闲的连接数），如果 `NumActive` 一直在涨而 `NumIdle` 为 0，连接泄漏几乎可以确定。\n\n## 第三步：正确的连接池配置与 Jedis vs Lettuce 的选择\n\n### Jedis 连接池关键参数详解\n\n根据上面的分析，一份适合高峰期的连接池配置应该是这样的：\n\n```yaml\nspring:\n  redis:\n    host: 10.0.1.55\n    port: 6379\n    jedis:\n      pool:\n        max-active: 200      # maxTotal：根据峰值 QPS × 平均响应时间 × 1.2 计算\n        max-idle: 50         # maxIdle：空闲连接保留上限，避免大量短暂峰值后连接不销毁\n        min-idle: 20         # minIdle：连接预热，启动时至少保持 20 条空闲连接，避免冷启动抖动\n        max-wait: 3000ms     # 等待超时 3 秒，超时快速失败而非无限阻塞\n```\n\n每个参数的作用都值得单独解释。`maxTotal` 是整个池子里允许存在的最大连接数（包含借出的和空闲的），这是最重要的参数，要根据业务峰值计算，不能拍脑袋。`maxIdle` 控制空闲状态下最多保留多少条连接——如果流量突然从峰值降回低谷，连接会被归还到池中，`maxIdle` 防止全部空闲连接都被保留，节省资源。`minIdle` 是连接预热的关键：设置了 `minIdle: 20` 之后，连接池会保证始终有 20 条可用连接处于空闲状态，服务重启后不需要等第一批请求进来才建立连接，避免冷启动时的连接建立延迟。\n\n`testOnBorrow` 这个参数值得特别提一下：开启后，每次从池里借连接时会先发一个 `PING` 命令验证连接是否存活，可以防止借到已断开的「死连接」，但代价是每次借连接多一次 Redis 往返（约 1ms 的额外延迟）。在连接稳定的内网环境下，通常不开启 `testOnBorrow`，转而开启 `testWhileIdle`，让后台线程定期清理死连接，这样不影响借连接的延迟。\n\n### Jedis vs Lettuce：一连接一线程 vs 异步多路复用\n\nJedis 的连接模型是同步阻塞的：一条连接在同一时刻只能处理一个命令，所以每个并发请求都需要独占一条连接，这就是连接池存在的原因——你有多少并发请求，就需要多少条连接。Jedis 适合对 Redis 操作延迟要求严格、编程模型简单的场景。\n\nLettuce 的连接模型完全不同。Lettuce 基于 Netty 实现异步非阻塞 I/O，一条物理连接可以通过「管道」同时发送多个命令，不需要等前一个命令响应回来才发送下一个。这种多路复用（multiplexing）模式意味着，**在大多数场景下，Lettuce 一条连接就能支撑数千 QPS**，根本不需要连接池。\n\nSpring Boot 2.x 起默认使用 Lettuce 作为 Redis 客户端。但要注意：Lettuce 默认不使用连接池，如果需要连接池（比如使用了事务 `MULTI/EXEC` 或 `SELECT` 命令，这些操作需要独占连接），必须额外引入 `commons-pool2` 依赖并显式开启：\n\n```xml\n<dependency>\n    <groupId>org.apache.commons</groupId>\n    <artifactId>commons-pool2</artifactId>\n</dependency>\n```\n\n```yaml\nspring:\n  redis:\n    lettuce:\n      pool:\n        max-active: 20   # Lettuce 池不需要配很大，20 基本够用\n        min-idle: 5\n        max-wait: 3000ms\n```\n\nLettuce 在 Sentinel 和 Cluster 模式下的连接管理也更完善：Lettuce 能自动处理主从切换和节点变更，而 Jedis 在这些场景下需要更多手动处理。如果你的 Redis 是 Cluster 模式，Lettuce 几乎是更好的默认选择。\n\n### 连接空闲超时要和服务端 timeout 参数对齐\n\n最后一个容易忽视的配置：Redis 服务端有一个 `timeout` 参数，默认 0（不超时），如果设置了比如 `timeout 300`（300 秒空闲就断开连接），那么客户端连接池里长时间空闲的连接会被服务端单方面关闭，下次借出这条「死连接」就会报错。解决方法是把客户端的 `timeBetweenEvictionRuns` 和 `minEvictableIdleTime` 设得比服务端 `timeout` 小，让连接池后台线程定期清理空闲过久的连接，避免借到服务端已关闭的连接。",
+      "keyPoints": [
+        "Redis 每个客户端连接在服务端占用一个文件描述符和约 20-50KB 内存缓冲区，`INFO clients` 的 `connected_clients` 字段反映当前活跃连接总数，`maxclients` 默认 10000 是服务端上限。",
+        "连接池耗尽（`Could not get a resource from the pool`）通常由三个原因叠加触发：`maxTotal` 配置过小无法应对峰值并发、连接泄漏（未在 finally/try-with-resources 中归还连接）、以及慢命令导致连接长时间被占用。",
+        "`maxTotal` 推荐按「峰值 QPS × 平均响应时间（秒） × 1.2」计算，例如 8000 QPS、20ms 响应时间对应约 200 条连接，而不是默认的 8。",
+        "`maxWaitMillis`（Spring 中为 `max-wait`）必须设置正数超时而非 -1（无限等待），无限等待会导致所有业务线程卡死，进而引发服务级雪崩；通常设置 2000-5000ms 让超时请求快速失败。",
+        "`minIdle` 用于连接预热，保证服务重启后连接池里始终有一定数量的可用空闲连接，避免冷启动时第一批请求触发大量 TCP 握手导致延迟抖动。",
+        "Jedis 是「一连接一线程」的同步模型，每个并发请求独占一条物理连接；Lettuce 基于 Netty 实现异步多路复用，默认单条连接即可处理高并发，Spring Boot 2.x 起默认使用 Lettuce。",
+        "客户端连接池的 `minEvictableIdleTime` 需要小于 Redis 服务端的 `timeout` 参数，否则空闲连接会被服务端单方面关闭，导致下次借到「死连接」时报错。",
+        "`CLIENT LIST` 命令输出中每条连接的 `idle` 字段表示最近一次命令执行距现在的秒数，大量 `idle` 时间异常高的连接是连接泄漏的直接证据。"
+      ],
+      "quiz": [
+        {
+          "id": "redis-connection-pool-q1",
+          "question": "Redis `INFO clients` 输出中，`connected_clients` 字段表示什么？",
+          "choices": [
+            { "id": "A", "text": "当前与 Redis 建立了 TCP 连接的客户端数量，包含空闲和活跃的连接" },
+            { "id": "B", "text": "仅统计正在执行命令的客户端数量，空闲连接不计入" },
+            { "id": "C", "text": "历史累计的连接建立次数" },
+            { "id": "D", "text": "连接池中可用的空闲连接数量" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "`connected_clients` 是 Redis 服务端当前维持的 TCP 连接总数，不论这条连接是否正在执行命令。即使客户端的 Jedis 实例借出后在代码里什么都没做，只要 TCP 连接存在，就会计入 `connected_clients`。B 选项描述的是「活跃」连接的概念，Redis 并没有这个独立指标。C 选项是 `total_connections_received` 的含义，是累计指标而非当前状态。D 选项描述的是客户端侧连接池的状态，Redis 服务端无法感知客户端的池化逻辑。"
+        },
+        {
+          "id": "redis-connection-pool-q2",
+          "question": "以下哪个 Jedis Pool 参数控制整个连接池允许存在的最大连接总数（包含借出和空闲）？",
+          "choices": [
+            { "id": "A", "text": "maxIdle" },
+            { "id": "B", "text": "maxTotal（Spring 配置中为 max-active）" },
+            { "id": "C", "text": "minIdle" },
+            { "id": "D", "text": "maxWaitMillis" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`maxTotal` 是连接池的总容量上限，对应 Spring Boot YAML 中的 `max-active`（名字容易引起误解，但它实际映射到 Commons Pool 的 `maxTotal`）。`maxIdle` 只控制空闲状态下最多保留的连接数，超过这个数量的归还连接会被销毁，但不影响借出状态的连接。`minIdle` 是最小空闲数，用于连接预热。`maxWaitMillis` 控制等待超时时间，与连接总数无关。许多初学者会把 `maxIdle` 误认为是连接总数上限，这是最常见的配置误区。"
+        },
+        {
+          "id": "redis-connection-pool-q3",
+          "question": "代码中使用 Jedis 最安全的资源管理方式是什么？",
+          "choices": [
+            { "id": "A", "text": "在方法结束时调用 jedis.disconnect() 关闭连接" },
+            { "id": "B", "text": "使用 try-with-resources 语句，Jedis 实现了 Closeable，close() 会自动归还连接到池中" },
+            { "id": "C", "text": "在 catch 块中调用 jedisPool.returnResource(jedis) 归还连接" },
+            { "id": "D", "text": "每次创建新的 JedisPool 实例以避免连接复用的问题" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Jedis 2.9 之后实现了 `Closeable` 接口，`close()` 方法会把连接归还到连接池（如果连接状态正常）或销毁（如果连接已断开）。使用 try-with-resources 可以保证无论正常退出还是任何异常退出，`close()` 都会被调用。A 选项的 `disconnect()` 会真正关闭底层 TCP 连接，不会归还到池中，且再次使用时需要重新建立连接。C 选项的 `returnResource()` 是 Jedis 老 API，已废弃，且在多个异常分支中容易遗漏。D 选项每次创建 JedisPool 完全失去了连接复用的意义，且创建 JedisPool 本身有相当的开销。"
+        },
+        {
+          "id": "redis-connection-pool-q4",
+          "question": "将 `maxWaitMillis`（max-wait）设置为 -1 会带来什么风险？",
+          "choices": [
+            { "id": "A", "text": "连接等待超时会立即抛出异常，影响用户体验" },
+            { "id": "B", "text": "连接池满后新请求线程无限阻塞，导致线程池耗尽、服务整体无响应，形成服务级雪崩" },
+            { "id": "C", "text": "-1 表示不使用连接池，每次请求都新建 TCP 连接" },
+            { "id": "D", "text": "Redis 服务端会主动断开等待过久的连接" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`maxWaitMillis: -1` 意味着当连接池中没有可用连接时，调用线程会无限期等待，直到有连接被归还。在连接泄漏或 `maxTotal` 过小的情况下，如果连接一直借不回来，所有业务线程都会卡在等待连接这一步，Java 线程池（如 Tomcat 的 HTTP 线程池）也随之耗尽，服务完全停止响应外部请求——这比快速报错要严重得多。正确做法是设置 2000-5000ms 的超时，让超时的请求抛出异常并返回 503，保留服务的局部可用性，避免全量雪崩。"
+        },
+        {
+          "id": "redis-connection-pool-q5",
+          "question": "通过 `CLIENT LIST` 命令输出发现大量连接的 `idle` 字段值在 3000 秒以上，这最可能说明什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 服务端性能良好，连接大部分时间都是空闲的" },
+            { "id": "B", "text": "这些连接被客户端的连接池持有，长时间没有发出 Redis 命令，属于正常的空闲连接" },
+            { "id": "C", "text": "存在连接泄漏，这些连接被借出后没有归还到连接池，长时间处于「孤儿」状态" },
+            { "id": "D", "text": "Redis 的 timeout 参数配置过大，应该调小" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "正常的连接池空闲连接虽然也可能长时间没有命令，但连接池框架会定期发送 `PING` 保活（如果开启了 `testWhileIdle`），或者在业务高峰时会被频繁借出使用，`idle` 不会一直持续增长到几千秒。`idle` 值异常大的连接更典型的原因是：这条连接被代码借出后，由于异常分支没有执行 `close()`，连接泄漏了——它已经不在池子里，应用代码也不会再用它，但 TCP 连接仍然存在，服务端一直看到它「连着但没有命令」。这是诊断连接泄漏最直接的证据。"
+        },
+        {
+          "id": "redis-connection-pool-q6",
+          "question": "Lettuce 与 Jedis 在连接模型上最本质的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "Lettuce 只支持 Redis Cluster，Jedis 只支持单机模式" },
+            { "id": "B", "text": "Jedis 是「一连接一线程」同步阻塞模型，Lettuce 基于 Netty 的异步非阻塞多路复用，单条连接可同时处理多个并发命令" },
+            { "id": "C", "text": "Lettuce 不支持连接池，Jedis 必须使用连接池" },
+            { "id": "D", "text": "Lettuce 只支持 JDK 11+，Jedis 支持 JDK 8" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Jedis 的每个 `Jedis` 对象对应一条 TCP 连接，且在命令发出后必须等待响应才能发送下一条命令（同步阻塞），所以高并发时需要大量连接，连接池因此是必须的。Lettuce 基于 Netty 的 NIO 事件循环，可以在单条 TCP 连接上实现「管道化」——同时发送多条命令而不等待中间响应，大幅提升单连接吞吐量。A 选项错误，两者都支持 Cluster、Sentinel、单机等所有模式。C 选项不准确，Lettuce 默认单连接即可但也可以通过 commons-pool2 开启连接池（事务场景需要）。D 选项是捏造的，两者都支持 JDK 8+。"
+        },
+        {
+          "id": "redis-connection-pool-q7",
+          "question": "使用 Lettuce 并希望开启连接池（例如使用 Redis 事务），需要做什么额外操作？",
+          "choices": [
+            { "id": "A", "text": "Lettuce 内置连接池，无需额外配置，spring.redis.lettuce.pool.max-active 直接生效" },
+            { "id": "B", "text": "需要在 pom.xml 中引入 commons-pool2 依赖，然后在 application.yml 中配置 spring.redis.lettuce.pool 参数" },
+            { "id": "C", "text": "需要将 spring.redis.client-type 改为 jedis 才能使用连接池" },
+            { "id": "D", "text": "Lettuce 不支持连接池，事务必须使用 Jedis" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Lettuce 依赖 Apache Commons Pool 2 来实现连接池功能，但 Spring Boot 在自动配置时不会强制引入这个依赖，需要在 pom.xml 或 build.gradle 中显式添加 `commons-pool2`。如果缺少这个依赖而在配置文件里写了 `spring.redis.lettuce.pool.*`，Spring Boot 不会报错，但连接池配置会被**静默忽略**——这是一个非常隐蔽的坑。添加依赖后，Spring Boot 的 `LettuceConnectionFactory` 会检测到 commons-pool2 存在，自动切换为使用连接池模式。使用 `MULTI/EXEC` 等事务操作时，必须使用 `SessionCallback` 绑定在同一条连接上执行，此时连接池是必要的。"
+        },
+        {
+          "id": "redis-connection-pool-q8",
+          "question": "一个应用的峰值 QPS 为 5000，Redis 平均响应时间为 10ms，按推荐公式应该将 `maxTotal` 设置为多少？",
+          "choices": [
+            { "id": "A", "text": "50（5000 × 0.01 不加安全系数）" },
+            { "id": "B", "text": "60（5000 × 0.01 × 1.2）" },
+            { "id": "C", "text": "100（经验值，不需要计算）" },
+            { "id": "D", "text": "500（把 QPS 除以 10 作为连接数）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "推荐公式是 `maxTotal = 峰值 QPS × 平均响应时间（秒） × 安全系数`。代入数据：5000 × 0.01（10ms = 0.01s）× 1.2 = 60。这个公式的逻辑是：如果每条连接每次处理一个请求耗时 10ms，那么 1 秒内一条连接最多能处理 100 个请求；5000 QPS 需要 50 条并发连接；乘以 1.2 的安全系数应对突发和慢命令波动。A 选项漏掉了安全系数。C 选项拍脑袋不可取，不同业务特征差异很大。D 选项的计算逻辑错误，把 QPS 除以响应时间的毫秒数（10）没有数学依据。"
+        },
+        {
+          "id": "redis-connection-pool-q9",
+          "question": "Redis 服务端配置了 `timeout 300`（300 秒无命令则断开连接），客户端连接池应该如何配置以避免借到「死连接」？",
+          "choices": [
+            { "id": "A", "text": "开启 testOnBorrow: true，每次借连接时发送 PING 验证存活，代价是每次借连接多一次往返延迟" },
+            { "id": "B", "text": "开启 testWhileIdle: true，并将 timeBetweenEvictionRunsMillis 设置为小于 300 秒，让后台线程定期清理空闲过久的连接" },
+            { "id": "C", "text": "将客户端的 maxIdle 设置为 0，不保留任何空闲连接" },
+            { "id": "D", "text": "不需要特殊处理，Commons Pool 会自动检测服务端关闭的连接" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "当服务端设置了 `timeout`，客户端空闲过久的连接会被服务端单方面关闭（TCP RST 包），但客户端的连接池并不一定能立即感知到（尤其是没有活跃 I/O 时）。`testWhileIdle` 开启后，Commons Pool 的后台 Evictor 线程会定期对空闲连接发送 PING，把已失效的连接从池中移除。关键是 `timeBetweenEvictionRunsMillis` 要小于服务端的 `timeout` 值（如设置为 240000ms，即 240 秒）。A 选项的 `testOnBorrow` 也能解决问题，但代价是每次借连接多一次 PING 延迟，对延迟敏感的场景不推荐。C 选项会导致每次请求都建立新连接，完全失去连接池的意义。D 选项错误，Commons Pool 没有这种自动感知能力。"
+        },
+        {
+          "id": "redis-connection-pool-q10",
+          "question": "排查连接池耗尽问题时，以下哪个排查步骤的顺序是最合理的？",
+          "choices": [
+            { "id": "A", "text": "直接重启 Redis 服务 → 观察是否恢复 → 调大 maxTotal → 上线" },
+            { "id": "B", "text": "查看应用日志确认报错类型 → `INFO clients` 查看 connected_clients → `CLIENT LIST` 找 idle 异常连接 → 检查应用代码是否有连接泄漏 → 根据公式重新计算并调整 maxTotal/maxWaitMillis" },
+            { "id": "C", "text": "立即重启应用服务 → 扩容更多应用实例 → 之后再分析" },
+            { "id": "D", "text": "升级 Redis 服务器规格 → 调大 Redis maxclients 参数 → 问题应该解决" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "排查连接池耗尽问题应该遵循「现象 → 数据 → 根因 → 修复」的路径。首先通过应用日志确认是连接池耗尽而非网络断开或认证失败。然后用 `INFO clients` 查看服务端看到的连接数是否异常高。再用 `CLIENT LIST` 找出 `idle` 时间异常长的连接，判断是否存在泄漏。最后结合代码 review 确认泄漏位置，同时根据峰值 QPS 和响应时间重新计算合理的 `maxTotal`。A 选项的重启是治标不治本，且不分析根因无法防止复发。C 选项扩容实例不能解决单实例连接泄漏的问题，反而让更多实例同时泄漏。D 选项将客户端连接池问题误诊为服务端容量问题，方向完全错误。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/clients/java/",
+        "https://github.com/redis/jedis/wiki/Getting-started",
+        "https://lettuce.io/core/release/reference/index.html#connection-pooling",
+        "https://commons.apache.org/proper/commons-pool/apidocs/org/apache/commons/pool2/impl/GenericObjectPoolConfig.html"
+      ]
+    }
+  ]
+}

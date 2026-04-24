@@ -1,0 +1,157 @@
+{
+  "id": "redis-hot-key",
+  "name": "Redis 热点 Key 问题排查与解决",
+  "domain": "troubleshooting",
+  "description": "Redis 热点 Key 的发现方法、产生原因与本地缓存/Key 拆分等解决策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-hot-key-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["redis", "hot-key", "cluster", "local-cache", "lfu", "caffeine"],
+      "title": "Redis 某节点因热点 Key 导致 CPU 100%，如何发现和解决热点 Key 问题？",
+      "content": "## 故障背景\n\n某直播平台在一位明星宣布开播后的第一分钟内，告警系统连续触发三条红色告警：Redis Cluster 中 `node-3` 节点的 CPU 使用率从正常的 15% 急速飙升至 100%，同时该节点开始出现大量命令超时，P99 延迟从 2ms 涨到了 800ms 以上，部分业务请求甚至直接返回 `LOADING Redis is loading the dataset in memory` 错误。而集群中其他五个节点，负载依然正常。\n\n查看监控大盘，该节点每秒处理的命令数（ops/sec）高达 **12 万次**，而正常节点只有约 8000 次，足足是其他节点的 15 倍。业务侧反馈：直播间的「当前在线人数」、「点赞数」以及「明星个人主页」的接口响应全部开始超时。\n\n你的同事怀疑是「Redis 集群扩容没跟上」，准备直接加节点。但 SRE 的直觉告诉你，集群其他节点完全空闲，加节点根本解决不了问题——这更像是某个 Key 被所有请求集中打到了同一个槽（slot）上，也就是典型的**热点 Key 问题**。\n\n```\n# 此时 redis-cli 连到 node-3 执行 INFO stats 的部分输出\ninstantaneous_ops_per_sec:118743\ninstantaneous_input_kbps:24312.45\ninstantaneous_output_kbps:98234.12\nblocked_clients:847\ntotal_commands_processed:4821093742\nrejected_connections:2341\n```\n\n现在问题来了：**如何快速定位是哪个 Key 导致的？定位之后又该如何解决？**",
+      "answer": "## 理解 Redis 热点 Key 的本质\n\nRedis 是单线程事件循环模型（6.0 引入了多线程 I/O，但命令执行仍然是单线程），这意味着一个节点的命令处理能力有硬上限——在普通机器上大约是 8 万到 12 万 QPS，取决于命令复杂度和数据大小。当某个 Key 每秒被访问的次数接近甚至超过这个上限时，这个节点就成了整个系统的木桶短板。\n\n在 Redis Cluster 模式下，数据按照 Key 的 CRC16 哈希值分布到 16384 个槽（slot）中，每个节点负责一段连续的槽范围。一个 Key 永远只存在于一个节点，无法被「分摊」到多个节点——这正是热点 Key 问题的根本矛盾所在。**热点 Key 的本质是流量倾斜**：整个集群的 QPS 总量可能并不高，但流量全部打到了一台机器上，其他节点的算力完全被浪费了。\n\n## 第一步：快速定位热点 Key\n\n面对正在发生的故障，首先要做的是确认热点 Key 的名字。有几种方式，速度和代价各不相同。\n\n**方式一：`redis-cli --hotkeys`（推荐，对生产影响最小）**\n\n这是 Redis 4.0 引入的官方热点 Key 检测命令，它依赖 LFU（Least Frequently Used，最近最少使用频率）算法来追踪访问频次。使用前提是 `maxmemory-policy` 必须配置为 LFU 相关策略，如 `allkeys-lfu` 或 `volatile-lfu`。\n\n```bash\n# 连到出问题的节点，扫描热点 key\nredis-cli -h node-3 -p 6379 --hotkeys\n\n# 典型输出如下：\n# Scanning the entire keyspace to find hot keys as well as\n# temporary worst case slots usage statistics.\n# You can use -i 0.01 to sleep 0.01 sec per SCAN command (Throughput: 100 SCAN/sec).\n#\n# [93.56%] Hot key 'live:room:9527:viewers'  found so far with counter 1284721\n# [93.56%] Hot key 'live:room:9527:likes'    found so far with counter 987432\n# [97.12%] Hot key 'user:profile:88888888'   found so far with counter 2341098\n#\n# -------- summary -------\n#\n# Sampled 14389201 keys in the keyspace!\n# hot key found with counter: 2341098  keyname: user:profile:88888888\n# hot key found with counter: 1284721  keyname: live:room:9527:viewers\n# hot key found with counter:  987432  keyname: live:room:9527:likes\n```\n\n输出直接告诉你：`user:profile:88888888` 这个 Key 的访问频次高达 234 万次，是最大的热点。这个 Key 就是那位明星的个人主页缓存。\n\n**方式二：`MONITOR` 命令（生产慎用）**\n\n`MONITOR` 会实时打印出 Redis 收到的每一条命令，通过采样统计可以找出热点 Key。但它的副作用很大——在高负载节点上执行 `MONITOR` 会给 Redis 额外增加约 50% 的 CPU 开销，因为它需要把每条命令序列化并通过网络推送给你。在故障时节点已经 CPU 100% 的情况下，`MONITOR` 很可能让节点直接崩溃，生产上建议只短暂采样（几秒）后立刻断开。\n\n```bash\n# 连上后，只采样 5 秒，然后 Ctrl+C\nredis-cli -h node-3 -p 6379 MONITOR | head -n 5000 | awk '{print $4}' | sort | uniq -c | sort -rn | head -20\n```\n\n**方式三：业务日志 + 代理层统计**\n\n如果你的架构中有 Redis 代理层（如 Twemproxy、Codis 或自研 Proxy），代理通常会记录每个 Key 的访问频次，直接查代理的 metrics 接口往往比 `--hotkeys` 更快。此外，在 Java 服务中查 Lettuce/Jedis 客户端的请求日志，或者直接全文检索业务代码里对这些 Key 名的引用，也能快速定位。\n\n## 第二步：解决热点 Key——从临时止血到根治\n\n找到热点 Key 之后，接下来的解决方案需要按影响范围和实施速度来分层。\n\n**本地缓存（JVM Heap 缓存）——最快的临时止血方案**\n\n最快能上线的方案是在应用层加一层本地缓存。Java 服务可以用 Caffeine，Go 服务可以用 `ristretto` 或简单的 `sync.Map` + TTL。思路是：先查本地缓存，命中则直接返回，不命中才去 Redis 取，取回来后写入本地缓存并设置一个短 TTL（如 3-5 秒）。\n\n```java\n// Caffeine 本地缓存示例，缓存热点 Key 3 秒\nLoadingCache<String, UserProfile> localCache = Caffeine.newBuilder()\n    .expireAfterWrite(3, TimeUnit.SECONDS)  // 短 TTL，避免数据严重过期\n    .maximumSize(1000)                       // 只缓存最热的 1000 个 Key\n    .build(key -> redisClient.get(key));     // 未命中时自动从 Redis 加载\n\n// 业务代码无需改动，直接用 localCache.get(key)\n```\n\n这个方案的好处是无需改动 Redis 集群，3 分钟内可以上线（改配置 + 发布）。缺点是每个服务实例各自维护一份本地缓存，数据可能有最多 3 秒的不一致窗口——对于直播间在线人数这类允许最终一致的数据完全可以接受，但对库存、余额这类强一致性场景则不适用。\n\n**Key 拆分——最彻底的 Redis 层解决方案**\n\nKey 拆分的思路是把一个热点 Key 变成 N 个 Key，让请求分散到不同槽（进而不同节点）。具体做法是写入时把 `hot_key` 的数据同时写到 `hot_key_0`、`hot_key_1`、...、`hot_key_N-1` 共 N 个 Key，读取时随机选一个后缀。\n\n```python\nimport random\nN = 16  # 拆成 16 份，分散到 16 个不同 slot\n\n# 写入（需要写 N 份，或者用异步任务批量写）\nfor i in range(N):\n    redis.setex(f\"user:profile:88888888_{i}\", 300, profile_data)\n\n# 读取（随机选一个副本）\nkey = f\"user:profile:88888888_{random.randint(0, N-1)}\"\nprofile = redis.get(key)\n```\n\nKey 拆分需要改动业务代码的读写逻辑，上线需要走完整的发布流程，但效果是最彻底的：原来 12 万 QPS 打到 1 个节点，拆分后变成平均 7500 QPS 分散到 16 个不同节点（假设集群够大），彻底消除热点。\n\n**读写分离——利用副本分摊读流量**\n\n对于 Redis Cluster，可以给热点 Key 所在节点单独增加只读副本（replica），然后在客户端配置随机读取副本。Lettuce 客户端支持 `ReadFrom.REPLICA_PREFERRED` 策略，Jedis Cluster 也支持 `READONLY` 命令。这种方式对业务代码改动最小，但副本同步存在毫秒级延迟，写操作仍然打在主节点上，对写密集型热点 Key 效果有限。\n\n**设置合理 TTL，避免热点 Key 永久存在**\n\n永远不要给热点数据设置无限期的缓存。明星个人主页这类数据，建议设置 60-300 秒的 TTL，同时在业务层做好 TTL 前主动刷新（即「逻辑过期」方案）。\n\n**对于极端热点，考虑迁移到独立实例**\n\n如果某个 Key 的访问量实在太高，在 Redis Cluster 中任何分片策略都难以应对，可以将其从 Cluster 中摘出，放到一个独立的 Redis 主从实例，业务层单独配置这个实例的连接，让该 Key 的读流量由专用实例承载。这是大促活动前常见的预案操作。\n\n## 延伸：热点 Key 与缓存击穿的区别，以及更深的防护体系\n\n这里有一个经典的混淆点：**热点 Key 问题**和**缓存击穿**经常被一起提起，但它们是两个不同的场景。热点 Key 是指某个 Key 一直存在、但被极高频率地访问，问题在于 Redis 节点被打垮；缓存击穿则是某个热点 Key 在过期的那一瞬间，大量并发请求同时发现缓存不存在，全部穿透到数据库，问题在于数据库被打垮。两者可能同时存在，也可以单独出现。\n\n防止缓存击穿最常用的方案是**互斥锁（Mutex）**：当缓存未命中时，先用 `SET key nx ex 30`（原子性的分布式锁）抢占一个锁，只有抢到锁的请求才去查数据库并回填缓存，其他请求等待或返回空。这样可以保证只有一个请求穿透到数据库。\n\n更优雅的方案是**逻辑过期**：Redis 中的 Key 永不设物理 TTL，而是在 value 里存一个逻辑过期时间戳。读取时如果发现逻辑时间戳已过期，则异步触发一个后台任务去刷新缓存，当前请求返回旧数据。这样缓存永远不会「空」，也就永远不会有击穿问题，代价是可能读到短暂过期的旧数据。\n\nRedis 6.0 还引入了 `client no-evict on` 命令，可以标记某个连接使用的内存不参与 LRU/LFU 淘汰。虽然这不能直接解决热点 Key 问题，但可以配合「热点 Key 不设 TTL + 逻辑过期」方案使用，确保热点数据不会被内存淘汰策略意外删除。\n\n在架构层面，成熟的方案是 **Caffeine（本地缓存）+ Redis（分布式缓存）的二级缓存体系**：L1 是进程内的 Caffeine，TTL 5 秒，命中率极高但数据量有限；L2 是 Redis，TTL 5 分钟，作为 L1 的后盾。绝大多数热点 Key 请求在 L1 就被挡住，Redis 只需承接 L1 过期后的「补货」请求，QPS 下降 90% 以上。这是直播、电商大促场景下最常见的生产级方案。",
+      "keyPoints": [
+        "Redis 单线程模型导致单节点 QPS 硬上限约 8-12 万，热点 Key 的本质是流量倾斜——整个集群的请求全部路由到同一个 slot 所在节点，其他节点算力被完全浪费。",
+        "使用 `redis-cli --hotkeys` 可以扫描热点 Key，但前提是 `maxmemory-policy` 必须配置为 `allkeys-lfu` 或 `volatile-lfu`，否则命令不会返回有效的频次数据。",
+        "`MONITOR` 命令可以实时观察所有命令流从而发现热点，但在高负载节点上使用会额外增加约 50% CPU 消耗，生产环境应仅短暂采样后立即断开，切勿长时间运行。",
+        "本地缓存（Caffeine/Guava Cache）是最快的临时止血方案，可以在不改动 Redis 架构的情况下将绝大多数热点读请求拦截在 JVM 进程内，3-5 分钟内可上线。",
+        "Key 拆分方案将 `hot_key` 扩展为 `hot_key_0` 到 `hot_key_N-1` 共 N 个副本，写时全量写入，读时随机选一个，可以让流量分散到 N 个不同 slot，是从 Redis 层彻底根治热点的最有效方案。",
+        "热点 Key 与缓存击穿是两个不同的概念：热点 Key 是 Key 持续存在但访问量过高导致节点过载；缓存击穿是热点 Key 过期瞬间大量请求同时穿透到数据库，两者需用不同手段防护。",
+        "逻辑过期方案（Key 无物理 TTL，value 中嵌入过期时间戳，过期后异步刷新）可以从根本上杜绝缓存击穿，代价是短暂读到旧数据，适用于允许最终一致的高频访问数据。",
+        "生产级的二级缓存架构是 Caffeine（L1，TTL 3-5 秒）+ Redis（L2，TTL 5 分钟），L1 拦截绝大多数热点请求，Redis 只承接 L1 过期后的补货流量，可将热点 Key 对 Redis 的压力降低 90% 以上。"
+      ],
+      "quiz": [
+        {
+          "id": "redis-hot-key-q1",
+          "question": "在 Redis Cluster 模式下，热点 Key 问题的根本原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis 的内存不足，导致频繁触发 LRU 淘汰，命中率下降" },
+            { "id": "B", "text": "某个 Key 的 CRC16 哈希落在同一个 slot，所有请求路由到同一节点，超过单节点 QPS 上限" },
+            { "id": "C", "text": "Redis 集群的主从同步延迟过高，读取副本时数据不一致" },
+            { "id": "D", "text": "网络带宽不足，导致该节点的网卡打满，进而出现超时" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis Cluster 通过 CRC16(key) % 16384 将数据分布到 16384 个 slot，每个 slot 只属于一个节点。一个特定的 Key 永远只落在一个固定节点上，无法被分摊。当这个 Key 的访问频率超过单节点 QPS 上限（约 8-12 万）时，该节点成为瓶颈。A 选项的 LRU 淘汰是内存不足的问题，与 CPU 100% 的现象不符；C 是读写分离场景下的一致性问题；D 是有可能的次要原因，但不是根本原因。热点 Key 的核心矛盾是：集群的总算力足够，但由于 Key 的固定映射关系，算力无法被分配给承压节点。"
+        },
+        {
+          "id": "redis-hot-key-q2",
+          "question": "使用 `redis-cli --hotkeys` 命令发现热点 Key，对 Redis 的配置有什么前提要求？",
+          "choices": [
+            { "id": "A", "text": "需要开启 keyspace notifications，配置 `notify-keyspace-events KEA`" },
+            { "id": "B", "text": "需要将 `maxmemory-policy` 设置为 LFU 相关策略，如 `allkeys-lfu` 或 `volatile-lfu`" },
+            { "id": "C", "text": "需要将 `activerehashing` 设置为 yes，并重启 Redis" },
+            { "id": "D", "text": "没有前提要求，任何配置下都可以直接使用" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`--hotkeys` 依赖 Redis 的 LFU 频率计数器来追踪每个 Key 的访问热度。LFU 计数器只有在淘汰策略配置为 LFU 相关（`allkeys-lfu` 或 `volatile-lfu`）时才会被维护——Redis 不会无条件地为所有 Key 记录访问频次，因为这有内存和 CPU 开销。如果 `maxmemory-policy` 是默认的 `noeviction` 或 LRU 策略，执行 `--hotkeys` 只会返回错误提示 `ERR This Redis instance has no such command`（老版本）或空结果。A 选项的 keyspace notifications 是用来做事件订阅的，与热点 Key 检测无关；D 选项说法错误。"
+        },
+        {
+          "id": "redis-hot-key-q3",
+          "question": "在故障时对 CPU 已经 100% 的 Redis 节点执行 `MONITOR` 命令，最可能发生什么？",
+          "choices": [
+            { "id": "A", "text": "`MONITOR` 是只读命令，不会对节点造成任何额外压力" },
+            { "id": "B", "text": "`MONITOR` 会让 Redis 暂停处理其他请求，专门输出监控数据" },
+            { "id": "C", "text": "`MONITOR` 需要序列化并推送每条命令给客户端，会额外增加约 50% CPU 开销，可能导致节点雪崩" },
+            { "id": "D", "text": "`MONITOR` 输出速度会跟不上命令速度，自动降级为采样模式，不影响性能" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 的 `MONITOR` 命令会让 Redis 把收到的每一条命令都序列化成文本并推送给 `MONITOR` 客户端。在高负载节点上，这意味着大量的额外序列化和网络 I/O 工作，实测可以给 Redis 增加 50% 甚至更多的 CPU 开销。对一个已经 CPU 100% 的节点执行 `MONITOR`，极大概率会让该节点完全失去响应，引发雪崩。正确的做法是：在测试环境验证，或者在生产上只短暂采样（2-5 秒后立刻断开），绝不能长时间开着 `MONITOR` 去观察生产节点。A 和 D 的说法都是错误的，B 的说法也是错误的，Redis 不会因为 `MONITOR` 停止处理其他请求。"
+        },
+        {
+          "id": "redis-hot-key-q4",
+          "question": "Key 拆分方案将 `hot_key` 变成 `hot_key_0` 到 `hot_key_15` 共 16 个 Key，读取时随机选一个。这个方案有一个重要的隐患是什么？",
+          "choices": [
+            { "id": "A", "text": "16 个 Key 的 CRC16 哈希值可能仍然落在同一个 slot，拆分无效" },
+            { "id": "B", "text": "写入时需要同时更新 16 个 Key，写操作的延迟和复杂度增加，且需要保证 16 份数据的一致性" },
+            { "id": "C", "text": "Redis 不支持 Key 名称包含数字后缀，`hot_key_0` 这样的命名方式会报错" },
+            { "id": "D", "text": "随机读取会导致 Redis 集群的 gossip 协议流量增加，影响集群稳定性" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Key 拆分将一个逻辑数据拆成 N 份物理存储，带来的核心挑战是写一致性问题。当数据需要更新时，必须原子地或最终一致地更新全部 N 个副本。如果更新过程中某些副本已更新、某些还是旧值，随机读取就会出现不一致。常见的处理方式是：用 Lua 脚本打包写入所有副本（保证原子性），或者允许短暂的最终一致（接受 N 个副本的写入时间差）。A 选项是错误的，`hot_key_0` 和 `hot_key_1` 的哈希值几乎不可能相同（如需精确控制 slot，可以用 hash tag `{hot_key}_0`）；C 和 D 完全是无稽之谈。"
+        },
+        {
+          "id": "redis-hot-key-q5",
+          "question": "以下是执行 `redis-cli --hotkeys` 的部分输出，根据输出判断哪个 Key 最需要优先处理？\n\n```\nhot key found with counter: 2341098  keyname: user:profile:88888888\nhot key found with counter: 1284721  keyname: live:room:9527:viewers\nhot key found with counter:  987432  keyname: live:room:9527:likes\nhot key found with counter:  123456  keyname: config:global:feature_flags\n```",
+          "choices": [
+            { "id": "A", "text": "`config:global:feature_flags`，因为配置类 Key 一旦出问题影响最广" },
+            { "id": "B", "text": "`live:room:9527:viewers`，因为直播间在线人数是最核心的业务指标" },
+            { "id": "C", "text": "`user:profile:88888888`，因为其访问频次最高（234 万次），是最大的热点来源" },
+            { "id": "D", "text": "`live:room:9527:likes` 和 `live:room:9527:viewers` 都需要处理，因为它们属于同一个直播间，会落在相近的 slot" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "`--hotkeys` 的 counter 字段代表这个 Key 在 LFU 窗口内的访问频次统计。`user:profile:88888888` 的 counter 是 2341098，是第二名的近两倍，说明这个 Key 承受了最大的流量压力，应该优先处理。D 选项的理解有误：属于同一个直播间的 Key（`live:room:9527:viewers` 和 `live:room:9527:likes`）名字相似，但它们的 CRC16 哈希值是独立计算的，不一定落在相邻 slot，更不一定在同一个节点。A 选项的 `config:global:feature_flags` 频次只有 12 万次，是最低的，业务影响未必最大，但可以预先加本地缓存。"
+        },
+        {
+          "id": "redis-hot-key-q6",
+          "question": "Caffeine 本地缓存作为热点 Key 的临时解决方案，以下哪种场景下最不适合使用它？",
+          "choices": [
+            { "id": "A", "text": "直播间实时在线人数展示，允许最多 5 秒的数据延迟" },
+            { "id": "B", "text": "明星个人主页的粉丝数展示，数据每分钟更新一次" },
+            { "id": "C", "text": "电商秒杀活动的商品库存扣减，需要强一致性" },
+            { "id": "D", "text": "APP 的全局配置信息（功能开关），每小时更新一次" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Caffeine 本地缓存存在于每个服务实例的 JVM 进程内，多个实例之间的数据相互独立。这意味着在 TTL 窗口内（如 5 秒），不同实例读到的数据可能不一致，而且写入数据库后，本地缓存的旧数据不会被立刻失效（除非主动通知所有实例刷新）。对于库存这类数据，要求的是强一致性和准确的原子性扣减，允许本地缓存存在的数据误差会导致超卖问题，因此完全不适合用本地缓存。A、B、D 三个场景都是允许一定程度「最终一致」的读多写少数据，非常适合本地缓存。"
+        },
+        {
+          "id": "redis-hot-key-q7",
+          "question": "「热点 Key 问题」与「缓存击穿」有什么核心区别？",
+          "choices": [
+            { "id": "A", "text": "热点 Key 问题是 Redis 层的问题，缓存击穿是数据库层的问题，两者没有关联" },
+            { "id": "B", "text": "热点 Key 是 Key 持续存在但访问量过高导致 Redis 节点过载；缓存击穿是热点 Key 过期瞬间大量请求同时穿透到数据库" },
+            { "id": "C", "text": "热点 Key 只发生在 Redis Cluster 模式，缓存击穿只发生在单机 Redis" },
+            { "id": "D", "text": "两者是同一个问题的不同叫法，解决方案完全相同" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "热点 Key 问题的关键词是「持续存在 + 高频访问」，它的受害者是 Redis 节点本身（CPU 打满、超时）；缓存击穿的关键词是「Key 过期」和「瞬间大量穿透」，它的受害者是后端数据库（被大量并发查询打垮）。两者可以同时存在：一个高频访问的 Key 在过期的那一刻，既是热点 Key 问题（过期前），也可能引发缓存击穿（过期的瞬间）。解决热点 Key 用本地缓存、Key 拆分；解决缓存击穿用互斥锁或逻辑过期。A 的说法不准确，两者都与 Redis 有关；C 完全错误；D 混为一谈。"
+        },
+        {
+          "id": "redis-hot-key-q8",
+          "question": "某直播平台决定对「明星个人主页」这个热点 Key 使用「逻辑过期」方案，以下描述哪个是对逻辑过期方案本质的正确理解？",
+          "choices": [
+            { "id": "A", "text": "Redis Key 设置非常长的物理 TTL（如 7 天），业务层每 5 分钟主动刷新一次 Key" },
+            { "id": "B", "text": "Redis Key 不设置物理 TTL，value 中存储逻辑过期时间，过期后异步刷新，读请求始终返回数据（可能是旧数据）" },
+            { "id": "C", "text": "Redis Key 的 TTL 设置为 5 分钟，过期后第一个请求用互斥锁阻塞其他请求并同步回源刷新" },
+            { "id": "D", "text": "对热点 Key 的读取请求做排队处理，同一时间只允许一个请求访问 Redis" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "逻辑过期方案的核心是：物理上这个 Key 在 Redis 中永不删除（不设 TTL），但 value 里存了一个 `expire_at` 时间戳。读取时检查这个时间戳，如果已经逻辑过期，则触发一个异步任务（如提交到线程池）去数据库取最新数据并更新 Redis，当前请求不等待，直接返回旧数据。这样做的好处是：缓存永远有数据，不会出现高并发击穿；缺点是在异步刷新完成前，会有短暂的数据不一致。A 选项有物理 TTL 就仍然存在击穿风险；C 选项是互斥锁方案，不是逻辑过期；D 是限流方案，效果有限且影响性能。"
+        },
+        {
+          "id": "redis-hot-key-q9",
+          "question": "如果想让某个热点 Key 在 Redis 内存满时绝对不被淘汰策略删除，Redis 6.0+ 提供了什么机制？",
+          "choices": [
+            { "id": "A", "text": "将该 Key 的 TTL 设置为 -1（永不过期），Redis 不会主动删除永不过期的 Key" },
+            { "id": "B", "text": "使用 `OBJECT FREQ` 命令手动提升该 Key 的 LFU 频率计数，让它在淘汰竞争中胜出" },
+            { "id": "C", "text": "使用 `CLIENT NO-EVICT ON` 标记当前连接，该连接使用的内存不参与内存淘汰" },
+            { "id": "D", "text": "将该 Key 迁移到 Redis 的 0 号数据库，0 号数据库的数据不会被淘汰" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 6.0 引入了 `CLIENT NO-EVICT ON/OFF` 命令，当为某个客户端连接开启 `no-evict` 模式后，该连接的输出缓冲区（output buffer）占用的内存不会被计入淘汰目标。在某些架构中，可以为持有热点 Key 数据的专用连接开启此标志，配合「逻辑过期 + 不设物理 TTL」方案，确保热点 Key 的数据不会被内存淘汰策略意外清除。A 选项是正确的常用做法，但「永不过期」只是不被主动过期删除，在 `allkeys-lru/lfu` 策略下仍然可能被内存压力淘汰；B 的 `OBJECT FREQ` 是只读查询命令；D 是完全错误的，Redis 数据库编号与淘汰策略无关。"
+        },
+        {
+          "id": "redis-hot-key-q10",
+          "question": "在使用 Caffeine + Redis 二级缓存架构时，某个节点的 Caffeine 缓存 TTL 到期，回源到 Redis 发现 Redis 也恰好过期了（缓存雪崩），此时最合适的兜底策略是什么？",
+          "choices": [
+            { "id": "A", "text": "立刻返回 500 错误，让调用方重试，通过重试机制等待缓存恢复" },
+            { "id": "B", "text": "所有服务实例同时向数据库发起查询，先查询完成的实例回填 Redis 和本地缓存，后来的用互斥锁等待结果" },
+            { "id": "C", "text": "使用随机抖动的 TTL（如 300 ± 60 秒）错开不同 Key 的集中过期时间，减少雪崩概率；并用互斥锁保证回源时只有一个请求穿透数据库" },
+            { "id": "D", "text": "直接绕过 Redis，所有请求改成直连数据库，等缓存层恢复后再切回" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "预防缓存雪崩的标准手段有两个：一是「TTL 随机抖动」，通过给不同 Key 的 TTL 加减随机偏移量（如 base_ttl + random(0, 60)），让大量 Key 不在同一时刻集中过期，这是预防措施；二是「互斥锁回源」，当缓存未命中需要查数据库时，通过分布式锁（Redis SETNX）保证同一时刻只有一个请求穿透，其他请求等待或返回旧数据，这是兜底措施。A 选项直接返回错误会影响用户体验；B 选项所有实例同时回源会把数据库打崩，是反模式；D 选项直连数据库在高并发场景下无异于引爆数据库，更不可取。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/manual/keyspace-notifications/",
+        "https://redis.io/commands/object-freq/",
+        "https://redis.io/docs/management/config/#maxmemory-policy",
+        "https://github.com/ben-manes/caffeine"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,156 @@
+{
+  "id": "redis-replication-delay",
+  "name": "Redis 主从复制延迟排查",
+  "domain": "troubleshooting",
+  "description": "排查 Redis 读写分离场景下主从延迟导致数据不一致的原因与解决方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-replication-delay-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["redis", "replication", "slave", "lag", "consistency", "read-write-splitting"],
+      "title": "Redis 读写分离后从库数据不一致，如何排查主从复制延迟？",
+      "content": "你们团队在一个电商商品详情页服务中引入了 Redis 读写分离架构：写操作走主库，读操作分发到两台从库以分摊压力。上线一周后，客服反馈出现了一个奇怪的问题：运营刚在后台更新了商品价格，但前端页面显示的还是旧价格，刷新几次之后才变成新价格。\n\n你排查了应用层代码，确认写入主库和读从库的逻辑都正确。然后你直接在 Redis 主库上设置一个 key，立刻切到从库查询，发现从库返回的确实是旧值——延迟大概在 200ms 到 2 秒之间，时好时坏。高峰期下午三点尤其明显，甚至偶尔出现 lag 超过 10 秒的情况。\n\n```bash\n# 在主库执行写入\n127.0.0.1:6379> SET product:price:10086 \"299.00\"\nOK\n\n# 立刻在从库执行读取，竟然返回旧值\n127.0.0.1:6380> GET product:price:10086\n\"399.00\"  # 从库还是旧价格\n```\n\n你的 SRE 同事跑过来说「复制延迟了，你看看 lag」，但你不太清楚 lag 从哪儿看，也不知道这个延迟究竟是因为网络问题、从库太慢、还是主库写入量太大。更令人困惑的是，从库偶尔还会出现断开重连的情况，重连后会有一段时间的全量数据同步，这段时间从库读到的数据更老。\n\n这个问题背后涉及 Redis 主从复制的核心机制。要彻底搞清楚延迟从哪里来，你需要先理解 Redis 的复制是怎么工作的，再结合诊断命令定位到具体原因，最后才能选择正确的解决方案。否则你很可能凭感觉乱调参数，调了半天问题还在。",
+      "answer": "## Redis 主从复制的工作机制\n\nRedis 主从复制（Replication）是 Redis 高可用和读写分离的基础。要理解延迟从哪里来，必须先搞清楚数据是怎么从主库流向从库的。\n\n从库第一次连上主库时，会触发**全量复制**（Full Resync）。主库执行 `BGSAVE` fork 一个子进程生成 RDB 快照，与此同时，fork 之后主库收到的所有新写命令都被追加进一个叫做**复制缓冲区**（replication buffer）的内存队列。RDB 文件生成完毕后，主库把 RDB 发给从库，从库载入 RDB 恢复数据；等 RDB 加载完，主库再把复制缓冲区里积压的命令发给从库，从库逐条回放，追上主库进度。这个过程结束后，两者进入稳定的**增量复制**阶段：主库每执行一条写命令，就把它写入**复制积压缓冲区**（replication backlog），然后通过 TCP 长连接实时推送给从库。\n\n有一个细节很关键：**Redis 的复制是完全异步的**。主库把命令写入 backlog 之后就直接返回客户端 OK，不会等从库确认收到。这意味着从主库的角度，写操作已经成功，但数据到达从库的时间完全取决于网络传输速度和从库的处理能力。这就是主从延迟（replication lag）的根本原因——它不是 Bug，是 Redis 设计上的权衡：牺牲从库的强一致性，换取主库写入的低延迟。\n\n复制积压缓冲区（repl-backlog）是一个固定大小的环形队列，默认只有 1MB。如果从库因为网络抖动断开了连接，重连后主库会用从库记录的 `repl_offset` 检查 backlog 里还有没有从库缺失的命令。如果有，走**增量重同步**（Partial Resync），只补发缺少的命令；如果没有——即从库掉线太久，backlog 已经被新数据覆盖——只能重新全量复制，代价极大。\n\n## 诊断：从 INFO replication 读懂数据\n\n排查主从延迟，第一步永远是在**主库**执行 `INFO replication`，这个命令会返回复制状态的全貌：\n\n```\n# 在主库执行\n127.0.0.1:6379> INFO replication\n# Replication\nrole:master\nconnected_slaves:2\nslave0:ip=10.0.1.11,port=6380,state=online,offset=103948721,lag=1\nslave1:ip=10.0.1.12,port=6381,state=online,offset=103812345,lag=8\nmaster_failover_state:no-failover\nmaster_replid:8a4c3f2d1b9e7a6c5d4f3e2a1b0c9d8e\nmaster_replid2:0000000000000000000000000000000000000000\nmaster_repl_offset:103949150\nrepl_backlog_active:1\nrepl_backlog_size:1048576\nrepl_backlog_first_byte_offset:102900575\nrepl_backlog_histlen:1048576\n```\n\n这里最重要的三个字段：`master_repl_offset` 是主库当前的复制偏移量，表示主库已经写了多少字节的命令数据；`slave0` 行里的 `offset` 是从库已经消费到的位置；`lag` 是从库上次 ACK 到现在的秒数。用主库 offset 减去从库 offset 得到的字节差值，就是积压了多少数据没有被从库消费。上面的例子里，slave1 的 lag 已经是 8 秒，offset 差值达到了 136805 字节，说明这台从库明显跟不上。\n\n接下来去**从库**执行 `INFO replication` 看另一个关键字段：\n\n```\n# 在从库执行\n127.0.0.1:6381> INFO replication\n# Replication\nrole:slave\nmaster_host:10.0.1.10\nmaster_port:6379\nmaster_link_status:up         # 关键：up 表示连接正常，down 表示断开\nmaster_last_io_seconds_ago:1\nmaster_sync_in_progress:0     # 1 表示正在全量同步\nslave_repl_offset:103812345\nslave_priority:100\nslave_read_only:1\n```\n\n如果 `master_link_status` 是 `down`，说明主从连接已经断开，从库可能正在触发全量同步，这时候读到的数据可能非常陈旧。如果 `master_sync_in_progress` 是 1，说明 RDB 正在传输，从库正处于「接受全量数据」的状态，这段时间内从库的数据是完全不可用的。\n\n## 常见延迟原因及解决方案\n\n确认存在延迟之后，需要找到根因。最常见的原因按照出现频率排列如下。\n\n**第一类：从库被慢命令阻塞。** Redis 是单线程处理命令的，如果从库在回放主库命令的同时，客户端还在用从库执行 `KEYS *`、`HGETALL` 一个巨大的 Hash、或者 `LRANGE` 一个几十万元素的 List，这些慢命令会把从库命令处理队列堵死，导致复制命令积压。解决办法是在从库上执行 `SLOWLOG GET 20` 查最近 20 条慢查询，找到元凶之后在应用层消除慢命令，或者禁止直接在从库执行耗时的管理命令。\n\n**第二类：网络带宽不足，复制流追不上主库写入速度。** 下午高峰期延迟恶化的场景，十有八九是这个原因。主库写入量大，产生的复制流（replication stream）超出了主从之间的网络带宽上限，数据在传输层就开始积压。可以用 `redis-cli --stat` 或者监控系统观察主库的 `instantaneous_output_kbps`（当前输出带宽），如果逼近网卡极限，就需要评估是否该限制业务写入速率，或者升级网络带宽，或者考虑把从库的读流量分担到本地缓存减少从库查询压力。\n\n**第三类：从库开启了 AOF 且 `appendfsync=always`。** AOF（Append Only File）是 Redis 的持久化日志。当 `appendfsync=always` 时，从库每回放一条命令都要 `fsync` 一次磁盘，这在 HDD 上会把每条命令的处理时间拖慢到 10ms 级别，复制速度断崖式下降。**从库通常不需要 AOF**——因为从库本身就是主库的数据副本，数据安全由主库 AOF 保障。如果确实需要，改成 `appendfsync=everysec` 每秒 fsync 一次，延迟可以从秒级降到毫秒级。\n\n**第四类：复制积压缓冲区溢出导致重复全量同步。** 默认的 `repl-backlog-size 1mb` 在高写入量场景下极容易溢出。主库每秒写入 10MB 数据，从库只要断线超过 0.1 秒，backlog 就已经覆盖了从库需要的命令，只能重走全量同步。而全量同步期间主库要 fork 子进程、传输 RDB、从库要清空内存重新加载，整个过程可能持续数十秒，然后新的 lag 又积累，于是陷入「断线→全量同步→同步期间又断线→再次全量同步」的死循环。解决方案是把 `repl-backlog-size` 调大到至少能覆盖 60 秒写入量，比如主库每秒写入 5MB，就应该把 backlog 设为至少 `300mb`：\n\n```bash\n# redis.conf\nrepl-backlog-size 300mb\nrepl-backlog-ttl 3600  # backlog 在没有从库连接时保留 1 小时\n```\n\n**业务层的应对方案。** 如果从库延迟无法从根本上消除，业务代码需要做适配。对于「写后立刻读」的一致性要求，把读操作也路由到主库，用 `WAIT numreplicas timeout` 命令等待指定数量的从库确认同步完成再返回：\n\n```bash\n# 等待至少 1 台从库同步完成，超时 500ms\n127.0.0.1:6379> WAIT 1 500\n(integer) 1  # 返回已同步的从库数量\n```\n\n`WAIT` 命令会让主库阻塞等待，直到指定数量的从库发来 ACK 或超时。这实际上把异步复制变成了半同步，适合对一致性要求高但写入频率不高的场景。代价是主库写入延迟增加了从库同步时间。\n\n## 进阶：更深的坑和更好的方案\n\nRedis 7.0 引入了 `replica-lazy-flush` 配置，允许从库在全量同步时异步清空旧数据而不是同步清空，减少全量同步期间从库不可用的时间窗口，对有大量 key 的从库效果明显。\n\n**无盘复制**（`repl-diskless-sync yes`）是另一个值得了解的优化。传统全量复制需要主库先把 RDB 写到磁盘，再从磁盘读出来发给从库，磁盘 IO 成为瓶颈。开启无盘复制后，主库直接通过 socket 把 RDB 流式发送给从库，跳过磁盘，全量同步速度可以显著提升，对 SSD 不够快或者磁盘已经很忙的主库特别有用。\n\n**多级复制**（从库的从库，即 replica-of-replica）会让延迟累加。假设主库→从库 A 的 lag 是 500ms，从库 A→从库 B 的 lag 又是 500ms，那从库 B 读到的数据可能比主库老 1 秒以上。如果你的架构里有多级从库，排查延迟时要把每一级的 lag 加起来分析。\n\nRedis Sentinel 在做主库故障转移时，有一个经常被忽视的数据丢失风险：如果主库挂掉时已经有数据没有复制到任何从库，Sentinel 选出新主库后，这些数据就永久消失了。`min-replicas-to-write` 和 `min-replicas-max-lag` 两个配置可以缓解这个问题——前者要求至少有 N 台从库在线才允许主库接受写请求，后者要求从库的 lag 不超过 M 秒：\n\n```bash\n# redis.conf — 主库配置\nmin-replicas-to-write 1       # 至少 1 台从库在线才接受写\nmin-replicas-max-lag 10       # 从库 lag 不超过 10 秒\n```\n\n这两个配置是一把双刃剑：它们提高了数据安全性，但当所有从库都掉线或者延迟过高时，主库会拒绝写入请求，服务可用性下降。在架构上，读写分离场景最终的设计哲学是：允许短暂不一致（最终一致性）还是要求强一致性路由到主库，这个选择取决于业务容忍度，没有通用答案，但必须在设计阶段明确，而不是出了问题再临时救火。",
+      "keyPoints": [
+        "Redis 主从复制是完全异步的，主库写入成功立刻返回客户端，不等从库确认，因此主从之间天然存在数据延迟窗口，这是设计权衡而非缺陷。",
+        "通过主库执行 `INFO replication` 可以获取每台从库的 `lag`（单位秒）和 offset 差值，offset 差值反映了从库还有多少字节数据未消费，是判断延迟严重程度的核心指标。",
+        "从库执行慢命令会阻塞单线程，导致复制命令积压；应使用 `SLOWLOG GET` 排查从库慢查询，并避免在从库执行 `KEYS *` 等全量扫描命令。",
+        "复制积压缓冲区（repl-backlog）默认仅 1MB，高写入量场景极易溢出，溢出后从库重连只能全量同步而非增量重同步，应根据「主库每秒写入量 × 可接受断线秒数」调大 repl-backlog-size。",
+        "从库开启 AOF 且 appendfsync=always 会使每条回放命令都触发磁盘 fsync，严重拖慢复制速度；生产环境从库推荐关闭 AOF 或改为 appendfsync=everysec。",
+        "业务层处理写后读一致性的最佳方案是对强一致要求的读操作路由到主库，或使用 `WAIT numreplicas timeout` 命令等待从库同步确认，将异步复制临时转为半同步。",
+        "min-replicas-to-write 和 min-replicas-max-lag 配置可防止主库在从库全部滞后时继续接受写请求，降低故障转移时的数据丢失风险，但会在从库不可用时牺牲主库写入可用性。"
+      ],
+      "quiz": [
+        {
+          "id": "redis-replication-delay-q1",
+          "question": "Redis 主从复制中，主库执行写命令后返回客户端 OK，此时从库的状态是？",
+          "choices": [
+            { "id": "A", "text": "已确认收到命令但尚未执行" },
+            { "id": "B", "text": "不确定，取决于网络延迟，从库可能还没收到命令" },
+            { "id": "C", "text": "已执行完毕，主从数据完全一致" },
+            { "id": "D", "text": "正在等待从库 ACK，主库处于阻塞状态" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis 默认使用**异步复制**，主库把命令写入复制积压缓冲区后立即返回客户端 OK，不等从库确认。这意味着主库返回成功时，从库可能还没收到命令，也可能已经执行完了，完全取决于当时的网络和从库负载。选项 A 描述的是一种假想的「确认收到但未执行」状态，Redis 没有这种机制。选项 C 错误，主库返回 OK 不代表主从一致。选项 D 描述的是 `WAIT` 命令的行为，不是默认行为。"
+        },
+        {
+          "id": "redis-replication-delay-q2",
+          "question": "在主库执行 `INFO replication`，看到 `slave0:ip=10.0.1.11,port=6380,state=online,offset=5000000,lag=0` 和 `master_repl_offset:5050000`。以下判断正确的是？",
+          "choices": [
+            { "id": "A", "text": "从库完全同步，数据一致，lag=0 代表无延迟" },
+            { "id": "B", "text": "从库 lag=0 但 offset 差 50000 字节，说明从库稍微落后，存在少量数据尚未同步" },
+            { "id": "C", "text": "lag=0 代表从库在 0 秒内响应过 PING，但 offset 差值才是真正的数据延迟指标" },
+            { "id": "D", "text": "lag=0 说明这台从库的 AOF 是关闭的" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "`lag` 字段表示的是从库**上次向主库发送 ACK 到现在过去的秒数**，而不是数据是否同步完毕。lag=0 只说明从库在 1 秒内有过心跳通信，并不代表数据完全一致。真正反映数据延迟的是 `master_repl_offset - slave_offset` 的字节差值，这里差了 50000 字节，说明还有这么多数据没被从库消费。选项 A 的「完全一致」判断是错误的。选项 B 判断方向正确但描述不够准确，lag 和 offset 差值是两个独立指标，lag=0 与是否有 offset 差是不同维度。选项 D 完全无关。"
+        },
+        {
+          "id": "redis-replication-delay-q3",
+          "question": "Redis 全量复制（Full Resync）期间，主库会怎么处理新收到的写命令？",
+          "choices": [
+            { "id": "A", "text": "拒绝所有新写命令，等待全量同步完成" },
+            { "id": "B", "text": "继续正常处理写命令，并把这些命令追加到复制缓冲区，RDB 发完后再补发给从库" },
+            { "id": "C", "text": "把新写命令写入 AOF，等从库加载完 RDB 后再把 AOF 发给从库" },
+            { "id": "D", "text": "继续处理写命令，但这些命令会丢失，等全量同步完成后从库只有 RDB 时刻的数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "全量复制期间，主库不会停止服务。fork 子进程生成 RDB 时，主库继续接受写命令，这些命令被追加到**复制缓冲区**（注意：这个是全量同步专用的 client output buffer，不是 replication backlog）。当 RDB 文件发送完毕后，主库把缓冲区里积压的命令依次发给从库，从库回放后追上主库进度，全量同步完成。选项 A 错误，主库不会停写。选项 C 混淆了 AOF 和复制缓冲区。选项 D 错误，全量同步期间的新命令不会丢失，正是靠复制缓冲区保存的。"
+        },
+        {
+          "id": "redis-replication-delay-q4",
+          "question": "复制积压缓冲区（replication backlog）的主要作用是什么？",
+          "choices": [
+            { "id": "A", "text": "存储主库所有历史写命令，用于数据恢复" },
+            { "id": "B", "text": "从库短暂断线重连后，判断能否走增量同步而不是全量同步" },
+            { "id": "C", "text": "限制主库的写入速度，防止从库追不上" },
+            { "id": "D", "text": "存储当前正在执行的写命令，防止主库崩溃丢数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "复制积压缓冲区是一个固定大小的环形队列，默认 1MB，主库把所有写命令都追加进去。当从库断线重连时，从库会把自己记录的 `repl_offset` 告诉主库，主库检查这个 offset 是否还在 backlog 的范围内：如果在，说明从库只是短暂断线，缺失的命令还在 backlog 里，可以走**部分重同步**（Partial Resync）只补发差量；如果不在，backlog 已经覆盖了从库需要的命令，必须全量同步。所以 backlog 越大，能容忍的断线时间越长，全量同步概率越低。选项 A 描述的是 AOF 的职责。选项 C 错误，backlog 不限流。选项 D 描述的是 AOF/RDB 持久化的职责。"
+        },
+        {
+          "id": "redis-replication-delay-q5",
+          "question": "在从库执行 `INFO replication` 看到 `master_link_status:down` 和 `master_sync_in_progress:1`，这意味着什么？",
+          "choices": [
+            { "id": "A", "text": "主库已宕机，从库正在等待 Sentinel 选主" },
+            { "id": "B", "text": "主从连接断开，从库正在进行全量同步，此时从库数据非常陈旧，不应该承接读流量" },
+            { "id": "C", "text": "从库正在向主库发送增量命令，处于正常复制状态" },
+            { "id": "D", "text": "从库磁盘 IO 慢，正在刷写 AOF 数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`master_link_status:down` 表示主从 TCP 连接已经断开，`master_sync_in_progress:1` 表示正在进行全量同步（传输 RDB）。在这个状态下，从库持有的是旧的 RDB 数据，新的写命令还没到，读取这台从库会得到严重滞后的数据，可能滞后数分钟到数小时。这种情况应该立刻把该从库从读流量池中摘除，待 `master_link_status` 恢复为 `up` 且 lag 正常后再重新加入。选项 A 混淆了 master_link_status 和 Sentinel 状态。选项 C 完全错误，`master_sync_in_progress:1` 是全量同步标志。选项 D 无关。"
+        },
+        {
+          "id": "redis-replication-delay-q6",
+          "question": "生产环境的 Redis 从库是否应该开启 AOF 持久化？",
+          "choices": [
+            { "id": "A", "text": "必须开启，从库也需要持久化防止数据丢失" },
+            { "id": "B", "text": "建议关闭或使用 appendfsync=everysec，因为 appendfsync=always 会严重拖慢复制速度" },
+            { "id": "C", "text": "从库开启 AOF 不影响复制速度，只影响磁盘空间" },
+            { "id": "D", "text": "从库开启 AOF 会导致主从数据不一致" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "从库开启 AOF 会对复制速度产生显著影响，核心原因是从库回放主库命令时本质上也是在执行写操作，AOF 会把每条命令追加到日志文件。如果 `appendfsync=always`，每条命令都会触发一次 `fsync` 系统调用，在 HDD 磁盘上这可能让每条命令的处理时间从微秒级变成毫秒级，直接拖慢复制回放速度，导致 lag 上升。从库的数据安全通常由主库的 AOF 或 RDB 保障，从库本身是主库的备份，通常不需要再做一份 AOF。如果确实需要从库 AOF 做额外备份，使用 `appendfsync=everysec` 是合理的折中。"
+        },
+        {
+          "id": "redis-replication-delay-q7",
+          "question": "`WAIT 2 1000` 命令在主库上执行，返回了 `(integer) 1`，这说明什么？",
+          "choices": [
+            { "id": "A", "text": "2 台从库都在 1000ms 内同步完成" },
+            { "id": "B", "text": "只有 1 台从库在 1000ms 内确认同步，命令超时，另一台从库可能还未同步" },
+            { "id": "C", "text": "1 台从库已经超过 1000ms 没有响应" },
+            { "id": "D", "text": "命令执行失败，写入未能同步到任何从库" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`WAIT numreplicas timeout` 命令会阻塞主库直到**至少 numreplicas 台从库确认同步到当前 offset**，或者超时。返回值是在超时时间内成功确认的从库数量。这里 `WAIT 2 1000` 期望 2 台，但返回 1，意味着等了 1000ms 只有 1 台从库发来 ACK，另一台超时了，可能存在复制延迟。这时调用方应该根据业务决定是重试 WAIT，还是接受最终一致性风险，还是直接读主库。选项 A 错误，如果都成功应该返回 2。选项 C 描述不准确，超时的是 WAIT 命令，不是从库无响应。选项 D 错误，(integer) 1 代表有 1 台成功，不是失败。"
+        },
+        {
+          "id": "redis-replication-delay-q8",
+          "question": "你发现 Redis 主库每秒写入约 8MB 数据，从库平均每 30 秒会因网络抖动短暂断线 1-2 秒。当前 repl-backlog-size 是默认的 1MB。以下哪个调整最能解决频繁全量同步的问题？",
+          "choices": [
+            { "id": "A", "text": "把 repl-backlog-size 调整为 32MB，保证至少能覆盖 4 秒的写入量" },
+            { "id": "B", "text": "把 repl-backlog-size 调整为 1GB，越大越好" },
+            { "id": "C", "text": "开启无盘复制（repl-diskless-sync yes）减少全量同步时的磁盘 IO" },
+            { "id": "D", "text": "把从库的 slave-lazy-flush 设为 yes 减少全量同步时间" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "每秒写入 8MB，断线 2 秒最多积压 16MB。把 backlog 调到 32MB，可以容忍约 4 秒的断线，覆盖 1-2 秒的抖动有充足余量，能让断线从库走增量重同步而不是全量同步。选项 B「越大越好」的思路虽然方向正确，但 backlog 会一直占用内存，盲目设置 1GB 会浪费大量内存，应该根据写入量和预期最大断线时间合理计算。选项 C 无盘复制能加快全量同步速度，但不能减少全量同步次数，治标不治本。选项 D slave-lazy-flush 是 Redis 7.0 的 replica-lazy-flush，可以减少全量同步期间的服务中断时间，但同样不能减少触发全量同步的次数。"
+        },
+        {
+          "id": "redis-replication-delay-q9",
+          "question": "Redis Sentinel 集群配置了 `min-replicas-to-write 1` 和 `min-replicas-max-lag 10`。当唯一的从库网络抖动，lag 升到 15 秒时，会发生什么？",
+          "choices": [
+            { "id": "A", "text": "Sentinel 自动触发故障转移，把从库提升为主库" },
+            { "id": "B", "text": "主库停止接受新的写请求，返回 NOREPLICAS 错误，直到从库 lag 降回 10 秒以内" },
+            { "id": "C", "text": "主库继续接受写请求，但写入的数据不会同步到从库" },
+            { "id": "D", "text": "Sentinel 把该从库从集群中移除，等待人工干预" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "当从库 lag 超过 `min-replicas-max-lag`（10 秒），满足在线且 lag 合格的从库数量变为 0，低于 `min-replicas-to-write`（1），主库会开始拒绝写请求，返回 `-NOREPLICAS Not enough good replicas to write` 错误。这个机制是为了防止主库在所有从库严重滞后时继续写入，避免故障转移时大量数据丢失。代价是主库写入可用性暂时下降。选项 A 错误，Sentinel 故障转移针对的是主库宕机，不是从库 lag 超标。选项 C 是没有这个配置时的默认行为。选项 D 错误，Sentinel 不会主动踢出从库。"
+        },
+        {
+          "id": "redis-replication-delay-q10",
+          "question": "线上 Redis 读写分离架构，某业务场景是「用户下单后立刻查询订单状态」，对数据一致性要求极高。以下哪种方案最合适？",
+          "choices": [
+            { "id": "A", "text": "写主库后异步等 500ms 再读从库，确保有足够同步时间" },
+            { "id": "B", "text": "写主库后调用 WAIT 1 500 等待从库确认，或者直接把「查询订单状态」这个读请求路由到主库" },
+            { "id": "C", "text": "为订单数据单独建一个 Redis 实例不做读写分离，普通数据继续走从库" },
+            { "id": "D", "text": "在应用层把刚写入的订单 ID 存到本地内存，读请求先查本地内存再查 Redis" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 是工程上标准的处理方式。`WAIT 1 500` 在主库等待 1 台从库确认同步，确保读从库时数据已到位；如果对延迟敏感，直接把该读操作路由到主库是最简单可靠的方案，牺牲的只是这一类请求的读扩展性，这对低频但强一致性的操作是完全合理的。选项 A 的「等 500ms」是拍脑袋的做法，高峰期 lag 可能超过 500ms，低峰期 lag 可能只有几毫秒，硬等浪费时间且不可靠。选项 C 增加了运维复杂度，但思路上可行，属于过度工程。选项 D 把状态存本地内存会带来多实例一致性问题，且本地内存无法持久化，服务重启数据就丢了，是反模式。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/manual/replication/",
+        "https://redis.io/commands/wait/",
+        "https://redis.io/commands/info/",
+        "https://redis.io/docs/management/replication/"
+      ]
+    }
+  ]
+}
