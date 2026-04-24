@@ -1,0 +1,276 @@
+{
+  "id": "k8s-resource-quota",
+  "name": "K8s ResourceQuota 与 LimitRange 配置",
+  "domain": "troubleshooting",
+  "description": "K8s 多租户场景下的资源配额设计、故障排查与 QoS 等级理解",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-resource-quota-1",
+      "domain": "troubleshooting",
+      "type": "env-config",
+      "difficulty": 2,
+      "tags": ["kubernetes", "resourcequota", "limitrange", "namespace", "qos"],
+      "title": "K8s 多团队共享集群如何配置 ResourceQuota 和 LimitRange？",
+      "content": "你所在的公司有三个研发团队共享同一个 Kubernetes 集群：后端团队、数据团队和前端团队。集群总共有 40 核 CPU、160 GB 内存。运维同学发现，数据团队最近在跑一个 Spark 作业，把集群的 CPU 几乎占满了，导致后端团队的新版本根本部署不进去，每次 `kubectl apply` 之后 Pod 一直 Pending，同时 CI 流水线报出如下错误：\n\n```\nError from server (Forbidden): error when creating \"deployment.yaml\":\npods \"backend-api-7d9f8b-\" is forbidden: exceeded quota: team-backend-quota,\nrequested: requests.cpu=500m, used: requests.cpu=7800m, limited: requests.cpu=8000m\n```\n\n后端团队的 SRE 找到你，希望彻底解决这个问题。他说这不是第一次了，上个月数据团队的 Kafka Consumer 把内存耗光，直接触发了节点 OOM，整个 Node 上的 Pod 全部被驱逐，包括线上 API 服务。\n\n问题的根源很清楚：**没有做资源隔离**。三个团队的工作负载混在同一个 Namespace，没有任何配额限制，谁先抢到资源谁先跑，彻底的「公地悲剧」。\n\n更隐蔽的问题是：数据团队写的很多 Deployment 根本没有设置 `resources.requests` 和 `resources.limits`。这意味着调度器在做资源规划时，这些 Pod 的资源占用被当成 0 来计算，但它们实际跑起来可能占用 4 核 8GB。等 Node 真正资源不足时，这些「隐身」的 Pod 会是最先被驱逐的目标，这就是为什么上个月 OOM 之后，数据团队的 Pod 全死了，而恰好有设置 limits 的后端 Pod 活下来了。\n\n现在你需要为这个集群设计一套完整的资源隔离方案。具体来说，需要回答以下几个问题：一、如何用 Namespace 隔离三个团队？二、如何配置 ResourceQuota 限制每个团队的资源上限？三、如何用 LimitRange 强制所有 Pod 必须声明 requests/limits，并防止单个容器滥用资源？四、遇到 `exceeded quota` 报错后，如何快速定位和处置？五、生产环境下多团队配额分配应该遵循哪些原则？",
+      "answer": "## 一、基础概念：Namespace 是 K8s 多租户的第一道门\n\n在回答怎么配之前，先要搞清楚这套机制在 K8s 里是怎么分层的。K8s 本身没有「租户」的概念，它提供的最近似多租户隔离的原语是 **Namespace**。Namespace 是一个逻辑边界：同一 Namespace 内的资源名字唯一，RBAC 策略、NetworkPolicy、ResourceQuota 都是以 Namespace 为粒度生效的。把三个团队分到三个 Namespace——`team-backend`、`team-data`、`team-frontend`——这是所有后续隔离手段的前提。没有 Namespace 隔离，ResourceQuota 就没有作用域，后面的一切都是空谈。\n\n**ResourceQuota** 是对一个 Namespace 内所有资源的**总量限制**。它的工作方式像一个「团队月度预算」：这个 Namespace 一共能申请多少 CPU、多少内存、能创建多少个 Pod、多少个 Service、多少个 PVC。ResourceQuota 由准入控制器（Admission Controller）在 API Server 层强制执行，任何超出配额的创建请求都会在进入 etcd 之前被拒绝，这正是上面那个 `exceeded quota` 错误的来源。\n\n**LimitRange** 则是对 Namespace 内**单个 Pod 或 Container** 的限制。它解决的是另一个问题：即便有了总量配额，如果某个 Container 没有写 `resources.requests`，调度器就把它的资源占用算作 0，导致节点实际负载远超预期；如果没有写 `resources.limits`，单个容器可以无限制地使用 CPU 和内存，把邻居 Pod 挤死。LimitRange 允许你为 Namespace 设置默认值（`default`/`defaultRequest`）和边界（`min`/`max`），强制每个容器都在一个合理的范围内运行。\n\n这两者的关系是互补的：ResourceQuota 管总量，LimitRange 管个体。两者都不设，集群就是无序竞争；只设 ResourceQuota 不设 LimitRange，一个没写 requests 的 Pod 创建时资源占用算 0，但实际跑起来消耗真实资源，配额的计算就会失真；只设 LimitRange 不设 ResourceQuota，个体受限了，但团队总量仍然没有边界。\n\n## 二、核心解答：实际配置该怎么写\n\n先为三个团队创建 Namespace，然后分别配置 ResourceQuota 和 LimitRange。以后端团队为例：\n\n```yaml\n# team-backend-quota.yaml\napiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: team-backend-quota\n  namespace: team-backend\nspec:\n  hard:\n    # CPU 总申请量上限：后端团队最多申请 8 核\n    requests.cpu: \"8\"\n    # CPU 总限制量上限：limits 的总和不超过 16 核（允许超售 2x）\n    limits.cpu: \"16\"\n    # 内存总申请量上限\n    requests.memory: 16Gi\n    # 内存总限制量上限\n    limits.memory: 32Gi\n    # Pod 数量上限，防止 HPA 失控创建大量 Pod\n    pods: \"50\"\n    # Service 数量上限\n    services: \"20\"\n    # PVC 数量和存储总量上限\n    persistentvolumeclaims: \"10\"\n    requests.storage: 200Gi\n```\n\n注意这里有个细节：`requests.cpu` 和 `limits.cpu` 分开计算。`requests` 是调度器用来选节点的依据（这个 Pod 保证能拿到多少资源），`limits` 是容器实际能用的上限。通常 `limits` 会设置成 `requests` 的 2 倍，允许一定程度的资源超售（overcommit），在大多数 Pod 不同时达到峰值的情况下，可以提高集群的整体利用率。但内存的超售要谨慎，超出 limits 的内存访问会触发 OOM Kill，而 CPU 超出只是限速（throttling），两者代价差异很大。\n\n数据团队的配额应该更宽松，因为他们需要跑批处理作业，但同时要防止 Spark 作业把整个集群吃光：\n\n```yaml\n# team-data-quota.yaml\napiVersion: v1\nkind: ResourceQuota\nmetadata:\n  name: team-data-quota\n  namespace: team-data\nspec:\n  hard:\n    requests.cpu: \"20\"\n    limits.cpu: \"24\"\n    requests.memory: 80Gi\n    limits.memory: 96Gi\n    pods: \"100\"\n    services: \"10\"\n    persistentvolumeclaims: \"20\"\n    requests.storage: 500Gi\n```\n\n光有 ResourceQuota 还不够。如果数据团队的 Spark executor 容器没写 `resources.requests`，那它被创建时 ResourceQuota 计算的 `requests.cpu` 增量是 0——意味着配额看起来没用满，但节点已经跑满了。解决这个问题要靠 LimitRange：\n\n```yaml\n# team-data-limitrange.yaml\napiVersion: v1\nkind: LimitRange\nmetadata:\n  name: team-data-limitrange\n  namespace: team-data\nspec:\n  limits:\n    - type: Container\n      # 没写 limits 的容器，自动注入这个默认值\n      default:\n        cpu: \"2\"\n        memory: 4Gi\n      # 没写 requests 的容器，自动注入这个默认值\n      defaultRequest:\n        cpu: \"500m\"\n        memory: 1Gi\n      # 单个容器最多能申请的资源上限（防止单个容器独占）\n      max:\n        cpu: \"8\"\n        memory: 16Gi\n      # 单个容器最少必须申请的资源下限\n      min:\n        cpu: \"100m\"\n        memory: 128Mi\n    - type: Pod\n      # 单个 Pod（所有容器总和）的上限\n      max:\n        cpu: \"16\"\n        memory: 32Gi\n```\n\n有了 LimitRange 之后，Webhook 准入控制器会在 Pod 创建时自动注入缺失的 `requests` 和 `limits`。这样 ResourceQuota 的计算就真实了——每个 Pod 创建时都会消耗配额中对应的量。\n\n当你收到 `exceeded quota` 报错之后，第一步是用 `kubectl describe quota` 查看当前用量：\n\n```\n$ kubectl describe quota team-backend-quota -n team-backend\nName:                     team-backend-quota\nNamespace:                team-backend\nResource                  Used    Hard\n--------                  ----    ----\nlimits.cpu                14500m  16\nlimits.memory             28Gi    32Gi\npersistentvolumeclaims    7       10\npods                      47      50\nrequests.cpu              7800m   8\nrequests.memory           14Gi    16Gi\nrequests.storage          180Gi   200Gi\nservices                  12      20\n```\n\n这个输出一目了然：`requests.cpu` 已用 7800m，上限 8000m，差 200m，而新 Pod 请求 500m，所以被拒绝了。这时候有三个应对策略：短期可以临时扩大配额（`kubectl edit quota`），中期应该审查现有 Pod 的 requests 是否过于保守（很多历史 Deployment 把 requests 写死成 1000m 但实际 CPU 使用率只有 100m），长期要建立按团队申请配额的流程，避免配额成为开发的障碍。\n\n另一个常见的故障是 `exceeded quota: pods`，说明 Pod 数量达到了上限。这通常发生在 HPA（Horizontal Pod Autoscaler，水平自动扩缩容）设置了过大的 `maxReplicas`，或者某个 CronJob 在短时间内启动了大量实例。遇到这种情况，`kubectl get pods -n <ns> --sort-by=.metadata.creationTimestamp` 可以按创建时间排序，找出最近批量创建的 Pod 群。\n\n## 三、扩展：QoS 等级与驱逐优先级\n\n这套配额机制还和 K8s 的 **QoS（Quality of Service）** 类别深度关联，这是很多人忽视的一个点。K8s 根据容器的 requests 和 limits 设置，自动将每个 Pod 归入三个 QoS 类别：\n\n**Guaranteed** 是最高优先级，要求 Pod 内所有容器都设置了 requests 和 limits，且两者相等。这类 Pod 在节点内存紧张时最后被驱逐，适合数据库、核心 API 等不容中断的服务。\n\n**Burstable** 是中间档，Pod 内至少有一个容器设置了 requests 或 limits，但不满足 Guaranteed 的条件。大多数生产服务应该在这个档：requests 设置一个合理的基线，limits 设置稍高的上限，允许偶尔突发。\n\n**BestEffort** 是最低优先级，Pod 内所有容器都没有设置 requests 和 limits。这类 Pod 在节点资源不足时第一个被驱逐。这就是上个月 OOM 事故中，数据团队的 Pod 全死了的根本原因——它们都是 BestEffort，驱逐器优先清理它们。\n\n如果你的 LimitRange 正确配置了 `defaultRequest` 和 `default`，那么所有没写 resources 的容器会自动被注入这些值，从 BestEffort 升级为 Burstable，大幅提高了稳定性。\n\n在设计建议上，生产环境的多团队 K8s 集群通常按三个维度分 Namespace：按团队（team-backend/team-data）、按环境（dev/staging/prod）、或两者结合（team-backend-prod/team-backend-staging）。dev 和 staging 的配额可以设置得紧一些，保证资源主要留给 prod；prod 的 LimitRange 中 min 值应该设置得稍高，防止应用在资源不足的节点上勉强启动，提供虚假的成功假象。\n\n进阶方向上，**VPA（Vertical Pod Autoscaler）** 可以观察容器的历史资源用量，自动推荐合理的 requests/limits 值，解决手工拍脑袋写配置的问题。用 `kubectl top pod -n <ns>` 可以查看实时的实际资源使用量，配合 `kubectl describe quota` 可以评估配额设置是否合理。对于更复杂的多集群场景，**Hierarchical Namespace Controller**（层级 Namespace 控制器）允许创建父子 Namespace 树，资源配额可以在树状结构中级联分配；而 **Karmada** 和 **Admiral** 则是跨集群资源管理的方案，可以在多个物理集群上统一调度和限额工作负载。",
+      "keyPoints": [
+        "Namespace 是 K8s 多租户隔离的基本单元，ResourceQuota 和 LimitRange 都以 Namespace 为作用域，没有 Namespace 隔离就无法实现多团队资源隔离。",
+        "ResourceQuota 在 API Server 的准入控制阶段强制执行，限制 Namespace 内资源的总量，包括 requests.cpu/memory、limits.cpu/memory、pods、services、pvc 数量和存储总量。",
+        "LimitRange 为 Namespace 内的 Pod 和 Container 设置默认值（default/defaultRequest）及边界（min/max），防止没有写 resources 的容器以 BestEffort 方式运行，导致配额计算失真和驱逐风险。",
+        "ResourceQuota 中 requests 和 limits 是分开计算的，limits 通常设为 requests 的 2 倍允许资源超售，但内存超售风险远高于 CPU——超出内存 limits 触发 OOM Kill，超出 CPU limits 只是限速（throttling）。",
+        "遇到 `exceeded quota` 报错后，应立即用 `kubectl describe quota -n <namespace>` 查看 Used/Hard 对比，定位是 CPU、内存还是 Pod 数量触达了上限，再决定是临时扩配额、回收闲置资源还是优化 requests 设置。",
+        "K8s 根据 requests/limits 的设置自动为 Pod 分配 QoS 等级：Guaranteed（requests == limits）最后被驱逐，Burstable（部分设置）次之，BestEffort（均未设置）在节点资源不足时第一个被驱逐，这是不配置 LimitRange 时线上事故的常见根因。",
+        "VPA（Vertical Pod Autoscaler）可以根据历史用量自动推荐 requests/limits 值，配合 `kubectl top pod` 查看实际资源使用，帮助团队将配额从拍脑袋估算迭代为数据驱动的精准设置。"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-resource-quota-q1",
+          "question": "以下关于 ResourceQuota 和 LimitRange 的描述，哪个是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "ResourceQuota 限制 Namespace 内资源总量，LimitRange 限制单个 Pod/Container 的资源边界，两者互补"
+            },
+            {
+              "id": "B",
+              "text": "ResourceQuota 和 LimitRange 功能相同，只需要配置其中一个"
+            },
+            {
+              "id": "C",
+              "text": "LimitRange 只能作用于 Deployment，不能作用于裸 Pod"
+            },
+            {
+              "id": "D",
+              "text": "ResourceQuota 在 Kubelet 层面执行，LimitRange 在 API Server 层面执行"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "ResourceQuota 和 LimitRange 解决的是两个不同层面的问题，功能不可相互替代。ResourceQuota 是总量限制（团队层面的预算），LimitRange 是个体限制（容器层面的边界），两者都由 API Server 的准入控制器在请求创建资源时强制执行，而不是在 Kubelet 层面。B 选项是最常见的误解——只配 ResourceQuota 而不配 LimitRange，没有 requests 的 Pod 创建时配额消耗为 0，导致配额计算完全失真。C 选项错误，LimitRange 对任何创建 Pod 的方式都生效，包括 Deployment、StatefulSet、裸 Pod 和 Job。"
+        },
+        {
+          "id": "k8s-resource-quota-q2",
+          "question": "一个 Container 没有设置 `resources.requests`，而其所在 Namespace 配置了 LimitRange 且 `defaultRequest.cpu: 500m`。这个 Container 被创建后，ResourceQuota 中 `requests.cpu` 会消耗多少？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "0，因为用户没有显式声明 requests"
+            },
+            {
+              "id": "B",
+              "text": "500m，LimitRange 的 defaultRequest 会被自动注入到 Pod spec 中"
+            },
+            {
+              "id": "C",
+              "text": "取决于容器实际运行时的 CPU 使用量"
+            },
+            {
+              "id": "D",
+              "text": "等于 LimitRange 中 default.cpu 的值，而非 defaultRequest 的值"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "LimitRange 中的 `defaultRequest` 会在 Pod 准入阶段被注入到没有显式声明 requests 的 Container 中。这个注入发生在 API Server 准入控制的 MutatingAdmissionWebhook 阶段，Pod spec 被修改后，ResourceQuota 计算的就是注入后的值，所以会消耗 500m。A 选项是没有 LimitRange 时的行为，也是不配置 LimitRange 的危险之处。C 选项是错误的，ResourceQuota 跟踪的是 `spec.containers[].resources.requests` 的声明值，不是实际运行时的使用量。D 选项混淆了 `default`（注入 limits）和 `defaultRequest`（注入 requests）两个字段。"
+        },
+        {
+          "id": "k8s-resource-quota-q3",
+          "question": "kubectl describe quota 输出中，`requests.cpu` 显示 `Used: 7800m, Hard: 8000m`。现在一个新 Pod 请求 `requests.cpu: 500m`，会发生什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Pod 创建成功，因为 8000m - 7800m = 200m 仍有余量"
+            },
+            {
+              "id": "B",
+              "text": "Pod 被拒绝，因为新增 500m 后总量 8300m 超过了 Hard 限制 8000m"
+            },
+            {
+              "id": "C",
+              "text": "Pod 进入 Pending 状态，等到有其他 Pod 释放资源后自动重试"
+            },
+            {
+              "id": "D",
+              "text": "Pod 会被截断，requests.cpu 自动降至 200m 后创建成功"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ResourceQuota 是硬性限制，API Server 在准入阶段计算「当前已用 + 本次请求」是否超过 Hard 值。7800m + 500m = 8300m > 8000m，所以请求会被直接拒绝，并返回 `exceeded quota` 错误。这里要特别注意 C 和 A 两个选项的误区：C 选项的行为是 Node 资源不足时调度器的行为（Pod Pending 等待节点），不是 ResourceQuota 超限时的行为；ResourceQuota 超限会直接拒绝，不会 Pending 重试。D 选项纯属虚构，K8s 不会静默修改用户提交的资源声明（除非 LimitRange 注入默认值的场景）。"
+        },
+        {
+          "id": "k8s-resource-quota-q4",
+          "question": "以下哪种 Pod 会被 K8s 分类为 `Guaranteed` QoS 等级？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "所有容器都设置了 requests 和 limits，但 requests < limits"
+            },
+            {
+              "id": "B",
+              "text": "所有容器都设置了 requests 和 limits，且每个容器的 requests == limits"
+            },
+            {
+              "id": "C",
+              "text": "Pod 中至少有一个容器设置了 limits.memory"
+            },
+            {
+              "id": "D",
+              "text": "Pod 设置了 priorityClassName: system-cluster-critical"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "K8s 的 QoS 分类规则非常严格：Guaranteed 要求 Pod 内**所有**容器（包括 init containers）都同时设置了 cpu 和 memory 的 requests 与 limits，且每个容器的 requests 必须等于 limits。这确保了这个 Pod 使用的资源量是确定的，不会突发，节点压力大时调度器可以对它的资源承诺最有把握。A 选项是 Burstable 的典型配置（requests < limits 说明允许突发）。C 选项只设置了部分资源的 limits，属于 Burstable。D 选项的 priorityClassName 影响的是调度优先级和抢占行为，与 QoS 等级是完全独立的两套机制，不要混淆。"
+        },
+        {
+          "id": "k8s-resource-quota-q5",
+          "question": "以下是 `kubectl describe quota team-data-quota -n team-data` 的输出，你能从中判断出什么问题？\n\n```\nResource          Used      Hard\n--------          ----      ----\npods              98        100\nrequests.cpu      19500m    20\nrequests.memory   78Gi      80Gi\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "集群节点资源不足，需要扩容节点"
+            },
+            {
+              "id": "B",
+              "text": "数据团队配额即将用尽，新 Pod 如果请求超过剩余量将被拒绝，需要提前审查和规划"
+            },
+            {
+              "id": "C",
+              "text": "数据团队的 Pod 存在 BestEffort QoS 问题，需要修复"
+            },
+            {
+              "id": "D",
+              "text": "LimitRange 配置不正确，requests 和 limits 应该相等"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "从这个输出可以读出：pods 已用 98/100（剩余 2 个），requests.cpu 已用 19500m/20000m（剩余 500m），requests.memory 已用 78Gi/80Gi（剩余 2Gi）。这说明数据团队的配额处于临界状态，任何请求超过剩余量的新 Pod 都会被 ResourceQuota 直接拒绝。正确应对是：立即通知数据团队审查是否有可以清理的历史 Pod（完成的 Job、旧版本 Deployment 遗留的 ReplicaSet），同时评估是否需要扩大配额或迁移部分工作负载。A 选项是节点层面的问题（kubectl get nodes 看 Allocatable），与 ResourceQuota 的剩余量无关。C 和 D 选项从这个输出中无法推断，属于过度解读。"
+        },
+        {
+          "id": "k8s-resource-quota-q6",
+          "question": "在配置了 ResourceQuota 的 Namespace 中，某个容器没有设置 `resources.requests`，且 Namespace 内也没有配置 LimitRange。以下说法正确的是？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Pod 创建会被 ResourceQuota 拒绝，因为没有声明 requests"
+            },
+            {
+              "id": "B",
+              "text": "Pod 创建成功，该容器以 BestEffort QoS 运行，ResourceQuota 中 requests.cpu/memory 消耗为 0"
+            },
+            {
+              "id": "C",
+              "text": "Pod 创建成功，K8s 会自动将节点的可用资源均分给没有声明 requests 的容器"
+            },
+            {
+              "id": "D",
+              "text": "Pod 创建成功，ResourceQuota 会使用容器镜像的默认资源声明来计算配额消耗"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个经典的「配额空洞」问题。当 Namespace 配置了 ResourceQuota 但没有 LimitRange 时，没有声明 requests 的容器可以成功创建，但它的 QoS 等级会是 BestEffort，ResourceQuota 计算时 requests.cpu 和 requests.memory 消耗均为 0。这意味着：配额账面上有充裕空间，但节点实际资源可能已经被这些「幽灵」容器大量消耗，导致计划调度的容器反而因节点资源不足而 Pending，形成诡异的「配额没满但 Pod 调度失败」的现象。正确做法是同时配置 LimitRange 的 defaultRequest，确保所有容器都有基线资源声明，让配额计算反映真实的资源占用。"
+        },
+        {
+          "id": "k8s-resource-quota-q7",
+          "question": "以下关于内存 limits 超出（OOM Kill）和 CPU limits 超出（CPU Throttling）的对比，哪个描述最准确？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "两者都会导致 Pod 被驱逐，OOM Kill 更快，CPU Throttling 有延迟"
+            },
+            {
+              "id": "B",
+              "text": "超出内存 limits 的容器会被内核直接 OOM Kill（进程终止），而超出 CPU limits 的容器只是被限速（throttling），进程不会终止"
+            },
+            {
+              "id": "C",
+              "text": "两者行为相同，都是先限速再终止进程"
+            },
+            {
+              "id": "D",
+              "text": "超出内存 limits 会触发 K8s 驱逐机制，超出 CPU limits 会触发 OOM Kill"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是资源限制里最容易混淆的一个对比。内存是不可压缩资源（incompressible resource）：当容器尝试分配超过 limits.memory 的内存时，Linux 内核的 cgroup 会立即触发 OOM Kill，将容器内的进程杀死，容器随即重启（如果有重启策略）。CPU 是可压缩资源（compressible resource）：超出 limits.cpu 时，内核通过 CFS（Completely Fair Scheduler，完全公平调度器）的 CPU 配额机制对容器进行限速，进程继续运行但速度被压低，表现为响应变慢、延迟上升，而不是进程终止。这个区别直接影响配额设计决策：生产环境中内存超售要比 CPU 超售危险得多，前者会导致服务不可用，后者只是性能下降。"
+        },
+        {
+          "id": "k8s-resource-quota-q8",
+          "question": "生产环境中，后端团队反映部署新版本时偶尔出现 `exceeded quota: pods`，但 `kubectl get pods -n team-backend` 看到的 Pod 数量远低于配额上限。最可能的原因是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "ResourceQuota 统计有 bug，需要重启 kube-controller-manager"
+            },
+            {
+              "id": "B",
+              "text": "滚动更新过程中新旧 ReplicaSet 的 Pod 同时存在，瞬时 Pod 总数超过配额，稳定后恢复正常"
+            },
+            {
+              "id": "C",
+              "text": "kubectl get pods 默认不显示 Terminating 状态的 Pod，实际运行 Pod 数更多"
+            },
+            {
+              "id": "D",
+              "text": "namespace 中存在其他团队的 Pod 占用了配额"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Deployment 滚动更新（RollingUpdate）的工作原理是：先创建新版本的 ReplicaSet，逐步增加新版本 Pod 数量，同时逐步减少旧版本 Pod 数量。在更新的中间阶段，新旧 Pod 同时存在，Pod 总数会超过稳定状态的副本数。如果配额上限设置得刚刚好等于目标副本数，那么滚动更新的中间状态就会超限。解决方案是：将 pods 配额设置为目标副本数的 1.5-2 倍，或者使用 `maxSurge: 0` 的 RollingUpdate 策略（先删后建），但这会造成短暂的容量下降。C 选项也是真实的，Terminating 的 Pod 在完全删除之前仍然占用配额，但这通常是短暂现象而非根因。"
+        },
+        {
+          "id": "k8s-resource-quota-q9",
+          "question": "以下关于 VPA（Vertical Pod Autoscaler）与 ResourceQuota 配合使用的描述，哪个是正确的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "VPA 自动调高 requests/limits 时，如果超过 ResourceQuota 剩余量，Pod 会被 VPA 自动驱逐以释放配额空间"
+            },
+            {
+              "id": "B",
+              "text": "VPA 在 Auto 模式下调高 requests 时，如果新的 requests 超过 ResourceQuota 剩余量，Pod 重建会失败，VPA 的推荐值可以作为调整配额的依据"
+            },
+            {
+              "id": "C",
+              "text": "VPA 和 ResourceQuota 不兼容，开启 VPA 的 Namespace 不能设置 ResourceQuota"
+            },
+            {
+              "id": "D",
+              "text": "VPA 只提供建议，不会实际修改 Pod 的 requests/limits，需要手动应用"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "VPA 有三种模式：Off（只推荐不执行）、Initial（只在 Pod 创建时注入推荐值）和 Auto（持续推荐，并在需要时驱逐 Pod 使其以新的 requests 重建）。在 Auto 模式下，VPA 会驱逐并重建 Pod 以应用新的资源声明，如果重建时新的 requests 超过 ResourceQuota 剩余量，Pod 创建会失败（而非静默降低推荐值）。这意味着 VPA 和 ResourceQuota 需要联动管理：可以用 VPA 的 Recommendation 对象（kubectl get vpa -n <ns>）查看推荐值，将其作为调整 ResourceQuota 的数据依据。D 选项描述的是 Off 模式的行为，不是 VPA 的全部。A 选项描述的场景不正确，VPA 不会主动驱逐其他 Pod 来释放配额空间。"
+        },
+        {
+          "id": "k8s-resource-quota-q10",
+          "question": "你接到告警：`team-backend` namespace 有 Pod 频繁 OOM Kill 重启，但 `kubectl describe quota` 显示内存用量只有 Hard 值的 60%。以下排查思路正确的是？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "立即扩大 ResourceQuota 中的 limits.memory，因为现有配额不够用"
+            },
+            {
+              "id": "B",
+              "text": "查看频繁重启 Pod 的 limits.memory 设置是否远低于实际内存需求，OOM Kill 是容器级别的限制而非 Namespace 总量问题"
+            },
+            {
+              "id": "C",
+              "text": "检查 Namespace 的 LimitRange 是否设置了过高的 max.memory，导致 OOM"
+            },
+            {
+              "id": "D",
+              "text": "ResourceQuota 统计的是 requests 不是实际使用量，说明实际使用量已超配额，需要扩容节点"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "OOM Kill 是容器级别的事件：当某个容器的内存使用超过其自身的 `limits.memory` 时，Linux cgroup 会 OOM Kill 该容器的进程，与 Namespace 总量配额无关。ResourceQuota 中 `limits.memory` 显示 60% 说明 Namespace 总量有余量，但并不意味着每个具体容器的限制都是合理的。正确排查步骤：`kubectl get pod -n team-backend | grep OOMKilled` 找到问题 Pod，`kubectl describe pod <name>` 查看 Last State 中的 OOM 记录和该容器的 limits.memory，再用 `kubectl top pod <name> --containers` 查看实际内存用量，对比两者差距。如果实际用量接近或超过 limits，说明需要调高该容器的 limits.memory，而不是调整 ResourceQuota。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/policy/resource-quotas/",
+        "https://kubernetes.io/docs/concepts/policy/limit-range/",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/quality-service-pod/",
+        "https://kubernetes.io/docs/concepts/workloads/autoscaling/#vertical-pod-autoscaler"
+      ]
+    }
+  ]
+}

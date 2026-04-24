@@ -1,0 +1,159 @@
+{
+  "id": "k8s-node-notready",
+  "name": "K8s Node NotReady 排查",
+  "domain": "troubleshooting",
+  "description": "系统排查 Kubernetes 节点变为 NotReady 状态的原因与恢复流程",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-node-notready-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["kubernetes", "node", "kubelet", "notready", "eviction", "taint"],
+      "title": "K8s Node 变成 NotReady 状态，如何系统排查和恢复？",
+      "content": "凌晨两点，你的手机 PagerDuty 报警响了。告警内容是：生产集群中 `k8s-worker-03` 节点突然变成了 `NotReady` 状态，节点上运行的 12 个 Pod 开始被 Kubernetes 驱逐，并陆续在其他节点上重新调度。与此同时，Grafana 上显示整个集群的可用节点从 5 个变成了 4 个，部分服务的副本数短时间内低于最小值，健康检查出现失败。\n\n你打开 kubectl，第一条命令是：\n\n```bash\nkubectl get nodes\n```\n\n输出是：\n\n```\nNAME              STATUS     ROLES    AGE    VERSION\nk8s-master-01     Ready      master   120d   v1.27.3\nk8s-worker-01     Ready      <none>   120d   v1.27.3\nk8s-worker-02     Ready      <none>   120d   v1.27.3\nk8s-worker-03     NotReady   <none>   120d   v1.27.3\nk8s-worker-04     Ready      <none>   120d   v1.27.3\n```\n\n`k8s-worker-03` 状态确实异常。你知道不能只看表象就盲目重启节点，因为不同根因的处理方式完全不同：如果是 kubelet 进程崩溃，重启服务就好；如果是磁盘写满，贸然重启会让节点一直 NotReady；如果是网络分区，节点本身还活着，上面的 Pod 可能还在正常运行，这时候重启会造成双写。\n\n这道题考的就是：你对 Kubernetes 节点健康检测机制的理解有多深，你的排查路径是否有系统性，你能不能在压力下快速定位根因并给出正确的恢复方案。",
+      "answer": "## 一、理解 Node 状态机制：问题是怎么被发现的\n\nKubernetes 判断一个节点是否健康，依赖的是 kubelet 的心跳上报机制。kubelet 默认每隔 10 秒（`nodeStatusUpdateFrequency` 参数控制）向 API Server 上报一次心跳，这个心跳会更新对应 Node 对象的 `status.conditions` 字段以及 `status.nodeInfo`。API Server 本身不主动探活节点，它只是被动接收 kubelet 推来的数据。\n\n真正负责监控节点心跳并做出判断的是 controller-manager 中的 `NodeLifecycleController`。这个控制器维护着一个针对每个节点的计时器，如果超过 `node-monitor-grace-period`（默认 40 秒）没有收到心跳，就会把该节点的 `Ready` Condition 改为 `Unknown`，再继续超时则改为 `False`（即 NotReady）。注意这里有个常见误区：很多人以为是 API Server 直接把节点标记为 NotReady，其实不是，标记动作是 controller-manager 做的，API Server 只是存储状态。\n\n节点变成 NotReady 之后，驱逐逻辑随之触发。kubelet 自身的驱逐是基于资源压力（内存、磁盘）的；而节点不可用时触发的 Pod 驱逐，是由 controller-manager 的 `pod-eviction-timeout`（Kubernetes 1.24+ 已被 `--default-not-ready-toleration-seconds` 替代，默认 300 秒即 5 分钟）控制的。也就是说，节点 NotReady 之后，Pod 并不会立刻被驱逐，而是等待 5 分钟，给节点自愈的机会，之后才开始驱逐并在其他节点重新调度。\n\n理解了这个时间线，就能解释为什么你在节点刚变 NotReady 时看到 Pod 还在 Terminating 状态：Kubernetes 在等，它不确定节点是真挂了还是只是心跳短暂中断。\n\n## 二、排查步骤：从外到内，系统定位根因\n\n### 第一步：kubectl describe node，看全量状态\n\n第一步永远是 `kubectl describe node k8s-worker-03`，重点看 `Conditions` 部分：\n\n```\nConditions:\n  Type                 Status    LastHeartbeatTime              LastTransitionTime             Reason                       Message\n  ----                 ------    -----------------              ------------------             ------                       -------\n  MemoryPressure       False     Thu, 20 Jun 2024 02:03:11 +08  Thu, 20 Jun 2024 01:00:00 +08  KubeletHasSufficientMemory   kubelet has sufficient memory available\n  DiskPressure         True      Thu, 20 Jun 2024 02:03:11 +08  Thu, 20 Jun 2024 01:58:42 +08  KubeletHasDiskPressure       kubelet has disk pressure\n  PIDPressure          False     Thu, 20 Jun 2024 02:03:11 +08  Thu, 20 Jun 2024 01:00:00 +08  KubeletHasSufficientPID      kubelet has sufficient PID available\n  Ready                False     Thu, 20 Jun 2024 02:03:11 +08  Thu, 20 Jun 2024 01:59:01 +08  KubeletNotReady              PLEG is not healthy: pleg was last seen active 3m45s ago; threshold is 3m0s\n```\n\n这里的四个 Condition 是排查的核心线索。`MemoryPressure: True` 说明节点内存不足，kubelet 开始驱逐 Pod；`DiskPressure: True` 说明磁盘空间或 inode 不足；`PIDPressure: True` 说明进程数超限；`Ready: False` 且 Reason 是 `KubeletNotReady` 表示 kubelet 虽然还在运行，但内部出现了故障，比如上面的 `PLEG is not healthy`（PLEG 是 Pod Lifecycle Event Generator，它轮询容器运行时来感知容器状态变化，如果容器运行时卡住，PLEG 就会超时）。如果 `Ready` 的 Reason 是 `NodeStatusUnknown`，则通常意味着 kubelet 进程本身已经死掉，或者节点发生了网络分区。\n\n同时看 `Events` 部分，会有更具体的错误信息，比如 `Failed to update node status` 或者 `Evicting pod due to node pressure`。\n\n### 第二步：SSH 到节点，检查 kubelet 进程\n\n确认节点本身还能 SSH 进去是关键的一步，它直接区分了两大类故障：节点操作系统层面的问题 vs Kubernetes 组件层面的问题。\n\n```bash\n# 检查 kubelet 服务状态\nsystemctl status kubelet\n\n# 如果 kubelet 状态是 failed 或 inactive\njournalctl -u kubelet -n 100 --no-pager\n\n# 检查容器运行时状态（containerd 为例）\nsystemctl status containerd\ncrictl info\n\n# 检查系统资源\ndf -h          # 磁盘空间\ndf -i          # inode 使用情况（磁盘满的另一种方式）\nfree -m        # 内存\ntop -bn1       # CPU 和进程\ndmesg | tail -50  # 内核日志，看是否有 OOM Kill 或硬件错误\n```\n\n根据这一步的结果，通常可以定位到以下几类根因：\n\n**kubelet 进程崩溃**：`systemctl status kubelet` 显示 `failed`，`journalctl` 里有 panic 日志或者 `signal: killed`。处理方式是 `systemctl restart kubelet`，然后观察节点是否重新变为 Ready。如果 kubelet 反复崩溃，要看是否是证书问题（kubelet 启动时会打印 `x509: certificate has expired or is not yet valid`）。\n\n**磁盘压力**：`df -h` 显示某个挂载点（通常是 `/var/lib/kubelet` 或 `/var/lib/containerd`）使用率超过 85%（kubelet 的 `eviction-hard` 默认阈值是 `imagefs.available<15%`，`nodefs.available<10%`）。常见原因是容器日志没有轮转、镜像堆积、或者某个 Pod 写了大量数据到 emptyDir。处理方式是 `crictl rmi --prune`（清理未使用的镜像），或者手动清理大文件，之后 kubelet 会自动解除 DiskPressure。\n\n**内存压力**：`free -m` 显示可用内存极低，`dmesg` 中有 `oom-kill` 记录，说明内核已经开始 OOM Kill 进程。如果 kubelet 本身被 OOM Kill 了，节点会变 NotReady。查看 `dmesg | grep -i oom` 确认哪个进程被杀。\n\n**网络分区**：最棘手的情况。节点 SSH 可达，kubelet 运行正常，`journalctl` 里显示 `Failed to connect to API Server`。这时候节点上的 Pod 其实还在正常运行，但 Kubernetes 控制面已经认为这个节点失联了。要检查网络路由、防火墙规则（`iptables -L -n`）、以及 API Server 的证书是否对节点 IP 有效。\n\n**证书过期**：kubelet 日志里有 `x509: certificate has expired`。通过 `openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem -noout -dates` 可以确认证书有效期。kubeadm 管理的集群证书默认 1 年有效，`kubeadm certs renew all` 可以手动续期。\n\n**容器运行时故障**：`crictl info` 超时或报错，`systemctl status containerd` 显示异常。重启 containerd 之后 PLEG 会恢复，节点重新变为 Ready。但要注意：重启 containerd 会导致节点上所有容器短暂停止，业务会有抖动。\n\n## 三、扩展：污点、驱逐容忍与节点自愈\n\n节点变为 NotReady 的同时，Kubernetes 会自动给节点添加两个污点（taint）：`node.kubernetes.io/not-ready:NoSchedule` 阻止新 Pod 调度到该节点，`node.kubernetes.io/not-ready:NoExecute` 触发已有 Pod 的驱逐。这个污点自动添加是在 Kubernetes 1.8 之后引入的，在此之前靠的是 `TaintBasedEvictions` feature gate 控制。\n\n驱逐的等待时间由 Pod 上的 `tolerationSeconds` 控制。系统 Pod（如 DaemonSet 管理的）默认有 `tolerationSeconds: 300` 的容忍，意味着节点 NotReady 后 5 分钟才被驱逐。你可以在业务 Pod 上设置更短的值来加快故障转移：\n\n```yaml\ntolerations:\n- key: node.kubernetes.io/not-ready\n  operator: Exists\n  effect: NoExecute\n  tolerationSeconds: 60  # 节点 NotReady 后 60 秒就驱逐，而不是默认的 300 秒\n```\n\n在节点自愈层面，生产环境推荐部署 **Node Problem Detector（NPD）**。NPD 是一个 DaemonSet，它运行在每个节点上，监控内核日志、系统日志等，能感知到更细粒度的问题（比如 OOM、网卡丢包、磁盘 IO 错误）并通过 Node Condition 或 Event 上报到 Kubernetes。配合 **cluster-autoscaler** 的 `--balance-similar-node-groups` 和节点健康检查，可以实现问题节点的自动终止和替换。在云环境（如 AWS EKS）中，Node Auto Repair 功能会在节点持续 NotReady 后自动触发实例替换，无需人工干预。\n\n最后说一个高频面试追问：节点恢复 Ready 后，被驱逐的 Pod 会自动迁回吗？答案是不会。Kubernetes 的调度器是单向的，Pod 一旦被调度到某个节点就会待在那里，直到有原因迫使它移动（比如 Pod 被删除重建、Descheduler 介入）。如果你想让 Pod 在节点恢复后均衡分布，需要额外部署 `descheduler` 这个工具。",
+      "keyPoints": [
+        "kubelet 默认每 10 秒上报一次心跳，controller-manager 的 NodeLifecycleController 在 40 秒（node-monitor-grace-period）没收到心跳后将节点标记为 NotReady，而不是由 API Server 直接标记。",
+        "节点 NotReady 后 Pod 不会立即被驱逐，而是等待 tolerationSeconds（默认 300 秒）后才触发驱逐，Kubernetes 在等待节点自愈的机会。",
+        "kubectl describe node 的 Conditions 字段是排查的第一手线索，MemoryPressure/DiskPressure/PIDPressure/Ready 四个 Condition 各对应一类根因，Reason 和 Message 字段会给出更具体的错误描述。",
+        "磁盘压力导致的 NotReady 有两种形式：磁盘空间不足（df -h 可见）和 inode 耗尽（df -i 可见），两者症状相同但处理方式不同，inode 耗尽时即使有空间也无法创建新文件。",
+        "网络分区场景最危险：节点本身和 Pod 还在运行，但控制面认为节点失联并触发驱逐，可能造成同一个服务在新旧节点各有一份副本在运行，出现双写或脑裂。",
+        "节点变为 NotReady 时 Kubernetes 会自动添加 node.kubernetes.io/not-ready:NoExecute 污点，业务 Pod 可以通过设置较短的 tolerationSeconds 来加快故障转移速度，减少服务不可用时间。",
+        "kubeadm 管理的集群证书默认 1 年有效期，证书过期会导致 kubelet 无法连接 API Server 进而使节点 NotReady，通过 kubeadm certs renew all 可以手动续期，生产环境应配置证书到期告警。",
+        "节点恢复 Ready 后被驱逐的 Pod 不会自动迁回原节点，若需要均衡 Pod 分布需要额外部署 descheduler 工具。"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-node-notready-q1",
+          "question": "在 Kubernetes 中，负责将节点标记为 NotReady 状态的组件是哪个？",
+          "choices": [
+            { "id": "A", "text": "kube-apiserver，它检测到节点心跳超时后主动修改 Node 对象状态" },
+            { "id": "B", "text": "kube-controller-manager 中的 NodeLifecycleController，在心跳超时后更新节点 Condition" },
+            { "id": "C", "text": "kube-scheduler，它发现节点不可用后将其从调度列表移除并标记状态" },
+            { "id": "D", "text": "kubelet 自身检测到异常后向 API Server 上报 NotReady 状态" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个非常常见的误解。kube-apiserver 本身是无状态的存储和请求处理层，它不会主动探活任何节点，只负责接收和存储数据。真正负责监控节点心跳并做出健康判断的是 kube-controller-manager 里的 NodeLifecycleController。它为每个节点维护一个计时器，超过 node-monitor-grace-period（默认 40s）没有收到 kubelet 心跳，就会将节点的 Ready Condition 改为 False 或 Unknown。kubelet 会上报自己的状态，但如果 kubelet 进程死掉了，就不会有上报，这正是 controller-manager 需要主动监控的原因。kube-scheduler 只负责 Pod 调度决策，不参与节点状态管理。"
+        },
+        {
+          "id": "k8s-node-notready-q2",
+          "question": "kubelet 的默认心跳上报频率（nodeStatusUpdateFrequency）是多少？",
+          "choices": [
+            { "id": "A", "text": "每 1 秒上报一次" },
+            { "id": "B", "text": "每 5 秒上报一次" },
+            { "id": "C", "text": "每 10 秒上报一次" },
+            { "id": "D", "text": "每 30 秒上报一次" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "kubelet 的 nodeStatusUpdateFrequency 默认值是 10 秒，这意味着正常情况下 API Server 每 10 秒会收到一次来自每个节点的状态更新。controller-manager 的 node-monitor-grace-period 默认是 40 秒，也就是说允许最多 4 次心跳丢失后才开始认为节点异常。这个设计是有意的容错窗口，避免因为短暂的网络抖动就错误标记节点为 NotReady。如果你的集群节点数很多（比如几千个节点），可能需要适当调大这个间隔来减少 API Server 的写入压力，但同时也要相应调大 grace period 以保持容错窗口不变。"
+        },
+        {
+          "id": "k8s-node-notready-q3",
+          "question": "节点变为 NotReady 后，该节点上的 Pod 默认等待多长时间后才会被驱逐？",
+          "choices": [
+            { "id": "A", "text": "立即驱逐，不等待" },
+            { "id": "B", "text": "等待 40 秒（与 node-monitor-grace-period 一致）" },
+            { "id": "C", "text": "等待 5 分钟（300 秒）" },
+            { "id": "D", "text": "等待 10 分钟，给节点充足的自愈时间" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "默认情况下，Pod 对 node.kubernetes.io/not-ready:NoExecute 污点的容忍时间（tolerationSeconds）是 300 秒，即 5 分钟。这个设计背后的逻辑是：节点可能只是短暂的网络抖动或者负载高峰，给 5 分钟的窗口让其自愈，避免因为短暂故障就触发大规模 Pod 迁移带来的不必要开销。如果你的业务对可用性要求很高、希望故障转移更快，可以在 Pod spec 的 tolerations 中将 tolerationSeconds 设为更小的值（如 30 或 60 秒）。注意 DaemonSet 管理的 Pod 由于需要在特定节点运行，其处理逻辑不同。"
+        },
+        {
+          "id": "k8s-node-notready-q4",
+          "question": "执行 kubectl describe node 后，发现节点的 Conditions 中 DiskPressure 为 True，以下哪个命令最适合快速确认是磁盘空间不足还是 inode 耗尽？",
+          "choices": [
+            { "id": "A", "text": "ls -la /var/lib/kubelet 查看目录大小" },
+            { "id": "B", "text": "分别执行 df -h 和 df -i，前者看空间占用，后者看 inode 占用" },
+            { "id": "C", "text": "du -sh /* 递归统计所有目录的大小" },
+            { "id": "D", "text": "kubectl top node 查看节点资源使用情况" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "磁盘压力有两种截然不同的表现形式：磁盘块空间耗尽和 inode 耗尽。df -h 显示的是磁盘块空间（以 GB 为单位），df -i 显示的是 inode 使用情况（每个文件系统创建时 inode 数量固定）。inode 耗尽时 df -h 可能显示还有大量可用空间，但你无法创建任何新文件，这种情况非常容易被忽略。inode 耗尽的常见原因是大量小文件（比如 Node.js 应用的 node_modules，或者日志切割产生的大量小日志文件）。kubectl top node 看的是 CPU 和内存，与磁盘无关。du -sh 很慢，不适合快速定位。"
+        },
+        {
+          "id": "k8s-node-notready-q5",
+          "question": "以下是一段 kubectl describe node 输出中的 Conditions 部分，根据这段输出最可能的根因是什么？\n\n```\nReady   False   02:15:33   01:59:01   KubeletNotReady   PLEG is not healthy: pleg was last seen active 4m12s ago; threshold is 3m0s\n```",
+          "choices": [
+            { "id": "A", "text": "kubelet 进程已经崩溃退出，需要 systemctl restart kubelet" },
+            { "id": "B", "text": "节点发生了网络分区，kubelet 无法连接到 API Server" },
+            { "id": "C", "text": "容器运行时（containerd/docker）出现故障，导致 PLEG 无法轮询容器状态" },
+            { "id": "D", "text": "节点内存不足触发了 OOM，kubelet 进入保护状态" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "PLEG（Pod Lifecycle Event Generator）是 kubelet 内部的一个组件，它通过定期调用容器运行时的 API（如 containerd 的 gRPC 接口）来获取容器状态变化。如果容器运行时卡死或响应极慢，PLEG 的轮询就会超时，超过 3 分钟阈值后 kubelet 就会将自己标记为 not healthy。注意关键点：kubelet 进程本身还在运行（否则 Reason 会是 NodeStatusUnknown 而不是 KubeletNotReady），它能够上报状态，只是内部的 PLEG 循环卡住了。排查方向是检查 containerd 或 docker 的状态（systemctl status containerd），重启容器运行时通常能解决这个问题，但会导致节点上的容器短暂停止。"
+        },
+        {
+          "id": "k8s-node-notready-q6",
+          "question": "节点 NotReady 且 kubectl describe node 显示 Ready Condition 的 Reason 是 NodeStatusUnknown，以下哪个说法最准确？",
+          "choices": [
+            { "id": "A", "text": "节点上的所有 Pod 已经停止运行，可以安全地在其他节点重新调度" },
+            { "id": "B", "text": "controller-manager 超过 grace period 没有收到心跳，节点可能存活也可能已宕机，直接驱逐可能导致双写" },
+            { "id": "C", "text": "这是正常的过渡状态，等待 10 秒后会自动变为 Ready 或 NotReady" },
+            { "id": "D", "text": "kubelet 上报了异常状态，节点肯定已经完全不可用" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "NodeStatusUnknown 是 controller-manager 在超过 node-monitor-grace-period 后、尚未确认节点真实状态时设置的值。它的含义是「我不知道这个节点现在是什么状态」，而不是「节点已宕机」。这个场景最危险：如果节点其实还活着（只是网络分区导致心跳中断），节点上的 Pod 依然在运行。此时如果 Kubernetes 驱逐并在其他节点重新调度这些 Pod，就会出现同一个 Pod 的两个实例同时运行的情况，对于有状态服务（比如数据库、消息队列）可能造成数据损坏。生产环境在处理 Unknown 状态节点时，应该先通过 SSH 或云平台控制台确认节点实际状态，再决定是否强制驱逐。"
+        },
+        {
+          "id": "k8s-node-notready-q7",
+          "question": "在 Kubernetes 1.27 集群中，节点变为 NotReady 时会自动添加哪些污点？",
+          "choices": [
+            { "id": "A", "text": "只添加 node.kubernetes.io/not-ready:NoSchedule，阻止新 Pod 调度" },
+            { "id": "B", "text": "node.kubernetes.io/not-ready:NoSchedule 和 node.kubernetes.io/not-ready:NoExecute 两个污点" },
+            { "id": "C", "text": "node.kubernetes.io/unreachable:NoSchedule 和 node.kubernetes.io/not-ready:NoExecute" },
+            { "id": "D", "text": "需要手动执行 kubectl taint node 命令添加污点，Kubernetes 不会自动添加" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kubernetes 1.8 引入了基于污点的驱逐机制（TaintBasedEvictions），在节点变为 NotReady 时，NodeLifecycleController 会自动添加两个污点：node.kubernetes.io/not-ready:NoSchedule 阻止新 Pod 调度到该节点，node.kubernetes.io/not-ready:NoExecute 触发已有 Pod 的驱逐（受 tolerationSeconds 控制）。另外，如果节点变为 Unknown 状态（心跳完全丢失），添加的是 node.kubernetes.io/unreachable 系列污点，而不是 not-ready。区分这两个污点很重要，因为它们对应的根因不同：not-ready 通常是 kubelet 或容器运行时问题，unreachable 通常是网络分区或节点宕机。"
+        },
+        {
+          "id": "k8s-node-notready-q8",
+          "question": "生产环境中，kubeadm 管理的 Kubernetes 集群证书默认有效期是多久？kubelet 客户端证书过期后会有什么现象？",
+          "choices": [
+            { "id": "A", "text": "证书默认 10 年有效，几乎不需要关注证书过期问题" },
+            { "id": "B", "text": "证书默认 1 年有效，过期后 kubelet 日志出现 x509 错误，节点变为 NotReady" },
+            { "id": "C", "text": "证书默认 90 天有效，Kubernetes 会自动轮转证书无需人工干预" },
+            { "id": "D", "text": "证书默认 2 年有效，过期后节点会自动请求新证书并重启 kubelet" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "kubeadm 创建的集群，CA 证书有效期是 10 年，但 API Server、controller-manager、scheduler 等组件证书以及 kubelet 客户端证书默认只有 1 年有效期。证书过期后，kubelet 在启动时会尝试用过期证书连接 API Server，得到 TLS 握手失败，journalctl -u kubelet 里会出现类似 x509: certificate has expired or is not yet valid 的错误，节点心跳停止，最终变为 NotReady。处理方式是执行 kubeadm certs renew all 然后重启相关组件。生产环境最佳实践是配置证书到期前 30 天的告警，或者启用 kubelet 的证书自动轮转（--rotate-certificates 参数），避免凌晨报警处理证书问题。"
+        },
+        {
+          "id": "k8s-node-notready-q9",
+          "question": "节点恢复 Ready 状态后，之前被驱逐并重新调度到其他节点的 Pod 会发生什么？",
+          "choices": [
+            { "id": "A", "text": "Kubernetes 会自动将 Pod 迁回原节点，保持原有的调度分布" },
+            { "id": "B", "text": "Pod 不会自动迁回，会继续在新节点运行，需要 descheduler 等工具才能重新均衡分布" },
+            { "id": "C", "text": "Pod 会在原节点和新节点各保留一个副本，直到手动删除其中一个" },
+            { "id": "D", "text": "Deployment 控制器会检测到不均衡，自动删除新节点的 Pod 并在原节点重建" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kubernetes 调度器遵循「只在 Pod 创建时调度」的原则，一旦 Pod 被调度到某个节点并运行起来，调度器就不再管它，除非 Pod 因为某种原因被删除需要重建。因此节点恢复后，已经在新节点跑起来的 Pod 不会自动迁回。从集群资源利用率的角度，这可能导致工作负载分布不均衡，原来的故障节点恢复后可能长时间闲置。要解决这个问题，可以部署 descheduler（一个 Kubernetes 社区维护的工具），它会定期检查 Pod 分布是否符合调度策略，对不满足条件的 Pod 触发驱逐，让调度器重新分配。这是生产环境提高资源利用率的常见手段。"
+        },
+        {
+          "id": "k8s-node-notready-q10",
+          "question": "想让业务 Pod 在节点 NotReady 后 30 秒就被驱逐迁移，而不是默认的 5 分钟，应该如何配置？",
+          "choices": [
+            { "id": "A", "text": "修改 kube-controller-manager 的 --pod-eviction-timeout 参数为 30s" },
+            { "id": "B", "text": "在 Pod spec 的 tolerations 中为 node.kubernetes.io/not-ready:NoExecute 设置 tolerationSeconds: 30" },
+            { "id": "C", "text": "在 Node 对象上添加 annotation kubernetes.io/eviction-timeout: 30s" },
+            { "id": "D", "text": "修改 kubelet 的 --eviction-hard 参数来调整驱逐超时时间" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "控制 Pod 在节点 NotReady 后等待多久被驱逐的机制是 Pod 上的 toleration。节点 NotReady 时会自动添加 node.kubernetes.io/not-ready:NoExecute 污点，Pod 上针对这个污点的 tolerationSeconds 决定了等待时间。在 Pod spec 里这样配置：tolerations: [{key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 30}]。值得注意的是：--pod-eviction-timeout 这个 controller-manager 参数在较新版本的 Kubernetes 中已经废弃，推荐方式就是通过 toleration 在 Pod 级别控制；而 --eviction-hard 是 kubelet 的资源压力驱逐阈值，与节点健康状态驱逐是完全不同的两个机制。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/architecture/nodes/",
+        "https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/",
+        "https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-certs/",
+        "https://kubernetes.io/docs/tasks/debug/debug-cluster/",
+        "https://github.com/kubernetes-sigs/descheduler"
+      ]
+    }
+  ]
+}

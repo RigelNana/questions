@@ -1,0 +1,156 @@
+{
+  "id": "k8s-persistent-volume",
+  "name": "K8s PersistentVolume 挂载失败排查",
+  "domain": "troubleshooting",
+  "description": "排查 Kubernetes 有状态应用 Volume 挂载失败的完整方法与常见陷阱",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-persistent-volume-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["kubernetes", "pv", "pvc", "csi", "statefulset", "storage"],
+      "title": "K8s StatefulSet Pod 卡在 ContainerCreating 因为 Volume 挂载失败，如何排查？",
+      "content": "## 故障现场\n\n凌晨三点，告警群里突然炸了。你们的用户行为分析服务（一个基于 StatefulSet 管理的 ClickHouse 集群，3 副本）在滚动更新后，`clickhouse-1` 这个 Pod 一直卡在 `ContainerCreating`，已经超过 15 分钟了。同样的镜像，`clickhouse-0` 和 `clickhouse-2` 都正常启动，唯独这个 Pod 卡住了。\n\n你赶紧跑 `kubectl describe pod clickhouse-1 -n data` 看了一眼 Events，输出如下：\n\n```\nName:         clickhouse-1\nNamespace:    data\nNode:         k8s-node-03/10.0.1.13\nStatus:       Pending\n...\nConditions:\n  Type              Status\n  Initialized       True\n  Ready             False\n  ContainersReady   False\n  PodScheduled      True\n\nEvents:\n  Type     Reason                  Age                From                     Message\n  ----     ------                  ----               ----                      -------\n  Normal   Scheduled               16m                default-scheduler         Successfully assigned data/clickhouse-1 to k8s-node-03\n  Warning  FailedAttachVolume      15m                attachdetach-controller   Multi-Attach error for volume \"pvc-a3f8b21c-...\" Volume is already exclusively attached to one node and can't be attached to another\n  Warning  FailedMount             13m                kubelet                   Unable to attach or mount volumes: unmounted volumes=[data], unattached volumes=[data kube-api-access-xxxxx]: timed out waiting for the condition\n  Warning  FailedMount             11m                kubelet                   MountVolume.SetUp failed for volume \"pvc-a3f8b21c-...\" : rpc error: code = Internal desc = VolumeID not found\n```\n\n看到 `Multi-Attach error` 和 `FailedMount`，你意识到问题跟 PVC 挂载有关，但具体是哪个环节出了问题、该怎么修，你有清晰的排查思路吗？\n\n请描述你的排查步骤、可能的根因，以及对应的修复方法。",
+      "answer": "## 第一步：先搞清楚 K8s 存储系统的三层抽象\n\n在开始排查之前，必须先把 Kubernetes 存储的核心概念捋清楚，否则看到报错你只会懵。K8s 的存储体系由三个层次组成：PersistentVolume（PV）、PersistentVolumeClaim（PVC）和 StorageClass。\n\nPV 是集群级别的存储资源，代表一块实际存在的存储介质，可以是云盘（AWS EBS、GCP PD、阿里云盘）、NFS 服务器上的一个目录、或者 Ceph RBD 块设备。PV 是管理员预先创建的，或者由 StorageClass 动态创建的。PVC 则是命名空间级别的「存储使用申请」，Pod 不直接使用 PV，而是通过 PVC 来声明「我要一块 10Gi 的 ReadWriteOnce 存储」，K8s 的控制器会负责把这个申请和合适的 PV 绑定起来。StorageClass 定义了存储的「配置模板」，包括用哪个 CSI 驱动、IOPS 是多少、是否支持动态供给。\n\n理解这三层之后，我们再说 PVC 和 PV 的绑定过程。静态供给（Static Provisioning）是管理员手动创建 PV，PVC 创建后由 kube-controller-manager 中的 PersistentVolumeController 来做匹配——它会扫描所有 Available 状态的 PV，找到容量不小于 PVC 请求量、访问模式兼容的 PV，然后双向绑定。动态供给（Dynamic Provisioning）则是 PVC 创建后由 StorageClass 关联的 external-provisioner 自动调用底层存储 API 创建一块新盘，再创建 PV 并绑定，整个过程无需手动干预。生产环境大多数有状态服务走的是动态供给。\n\n然后是 CSI（Container Storage Interface），这是 K8s 1.13 之后存储插件的标准接口。CSI 架构把存储操作分成两类组件：Controller Plugin 负责 Provision（创建盘）和 Attach（把盘挂到节点）；Node Plugin 负责 Mount（把块设备挂载到 Pod 的目录）。这两者分别运行在不同的地方——Controller Plugin 通常以 Deployment 形式跑，Node Plugin 以 DaemonSet 形式在每个节点上跑。这个分离架构对排查非常关键，因为 Attach 失败和 Mount 失败是两个完全不同的问题路径。\n\n最后是 Volume 的完整挂载生命周期，分五个阶段：**Provision**（创建底层存储资源）→ **Attach**（将存储设备挂接到 Pod 所在节点，类似于把硬盘插到服务器的 SATA 口）→ **Mount**（在节点上格式化并 mount 到 Pod 的 volume 目录，类似于 `mount /dev/sdb1 /mnt/data`）→ **Use**（Pod 内容器正常读写）→ **Unmount** → **Detach**。Pod 卡在 ContainerCreating，说明 Attach 或 Mount 阶段出了问题。\n\n## 第二步：按照报错信息系统化排查\n\n### 先看 PVC 状态\n\n回到案例中的报错，第一条 `Multi-Attach error` 是关键线索，但在分析根因之前，先跑一下 `kubectl describe pvc data-clickhouse-1 -n data` 看 PVC 当前状态：\n\n```\nName:          data-clickhouse-1\nNamespace:     data\nStorageClass:  premium-rwo\nStatus:        Bound\nVolume:        pvc-a3f8b21c-4d7e-4b9f-8c3a-1e2f3d4a5b6c\nLabels:        app=clickhouse\nAccessModes:   [ReadWriteOnce]\nVolumeMode:    Filesystem\nCapacity:      100Gi\nEvents:\n  Type    Reason                 Age   From                         Message\n  ----    ------                 ----  ----                         -------\n  Normal  WaitForFirstConsumer   18m   persistentvolume-controller  waiting for first consumer to be created before binding\n  Normal  Provisioning           17m   ebs.csi.aws.com              External provisioner is provisioning volume for claim ...\n  Normal  ProvisioningSucceeded  16m   ebs.csi.aws.com              Successfully provisioned volume pvc-a3f8b21c-...\n```\n\nPVC 是 Bound 状态，说明 PV 已经创建并绑定好了，Provision 阶段没问题。AccessModes 是 `ReadWriteOnce`——这是关键。RWO（ReadWriteOnce）意味着这块盘同一时刻只能被挂载到**一个节点**上。\n\n再看 `kubectl describe pv pvc-a3f8b21c-... ` 的输出：\n\n```\nName:            pvc-a3f8b21c-4d7e-4b9f-8c3a-1e2f3d4a5b6c\nStorageClass:    premium-rwo\nStatus:          Bound\nClaim:           data/data-clickhouse-1\nReclaim Policy:  Delete\nAccess Modes:    RWO\nVolumeMode:      Filesystem\nNode Affinity:\n  Required Terms:\n    Term 0:  topology.kubernetes.io/zone in [ap-east-1a]\nMessage:\nSource:\n    Type:       CSI (a Container Storage Interface (CSI) volume source)\n    Driver:     ebs.csi.aws.com\n    VolumeHandle:  vol-0a1b2c3d4e5f67890\nMountOptions: <none>\n```\n\nPV 里有一个 Node Affinity，限制了只能在 `ap-east-1a` 可用区使用。\n\n### 定位根因\n\n现在把线索拼在一起：`clickhouse-1` 这次调度到了 `k8s-node-03`，而报错说「volume 已经 exclusively attached 到另一个节点，无法 attach 到新节点」。这意味着**旧 Pod 所在节点（很可能是 k8s-node-02）上，这块 EBS 盘的 Detach 操作没有完成**。\n\n这种情况在节点异常（Not Ready、宕机、网络分区）时最容易发生。K8s 的 `attachdetach-controller` 需要确认旧节点上的 Detach 成功后，才能在新节点上发起 Attach。但如果旧节点已经失联，Detach 就会永远卡住，新 Pod 就永远无法启动。\n\n验证这个判断，查看 VolumeAttachment 对象：\n\n```bash\nkubectl get volumeattachment | grep vol-0a1b2c3d4e5f67890\n# 输出:\n# csi-a3f8b21c-... True  ebs.csi.aws.com  vol-0a1b2c3d4e5f67890  k8s-node-02  18m\n```\n\n果然，VolumeAttachment 显示盘还挂在 `k8s-node-02` 上，而 `k8s-node-02` 此时状态是 `NotReady`——这是滚动更新时节点恰好出现问题的典型场景。\n\n### 五大常见根因速查\n\n除了节点宕机导致的 Detach 卡住，以下几种原因在生产中也非常高频。**PVC 一直 Pending** 的情况最常见于两类场景：一是 StorageClass 名字写错或者根本没有配置 Default StorageClass，Dynamic Provisioning 就不会触发；二是 StorageClass 设置了 `volumeBindingMode: WaitForFirstConsumer`，这会导致 PVC 在没有 Pod 使用时故意保持 Pending 状态，直到 Pod 被调度才绑定——这是为了让 PV 和 Pod 在同一个可用区创建，很多人第一次看到这个 Pending 会误以为是 bug。**AccessMode 不匹配**则是另一个坑：RWO 的 PV 不能被两个节点同时 Attach，但 RWX（ReadWriteMany）通常需要 NFS 或 CephFS 这类分布式文件系统支持，用 AWS EBS 申请 RWX 会直接失败。**PV 状态为 Released** 但 reclaimPolicy 是 Retain 时，PV 不会自动回收，下次 PVC 创建后找不到可用的 PV，同样会 Pending。\n\n### 修复卡住的 VolumeAttachment\n\n确认根因是旧节点的 VolumeAttachment 卡住后，修复步骤如下。首先确认旧节点的 Pod 确实已经终止（哪怕节点 NotReady，Pod 对象可能还在）：\n\n```bash\n# 强制删除旧节点上的 Pod（如果还存在）\nkubectl delete pod clickhouse-1 -n data --force --grace-period=0\n```\n\n然后手动删除卡住的 VolumeAttachment：\n\n```bash\n# 先找到对应的 VolumeAttachment 名字\nkubectl get volumeattachment\n# 强制删除\nkubectl delete volumeattachment csi-a3f8b21c-... --force --grace-period=0\n```\n\n删除 VolumeAttachment 后，`attachdetach-controller` 会在几秒内重新在新节点上发起 Attach，随后 kubelet 完成 Mount，Pod 就能正常启动了。如果 VolumeAttachment 有 finalizer 导致删不掉，需要先 patch 掉 finalizer：\n\n```bash\nkubectl patch volumeattachment csi-a3f8b21c-... \\\n  -p '{\"metadata\":{\"finalizers\":null}}' \\\n  --type=merge\n```\n\n## 第三步：进阶场景与扩展排查手段\n\n### CSI Driver 日志排查\n\n如果上面的步骤都做完了，VolumeAttachment 也删了，Pod 还是起不来，就该深挖 CSI Driver 了。CSI Node Plugin 以 DaemonSet 形式运行，找到 Pod 所在节点上的那个 CSI Node Pod，看它的日志：\n\n```bash\n# 找到节点 k8s-node-03 上的 CSI node pod\nkubectl get pod -n kube-system -l app=ebs-csi-node -o wide | grep k8s-node-03\n# 查看 CSI driver 容器的日志\nkubectl logs -n kube-system ebs-csi-node-xxxxx -c ebs-plugin --tail=100\n```\n\n常见的 CSI 日志报错包括 `VolumeID not found`（云盘被手动删除或 Region 不对）、`device is busy`（设备被其他进程占用，需要登录节点手动 `fuser -v /dev/xvdb` 排查）以及 IAM 权限错误（EC2 实例没有 EBS 操作权限）。\n\n### StatefulSet 的特殊性\n\nStatefulSet 的 `volumeClaimTemplates` 和普通 Deployment 的 volumes 有一个本质区别：StatefulSet 为每个 Pod 副本创建**独立的** PVC，命名规则是 `<template-name>-<pod-name>`，这些 PVC 在 StatefulSet 缩容或删除时**不会自动删除**（这是故意的设计，防止误删数据）。这意味着如果你 `kubectl delete sts clickhouse`，Pod 没了，但 `data-clickhouse-0`、`data-clickhouse-1`、`data-clickhouse-2` 这三个 PVC 还在，下次重建 StatefulSet 会直接绑定回原来的 PV。相比之下，普通 Deployment 所有 Pod 共享同一个 PVC，PVC 必须支持 RWX 才能多节点同时挂载。\n\n### 不同存储后端的特有问题\n\n**AWS EBS / 阿里云盘**（块存储）：天生只支持 RWO，Attach 到节点是独占的，节点宕机必然触发 Multi-Attach 问题，解决方案就是上面说的手动删 VolumeAttachment。同时注意可用区亲和性，EBS 盘只能挂到同 AZ 的节点，如果调度器把 Pod 调到了其他 AZ，Attach 必然失败。\n\n**NFS / CephFS**（网络文件系统）：支持 RWX，但挂载失败通常是网络问题或 NFS server 不可达。排查时在节点上手动跑 `mount -t nfs <server>:<path> /mnt/test` 来验证网络连通性，看 `dmesg | tail -30` 找内核级别的 mount 报错。\n\n**Ceph RBD**（块设备，类似 EBS）：常见问题是 ceph mon 地址变更后，节点上的 keyring 或 configmap 没更新，导致 RBD map 失败。看 kubelet 日志里 `rbd: map failed` 相关的错误，通常需要更新 `ceph-secret` 这个 Secret。",
+      "keyPoints": [
+        "K8s 存储体系分 PV（集群级存储资源）、PVC（命名空间级存储申请）、StorageClass（动态供给模板）三层抽象，Pod 通过 PVC 间接消费存储，而不直接引用 PV。",
+        "Volume 挂载生命周期是 Provision → Attach → Mount → Use → Unmount → Detach 五阶段，Pod 卡在 ContainerCreating 通常意味着 Attach 或 Mount 阶段失败，两者由 CSI Controller Plugin 和 Node Plugin 分别负责。",
+        "RWO（ReadWriteOnce）类型的 PV 同一时刻只能 Attach 到一个节点，当旧节点宕机导致 Detach 卡住时，新 Pod 会触发 Multi-Attach error，必须手动删除 VolumeAttachment 对象才能解除阻塞。",
+        "StatefulSet 的 volumeClaimTemplates 为每个 Pod 副本创建独立命名的 PVC（如 data-clickhouse-1），这些 PVC 在 StatefulSet 删除时不会自动回收，重建 StatefulSet 会绑定回原来的数据盘，是有状态服务数据安全的重要保障。",
+        "StorageClass 的 volumeBindingMode: WaitForFirstConsumer 是一种延迟绑定策略，PVC 在没有 Pod 消费时会故意保持 Pending，直到 Pod 被调度后才在对应可用区创建并绑定 PV，目的是避免跨 AZ 挂载失败。",
+        "PV 状态为 Released（PVC 被删但 PV 还在）且 reclaimPolicy 为 Retain 时，PV 不会自动进入 Available，新 PVC 无法绑定，需要手动删除 PV 的 claimRef 字段才能复用。",
+        "CSI 架构将存储操作分为 Controller Plugin（负责 Provision/Attach，以 Deployment 运行）和 Node Plugin（负责 Mount，以 DaemonSet 运行）两部分，排查 Attach 失败看 Controller 日志，排查 Mount 失败看节点上 Node Plugin 的日志。"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-pv-q1",
+          "question": "在 Kubernetes 的存储体系中，PVC 与 PV 绑定时，以下哪个说法是正确的？",
+          "choices": [
+            { "id": "A", "text": "PVC 只能绑定容量完全等于自身请求量的 PV，容量不同则无法绑定" },
+            { "id": "B", "text": "PVC 绑定的 PV 容量必须大于或等于 PVC 请求量，且访问模式必须兼容" },
+            { "id": "C", "text": "PVC 可以绑定任意状态的 PV，包括 Released 和 Failed 状态" },
+            { "id": "D", "text": "一个 PV 可以同时被多个 PVC 绑定，由 PV 的 accessModes 控制" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "PersistentVolumeController 在做 PVC 与 PV 匹配时，遵循两个核心条件：PV 的容量必须大于等于 PVC 的请求量（而不是完全相等），以及 PV 的 accessModes 必须包含 PVC 请求的访问模式。A 选项是常见误解，容量只需「不小于」而非「等于」。C 选项错误，Released 状态的 PV 因为 claimRef 还保留着上一个 PVC 的引用，新 PVC 无法绑定；Failed 状态的 PV 同样不可用。D 选项根本错误，一个 PV 在同一时刻只能被一个 PVC 绑定，这是 PV 的基本约束，accessModes 描述的是该 PV 支持的挂载模式，而非允许多 PVC 绑定。"
+        },
+        {
+          "id": "k8s-pv-q2",
+          "question": "kubectl describe pod 的 Events 中出现 `Multi-Attach error for volume: Volume is already exclusively attached to one node`，最可能的根本原因是什么？",
+          "choices": [
+            { "id": "A", "text": "PVC 的 accessMode 配置为 ReadWriteMany，但 StorageClass 不支持 RWX" },
+            { "id": "B", "text": "旧 Pod 所在节点异常（NotReady 或宕机），导致 VolumeAttachment 对象的 Detach 操作无法完成" },
+            { "id": "C", "text": "PV 的容量不足，无法同时满足两个 Pod 的存储需求" },
+            { "id": "D", "text": "StorageClass 的 reclaimPolicy 设置为 Retain，阻止了旧 PV 的回收" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Multi-Attach error 的直接含义是：一块 RWO（ReadWriteOnce）的存储卷当前已经 Attach 到节点 A，而控制器试图把它 Attach 到节点 B 时被底层存储系统拒绝。这种情况最典型的触发场景就是旧节点宕机或 NotReady——attachdetach-controller 需要先确认旧节点的 Detach 成功，才能在新节点发起 Attach，但节点失联导致 Detach 确认永远拿不到，新 Pod 因此永远等待。A 选项描述的是 PVC Pending 的问题，而非 Multi-Attach。C 选项与这个报错无关，容量是 Provision 阶段的问题。D 选项的 Retain 策略影响的是 PVC 删除后 PV 的回收行为，和 Attach 冲突无关。"
+        },
+        {
+          "id": "k8s-pv-q3",
+          "question": "CSI（Container Storage Interface）架构中，Attach 操作和 Mount 操作分别由哪个组件负责？",
+          "choices": [
+            { "id": "A", "text": "两者都由 kubelet 直接调用 CSI Node Plugin 完成" },
+            { "id": "B", "text": "Attach 由 kube-controller-manager 内的 attachdetach-controller 触发 CSI Controller Plugin 完成，Mount 由 kubelet 调用 CSI Node Plugin 完成" },
+            { "id": "C", "text": "Attach 由 CSI Node Plugin 在节点上完成，Mount 由 CSI Controller Plugin 远程调用完成" },
+            { "id": "D", "text": "两者都由 external-provisioner 这个 sidecar 统一负责" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "CSI 的设计把存储操作的控制平面和数据平面分离。Attach（将存储设备关联到节点，类似云厂商 API 的 AttachVolume 调用）是集群级别的操作，由运行在 master 侧的 attachdetach-controller 负责触发，实际通过 CSI Controller Plugin 的 ControllerPublishVolume 接口完成。Mount（在节点上将块设备挂载到具体目录）是节点级别的操作，由 kubelet 直接调用运行在同节点的 CSI Node Plugin 的 NodeStageVolume/NodePublishVolume 接口完成。这个分离设计意味着排查 Attach 失败要看 Controller Plugin 的日志，排查 Mount 失败要看节点上 Node Plugin 的日志，不能混淆。"
+        },
+        {
+          "id": "k8s-pv-q4",
+          "question": "StorageClass 配置了 `volumeBindingMode: WaitForFirstConsumer`，此时新建一个 PVC 后会看到什么状态？",
+          "choices": [
+            { "id": "A", "text": "PVC 立即进入 Bound 状态，因为 Dynamic Provisioning 会立刻创建 PV" },
+            { "id": "B", "text": "PVC 进入 Pending 状态，这是故障，需要检查 StorageClass 配置" },
+            { "id": "C", "text": "PVC 保持 Pending 状态，直到第一个使用该 PVC 的 Pod 被调度后才会绑定，这是预期行为" },
+            { "id": "D", "text": "PVC 进入 Lost 状态，因为没有满足条件的 PV 存在" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "WaitForFirstConsumer 是一种延迟绑定策略，它解决的是 PV 的拓扑亲和性问题。如果 StorageClass 使用 Immediate 模式（默认），PVC 创建后立刻触发 Provisioning，PV 会在某个可用区创建，但此后 Pod 调度时可能被调度到其他可用区，导致无法挂载。WaitForFirstConsumer 模式下，PVC 故意等到 Pod 被调度之后，才根据 Pod 所在节点的拓扑信息在对应可用区创建 PV，从根本上避免跨 AZ 挂载失败。很多第一次见到这个 Pending 的人会以为是配置错误，这是一个高频误解。Lost 状态是 PV 被删除但 PVC 还在时出现的，而不是这种场景。"
+        },
+        {
+          "id": "k8s-pv-q5",
+          "question": "执行 `kubectl describe pv <pv-name>` 后发现 Status 为 Released，这意味着什么？",
+          "choices": [
+            { "id": "A", "text": "PV 处于空闲状态，可以被新的 PVC 直接绑定" },
+            { "id": "B", "text": "PV 对应的底层存储已经被删除，PV 对象是一个空壳" },
+            { "id": "C", "text": "绑定该 PV 的 PVC 已经被删除，但 PV 本身还存在，由于 claimRef 仍然保留，新 PVC 无法自动绑定它" },
+            { "id": "D", "text": "PV 正在执行 Detach 操作，等待从节点上卸载" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Released 状态表示之前绑定这个 PV 的 PVC 已经被删除，但 PV 还在。关键在于 PV 的 claimRef 字段还保留着已删除 PVC 的引用（namespace/name），PersistentVolumeController 会把这理解为「这个 PV 已经被预留，只等那个 PVC 回来」，因此不会把它分配给其他 PVC。要想复用这个 PV，必须手动删除 claimRef 字段（或者直接删除再重建 PV），让它回到 Available 状态。如果 reclaimPolicy 是 Delete，PVC 删除时会自动级联删除 PV 和底层存储，就不会出现 Released 状态。Released 和 Failed 都不等于「可用」，这是很多人的误解。"
+        },
+        {
+          "id": "k8s-pv-q6",
+          "question": "一个 StatefulSet 被 `kubectl delete sts myapp` 删除后，其 volumeClaimTemplates 创建的 PVC 会怎样？",
+          "choices": [
+            { "id": "A", "text": "PVC 会随 StatefulSet 一起被自动删除，以释放存储资源" },
+            { "id": "B", "text": "PVC 会保留，重建同名 StatefulSet 后，Pod 会自动绑定回原来的 PVC 和数据" },
+            { "id": "C", "text": "PVC 会保留，但重建 StatefulSet 后会创建新的 PVC，旧 PVC 变成孤儿" },
+            { "id": "D", "text": "PVC 的状态变为 Released，需要手动清理才能被新 StatefulSet 使用" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 StatefulSet 的核心设计决策之一：有状态服务的数据比 Pod 更「珍贵」，删除 StatefulSet 不应该导致数据丢失。因此 K8s 特意将 PVC 的生命周期与 StatefulSet 解耦，删除 StatefulSet 只会删除 Pod，PVC 保留。当你用同样的名字重建 StatefulSet 时，新 Pod（clickhouse-0、clickhouse-1 等）会按命名规则找到对应的 PVC（data-clickhouse-0、data-clickhouse-1），自动绑定并挂载原来的数据。这个行为意味着缩容时旧副本的 PVC 也不会被清理，在需要彻底清理时必须手动删除 PVC，否则会有存储资源泄漏。从 K8s 1.27 开始，StatefulSet 增加了 `persistentVolumeClaimRetentionPolicy` 字段可以配置这个行为。"
+        },
+        {
+          "id": "k8s-pv-q7",
+          "question": "RWO（ReadWriteOnce）和 RWX（ReadWriteMany）访问模式的核心区别是什么？",
+          "choices": [
+            { "id": "A", "text": "RWO 允许多个 Pod 同时读写，RWX 只允许一个 Pod 读写" },
+            { "id": "B", "text": "RWO 表示同一时间只能被一个节点挂载（读写），RWX 表示可以被多个节点同时挂载（读写）" },
+            { "id": "C", "text": "RWO 和 RWX 的区别只在于 Pod 级别，同一节点的不同 Pod 使用 RWO 不能同时挂载" },
+            { "id": "D", "text": "RWX 是 RWO 的超集，支持 RWX 的存储也自然支持 RWO，反之亦然" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "访问模式的粒度是「节点」而不是「Pod」——这是一个关键细节。RWO 意味着这个 PV 同一时刻只能被挂载到一个节点，但该节点上的多个 Pod 都可以使用它（通过 subPath 或直接共享 volume）。RWX 则允许多个节点同时挂载，这需要底层存储支持分布式并发写，典型的有 NFS、CephFS、AWS EFS。块存储（EBS、云盘、Ceph RBD）天生是 RWO 的，因为块设备不支持多节点并发写。另外还有 ROX（ReadOnlyMany），支持多节点只读挂载，适合存放静态配置或只读数据集。D 选项是错的：支持 RWX 的存储（如 NFS）也支持 RWO，但反过来不成立；而且 accessModes 是 PV 声明支持的模式列表，PVC 必须申请其中的一种。"
+        },
+        {
+          "id": "k8s-pv-q8",
+          "question": "线上一个使用 AWS EBS 的 StatefulSet Pod 卡在 ContainerCreating，kubectl describe pod 看到 `AttachVolume.Attach failed: VolumeID not found`，最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "PVC 的 storageClassName 配置错误，导致选择了错误的 StorageClass" },
+            { "id": "B", "text": "EBS 卷被人在 AWS 控制台手动删除，但 K8s 中对应的 PV 对象还在" },
+            { "id": "C", "text": "节点的 IAM Role 缺少 ec2:DescribeVolumes 权限，无法查询 EBS 卷信息" },
+            { "id": "D", "text": "EBS 卷在不同 Region，而节点在另一个 Region，跨 Region 无法 Attach" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "VolumeID not found 是 EBS CSI Driver 在调用 AWS API AttachVolume 时，AWS 返回「该 volume ID 不存在」的错误，直接原因就是底层 EBS 卷已经不存在了。最常见的场景是有人误操作在 AWS 控制台或通过 CLI 直接删除了 EBS 卷，但 K8s 中的 PV 对象（以及 PVC 的 Bound 状态）还在，因为 K8s 不知道 AWS 侧的变化。这种情况的修复方式是：在 AWS 上重新创建一个同规格的 EBS 卷，然后手动创建一个新 PV 指向新卷 ID，再删除旧 PVC 和 PV，让 StatefulSet 绑定新的 PVC。C 选项的权限问题通常表现为 AccessDenied 错误，而不是 VolumeID not found。D 选项的跨 Region 问题实际上在创建 PV 时就会失败，不会等到 Attach 阶段才报错。"
+        },
+        {
+          "id": "k8s-pv-q9",
+          "question": "想要强制删除一个卡在终止状态的 VolumeAttachment，执行 `kubectl delete volumeattachment <name>` 后发现对象一直无法删除，最可能的原因和解决方法是什么？",
+          "choices": [
+            { "id": "A", "text": "VolumeAttachment 是只读对象，不能通过 kubectl 删除，需要通过 API Server 的管理接口删除" },
+            { "id": "B", "text": "VolumeAttachment 上有 finalizer（通常是 external-attacher 设置的），需要先 patch 删除 finalizer 才能让对象真正被删除" },
+            { "id": "C", "text": "VolumeAttachment 被 PV 对象引用，需要先删除 PV 才能删除 VolumeAttachment" },
+            { "id": "D", "text": "只有 cluster-admin 角色才有删除 VolumeAttachment 的权限，需要检查 RBAC 配置" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "VolumeAttachment 对象上通常有一个 finalizer，值为 `external-attacher/ebs-csi-aws-com`（或对应 CSI driver 的名字）。这个 finalizer 的作用是确保在对象被删除之前，CSI Controller Plugin 有机会执行真正的 Detach 操作（调用底层 API 把盘从节点卸载）。但当节点已经宕机，CSI Controller 无法完成 Detach 时，finalizer 就成了「死锁」——Controller 等不到成功，不移除 finalizer；finalizer 不移除，对象删不掉。解决方法是手动 patch 清空 finalizer：`kubectl patch volumeattachment <name> -p '{\"metadata\":{\"finalizers\":null}}' --type=merge`，之后 API Server 会立即删除该对象，attachdetach-controller 随即可以在新节点上发起 Attach。这个操作需要谨慎，因为它跳过了正常的 Detach 流程，理论上可能导致「双挂载」（如果旧节点其实还活着但只是暂时失联），应确认旧节点确实无法恢复再操作。"
+        },
+        {
+          "id": "k8s-pv-q10",
+          "question": "使用 NFS 作为存储后端的 PVC，Pod 启动时 kubelet 日志中出现 `mount.nfs: Connection timed out`，你会怎么在节点上快速验证连通性？",
+          "choices": [
+            { "id": "A", "text": "在节点上执行 `kubectl exec` 进入 Pod 里面 ping NFS 服务器 IP" },
+            { "id": "B", "text": "在 Pod 所在节点上直接执行 `mount -t nfs <server>:<path> /mnt/test` 手动挂载来验证" },
+            { "id": "C", "text": "重启节点上的 kubelet 服务，让它重新尝试挂载" },
+            { "id": "D", "text": "删除 PVC 并重建，触发 StorageClass 重新 Provision 一个新的 PV" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "排查 NFS 挂载失败最直接的方法是绕过 K8s，直接在故障节点上手动执行 mount 命令。这能立刻区分「K8s 配置问题」和「网络/NFS 服务器问题」：如果手动 mount 也失败，说明是基础设施层的问题（防火墙规则、NFS server 宕机、2049 端口不通等），和 K8s 无关；如果手动 mount 成功，说明底层连通性没问题，问题在 K8s 的 PV/PVC 配置上（路径错误、exportfs 权限等）。同时可以配合 `showmount -e <nfs-server>` 查看 NFS server 的 export 列表，以及 `dmesg | tail -30` 查看内核级别的挂载错误。A 选项没有意义，因为 Pod 都还没起来。C 选项重启 kubelet 属于「蒙眼撞运气」的操作，不能定位问题。D 选项对 NFS 这类网络文件系统来说，重新 Provision 不会解决网络连通性问题。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/storage/persistent-volumes/",
+        "https://kubernetes.io/docs/concepts/storage/storage-classes/",
+        "https://kubernetes-csi.github.io/docs/",
+        "https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#stable-storage"
+      ]
+    }
+  ]
+}
