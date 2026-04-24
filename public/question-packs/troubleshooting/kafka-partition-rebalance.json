@@ -1,0 +1,158 @@
+{
+  "id": "kafka-partition-rebalance",
+  "name": "Kafka Consumer Group Rebalance 原理",
+  "domain": "troubleshooting",
+  "description": "理解 Kafka Consumer Group Rebalance 触发条件、Stop-The-World 影响与渐进式 Rebalance 优化",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "kafka-partition-rebalance-1",
+      "domain": "troubleshooting",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["kafka", "rebalance", "consumer-group", "cooperative", "static-membership"],
+      "title": "Kafka Consumer Group 频繁 Rebalance 导致消费暂停，原因是什么？如何优化？",
+      "content": "你们的订单消费服务最近出了一个诡异的问题：消费者 Lag 监控图上每隔几分钟就出现一个「锯齿」——Lag 平稳地往下降，然后突然在十几秒内急速上升，之后再慢慢恢复。与此同时，日志里出现了大量这样的输出：\n\n```\n[2024-03-15 14:32:17] INFO  o.a.k.c.consumer.internals.AbstractCoordinator\n  - [Consumer clientId=order-consumer-1, groupId=order-group]\n    Attempt to heartbeat failed since group is rebalancing\n[2024-03-15 14:32:17] INFO  o.a.k.c.consumer.internals.ConsumerCoordinator\n  - [Consumer clientId=order-consumer-1, groupId=order-group]\n    Revoke previously assigned partitions {order-topic-0, order-topic-1, order-topic-2}\n[2024-03-15 14:32:18] INFO  o.a.k.c.consumer.internals.AbstractCoordinator\n  - [Consumer clientId=order-consumer-2, groupId=order-group]\n    (Re-)joining group\n[2024-03-15 14:32:19] INFO  o.a.k.c.consumer.internals.ConsumerCoordinator\n  - [Consumer clientId=order-consumer-1, groupId=order-group]\n    Setting newly assigned partitions {order-topic-0, order-topic-3}\n```\n\n当前消费者配置如下：\n\n```properties\n# Consumer 核心配置\ngroup.id=order-group\nsession.timeout.ms=10000       # 10秒\nheartbeat.interval.ms=3000     # 3秒\nmax.poll.interval.ms=300000    # 5分钟\nmax.poll.records=500           # 每次最多拉取500条\nauto.offset.reset=earliest\nenable.auto.commit=true\nauto.commit.interval.ms=5000\n```\n\n服务部署在 Kubernetes 上，每个 Pod 跑一个消费者实例，共 3 个副本。消费的 `order-topic` 有 6 个分区。业务逻辑是：拉到一批订单后，需要调用一个第三方风控接口做校验，这个接口的 P99 延迟约 8 秒，有时候在促销活动期间会到 25 秒。\n\n**请回答：**\n\nKafka Consumer Group 的 Rebalance 是什么？什么情况下会触发？上面这个场景的 Rebalance 是由什么引起的？频繁 Rebalance 会带来哪些具体危害？给出优化方案并说明每个参数调整的原理。",
+      "answer": "## Kafka Consumer Group 是什么，Rebalance 又是怎么回事\n\nKafka 的 Consumer Group 是 Kafka 实现高吞吐消费的核心设计。简单说就是：一个 topic 的多个分区，由同一个 group 内的多个消费者实例来分担消费，每个分区在同一时刻只会被 group 内的一个消费者消费。这样既保证了消息的有序性（单分区内有序），又通过水平扩展提升了整体吞吐。\n\n但这里有个天然的问题：group 内的消费者数量是动态变化的——可能某个实例挂了，可能新实例加入，可能 topic 扩容了分区数。每当这些变化发生，就需要重新商量一下「你消费哪几个分区，我消费哪几个分区」。这个重新协商分区归属的过程，就是 **Rebalance**。\n\nRebalance 涉及两个关键角色：**Group Coordinator** 和 **Group Leader**。Group Coordinator 是 Broker 端的一个组件，专门负责管理 Consumer Group 的元数据——哪些消费者在线、心跳状态、当前的分区分配方案。每个 Consumer Group 都会被固定分配到某一个 Broker 上作为其 Coordinator，计算方式是 `Math.abs(groupId.hashCode()) % __consumer_offsets 分区数`，找到对应的 `__consumer_offsets` 分区的 Leader 所在 Broker。Group Leader 则是消费者侧的概念，是第一个成功加入 group 的消费者实例，负责真正执行分区分配算法并把结果上报给 Coordinator。\n\nRebalance 的完整流程走的是两阶段协议：**JoinGroup → SyncGroup**。触发 Rebalance 后，所有消费者先发送 JoinGroup 请求到 Coordinator。Coordinator 等所有成员都到齐（或超时）后，把成员列表发给 Group Leader，由 Leader 用配置的 Assignor 算法计算新的分区分配方案，再通过 SyncGroup 请求把方案上报。Coordinator 把方案分发给所有消费者，每个消费者收到自己新的分区列表后，才能继续消费。\n\n这里最关键的一点是：**在整个 JoinGroup 到 SyncGroup 阶段，所有消费者都必须暂停消费，等待协议完成**。这就是所谓的 Stop-The-World（STW）效应——不是只有挂掉或新加入的那个消费者受影响，是整个 group 里所有消费者全部停下来等待。一次 Rebalance 的时长通常在几秒到几十秒之间，期间消息在 topic 里堆积，Lag 自然就涨起来了。\n\n## 四种会触发 Rebalance 的条件\n\n**消费者成员变化**是最直觉的触发条件。新消费者调用 `subscribe()` 并发出第一次 `poll()` 时，会向 Coordinator 发送 JoinGroup 请求，触发 Rebalance。消费者正常关闭时调用 `close()` 会主动发送 LeaveGroup 请求，同样触发 Rebalance。如果消费者进程直接崩溃而没有调用 `close()`，则需要等 Coordinator 检测到心跳超时才会触发。\n\n**心跳超时**是第二个触发条件，由 `session.timeout.ms` 控制（默认 10 秒，Kafka 2.x 起服务端强制要求在 `group.min.session.timeout.ms`=6s 到 `group.max.session.timeout.ms`=1800s 之间）。消费者有一个后台线程专门负责发心跳，每隔 `heartbeat.interval.ms` 发一次。如果 Coordinator 在 `session.timeout.ms` 内没有收到某个消费者的心跳，就认为它挂了，踢出 group 并触发 Rebalance。注意，**心跳线程和 poll 线程是分开的**，所以就算消费者在主线程里卡住了，心跳线程仍然在发心跳——这就引出了第三个条件。\n\n**poll 超时被踢出**，由 `max.poll.interval.ms` 控制（默认 5 分钟）。Kafka 0.10.1 之后引入这个参数，专门解决「消费者活着但处理太慢」的问题。消费者必须在两次 `poll()` 调用之间的时间不超过这个值，否则 Coordinator 会认为该消费者「虽然心跳正常，但消费能力出了问题」，主动踢出该消费者并触发 Rebalance。\n\n**Topic 分区数变化**是第四个条件，比如运维给 topic 增加了分区数，或者消费者动态订阅的 topic 列表发生变化（使用正则表达式订阅时，新建了匹配的 topic），都会触发 Rebalance。\n\n## 回到题目：这个场景的 Rebalance 是怎么触发的\n\n看这个场景的配置：`max.poll.records=500`，每次最多拉 500 条消息，每条消息要调用风控接口，P99 延迟 8 秒，促销时可能 25 秒。最坏情况下，处理 500 条消息需要 500 × 25s = 12500 秒——当然实际上有并发，但就算 50 个并发，也需要 500 × 25s / 50 = 250 秒。而 `max.poll.interval.ms=300000`（5 分钟 = 300 秒），一旦促销流量上来，极有可能超过 300 秒。\n\n超过 `max.poll.interval.ms` 后，消费者客户端会自己主动调用 `MaybeLeaveGroup`，向 Coordinator 发送 LeaveGroup 请求然后触发 Rebalance。日志里那个「Attempt to heartbeat failed since group is rebalancing」就是发生在这之后——消费者被踢出后，尝试重新加入 group，但这时 group 已经处于 Rebalancing 状态，心跳自然失败。\n\nKubernetes 上的 Pod Rebalance 还有一个额外放大因素：滚动更新时，Pod 会按顺序依次重启，每次重启都会触发一次 Rebalance，3 个 Pod 就是连续 3 次 Rebalance。\n\n## 频繁 Rebalance 的三层危害\n\n**第一层是消费暂停，Lag 堆积。** 每次 Rebalance 少则几秒，多则几十秒。期间消息持续写入 topic 但无人消费，Lag 直线上升。Rebalance 结束后，消费者需要一段时间才能把堆积消化完，这就是监控里「锯齿」的来源。\n\n**第二层是大量重复消费。** `enable.auto.commit=true` 时，offset 每隔 `auto.commit.interval.ms`（默认 5 秒）自动提交一次。Rebalance 发生时，上一次自动提交到 Rebalance 触发之间的那批消息，offset 还没有提交就已经被踢出 group 了。Rebalance 之后重新分配分区，消费者会从上次提交的 offset 开始重新消费，导致这些消息被重复处理。如果下游业务不是幂等的，重复消费会产生数据错误。\n\n**第三层是雪崩风险。** 频繁 Rebalance 说明消费者的处理能力或稳定性不足以应对当前负载。在 Rebalance 期间 Lag 堆积，Rebalance 结束后消费者需要追赶大量积压消息，处理压力更大，更容易再次触发 `max.poll.interval.ms` 超时，进入「Rebalance → Lag 堆积 → 压力更大 → 再次 Rebalance」的恶性循环。\n\n## 五个具体的优化方案\n\n**第一：减少每次 poll 的消息量，配合增大 max.poll.interval.ms。**\n\n对于这个场景，风控接口是瓶颈，每次 500 条太多。把 `max.poll.records` 从 500 调到 50，每次只拉 50 条，以 50 个并发处理，每条最坏 25 秒，总共只需 25 秒。同时把 `max.poll.interval.ms` 调到 60000（60 秒），留足余量：\n\n```properties\nmax.poll.records=50\nmax.poll.interval.ms=60000\n```\n\n这样就能确保每次 poll 的批次都能在规定时间内处理完，根本不会触发超时踢出。\n\n**第二：合理调整心跳参数。**\n\n`heartbeat.interval.ms` 建议设置为 `session.timeout.ms` 的 1/3，这样在一个 session 超时周期内能发出至少 3 次心跳，单次网络抖动不会导致误判。生产环境通常把 `session.timeout.ms` 调到 30 秒，`heartbeat.interval.ms` 调到 10 秒：\n\n```properties\nsession.timeout.ms=30000\nheartbeat.interval.ms=10000\n```\n\n注意不要把 `session.timeout.ms` 调得太大，否则真正挂掉的消费者要等很久才会被检测到，增大了故障感知延迟。\n\n**第三：切换到 CooperativeStickyAssignor，实现渐进式 Rebalance。**\n\n传统的 EagerRebalance（也就是 RangeAssignor、RoundRobinAssignor、StickyAssignor 使用的协议）在 Rebalance 时要求所有消费者先放弃所有分区，再统一重新分配，这是 STW 的根源。Kafka 2.4 引入的 `CooperativeStickyAssignor` 使用增量协议（Incremental Cooperative Rebalance），只迁移真正需要变动的分区，其余分区继续正常消费：\n\n```properties\npartition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor\n```\n\n举个具体例子：3 个消费者各消费 2 个分区，第 4 个消费者加入。老协议下，所有 3 个消费者先全部放弃自己的分区，然后重新分配；新协议下，只有 1 个分区从某个现有消费者迁移给新消费者，其他 5 个分区继续不间断消费。这对消费 Lag 的影响从「全组停消费 N 秒」降低到「1 个分区短暂中断」。\n\n**第四：使用 Static Membership 避免因 Pod 重启触发 Rebalance。**\n\nKubernetes 上 Pod 重启是很常见的事（滚动更新、OOM 重启、节点漂移），每次重启都会让消费者用一个新的 `client.id` 加入 group，触发 Rebalance。Static Membership 通过给每个消费者配置一个稳定的 `group.instance.id`，告诉 Coordinator「这个实例重启后还是我」，在 `session.timeout.ms` 内重连时不会触发 Rebalance，而是直接继承原来的分区分配：\n\n```properties\ngroup.instance.id=order-consumer-pod-0  # 每个Pod配置唯一且稳定的ID\nsession.timeout.ms=30000               # 给Pod足够的重启时间\n```\n\n在 K8s 中，可以用 StatefulSet 的 Pod 名称（`$(POD_NAME)`）作为 `group.instance.id`，因为 StatefulSet 保证 Pod 名称在重启后不变。\n\n**第五：使用 ConsumerRebalanceListener 在 Rebalance 前手动提交 offset，减少重复消费。**\n\n当 Rebalance 不可避免时，通过监听器在分区被撤销前提交 offset，可以把重复消费的窗口从「上次自动提交到 Rebalance」缩小到几乎零：\n\n```java\nconsumer.subscribe(topics, new ConsumerRebalanceListener() {\n    @Override\n    public void onPartitionsRevoked(Collection<TopicPartition> partitions) {\n        // 分区被撤销前，立即同步提交当前 offset\n        // 用 commitSync 而不是 commitAsync，确保提交成功\n        consumer.commitSync(currentOffsets);\n        log.info(\"Rebalance triggered, committed offsets for: {}\", partitions);\n    }\n\n    @Override\n    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {\n        log.info(\"Assigned new partitions: {}\", partitions);\n    }\n});\n```\n\n## 进阶：Kafka 3.x 的 KIP-848 彻底解决 STW\n\nCooperativeStickyAssignor 虽然大幅减少了 STW 范围，但 Rebalance 协议本身还是基于 Group 的两阶段协议，每次成员变化都需要全组参与。Kafka 3.x 的 KIP-848 提出了全新的 Consumer Protocol，引入了 **Server-side Assignment**：分区分配逻辑从 Group Leader（客户端）移到了 Broker 端，Coordinator 直接管理每个消费者的分区，成员加入或离开只影响当事消费者的分区，其他消费者完全不受影响，彻底消除了 STW 的根因。\n\n截至 Kafka 3.7，KIP-848 仍处于 Early Access 阶段，在 Kafka 4.0 中已经正式 GA，生产使用需要关注版本成熟度。\n\n## 优化后的完整配置参考\n\n```properties\n# Rebalance 优化配置（针对有耗时外部调用的消费者）\ngroup.id=order-group\ngroup.instance.id=${POD_NAME}             # Static Membership，K8s StatefulSet 场景\n\n# 心跳参数\nsession.timeout.ms=30000                  # 30秒，给Pod足够重启时间\nheartbeat.interval.ms=10000               # session.timeout 的 1/3\n\n# Poll 参数：核心优化点\nmax.poll.records=50                       # 从500降到50，匹配风控接口的处理能力\nmax.poll.interval.ms=60000                # 60秒，50条×25s/50并发 = 25s，留足2倍余量\n\n# 分配策略：渐进式 Rebalance\npartition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor\n\n# 关闭自动提交，改为手动提交，配合 RebalanceListener\nenable.auto.commit=false\n```",
+      "keyPoints": [
+        "Rebalance 是 Consumer Group 内分区归属权的重新协商过程，由 Broker 端的 Group Coordinator 和消费者侧的 Group Leader 协作完成，触发后 Group 内所有消费者必须暂停消费（Stop-The-World），等待 JoinGroup→SyncGroup 两阶段协议完成才能恢复。",
+        "触发 Rebalance 的四大条件：消费者实例加入或退出 Group；消费者在 session.timeout.ms 内未发送心跳被判定超时；消费者两次 poll() 之间的处理时间超过 max.poll.interval.ms 被主动踢出；订阅 Topic 的分区数发生变化。",
+        "频繁 Rebalance 的核心危害是三层叠加：消费暂停导致 Lag 堆积、Rebalance 前未提交的 offset 导致大量重复消费、Lag 堆积后追赶压力更大反而触发更多 Rebalance 形成恶性循环。",
+        "max.poll.interval.ms 超时是最容易被忽视的 Rebalance 根因：心跳线程与消费线程独立运行，消费者主线程卡在耗时操作（如调用第三方接口）时心跳仍然正常，但 poll() 超时后客户端会主动发送 LeaveGroup 请求触发 Rebalance。",
+        "减少 max.poll.records（限制每批消息量）是解决 poll 超时触发 Rebalance 最直接的手段，需要配合 max.poll.interval.ms 留足处理时间余量，两个参数必须协同调整而不能只改其一。",
+        "CooperativeStickyAssignor（Kafka 2.4+）通过增量协议实现渐进式 Rebalance，只迁移需要变动的分区，其余分区继续消费，将 STW 影响从「全 Group 停消费」缩小为「部分分区短暂中断」，是生产环境的推荐策略。",
+        "Static Membership（group.instance.id）让消费者在 session.timeout.ms 内重启后直接继承原有分区分配，不触发 Rebalance，特别适合 Kubernetes StatefulSet 场景，能有效避免因 Pod 滚动更新导致的连续 Rebalance 风暴。",
+        "ConsumerRebalanceListener 的 onPartitionsRevoked() 回调是减少重复消费的最后一道防线：在分区被撤销前同步提交当前 offset，可以把重复消费窗口从「上次自动提交到 Rebalance 触发」缩短到接近零，建议配合手动提交（enable.auto.commit=false）使用。"
+      ],
+      "quiz": [
+        {
+          "id": "kafka-partition-rebalance-q1",
+          "question": "Kafka Consumer Group Rebalance 期间，哪些消费者会暂停消费？",
+          "choices": [
+            { "id": "A", "text": "只有触发 Rebalance 的那个消费者（如刚挂掉的实例）" },
+            { "id": "B", "text": "整个 Consumer Group 内的所有消费者实例" },
+            { "id": "C", "text": "与触发 Rebalance 的消费者消费同一分区的消费者" },
+            { "id": "D", "text": "所有订阅了同一 Topic 的 Consumer Group 都会暂停" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Rebalance 的 Stop-The-World 效应是 Group 级别的，整个 Consumer Group 内所有消费者都必须先放弃当前分区，等待 JoinGroup→SyncGroup 两阶段协议完成，才能重新开始消费。这是传统 EagerRebalance 协议（RangeAssignor、RoundRobinAssignor 等）的核心缺陷。A 选项是最常见的误解，觉得「我的消费者没问题，凭什么受影响」。D 选项不正确，Rebalance 只影响同一个 Consumer Group，不同 Group 之间完全隔离，互不影响。C 选项也不正确，分区与消费者之间的对应关系本身就是 Rebalance 的结果，不能作为分组依据。"
+        },
+        {
+          "id": "kafka-partition-rebalance-q2",
+          "question": "在 Rebalance 协议中，分区分配算法（如 RangeAssignor）由谁执行？",
+          "choices": [
+            { "id": "A", "text": "由 Broker 端的 Group Coordinator 统一计算并下发" },
+            { "id": "B", "text": "由每个消费者独立计算自己应该消费哪些分区" },
+            { "id": "C", "text": "由第一个加入 Group 的消费者（Group Leader）计算后上报给 Coordinator" },
+            { "id": "D", "text": "由 ZooKeeper 选出的 Controller 负责计算" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个经常被混淆的知识点。Group Coordinator 在 Broker 端负责管理 Group 元数据和协调 Rebalance 流程（收集成员、分发结果），但分配算法本身由客户端侧的 Group Leader 执行。Group Leader 是第一个发送 JoinGroup 请求并成功加入的消费者实例，它收到全部成员列表后运行配置的 Assignor 计算出分配方案，通过 SyncGroup 请求把方案上报给 Coordinator，Coordinator 再把对应的分区列表发给每个消费者。这样设计的好处是：Broker 不需要了解消费者配置的分配策略，分配逻辑完全在客户端实现，可以灵活扩展。Kafka 3.x 的 KIP-848 才真正把分配逻辑移到了 Broker 端。"
+        },
+        {
+          "id": "kafka-partition-rebalance-q3",
+          "question": "以下关于 session.timeout.ms 和 max.poll.interval.ms 的描述，哪个是正确的？",
+          "choices": [
+            { "id": "A", "text": "两个参数都由后台心跳线程监控，超时逻辑完全相同" },
+            { "id": "B", "text": "session.timeout.ms 监控心跳超时（后台线程），max.poll.interval.ms 监控两次 poll() 之间的处理时间（主线程），两者独立触发不同的 Rebalance 条件" },
+            { "id": "C", "text": "max.poll.interval.ms 必须大于 session.timeout.ms，否则配置无效" },
+            { "id": "D", "text": "session.timeout.ms 超时后消费者会自动提交 offset 再退出，max.poll.interval.ms 超时则直接丢弃未提交的 offset" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这两个参数控制的是两种完全不同的超时场景。心跳线程独立于消费主线程运行，负责定期向 Coordinator 发送心跳；如果 Coordinator 在 session.timeout.ms 内收不到心跳，认为消费者已宕机，踢出 Group。max.poll.interval.ms 则由消费者客户端内部计时，如果主线程两次调用 poll() 的间隔超过这个值，客户端会主动调用 MaybeLeaveGroup 发送 LeaveGroup 请求。关键在于：主线程卡在业务逻辑时，心跳线程仍然正常，所以 session.timeout.ms 不会触发，但 max.poll.interval.ms 会触发——这是导致题目中场景 Rebalance 的根本原因。C 选项是常见误解，两者没有强制的大小约束关系（尽管合理配置上 max.poll.interval.ms 通常远大于 session.timeout.ms）。"
+        },
+        {
+          "id": "kafka-partition-rebalance-q4",
+          "question": "CooperativeStickyAssignor 与传统 StickyAssignor 的核心区别是什么？",
+          "choices": [
+            { "id": "A", "text": "CooperativeStickyAssignor 在分配时尽量保持原有的分区归属，而 StickyAssignor 每次都完全重新分配" },
+            { "id": "B", "text": "CooperativeStickyAssignor 使用增量协议，只迁移必要的分区，其余分区在 Rebalance 期间继续消费；StickyAssignor 使用全量协议，所有分区先全部撤销再重新分配" },
+            { "id": "C", "text": "CooperativeStickyAssignor 只能用于 Kafka 3.x，StickyAssignor 适用于所有版本" },
+            { "id": "D", "text": "两者功能完全相同，CooperativeStickyAssignor 只是 StickyAssignor 的新名称" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "两者的根本区别在于 Rebalance 协议，而不是分配算法本身。StickyAssignor 虽然在「分配结果」上尽量保持粘性（减少分区迁移），但它底层仍然是 EagerRebalance 协议：Rebalance 时所有消费者先放弃全部分区，然后重新分配，即便最终结果大多数分区分配不变，中间也必须经历一段 STW。CooperativeStickyAssignor（Kafka 2.4+ 引入）改用 IncrementalCooperativeRebalance 协议，通过两轮协商只迁移真正需要变动的分区，其余分区从不停止消费，彻底消除了大部分 Rebalance 场景的 STW 效果。A 选项描述的是 StickyAssignor 相比 RangeAssignor 的优势，不是两者的区别。"
+        },
+        {
+          "id": "kafka-partition-rebalance-q5",
+          "question": "消费者日志出现 \"Attempt to heartbeat failed since group is rebalancing\"，最可能的原因是？",
+          "choices": [
+            { "id": "A", "text": "消费者的网络出现波动，心跳包丢失" },
+            { "id": "B", "text": "消费者处理时间超过 max.poll.interval.ms，客户端主动触发了 LeaveGroup，Group 进入 Rebalancing 状态" },
+            { "id": "C", "text": "Broker 端的 session.timeout.ms 配置比客户端的小，产生了配置冲突" },
+            { "id": "D", "text": "消费者的 offset 提交失败，Coordinator 拒绝了心跳请求" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这条日志的含义是：消费者尝试发心跳，但 Coordinator 回复说 Group 当前正在 Rebalancing，心跳请求被拒绝了。触发这个的典型路径是：消费者主线程处理业务逻辑耗时过长，超过 max.poll.interval.ms，客户端检测到超时后主动发送 LeaveGroup 请求退出 Group，Group 进入 Rebalancing 状态；随后消费者自动尝试重新加入 Group，在 Rebalancing 未结束前发出的心跳都会收到这个错误。这是一个「症状」而不是「原因」——看到这条日志应该往上翻日志，找 LeaveGroup 或 max.poll.interval.ms exceeded 的记录，那才是根因。A 选项的网络波动会导致心跳发不出去，但不会收到「group is rebalancing」的明确回复。"
+        },
+        {
+          "id": "kafka-partition-rebalance-q6",
+          "question": "开启 enable.auto.commit=true 时，Rebalance 会导致什么问题？",
+          "choices": [
+            { "id": "A", "text": "不会有额外问题，auto commit 会在 Rebalance 前自动提交所有已处理的 offset" },
+            { "id": "B", "text": "上次自动提交到 Rebalance 触发之间的消息 offset 未提交，Rebalance 后会从上次提交的位置重新消费，导致重复消费" },
+            { "id": "C", "text": "Rebalance 会清空所有消费者的 offset，导致从头消费整个 Topic" },
+            { "id": "D", "text": "Rebalance 后 auto.commit 会自动补交所有遗漏的 offset，不会重复消费" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "auto.commit 是定时触发的（默认每 5 秒），不是事件驱动的。Rebalance 发生时，如果距离上次自动提交还没到 5 秒，那这段时间内已经被消费者 poll 出来并处理完的消息，其 offset 并没有提交到 Coordinator。Rebalance 后重新分配分区的消费者会从最后一次成功提交的 offset 开始消费，这段未提交的消息会被重新处理。解决方案是：关闭 auto commit，改为手动提交；同时通过 ConsumerRebalanceListener 的 onPartitionsRevoked() 在分区撤销前做一次 commitSync，确保 Rebalance 前处理过的消息 offset 全部提交。A 选项的「自动提交会在 Rebalance 前触发」是错误的，auto commit 没有这个机制。"
+        },
+        {
+          "id": "kafka-partition-rebalance-q7",
+          "question": "Static Membership（group.instance.id）的主要作用是什么？",
+          "choices": [
+            { "id": "A", "text": "让消费者每次重启后都能获得与上次相同的分区分配，彻底禁止 Rebalance" },
+            { "id": "B", "text": "消费者重启后在 session.timeout.ms 内重连时，Coordinator 识别为同一个实例，不触发 Rebalance，直接恢复原有分区分配" },
+            { "id": "C", "text": "增加消费者的会话超时时间，让消费者有更长的时间处理消息" },
+            { "id": "D", "text": "让同一个 group.instance.id 的消费者跨不同 Consumer Group 共享分区" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Static Membership 的核心是「在超时时间内的重连不触发 Rebalance」，而不是「永久禁止 Rebalance」或「保证分区永远不变」。配置 group.instance.id 后，该消费者在 Coordinator 侧以这个 ID 注册，而不是随机生成的 client.id。当消费者重启并重连时，只要在 session.timeout.ms 内连上，Coordinator 就认为是同一个消费者回来了，不触发 Rebalance，直接把原来的分区还给它。如果超过 session.timeout.ms 才重连，Coordinator 已经把它从 Group 移除了，这时才会触发 Rebalance。因此在 Kubernetes 场景中要把 session.timeout.ms 设置成足够容纳 Pod 重启时间（通常 30-60 秒）。A 选项「彻底禁止 Rebalance」是错误的，如果新增了消费者实例，或者超时了，仍然会触发 Rebalance。"
+        },
+        {
+          "id": "kafka-partition-rebalance-q8",
+          "question": "一个 Consumer Group 有 6 个消费者消费一个 6 分区的 Topic。现在新增第 7 个消费者，使用传统 RangeAssignor，会发生什么？",
+          "choices": [
+            { "id": "A", "text": "第 7 个消费者会空闲，因为 6 个分区已经被 6 个消费者消费完了，不会触发 Rebalance" },
+            { "id": "B", "text": "触发 Rebalance，全部 6 个已有消费者暂停消费，重新分配后 6 个消费者各 1 个分区，第 7 个消费者空闲" },
+            { "id": "C", "text": "触发 Rebalance，但只有第 7 个消费者等待分配，其他 6 个消费者不受影响" },
+            { "id": "D", "text": "Coordinator 会拒绝第 7 个消费者加入，因为消费者数量不能超过分区数" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这个问题揭示了传统 EagerRebalance 协议的代价。第 7 个消费者加入时，Coordinator 通知所有成员 Group 开始 Rebalance，全部 6 个现有消费者必须先放弃自己的分区（STW），等待 JoinGroup 阶段收集所有 7 个成员信息，然后 Group Leader 用 RangeAssignor 重新计算：6 个分区分给 7 个消费者，结果 6 个各得 1 个，第 7 个空闲。虽然最终「实质上」只有第 7 个消费者的状态变了（从无到空闲），但协议要求全组暂停，这就是 CooperativeStickyAssignor 要解决的问题——在这个场景下，增量协议只会让一个消费者「让出」一个分区给第 7 个，其余 5 个消费者完全不受影响。D 选项是误解，消费者数量可以超过分区数，超出的消费者空闲等待。"
+        },
+        {
+          "id": "kafka-partition-rebalance-q9",
+          "question": "使用 CooperativeStickyAssignor 时，如果要从旧的 EagerRebalance Assignor（如 RangeAssignor）迁移过来，可以直接替换 partition.assignment.strategy 配置重启消费者吗？",
+          "choices": [
+            { "id": "A", "text": "可以直接替换，Kafka 会自动检测协议差异并做兼容处理" },
+            { "id": "B", "text": "不能直接替换，需要先把 partition.assignment.strategy 同时配置两个 Assignor 进行滚动升级，等所有消费者都支持 Cooperative 后再移除旧 Assignor" },
+            { "id": "C", "text": "不需要关心，CooperativeStickyAssignor 向下兼容所有旧协议，可以直接混用" },
+            { "id": "D", "text": "只有 Kafka 4.0+ 支持从旧 Assignor 迁移到 CooperativeStickyAssignor" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "从 EagerRebalance 协议迁移到 IncrementalCooperative 协议是一个需要滚动升级的过程，不能直接一步切换。原因是：如果 Group 里同时存在使用 EagerRebalance 协议的旧消费者和使用 Cooperative 协议的新消费者，两种协议不兼容，会导致 Rebalance 失败或行为异常。正确的迁移步骤是：第一步，把所有消费者的 partition.assignment.strategy 改为同时列出新旧两个 Assignor（如 `CooperativeStickyAssignor,RangeAssignor`），滚动重启；第二步，等所有消费者都用上了包含 Cooperative 的配置；第三步，再把旧 Assignor 从配置中移除，再次滚动重启。Kafka 官方文档对这个两步升级过程有明确说明，生产环境跳过这个步骤直接切换会导致消费中断。"
+        },
+        {
+          "id": "kafka-partition-rebalance-q10",
+          "question": "消费者日志中发现 Rebalance 越来越频繁，但检查了 session.timeout.ms 和 max.poll.interval.ms 都没有超时记录，也没有新的消费者加入，排查方向应该是？",
+          "choices": [
+            { "id": "A", "text": "增大 max.poll.records，让每次 poll 拉更多消息来保持心跳活跃" },
+            { "id": "B", "text": "检查 Topic 的分区数是否有变化，或者消费者是否用正则表达式订阅了 Topic 导致匹配到新建的 Topic" },
+            { "id": "C", "text": "升级 Kafka 版本，可能是旧版本的 Bug" },
+            { "id": "D", "text": "增大 session.timeout.ms 到 300 秒以上，彻底避免超时判断" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "当排除了成员变化和超时两大常见原因后，分区数变化或 Topic 元数据变化是最值得检查的方向。具体排查步骤：首先用 `kafka-topics.sh --describe --topic <name>` 确认分区数是否近期有变化；其次，如果消费者用了 `subscribe(Pattern)` 正则订阅，检查 Broker 上是否新创建了匹配该正则的 Topic（Kafka 默认开启了 auto.create.topics.enable，某些情况下会自动创建 Topic）；再次，检查 Broker 端是否有 Leader 选举发生（Preferred Leader Election 或 Unclean Leader Election），虽然不直接触发 Rebalance，但可能导致 Coordinator 所在 Broker 变更，消费者需要重新查找 Coordinator，过程中可能触发 Rebalance。A 选项反了，增大 max.poll.records 会增加每次处理时间，更容易触发 max.poll.interval.ms 超时。D 选项是治标不治本且有副作用（故障感知延迟增大）的做法。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#consumerconfigs",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-429%3A+Kafka+Consumer+Incremental+Rebalance+Protocol",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-345%3A+Introduce+static+membership+protocol+to+reduce+consumer+rebalances",
+        "https://cwiki.apache.org/confluence/display/KAFKA/KIP-848%3A+The+Next+Generation+of+the+Consumer+Rebalance+Protocol",
+        "https://www.confluent.io/blog/incremental-cooperative-rebalancing-in-kafka/"
+      ]
+    }
+  ]
+}
