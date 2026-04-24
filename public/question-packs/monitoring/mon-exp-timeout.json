@@ -1,0 +1,162 @@
+{
+  "id": "monitoring-q163",
+  "name": "Exporter 采集超时处理",
+  "domain": "monitoring",
+  "description": "排查与解决 Prometheus Exporter 在高负载场景下采集超时的完整方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q163",
+      "domain": "monitoring",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["prometheus", "exporter", "timeout", "mysqld_exporter", "scrape", "监控", "可观测性"],
+      "title": "如何处理 Exporter 采集超时的问题？",
+      "content": "你们公司的监控团队收到了一个令人头疼的告警：每天中午 12:00-12:30 的业务高峰期，Prometheus 大盘上 `mysqld_exporter` 对应的 `up` 指标会变成 0，同时触发数据库监控不可用的 P2 告警，影响 DBA 和后端团队的值班判断。异常持续约 10-15 分钟后，随着高峰期过去，监控自动恢复正常。\n\n以下是 Prometheus 服务端在今天中午 12:03 的日志：\n\n```\nlevel=warn ts=2024-01-15T12:03:47.234Z caller=scrape.go:1423 \\\n  component=\"scrape manager\" scrape_pool=mysql \\\n  target=http://10.0.1.42:9104/metrics \\\n  msg=\"scrape timeout\" timeout=10.001s\nlevel=warn ts=2024-01-15T12:04:03.891Z caller=scrape.go:1423 \\\n  component=\"scrape manager\" scrape_pool=mysql \\\n  target=http://10.0.1.42:9104/metrics \\\n  msg=\"scrape timeout\" timeout=10.001s\n```\n\n你登录到 mysqld_exporter 所在机器，进程活着、端口在监听。手动 `curl -w \"\\ntime_total: %{time_total}s\\n\" http://localhost:9104/metrics` 能拿到数据，但输出结尾显示：\n\n```\n...\n# HELP mysql_up Whether the MySQL server is up.\nmysql_up 1\ntime_total: 25.318s\n```\n\n接口能响应，但整整花了 25 秒。平时同样的请求在 200ms 以内就能返回。Grafana 上的 `scrape_duration_seconds` 曲线印证了这一点——mysqld_exporter 的采集耗时在高峰期从 0.15 秒骤升到 25 秒以上，远超 Prometheus 默认的 10 秒超时上限。\n\n```promql\n# 在 Prometheus 上查询该 exporter 的采集耗时\nscrape_duration_seconds{job=\"mysql\", instance=\"10.0.1.42:9104\"}\n\n# 高峰前（正常）：0.15s\n# 高峰中（超时）：25.3s\n\n# 对应的存活指标\nup{job=\"mysql\", instance=\"10.0.1.42:9104\"} = 0\n```\n\n这台 MySQL 在高峰期的 QPS 约 8000-10000，CPU 使用率在 75% 左右，`SHOW PROCESSLIST` 显示有 300+ 活跃连接。\n\n**问题：** 为什么数据库负载升高会导致 mysqld_exporter 采集超时？应该如何从根本上解决，而不是简单地调大超时参数？",
+      "answer": "## Exporter 是什么，Prometheus 拉取的完整流程\n\nExporter 是 Prometheus 监控体系里的数据翻译器。它的职责是把目标系统（数据库、消息队列、操作系统内核）的内部状态，转换成 Prometheus 能理解的 `text/plain` 格式，暴露在 `/metrics` HTTP 接口上，等 Prometheus 定时来拉取。这就是 Prometheus 的「拉取模型」（pull model），与传统推送式监控正好相反——目标系统不需要主动上报，Prometheus 自己定时去取。\n\nPrometheus 每隔 `scrape_interval`（默认 15 秒）向 Exporter 的 `/metrics` 端点发起一次 HTTP GET 请求。这个请求有一个大多数人不知道的关键请求头：`X-Prometheus-Scrape-Timeout-Seconds`，它的值等于配置文件里 `scrape_timeout`（默认 10 秒）。这个头部告诉 Exporter：「我给你最多 10 秒，超时我就断开连接，并把 `up` 记录为 0。」\n\n这是理解超时问题的第一块拼图。成熟的 Exporter 实现应该读取这个头部值，用它构造一个带超时的 Go `context.Context`，然后把这个 context 传入所有的采集逻辑——包括数据库查询、外部 HTTP 调用、文件读取等。一旦 context 超时，所有正在执行的采集操作都应该被取消，Exporter 把已经收集到的数据返回出去，而不是让 HTTP 连接傻等到 Prometheus 客户端那侧强行断开。\n\n## mysqld_exporter 超时的根因：SHOW GLOBAL STATUS 的锁争用\n\nmysqld_exporter 采集数据并不是直接读内存，而是通过标准 MySQL 客户端连接，执行一系列诊断性 SQL。其中最核心的一条是 `SHOW GLOBAL STATUS`，它会返回 400 多个状态变量，涵盖连接数、查询计数、InnoDB 缓冲池命中率等核心指标。除此之外还有 `SHOW GLOBAL VARIABLES`、`SHOW SLAVE STATUS`、`SELECT ... FROM information_schema.*` 等十几条查询，每次 `/metrics` 请求触发时都会**串行**执行这些 SQL。\n\n问题的关键在于 `SHOW GLOBAL STATUS` 这条命令。在 MySQL 5.7 和早期 8.0 版本中，`SHOW GLOBAL STATUS` 在执行时需要竞争一个名为 `LOCK_status` 的全局互斥锁（mutex）。正常负载下，这把锁几乎瞬间就能拿到，整条命令 1ms 内返回。但在高峰期，数据库有 300+ 活跃连接、大量并发事务在提交，每个事务完成时都会去更新 `GLOBAL STATUS` 计数器，这意味着 `LOCK_status` 被频繁争用。mysqld_exporter 的采集查询在这把锁上等待了十几秒，加上其余查询的串行执行，总耗时轻松超过 25 秒。\n\n要确认这个根因，可以在高峰期用 `--log.level=debug` 临时重启 exporter，观察各采集器的耗时日志：\n\n```bash\n./mysqld_exporter --log.level=debug 2>&1 | grep -E \"collector|duration\"\n\n# 示例输出（高峰期）：\n# msg=\"Starting collector\" collector=global_status\n# msg=\"Collector finished\" collector=global_status duration=18.342s  ← 元凶\n# msg=\"Starting collector\" collector=global_variables\n# msg=\"Collector finished\" collector=global_variables duration=0.091s\n# msg=\"Starting collector\" collector=slave_status\n# msg=\"Collector finished\" collector=slave_status duration=0.003s\n```\n\n`global_status` 采集器花了 18 秒，其他采集器加起来不到 1 秒。问题定位完成。\n\n## 治标：让 Exporter 尊重 Prometheus 给出的超时信号\n\n如果你有机会修改或二次开发 Exporter，正确的实现是从 HTTP 请求头中读取超时时间，并用 `context.WithTimeout` 让所有慢操作可以被取消：\n\n```go\nfunc (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {\n    ctx := r.Context()\n\n    // 读取 Prometheus 告知的超时时间\n    if v := r.Header.Get(\"X-Prometheus-Scrape-Timeout-Seconds\"); v != \"\" {\n        if timeoutSeconds, err := strconv.ParseFloat(v, 64); err == nil {\n            // 留出 5% 缓冲，确保能在 Prometheus 断开前主动响应\n            timeout := time.Duration(timeoutSeconds * 0.95 * float64(time.Second))\n            var cancel context.CancelFunc\n            ctx, cancel = context.WithTimeout(ctx, timeout)\n            defer cancel()\n        }\n    }\n\n    // 将 ctx 传入所有采集逻辑，慢查询在 ctx 超时时自动取消\n    registry := prometheus.NewRegistry()\n    h.collectWithContext(ctx, registry)\n\n    // 即使部分采集超时，也把已收集的指标写回去（部分采集策略）\n    promhttp.HandlerFor(registry, promhttp.HandlerOpts{}).ServeHTTP(w, r)\n}\n```\n\n这里有个细节值得注意：留出 5% 的缓冲时间（即 `0.95 × scrape_timeout`）。这样 Exporter 能在 Prometheus 客户端断开之前主动结束，把已经采集到的指标部分返回给 Prometheus。Prometheus 收到了完整的 HTTP 200 响应，`up` 记录为 1，只是部分指标缺失了一个采集周期。这比整体超时导致 `up=0` 要好得多——至少值班工程师知道数据库还活着，只是监控稍有不完整。\n\n## 治本：后台采集 + 缓存返回\n\n更优雅的根本解法是把采集逻辑从 HTTP 请求链路上彻底解耦。不要每次 `/metrics` 请求都现场去数据库执行查询，而是维护一个后台 goroutine 定时采集，将结果缓存在内存里，每次 HTTP 请求直接从缓存读取返回。这就是「后台采集模式」（background collection pattern）：\n\n```go\ntype CachingCollector struct {\n    mu          sync.RWMutex\n    lastMetrics []prometheus.Metric\n    lastCollect time.Time\n    maxStaleness time.Duration // 允许的最大数据陈旧度，通常为 2 × scrape_interval\n}\n\nfunc (c *CachingCollector) Start(ctx context.Context, interval time.Duration) {\n    ticker := time.NewTicker(interval)\n    defer ticker.Stop()\n    for {\n        select {\n        case <-ticker.C:\n            // 后台异步采集，即使耗时 20 秒也不影响 HTTP 响应速度\n            if metrics, err := c.collectFromDB(ctx); err == nil {\n                c.mu.Lock()\n                c.lastMetrics = metrics\n                c.lastCollect = time.Now()\n                c.mu.Unlock()\n            }\n        case <-ctx.Done():\n            return\n        }\n    }\n}\n\nfunc (c *CachingCollector) Collect(ch chan<- prometheus.Metric) {\n    c.mu.RLock()\n    defer c.mu.RUnlock()\n    // 数据太旧时不输出，避免误导告警判断\n    if time.Since(c.lastCollect) > c.maxStaleness {\n        return\n    }\n    for _, m := range c.lastMetrics {\n        ch <- m\n    }\n}\n```\n\n这个模式的本质是：采集成功与否和 HTTP 响应速度完全解耦。就算某一次后台采集花了 20 秒，HTTP 接口依然在 1ms 内响应（只是返回的是上一次采集的结果）。代价是数据有一定的滞后性，通常接受 1-2 个 `scrape_interval` 级别的延迟。对于数据库监控这个场景，15-30 秒的指标延迟完全可以接受。\n\n## 为什么不能简单地调大 scrape_timeout\n\n直觉上最快的解法是把 `scrape_timeout` 从 10 秒改成 30 秒，问题不就消失了？这个想法有三个致命的局限性。\n\n第一，`scrape_timeout` 必须严格小于 `scrape_interval`，否则 Prometheus 启动时会报配置错误。如果 `scrape_interval` 是 15 秒，最大只能配到 14 秒，根本不够覆盖 25 秒的采集耗时。你被迫要同时把 `scrape_interval` 也拉长，导致监控精度下降。\n\n第二，超时时间变长意味着每次超时的 scrape goroutine 会 hang 更长时间。高峰期如果持续超时，Prometheus 内部的 scrape worker goroutine 会不断累积，每个 goroutine 都在等待 `/metrics` 响应，大量占用内存和 goroutine 调度资源，最终可能把 Prometheus 本身拖垮。\n\n第三，这是治标不治本。采集慢的根因（数据库锁争用、查询串行执行）没有得到解决，只是延长了等待时间，下次负载更高时还会再超时。\n\n## 针对 mysqld_exporter 的具体调优\n\n对于这个真实案例，有几个立竿见影的优化手段。首先，禁用对根因贡献最大、业务价值相对低的采集器，减少 SQL 查询数量：\n\n```bash\n./mysqld_exporter \\\n  --no-collect.info_schema.tables \\\n  --no-collect.info_schema.innodb_tablespaces \\\n  --no-collect.auto_increment.columns \\\n  --collect.global_status \\\n  --collect.global_variables \\\n  --collect.slave_status\n```\n\n其次，升级 MySQL 版本。MySQL 8.0.26 及以上版本对 `SHOW GLOBAL STATUS` 做了重大优化，将全局锁拆分成更细粒度的 per-variable 锁，高并发下这条命令的耗时可以从 18 秒降到 200ms 以内。这一个版本升级可能比所有 exporter 端的优化加起来效果都大。\n\n最后，如果 `scrape_duration_seconds` 依然偏高，考虑并行化采集——把多个独立的 SQL 查询同时发给数据库，而不是串行等待。对于 I/O 密集型采集，并行度提高 3-5 倍通常能把总耗时降低到同等倍数。\n\n## 延伸：高基数指标也会导致超时\n\n还有一类超时原因更隐蔽：指标基数（cardinality）过高。如果 Exporter 暴露了带高基数标签的指标（比如把每个 SQL 语句的 `query_digest` 作为标签，而数据库里有几万种不同的查询），生成 `/metrics` 文本本身就需要大量内存分配和字符串序列化，可能把整个 `/metrics` 响应体膨胀到几十 MB，导致 HTTP 响应超时。\n\n判断方法很简单，看 `/metrics` 响应体的大小：`curl -s http://localhost:9104/metrics | wc -c`。正常的 Exporter 输出几十 KB 到几百 KB；如果看到几十 MB 甚至更大，基数问题几乎可以确定。解决方法是在 Prometheus 配置里用 `metric_relabel_configs` 对高基数标签做 `drop` 或 `replace`，或者在 Exporter 层面做标签规范化，把低频的标签值归并为 `other`。",
+      "keyPoints": [
+        "Prometheus 每次拉取时在请求头中附带 `X-Prometheus-Scrape-Timeout-Seconds`，成熟的 Exporter 应读取该值并用 `context.WithTimeout` 限制采集时间，而非等待 Prometheus 客户端强行断开连接",
+        "`scrape_duration_seconds` 和 `up` 是诊断采集超时的核心双指标：前者接近 `scrape_timeout` 说明采集偏慢，后者等于 0 表示当次采集已完全超时失败",
+        "mysqld_exporter 在高负载 MySQL 上超时的根因通常是 `SHOW GLOBAL STATUS` 竞争 `LOCK_status` 全局互斥锁，在 MySQL 5.7 和早期 8.0 版本的高并发场景下这条 SQL 本身可能耗时十几秒",
+        "部分采集策略（partial collection）是在 context 超时时取消剩余慢查询、将已完成指标先行返回，使 `up` 保持为 1，避免因某一个慢采集器拖累整体采集失败",
+        "后台采集 + 缓存返回模式将采集耗时从 HTTP 请求链路上解耦，接口始终毫秒级响应，代价是指标有一个 `scrape_interval` 级别的滞后性，适合对实时性要求非极端的场景",
+        "直接调大 `scrape_timeout` 是危险的临时方案：它受 `scrape_interval` 上限约束，且持续超时会导致 Prometheus 内部 scrape goroutine 堆积、内存膨胀，是掩盖问题而非解决问题",
+        "指标基数过高同样会导致采集超时，判断依据是 `/metrics` 响应体超过几十 MB，应通过标签规范化或 `metric_relabel_configs` 在源头控制基数"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q163-q1",
+          "question": "在 Prometheus 的监控数据中，`up{job=\"mysql\", instance=\"10.0.1.42:9104\"} = 0` 最准确地表示什么？",
+          "choices": [
+            {"id": "A", "text": "MySQL 数据库服务本身宕机，无法接受连接"},
+            {"id": "B", "text": "Prometheus 在本次 scrape 中未能在超时时间内从该 Exporter 获取到有效指标"},
+            {"id": "C", "text": "mysqld_exporter 进程已经崩溃，端口不再监听"},
+            {"id": "D", "text": "该 target 在 prometheus.yml 中被手动配置为禁用状态"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`up` 指标是 Prometheus 自动生成的，反映的是 Prometheus 对该 target 的 scrape 结果，而不是目标服务本身的健康状况。scrape 成功（HTTP 200 且在超时前返回）为 1，失败（网络不通、超时、HTTP 非 2xx）为 0。因此 `up=0` 可能是因为数据库宕机、Exporter 进程挂掉、网络不通，也可能仅仅是 Exporter 响应太慢导致超时——就像本题的情况，Exporter 进程活着、数据库也在运行，只是采集耗时 25 秒超过了 scrape_timeout。A 选项是常见误解，把监控层面的失败等同于服务本身宕机，这是告警设计里一个经典的坑。"
+        },
+        {
+          "id": "monitoring-q163-q2",
+          "question": "Prometheus 在每次 scrape 时会附带一个 HTTP 请求头 `X-Prometheus-Scrape-Timeout-Seconds`，以下关于这个头部的描述哪项是正确的？",
+          "choices": [
+            {"id": "A", "text": "这个头部由 Exporter 设置并返回给 Prometheus，告诉 Prometheus 自己的采集需要多少时间"},
+            {"id": "B", "text": "这个头部由 Prometheus 设置并随 scrape 请求发出，值来自配置文件的 `scrape_timeout`，Exporter 应据此构造超时 context"},
+            {"id": "C", "text": "这个头部是可选的，大多数情况下 Prometheus 不会发送，只有配置了 `send_timeout_header: true` 时才启用"},
+            {"id": "D", "text": "这个头部仅用于 Prometheus 内部统计，Exporter 无法读取，也不需要关心"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这个头部是 Prometheus 在每次发起 scrape 请求时**主动附带**的，值来自 `prometheus.yml` 中 `scrape_timeout` 配置（默认 10 秒）。它的设计意图是告诉 Exporter「我最多等你这么长时间」，让 Exporter 有机会在 Prometheus 客户端断开之前主动取消慢操作、返回部分结果。A 选项完全搞反了方向。C 选项是错的，这个头部始终会被发送，不需要额外配置。D 选项是最危险的误解——正是因为开发者「不需要关心」这个头部，才导致大量 Exporter 实现在超时发生时只能等 Prometheus 那侧强行断开，`up` 直接变 0。"
+        },
+        {
+          "id": "monitoring-q163-q3",
+          "question": "在 Go 编写的 Exporter 中，以下哪种方式能最正确地处理来自 Prometheus 的超时信号？",
+          "choices": [
+            {"id": "A", "text": "在 `ServeHTTP` 中设置 `http.Server.WriteTimeout`，让 Go HTTP 服务器自动处理超时"},
+            {"id": "B", "text": "读取 `X-Prometheus-Scrape-Timeout-Seconds` 请求头，用 `context.WithTimeout` 创建带超时的 context，并将该 context 传入所有采集函数"},
+            {"id": "C", "text": "读取 `X-Prometheus-Scrape-Timeout-Seconds`，然后用 `time.Sleep` 等到超时时间的 95% 再返回"},
+            {"id": "D", "text": "在 `prometheus.yml` 中设置足够大的 `scrape_timeout`，Exporter 代码层面不需要做任何处理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确做法是读取超时头部，用 `context.WithTimeout` 构造一个限时 context（通常留 5% 缓冲，即 `0.95 × timeout`），然后把这个 context **传入每一个采集函数**——包括数据库查询、HTTP 调用等。当 context 超时时，这些操作会自动取消，Exporter 把已收集的数据返回出去。A 选项的 `WriteTimeout` 针对的是 HTTP 响应体写入超时，无法取消正在执行的数据库查询。C 选项的 `time.Sleep` 完全不能取消正在进行的慢查询，只是延迟了响应时间，逻辑错误。D 选项把问题转移给了 Prometheus 的配置，是治标不治本，且 `scrape_timeout` 受 `scrape_interval` 约束，不能无限调大。"
+        },
+        {
+          "id": "monitoring-q163-q4",
+          "question": "以下 PromQL 查询用于分析 Exporter 的采集健康状况，哪个查询能帮助**提前预警**采集即将超时（还未发生 `up=0`）的风险？",
+          "choices": [
+            {"id": "A", "text": "`up{job=\"mysql\"} == 0`"},
+            {"id": "B", "text": "`scrape_duration_seconds{job=\"mysql\"} > 8` （当 scrape_timeout=10s 时）"},
+            {"id": "C", "text": "`scrape_samples_scraped{job=\"mysql\"} == 0`"},
+            {"id": "D", "text": "`increase(scrape_duration_seconds{job=\"mysql\"}[5m]) > 0`"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`scrape_duration_seconds` 记录了每次 scrape 的实际耗时。当该值接近但尚未超过 `scrape_timeout` 时，`up` 仍然是 1，告警还未触发——但已经非常危险。合理的做法是在 `scrape_timeout` 的 80% 处设置警告级别告警（如 `> 8s` when timeout=10s），这样在真正超时前就能介入排查。A 选项的 `up==0` 是事后告警，超时已经发生了。C 选项的 `scrape_samples_scraped==0` 表示没有抓到任何指标，通常是 Exporter 返回空内容的情况，和超时场景不同。D 选项的 `increase` 只能判断耗时是否在增长，无法判断是否接近阈值。"
+        },
+        {
+          "id": "monitoring-q163-q5",
+          "question": "通过 `--log.level=debug` 重启 mysqld_exporter 后，在高峰期观察到如下日志输出：\n\n```\nmsg=\"Collector finished\" collector=global_status duration=18.342s\nmsg=\"Collector finished\" collector=global_variables duration=0.091s\nmsg=\"Collector finished\" collector=slave_status duration=0.003s\n```\n\n根据这段日志，以下哪个结论最准确？",
+          "choices": [
+            {"id": "A", "text": "mysqld_exporter 总采集时间是 18.342 + 0.091 + 0.003 = 18.436s，三个采集器串行执行"},
+            {"id": "B", "text": "slave_status 采集器最健康，应该只保留它，禁用其他两个"},
+            {"id": "C", "text": "global_status 采集器耗时 18 秒是主要瓶颈，根因很可能是 `SHOW GLOBAL STATUS` 在高并发下争抢全局锁"},
+            {"id": "D", "text": "这说明 Exporter 的连接池配置有问题，三个采集器在等待同一个数据库连接"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "日志清晰地显示 global_status 采集器单独耗时 18.3 秒，而其他两个合计不到 100ms，问题高度集中。`SHOW GLOBAL STATUS` 在 MySQL 5.7 和早期 8.0 版本的高并发场景下，会因为争抢 `LOCK_status` 全局互斥锁而阻塞很长时间——这是 MySQL 的已知行为，与 exporter 连接池无关。A 选项的计算方式是对的（串行执行），但结论不够深入，没有指出根因。B 选项的建议过于激进，禁用 global_status 会丢失数据库最核心的运行状态指标，得不偿失。D 选项把问题归因于连接池，与日志显示的各采集器独立完成的事实不符。"
+        },
+        {
+          "id": "monitoring-q163-q6",
+          "question": "以下 prometheus.yml 配置片段，哪里存在问题？",
+          "choices": [
+            {"id": "A", "text": "`scrape_timeout: 20s` 超过了 `scrape_interval: 15s`，Prometheus 启动时会报配置错误"},
+            {"id": "B", "text": "`scrape_timeout` 应该设置为 `scrape_interval` 的整数倍，20s 不满足这个要求"},
+            {"id": "C", "text": "`static_configs` 里只有一个 target，高可用场景下应该配置多个 target 做负载均衡"},
+            {"id": "D", "text": "没有问题，这是完全合法的配置，Prometheus 会正常运行"}
+          ],
+          "choices": [
+            {"id": "A", "text": "`scrape_timeout: 20s` 超过了 `scrape_interval: 15s`，Prometheus 启动时会报配置错误，这是硬性约束"},
+            {"id": "B", "text": "`scrape_timeout` 应该设置为 `scrape_interval` 的整数倍，否则采集周期会错乱"},
+            {"id": "C", "text": "`static_configs` 里只有一个 target，高可用场景下应该配置多个 target 做负载均衡"},
+            {"id": "D", "text": "没有问题，Prometheus 允许 `scrape_timeout` 大于 `scrape_interval`"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Prometheus 有一条硬性规则：`scrape_timeout` 必须严格小于 `scrape_interval`。这是因为如果上一次 scrape 还未完成就到了下一次 scrape 的时间点，会导致 scrape worker 堆积。试图把 scrape_timeout 调到 20s 而 scrape_interval 是 15s，Prometheus 在 `promtool check config` 或启动时会直接报错退出：`scrape timeout greater than scrape interval for scrape config with job name \"mysql\"`。这个约束意味着如果 scrape_interval=15s，最大超时只能配到约 14s——本题场景中采集需要 25 秒，单靠调大 timeout 根本解决不了问题，必须用后台采集模式。B 选项是错误的，没有整数倍的要求。"
+        },
+        {
+          "id": "monitoring-q163-q7",
+          "question": "「部分采集策略（partial collection）」和「后台采集 + 缓存返回」这两种方案最核心的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "部分采集策略只适用于 Go 编写的 Exporter，后台采集模式只适用于 Python 编写的 Exporter"},
+            {"id": "B", "text": "部分采集策略在超时时返回不完整的指标集（某些采集器的结果缺失），`up` 为 1；后台采集模式始终返回完整的上一次采集结果，对 Prometheus 完全透明"},
+            {"id": "C", "text": "部分采集策略性能更好，后台采集模式会占用更多内存，不适合生产环境"},
+            {"id": "D", "text": "两者没有实质区别，都是「尽力而为」地返回数据，只是实现方式不同"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这两种方案解决的是不同层面的问题。部分采集策略（partial collection）的核心思路是「在请求链路内，超时就取消慢采集器，把已完成的结果先返回」——HTTP 响应时间仍然等于 scrape_timeout，且某次响应里可能缺少某些指标族（比如 global_status 相关指标全部缺失）。后台采集模式则是「提前把数据备好放在内存里，HTTP 请求只是读缓存」——无论数据库有多忙，响应时间恒定在毫秒级，返回的是上一次完整采集的完整指标集，代价是数据有 scrape_interval 级别的延迟。对于数据库监控，后台采集模式通常是更优解，因为它把采集压力和监控可用性完全解耦。"
+        },
+        {
+          "id": "monitoring-q163-q8",
+          "question": "生产环境中，以下哪个组合方案对解决 mysqld_exporter 采集超时问题效果最好？",
+          "choices": [
+            {"id": "A", "text": "仅将 `scrape_timeout` 调大到 `scrape_interval - 1s`，其余不变"},
+            {"id": "B", "text": "将 mysqld_exporter 改为后台采集模式，同时禁用高耗时、低价值的采集器（如 `info_schema.tables`），并评估升级 MySQL 到 8.0.26+"},
+            {"id": "C", "text": "为 mysqld_exporter 单独增加一台机器，把采集任务分散到多台 exporter 上"},
+            {"id": "D", "text": "减少 Prometheus 的 scrape 频率，把 `scrape_interval` 从 15s 改成 60s，给 exporter 更多时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "最优解是多措并举：后台采集模式将响应时间压到毫秒级，彻底解决超时问题；禁用 `info_schema.tables` 等高耗时采集器（这些信息 DBA 通常不需要实时监控）直接减少 SQL 查询数量；MySQL 8.0.26+ 对 `SHOW GLOBAL STATUS` 的锁做了优化，从根源上减少单条 SQL 耗时。这三个措施分别从「监控架构」「采集器配置」「数据库版本」三个层面入手。A 选项仍然无法覆盖 25 秒的采集时间（scrape_interval=15s 时最大只能配 14s）。C 选项误解了问题，多台 exporter 不能把一条慢 SQL 变快。D 选项降低了监控精度，只是让超时问题发生得少了，并非根治。"
+        },
+        {
+          "id": "monitoring-q163-q9",
+          "question": "在后台采集模式中，`maxStaleness` 参数控制缓存数据的最大允许陈旧度。如果将其设置为 `2 × scrape_interval`（如 scrape_interval=15s，则 maxStaleness=30s），当后台采集连续失败超过 30 秒后会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Exporter 进程会自动重启，尝试恢复采集"},
+            {"id": "B", "text": "`Collect` 方法不再输出任何指标，Prometheus 在下次 scrape 时会记录 `up=0`"},
+            {"id": "C", "text": "Exporter 会持续输出 30 秒前的旧数据，Prometheus 永远不会知道数据已经过期"},
+            {"id": "D", "text": "Prometheus 会自动检测到数据陈旧，并在时序数据库中标记这些指标为 stale"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在示例代码的实现中，`Collect` 方法在输出前会检查 `time.Since(c.lastCollect) > c.maxStaleness`，如果超过最大陈旧度，则不输出任何指标并直接返回。这样 Prometheus 在这次 scrape 中收不到任何有效指标（HTTP 200 但内容为空或缺少必要指标），会相应地把 `up` 设为 0 或触发告警。这是一种故障透明化设计：宁可暴露问题，也不输出误导性的陈旧数据。C 选项是常见的错误实现——如果没有这个陈旧检查，后台采集失败后确实会一直输出旧数据，DBA 可能一直看到「正常」的指标，实际上数据库已经有问题了。D 选项中 Prometheus 的 staleness 标记是基于指标的「time series disappears」机制，不是基于数据内容本身的时间戳。"
+        },
+        {
+          "id": "monitoring-q163-q10",
+          "question": "你排查一个 node_exporter 的采集超时问题，发现 Prometheus 日志里是超时错误，但手动 curl 后发现接口能返回，只是很慢。以下哪个命令能最快判断「高基数指标」是否是根因？",
+          "choices": [
+            {"id": "A", "text": "`top -p $(pgrep node_exporter)` 观察 CPU 使用率"},
+            {"id": "B", "text": "`curl -s http://localhost:9100/metrics | wc -c` 检查响应体大小，正常应在几百 KB 以内"},
+            {"id": "C", "text": "`netstat -an | grep 9100 | wc -l` 统计到 exporter 的连接数"},
+            {"id": "D", "text": "`cat /proc/$(pgrep node_exporter)/status | grep VmRSS` 查看内存占用"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "高基数问题的直接表现是 `/metrics` 响应体异常大。正常的 node_exporter 输出大约 50-300KB，如果某个 collector 暴露了带高基数标签的指标（比如 systemd 服务太多，或者有人把容器 ID 作为标签），响应体可能膨胀到几十 MB 乃至几百 MB，导致 HTTP 响应超时。`curl -s http://localhost:9100/metrics | wc -c` 直接测量字节数，几秒内出结果，是最直接的诊断手段。如果看到超过 10MB，几乎可以确定是基数问题，接下来用 `curl -s ... | grep '^# TYPE' | wc -l` 统计指标族数量，或用 `curl -s ... | awk '{print $1}' | sort | uniq -c | sort -rn | head -20` 找出出现次数最多的指标。A 选项的 CPU 观察需要在采集期间进行，时机难以把握；C 和 D 都与高基数诊断关联不大。"
+        }
+      ],
+      "references": [
+        "https://prometheus.io/docs/instrumenting/writing_exporters/",
+        "https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config",
+        "https://github.com/prometheus/mysqld_exporter",
+        "https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-26.html"
+      ]
+    }
+  ]
+}
