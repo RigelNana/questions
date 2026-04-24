@@ -1,0 +1,157 @@
+{
+  "id": "monitoring-q169",
+  "name": "Prometheus 指标长期存储方案",
+  "domain": "monitoring",
+  "description": "分析 Prometheus 本地存储的局限性，掌握 Thanos、VictoriaMetrics、Cortex/Mimir 等长期存储方案的选型与生产落地实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q169",
+      "domain": "monitoring",
+      "type": "requirement",
+      "difficulty": 3,
+      "tags": ["prometheus", "thanos", "victoriametrics", "cortex", "mimir", "remote_write", "object-storage", "long-term-storage", "tsdb", "downsampling"],
+      "title": "如何实现 Prometheus 指标的长期存储？",
+      "content": "你们公司的微服务平台运行在 Kubernetes 上，部署了 200+ 个服务，当前监控架构是一套 Prometheus + Grafana，抓取间隔 15s，活跃时间序列约 100 万条（1M active series）。本地存储目前配置了 `--storage.tsdb.retention.time=15d`，每台 Prometheus 节点占用约 120GB 磁盘。\n\n最近遇到了三个棘手问题：\n\n**问题一：合规审计要求**。安全团队要求保留 12 个月的指标数据用于安全审计和事后溯源，目前 15 天的 retention 完全不够用。你尝试把 retention 改成 `180d`，Prometheus 节点直接 OOM 重启了。\n\n**问题二：跨实例查询**。你们有 3 套 Prometheus 实例分别负责不同的业务域（应用层、基础设施层、数据库层），研发团队想在同一张 Grafana 面板里做全局 SLO 统计，但 3 个 Prometheus 数据互不相通。\n\n**问题三：容量规划困难**。平台团队想做季度维度的容量趋势分析（比如过去 3 个月 CPU 利用率的 P95 变化趋势），精细到 15s 粒度的数据根本查不动，一条跨 90 天的 `rate()` 查询能让 Prometheus 卡死 30 秒。\n\n现在需要你设计一套**生产可用的 Prometheus 指标长期存储方案**，要求满足：\n- 保留至少 12 个月的历史数据\n- 支持跨 Prometheus 实例的全局查询\n- 长期数据查询响应时间 < 30s（P95）\n- 团队规模：SRE 3 人，运维预算有限，偏好开源方案\n- 当前基础设施：已有 AWS S3 存储桶，Kubernetes 集群\n\n请分析技术方案选型，给出推荐落地方案及关键配置。",
+      "answer": "## 先搞清楚 Prometheus 的存储模型：它为什么天生不适合长期存储\n\nPrometheus 本身是一个为「近期实时监控」设计的系统，它的本地存储引擎 TSDB（Time Series Database）是专门针对「写多读少、时间局部性强」的监控场景优化的。TSDB 把数据按时间分成若干个 2 小时的 block，每个 block 包含一批 chunk 文件（实际的时间序列数据，用 Gorilla 压缩算法编码）和一个 index 文件（标签索引）以及 tombstones 文件（标记待删除的数据）。新写入的数据先进内存中的 WAL（Write-Ahead Log，预写日志）和 head block，每 2 小时刷盘形成一个新 block，老 block 会被后台合并（compaction）成更大的 block。\n\n这套设计对于 15-30 天的 retention 非常高效，但它有三个根本性的局限，让它无法直接作为长期存储使用。\n\n**第一个局限是内存模型决定的扩展上限**。Prometheus 的 head block 永远在内存里，它保存的是「retention 窗口内所有活跃时间序列的最新两小时数据」。1M 活跃 series、每条序列的 head chunk 约占 500-800 字节内存，仅 head block 就要消耗 500MB-800MB。当你把 retention 从 15d 改成 180d，磁盘从 120GB 飙到 1.4TB，同时 Prometheus 的内存使用也会因为 compaction 期间需要加载更多的 index 数据而暴涨，这就是你看到 OOM 的根本原因，不是因为 retention 本身占内存，而是 compaction 时的内存峰值。\n\n**第二个局限是单节点设计**。Prometheus 没有内置的集群模式，每个实例只保存自己抓取的数据，没有副本，挂了就有数据空洞。你要实现 HA 只能部署两个 Prometheus 抓同样的目标（Prometheus Operator 支持这个），但这样查询时要对两份数据去重，普通的 Grafana datasource 做不到这点。\n\n**第三个局限是查询性能在大时间范围下崩溃**。Prometheus 的查询引擎 PromQL 在扫描跨度很大的时间范围时，需要加载 N 个 block 的 chunk 数据到内存，再做计算。90 天 × 1M series × `rate()` 意味着要读取几十 GB 的原始数据，在单机上根本跑不动。\n\n明白了这三个根本问题，才能理解为什么长期存储方案都是「让 Prometheus 只干好它擅长的事——近期数据的高密度写入和查询，把历史数据卸载到更合适的系统里」。\n\n## 长期存储方案全景：四条路，各有适用场景\n\n市面上的方案可以分成两大类：「Prometheus 联邦/分层」和「远程写入（remote_write）到专用长期存储」。前者复杂度高且仍然治标不治本，生产上基本没人用了；后者是主流。remote_write 是 Prometheus 2.0 引入的特性，核心思路是 Prometheus 在本地保留短期数据（15-30d），同时把每一个采样点实时通过 HTTP POST 写入远端存储系统，远端系统负责长期保留和查询。\n\n**方案一：Thanos**，CNCF 孵化项目，目前是开源方案里生产成熟度最高的选择。Thanos 的架构思路是在不改动 Prometheus 的前提下，给它「插上翅膀」。核心组件是 Sidecar：在每个 Prometheus Pod 旁边跑一个 Thanos Sidecar 容器，Sidecar 会监视 Prometheus 本地 TSDB，每当有新的 2 小时 block 刷盘时，Sidecar 就把这个 block 上传到对象存储（S3/GCS/Azure Blob）。长期数据查询通过 Thanos Query 组件完成，Query 能同时查询所有 Prometheus Sidecar（近期数据）和对象存储上的历史 block（通过 Thanos Store Gateway 加载），并自动去重（基于 external labels 区分不同 Prometheus 实例）。Thanos 还提供了 Compactor 组件，负责对象存储上 block 的合并和降采样（downsampling）。\n\nThanos 的优点是和 Prometheus 解耦彻底，Prometheus 完全感知不到 Thanos 的存在；缺点是组件多（Sidecar、Query、Store Gateway、Compactor、Ruler），运维复杂度不低，第一次搭起来要花不少时间。\n\n**方案二：Cortex / Grafana Mimir**，Cortex 是 Grafana Labs 开发的 Prometheus 兼容的微服务化长期存储，Grafana Mimir 是 Cortex 的商业演进版本，2022 年开源。Cortex/Mimir 走的是完全不同的路：它不用 Thanos 那套 block 上传机制，而是通过 remote_write 接收 Prometheus 写入的数据，自己管理对象存储上的 block。Mimir 的架构高度微服务化，适合超大规模（数十亿 series）场景，但对于你们这个规模（1M series，3 人 SRE 团队）来说是过度工程——你至少要维护 Ingester、Querier、Compactor、Store-gateway、Distributor 这五类组件。\n\n**方案三：VictoriaMetrics**，俄罗斯工程师团队开发的高性能时序数据库，Prometheus 兼容。最大的卖点是「单二进制部署」——单节点版本只有一个 `victoria-metrics` 二进制，支持 remote_write 接收写入，支持 MetricsQL（PromQL 超集）查询，内置压缩率比 Prometheus TSDB 高 5-10 倍（得益于更激进的 delta-of-delta 压缩算法）。1M active series 在 VictoriaMetrics 上的内存占用只有 Prometheus 的约 1/3。对于 3 人 SRE 团队来说，VictoriaMetrics 单节点版本的运维成本接近零，高可用版本（vmcluster）也只有 vminsert、vmselect、vmstorage 三个组件。唯一的风险是商业公司主导的开源项目，社区生态不如 Thanos 广。\n\n**方案四：托管服务**，Grafana Cloud（免费层 10k series）、AWS Managed Prometheus（AMP）、Datadog Remote Write。对于有预算的团队可以直接绕过所有运维问题，但成本在 1M series 规模下并不便宜：AWS AMP 在 us-east-1 的价格约 $0.9/million samples，1M series × 4 samples/min = 240M samples/hour，一个月存储费用轻松破万美元。\n\n## 给你的场景的推荐方案：Thanos + S3\n\n结合你的约束（已有 S3、Kubernetes、开源偏好、3 人 SRE 团队、1M series），推荐 **Thanos** 方案。Thanos 在 CNCF 生态里是事实标准，文档齐全，社区大，排查问题容易找到资料。以下是关键配置。\n\n**第一步，给 Prometheus 加 Thanos Sidecar。** 在 Prometheus Pod spec 里加一个 sidecar 容器，注意 `--prometheus.url` 指向同 Pod 的 Prometheus，`--objstore.config-file` 指向包含 S3 配置的 Secret：\n\n```yaml\n# prometheus-deployment.yaml (关键片段)\ncontainers:\n- name: prometheus\n  image: prom/prometheus:v2.51.0\n  args:\n  - --config.file=/etc/prometheus/prometheus.yml\n  - --storage.tsdb.path=/prometheus\n  - --storage.tsdb.retention.time=7d   # 本地只保留 7 天，历史数据靠 Thanos\n  - --storage.tsdb.min-block-duration=2h  # Thanos 要求不能改这个\n  - --storage.tsdb.max-block-duration=2h  # 固定为 2h，防止 block 过大导致上传阻塞\n  - --web.enable-lifecycle\n\n- name: thanos-sidecar\n  image: quay.io/thanos/thanos:v0.35.0\n  args:\n  - sidecar\n  - --prometheus.url=http://localhost:9090\n  - --tsdb.path=/prometheus\n  - --objstore.config-file=/etc/thanos/objstore.yml\n  - --grpc-address=0.0.0.0:10901  # Query 通过这个端口来查近期数据\n  - --http-address=0.0.0.0:10902\n  volumeMounts:\n  - name: prometheus-data\n    mountPath: /prometheus\n  - name: objstore-config\n    mountPath: /etc/thanos\n```\n\n对象存储配置文件 `objstore.yml`：\n\n```yaml\ntype: S3\nconfig:\n  bucket: your-metrics-bucket\n  endpoint: s3.amazonaws.com\n  region: us-east-1\n  # 使用 IAM Role 而不是 AK/SK，安全最佳实践\n  # aws_sdk_auth: true  # 让 SDK 自动从 EC2 Instance Profile 或 IRSA 获取凭证\n  # 如果必须用 AK/SK，放在 Kubernetes Secret 里，不要硬编码\n  access_key: ${S3_ACCESS_KEY}\n  secret_key: ${S3_SECRET_KEY}\n  sse_config:\n    type: SSE-S3  # S3 服务端加密，合规审计要求\n```\n\n**第二步，配置 Prometheus remote_write（可选但推荐）**。Sidecar 的上传是「block 刷盘后上传」，有最长 2 小时的延迟。如果你需要长期存储数据实时可查，可以同时开 remote_write 写入一套 VictoriaMetrics 作为缓冲，但对于大多数场景，2 小时的延迟完全可以接受。\n\n如果使用 remote_write，一定要配好队列参数，否则在高负载下很容易积压导致 Prometheus 内存暴涨：\n\n```yaml\n# prometheus.yml\nremote_write:\n- url: http://victoriametrics:8428/api/v1/write\n  queue_config:\n    capacity: 100000        # 本地队列容量，防止 remote 端慢时积压在内存\n    max_shards: 200         # 最大并发写入 goroutine 数\n    min_shards: 1\n    max_samples_per_send: 10000  # 每次批量发送的最大样本数\n    batch_send_deadline: 5s      # 即使队列没满，5s 也强制发送一次\n    min_backoff: 30ms\n    max_backoff: 5s         # 失败后指数退避的上限\n  metadata_config:\n    send: true\n    send_interval: 1m\n```\n\n**第三步，部署 Thanos Query + Store Gateway**。Query 是查询入口，Store Gateway 负责把 S3 上的历史 block 按需加载到内存：\n\n```bash\n# Thanos Query，配置 sidecar 地址和 store gateway 地址\nthanos query \\\n  --grpc-address=0.0.0.0:10901 \\\n  --http-address=0.0.0.0:10902 \\\n  --endpoint=prometheus-0.prometheus-headless:10901 \\\n  --endpoint=prometheus-1.prometheus-headless:10901 \\\n  --endpoint=thanos-store-gateway:10901 \\\n  --query.replica-label=prometheus_replica  # 用这个 label 去重\n\n# Thanos Store Gateway\nthanos store \\\n  --data-dir=/data/store \\\n  --objstore.config-file=/etc/thanos/objstore.yml \\\n  --grpc-address=0.0.0.0:10901 \\\n  --index-cache-size=250MB   # 索引缓存，直接影响查询速度\n  --chunk-pool-size=2GB       # chunk 数据缓存池\n```\n\n**第四步，配置 Thanos Compactor 做降采样（downsampling）**。这是解决「长时间范围查询慢」的关键。Compactor 会对 S3 上的 block 做两级降采样：40 天以上的数据降为 5 分钟分辨率，10 个月以上的数据降为 1 小时分辨率。这样一条跨 6 个月的 `avg_over_time()` 查询，实际只需要扫描 1h 分辨率的数据，数据量减少 240 倍（从 15s 到 1h），查询从 30 秒降到 2 秒以内。\n\n```bash\nthanos compact \\\n  --data-dir=/data/compact \\\n  --objstore.config-file=/etc/thanos/objstore.yml \\\n  --retention.resolution-raw=30d   # 原始精度（15s）保留 30 天\n  --retention.resolution-5m=90d    # 5 分钟精度保留 90 天\n  --retention.resolution-1h=365d   # 1 小时精度保留 1 年\n  --wait        # 持续运行模式\n  --wait-interval=30m\n```\n\n## 存储成本估算与选型对比\n\n以 1M active series、15s 抓取间隔、保留 12 个月为基准做成本估算。Prometheus TSDB 的压缩率约为每个样本 1.3 字节，1M series × 4 samples/min × 60 × 24 × 30 = 172.8 亿样本/月，约 22.5GB/月原始数据。12 个月约 270GB，加上降采样数据约 320GB。S3 标准存储在 us-east-1 的价格是 $0.023/GB，一年的存储费用约 **$90/年**，加上 PUT 请求费用约 $50/年，合计 **$140/年**，极其便宜。\n\n相比之下，Grafana Cloud 免费层只有 10k series，超出部分收费 $8/month/1000 series，990k 超出 series 一个月就是 $7,920，一年近十万美元，完全不可接受。AWS AMP 的价格也在同等量级。对于 1M series 的规模，**自建方案（Thanos/VictoriaMetrics + S3）是唯一经济可行的选择**。\n\n如果你们的 SRE 团队对运维复杂度特别敏感，VictoriaMetrics 单节点版本是比 Thanos 更简单的替代——部署一个容器，挂一块大磁盘，配好 remote_write 就能用。1M series 在 VictoriaMetrics 上的内存用量约 2GB，每天写入量约 750MB，12 个月数据约 270GB（内置压缩比 Prometheus 更高，实际约 100-150GB）。缺点是没有对象存储卸载，磁盘需要本地高可用；生产上通常用 vmcluster 做 3 副本，总存储成本是 3× 但运维成本远低于 Thanos。\n\n## 备份、容灾与 retention 分层\n\n一个经常被忽视的生产问题是：S3 上的监控数据本身的容灾。一旦 S3 bucket 被误删（这比你想象的更常见——有人在压测环境清理 bucket 的时候手滑删了生产），12 个月的历史数据就没了。正确做法是开启 S3 versioning + MFA Delete 保护，同时考虑跨区域复制（CRR）到另一个 region。每月额外 S3 复制费用约 $30，是很便宜的保险。\n\n另一个实践是按指标类别设置不同的 retention。不是所有指标都需要保存 12 个月。容量规划类指标（CPU、内存、磁盘利用率）需要 12 个月；SLO 相关指标（错误率、延迟 P99）需要 12 个月；临时调试用的指标（某次发布加的临时 debug 指标）只需要 30 天。在 Thanos Compactor 里可以通过 `--selector.relabel-config` 对不同 label 的 series 应用不同的 retention 策略，但更实用的做法是在 Prometheus 的 `remote_write` 里用 `write_relabel_configs` 只把需要长期保留的指标写入长期存储，临时指标只存本地 15 天。这样长期存储的数据量可以减少 30-50%，显著降低成本和查询复杂度。",
+      "keyPoints": [
+        "Prometheus TSDB 的 head block 常驻内存，1M active series 约消耗 500-800MB；增大 retention 导致 OOM 的根本原因是 compaction 期间的内存峰值，而非数据本身占内存",
+        "Thanos Sidecar 在不修改 Prometheus 的前提下，将每个 2h block 刷盘后自动上传到 S3/GCS，本地 retention 可以缩短到 7 天，历史数据通过 Store Gateway 按需从对象存储加载查询",
+        "Thanos Compactor 的降采样（downsampling）是解决长时间范围查询慢的关键：40 天以上数据降为 5m 精度，10 个月以上降为 1h 精度，跨 6 个月的查询数据量减少 240 倍",
+        "remote_write 的 queue_config 必须显式配置 capacity、max_shards、max_samples_per_send，否则在 remote 端慢时 Prometheus 内存会因队列积压而无限增长",
+        "1M active series + 12 个月保留 + S3 存储的年成本约 $140，而同等规模使用 Grafana Cloud 托管服务的年成本超过 $90,000；自建方案在这个规模下是唯一经济可行的选择",
+        "VictoriaMetrics 单节点版本是运维成本最低的替代方案，内置压缩率比 Prometheus TSDB 高 5-10 倍，1M series 内存占用约 2GB，适合 SRE 团队规模小、偏好单一进程的场景",
+        "对象存储上的监控数据需要开启 S3 versioning + MFA Delete 保护，防止误删造成历史数据永久丢失；使用 write_relabel_configs 只将需要长期保留的指标写入长期存储，临时调试指标仅保留本地短期数据，可降低 30-50% 存储成本"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q169-q1",
+          "question": "Prometheus 默认的本地存储保留时间是多少？",
+          "choices": [
+            {"id": "A", "text": "7 天"},
+            {"id": "B", "text": "15 天"},
+            {"id": "C", "text": "30 天"},
+            {"id": "D", "text": "90 天"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Prometheus 的默认 retention 是 15 天，对应启动参数 `--storage.tsdb.retention.time=15d`。这个默认值是 Prometheus 团队认为对大多数「实时告警和短期趋势分析」场景足够的时长。超过这个时间的数据会被定期清理（compaction 时删除过期 block）。选项 A（7 天）是很多团队为了配合 Thanos 而主动缩短的本地 retention，但不是默认值；选项 C 和 D 需要手动配置且在大规模场景下容易导致内存问题。"
+        },
+        {
+          "id": "monitoring-q169-q2",
+          "question": "Thanos Sidecar 在什么时机将数据上传到对象存储？",
+          "choices": [
+            {"id": "A", "text": "每条指标采样后实时上传"},
+            {"id": "B", "text": "每分钟批量上传最新样本"},
+            {"id": "C", "text": "每当 Prometheus 生成新的 2h block 并刷盘时上传"},
+            {"id": "D", "text": "每天凌晨定时全量上传当日数据"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Thanos Sidecar 监视 Prometheus 的 TSDB 目录，当 Prometheus 完成一个 2h block 的写入并刷盘时，Sidecar 检测到新 block 出现，将其上传到 S3/GCS 等对象存储。这意味着通过 Thanos Store Gateway 查询的对象存储数据最多有约 2 小时的延迟（最新 2 小时仍在 Prometheus head block 里，通过 Sidecar gRPC 接口实时查询）。选项 A 会产生海量 HTTP 请求，成本和延迟都不可接受；选项 B 的分钟级上传不符合 TSDB block 机制；选项 D 的全量上传会有大量重复数据。"
+        },
+        {
+          "id": "monitoring-q169-q3",
+          "question": "Thanos Compactor 的降采样（downsampling）功能中，默认配置下 40 天以上的历史数据会被降采样到什么精度？",
+          "choices": [
+            {"id": "A", "text": "1 分钟分辨率"},
+            {"id": "B", "text": "5 分钟分辨率"},
+            {"id": "C", "text": "10 分钟分辨率"},
+            {"id": "D", "text": "1 小时分辨率"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Thanos Compactor 支持两级降采样：第一级是 5 分钟（5m）分辨率，第二级是 1 小时（1h）分辨率。通过 `--retention.resolution-5m` 参数配置 5m 精度数据的保留期，超过该期限的数据只保留 1h 精度。对于「40 天以上数据」，通常配置保留 5m 精度（如 `--retention.resolution-5m=90d`），再老的数据才降为 1h。注意降采样会生成新的 block 和原始 block 共存，Thanos Query 会自动选择最合适精度的数据来回答不同时间范围的查询。"
+        },
+        {
+          "id": "monitoring-q169-q4",
+          "question": "在 Prometheus 的 remote_write 配置中，`queue_config.capacity` 参数的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "限制 remote_write 的最大发送速率（samples/second）"},
+            {"id": "B", "text": "控制本地内存队列的容量，防止 remote 端慢时无限积压"},
+            {"id": "C", "text": "设置每次 HTTP 请求的超时时间"},
+            {"id": "D", "text": "限制写入 remote 端的最大时间序列数量"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`queue_config.capacity` 设置每个 shard 的本地内存队列容量（样本数）。当 remote 端（如 VictoriaMetrics）处理慢或暂时不可用时，Prometheus 会把待发送的样本放入本地队列。如果不设置上限，队列会无限增长，最终导致 Prometheus OOM。当队列满时，Prometheus 会开始丢弃最新的样本（而不是阻塞采样），这是可接受的降级策略。选项 A 描述的是 `max_samples_per_send` 和 `max_shards` 共同影响的吞吐率；选项 C 是 `remote_timeout` 参数；选项 D 没有对应的配置项。"
+        },
+        {
+          "id": "monitoring-q169-q5",
+          "question": "以下是 Thanos Store Gateway 的一条启动日志，请判断问题所在：\n\n```\nlevel=warn msg=\"index cache full, evicting entries\" \ncache_size=250MB used=249.8MB hit_rate=0.12\n```\n\n这条日志说明了什么？",
+          "choices": [
+            {"id": "A", "text": "Store Gateway 的磁盘空间不足，需要扩容 data-dir"},
+            {"id": "B", "text": "index cache 太小，导致大量缓存未命中，历史数据查询会很慢"},
+            {"id": "C", "text": "对象存储连接失败，无法加载 block 的 index 文件"},
+            {"id": "D", "text": "Thanos Compactor 没有正确合并 block，导致 index 过大"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "日志显示 `--index-cache-size=250MB` 的 index cache 已经用满（249.8MB），且命中率只有 0.12（12%），说明大量查询需要从对象存储重新加载 index 数据，导致查询延迟很高。index cache 保存的是 block 的标签索引，命中率越低意味着每次查询都要走 S3，往返延迟约 50-100ms，严重拖慢查询响应时间。解决方案是把 `--index-cache-size` 调大（一般建议 1-4GB），或者使用 Memcached 作为外部 index cache。选项 A 误解了 cache 和 data-dir 的关系；选项 C 应该有连接错误日志；选项 D 与 index cache 无关。"
+        },
+        {
+          "id": "monitoring-q169-q6",
+          "question": "团队决定把 Prometheus 的本地 retention 从 15d 改成 30d 来「省事」，不用部署 Thanos。以下哪个风险描述是最准确的？",
+          "choices": [
+            {"id": "A", "text": "30d retention 完全可行，只是磁盘占用翻倍，没有其他风险"},
+            {"id": "B", "text": "compaction 期间的内存峰值会远超平时内存使用，可能在业务高峰叠加 compaction 时触发 OOM"},
+            {"id": "C", "text": "Prometheus 不支持超过 15d 的 retention，这是硬限制"},
+            {"id": "D", "text": "30d retention 会导致 WAL 文件无限增长，最终耗尽磁盘"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Prometheus 支持任意长度的 retention（没有 15d 硬限制，选项 C 错误），但扩大 retention 的真实风险在于内存。Prometheus 后台 compaction 时会把多个旧 block 读入内存进行合并，旧 block 的 index 越大内存占用越高。在高写入负载 + compaction 叠加的时间窗口，内存峰值可能达到平时的 2-3 倍，在内存本来就偏紧的节点上就会 OOM。WAL 文件大小跟 retention 无关（WAL 只保留约 2h 的数据用于 crash recovery），所以选项 D 也是错的。最安全的方式是在 retention 增大的同时，同步把 Prometheus 的内存 limit 也提高 50-100%，并在非高峰期观察内存峰值后再决定是否上线。"
+        },
+        {
+          "id": "monitoring-q169-q7",
+          "question": "在 1M active series、12 个月保留期的场景下，对比 VictoriaMetrics 自建和 AWS Managed Prometheus（AMP）托管方案，哪种说法最准确？",
+          "choices": [
+            {"id": "A", "text": "AMP 更贵但运维成本为零，对于 1M series 规模的团队综合 TCO 更低"},
+            {"id": "B", "text": "两者成本相近，主要区别在于 SLA 和技术支持"},
+            {"id": "C", "text": "VictoriaMetrics 自建在存储成本上比 AMP 便宜约 100 倍，1M series 规模下两者成本差距在数量级以上"},
+            {"id": "D", "text": "AMP 对 PromQL 兼容性更好，VictoriaMetrics 的 MetricsQL 不兼容 Grafana"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "以 1M active series、15s 抓取间隔为基准，每月产生约 172.8 亿样本。AWS AMP 按 $0.9/100M samples 计费（写入费用），月写入费用约 $155，存储费用另计，年费用约 $2,000-3,000 美元（不含数据传输）。而 VictoriaMetrics 自建 + S3 存储的年成本约 $140-200，差距约 10-20 倍，在这个规模下差距是显著的。选项 A 高估了 AMP 的 TCO 优势，对于有基本 SRE 能力的团队，VictoriaMetrics 的运维负担极低。选项 D 是错的，MetricsQL 是 PromQL 超集，Grafana 的 Prometheus datasource 完全兼容。"
+        },
+        {
+          "id": "monitoring-q169-q8",
+          "question": "生产环境中，Thanos Query 开启了 `--query.replica-label=prometheus_replica` 参数，其作用是什么？",
+          "choices": [
+            {"id": "A", "text": "指定哪台 Prometheus 作为主节点，其他作为只读备节点"},
+            {"id": "B", "text": "告诉 Query 组件用这个 label 来识别并去重来自多个 Prometheus 副本的相同数据"},
+            {"id": "C", "text": "限制只查询带有 prometheus_replica label 的时间序列"},
+            {"id": "D", "text": "设置 Prometheus 实例之间数据同步的 topic 名称"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 Prometheus HA 部署中，两个 Prometheus 实例抓取同样的 targets，产生完全相同的数据，只是 external label 里的 `prometheus_replica` 值不同（比如一个是 `replica-0`，另一个是 `replica-1`）。Thanos Query 通过 `--query.replica-label=prometheus_replica` 参数知道「这个 label 用于区分副本，在合并结果时要按 series 的其他 label 去重，只保留一份」，这样从两个副本查出来的相同数据不会被叠加计数。没有这个参数，同一个指标的值会翻倍。选项 A 描述的是 master-slave 架构，Thanos 不是这种模式；选项 C 描述的是 label selector；选项 D 完全不相关。"
+        },
+        {
+          "id": "monitoring-q169-q9",
+          "question": "在配置 Thanos Compactor 的降采样 retention 时，以下哪种配置是错误的？",
+          "choices": [
+            {"id": "A", "text": "`--retention.resolution-raw=30d --retention.resolution-5m=90d --retention.resolution-1h=365d`"},
+            {"id": "B", "text": "`--retention.resolution-raw=90d --retention.resolution-5m=30d --retention.resolution-1h=365d`"},
+            {"id": "C", "text": "`--retention.resolution-raw=0d --retention.resolution-5m=0d --retention.resolution-1h=0d`（全部永久保留）"},
+            {"id": "D", "text": "`--retention.resolution-raw=7d --retention.resolution-5m=60d --retention.resolution-1h=365d`"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 的配置逻辑矛盾：raw 精度（原始 15s）保留 90 天，但 5m 精度只保留 30 天。这意味着 30-90 天的历史数据只有 raw 精度可用，而 5m 降采样数据反而先被删了，既浪费存储又破坏了降采样的意义。正确的配置应该保证「精度越低保留越久」：raw < 5m < 1h 的保留期应该递增。选项 A 是最典型的生产配置；选项 C 使用 0d 代表永久保留，是合法的（意味着不根据时间自动清理）；选项 D 也是合理配置，raw 精度 7 天（配合 Prometheus 本地 7d retention），5m 保留 60 天，1h 保留 1 年。"
+        },
+        {
+          "id": "monitoring-q169-q10",
+          "question": "某天 Thanos Query 返回报错：`partial response: store gateway is not ready`，同时 Grafana 面板上超过 30 天的历史数据无法加载，但 7 天内的数据正常。最可能的原因是什么，应如何排查？",
+          "choices": [
+            {"id": "A", "text": "Prometheus Sidecar 崩溃，新数据无法上传到 S3，导致历史数据断档"},
+            {"id": "B", "text": "Thanos Store Gateway 正在启动或重启，index cache 尚未加载完成，处于 not-ready 状态"},
+            {"id": "C", "text": "S3 Bucket 的访问权限被修改，Store Gateway 无法读取历史 block"},
+            {"id": "D", "text": "Thanos Compactor 正在进行 compaction，对象存储数据被锁定无法查询"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Thanos Store Gateway 启动时需要扫描 S3 bucket 中所有 block 的 meta.json 并加载 index，这个初始化过程在数据量大时（如 1 年历史数据）可能耗时 5-20 分钟，期间 Store Gateway 会返回 not-ready。Thanos Query 的 `--no-query.partial-response` 默认允许 partial response，即历史数据不可用时仍返回近期数据，这解释了为什么 7 天内数据正常但历史数据不可用。排查步骤：`kubectl logs thanos-store-gateway` 查看启动进度，等待 `msg=\"all blocks loaded\"` 日志出现后历史数据会自动恢复。选项 C（S3 权限问题）会有明确的 `AccessDenied` 错误日志，而不是 not-ready；选项 D 是误解，Compactor 加锁只影响 Compactor 自身不重复运行，不影响 Store Gateway 读取。"
+        }
+      ],
+      "references": [
+        "https://thanos.io/tip/thanos/quick-tutorial.md/",
+        "https://docs.victoriametrics.com/single-server-victoriametrics/",
+        "https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write",
+        "https://grafana.com/oss/mimir/",
+        "https://thanos.io/tip/components/compact.md/#downsampling"
+      ]
+    }
+  ]
+}
