@@ -1,0 +1,279 @@
+{
+  "id": "elasticsearch-log-query",
+  "name": "Elasticsearch 日志查询性能优化",
+  "domain": "troubleshooting",
+  "description": "ES 日志系统查询慢的诊断方法、索引设计优化与冷热分层存储策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "elasticsearch-log-query-1",
+      "domain": "troubleshooting",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["elasticsearch", "kibana", "logging", "ilm", "shard", "performance", "mapping", "inverted-index"],
+      "title": "Elasticsearch 日志查询越来越慢，如何优化 10TB 日志集群的查询性能？",
+      "content": "团队的日志系统运行了两年，Elasticsearch 集群从最初的 500GB 膨胀到了 10TB，节点数也从 3 个扩展到了 12 个。但随着数据量的增长，Kibana 里的查询变得越来越慢——配置什么都没动，就是慢了。\n\n最近 SRE 在追一个线上故障时，需要在 Kibana 里搜索过去 24 小时内 `level:error` 的日志，转圈超过 30 秒才返回结果，有时甚至直接超时。你打开 ES 集群的监控面板，看到查询期间 CPU 飙到了 70%，JVM heap 使用率常态维持在 80% 以上，GC 每隔几秒就触发一次。\n\n仔细检查索引的情况，发现更多问题：当初设计时图省事，所有日志都写入一个名为 `app-logs` 的单一索引，从没按时间分割；mapping 是动态映射自动生成的，`request_url`、`client_ip` 等字段被自动映射成了 `text` 类型，同时带有 keyword 子字段；shard 数量设成了 20，但数据从未做过分层，每个 shard 现在大约有 500GB；更糟的是，团队成员习惯在 Kibana 里用 `*error*` 这样前后都带通配符的 wildcard 查询来搜关键字。\n\n现在的需求是：日志保留 90 天，每天新增约 200GB；常用的时间范围加关键字过滤查询必须在 5 秒内返回结果；成本不能无限堆硬件。请你分析这个集群查询慢的根本原因，并给出从索引设计、mapping 优化、查询写法到冷热分层存储的完整优化方案。",
+      "answer": "## 一、先理解 Elasticsearch 的数据存储模型\n\nES 是构建在 Lucene 之上的分布式搜索引擎。要真正诊断它的性能问题，必须先理解它的存储原理，而不是靠经验瞎调参数。\n\nLucene 的核心数据结构是倒排索引（inverted index）。所谓倒排索引，就是把「词 → 文档列表」这个映射关系预先存下来。搜索某个关键词时，不需要扫描所有文档，直接查这张「词表」就能拿到所有包含这个词的文档 ID 列表，再去取对应的文档。这就是全文搜索快的根本原因：它本质上是一次哈希查找加上有序列表的归并，而不是全表扫描。\n\n但倒排索引有一个天生的局限：它是为「找到哪些文档包含这个词」优化的，不擅长「统计每个字段值出现多少次」。做 terms aggregation 时，ES 用的是另一套数据结构——`doc_values`，本质是列式存储（column store），把每个文档的某个字段值按列组织在一起，专门为排序和聚合设计，工作原理类似于列数据库。`doc_values` 默认对 keyword 和数值类型字段开启，对 text 类型字段关闭（text 用的是 fielddata，会占用大量 JVM heap）。\n\nLucene 的另一个关键概念是 segment（段）。写入 ES 的数据先进内存缓冲区，每隔 1 秒（默认 `refresh_interval`）被刷新成一个不可变的 segment 文件落到磁盘。每次搜索，协调节点需要把所有 shard 上的所有 segment 的结果合并起来返回。Segment 越多，搜索时的合并开销就越大。为此，Lucene 会在后台把小 segment 合并成大 segment，这个 merge 过程会消耗大量磁盘 I/O 和 CPU，跟查询竞争资源。\n\n最后是 shard（分片）。ES 的每个 shard 就是一个完整的 Lucene 实例，是 ES 并行处理的基本单元。查询时每个 shard 独立执行搜索，结果在协调节点汇总。但 shard 不是越多越好——每个 shard 有固定的 overhead：JVM 对象、文件句柄、merge 线程、内存中缓存的 segment 元数据。Shard 过多，这些 overhead 累积起来会在 GC 和查询合并阶段产生明显的延迟放大效应。官方经验值是每个 shard 控制在 10–50GB，理想目标是 20–40GB。\n\n## 二、逐一定位这个集群的性能根因\n\n有了这些基础认知，再回头看题目里的集群，根因就一清二楚了。\n\n**根因一：单个 shard 500GB，严重超标。** 20 个 shard，每个 500GB，JVM 需要缓存海量的 segment 元数据和 filter cache，heap 自然常态 80%，GC 自然频繁。每次查询还要在一个 500GB 的 Lucene 实例里执行，根本无法高效利用 ES 的并行能力。正确的设计是索引按天 rollover，每天约 200GB，配合每天 2 个 shard，单 shard 大约 100GB，仍然偏大但在可接受范围内；随着 ILM 进入 warm 阶段再 shrink 成 1 个 shard，就完全达标了。\n\n**根因二：wildcard 查询 `*error*` 是性能杀手。** 这是面试里最常被忽略的坑。前后都带通配符的查询（`*xxx*`）无法利用倒排索引，ES 必须对每个 segment 里的所有词项逐一做正则匹配，时间复杂度是 O(所有词项总数)。10TB 的数据里可能有数以亿计的独特词项，这个扫描会直接把所有 shard 的 CPU 全部打满。正确做法是：如果要搜 `message` 字段里的错误关键字，用全文检索的 `match` 查询，它对搜索词做分词后查倒排索引；如果是精确匹配有限枚举值的字段（比如 `level`），用 `term` 查询 keyword 类型字段，性能是 wildcard 的几个数量级之差。\n\n**根因三：mapping 设计不当，高基数字段用了 text 类型。** `request_url` 这类高基数字段（cardinality 极高，意味着每条日志的 URL 几乎都不同）如果被映射成 `text`，Lucene 会对它做全文分词，索引里会产生海量词项（`api`、`v1`、`users`、`12345` 等每个 token 都是独立词项），这不仅极大膨胀了索引大小，在做聚合时还会使用 JVM heap 里的 fielddata，内存消耗不可控，严重时会直接 OOM。对于 URL、IP、trace ID 这类字段，应该只映射成 `keyword`（或 ES 内置的 `ip` 类型），不需要全文分词，也应该根据是否需要聚合来决定是否开 `doc_values`。\n\n**根因四：没有冷热分层，历史数据白白占用 SSD 资源。** 90 天的历史日志全部压在同样的热节点上，每天查询的只有最近 1–3 天的数据，90 天前的日志几乎没人看，却消耗同等昂贵的 SSD 存储和内存资源，这是对资源的极大浪费。\n\n### 正确的 mapping 设计\n\n先定义一个合理的 index template，从根本上解决类型问题：\n\n```json\nPUT _index_template/app-logs-template\n{\n  \"index_patterns\": [\"app-logs-*\"],\n  \"template\": {\n    \"settings\": {\n      \"number_of_shards\": 2,\n      \"number_of_replicas\": 1,\n      \"refresh_interval\": \"5s\",\n      \"index.search.slowlog.threshold.query.warn\": \"5s\",\n      \"index.search.slowlog.threshold.query.info\": \"2s\"\n    },\n    \"mappings\": {\n      \"dynamic\": \"strict\",\n      \"properties\": {\n        \"@timestamp\":       { \"type\": \"date\" },\n        \"level\":           { \"type\": \"keyword\" },\n        \"service\":         { \"type\": \"keyword\" },\n        \"message\":         { \"type\": \"text\" },\n        \"client_ip\":       { \"type\": \"ip\" },\n        \"request_url\":     { \"type\": \"keyword\" },\n        \"response_time_ms\": { \"type\": \"long\" },\n        \"trace_id\": {\n          \"type\": \"keyword\",\n          \"doc_values\": false\n        }\n      }\n    }\n  }\n}\n```\n\n这里几个关键决策值得解释。`@timestamp` 必须是 `date` 类型，不能是 `keyword`——date 类型底层用的是 BKD 树（Block K-d Tree，一种多维范围索引），时间范围查询直接走树索引，性能极好；keyword 类型没有范围索引，时间范围查询会退化成扫描。`dynamic: strict` 阻止动态 mapping 自动创建字段，防止新字段意外被映射成不恰当类型。`trace_id` 只用于精确查找，不用于聚合，因此关掉 `doc_values` 可以节省约 15–20% 的磁盘空间，在 10TB 集群上相当可观。不需要全文搜索的字段也可以加上 `\"index\": false` 彻底关掉倒排索引，进一步减小索引体积。\n\n### ILM 策略：实现冷热分层\n\n按天 rollover 加上 ILM 是解决数据增长问题的标准方案。策略配置如下：\n\n```json\nPUT _ilm/policy/app-logs-policy\n{\n  \"policy\": {\n    \"phases\": {\n      \"hot\": {\n        \"min_age\": \"0ms\",\n        \"actions\": {\n          \"rollover\": {\n            \"max_size\": \"40gb\",\n            \"max_age\": \"1d\"\n          },\n          \"set_priority\": { \"priority\": 100 }\n        }\n      },\n      \"warm\": {\n        \"min_age\": \"7d\",\n        \"actions\": {\n          \"shrink\": { \"number_of_shards\": 1 },\n          \"forcemerge\": { \"max_num_segments\": 1 },\n          \"allocate\": {\n            \"require\": { \"box_type\": \"warm\" }\n          },\n          \"set_priority\": { \"priority\": 50 }\n        }\n      },\n      \"cold\": {\n        \"min_age\": \"30d\",\n        \"actions\": {\n          \"freeze\": {},\n          \"allocate\": {\n            \"require\": { \"box_type\": \"cold\" }\n          },\n          \"set_priority\": { \"priority\": 0 }\n        }\n      },\n      \"delete\": {\n        \"min_age\": \"90d\",\n        \"actions\": { \"delete\": {} }\n      }\n    }\n  }\n}\n```\n\nWarm 阶段的 `forcemerge` 是精髓所在。当一个索引不再接收写入时，它的 segment 就可以合并成 1 个大 segment，彻底消除多 segment 合并的查询 overhead。`forcemerge` 到 `max_num_segments: 1` 对于只读历史索引的查询性能提升非常显著。`shrink` 则把 2 个 shard 收缩成 1 个，减少 warm 节点上的 shard overhead。Freeze（冻结）操作让索引常驻磁盘、不占 JVM heap，只在收到查询请求时才按需加载，用少量的查询延迟换取大量的内存节省，对于 30 天以上几乎没人看的历史日志非常合适。\n\n### 查询写法：全面使用 filter 代替 query\n\n日志场景里绝大多数过滤条件（时间范围、level、service）不需要计算相关性分数，一律应该用 `filter` 而不是 `must`：\n\n```json\nGET app-logs-*/_search\n{\n  \"query\": {\n    \"bool\": {\n      \"filter\": [\n        { \"range\": { \"@timestamp\": { \"gte\": \"now-24h\", \"lte\": \"now\" } } },\n        { \"term\":  { \"level\": \"error\" } },\n        { \"term\":  { \"service\": \"payment\" } }\n      ],\n      \"must\": [\n        { \"match\": { \"message\": \"connection refused\" } }\n      ]\n    }\n  }\n}\n```\n\n`filter` 上下文的结果会被 ES 的 filter cache 缓存，相同的过滤条件第二次执行直接命中缓存，对于高频查询模式（比如监控大盘每 30 秒刷一次同样时间窗口的同一个服务的错误数），缓存命中率很高，效果立竿见影。只有 `message` 需要全文搜索相关性时，才放入 `must`。\n\n## 三、进阶手段与扩展思考\n\n以上优化能解决大部分问题，但在极端场景下还有几个进阶手段值得了解。\n\n对于历史只读索引，除了在 ILM warm 阶段自动执行 forcemerge，也可以手动触发：`POST app-logs-2024.01.01/_forcemerge?max_num_segments=1`。注意绝对不能对还在写入的 hot 索引执行 forcemerge，否则 merge 线程会跟写入线程激烈竞争 I/O，引起写入延迟飙升。\n\nES 8.x 的 Async Search API 对于超长查询（跨度超过 30 天的历史聚合）很实用，可以改为异步执行，先拿到一个查询 ID，后续轮询结果，彻底绕开客户端超时的问题。\n\nJVM heap 的调优是 ES 稳定性的基础，这里有一个反直觉的陷阱：heap 应该设为物理内存的一半，但不能超过 32GB。原因是 JVM 在 heap 小于约 32GB 时会启用 Compressed OOPs（指针压缩），把 64 位对象指针压缩成 32 位存储，内存效率大幅提升；一旦 heap 超过 32GB，指针压缩被迫关闭，每个对象引用多占 4 字节，同样物理内存能装下的对象反而更少，是一个非常真实的生产坑。\n\n最后值得提到的是 Grafana Loki 作为替代方案的场景。Loki 不对日志内容做全文索引，只索引少量标签（服务名、环境、pod 等），存储成本比 ES 低一个数量级。如果你的查询模式主要是「按标签过滤 + 关键字 grep」，Loki 可能是更合适、更经济的选择。10TB 的 ES 集群迁到 Loki 后，存储成本可以降到原来的约 1/5。但 Loki 不支持复杂 aggregation 和 fuzzy 全文搜索，两者的功能差距是真实存在的，选型时需要根据实际查询需求权衡。",
+      "keyPoints": [
+        "Elasticsearch 的倒排索引使全文搜索高效，但前后都带通配符的 wildcard 查询（如 `*error*`）无法利用倒排索引，会退化成对所有词项的全量扫描，在 TB 级数据下会把 CPU 打满。",
+        "`@timestamp` 字段必须映射为 `date` 类型而非 `keyword`，因为 date 类型底层使用 BKD 树索引，时间范围查询走树遍历而非全量扫描，性能差距可达数个数量级。",
+        "每个 ES shard 就是一个完整的 Lucene 实例，都有固定的 JVM 内存 overhead；官方建议单 shard 控制在 20–40GB，500GB 的 shard 会导致 heap 持续高压、GC 频繁、查询延迟累积放大。",
+        "filter 上下文的查询结果会被 ES 的 filter cache 缓存，对于日志查询中不需要相关性评分的过滤条件（时间范围、level、service），应全部放入 `filter` 而非 `must`，可显著提高重复查询的响应速度。",
+        "Index Lifecycle Management（ILM）配合按天 rollover 是管理日志集群生命周期的标准方案：hot 节点（SSD）存近 7 天，warm 节点（HDD）存 7–30 天并执行 forcemerge 和 shrink，cold 节点或 freeze 存 30–90 天，到期自动删除。",
+        "对只读的历史索引执行 `forcemerge?max_num_segments=1` 可以把大量小 segment 合并成单个 segment，彻底消除多 segment 查询合并的 overhead，对 warm 阶段索引的查询性能提升非常显著，但绝不能在仍在写入的 hot 索引上执行。",
+        "ES 的 JVM heap 设置存在一个反直觉的 32GB 上限陷阱：超过约 32GB 时 JVM 关闭 Compressed OOPs（指针压缩），每个对象引用多占 4 字节，导致实际可用内存容量反而低于 31GB heap，生产中 heap 应设为物理内存一半且不超过 32GB。",
+        "`index.search.slowlog.threshold.query.warn: 5s` 配置会把超过 5 秒的查询完整记录到 slowlog 文件（含 DSL 和执行时间），是定位具体慢查询根源、分析是哪条查询语句引发问题的第一手排查工具。"
+      ],
+      "quiz": [
+        {
+          "id": "elasticsearch-log-query-1-q1",
+          "question": "Elasticsearch 的倒排索引（inverted index）最适合解决哪类查询，对哪类操作性能较差？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "最适合全文搜索（查哪些文档包含某个词），对高基数字段的聚合统计（如 terms aggregation）性能较差，聚合依赖 doc_values 列式存储"
+            },
+            {
+              "id": "B",
+              "text": "最适合范围查询（时间、数值范围），对全文搜索性能较差，因为倒排索引无法处理词语匹配"
+            },
+            {
+              "id": "C",
+              "text": "最适合聚合统计，对精确匹配查询性能较差，因为需要扫描所有文档"
+            },
+            {
+              "id": "D",
+              "text": "最适合精确 term 查询，对全文搜索和聚合性能都很差，需要额外的 fielddata 支持"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "倒排索引本质是「词 → 文档列表」的映射，全文搜索时通过词查文档，效率极高，相当于哈希查找加有序列表归并。但聚合统计（如统计每个 IP 的出现次数）需要遍历每个文档的字段值，倒排索引帮不上忙，ES 为此设计了 doc_values（列式存储），专门为排序和聚合优化。B 选项搞反了，时间范围查询用的是 BKD 树索引，不是倒排索引的核心能力。C、D 选项对倒排索引的理解完全错误。"
+        },
+        {
+          "id": "elasticsearch-log-query-1-q2",
+          "question": "ES 官方建议单个 shard 的大小控制在什么范围，这个建议背后的核心原因是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "10–50GB，理想 20–40GB；因为每个 shard 是一个完整的 Lucene 实例，有固定的 JVM 内存 overhead，shard 过大会导致内存压力和 GC 频繁，shard 过多则 overhead 累积放大"
+            },
+            {
+              "id": "B",
+              "text": "不超过 1GB；因为 shard 越小，查询并行度越高，性能越好，所以应该尽量把 shard 切小"
+            },
+            {
+              "id": "C",
+              "text": "没有固定建议，越大越好；大 shard 减少了节点间网络通信，查询延迟更低"
+            },
+            {
+              "id": "D",
+              "text": "100–500GB；ES 7.x 之后优化了 shard 管理，单 shard 支持更大数据量而不影响性能"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "每个 shard 是一个独立的 Lucene 实例，会占用 JVM heap（存放 segment 元数据、filter cache、fielddata 等），有固定的文件句柄消耗和 merge 线程开销。Shard 过大（如本题的 500GB/shard）意味着单个 Lucene 实例需要处理的数据量太大，GC 压力剧增；shard 过多则所有 overhead 累积，协调节点合并结果的开销也会放大。官方经验值 20–40GB 是兼顾并行性和资源利用率的平衡点。B 选项犯了「shard 越多越好」的误区，1GB 的 shard 会让一个 200GB 索引产生 200 个 shard，overhead 爆炸。"
+        },
+        {
+          "id": "elasticsearch-log-query-1-q3",
+          "question": "为什么 `request_url: *error*` 这样的 wildcard 查询在 TB 级 ES 集群上会导致 CPU 飙满，而 `message: \"error\"` 的 match 查询不会？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "前后都带通配符的 wildcard 查询无法使用倒排索引，必须对每个 segment 中的所有词项做正则遍历，复杂度是 O(所有词项总数)；match 查询对搜索词分词后直接查倒排索引，是 O(1) 的哈希查找"
+            },
+            {
+              "id": "B",
+              "text": "wildcard 查询走网络传输，而 match 查询在本地执行，所以 wildcard 更慢"
+            },
+            {
+              "id": "C",
+              "text": "match 查询使用缓存，wildcard 查询不使用缓存，所以 wildcard 每次都需要重新计算"
+            },
+            {
+              "id": "D",
+              "text": "两者性能相同，只是 wildcard 匹配的文档更多，返回结果集更大导致更慢"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "倒排索引的本质是「词项表 + 倒排列表」。`match` 查询会对输入分词，然后在词项表里查找，时间复杂度接近 O(1)（哈希表查找）。而前后都带 `*` 的 wildcard 查询，比如 `*error*`，无法锁定具体词项，必须遍历倒排索引里的每一个词项做正则匹配。10TB 数据的词项表可能有几亿条，每次查询都是一次全表扫描，CPU 自然被打满。缓存（C 选项）虽然确实影响性能，但不是根本原因。D 选项对问题的理解停留在结果集大小，但实际上两者的执行路径完全不同。"
+        },
+        {
+          "id": "elasticsearch-log-query-1-q4",
+          "question": "在 ES 查询 DSL 中，把过滤条件放在 `filter` 上下文和放在 `must` 上下文，性能上有什么本质差别？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "`filter` 上下文不计算相关性分数（_score），结果可以被 ES 的 filter cache 缓存；`must` 上下文需要计算每个文档的相关性分数，无法被 filter cache 缓存，且计算开销更大"
+            },
+            {
+              "id": "B",
+              "text": "`filter` 先于 `must` 执行，所以 filter 更快；两者功能完全相同，只是执行顺序不同"
+            },
+            {
+              "id": "C",
+              "text": "`must` 比 `filter` 更快，因为 must 是强制匹配，ES 会对其做更多优化"
+            },
+            {
+              "id": "D",
+              "text": "两者没有性能差别，只影响查询的逻辑语义（AND vs. weighted AND）"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 ES 查询优化里最重要的一个原则。`filter` 上下文做的是「是否匹配」的二元判断，不涉及分数计算，ES 会把 filter 结果以 bitset 形式缓存在内存里（filter cache）。当同样的 filter 条件再次被执行时（比如监控大盘每 30 秒刷新一次相同时间窗口的查询），直接命中缓存，几乎零开销。`must` 上下文不仅要判断是否匹配，还要计算 BM25 相关性分数，既有额外计算开销，又因为分数跟具体文档内容相关而无法缓存。日志场景几乎不需要相关性排序，把时间范围、level、service 等条件全放 `filter` 是标准做法。"
+        },
+        {
+          "id": "elasticsearch-log-query-1-q5",
+          "question": "ES 的 slowlog 配置了 `index.search.slowlog.threshold.query.warn: 5s`，在慢查询排查中，slowlog 文件里记录了哪些关键信息？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "完整的查询 DSL、该查询在这个 shard 上的执行耗时、命中的文档数、索引名和 shard ID，通过这些信息可以精准定位是哪条查询语句在哪个索引上慢"
+            },
+            {
+              "id": "B",
+              "text": "只记录超时的客户端 IP 和查询时间，不记录具体的查询语句，需要结合应用日志对应"
+            },
+            {
+              "id": "C",
+              "text": "只记录查询耗时，不记录 DSL，因为 DSL 可能包含敏感数据"
+            },
+            {
+              "id": "D",
+              "text": "记录所有查询（不只是慢查询），并按耗时排序，可以直接看 top 10 最慢查询"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "ES slowlog 是排查慢查询的第一手工具，它记录的信息非常完整：查询的完整 DSL（你可以直接复制出来在 Kibana DevTools 里重现）、该 shard 上的执行耗时（注意每个 shard 都会独立记录，同一个查询可能产生多条 slowlog 记录）、命中文档总数、涉及的索引和 shard 编号。通过分析 slowlog，你可以判断是 DSL 设计问题（比如发现大量 wildcard 查询）还是数据分布问题（某个特定 shard 特别慢）。D 选项描述的是一个不存在的功能，slowlog 只记录超过阈值的查询，全量查询记录需要 audit log 插件。"
+        },
+        {
+          "id": "elasticsearch-log-query-1-q6",
+          "question": "为什么 ES 节点的 JVM heap 不能设置超过 32GB，超过 32GB 之后实际可用内存反而会减少？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "JVM 在 heap < 约 32GB 时会启用 Compressed OOPs（指针压缩），把 64 位对象指针压缩为 32 位，节省内存；超过 32GB 后指针压缩被迫关闭，每个对象引用多占 4 字节，相同物理内存能装下的对象数量反而减少"
+            },
+            {
+              "id": "B",
+              "text": "超过 32GB 是 ES 的软限制，会触发 ES 集群自动降级，性能下降"
+            },
+            {
+              "id": "C",
+              "text": "超过 32GB 的 heap 会导致 JVM GC 的 Full GC 时间超过 ES 的 master 选举超时，引发集群脑裂"
+            },
+            {
+              "id": "D",
+              "text": "这是一个历史限制，32 位操作系统最大寻址 4GB，ES 为了兼容老系统限制了 heap 大小"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 JVM 层面的一个真实机制，叫 Compressed Ordinary Object Pointers（Compressed OOPs）。在 64 位 JVM 上，每个对象引用默认是 8 字节（64 位），但当 heap 小于约 32GB 时，JVM 可以用 32 位整数（乘以 8 的对齐系数）来表示堆内地址，把对象引用从 8 字节压缩到 4 字节，整个 JVM 对象图的内存占用减少 20–30%。一旦 heap 超过 32GB，这个压缩方案就失效了，所有对象引用回到 8 字节，同样的对象数量反而需要更多内存。所以 31GB 的 heap 实际上比 33GB 的 heap 能存更多数据。C 选项描述的 GC 暂停引发脑裂是另一个真实问题，但不是 32GB 限制的根本原因。"
+        },
+        {
+          "id": "elasticsearch-log-query-1-q7",
+          "question": "日志索引里的 `request_url` 字段，应该映射成 `text` 类型还是 `keyword` 类型？各有什么后果？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "应该映射成 `keyword`；映射成 `text` 会对 URL 做全文分词，产生海量词项膨胀索引，聚合时使用 fielddata 占用大量 heap，高并发下可能 OOM；keyword 只做精确匹配，无需分词，索引紧凑，聚合走 doc_values 更高效"
+            },
+            {
+              "id": "B",
+              "text": "应该映射成 `text`；URL 需要做全文搜索，keyword 类型不支持模糊匹配"
+            },
+            {
+              "id": "C",
+              "text": "两者性能相同；`text` 和 `keyword` 都会创建倒排索引，查询效率没有区别"
+            },
+            {
+              "id": "D",
+              "text": "应该同时映射成 `text` 和 `keyword`（multi-field）；`text` 用于搜索，`keyword` 用于聚合，这是最佳实践"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "URL 是高基数字段（每条日志的 URL 几乎都不同），映射成 `text` 类型的危害是双重的：第一，Lucene 会对 URL 做全文分词（按斜杠、问号等分隔），一个 URL 会产生多个词项，索引体积膨胀；第二，对 `text` 字段做聚合时，ES 必须把字段值加载到 JVM heap 的 fielddata 结构里，高基数字段的 fielddata 可以轻易消耗几十 GB 内存直到 OOM。D 选项的 multi-field 方案在某些场景合理（如 `message` 字段既需要全文搜索又需要 keyword），但对 URL 这种高基数字段来说，`text` 部分的存在本身就是负担，不建议保留。"
+        },
+        {
+          "id": "elasticsearch-log-query-1-q8",
+          "question": "在 ILM 策略的 warm 阶段，除了把索引迁移到 warm 节点（HDD），还需要执行哪两个关键操作，分别有什么作用？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "`forcemerge`（把多个 segment 合并成 1 个，消除多 segment 查询合并开销）和 `shrink`（把多个 shard 收缩成更少的 shard，降低 JVM overhead）；两者组合让只读历史索引的查询效率接近最优"
+            },
+            {
+              "id": "B",
+              "text": "`snapshot`（备份到 S3）和 `delete`（删除本地副本），warm 阶段主要目的是做冷备"
+            },
+            {
+              "id": "C",
+              "text": "`reindex`（重建索引用新的 mapping）和 `refresh`（刷新使数据可搜索），让 warm 阶段的数据用优化后的 mapping"
+            },
+            {
+              "id": "D",
+              "text": "`freeze`（冻结索引节省 heap）和 `close`（关闭索引不占资源），warm 阶段主要目的是释放内存"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Warm 阶段处理的是「还偶尔需要查询但不再写入」的历史数据（本题是 7–30 天的日志），优化目标是在用更廉价硬件的同时保持可接受的查询性能。`forcemerge` 把历史索引的 N 个 segment 合并成 1 个，查询时不再需要合并多个 segment 的结果，减少 I/O 和 CPU；`shrink` 把写入阶段为了并行吞吐设置的多个 shard 收缩成 1 个，因为只读索引不需要并行写入，减少 shard overhead 释放内存。D 选项描述的 `freeze` 是 cold 阶段（30 天以上）的操作，warm 阶段的数据还需要保持一定的查询响应速度，不适合直接 freeze。"
+        },
+        {
+          "id": "elasticsearch-log-query-1-q9",
+          "question": "对于 `trace_id` 这类只用于精确查找、从不用于聚合排序的 keyword 字段，应该做哪个 mapping 优化？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "设置 `\"doc_values\": false`；doc_values 是为排序和聚合设计的列式存储，`trace_id` 不需要这些能力，关掉后可以节省约 15–20% 的磁盘空间，在 10TB 集群上相当于节省 1.5–2TB 存储"
+            },
+            {
+              "id": "B",
+              "text": "设置 `\"index\": false`；关掉倒排索引后就无法搜索这个字段，应该对精确匹配字段关掉倒排索引"
+            },
+            {
+              "id": "C",
+              "text": "设置 `\"store\": true`；启用独立存储可以加速精确查找，比默认的 `_source` 检索更快"
+            },
+            {
+              "id": "D",
+              "text": "不需要任何优化；keyword 类型的默认 mapping 已经针对精确查找做了最优配置"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Doc_values 是 ES 在磁盘上额外维护的一套列式存储结构，专为排序（sort）和聚合（aggregation）设计。对于 `trace_id` 这类字段，使用场景只有精确匹配（`term` 查询），从来不会对它做 `terms aggregation` 或 `sort`，那么 doc_values 就是纯粹的存储浪费。关掉 `doc_values` 后，这个字段只保留倒排索引用于搜索，磁盘占用大幅减少。注意 B 选项的 `index: false` 是另一个优化手段，用于「不需要被搜索的字段」（比如某些仅用于展示的原始数据字段），但 trace_id 需要被 `term` 查询搜索，所以不能关 `index`。"
+        },
+        {
+          "id": "elasticsearch-log-query-1-q10",
+          "question": "你收到告警：某 ES 节点 heap 使用率持续 85%，GC 每 10 秒触发一次，Kibana 查询 P99 延迟超过 20 秒。排查时，下面哪个顺序是最有效率的？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "先看 slowlog 定位具体慢查询 DSL → 用 `_profile` API 分析查询执行细节 → 检查 `_cat/shards` 确认 shard 大小分布 → 看 heap 的 fielddata/filter cache 使用比例判断内存压力来源",
+              "relatedConcepts": ["slowlog", "profile API", "shard sizing"]
+            },
+            {
+              "id": "B",
+              "text": "直接重启 ES 节点释放内存 → 重启后观察 heap 是否下降 → 如果还高再看日志"
+            },
+            {
+              "id": "C",
+              "text": "先加节点扩容集群 → 扩容后如果还慢再分析原因 → 最后考虑改查询"
+            },
+            {
+              "id": "D",
+              "text": "先升级 ES 版本到最新版本 → 新版本有更多性能优化 → 升级后观察效果"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "性能排查的核心原则是「先定位根因，再针对性处理」，不能盲目重启或扩容，否则症状消失但根因还在，问题会反复出现。Slowlog 是最直接的入口，直接告诉你哪条查询 DSL 超过了阈值，耗时多少；`_profile` API 可以对单条查询做执行细节分析，看清楚查询在哪个阶段耗时最多（是查询阶段还是 fetch 阶段）；`_cat/shards?v&h=index,shard,store` 快速检查 shard 大小是否超标；`_nodes/stats/indices` 里的 `fielddata.memory_size_in_bytes` 和 `filter_cache.memory_size_in_bytes` 可以判断 heap 压力来源。重启（B）只是临时释放缓存，不解决根因；扩容（C）在根因不明的情况下往往是在浪费资源；升级版本（D）是极端的最后手段，不是排查的第一步。"
+        }
+      ],
+      "references": [
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/tune-for-search-speed.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/index-lifecycle-management.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-params.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/search-search.html#request-body-search-filter",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules-slowlog.html"
+      ]
+    }
+  ]
+}
