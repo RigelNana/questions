@@ -1,0 +1,157 @@
+{
+  "id": "java-heap-leak",
+  "name": "Java 堆内存泄漏排查",
+  "domain": "troubleshooting",
+  "description": "通过 Heap Dump 和 MAT 工具分析 Java OOM 根因，定位泄漏对象的引用链",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "java-heap-leak-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["java", "memory-leak", "heap-dump", "mat", "gc", "jvm", "oom"],
+      "title": "Java 服务 Full GC 后内存不下降最终 OOM，如何定位堆内存泄漏？",
+      "content": "你接手了一个线上的 Java 微服务，技术栈是 Spring Boot 2.7 + JDK 17，部署在 Kubernetes 上，容器内存限制 4 GB，JVM 参数里设置了 `-Xmx3g`。服务刚上线的前几小时运行得很正常，堆内存稳定在 800MB 左右。但是过了三四天之后，监控开始报警：堆内存使用率持续爬升，GC 日志显示 Full GC 的触发越来越频繁，从最开始每小时一次变成了每十分钟一次，最终每分钟好几次。最糟糕的是，每次 Full GC 结束之后，堆内存不仅没有明显下降，反而只比 GC 之前少了几十 MB，然后很快又涨回来。就这样循环了一段时间之后，服务抛出了 `java.lang.OutOfMemoryError: Java heap space`，Pod 随即被 Kubernetes 重启。\n\n重启之后服务恢复正常，但几天后同样的现象又会重演。你的同事猜测是某处代码存在内存泄漏，但整个服务有将近八万行业务代码，涉及缓存、线程池、事件监听、定时任务多个模块，根本不知道从哪里入手排查。\n\n以下是故障期间截取的一段 GC 日志片段，供你参考：\n\n```\n[2024-03-15T03:12:44.521+0000][gc] GC(1842) Pause Full (Ergonomics) 2891M->2847M(3072M) 4.823s\n[2024-03-15T03:21:09.334+0000][gc] GC(1901) Pause Full (Ergonomics) 2963M->2921M(3072M) 6.117s\n[2024-03-15T03:29:55.102+0000][gc] GC(1958) Pause Full (Ergonomics) 3011M->2989M(3072M) 7.445s\n[2024-03-15T03:31:22.887+0000][gc] GC(1960) Pause Full (Ergonomics) 3059M->3041M(3072M) 8.203s\n```\n\n从这段日志你能看出什么？如果你是这个服务的 SRE，请给出完整的内存泄漏排查方案：如何在服务运行时或 OOM 发生时获取诊断数据，如何用工具分析数据找到泄漏的根因，以及如何在代码层面定位具体的泄漏场景。",
+      "answer": "## 第一步：先读懂 GC 日志，建立「这是泄漏」的确定性\n\n很多人看到服务 OOM 之后，第一反应是「把堆内存调大」。这是最常见也最危险的错误操作——它会让服务多撑几天，但根本原因没有消除，最终还是会再次 OOM。正确的第一步是从现象推断根因，而 GC 日志就是最直接的证据。\n\n回到题目给出的那段日志，注意看数字的变化：`2891M->2847M`、`2963M->2921M`、`3011M->2989M`、`3059M->3041M`。Full GC 之后堆内存的释放量分别是 44MB、42MB、22MB、18MB，不仅绝对释放量越来越少，而且 GC 耗时却越来越长，从 4.8 秒涨到 8.2 秒。这个模式说明了一件事：堆里有大量对象是 GC 无法回收的，随着时间推移，这些不可回收的对象越积越多，把整个堆几乎填满了，导致每次 GC 能扫描的「有效」内存越来越少，GC 的回报率越来越低，但 GC 本身的工作量（扫描所有存活对象）却越来越大。\n\n为什么 GC 无法回收这些对象？这就涉及 Java 内存泄漏的本质定义，很多人对它有误解。Java 的内存泄漏不是 C/C++ 那种「malloc 了一块内存但没有 free」，而是：**对象在逻辑上已经用完了，程序不再需要它，但仍然有一条从 GC Root 出发的引用链指向它，所以 GC 认为它还活着，不敢回收**。理解这一点非常关键，它决定了后续排查的方向——你要找的不是「哪里的内存没释放」，而是「哪条意外残留的引用链，让本该死掉的对象一直活着」。\n\nJVM 里的 GC Root 主要有这几类：静态变量（`static` 字段）、所有活跃线程的栈帧中的局部变量、JNI 全局引用，以及系统类加载器。只要某个对象在这些 Root 的可达范围内，不管它在业务逻辑上是否还有用，GC 一律不碰它。\n\n## 第二步：获取 Heap Dump —— 找到「案发现场」\n\n确认是泄漏之后，下一步是采集 Heap Dump。Heap Dump 本质上是 JVM 堆内存在某个时刻的完整快照，它会把堆里每个对象的类型、大小、字段值以及对象之间的引用关系全部序列化到一个 `.hprof` 文件里。有了它，你才能离线分析「到底是什么对象占了那么多内存，谁在引用它们」。\n\n获取 Heap Dump 有三种主要方式，选哪种取决于你的场景。\n\n最推荐的方式是**在 JVM 启动参数里加上自动 dump 的配置**：\n\n```bash\n# 在 Kubernetes Deployment 的 env 或启动脚本中加入\n-XX:+HeapDumpOnOutOfMemoryError \\\n-XX:HeapDumpPath=/app/logs/heap-$(date +%Y%m%d%H%M%S).hprof\n```\n\n这样当 OOM 真正发生时，JVM 会在抛出错误之前自动把堆 dump 到指定路径。对于 Kubernetes 环境，要确保这个路径挂载了 PVC 或者 emptyDir，否则 Pod 重启之后文件就丢了。很多团队踩的坑就是：加了这个参数但忘记挂载持久化存储，每次 OOM 之后 Pod 重启，dump 文件随容器一起消失，什么都没留下。\n\n如果你想在服务运行期间主动抓取快照（比如内存已经涨到 80% 但还没 OOM 的时候），用 `jcmd` 是最安全的选择：\n\n```bash\n# 先找到 JVM 进程 PID\njcmd\n# 或者：ps aux | grep java\n\n# 用 jcmd 触发 heap dump（推荐，相比 jmap 更安全）\njcmd 12345 GC.heap_dump /app/logs/heap-$(date +%Y%m%d%H%M%S).hprof\n```\n\n你也可以用老牌的 `jmap`，但要注意它会触发一次 Full GC 并且在 dump 期间完全暂停应用（STW），对于内存已经接近 3GB 的服务，这个停顿可能长达十几秒，生产环境慎用：\n\n```bash\njmap -dump:format=b,file=/app/logs/heap.hprof 12345\n```\n\n在 Kubernetes 环境里，你需要先 exec 进容器再执行这些命令：\n\n```bash\nkubectl exec -it <pod-name> -n <namespace> -- bash\n# 然后在容器内执行 jcmd 或 jmap\n```\n\ndump 文件可能有 2-3GB 大，用 `kubectl cp` 把它拷出来：\n\n```bash\nkubectl cp <namespace>/<pod-name>:/app/logs/heap.hprof ./heap.hprof\n```\n\n如果你集成了 Arthas（阿里开源的 Java 诊断工具），也可以直接用它的 `heapdump` 命令，对运行中的服务侵入性更小：\n\n```bash\n# attach 到目标进程后执行\nheapdump --live /app/logs/heap.hprof\n```\n\n`--live` 参数表示只 dump 存活对象，文件会小一些，分析更聚焦。\n\n## 第三步：用 Eclipse MAT 分析 Heap Dump\n\n有了 `.hprof` 文件之后，用 Eclipse Memory Analyzer Tool（MAT）来分析。MAT 是分析 Java 内存泄漏事实上的标准工具，免费，功能强大，能自动识别大多数常见的泄漏模式。\n\n打开 MAT 加载 hprof 文件之后，第一个要看的是**Leak Suspects Report**（泄漏嫌疑报告）。MAT 会自动用启发式算法扫描 heap，找出那些「自己占用内存不多但通过引用链间接持有大量内存」的对象，用一句话描述嫌疑点。实际工作中大约 70% 的泄漏案例，看完这份报告就基本定位到了。\n\n报告里最重要的概念是 **Retained Heap**（保留堆大小）。它的定义是：如果这个对象被 GC 回收，连带着能一起释放的所有内存总量。一个 `HashMap` 对象本身只有几十字节，但如果它持有 500 万个 Entry，那它的 Retained Heap 可能是 800MB。Retained Heap 大的对象，就是泄漏的嫌疑人。\n\n第二个要看的是 **Dominator Tree**（支配树）。支配树按 Retained Heap 从大到小排列所有对象，让你一眼看出「谁是内存大户」。在一个真实的泄漏案例里，你可能会看到这样的输出：\n\n```\nClass Name                                    Shallow Heap    Retained Heap\n──────────────────────────────────────────────────────────────────────────\njava.util.HashMap @ 0x7f3a2c0b1000              48 B         1,247,832,960 B  (约 1.16 GB)\n  |- java.util.HashMap$Entry[] @ 0x7f3a2c0b1020  ...\n  |- java.util.HashMap$Entry @ 0x7f3a2c0b2000    ...\n       |- key: com.example.UserSession @ ...      240 B         ...\n       |- value: byte[] @ ...                     ...\n```\n\n看到一个 `HashMap` 的 Retained Heap 超过 1GB，基本上这就是泄漏点了。接下来右键这个对象，选「Path to GC Roots」，MAT 会显示出从 GC Root 到这个对象的完整引用链：\n\n```\njava.util.HashMap @ 0x7f3a2c0b1000\n  └─ com.example.SessionManager.sessionCache (static field)\n       └─ com.example.SessionManager @ 0x7f3a1a2c0000\n            └─ Class com.example.SessionManager (class loader)\n```\n\n这条链立刻告诉你：`SessionManager` 类里有一个 `static` 字段 `sessionCache`，它是一个 `HashMap`，GC Root 是 SessionManager 的类加载器。这个 `HashMap` 在不断地往里加 `UserSession` 对象，但从来没有移除，这就是泄漏的根源。\n\n如果 Leak Suspects 没有直接给出答案，可以用 MAT 的 OQL（Object Query Language）查询来辅助定位。OQL 语法类似 SQL：\n\n```sql\n-- 找出所有 size 超过 1 万的 HashMap\nSELECT * FROM java.util.HashMap WHERE size > 10000\n\n-- 找出所有 ThreadLocal.ThreadLocalMap.Entry 对象（排查 ThreadLocal 泄漏）\nSELECT * FROM java.lang.ThreadLocal$ThreadLocalMap$Entry\n\n-- 统计每个类的实例数，找出异常多的类\nSELECT classof(s).name, count(*) FROM java.lang.Object s GROUP BY classof(s).name\n```\n\n## 第四步：认识常见的泄漏场景，对号入座\n\n知道了排查工具之后，还需要知道泄漏最常发生在哪里，这样在看 MAT 输出的时候才能快速「对号入座」。\n\n**静态集合无限增长**是最常见也是最容易发现的泄漏。代码里有一个 `static Map` 或 `static List`，业务代码不断往里 `put` 或 `add`，但从来没有相应的清除逻辑：\n\n```java\n// 典型的泄漏代码\npublic class RequestTracker {\n    // static 字段是 GC Root，Map 里的对象永远不会被回收\n    private static final Map<String, RequestContext> activeRequests = new HashMap<>();\n\n    public static void track(String requestId, RequestContext ctx) {\n        activeRequests.put(requestId, ctx); // 只进不出\n    }\n    // 没有 remove 方法，或者 remove 在异常路径下没有被调用\n}\n```\n\n修复方式是用 `WeakHashMap` 替代普通 `HashMap`（当 key 没有其他强引用时 Entry 会自动被 GC），或者改用 Guava Cache 并设置过期时间和容量上限：\n\n```java\n// 修复后：使用 Guava Cache，最多保留 10000 条，1 小时后过期\nprivate static final Cache<String, RequestContext> activeRequests = CacheBuilder.newBuilder()\n    .maximumSize(10_000)\n    .expireAfterWrite(1, TimeUnit.HOURS)\n    .build();\n```\n\n**ThreadLocal 在线程池中泄漏**是另一个非常隐蔽的泄漏场景。ThreadLocal 的设计本意是让每个线程拥有变量的独立副本，在 `new Thread()` 的场景下没有问题，因为线程结束后 ThreadLocalMap 会一起被清理。但在线程池里，线程会被反复复用，如果你在处理完一个请求之后没有显式调用 `threadLocal.remove()`，这个线程的 ThreadLocalMap 里的 Entry 就会一直残留，并且随着请求越来越多不断积累：\n\n```java\n// 泄漏的代码\npublic class UserContextHolder {\n    private static final ThreadLocal<UserContext> context = new ThreadLocal<>();\n\n    public static void set(UserContext ctx) { context.set(ctx); }\n    public static UserContext get() { return context.get(); }\n    // 缺少 clear() 方法，或者调用方忘记在 finally 里调用 remove\n}\n\n// 正确的用法\ntry {\n    UserContextHolder.set(ctx);\n    // 业务逻辑\n} finally {\n    UserContextHolder.remove(); // 必须在 finally 里，确保异常时也能清理\n}\n```\n\n**监听器/回调注册后未注销**也是一类常见场景。Spring 的 `ApplicationEventPublisher`、Guava 的 `EventBus`，以及各种自定义的 Observer 模式，如果往事件总线里注册了监听器但忘记在对象销毁时注销，被注册进去的对象就永远不会被 GC：\n\n```java\n// 泄漏：每次请求都创建新的 listener 并注册，但从不注销\n@GetMapping(\"/subscribe\")\npublic void subscribe() {\n    eventBus.register(new DataChangeListener()); // 注册后永远不 unregister\n}\n```\n\n**内部类/匿名类持有外部类引用**也非常常见，尤其是在 Android 开发中，但 Java 后端同样会踩。Java 的非静态内部类默认持有外部类实例的引用，当你把一个匿名内部类（比如 `Runnable`、`Callable`）提交到长生命周期的线程池时，这个匿名类会把它所在的外部类对象一直钉在内存里：\n\n```java\npublic class OrderService {\n    private final byte[] largeBuffer = new byte[10 * 1024 * 1024]; // 10MB\n\n    public void processAsync() {\n        // 这个匿名 Runnable 隐式持有 OrderService.this 的引用\n        // 只要这个任务在线程池队列里没执行，OrderService 就不会被 GC\n        executor.submit(new Runnable() {\n            @Override\n            public void run() { /* 业务逻辑 */ }\n        });\n    }\n}\n// 修复：改用静态内部类或 lambda，并确保 lambda 不捕获外部 this\n```\n\n## 第五步：用 jstat 实时监控，判断泄漏速度\n\n在排查过程中，`jstat` 是一个非常实用的实时监控工具，能让你不依赖 Heap Dump 就对泄漏的速度和位置有初步判断：\n\n```bash\n# 每 1 秒输出一次 GC 统计，共观察 60 次\njstat -gcutil <pid> 1000 60\n\n# 输出示例：\n#  S0     S1     E      O      M     CCS    YGC     YGCT    FGC    FGCT     GCT\n#   0.00  23.45  67.89  91.23  96.45  93.21    842    8.234   156   89.412  97.646\n#   0.00  23.45  78.34  91.89  96.45  93.21    843    8.241   156   89.412  97.653\n#   0.00   0.00  12.34  92.45  96.45  93.21    844    8.249   157   96.834 105.083\n```\n\n关注 `O`（Old Gen 使用率）这一列。如果 Old Gen 在每次 Full GC 之后只稍微下降一点然后又快速爬升，而且爬升速度稳定（比如每分钟涨 1%），说明泄漏速度比较规律，可以估算出还有多久会 OOM，也能帮助判断泄漏是「持续写入」型（比如静态 Map 不断增长）还是「批量累积」型（比如定时任务每次执行后留下一批残留对象）。\n\n## 第六步：扩展工具和预防机制\n\n值得一提的是，G1 GC（JDK 9 之后的默认 GC）和 ZGC 在面对内存泄漏时的行为和传统 CMS 有所不同。G1 采用 Region 划分堆，Mixed GC 会同时回收 Young Region 和部分 Old Region，所以在泄漏初期，G1 日志里你会先看到 Mixed GC 频率增加，然后才退化到 Full GC。如果直接用传统的「Full GC 频率」作为报警指标，G1 下可能会漏报。更合理的指标是 Old Gen 使用率的趋势（持续上涨且 GC 后不明显下降）。\n\nJDK 11 及以上版本内置了 **Java Flight Recorder（JFR）**，这是一个低开销的持续采集工具，可以记录 GC 事件、内存分配热点、线程状态等，特别适合生产环境的长期监控：\n\n```bash\n# 开启 JFR，持续录制 60 秒，输出到文件\njcmd <pid> JFR.start duration=60s filename=/app/logs/recording.jfr\n\n# 也可以在 JVM 启动参数里开启持续录制\n-XX:StartFlightRecording=dumponexit=true,filename=/app/logs/app.jfr\n```\n\n用 JDK Mission Control（JMC）打开 `.jfr` 文件，可以看到内存分配的火焰图，直接定位到是哪个方法在大量创建某类对象，比 MAT 的 Dominator Tree 更直观。\n\n在预防层面，代码审查时对以下几个模式重点关注：所有 `static` 集合字段是否有清理机制；所有 ThreadLocal 的使用点是否在 `finally` 里调用了 `remove()`；所有事件监听器是否有对应的注销逻辑；所有非静态内部类是否被提交到了比外部类生命周期更长的执行器。此外，在集成测试或压测环境里可以引入 `JVM 内存趋势断言`：跑完一轮完整的业务流程之后，强制触发 GC，检查堆内存是否回落到接近初始水位，如果连续几轮下来内存有明显的「基线漂移」，就在 CI 阶段阻断发布。这比等到生产 OOM 之后再排查，要便宜得多。",
+      "keyPoints": [
+        "Java 内存泄漏的本质是对象被 GC Root 可达（有强引用链），所以 GC 无法回收，但程序逻辑上已经不再需要这些对象；Full GC 后 Old Gen 内存释放量越来越少、耗时越来越长，是内存泄漏的强有力证据。",
+        "获取 Heap Dump 有三种方式：JVM 启动参数 `-XX:+HeapDumpOnOutOfMemoryError` 在 OOM 时自动 dump（Kubernetes 环境需要挂载持久化存储）；`jcmd <pid> GC.heap_dump` 主动触发且对应用影响较小；`jmap -dump` 会触发 Full GC 并长时间 STW，生产环境慎用。",
+        "Eclipse MAT 的 Retained Heap 概念至关重要：一个对象的 Retained Heap 是指回收它后能连带释放的所有内存总量，比 Shallow Heap 更能反映它对内存的实际占用；Dominator Tree 按 Retained Heap 排序，是快速找到内存大户的第一步。",
+        "静态集合（`static Map/List`）不断 `put` 而没有对应的清除逻辑，是最常见的泄漏场景；修复方式是改用 Guava Cache 并设置 `maximumSize` 和 `expireAfterWrite`，或者改用 `WeakHashMap`。",
+        "ThreadLocal 在线程池环境下必须在 `finally` 块中调用 `remove()`，否则线程复用时旧的 Entry 会一直残留在 ThreadLocalMap 里并不断积累，导致 Old Gen 持续增长。",
+        "`jstat -gcutil <pid> 1000` 可以实时观察 Old Gen 使用率的变化趋势，判断泄漏速度是否规律，帮助在 OOM 前估算出危险窗口并合理安排运维操作时间。",
+        "JDK 11+ 内置的 Java Flight Recorder（JFR）是低开销持续录制工具，能记录内存分配热点并生成火焰图，比 Heap Dump 的一次性快照更能反映「谁在持续分配大量对象」，是生产环境内存问题的首选持续监控手段。",
+        "在 G1 GC 下，内存泄漏的早期症状是 Mixed GC 频率增加而非直接出现 Full GC，因此报警指标应监控 Old Gen 使用率的上升趋势，而非单纯依赖 Full GC 频率。"
+      ],
+      "quiz": [
+        {
+          "id": "java-heap-leak-q1",
+          "question": "Java 堆内存泄漏的本质定义是什么？",
+          "choices": [
+            { "id": "A", "text": "程序调用了 new 分配内存之后，没有通过某种方式手动释放，导致内存无法被操作系统回收" },
+            { "id": "B", "text": "对象在逻辑上已不再被业务使用，但仍有从 GC Root 出发的引用链指向它，导致 GC 无法回收" },
+            { "id": "C", "text": "堆内存设置太小，导致正常使用的对象也因为空间不足而触发频繁 GC" },
+            { "id": "D", "text": "方法区（Metaspace）加载了过多的类，挤占了堆内存可用空间" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Java 有自动垃圾回收机制，不存在「忘记手动释放」的情况，所以 A 是 C/C++ 的内存泄漏定义，不适用于 Java。C 描述的是内存不足的问题，属于正常的 OOM，不是泄漏。D 描述的是 Metaspace 溢出，是不同类型的 OOM（`OutOfMemoryError: Metaspace`）。Java 内存泄漏的核心是：GC Root 到对象之间存在一条活跃的强引用链，所以 GC 算法判定该对象「存活」，不能回收——哪怕在业务语义上这个对象早就没用了。找到并切断这条引用链，才是修复泄漏的正确方式。"
+        },
+        {
+          "id": "java-heap-leak-q2",
+          "question": "以下哪些属于 JVM 的 GC Root？（多选）",
+          "choices": [
+            { "id": "A", "text": "所有 static 字段引用的对象" },
+            { "id": "B", "text": "所有活跃线程栈帧中的局部变量引用" },
+            { "id": "C", "text": "堆中已被标记为存活但尚未扫描的对象" },
+            { "id": "D", "text": "JNI 全局引用（Native 代码持有的 Java 对象引用）" }
+          ],
+          "correctAnswer": "ABD",
+          "explanation": "GC Root 是 GC 可达性分析的起点，从这些 Root 出发能「走到」的对象都被认为是存活的，不会被回收。静态字段（A）由类加载器持有，只要类不被卸载就一直是 Root。活跃线程的栈帧局部变量（B）在方法执行期间一直有效。JNI 全局引用（D）是 Native 层显式创建的、让 Java 对象在 Native 代码中持久存活的机制。C 描述的是 GC 标记阶段的中间状态（灰色对象），它本身不是 Root，而是 Root 可达性传播过程中的中间节点。理解 GC Root 对于排查泄漏至关重要：泄漏对象的引用链一定能追溯到某个 GC Root。"
+        },
+        {
+          "id": "java-heap-leak-q3",
+          "question": "在 Kubernetes 环境中使用 `-XX:+HeapDumpOnOutOfMemoryError` 参数，需要注意什么才能确保 dump 文件不丢失？",
+          "choices": [
+            { "id": "A", "text": "需要给容器分配足够的 CPU，因为 dump 是 CPU 密集型操作" },
+            { "id": "B", "text": "需要将 `-XX:HeapDumpPath` 指向一个挂载了 PVC 或 hostPath 的持久化目录，否则 Pod 重启后文件消失" },
+            { "id": "C", "text": "需要给 JVM 配置 `-Xmx` 比容器内存限制小至少 1GB，为 dump 操作预留空间" },
+            { "id": "D", "text": "需要在 Pod 的 readinessProbe 里加一个检查，确保 dump 文件写完后再重启" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个在生产环境中非常常见的疏漏。Kubernetes 容器的文件系统是临时的（ephemeral），Pod 一旦重启，容器内的写入（包括 heap dump 文件）就会全部丢失。要让 dump 文件在重启后仍然可以访问，必须把 `-XX:HeapDumpPath` 指向一个挂载了持久化存储的目录，比如 PersistentVolumeClaim（PVC）、NFS 挂载点，或者 hostPath（但 hostPath 有安全风险，生产一般不推荐）。A 选项关于 CPU 的说法不准确，dump 的主要瓶颈是磁盘 I/O，不是 CPU。C 的预留空间是合理实践但和 dump 文件丢失无关。D 不可行，OOM 后 JVM 会立即退出，readinessProbe 无法干预这个过程。"
+        },
+        {
+          "id": "java-heap-leak-q4",
+          "question": "Eclipse MAT 中「Retained Heap」和「Shallow Heap」的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "Shallow Heap 是对象在 Young Gen 占用的内存，Retained Heap 是它晋升到 Old Gen 后占用的内存" },
+            { "id": "B", "text": "Shallow Heap 是对象本身占用的内存，Retained Heap 是回收该对象后能连带释放的所有内存总量（包括它独占引用的所有子对象）" },
+            { "id": "C", "text": "Shallow Heap 是对象的实际内存，Retained Heap 是它加上所有共享引用对象的内存之和" },
+            { "id": "D", "text": "两者的差值代表该对象在堆中的内存碎片数量" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Shallow Heap 就是对象自身结构占用的字节数，对于一个 `HashMap` 实例来说，Shallow Heap 只有 48 字节左右，因为它只存了几个 int 字段和一个数组引用。Retained Heap 则是「如果把这个对象从引用图中删掉，能够连带清除的所有对象的 Shallow Heap 之和」——也就是只被这个对象独占引用的所有子孙对象。同样的 `HashMap`，如果它持有 500 万条 Entry，Retained Heap 可能超过 1 GB。A 选项把 GC 分代和 MAT 指标混淆了。C 选项说「共享引用对象」是错的，Retained Heap 只计算能被独占释放的部分，如果一个子对象还被其他路径引用，它就不会计入 Retained Heap。"
+        },
+        {
+          "id": "java-heap-leak-q5",
+          "question": "以下哪条 jstat 命令可以实时观察 JVM 各代内存使用率，每秒输出一次，共观察 30 次？",
+          "choices": [
+            { "id": "A", "text": "`jstat -gc <pid> 1 30`" },
+            { "id": "B", "text": "`jstat -gcutil <pid> 1000 30`" },
+            { "id": "C", "text": "`jstat -heap <pid> 30 1`" },
+            { "id": "D", "text": "`jstat -gcnew <pid> 1s 30`" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`jstat -gcutil <pid> <间隔ms> <次数>` 是最常用的 GC 监控命令。`-gcutil` 输出各代使用率百分比（S0、S1、Eden、Old、Metaspace），更直观；`-gc` 输出绝对字节数，更适合精确计算。间隔单位是毫秒，所以 `1000` 表示每秒一次。`30` 是采集次数。A 选项 `jstat -gc <pid> 1 30` 也能运行，但间隔参数 `1` 表示每 1 毫秒采集一次，输出极快，不适合人工观察。C 选项 `-heap` 不是有效的 jstat 子命令（应用 `jmap -heap` 来查看堆的整体信息）。D 选项 `1s` 不是合法的时间格式，jstat 只接受纯数字毫秒值。"
+        },
+        {
+          "id": "java-heap-leak-q6",
+          "question": "以下哪种 ThreadLocal 的使用方式会导致线程池场景下的内存泄漏？",
+          "choices": [
+            { "id": "A", "text": "在 try-finally 块中 set，finally 里调用 remove()" },
+            { "id": "B", "text": "在请求进入时 set，请求处理完成的 finally 块中调用 remove()" },
+            { "id": "C", "text": "在 Spring 的 @Async 方法里 set 值，方法结束后没有显式 remove()" },
+            { "id": "D", "text": "在使用 InheritableThreadLocal 时，父线程 set 值后子线程能继承" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Spring `@Async` 方法默认使用内部的线程池（TaskExecutor）执行，线程会被反复复用。如果在 `@Async` 方法里往 ThreadLocal 里 set 了值，方法执行结束后线程并不销毁而是回到线程池等待下一个任务，ThreadLocalMap 里的 Entry 就会一直残留。下一个请求被这个线程执行时，`ThreadLocal.get()` 会拿到上一个请求遗留的数据，不仅是内存泄漏，还可能导致数据污染 bug。A 和 B 都是正确的用法，在 finally 里调用 remove() 可以确保无论是否发生异常，ThreadLocal 都会被清理。D 描述的是 InheritableThreadLocal 的正常继承行为，不是泄漏场景。"
+        },
+        {
+          "id": "java-heap-leak-q7",
+          "question": "以下关于 `jmap -dump` 和 `jcmd GC.heap_dump` 的对比，哪个说法是正确的？",
+          "choices": [
+            { "id": "A", "text": "两者效果完全相同，只是命令格式不同，生产环境可以随意选择" },
+            { "id": "B", "text": "`jmap -dump` 在某些 JVM 版本和 OS 组合下可能导致进程崩溃，而 `jcmd` 是更安全的官方推荐方式" },
+            { "id": "C", "text": "`jmap -dump` 更新，是 JDK 11 之后替代 `jcmd` 的主流工具" },
+            { "id": "D", "text": "`jcmd GC.heap_dump` 只能 dump 存活对象，无法获取完整的堆快照" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "虽然 `jmap` 和 `jcmd GC.heap_dump` 在正常情况下功能类似，但 `jmap` 历史上在某些平台（尤其是 Linux + OpenJDK 组合）下有已知的稳定性问题，在触发 dump 时可能因为底层 ptrace 权限或 JVM 内部状态问题导致目标进程崩溃。Oracle/OpenJDK 的官方文档明确推荐在 JDK 8+ 优先使用 `jcmd` 来替代 `jmap`，`jcmd` 通过 JVM 内部的安全机制触发 dump，不依赖外部调试接口，风险更低。A 说两者完全相同是不准确的。C 的时间线是反的，`jcmd` 早在 JDK 7 就引入，`jmap` 才是老工具。D 错误，`jcmd GC.heap_dump` 默认 dump 完整堆，Arthas 的 `heapdump --live` 才是只 dump 存活对象。"
+        },
+        {
+          "id": "java-heap-leak-q8",
+          "question": "一个 Spring Boot 服务使用了静态的 `HashMap` 作为本地缓存，已知是内存泄漏根源。以下哪个修复方案既能解决泄漏问题又保留缓存功能？",
+          "choices": [
+            { "id": "A", "text": "把 HashMap 改成 ConcurrentHashMap，用线程安全的容器替代" },
+            { "id": "B", "text": "使用 Guava Cache 并配置 maximumSize 和 expireAfterWrite，让缓存自动淘汰过期条目" },
+            { "id": "C", "text": "在 HashMap 的 put 方法调用之前，先判断 size 是否超过阈值，如果超过则先 clear() 再 put" },
+            { "id": "D", "text": "把 HashMap 声明为局部变量而非 static 字段，这样方法返回时 Map 会自动被 GC" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "A 选项 `ConcurrentHashMap` 解决了线程安全问题，但没有解决无限增长的问题，换了一个线程安全的无界容器泄漏照样存在。C 的 `clear()` 方案会导致缓存瞬间全部失效（cache stampede，缓存雪崩），而且清空后马上 put 一条，并不能真正防止增长，只是把「慢慢泄漏」变成了「定期抖动」，不是正确的解法。D 改成局部变量确实解决了 GC 问题，但也彻底失去了缓存功能——每次调用方法都会创建一个新的 Map，缓存命中率为零，和直接不用缓存没区别。Guava Cache（B）的 `maximumSize` 设置容量上限、`expireAfterWrite` 设置 TTL，超出限制的条目会自动按 LRU 或 LFU 策略淘汰，在有界内存使用下保留了缓存语义，是正确的修复方案。"
+        },
+        {
+          "id": "java-heap-leak-q9",
+          "question": "在 G1 GC 下，内存泄漏的早期症状与传统 CMS GC 有什么不同？",
+          "choices": [
+            { "id": "A", "text": "G1 下内存泄漏会直接触发 Full GC，和 CMS 行为一致，没有区别" },
+            { "id": "B", "text": "G1 下内存泄漏的早期症状是 Mixed GC 频率增加，因为 G1 会先尝试通过 Mixed GC 回收 Old Region，而不是直接触发 Full GC" },
+            { "id": "C", "text": "G1 能自动修复内存泄漏，因为它的 Region 机制可以识别并释放不再需要的对象" },
+            { "id": "D", "text": "G1 下内存泄漏的早期症状是 Young GC 停顿时间变长，而不是 GC 频率增加" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "G1 GC 的设计目标是避免 Full GC，它引入了 Mixed GC 来增量回收 Old Gen。当 Old Gen 占用率超过 `InitiatingHeapOccupancyPercent`（默认 45%）时，G1 会触发并发标记，之后执行 Mixed GC 同时回收 Young Region 和部分高垃圾率的 Old Region。在内存泄漏的早期，泄漏对象还不够多，G1 能通过 Mixed GC 勉强控制 Old Gen 增长，所以你会看到 Mixed GC 的频率在升高；随着泄漏越来越严重，G1 的 Mixed GC 也无济于事，最终 Evacuation Failure（没有足够的空 Region 来移动存活对象），才会退化成 Full GC。如果你的报警指标只有 Full GC 频率，G1 下的早期泄漏会漏报，所以应该同时监控 Old Gen 使用率的增长趋势。"
+        },
+        {
+          "id": "java-heap-leak-q10",
+          "question": "使用 MAT 分析 Heap Dump 时，「Path to GC Roots」功能的作用是什么？",
+          "choices": [
+            { "id": "A", "text": "显示从当前对象出发，它所引用的所有子对象的树形结构（对象图的出方向）" },
+            { "id": "B", "text": "显示从 GC Root 到当前对象的完整引用链（对象图的入方向），帮助定位是谁在「意外地」持有这个对象" },
+            { "id": "C", "text": "自动建议修复内存泄漏的代码路径，指出应该在哪一行代码调用 null 赋值或 remove()" },
+            { "id": "D", "text": "统计当前对象被多少个其他对象引用，引用数最多的对象是泄漏源" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「Path to GC Roots」是定位内存泄漏根因的关键功能。当你在 Dominator Tree 里找到了一个 Retained Heap 异常大的对象，你需要知道「谁在引用它，为什么 GC 不能回收它」。Path to GC Roots 从这个对象出发，沿着入引用（inbound references）方向向上追溯，直到找到某个 GC Root（比如 static 字段或活跃线程栈）。这条路径就是泄漏的「证据链」：最终你会看到某个 static Map 或某个线程的栈变量把这个对象「钉」在了内存里，这就是需要在代码里修复的地方。A 描述的是 Dominator Tree 展开子节点的行为，不是 Path to GC Roots。C 和 D 都不是这个功能的描述，MAT 不会直接建议代码修改，也不简单按引用数判断泄漏源。"
+        }
+      ],
+      "references": [
+        "https://help.eclipse.org/latest/index.jsp?topic=/org.eclipse.mat.ui.help/welcome.html",
+        "https://docs.oracle.com/en/java/javase/17/docs/specs/man/jcmd.html",
+        "https://docs.oracle.com/en/java/javase/17/docs/specs/man/jstat.html",
+        "https://github.com/alibaba/arthas"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,157 @@
+{
+  "id": "redis-cluster-failover",
+  "name": "Redis 集群故障转移与高可用",
+  "domain": "troubleshooting",
+  "description": "分析 Redis Sentinel 故障转移 30 秒中断的原因，通过调优缩短 RTO",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-cluster-failover-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["redis", "sentinel", "high-availability", "failover", "cluster"],
+      "title": "Redis 主节点宕机故障转移期间有 30 秒连接中断，如何分析原因并缩短？",
+      "content": "凌晨 3 点，你的手机告警震动把你从睡梦中惊醒。监控大盘显示 Redis 主节点宕机，Sentinel 开始发起故障转移，与此同时应用层的错误监控也跟着爆掉了——Sentry 里几百条 `ECONNREFUSED` 和 `Connection reset by peer` 堆成了一列。等你睡眼惺忪打开电脑，大约 30 秒后，Sentinel 完成了故障转移，应用恢复正常，写入也重新开始工作。\n\n整个过程的告警记录如下：\n\n```\n03:14:22  [WARN]  Redis master 10.0.1.10:6379 is unreachable from sentinel-1\n03:14:22  [WARN]  Redis master 10.0.1.10:6379 is unreachable from sentinel-2\n03:14:22  [WARN]  Redis master 10.0.1.10:6379 is unreachable from sentinel-3\n03:14:52  [INFO]  +sdown master mymaster 10.0.1.10 6379   ← 主观下线\n03:14:52  [INFO]  +odown master mymaster 10.0.1.10 6379 #quorum 3/2\n03:14:52  [INFO]  +try-failover master mymaster 10.0.1.10 6379\n03:14:52  [INFO]  +elected-leader master mymaster 10.0.1.10 6379\n03:14:53  [INFO]  +selected-slave slave 10.0.1.11:6379\n03:14:53  [INFO]  +failover-state-send-slaveof-noone\n03:14:54  [INFO]  +promoted-slave slave 10.0.1.11:6379\n03:14:54  [INFO]  +switch-master mymaster 10.0.1.10 6379 10.0.1.11 6379\n03:14:54  [INFO]  +slave slave 10.0.1.10:6379 mymaster 10.0.1.11 6379\n```\n\n从日志可以看出，从 03:14:22 宕机告警到 03:14:54 故障转移完成，整整 32 秒。应用层在这段时间内所有 Redis 写操作全部失败，部分涉及用户行为统计的数据永久丢失，涉及支付状态更新的操作则因为应用层有重试逻辑而最终成功补偿了回来。\n\n你们的 Sentinel 当前配置如下：\n\n```ini\n# sentinel.conf\nsentinel monitor mymaster 10.0.1.10 6379 2\nsentinel down-after-milliseconds mymaster 30000\nsentinel failover-timeout mymaster 180000\nsentinel parallel-syncs mymaster 1\n```\n\n同事复盘时问了几个问题：「30 秒中断是正常的吗，还是配置有问题？」「如果把 `down-after-milliseconds` 调小，会不会引入新的问题？」「除了 Sentinel，Redis Cluster 模式在故障转移速度上有区别吗？」「数据写失败这件事，从架构层面有没有更好的处理方式？」\n\n请你详细分析这 30 秒中断的各阶段原因，给出具体的调优方案和生产环境配置建议。",
+      "answer": "## Redis 高可用的两种模式\n\nRedis 本身是一个单线程的内存数据库，进程挂掉数据就没了，所以高可用必须靠外部机制来保证。Redis 社区先后推出了两套方案，理解它们的差异是读懂这次故障的前提。\n\n第一套是 **Redis Sentinel（哨兵模式）**，本质上是主从复制加上一个自动故障转移的控制面。主节点负责读写，从节点实时同步主节点的写入（异步复制），Sentinel 是一组独立进程，持续监控主从节点的存活状态，一旦主节点不可达就发起投票并完成切换。Sentinel 的优点是架构简单、运维成本低，适合数据量不大、单节点可以承载全量数据的场景。生产上至少部署 3 个 Sentinel 节点（奇数，保证投票有多数派），通常部署在不同的物理机或可用区。\n\n第二套是 **Redis Cluster**，它把数据分片到多个主节点（每个主节点负责一部分 slot，共 16384 个），每个主节点有自己的从节点，去中心化地互相监控，不需要额外的 Sentinel 进程。Redis Cluster 适合数据量大、需要水平扩展写入能力的场景，故障转移流程比 Sentinel 更快（后面详细比较）。\n\n这次故障发生在 Sentinel 架构下，接下来一层层拆解那 30 秒究竟发生了什么。\n\n## 30 秒中断的四阶段分解\n\n看日志，03:14:22 到 03:14:54，总共 32 秒，可以拆成四个阶段。\n\n**第一阶段：主观下线检测（约 30 秒）**。这是最关键的一段。Sentinel 通过每隔 1 秒向主节点发送 `PING` 命令来检测其存活状态。当 `PING` 的响应超时时间超过 `down-after-milliseconds` 配置值时，该 Sentinel 实例才会把主节点标记为「主观下线」（SDOWN，Subjectively Down）。你们的配置是 `down-after-milliseconds mymaster 30000`，也就是 30,000 毫秒 = **30 秒**。这就是那 30 秒消失的主要原因：Sentinel 在整整等了 30 秒之后，才认定主节点挂了。\n\n这个配置默认值就是 30000，很多人部署 Redis Sentinel 后从来没改过这一行，结果在故障切换时才发现自己踩了坑。\n\n**第二阶段：客观下线投票（毫秒级）**。单个 Sentinel 的「主观下线」判断可能是误判（比如网络短暂抖动），所以需要多数派确认，这就是「客观下线」（ODOWN，Objectively Down）。日志里 `+odown #quorum 3/2` 表示有 3 个 Sentinel 都认为主节点挂了，达到了 quorum=2 的要求。这个阶段的耗时是 Sentinel 之间的网络往返，在同机房环境下通常在毫秒量级，可以忽略不计。\n\n**第三阶段：Leader 选举与 Slave 提升（1-2 秒）**。达到客观下线后，Sentinel 需要在自己内部选出一个 Leader 来主导故障转移（用的是 Raft-like 的投票算法），然后 Leader 选出一个延迟最低、数据最新的从节点，向它发送 `SLAVEOF NO ONE` 命令，把它提升为新主节点。被提升的从节点需要执行 `REPLICAOF NO ONE`（Redis 5.0+ 的新命令名），清除自己的从库状态，这个过程通常在 1 秒左右完成。\n\n**第四阶段：客户端感知与重连（秒级）**。这是最容易被忽视的一段延迟。即使 Sentinel 已经完成了切换，客户端也不会立刻知道新主节点的地址。使用原生 Redis 客户端直连主节点的应用会持续收到连接错误，直到主动重试或者连接超时重建。使用 Sentinel-aware 客户端（比如 Jedis 的 `JedisSentinelPool`，或者 Lettuce 的 `RedisClient.create(RedisURI.Builder.sentinel(...))` 方式）的应用，客户端会监听 Sentinel 的 `+switch-master` 事件，在事件触发后自动重连到新主，这个过程通常在 1 秒以内。\n\n## 缩短中断窗口的具体方案\n\n理解了四个阶段，调优方向就清晰了。\n\n**核心手段：调低 `down-after-milliseconds`**。这是最直接的改动。把 30000ms 降到 5000ms，理论上可以把故障检测阶段从 30 秒缩短到 5 秒，总中断时间从 ~32 秒压缩到 ~7 秒。这是生产上常见的调优配置：\n\n```ini\n# sentinel.conf — 调优后的生产配置\nsentinel monitor mymaster 10.0.1.10 6379 2\n\n# 核心改动：把主观下线超时从 30s 降低到 5s\n# 5000ms 在稳定网络中不会触发误判，但要结合你们网络质量评估\nsentinel down-after-milliseconds mymaster 5000\n\n# 故障转移超时保持默认即可，通常不需要改\nsentinel failover-timeout mymaster 180000\n\n# parallel-syncs=1 表示故障转移后每次只有 1 个 slave 向新主同步\n# 如果有多个 slave，可以适当调高，但会增加新主节点的压力\nsentinel parallel-syncs mymaster 1\n\n# 可选：配置通知脚本，故障转移后触发自定义动作（如更新配置中心）\n# sentinel notification-script mymaster /usr/local/bin/notify.sh\n```\n\n但这里有一个需要认真权衡的问题：`down-after-milliseconds` 越小，Sentinel 越敏感，**误判风险越高**。如果你们的机房网络质量不稳定，偶尔有几秒的抖动，设置 5000ms 可能导致 Sentinel 在主节点其实还活着的情况下发起了不必要的故障转移，这比 30 秒中断更可怕——因为故障转移本身会造成短暂的写入中断，而且新主节点可能数据比旧主节点少（异步复制的数据丢失）。\n\n经验上的建议：同机房环境，5000-10000ms 是合理范围；跨 AZ 或跨机房的 Sentinel，建议不低于 10000ms；如果你的应用对 RTO（恢复时间目标）要求在 5 秒以内，那 Sentinel 可能本身就不是合适的方案，应该考虑 Redis Cluster 或者云服务商提供的托管 Redis。\n\n**使用 Sentinel-aware 客户端**。如果你的应用还在用 `redis.New(\"10.0.1.10:6379\")` 这种直连主节点的方式，那即使 Sentinel 切换再快，客户端也不知道。应该改成通过 Sentinel 发现主节点地址的方式：\n\n```python\n# Python — redis-py 的 Sentinel 连接方式\nfrom redis.sentinel import Sentinel\n\n# 连接到所有 Sentinel 节点\nsentinel = Sentinel(\n    [('10.0.1.20', 26379), ('10.0.1.21', 26379), ('10.0.1.22', 26379)],\n    socket_timeout=0.5,      # Sentinel 连接超时，不能太长\n    socket_connect_timeout=0.5,\n)\n\n# master() 返回当前主节点的连接，内部自动处理切换\nmaster = sentinel.master_for('mymaster', socket_timeout=0.5, retry_on_timeout=True)\nslave = sentinel.slave_for('mymaster', socket_timeout=0.5)\n\n# 写操作走主节点，读操作可以走从节点\nmaster.set('key', 'value')\nslave.get('key')\n```\n\n```java\n// Java — Lettuce 的 Sentinel 连接方式\nRedisURI redisUri = RedisURI.Builder\n    .sentinel(\"10.0.1.20\", 26379, \"mymaster\")\n    .withSentinel(\"10.0.1.21\", 26379)\n    .withSentinel(\"10.0.1.22\", 26379)\n    .withTimeout(Duration.ofMillis(500))\n    .build();\n\nRedisClient client = RedisClient.create(redisUri);\nStatefulRedisMasterReplicaConnection<String, String> connection =\n    MasterReplica.connect(client, StringCodec.UTF8, redisUri);\nconnection.setReadFrom(ReadFrom.REPLICA_PREFERRED); // 读优先走从库\n```\n\n这类客户端会订阅 Sentinel 的 Pub/Sub 频道，在收到 `+switch-master` 事件后立刻更新内部连接池指向新主节点，切换延迟通常在 500ms 以内。\n\n**在应用层加短暂重试逻辑**。故障转移期间不可避免地会有短暂报错，合理的重试策略可以让这段空白对用户透明：\n\n```python\nimport time\nfrom redis.exceptions import ConnectionError, TimeoutError\n\ndef redis_set_with_retry(redis_client, key, value, max_retries=5):\n    \"\"\"带退避重试的写入，专门应对故障转移期间的短暂中断\"\"\"\n    for attempt in range(max_retries):\n        try:\n            return redis_client.set(key, value)\n        except (ConnectionError, TimeoutError) as e:\n            if attempt == max_retries - 1:\n                raise  # 重试耗尽，上抛让上层决定降级策略\n            # 指数退避，最长等待 2 秒\n            wait_time = min(0.1 * (2 ** attempt), 2.0)\n            time.sleep(wait_time)\n```\n\n注意这里的重试只适用于**幂等操作**或**写入失败后可重试的操作**。支付状态这类「必须成功」的写入，除了重试之外，还应该在本地做持久化记录，故障恢复后通过对账补偿。\n\n## Redis Cluster 的故障转移速度对比\n\nRedis Cluster 的故障转移流程在设计上就比 Sentinel 快。在 Cluster 模式下，所有节点互相发送 PING/PONG 心跳，当某个节点被一定数量的节点标记为 PFAIL（可能失败，类似 Sentinel 的主观下线），就会进入 FAIL 状态并触发故障转移，这个检测默认超时是 `cluster-node-timeout`，默认值是 15000ms（15 秒），但社区通常推荐设置为 5000-10000ms。\n\nCluster 之所以快，原因在于它是**去中心化**的：每个从节点自己就能发起选举成为新主，不需要等一个外部的 Sentinel Leader 来指挥，省掉了 Sentinel Leader 选举和通知的往返时间。在相同的超时配置下，Redis Cluster 的故障转移通常比 Sentinel 快 2-5 秒。\n\n但 Cluster 也有代价：运维复杂度高，槽迁移（reshard）操作需要谨慎，客户端需要支持 Cluster 协议（处理 `MOVED` 和 `ASK` 重定向），跨槽（multi-key）操作受限。如果你的数据量在单机 50GB 以内、写入量不是瓶颈，Sentinel 通常是更简单稳定的选择。\n\n## 写入失败的分级处理\n\n回到最初的问题：故障转移期间的写失败，怎么处理才对？这不是 Redis 单方面能解决的，需要应用层设计配合。一个成熟的方案通常按数据重要性分级：核心业务数据（支付流水、订单状态）在写 Redis 失败时必须触发告警并写入本地持久化队列，等 Redis 恢复后通过对账任务补偿回去；次要数据（用户行为统计、页面访问计数）可以接受有限丢失，写失败直接丢弃并记录计数器，事后评估丢失量；非关键数据（Session 缓存、热点推荐缓存）写失败后直接降级到数据库或返回默认值。\n\n## 进阶：WAIT 命令与强一致写入\n\nRedis 默认的主从复制是异步的，这意味着主节点确认写入后，从节点可能还没同步到这条数据。如果主节点在此时宕机，这条数据就丢失了。Redis 4.0 之后提供了 `WAIT` 命令，可以在写入后等待指定数量的从节点确认同步完成再返回，类似同步复制：\n\n```bash\n# 写入数据\nSET payment:order:123 \"paid\"\n# 等待至少 1 个从节点在 1000ms 内确认同步，返回实际确认的从节点数\nWAIT 1 1000\n# 返回 1 表示有 1 个从节点已同步，返回 0 表示超时没有从节点确认\n```\n\n`WAIT` 命令本质上是把异步复制变成了「半同步」，代价是写入延迟会增加（多了一个主从网络往返）。对于支付类场景，在关键写入后执行 `WAIT 1 500` 是一种有效的数据保护手段——它无法保证 100% 不丢数据（比如网络超时后仍然返回），但能极大降低丢失概率。\n\n顺便说一句，`WAIT` 命令也是著名的 **Redlock 争议**的核心背景之一。Martin Kleppmann 在 2016 年的文章中指出，Redlock 在异步主从复制下无法保证互斥性，因为锁的写入可能没来得及同步到从节点就发生了故障转移，新主节点上这个锁就消失了，导致分布式锁失效。Redis 作者 Antirez 的反驳是 Redlock 的设计前提是节点间无强依赖，这场争论至今没有定论，工程上的共识是：如果你的业务需要强一致的分布式锁，ZooKeeper 或 etcd 比 Redis 更可靠。\n\n云上托管的 Redis 服务（AWS ElastiCache、阿里云 Redis）通常把故障转移时间 SLA 控制在 30-60 秒，部分版本通过 Multi-AZ 自动故障转移可以压到 10-15 秒。如果你的 RTO 要求在 5 秒以内，自建 Redis 方案在架构上就需要做更多工作，比如双活写入、客户端多主路由等。",
+      "keyPoints": [
+        "Redis Sentinel 的 `down-after-milliseconds` 默认值为 30000ms（30 秒），这是这次 30 秒中断的根本原因：Sentinel 会等待这么长时间确认主节点「主观下线」后才开始故障转移流程。",
+        "故障转移的完整延迟 = 主观下线检测时间（down-after-milliseconds）+ 客观下线投票时间（毫秒级）+ 新主提升时间（1-2 秒）+ 客户端感知重连时间（取决于客户端类型）。",
+        "将 `down-after-milliseconds` 从 30000ms 调低到 5000-10000ms 可以显著缩短中断窗口，但阈值过低会提高网络抖动时的误判风险，需要根据实际网络质量权衡。",
+        "使用 Sentinel-aware 客户端（Jedis SentinelPool、Lettuce Sentinel 模式）通过订阅 `+switch-master` 事件自动重连，相比直连主节点的客户端，可以将客户端感知延迟从数秒压缩到 500ms 以内。",
+        "Redis Cluster 的故障转移比 Sentinel 更快，原因是它的去中心化设计：从节点可以自主发起选举，无需等待外部 Sentinel Leader 协调，在相同超时配置下通常快 2-5 秒。",
+        "Redis 的主从复制默认是异步的，主节点宕机时可能丢失最近未同步的写入；对关键数据（支付）可使用 `WAIT n timeout` 命令等待 n 个从节点同步确认，将异步复制升级为半同步，降低数据丢失风险。",
+        "故障转移期间写入失败应按数据重要性分级处理：核心数据写本地持久化队列后补偿，非关键数据可接受丢弃，所有分支都应有对应的监控告警，而不是统一的「报错就失败」。"
+      ],
+      "quiz": [
+        {
+          "id": "redis-cluster-failover-q1",
+          "question": "在 Redis Sentinel 架构中，`down-after-milliseconds` 参数控制的是什么？",
+          "choices": [
+            { "id": "A", "text": "Sentinel 判断主节点「主观下线」（SDOWN）所需的连续无响应时间" },
+            { "id": "B", "text": "故障转移整体超时时间，超过此时间则放弃本次故障转移" },
+            { "id": "C", "text": "达到客观下线（ODOWN）所需的 quorum 数量" },
+            { "id": "D", "text": "从节点向新主节点同步数据的最大等待时间" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "`down-after-milliseconds` 是 Sentinel 用于判断「主观下线」（SDOWN）的超时阈值：当 Sentinel 向主节点发送的 PING 命令在超过这个时间内没有得到有效响应时，该 Sentinel 实例会将主节点标记为 SDOWN。这个参数是故障转移延迟的最大组成部分。控制故障转移整体超时的参数是 `failover-timeout`（选项 B 是它的描述）；quorum 是 `sentinel monitor` 命令的第四个参数（选项 C）；从节点同步超时由 `parallel-syncs` 和复制超时参数控制（选项 D）。"
+        },
+        {
+          "id": "redis-cluster-failover-q2",
+          "question": "Redis Sentinel 中「主观下线」（SDOWN）和「客观下线」（ODOWN）的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "SDOWN 是单个 Sentinel 的判断，ODOWN 是多数 Sentinel 达成共识后的判断，只有 ODOWN 才会触发故障转移" },
+            { "id": "B", "text": "SDOWN 表示主节点进程崩溃，ODOWN 表示主节点网络不可达，两者都会独立触发故障转移" },
+            { "id": "C", "text": "SDOWN 是临时状态会自动恢复，ODOWN 是永久状态，需要人工干预才能恢复" },
+            { "id": "D", "text": "SDOWN 由 Sentinel Leader 判断，ODOWN 由所有 Sentinel 投票决定" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "SDOWN（Subjectively Down，主观下线）是单个 Sentinel 实例基于自己与主节点的通信超时做出的局部判断。由于网络可能存在分区，单个 Sentinel 的判断可能是错误的（误判），所以 Redis 设计了 ODOWN（Objectively Down，客观下线）机制：只有当达到 quorum 数量的 Sentinel 都认为主节点是 SDOWN 时，才会升级为 ODOWN，只有 ODOWN 状态才会触发故障转移。选项 B 混淆了故障原因与状态含义；选项 C 错误描述了恢复机制；选项 D 错误描述了判断主体。"
+        },
+        {
+          "id": "redis-cluster-failover-q3",
+          "question": "下面哪个 Sentinel 配置能最有效地将故障检测时间从 30 秒缩短到 5 秒？",
+          "choices": [
+            { "id": "A", "text": "`sentinel down-after-milliseconds mymaster 5000`" },
+            { "id": "B", "text": "`sentinel failover-timeout mymaster 5000`" },
+            { "id": "C", "text": "`sentinel parallel-syncs mymaster 5`" },
+            { "id": "D", "text": "`sentinel monitor mymaster 10.0.1.10 6379 1`（将 quorum 从 2 改为 1）" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "直接将 `down-after-milliseconds` 从 30000 改为 5000 才能缩短主观下线的检测时间，这是导致 30 秒等待的根本参数。`failover-timeout`（选项 B）控制的是整个故障转移过程的最长超时时间，缩短它不会加快检测，反而可能在网络偶尔慢时让正常的故障转移超时失败。`parallel-syncs`（选项 C）控制故障转移后有多少 slave 并行向新主同步，与检测时间无关。降低 quorum（选项 D）虽然可以减少投票耗时，但这个阶段本就是毫秒级，而且降低 quorum 会大幅增加误判和脑裂风险，是危险的操作。"
+        },
+        {
+          "id": "redis-cluster-failover-q4",
+          "question": "在 Sentinel 故障转移完成后，哪种客户端连接方式能最快感知到主节点切换？",
+          "choices": [
+            { "id": "A", "text": "使用 Sentinel-aware 客户端（如 Lettuce Sentinel 模式），订阅 `+switch-master` 事件后自动重连" },
+            { "id": "B", "text": "直连主节点 IP，设置较短的连接超时（100ms），超时后自动重连" },
+            { "id": "C", "text": "通过 DNS 连接主节点，Sentinel 切换后更新 DNS 记录" },
+            { "id": "D", "text": "客户端定期（每秒）调用 `SENTINEL get-master-addr-by-name` 接口轮询新主地址" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Sentinel-aware 客户端（如 Jedis 的 JedisSentinelPool、Lettuce 的 Sentinel 连接模式）会主动订阅 Sentinel 节点的 Pub/Sub 频道，当 Sentinel 完成故障转移并广播 `+switch-master` 消息时，客户端立即收到事件并更新连接池中的主节点地址，整个感知过程通常在 500ms 以内。直连 IP 方式（选项 B）需要等到连接超时后才能重连，且不知道新主地址在哪。DNS 方案（选项 C）受限于 DNS TTL，通常延迟在数秒到数分钟。轮询方案（选项 D）理论上可行但延迟取决于轮询间隔，1 秒轮询也比事件订阅慢，且增加了 Sentinel 的查询压力。"
+        },
+        {
+          "id": "redis-cluster-failover-q5",
+          "question": "以下 Sentinel 日志片段中，`+odown #quorum 3/2` 表示什么含义？",
+          "choices": [
+            { "id": "A", "text": "有 3 个 Sentinel 认为主节点已下线，配置要求的 quorum 是 2，已达到客观下线条件" },
+            { "id": "B", "text": "主节点下线了 3 次，但只有 2 次被记录，存在日志丢失" },
+            { "id": "C", "text": "Sentinel 集群共有 3 个节点，其中 2 个节点投票赞成故障转移" },
+            { "id": "D", "text": "主节点在 3 分钟内有 2 次心跳超时，即将触发主观下线" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "`+odown #quorum 3/2` 是标准的 Sentinel 日志格式，斜线前的数字是「当前有多少个 Sentinel 报告了 SDOWN」，斜线后是「配置要求的 quorum 值」。这里表示 3 个 Sentinel 都认为主节点处于 SDOWN 状态，而配置要求最少 2 个（quorum=2）就可以宣告客观下线，所以条件已满足，接下来会触发故障转移。这个格式容易被误读为选项 C 的意思（集群总节点数与投票数），但实际上 Sentinel 集群总数和投票赞成数并不是这个字段的含义。"
+        },
+        {
+          "id": "redis-cluster-failover-q6",
+          "question": "将 `down-after-milliseconds` 调低到 1000ms（1 秒）有什么潜在风险？",
+          "choices": [
+            { "id": "A", "text": "机房网络抖动或主节点短暂 GC 暂停可能导致 Sentinel 误判主节点下线，触发不必要的故障转移造成数据丢失" },
+            { "id": "B", "text": "Sentinel 检测频率变高，大量 PING 命令会占满主节点 CPU 导致性能下降" },
+            { "id": "C", "text": "下线时间太短会导致从节点来不及完成数据同步，故障转移后新主数据不完整" },
+            { "id": "D", "text": "quorum 投票时间不足，Sentinel 之间来不及通信就开始故障转移，导致多个 Sentinel 同时发起切换" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "`down-after-milliseconds` 本质上是「误判容忍度」的设置。1000ms 意味着主节点只要有超过 1 秒没有响应，Sentinel 就认为它挂了。但现实网络中，主节点可能因为 CPU 密集操作（如 RDB fork）、Linux 内存页交换、JVM Full GC 等原因造成短暂的响应超时，这些情况下主节点其实是活着的。误触发故障转移的代价很大：新主升级后旧主恢复，两个节点都认为自己是主（脑裂风险），此外异步复制的数据差异会导致旧主上的最新写入丢失。选项 B 错误，Sentinel 的 PING 频率固定是每秒一次，与 down-after-milliseconds 无关。选项 C 混淆了参数含义，down-after-milliseconds 控制的是检测时间而非同步等待时间。选项 D 错误，Leader 选举机制会防止多个 Sentinel 同时发起切换。"
+        },
+        {
+          "id": "redis-cluster-failover-q7",
+          "question": "Redis Cluster 的故障转移通常比 Redis Sentinel 更快，主要原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Redis Cluster 是去中心化架构，从节点可以自主发起选举成为新主，无需等待外部 Sentinel Leader 协调" },
+            { "id": "B", "text": "Redis Cluster 使用同步复制，故障转移后无需等待数据同步" },
+            { "id": "C", "text": "Redis Cluster 的节点心跳间隔更短（默认 100ms），而 Sentinel 心跳间隔是 1 秒" },
+            { "id": "D", "text": "Redis Cluster 的 quorum 要求更低，只需 1 个节点确认即可触发故障转移" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 的速度优势来自于它的去中心化设计。在 Sentinel 模式中，故障转移需要：Sentinel 发现 SDOWN → Sentinel 之间协商 ODOWN → Sentinel 选出 Leader → Leader 指定从节点升级为新主 → 通知客户端。而在 Redis Cluster 中，集群节点通过 Gossip 协议互相监控，一旦某个主节点被足够多的节点标记为 PFAIL 并升级为 FAIL，该主节点的从节点会自行发起选举，赢得多数主节点投票后立即升级为新主。整个过程不需要一个外部的「Sentinel Leader」来协调，省掉了 Leader 选举和跨进程通信的往返时间。选项 B 错误，Cluster 默认也是异步复制。选项 C 不准确，心跳间隔差异不是主要因素。选项 D 错误，Cluster 的选举也需要多数主节点（N/2+1）投票。"
+        },
+        {
+          "id": "redis-cluster-failover-q8",
+          "question": "生产环境中有一个支付系统，需要在 Redis 写入时保证数据不因主节点故障而丢失，最合适的方案是什么？",
+          "choices": [
+            { "id": "A", "text": "写入 Redis 后执行 `WAIT 1 500`，要求至少 1 个从节点在 500ms 内确认同步，超时则记录本地补偿队列" },
+            { "id": "B", "text": "将 Redis 的持久化配置为 `appendfsync always`，每次写入都同步落盘" },
+            { "id": "C", "text": "增加 Sentinel 节点数量到 5 个，quorum 设置为 4，提高故障判断的准确性" },
+            { "id": "D", "text": "禁用 AOF 和 RDB 持久化，依靠从节点作为数据备份，减少持久化 I/O 开销" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "`WAIT numreplicas timeout` 命令要求主节点等待指定数量的从节点确认写入同步完成才返回，将异步复制升级为「半同步」，有效降低主节点宕机时的数据丢失风险。同时结合本地补偿队列处理 WAIT 超时的情况，是支付场景的正确实践。选项 B（`appendfsync always`）确实能保证主节点本地不丢数据，但它是单节点持久化策略，无法防止主节点宕机后数据未同步到从节点的问题，而且 `always` 模式会把 Redis 写性能降低 10 倍以上，生产中极少用。选项 C 增加 Sentinel 数量只能提高故障判断准确性，不能防止数据丢失。选项 D 完全错误，禁用持久化意味着所有节点（包括从节点）重启后数据全部丢失。"
+        },
+        {
+          "id": "redis-cluster-failover-q9",
+          "question": "Redis `WAIT` 命令返回 0 而不是预期的 1，意味着什么？应该如何处理？",
+          "choices": [
+            { "id": "A", "text": "在超时时间内没有从节点确认同步完成，可能是主从网络慢或从节点有延迟，数据可能只在主节点，需要触发补偿逻辑" },
+            { "id": "B", "text": "写入命令本身失败了，数据没有写入主节点，需要立刻重试" },
+            { "id": "C", "text": "当前没有配置从节点，Redis 以单节点模式运行，属于正常返回值" },
+            { "id": "D", "text": "所有从节点都已经下线，应该立刻触发故障转移切换到备用主节点" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "`WAIT` 命令的返回值是「在超时时间内确认同步的从节点数量」。返回 0 不代表写入失败——数据已经成功写入主节点——而是说在指定的超时时间内，没有任何从节点向主节点发送 ACK 确认它们已经同步了这条数据。这种情况常见于：主从之间网络延迟偏高（跨机房场景）、从节点正在处理大量积压的复制数据、从节点 CPU/I/O 负载高导致复制延迟。处理方式取决于业务容忍度：对支付等核心场景，WAIT 返回 0 应视为「可能丢数据的风险信号」，记录到本地重试队列；对非关键数据，可以接受这种情况并只记录监控指标。选项 B 错误，写入主节点和从节点同步是两回事。选项 C 部分正确但描述不完整（无从节点时 WAIT 确实总返回 0，但这不是本题场景）。选项 D 错误，WAIT 超时不会也不应该触发故障转移。"
+        },
+        {
+          "id": "redis-cluster-failover-q10",
+          "question": "故障转移后发现旧主节点（10.0.1.10）重新上线了，但 Sentinel 日志显示它被自动降级为新主（10.0.1.11）的从节点。这个行为是否正确？为什么？",
+          "choices": [
+            { "id": "A", "text": "正确。Sentinel 会自动将恢复的旧主配置为新主的从节点，防止脑裂，旧主上可能有的最新数据会被覆盖丢失" },
+            { "id": "B", "text": "不正确，这是 Sentinel 的 Bug，应该手动执行 `SLAVEOF NO ONE` 让旧主重新成为主节点" },
+            { "id": "C", "text": "正确，但旧主会自动与新主协商，把自己的最新数据合并到新主，不会有数据丢失" },
+            { "id": "D", "text": "不正确，Sentinel 应该先比较两个节点的数据量，让数据更多的节点成为主节点" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是完全正确且预期的行为，也是 Redis 异步复制最重要的数据丢失场景之一。当 Sentinel 完成故障转移后，它会更新所有节点的配置，将旧主标记为新主的从节点。当旧主恢复上线时，它会接收到 `SLAVEOF 10.0.1.11 6379` 命令，开始向新主同步数据。由于主从同步是覆盖式的——从节点的数据全量对齐主节点——如果旧主在宕机前有一些写入没来得及同步到现在的新主（10.0.1.11），这些写入就会在旧主降级为从节点时被覆盖掉，永久丢失。这正是异步复制的固有风险，也是 `WAIT` 命令存在的意义。选项 B 完全错误，手动将旧主重新设为主节点会造成脑裂。选项 C 错误，Redis 主从同步没有「合并」机制，只有「覆盖」。选项 D 错误，Sentinel 没有比较数据量选主的机制，而是按从节点的 replication offset（复制偏移量）和优先级（slave-priority）选择最新的从节点。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/management/sentinel/",
+        "https://redis.io/docs/management/scaling/",
+        "https://redis.io/commands/wait/",
+        "http://antirez.com/news/101",
+        "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"
+      ]
+    }
+  ]
+}
