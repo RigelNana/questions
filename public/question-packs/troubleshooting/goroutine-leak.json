@@ -1,0 +1,156 @@
+{
+  "id": "goroutine-leak",
+  "name": "Go Goroutine 泄漏排查",
+  "domain": "troubleshooting",
+  "description": "通过 pprof goroutine profile 定位 Go 服务 goroutine 泄漏，修复 channel 阻塞和超时缺失问题",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "goroutine-leak-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["go", "goroutine", "pprof", "memory-leak", "concurrency"],
+      "title": "Go 服务 goroutine 数量从 50 增长到 50000 且内存持续增长，如何定位泄漏？",
+      "content": "## 故障背景\n\n你们团队维护一个 Go 编写的微服务，负责聚合下游多个 HTTP API 的数据并返回给前端。服务部署在 Kubernetes 上，正常情况下 Pod 内存占用约 200MB，goroutine 数量维持在 50 个左右，这是健康状态下的基线。\n\n服务上线一周后，值班同学在看 Grafana 面板时发现一个令人不安的趋势：内存曲线不再平稳，而是从 200MB 开始缓慢但持续地往上爬，一周后已经接近 2GB。与此同时，另一张图表显示 goroutine 数量从启动时的 50 个增长到了将近 50000 个，而且还在以每小时大约 200 个的速度继续增加。\n\n你们重启了 Pod，监控指标立刻恢复正常——内存回到 200MB，goroutine 回到 50 个。所有人松了口气。但三天后，同样的现象再次出现。这是一个典型的 goroutine 泄漏：goroutine 只进不出，每个泄漏的 goroutine 都持有栈内存，随着时间推移把进程的内存慢慢榨干。\n\n服务的核心逻辑大致如下：\n\n```go\nfunc fetchData(urls []string) []Result {\n    results := make([]Result, len(urls))\n    ch := make(chan Result) // 无缓冲 channel\n\n    for i, url := range urls {\n        go func(i int, url string) {\n            resp, err := http.Get(url) // 没有超时设置\n            if err != nil {\n                ch <- Result{Err: err}\n                return\n            }\n            defer resp.Body.Close()\n            var r Result\n            json.NewDecoder(resp.Body).Decode(&r)\n            ch <- Result{Data: r}\n        }(i, url)\n    }\n\n    // 只收集前 N 个结果就返回了\n    for i := 0; i < len(urls); i++ {\n        results[i] = <-ch\n        if results[i].Err != nil {\n            return results // 提前返回！\n        }\n    }\n    return results\n}\n```\n\n你能看出这段代码里隐藏了几个 goroutine 泄漏的根源吗？如果换成线上真实服务，你会如何快速定位泄漏的位置，又该如何修复？",
+      "answer": "## 理解 Goroutine：从「轻量级线程」说起\n\nGoroutine 是 Go 运行时管理的用户态并发单元，而不是操作系统线程。这个区别至关重要。操作系统线程在 Linux 上默认栈大小是 8MB，创建和切换需要陷入内核，代价很高。Goroutine 的初始栈只有 2KB（Go 1.4 之前是 8KB，之后改为 2KB，Go 1.13 又调整为 4KB 作为平衡），并且可以按需动态扩展，最大可以增长到 1GB（默认上限由 `runtime/debug.SetMaxStack` 控制）。正因为 goroutine 这么便宜，Go 程序可以轻松启动几十万个并发任务，而传统线程模型在几千个线程时就已经因为内存压力和切换开销而喘不过气来。\n\n但「便宜」不等于「免费」。50000 个 goroutine，哪怕每个只占用最小的 4KB 栈，也是 200MB；如果 goroutine 在运行过程中触发了栈增长（比如深层递归或大局部变量），实际占用可能达到 32KB、128KB 甚至更多。这就是本题中内存从 200MB 涨到 2GB 的根本原因——不是堆上有大量对象，而是几万个僵尸 goroutine 各自抱着一段栈内存不肯释放。\n\nGoroutine 泄漏的本质是：goroutine 陷入了某个阻塞操作，且这个阻塞永远不会被解除，导致 goroutine 无法退出、GC 也无法回收它占用的资源。最常见的阻塞原因有三类：channel 读写因为没有对端而永久阻塞、`select` 语句的所有 case 都不满足且没有 `default` 分支、HTTP 或数据库调用没有设置超时导致在等待网络响应时永久挂起。\n\n## 用 pprof 快速定位泄漏位置\n\n当你面对一个生产环境中 goroutine 数量持续增长的服务时，第一步不是猜测，而是直接拿数据。Go 的 `net/http/pprof` 包提供了 goroutine profile 接口，只需要在服务中 `import _ \"net/http/pprof\"` 并启动 debug 端口，就能随时拿到当前所有 goroutine 的完整调用栈快照。\n\n执行这条命令可以获取人类可读的 goroutine dump：\n\n```bash\ncurl -s http://localhost:6060/debug/pprof/goroutine?debug=2 | head -100\n```\n\n真实输出会类似这样（注意第一行的数字——那是当前 goroutine 的数量，49823 说明问题已经相当严重）：\n\n```\ngoroutine profile: total 49823\n49771 @ 0x43e526 0x43ec29 0x6b8c85 0x6b8f42 0x463801\n#\t0x6b8c84\tnet/http.(*persistConn).writeLoop+0x64\t/usr/local/go/src/net/http/transport.go:2596\n\n49771 @ 0x43e526 0x43ec29 0x6b8c85 0x6b9203 0x463801\n#\t0x6b9202\tnet/http.(*persistConn).readLoop+0x742\t/usr/local/go/src/net/http/transport.go:2204\n\n48 @ 0x43e526 0x43ec29 0x6b8c85 0x6b8d3a 0x463801\n#\t0x6b8d39\tmain.fetchData.func1+0x79\t/app/main.go:47\n```\n\n这个输出里有两个关键信息。第一，49771 个 goroutine 都卡在 `net/http` 的 `writeLoop` 和 `readLoop` 里，这是 Go HTTP 客户端的内部实现，说明有大量 HTTP 连接在等待响应——这就是无超时 `http.Get` 的直接后果。第二，输出最后几行显示 48 个 goroutine 卡在 `main.fetchData.func1`，对应我们代码里启动的那些匿名 goroutine，它们在尝试往 `ch` 写数据，但接收方已经因为提前 `return` 而消失了，这些 goroutine 将永远阻塞在 `ch <- Result{...}` 这一行。\n\n如果你想做交互式分析，用 `go tool pprof` 更直观：\n\n```bash\ngo tool pprof http://localhost:6060/debug/pprof/goroutine\n# 进入交互模式后\n(pprof) top\n(pprof) traces   # 显示完整调用链\n(pprof) web      # 生成可视化图（需要安装 graphviz）\n```\n\n`top` 命令会按 goroutine 数量排序，告诉你哪个调用栈最多人「聚集」，那里就是泄漏点。\n\n## 这段代码的两个泄漏根源以及修复方案\n\n现在回到题目里的代码，泄漏原因其实有两个，它们在生产环境中叠加出现，加速了问题的恶化。\n\n第一个根源是「提前 return 导致 channel 写端阻塞」。当 `fetchData` 遇到第一个错误时，函数直接 `return results`，但此时还有若干个 goroutine 正在执行 `http.Get` 并准备往无缓冲的 `ch` 写结果。接收方已经不存在了，这些 goroutine 会永远阻塞在 `ch <- Result{...}` 上。每次调用 `fetchData` 泄漏的 goroutine 数量等于 `len(urls) - 1`（最坏情况），调用量一大，泄漏就会以线性速度积累。\n\n第二个根源是「HTTP 请求没有超时」。`http.Get` 使用的是 `http.DefaultClient`，而 `DefaultClient` 的 `Timeout` 字段默认是零值，意味着永不超时。如果某个下游服务出现故障，连接建立了但响应迟迟不来（比如服务端在处理请求期间挂起），对应的 goroutine 就会无限等待，直到进程重启。\n\n修复方案需要同时解决这两个问题，核心思路是引入 `context` 传递取消信号，让所有 goroutine 都有明确的退出路径：\n\n```go\nfunc fetchData(ctx context.Context, urls []string) []Result {\n    // 为这批请求设置一个总超时，比如 5 秒\n    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)\n    defer cancel() // 函数退出时取消所有子 goroutine\n\n    // 使用带缓冲的 channel，容量等于 goroutine 数量\n    // 这样即使接收方提前退出，goroutine 也能写入后正常退出\n    ch := make(chan Result, len(urls))\n\n    // 构造带超时的 HTTP 客户端\n    client := &http.Client{\n        Timeout: 3 * time.Second, // 单个请求级别的超时\n    }\n\n    for i, url := range urls {\n        go func(i int, url string) {\n            req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)\n            if err != nil {\n                ch <- Result{Err: err}\n                return\n            }\n            resp, err := client.Do(req)\n            if err != nil {\n                ch <- Result{Err: err}\n                return\n            }\n            defer resp.Body.Close()\n            var r Result\n            json.NewDecoder(resp.Body).Decode(&r)\n            ch <- Result{Data: r} // 有缓冲，不会阻塞\n        }(i, url)\n    }\n\n    results := make([]Result, len(urls))\n    for i := 0; i < len(urls); i++ {\n        select {\n        case result := <-ch:\n            results[i] = result\n        case <-ctx.Done():\n            // 超时或取消，记录错误后退出\n            results[i] = Result{Err: ctx.Err()}\n        }\n    }\n    return results\n}\n```\n\n这个修复版本有三处关键变化。把 `ch` 改为带缓冲的 channel，容量等于 goroutine 数量，这样即使主 goroutine 提前退出，子 goroutine 也能把结果写入缓冲区后正常结束，不会阻塞。用 `context.WithTimeout` 给整个操作设定上限，`defer cancel()` 确保函数退出时所有子 goroutine 通过 `ctx.Done()` 得到取消信号。在 HTTP 请求上同时设置客户端级别的 `Timeout` 和请求级别的 `context`，双重保障，防止单个请求无限等待。\n\n## 预防与持续监控\n\n修复代码是治标，真正治本需要在开发阶段就把 goroutine 泄漏检测纳入测试流程。`github.com/uber-go/goleak` 这个库专门做这件事，用法极其简单：\n\n```go\nfunc TestFetchData(t *testing.T) {\n    defer goleak.VerifyNone(t) // 测试结束时检查是否有 goroutine 泄漏\n    // ... 正常测试逻辑\n}\n```\n\n如果 `fetchData` 里存在泄漏，`goleak.VerifyNone` 会让测试失败并打印出泄漏 goroutine 的调用栈，帮你在 CI 阶段就把问题拦住。\n\n在监控层面，Prometheus 的 Go 客户端默认暴露 `go_goroutines` 指标，建议在 Grafana 上为这个指标设置告警阈值。一个经验性的规则是：如果 `go_goroutines` 在 30 分钟内增长超过了启动基线的 10 倍，就触发 P2 告警。你也可以在代码中周期性地用 `runtime.NumGoroutine()` 打一条结构化日志，方便事后关联分析。\n\n另一个实用技巧是在关键位置加上 heap profile 交叉验证。goroutine 泄漏会导致栈内存增长，`/debug/pprof/heap?debug=1` 里的 `inuse_stack` 字段会随之上升，而 `inuse_heap` 不会有明显变化——这个模式本身就是区分「goroutine 泄漏」和「堆内存泄漏」的重要依据。如果你看到 RSS 在增长但 `inuse_heap` 没怎么动，首先应该查 goroutine 数量，而不是去 heap profile 里找大对象。\n\nGo 1.21 引入的 `log/slog` 可以在打印 goroutine 快照时减少额外的内存分配，对于高频 debug 场景有一定帮助。此外，设置 `GODEBUG=gctrace=1` 可以观察 GC 的触发频率——goroutine 泄漏导致栈内存增加，会让 GC 更频繁触发（因为 live set 变大），如果你发现 GC 频率比正常高出好几倍，也是一个排查 goroutine 泄漏的间接信号。",
+      "keyPoints": [
+        "每个 goroutine 的初始栈大小约为 4KB（Go 1.13+ 默认值），但可以动态增长；50000 个 goroutine 哪怕只用最小栈也会占用约 200MB 内存，这是「goroutine 泄漏导致内存增长」的直接机制。",
+        "Goroutine 泄漏的本质是 goroutine 陷入永久阻塞无法退出，常见原因是往无人接收的 channel 写数据、使用无缓冲 channel 而接收方已提前退出，以及 HTTP 请求没有设置超时导致永久等待网络响应。",
+        "使用 `curl http://localhost:6060/debug/pprof/goroutine?debug=2` 可以获取所有 goroutine 的调用栈快照，输出的第一行 total 数字是当前 goroutine 总量，重复出现次数最多的调用栈就是泄漏点。",
+        "修复 channel 泄漏的核心手段是把无缓冲 channel 改为容量等于生产者 goroutine 数量的有缓冲 channel，让生产者在接收方退出后仍能正常写入并结束，而不是永久阻塞。",
+        "所有启动 goroutine 的代码必须通过 `context.WithTimeout` 或 `context.WithCancel` 传入取消信号，配合 `select { case <-ctx.Done() }` 确保每个 goroutine 都有明确且可达的退出路径。",
+        "`github.com/uber-go/goleak` 库可以在单元测试中自动检测 goroutine 泄漏，配合 `defer goleak.VerifyNone(t)` 能在 CI 阶段拦截泄漏，避免问题流入生产环境。",
+        "区分 goroutine 泄漏和堆内存泄漏的关键特征是：goroutine 泄漏时 pprof 的 `inuse_stack` 上升而 `inuse_heap` 基本不变，堆泄漏则相反；两者结合 `go_goroutines` 指标的增长曲线可以快速判断泄漏类型。"
+      ],
+      "quiz": [
+        {
+          "id": "goroutine-leak-q1",
+          "question": "Go 1.13+ 中，新创建的 goroutine 的初始栈大小是多少？",
+          "choices": [
+            { "id": "A", "text": "2KB" },
+            { "id": "B", "text": "4KB" },
+            { "id": "C", "text": "8KB" },
+            { "id": "D", "text": "64KB" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go 的 goroutine 初始栈大小经历了几次调整。Go 1.2 及之前是 4KB，Go 1.3 改成 8KB 以减少栈增长次数，Go 1.4 为了降低内存压力改回 2KB，Go 1.13 做了一次平衡性调整，最终确定为 4KB。A 选项是 Go 1.4 的值，C 是 Go 1.3 的值，D 是操作系统线程的默认栈大小（Linux 下为 8MB，这里 D 选项 64KB 是另一个常见误解）。记住这个值的意义在于：50000 个 goroutine 仅初始栈就需要约 200MB，还不计算运行时的栈增长。"
+        },
+        {
+          "id": "goroutine-leak-q2",
+          "question": "下列哪种情况会导致 goroutine 永久泄漏？",
+          "choices": [
+            { "id": "A", "text": "goroutine 里调用了 time.Sleep(10 * time.Second)" },
+            { "id": "B", "text": "goroutine 向无缓冲 channel 发送数据，但接收方函数已经 return" },
+            { "id": "C", "text": "goroutine 里发生了 panic 但没有 recover" },
+            { "id": "D", "text": "goroutine 里使用了 sync.WaitGroup 但忘记调用 wg.Done()" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "A 选项中 `time.Sleep` 只是临时阻塞，睡眠结束后 goroutine 会继续执行并正常退出，不会泄漏。C 选项中 goroutine panic 后如果没有 recover，会让整个进程 crash 而不是单个 goroutine 泄漏。D 选项中 `wg.Done()` 缺失会导致调用 `wg.Wait()` 的 goroutine 阻塞，但 `WaitGroup` 内部没有 goroutine，影响的是等待方。B 是典型的泄漏场景：无缓冲 channel 的发送操作必须有对应的接收方才能完成，接收方退出后发送方会永远阻塞在那一行代码上。"
+        },
+        {
+          "id": "goroutine-leak-q3",
+          "question": "执行 `curl http://localhost:6060/debug/pprof/goroutine?debug=2` 后，输出第一行显示 `goroutine profile: total 48000`。这个数字代表什么？",
+          "choices": [
+            { "id": "A", "text": "过去 1 分钟内创建的 goroutine 总数" },
+            { "id": "B", "text": "当前时刻正在运行（非阻塞）的 goroutine 数量" },
+            { "id": "C", "text": "当前时刻存活的全部 goroutine 数量（包含阻塞和运行中）" },
+            { "id": "D", "text": "自进程启动以来累计创建的 goroutine 总数" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "pprof goroutine profile 是一个「当前时刻快照」，total 字段代表执行命令那一刻进程中存活的全部 goroutine，包括正在运行的、被调度器挂起的、以及阻塞在 channel/syscall/sleep 上的。A 和 D 涉及历史计数，Go runtime 没有内置这类累计指标（累计创建数可以通过 `runtime.ReadMemStats` 的 `NumGoroutine` 相关字段间接推算）。B 是最常见的错误理解——阻塞的 goroutine 仍然存活并占用内存，必须计入 total。"
+        },
+        {
+          "id": "goroutine-leak-q4",
+          "question": "关于 `http.DefaultClient`，下列说法正确的是？",
+          "choices": [
+            { "id": "A", "text": "DefaultClient 的默认 Timeout 是 30 秒" },
+            { "id": "B", "text": "DefaultClient 的默认 Timeout 是 0，意味着永不超时" },
+            { "id": "C", "text": "DefaultClient 会自动继承调用方传入的 context 超时" },
+            { "id": "D", "text": "使用 http.Get 时如果超过 30 秒会自动返回 timeout 错误" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Go 标准库里一个著名的陷阱。`http.DefaultClient` 是 `&http.Client{}` 的零值，其 `Timeout` 字段默认是 `0`，在 Go 的语义中 `0` 表示无限制。这意味着 `http.Get(url)` 在目标服务器不响应时会永久阻塞，不会自动超时。A 选项的「30 秒」是很多人根据经验猜测的值，实际上并不存在。C 是错误的，`http.DefaultClient` 不会自动感知外部 context，必须用 `http.NewRequestWithContext` 显式绑定。在生产代码中应该始终使用自定义的 `http.Client` 并设置合理的 `Timeout`。"
+        },
+        {
+          "id": "goroutine-leak-q5",
+          "question": "以下 pprof goroutine 输出片段中，哪个信息最直接指向泄漏根源？\n\n```\ngoroutine profile: total 47392\n47341 @ 0x43e526 0x6b8c84\n#\t0x6b8c83\tnet/http.(*persistConn).writeLoop+0x64\n```",
+          "choices": [
+            { "id": "A", "text": "total 47392 说明 goroutine 总量过多，需要增加 GOMAXPROCS" },
+            { "id": "B", "text": "47341 个 goroutine 卡在 net/http 内部的 writeLoop，说明大量 HTTP 连接在等待发送机会" },
+            { "id": "C", "text": "47341 个 goroutine 卡在 net/http 内部的 writeLoop，说明大量 HTTP 连接建立后没有收到响应，对端可能已挂起" },
+            { "id": "D", "text": "writeLoop 是正常的 HTTP 长连接保活逻辑，这里看到多个是正常的" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "`net/http.(*persistConn).writeLoop` 是 Go HTTP 客户端 Transport 层维护持久连接时负责写请求的 goroutine。正常情况下，写完请求数据后这个 goroutine 会等待下一个请求或连接关闭。当它大量堆积时，意味着有大量连接处于「请求已发出但响应未到」的状态。最常见原因是目标服务器接受了 TCP 连接和请求，但迟迟不返回响应（服务器侧挂起或死锁），加上客户端没有设置超时，导致这些连接和对应的 goroutine 永久挂起。A 选项混淆了 GOMAXPROCS（CPU 并行度）和 goroutine 数量的关系，D 选项严重低估了问题的严重性。"
+        },
+        {
+          "id": "goroutine-leak-q6",
+          "question": "下面哪种修复方式能正确解决「接收方提前 return 导致发送 goroutine 永久阻塞」的问题？",
+          "choices": [
+            { "id": "A", "text": "把 channel 改成 `make(chan Result, 1)`，容量固定为 1" },
+            { "id": "B", "text": "把 channel 改成 `make(chan Result, len(urls))`，容量等于发送方 goroutine 数量" },
+            { "id": "C", "text": "在接收方 return 前用 `close(ch)` 关闭 channel" },
+            { "id": "D", "text": "在每个发送 goroutine 里加 `recover()` 捕获 panic" }
+        ],
+          "correctAnswer": "B",
+          "explanation": "A 选项中容量为 1 的 channel 只能让第一个发送方写入后不阻塞，第二个及以后的发送方仍然会阻塞（因为 channel 已满），只是把问题延后了而非解决。C 选项关闭 channel 后，如果发送方还在尝试往已关闭的 channel 发送数据，会触发 panic（`send on closed channel`），反而引入新问题；正确做法是用 context 通知发送方取消，而不是关闭 channel。D 选项 recover 只能捕获 panic，与 channel 阻塞无关。B 是正确答案：把 channel 的缓冲区设为恰好能容纳所有发送方的容量，即使接收方提前退出，所有发送方仍能将数据写入缓冲区后正常退出。"
+        },
+        {
+          "id": "goroutine-leak-q7",
+          "question": "区分「goroutine 泄漏」和「堆内存泄漏」，最有效的判断依据是？",
+          "choices": [
+            { "id": "A", "text": "堆内存泄漏时重启后会立刻复现，goroutine 泄漏重启后会恢复正常" },
+            { "id": "B", "text": "pprof heap profile 中 inuse_stack 上升而 inuse_heap 基本不变，是 goroutine 泄漏的特征" },
+            { "id": "C", "text": "goroutine 泄漏时 CPU 使用率会持续升高，堆泄漏不影响 CPU" },
+            { "id": "D", "text": "两种泄漏无法区分，都需要通过减少业务逻辑来排查" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "goroutine 的内存主要体现在栈（stack）上，而不是 Go runtime 管理的堆（heap）。pprof heap profile 中 `inuse_space` 反映的是堆上存活对象的大小，goroutine 的栈不计入这个数字，而是体现在 `inuse_stack` 中。因此当你看到进程 RSS 在增长，但 pprof heap 的 `inuse_space` 没有明显变化，应该立刻去看 goroutine 数量和 `inuse_stack`。A 选项描述的规律在某些情况下成立但不是判断标准。C 选项是错误的——泄漏的 goroutine 通常处于阻塞状态，不消耗 CPU。"
+        },
+        {
+          "id": "goroutine-leak-q8",
+          "question": "在生产环境中，对于启动 goroutine 发起 HTTP 调用的代码，以下哪个方案的防泄漏设计最完整？",
+          "choices": [
+            { "id": "A", "text": "设置 http.Client.Timeout = 10*time.Second，确保单次请求有超时" },
+            { "id": "B", "text": "使用 context.WithTimeout 创建请求 context，并通过 http.NewRequestWithContext 绑定" },
+            { "id": "C", "text": "同时设置 http.Client.Timeout 和 context.WithTimeout，并使用带缓冲的 channel 收集结果，parent context 取消时能通知所有子 goroutine 退出" },
+            { "id": "D", "text": "在 goroutine 里加 defer recover() 并设置 http.Client.Timeout" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "A 只解决了单次请求超时的问题，但如果调用方因为其他原因（用户取消、上游超时）提前退出，goroutine 仍然会等满 10 秒才退出，不能快速响应取消信号。B 能响应 context 取消，但没有独立的客户端超时保底——如果调用方忘记设置 context deadline，仍然可能超时。C 是最完整的方案：`http.Client.Timeout` 作为独立的网络层超时保底，`context` 允许业务层快速取消，带缓冲的 channel 防止接收方退出后发送方阻塞。D 的 recover 只处理 panic，与超时和 channel 阻塞无关，算是「正确但不相关」的选项。"
+        },
+        {
+          "id": "goroutine-leak-q9",
+          "question": "`uber-go/goleak` 的 `goleak.VerifyNone(t)` 通常应该放在测试函数的什么位置，为什么？",
+          "choices": [
+            { "id": "A", "text": "放在测试函数开头，在调用被测代码之前先检查基线 goroutine" },
+            { "id": "B", "text": "用 `defer goleak.VerifyNone(t)` 放在测试函数开头，确保函数退出时检查泄漏" },
+            { "id": "C", "text": "放在测试函数末尾，在所有断言之后调用" },
+            { "id": "D", "text": "放在 TestMain 里，在所有测试用例开始前调用一次" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "goleak 的工作原理是：在调用点拍一个当前 goroutine 快照，然后在内部做轮询等待，直到「非预期 goroutine」都退出，或者超时后报告泄漏。`defer` 的作用是让检查发生在函数退出的最后一刻，此时测试逻辑已经全部完成，被测代码应该已经清理完毕——如果还有 goroutine 残留就能被检测到。A 选项在测试开始前检查，被测代码还没运行，根本检测不到泄漏。C 选项放在末尾不用 defer 也能工作，但如果测试中间发生 panic 或 `t.Fatal`，检查语句就不会执行了，`defer` 更健壮。D 选项在 TestMain 只检查一次，无法定位是哪个测试用例引入了泄漏。"
+        },
+        {
+          "id": "goroutine-leak-q10",
+          "question": "设置 `GODEBUG=gctrace=1` 启动 Go 服务后，你发现 GC 频率从正常的每 10 秒一次变成了每 1 秒多次。在已经确认堆对象没有大量增加的前提下，这最可能说明什么？",
+          "choices": [
+            { "id": "A", "text": "GOMAXPROCS 设置得太低，GC 没有足够的 CPU 并行度" },
+            { "id": "B", "text": "goroutine 泄漏导致 live stack 增大，GC 扫描工作量增加，触发更频繁的 GC 周期" },
+            { "id": "C", "text": "服务的 QPS 升高，内存分配速率加快，正常现象" },
+            { "id": "D", "text": "Go runtime 的 GOGC 参数被修改为一个更小的值" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go GC 的触发条件是「堆内存自上次 GC 后增长了 GOGC%」（默认 100%）。goroutine 泄漏时，虽然堆上的业务对象没增加，但每个泄漏 goroutine 的栈是从堆分配的（goroutine 栈在 Go 的内存管理中属于堆上的特殊对象），大量泄漏 goroutine 的栈累积会持续消耗堆空间，触发 GC；GC 完成后内存稍微释放，堆使用量下降，但随即又被新泄漏的 goroutine 的栈填满，很快再次触发 GC，形成高频 GC 循环。A 选项 GOMAXPROCS 影响 GC 并行度但不影响触发频率。C 选项如果题目已说明 QPS 没变则可排除。D 选项 GOGC 变化是外部配置，题目没有提到这种情况。"
+        }
+      ],
+      "references": [
+        "https://pkg.go.dev/net/http/pprof",
+        "https://github.com/uber-go/goleak",
+        "https://go.dev/blog/pprof",
+        "https://pkg.go.dev/runtime/debug#SetMaxStack"
+      ]
+    }
+  ]
+}

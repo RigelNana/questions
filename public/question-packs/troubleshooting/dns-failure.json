@@ -1,0 +1,167 @@
+{
+  "id": "dns-failure",
+  "name": "Kubernetes DNS 解析故障排查",
+  "domain": "troubleshooting",
+  "description": "排查 K8s 集群内 CoreDNS 故障，理解 ndots 配置和 NodeLocal DNSCache 优化",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "dns-failure-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["kubernetes", "coredns", "dns", "networking", "service-discovery"],
+      "title": "K8s 集群内服务 DNS 解析间歇性超时，如何排查 CoreDNS 问题？",
+      "content": "某电商平台的 Kubernetes 集群运行稳定数月后，运维团队突然收到大量告警：订单服务在调用库存服务时出现间歇性超时。查看应用日志，错误信息如下：\n\n```\ndial tcp: lookup order-service on 10.96.0.10:53: i/o timeout\ncontext deadline exceeded\n```\n\n错误中明确指向了 `10.96.0.10:53`，这正是集群内 CoreDNS Service 的地址。问题并非持续发生，而是间歇出现，高峰期尤为明显。部分请求能正常完成，部分则超时，表现出明显的「时好时坏」特征。\n\n团队初步排查后发现：应用代码本身没有变动；集群节点负载整体正常；Kubernetes 控制平面组件运行稳定；唯独 DNS 解析存在延迟甚至超时。\n\n此时 SRE 工程师需要系统性地排查集群内 DNS 链路的每一个环节。请你作为一名资深 SRE，描述你的完整排查思路：从 CoreDNS Pod 自身状态、日志分析，到 Pod 内部 DNS 配置检查，再到常见根因（资源不足、ndots 配置放大查询量、conntrack 表溢出）的识别与解决方案，最后给出 CoreDNS 的性能调优建议，并说明 NodeLocal DNSCache 的适用场景。",
+      "answer": "## 一、基础概念：K8s 内 DNS 的工作原理\n\nKubernetes 集群内的服务发现依赖一套精心设计的 DNS 体系。CoreDNS 是目前主流集群的集群内 DNS 服务，以 Deployment 形式运行在 `kube-system` 命名空间中，对外暴露一个固定 ClusterIP（通常为 `10.96.0.10`）的 Service，名为 `kube-dns`。\n\n每一个新建的 Pod，kubelet 都会自动向其注入 `/etc/resolv.conf`，内容大致如下：\n\n```\nnameserver 10.96.0.10\nsearch default.svc.cluster.local svc.cluster.local cluster.local\noptions ndots:5\n```\n\n其中最容易被忽视的是 `ndots:5` 这个配置。它的含义是：若查询的域名中「点」的数量少于 5 个，DNS 解析器会先依次尝试拼接 `search` 列表中的每个后缀，只有在所有后缀都失败之后，才会将原始域名作为绝对域名发出查询。换言之，一次对 `order-service` 的查询，实际上会在网络上发出以下五次查询：\n\n1. `order-service.default.svc.cluster.local`（命中，返回结果）\n2. 若第一步失败则继续：`order-service.svc.cluster.local`\n3. `order-service.cluster.local`\n4. `order-service`（绝对域名）\n\n在多数情况下第一次查询即可命中，但每一次查询都要占用 CoreDNS 的处理能力。集群规模越大、服务间调用越频繁，这种「查询量放大」效应越显著。\n\n服务发现的完整 FQDN 格式为 `<service>.<namespace>.svc.cluster.local`，理解这一点对后续排查至关重要。\n\n---\n\n## 二、核心解答：系统性排查步骤\n\n### 第一步：确认 CoreDNS Pod 自身状态\n\n首先确认 CoreDNS 的 Pod 是否健康运行：\n\n```bash\nkubectl get pods -n kube-system -l k8s-app=kube-dns\n```\n\n重点关注 Pod 是否处于 `Running` 状态、重启次数（RESTARTS 列）是否异常偏高。若 Pod 频繁重启，说明 CoreDNS 本身出现了 OOM 或存活探针失败等问题。同时查看 CoreDNS 的资源使用情况：\n\n```bash\nkubectl top pods -n kube-system -l k8s-app=kube-dns\n```\n\n若 CPU 使用率持续接近 Limit 上限，说明 CoreDNS 正在被 CPU Throttling，响应延迟因此升高。\n\n### 第二步：分析 CoreDNS 日志\n\n```bash\nkubectl logs -n kube-system -l k8s-app=kube-dns --tail=200\n```\n\n在日志中重点搜索 `SERVFAIL`、`timeout`、`i/o timeout` 等关键词。若看到大量 SERVFAIL，通常意味着上游 DNS（集群外部解析）出现问题；若看到查询延迟数字异常偏大，则指向 CoreDNS 处理能力不足。\n\n### 第三步：在问题 Pod 内部直接测试 DNS\n\n```bash\n# 进入问题 Pod 执行 DNS 查询测试\nkubectl exec -it <pod-name> -- nslookup order-service\nkubectl exec -it <pod-name> -- nslookup order-service.default.svc.cluster.local\n\n# 查看 Pod 的 resolv.conf 配置\nkubectl exec -it <pod-name> -- cat /etc/resolv.conf\n\n# 测试完整 FQDN 解析速度对比\nkubectl exec -it <pod-name> -- time nslookup order-service.default.svc.cluster.local.\n```\n\n对比短域名与完整 FQDN 的查询耗时，可以直观感受 `ndots:5` 带来的查询放大效应。\n\n### 第四步：识别常见根因\n\n**根因一：CoreDNS 资源不足导致 CPU Throttling**\n\nCoreDNS 默认的 resource limits 较保守（通常 CPU limit 为 100m）。在大型集群或高并发场景下极易被打满，导致响应延迟升高，最终触发客户端超时。解决方案是调大 CoreDNS 的资源配额并增加副本数：\n\n```bash\nkubectl edit deployment coredns -n kube-system\n# 将 resources.limits.cpu 从 100m 调整为 500m 或更高\n# 将 replicas 从 2 增加到 4\n```\n\n**根因二：ndots:5 导致 DNS 查询量 5 倍放大**\n\n如前文所述，`ndots:5` 会在查询成功前触发多次无效查询。可以在应用调用时直接使用完整 FQDN（结尾加点号表示绝对域名）：`order-service.default.svc.cluster.local.`，或者在 Pod Spec 中通过 `dnsConfig` 降低 ndots 值：\n\n```yaml\nspec:\n  dnsConfig:\n    options:\n      - name: ndots\n        value: \"1\"\n```\n\n**根因三：节点 conntrack 表溢出**\n\nDNS 查询使用 UDP 协议，Linux 内核的 conntrack（连接跟踪表）在高并发下可能被耗尽，导致新的 UDP 数据包被直接丢弃。排查方式：\n\n```bash\n# 在节点上执行\ndmesg | grep -i conntrack\ncat /proc/sys/net/netfilter/nf_conntrack_count\ncat /proc/sys/net/netfilter/nf_conntrack_max\n```\n\n若 count 接近 max，说明 conntrack 表已满。临时解决方案是增大 `nf_conntrack_max`；根本解决方案是部署 NodeLocal DNSCache（详见扩展部分）。\n\n### 第五步：CoreDNS 性能调优配置\n\n编辑 CoreDNS 的 ConfigMap，在 Corefile 中启用 `cache` 和 `autopath` 插件：\n\n```bash\nkubectl edit configmap coredns -n kube-system\n```\n\n优化后的 Corefile 示例：\n\n```\n.:53 {\n    errors\n    health {\n        lameduck 5s\n    }\n    ready\n    kubernetes cluster.local in-addr.arpa ip6.arpa {\n        pods insecure\n        fallthrough in-addr.arpa ip6.arpa\n        ttl 30\n    }\n    # autopath 插件：服务端自动补全 search 域名，减少客户端多次查询\n    autopath @kubernetes\n    # cache 插件：缓存成功和否定响应，降低重复查询压力\n    cache 30\n    prometheus :9153\n    forward . /etc/resolv.conf {\n        max_concurrent 1000\n    }\n    loop\n    reload\n    loadbalance\n}\n```\n\n---\n\n## 三、扩展：深入理解与长效治理\n\n### NodeLocal DNSCache 的工作原理\n\nNodeLocal DNSCache 是解决 CoreDNS 压力问题的根本方案。它在每个节点上以 DaemonSet 形式运行一个本地 DNS 缓存（使用 `169.254.20.10` 这个 link-local 地址），Pod 的 DNS 请求首先打到本地缓存，命中则直接返回，未命中才转发给 CoreDNS。这样做的好处有两点：一是大幅减少到达 CoreDNS 的查询量；二是本地缓存使用 TCP 连接 CoreDNS，彻底规避了 UDP + conntrack 表溢出的问题。\n\n### CoreDNS Prometheus 监控指标\n\nCoreDNS 默认在 `:9153/metrics` 暴露 Prometheus 指标，关键指标包括：\n\n- `coredns_dns_request_duration_seconds`：查询延迟分布，重点关注 p99\n- `coredns_dns_responses_total{rcode=\"SERVFAIL\"}`：SERVFAIL 响应数量\n- `coredns_cache_hits_total` / `coredns_cache_misses_total`：缓存命中率\n\n通过这些指标可以建立完善的 DNS SLO 告警体系，在用户感知到问题之前提前预警。\n\n### ExternalDNS 与外部 DNS 集成\n\n对于需要将集群内服务暴露到集群外的场景，ExternalDNS 可以监听 Kubernetes Service 和 Ingress 资源，自动将其同步到 Route53、Cloud DNS 等外部 DNS 服务，实现集群内外 DNS 管理的统一。",
+      "keyPoints": [
+        "CoreDNS 是 Kubernetes 集群内的 DNS 服务，以 Deployment 形式运行在 kube-system 命名空间，Pod 的 /etc/resolv.conf 中 nameserver 字段指向其 ClusterIP（通常为 10.96.0.10）。",
+        "Pod 默认的 ndots:5 配置会导致每次 DNS 查询在找到正确结果前先尝试多个 search 域名后缀，在高并发场景下会将 CoreDNS 的查询负载放大数倍。",
+        "排查 DNS 故障应遵循从外到内的顺序：先检查 CoreDNS Pod 状态和资源使用，再分析 CoreDNS 日志中的 SERVFAIL 和延迟信息，最后在问题 Pod 内部执行 nslookup 进行端到端验证。",
+        "CoreDNS CPU Throttling 是间歇性 DNS 超时的常见根因，解决方案是调大 resource limits 并增加 CoreDNS 副本数以水平扩展处理能力。",
+        "节点 conntrack 表溢出会导致 DNS UDP 包被内核静默丢弃，可通过 dmesg 和 /proc/sys/net/netfilter/nf_conntrack_count 来确认，NodeLocal DNSCache 通过使用 TCP 连接从根本上规避了这一问题。",
+        "NodeLocal DNSCache 在每个节点本地运行 DNS 缓存 DaemonSet，将 Pod 的 DNS 请求优先在本地节点解决，大幅降低 CoreDNS 的查询压力并消除 UDP conntrack 问题。",
+        "通过 CoreDNS 暴露的 Prometheus 指标（如 coredns_dns_request_duration_seconds 和 coredns_dns_responses_total）可以建立 DNS 延迟和错误率的 SLO 监控，实现问题提前预警。"
+      ],
+      "quiz": [
+        {
+          "id": "dns-failure-1-q1",
+          "type": "single",
+          "question": "在 Kubernetes 集群中，Pod 的 /etc/resolv.conf 里 nameserver 指向的地址通常是什么？",
+          "options": [
+            "宿主机节点的 IP 地址",
+            "CoreDNS Service 的 ClusterIP（如 10.96.0.10）",
+            "kube-apiserver 的地址",
+            "Pod 自身的 IP 地址"
+          ],
+          "answer": 1,
+          "explanation": "Kubernetes 的 kubelet 在创建 Pod 时会自动注入 /etc/resolv.conf，其中 nameserver 指向 kube-dns Service 的 ClusterIP。这个地址在集群初始化时确定，通常为 10.96.0.10（取决于 --service-dns-domain 和 --service-cidr 配置）。CoreDNS Pod 背后就是这个 Service，通过 iptables/ipvs 规则将 53 端口流量转发到实际的 CoreDNS Pod。理解这一链路对 DNS 故障排查至关重要。"
+        },
+        {
+          "id": "dns-failure-1-q2",
+          "type": "single",
+          "question": "ndots:5 配置的含义是什么？",
+          "options": [
+            "DNS 查询最多重试 5 次",
+            "DNS 响应的 TTL 最大为 5 秒",
+            "若域名中点的数量少于 5 个，则先尝试 search 域名后缀列表",
+            "CoreDNS 最多缓存 5 个查询结果"
+          ],
+          "answer": 2,
+          "explanation": "ndots:5 是 /etc/resolv.conf 中的 options 配置项，含义为：如果查询域名中「.」的数量少于指定值（此处为 5），DNS 解析器会先依次拼接 search 列表中的每个后缀进行查询，直到所有后缀都失败后才将原始名称作为绝对域名发出。对于 Kubernetes 集群内的短域名（如 order-service），这意味着每次查询可能产生 3-5 次网络请求，在高并发下会显著放大 CoreDNS 的负载。"
+        },
+        {
+          "id": "dns-failure-1-q3",
+          "type": "single",
+          "question": "查看 CoreDNS Pod 实时日志应使用哪条命令？",
+          "options": [
+            "kubectl describe pods -n kube-system coredns",
+            "kubectl logs -n kube-system -l k8s-app=kube-dns",
+            "kubectl get events -n kube-system",
+            "journalctl -u coredns"
+          ],
+          "answer": 1,
+          "explanation": "CoreDNS Pod 位于 kube-system 命名空间，且带有标签 k8s-app=kube-dns。使用 kubectl logs 配合 -l 标签选择器可以同时查看所有 CoreDNS 副本的日志。如果想查看指定时间范围或持续跟踪，可以添加 --since=10m 或 -f 参数。日志中应重点搜索 SERVFAIL、timeout、error 等关键词来定位问题。"
+        },
+        {
+          "id": "dns-failure-1-q4",
+          "type": "single",
+          "question": "在 Pod 内部测试 DNS 解析最直接的命令是什么？",
+          "options": [
+            "kubectl dns-check order-service",
+            "kubectl exec -it <pod> -- nslookup order-service",
+            "kubectl port-forward svc/kube-dns 53:53",
+            "kubectl debug node/<node> -- dig order-service"
+          ],
+          "answer": 1,
+          "explanation": "使用 kubectl exec 进入问题 Pod 后执行 nslookup 是端到端验证 DNS 的最直接方式，因为它完整模拟了应用实际的 DNS 解析路径（使用 Pod 自身的 /etc/resolv.conf 配置）。对比测试短域名（nslookup order-service）和完整 FQDN（nslookup order-service.default.svc.cluster.local.），可以直观感受 ndots 配置对查询速度的影响。若 Pod 镜像中没有 nslookup，也可以使用 dig 或 curl 替代。"
+        },
+        {
+          "id": "dns-failure-1-q5",
+          "type": "single",
+          "question": "CoreDNS 因 CPU Throttling 导致响应慢，最直接的解决方案是？",
+          "options": [
+            "重启所有业务 Pod",
+            "升级 Kubernetes 版本",
+            "调大 CoreDNS Deployment 的 resource limits 并增加副本数",
+            "将 ndots 从 5 改为 0"
+          ],
+          "answer": 2,
+          "explanation": "CPU Throttling 意味着 CoreDNS 的 CPU 使用已达到 limits 上限，内核开始限制其运行时间，导致 DNS 查询处理延迟。最直接的解法是通过 kubectl edit deployment coredns -n kube-system 调大 resources.limits.cpu（如从 100m 提升到 500m），同时增加副本数实现水平扩展。这样既提升了单个实例的处理能力，又通过负载均衡分散了查询压力。长期来看，配合 NodeLocal DNSCache 可以从根本上降低 CoreDNS 的负载。"
+        },
+        {
+          "id": "dns-failure-1-q6",
+          "type": "single",
+          "question": "conntrack 表溢出导致 DNS 超时时，以下哪个命令可以在节点上确认这个问题？",
+          "options": [
+            "kubectl get events --field-selector reason=DNSError",
+            "dmesg | grep conntrack",
+            "kubectl logs -n kube-system coredns | grep conntrack",
+            "netstat -s | grep dns"
+          ],
+          "answer": 1,
+          "explanation": "当 Linux 内核的 nf_conntrack 表溢出时，会通过 dmesg 输出类似「nf_conntrack: table full, dropping packet」的内核日志。由于 DNS 使用 UDP 协议，且 conntrack 默认会跟踪 UDP 连接，在高并发下极易导致表满进而丢包。还可以通过 cat /proc/sys/net/netfilter/nf_conntrack_count 和 nf_conntrack_max 对比当前值与上限，若接近则说明存在溢出风险。NodeLocal DNSCache 通过 TCP 连接 CoreDNS，可从根本上规避这一问题。"
+        },
+        {
+          "id": "dns-failure-1-q7",
+          "type": "single",
+          "question": "NodeLocal DNSCache 的核心工作原理是什么？",
+          "options": [
+            "将 CoreDNS 的副本数扩展到与节点数相同",
+            "在每个节点以 DaemonSet 运行本地 DNS 缓存，Pod DNS 请求优先本地解析",
+            "将所有 DNS 查询通过 TCP 转发到外部 DNS 服务器",
+            "修改每个 Pod 的 ndots 配置为 1"
+          ],
+          "answer": 1,
+          "explanation": "NodeLocal DNSCache 以 DaemonSet 形式在每个节点运行一个 DNS 缓存实例，监听 link-local 地址 169.254.20.10。节点上的 Pod 的 DNS 请求首先发送到本地缓存，命中则立即返回，未命中才由本地缓存通过 TCP 连接转发给 CoreDNS。这一架构带来两个核心收益：①大幅降低到达 CoreDNS 的查询量；②使用 TCP 而非 UDP，彻底规避了 conntrack 表溢出导致 DNS 包丢失的问题，是大型集群 DNS 稳定性优化的标准方案。"
+        },
+        {
+          "id": "dns-failure-1-q8",
+          "type": "single",
+          "question": "以下哪种写法可以绕过 ndots:5 的多次查询，直接解析集群内服务？",
+          "options": [
+            "order-service.local",
+            "order-service.default",
+            "order-service.default.svc.cluster.local.（结尾有点号）",
+            "http://order-service:8080"
+          ],
+          "answer": 2,
+          "explanation": "在域名末尾添加点号（.）表示这是一个绝对域名（FQDN），DNS 解析器会直接发出查询而不尝试拼接 search 后缀，从而跳过 ndots 的多次查询逻辑。完整写法 order-service.default.svc.cluster.local. 直接命中，只需一次 DNS 查询。在应用代码或服务配置中使用完整 FQDN 是减少 DNS 查询放大的最简单方案，适合对延迟敏感的服务间调用场景。"
+        },
+        {
+          "id": "dns-failure-1-q9",
+          "type": "single",
+          "question": "CoreDNS 暴露的 Prometheus 指标中，用于监控 DNS 查询延迟分布的指标名称是？",
+          "options": [
+            "coredns_cache_hits_total",
+            "coredns_dns_request_duration_seconds",
+            "coredns_forward_request_duration_seconds",
+            "coredns_health_request_failures_total"
+          ],
+          "answer": 1,
+          "explanation": "coredns_dns_request_duration_seconds 是 CoreDNS 最核心的性能指标，以 histogram 形式记录每次 DNS 查询的处理耗时，可用于计算 p50、p95、p99 等百分位延迟。在故障排查中，若发现 p99 延迟异常升高（如超过 200ms），则可判定 CoreDNS 存在处理瓶颈。结合 coredns_dns_responses_total{rcode=\"SERVFAIL\"} 监控错误率，可以建立完整的 DNS SLO 告警体系。"
+        },
+        {
+          "id": "dns-failure-1-q10",
+          "type": "single",
+          "question": "在 CoreDNS 的 Corefile 中，cache 插件的作用是什么？",
+          "options": [
+            "将 CoreDNS 的配置缓存到内存中防止重读",
+            "缓存 DNS 查询结果，减少对上游的重复查询",
+            "缓存 Pod 的 IP 地址避免每次查询 kube-apiserver",
+            "将频繁查询的域名预加载到 CoreDNS 内存"
+          ],
+          "answer": 1,
+          "explanation": "CoreDNS 的 cache 插件会在内存中缓存 DNS 查询的响应结果，包括成功响应（positive cache）和 NXDOMAIN 等否定响应（negative cache），默认 TTL 为 30 秒。启用 cache 后，相同域名的重复查询可以直接从缓存返回，无需重新向 Kubernetes API 或上游 DNS 发出查询，可以显著降低 CoreDNS 的处理压力。在高并发场景下，cache 插件往往能将 CoreDNS 的实际查询量降低 50% 以上。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/tasks/administer-cluster/dns-debugging-resolution/",
+        "https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/nodelocaldns/",
+        "https://coredns.io/plugins/cache/",
+        "https://coredns.io/plugins/autopath/"
+      ]
+    }
+  ]
+}

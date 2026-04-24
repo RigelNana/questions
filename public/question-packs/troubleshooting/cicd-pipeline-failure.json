@@ -1,0 +1,158 @@
+{
+  "id": "cicd-pipeline-failure",
+  "name": "CI/CD 流水线故障排查",
+  "domain": "troubleshooting",
+  "description": "排查 GitLab CI 流水线随机失败问题，定位 Docker daemon 连接失败、测试超时、K8s 连接超时的根本原因",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "cicd-pipeline-failure-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["gitlab-ci", "cicd", "docker", "kubernetes", "pipeline", "docker-in-docker", "gitlab-runner"],
+      "title": "GitLab CI 流水线随机失败（Docker 连不上 / 测试超时 / K8s 超时），如何系统排查？",
+      "content": "## 场景描述\n\n你所在的团队维护一套基于 GitLab CI 的交付流水线，技术栈是：GitLab Runner（Docker executor）+ Docker-in-Docker 构建镜像 + `kubectl`/Helm 部署到 Kubernetes。流水线分三个 Stage：`build`（构建镜像）→ `test`（运行单元测试和集成测试）→ `deploy`（部署到 K8s 集群）。\n\n本周开始，流水线出现了让人头疼的「间歇性失败」，具体表现如下：\n\n**构建阶段**偶尔会出现：\n\n```\nERROR: Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\nAre you sure the Docker daemon is running?\nerror during connect: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.24/info\": \ndial unix /var/run/docker.sock: connect: no such file or directory\n```\n\n**测试阶段**偶尔会出现整个 Job 超时（超过 CI 配置的 10 分钟限制），但本地跑同样的测试只需要 2 分钟。\n\n**部署阶段**偶尔出现：\n\n```\nError from server: etcdserver: request timed out\nUnable to connect to the server: dial tcp 10.0.0.100:6443: i/o timeout\n```\n\n最诡异的地方是：**手动点击「Retry」往往能成功**。失败不是每次都发生，也没有明显规律，有时候同一个 commit 第一次跑失败、重试就过了；有时候连续失败三次，第四次又正常了。\n\n这种「随机性失败」在排查时特别难受，因为你很难稳定复现，也很难确定是代码问题还是基础设施问题。请描述你的系统排查思路：如何从现象定位根因，每个阶段的失败分别对应什么底层问题，以及如何彻底根治？",
+      "answer": "## 第一步：建立诊断框架，排除代码嫌疑\n\n在动手排查任何具体组件之前，最重要的一步是明确「随机性失败」的诊断方向。手动重试能成功，这个信息价值极高——它直接排除了代码本身的问题（如果是代码 Bug，重试也不会过），把怀疑目标锁定在**基础设施的不稳定性**上。\n\n理解这一点需要先搞清楚 GitLab CI 流水线的典型架构。GitLab CI 的核心组件是 **GitLab Runner**，它是负责执行 Job 的 Agent，注册到 GitLab 后台之后，每当有 Pipeline 触发，GitLab 就会把 Job 分发给空闲的 Runner 去执行。Runner 支持多种 executor，我们这里用的是 **Docker executor**，也就是说每个 Job 都会拉起一个独立的 Docker 容器来隔离执行环境。\n\n而「构建 Docker 镜像」这件事需要在 Docker 容器**内部**访问 Docker daemon，这就是 **Docker-in-Docker（dind）** 的场景——容器里面需要有一个 Docker daemon 可以连接。GitLab 的标准做法是在 Job 的 `services` 里起一个 `docker:dind` 的 sidecar 服务，主 Job 容器通过 `DOCKER_HOST=tcp://docker:2376` 连接这个 sidecar 来执行 `docker build`。\n\n明白了这个架构之后，三种「随机失败」的根因就有了对应的方向：构建阶段的 dind 启动竞态、测试阶段的资源和网络问题、部署阶段的 K8s 网络抖动。\n\n## 第二步：逐阶段定位根因\n\n### 构建阶段：「Cannot connect to Docker daemon」\n\n这个报错的第一反应很容易是「Docker 没启动」，但在 dind 模式下，真正的原因几乎总是**启动顺序竞态**：主 Job 容器和 `docker:dind` sidecar 是同时被 Docker executor 拉起的，但主容器的启动速度往往比 dind 快——dind 里面要初始化 Docker daemon，需要几秒钟；而主容器一启动就立刻运行 CI 脚本执行 `docker build`，这时 dind 还没准备好，自然就报「无法连接」。\n\n为什么是「随机」失败？因为两个容器的启动时间受宿主机负载影响——机器空闲时 dind 启动快，主容器还没运行到 `docker build` 就已经好了；机器繁忙时 dind 启动慢，竞态就暴露了。\n\n**解决方案一：增加 Docker 就绪探测脚本。**\n\n在 Job 脚本最开始加一个等待循环，直到 Docker daemon 就绪才继续：\n\n```yaml\n# .gitlab-ci.yml\nbuild-image:\n  stage: build\n  image: docker:24.0\n  services:\n    - name: docker:24.0-dind\n      alias: docker\n  variables:\n    DOCKER_HOST: tcp://docker:2376\n    DOCKER_TLS_CERTDIR: \"/certs\"\n  before_script:\n    # 等待 dind 就绪，最多等 30 秒\n    - |\n      echo \"Waiting for Docker daemon...\"\n      timeout=30\n      until docker info > /dev/null 2>&1; do\n        timeout=$((timeout - 1))\n        if [ $timeout -le 0 ]; then\n          echo \"Timed out waiting for Docker daemon!\"\n          exit 1\n        fi\n        echo \"Docker not ready yet, retrying in 1s... ($timeout left)\"\n        sleep 1\n      done\n      echo \"Docker is ready!\"\n  script:\n    - docker build -t myapp:$CI_COMMIT_SHA .\n    - docker push myapp:$CI_COMMIT_SHA\n```\n\n这个脚本的原理是：用 `docker info` 探测 daemon 是否就绪，失败就睡 1 秒重试，最多等 30 秒。大部分情况下 3-5 秒内 dind 就好了。\n\n**解决方案二：改用 kaniko 彻底避免 dind 依赖。**\n\nkaniko 是 Google 开源的无 daemon 镜像构建工具，它直接在用户态解析 Dockerfile 并构建镜像，完全不需要 Docker daemon，从根本上消除了这个竞态问题：\n\n```yaml\nbuild-image:\n  stage: build\n  image:\n    name: gcr.io/kaniko-project/executor:v1.21.0-debug\n    entrypoint: [\"\"]  # kaniko 的 entrypoint 是 /kaniko/executor，要 override\n  script:\n    - /kaniko/executor\n      --context $CI_PROJECT_DIR\n      --dockerfile $CI_PROJECT_DIR/Dockerfile\n      --destination myregistry.example.com/myapp:$CI_COMMIT_SHA\n```\n\n除了启动竞态之外，还有另一个容易忽视的根因：**Runner 宿主机磁盘空间不足**。Docker daemon 在磁盘满时会拒绝创建新容器，也会报连接失败。排查命令：\n\n```bash\n# 在 Runner 宿主机上执行\ndf -h\n# 看 /var/lib/docker 所在分区的使用率，超过 85% 就有风险\n\n# 清理 Docker 未使用资源\ndocker system prune -f --volumes\n```\n\n### 测试阶段：测试超时\n\n本地 2 分钟跑完，CI 里 10 分钟超时，这个差距说明 CI 环境里测试的执行速度慢了至少 5 倍。可能原因有三个方向。\n\n第一个方向是**测试依赖的外部服务启动慢**。集成测试通常依赖数据库、Redis 等 `services` 容器，如果测试代码里没有等待服务就绪的逻辑（直接假设服务已经可用），就会出现连接失败，然后靠 retry 或 sleep 等到超时。检查方法是打开 `CI_DEBUG_TRACE`，看测试开始前有没有大量的连接重试日志：\n\n```yaml\nvariables:\n  CI_DEBUG_TRACE: \"true\"  # 开启后会输出每条 shell 命令，非常详细\n```\n\n如果确实是服务启动问题，可以在 `before_script` 里用类似的等待脚本探测服务端口：\n\n```bash\n# 等待 PostgreSQL 就绪\nuntil pg_isready -h postgres -p 5432 -U testuser; do\n  echo \"Waiting for PostgreSQL...\"\n  sleep 2\ndone\n```\n\n第二个方向是**测试代码里有访问外部 URL 的网络请求**。Runner 的网络环境和本地不同，对外部域名的解析或访问可能受限，每次访问都等到超时（通常 30 秒），积累下来就超过了 Job 超时限制。排查方法是在测试日志里看有没有明显的等待停顿，以及用 `CI_DEBUG_TRACE` 追踪网络调用。\n\n第三个方向是**Runner 资源不足**。如果 Runner 节点同时在跑大量并发 Job，CPU 和内存都被瓜分，测试进程的执行速度会严重变慢。用 GitLab UI 查看 Runner 的并发配置（`config.toml` 里的 `concurrent` 参数），或者直接在 Runner 节点上看负载：\n\n```bash\ntop -b -n 1 | head -20\nfree -h\n# 内存如果已经在 swap，测试慢不奇怪\n```\n\n### 部署阶段：K8s API Server 连接超时\n\n`etcdserver: request timed out` 和 `dial tcp 10.0.0.100:6443: i/o timeout` 这两条错误指向不同的层次。前者是 K8s API Server 与 etcd 之间的内部通信超时，说明 etcd 本身有压力；后者是 Runner 到 API Server 的网络超时，说明网络层有问题。\n\n最常见的根因是**大量 CI Pipeline 并发部署触发了 K8s API Server 过载**。想象一下：如果团队有 10 个人同时 push 代码，10 条 Pipeline 同时到达 deploy stage，10 个 kubectl/Helm 命令同时打到 API Server，而 API Server 的并发处理能力有限，就会出现请求队列堆积，部分请求超时。这就是为什么重试会成功——等你重试时，其他人的部署已经完成，API Server 空闲了。\n\n另一个需要检查的是 **kubeconfig 里的 ServiceAccount token 是否过期**。Kubernetes 1.21 之后，通过 `kubectl create token` 创建的短期 token 默认有效期只有 1 小时，如果 CI 环境里存储的 token 快过期了，就会出现时好时坏的认证失败（看起来像网络超时，实际上是 401 之后 kubectl 的重试也超时了）：\n\n```bash\n# 检查 token 过期时间\nkubectl --kubeconfig $KUBECONFIG auth whoami\n# 或者解码 token 看 exp 字段\necho $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool | grep exp\n```\n\n建议在 CI 里使用**长期有效的 ServiceAccount token（Kubernetes Secret 类型）**，或者使用 GitLab 的 Kubernetes Agent（gitlab-agent）替代 kubeconfig，它会维护一条长连接，不依赖每次创建临时 token。\n\n## 第三步：体系化扩展——从「救火」到「防火」\n\n### GitLab Runner Executor 的选型\n\n排查完具体问题之后，有必要重新审视一下 executor 的选型。`shell` executor 直接在 Runner 节点的宿主机 shell 里执行，配置最简单，但隔离性差，不同 Job 可能互相干扰，也不方便清理现场，适合小团队试验环境。`docker` executor 是最常见的选择，每个 Job 一个独立容器，隔离性好，支持 dind；缺点是对宿主机 Docker daemon 有依赖，dind 有启动竞态问题（本文已详述）。`kubernetes` executor 直接在 K8s 集群里为每个 Job 创建一个 Pod，天然支持资源限制和调度，是规模化 CI 的最佳实践；缺点是配置复杂度高，Pod 启动时间比容器稍长。\n\n### Runner 自动扩缩容\n\nRunner 资源不足导致的「随机慢」问题，根治方案是配置 **GitLab Runner Autoscaler**（旧版叫 fleeting）。它能根据队列里等待的 Job 数量自动在云厂商上创建/销毁 Runner 实例，做到「有活时扩容，没活时缩到零」，从根本上解决资源争抢问题。配置示例（`config.toml` 片段）：\n\n```toml\n[runners.autoscaler]\n  max_use_count = 0         # 0 = 不限制单个实例使用次数\n  max_instances = 20        # 最多扩容到 20 个实例\n  idle_count = 2            # 保持至少 2 个空闲实例，减少冷启动等待\n  idle_time = \"30m0s\"       # 空闲超过 30 分钟就回收\n```\n\n### 流水线缓存与超时最佳实践\n\n测试超时问题除了等服务就绪之外，还可以通过合理配置 `cache` 大幅减少依赖下载时间，让测试有更多时间预算：\n\n```yaml\ncache:\n  key:\n    files:\n      - package-lock.json  # 依赖文件变化时才失效缓存\n  paths:\n    - node_modules/\n  policy: pull-push        # pull: 先读缓存; push: Job 结束后更新缓存\n```\n\n对于超时设置，建议遵循以下原则：每个 Job 的 `timeout` 设置为正常执行时间的 3 倍（留出异常重试的余量），但不要超过 1 小时；整个 Pipeline 设置一个总超时（`timeout` 在 Pipeline 层），防止某个 Job 卡住永不结束。\n\n最后一个容易被忽视的点：**把关键的中间产物（Artifact）存起来**，方便排查失败时复盘。比如把测试报告、coverage 文件存成 Artifact，即使 Job 失败也能下载查看：\n\n```yaml\ntest:\n  script:\n    - npm test -- --reporter junit --reporter-option output=report.xml\n  artifacts:\n    when: always    # 无论成功失败都保留\n    reports:\n      junit: report.xml\n    expire_in: 7 days\n```\n\n「随机性失败」本质上是基础设施抖动与 CI 脚本防御性不足的叠加结果。真正的解法不是靠重试掩盖，而是找到每类失败的具体根因：dind 竞态加等待脚本或改 kaniko、磁盘满则清理并监控、测试依赖未就绪则加探测脚本、Runner 资源不足则开自动扩缩容、K8s 超时则检查 token 有效期和 API Server 负载。每个问题都有具体的命令和配置可以落地。",
+      "keyPoints": [
+        "手动重试能成功是诊断「随机失败」的关键线索，直接排除代码 Bug，将根因锁定在基础设施不稳定性上，避免在代码层面浪费排查时间。",
+        "Docker-in-Docker 模式下「cannot connect to Docker daemon」的最常见原因是主容器与 dind sidecar 的启动竞态，主容器先启动时 dind daemon 尚未就绪，在 `before_script` 加 `docker info` 循环探测脚本可稳定解决。",
+        "kaniko 通过在用户态解析 Dockerfile 构建镜像，完全不依赖 Docker daemon，彻底消除了 dind 启动竞态问题，是生产环境构建镜像的更优选择。",
+        "CI 测试超时的三大根因分别是：依赖的 service 容器（数据库/Redis）启动慢、测试代码内含访问外部 URL 的网络请求被 Runner 网络限制、Runner 宿主机资源不足导致测试进程执行变慢。",
+        "Kubernetes 1.21 之后通过 `kubectl create token` 创建的短期 token 默认只有 1 小时有效期，过期后 CI 会出现时好时坏的认证失败，表现为 K8s 连接超时，需改用长期 ServiceAccount Secret token 或 GitLab Kubernetes Agent。",
+        "大量 CI Pipeline 并发部署是 K8s API Server 连接超时的常见诱因，API Server 过载会导致部分请求超时，通过限制流水线并发度（`resource_group`）可以有效缓解。",
+        "GitLab Runner Autoscaler 能根据等待 Job 数量自动扩缩 Runner 实例，彻底解决资源争抢导致的「随机慢」，是规模化 CI/CD 的必备配置。",
+        "开启 `CI_DEBUG_TRACE: \"true\"` 可以输出 Job 中每条 shell 命令及其耗时，是定位测试超时具体卡在哪一步的最直接手段，排查完后记得关闭（日志量极大）。"
+      ],
+      "quiz": [
+        {
+          "id": "cicd-pipeline-failure-1-q1",
+          "question": "GitLab CI 流水线中「手动重试往往能成功」这一现象，对排查方向最关键的提示是什么？",
+          "choices": [
+            { "id": "A", "text": "代码本身存在非确定性 Bug，需要检查并发代码逻辑" },
+            { "id": "B", "text": "排除了代码问题，根因应聚焦在基础设施或资源的不稳定性上" },
+            { "id": "C", "text": "说明 GitLab Runner 版本过旧，需要升级到最新版本" },
+            { "id": "D", "text": "说明流水线配置有误，应该检查 .gitlab-ci.yml 的语法" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「重试能成功」是最关键的诊断线索。如果是代码 Bug（如并发竞态、业务逻辑错误），重试执行相同代码大概率仍然失败；而重试成功说明代码是正确的，失败原因是环境在某个时刻处于不良状态。这把排查方向从「代码」转向「基础设施」，包括 Runner 资源、网络抖动、依赖服务启动竞态等。A 选项错误，非确定性 Bug 重试也可能失败。C 和 D 是常见的「撒网式排查」思路，但没有利用「重试能成功」这个关键信息做有效推断。"
+        },
+        {
+          "id": "cicd-pipeline-failure-1-q2",
+          "question": "GitLab CI 的 Docker executor 中，Job 是如何被执行的？",
+          "choices": [
+            { "id": "A", "text": "所有 Job 共享同一个长期运行的容器，通过工作目录隔离" },
+            { "id": "B", "text": "每个 Job 都会拉起一个独立的 Docker 容器，Job 结束后容器被销毁" },
+            { "id": "C", "text": "Job 直接在 GitLab Server 的宿主机上以 shell 进程执行" },
+            { "id": "D", "text": "Job 在 GitLab Runner 进程内部的 goroutine 中执行，不创建容器" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Docker executor 的核心设计是：每个 Job 独立容器、完全隔离。Runner 接收到 Job 后会 `docker run` 拉起一个新容器，把 CI 脚本注入进去执行，Job 完成后 `docker rm` 销毁容器。这种「用完即毁」的设计保证了 Job 之间互不干扰，但也意味着每次都要承担容器启动时间。A 选项描述的是一种不存在的模式。C 选项描述的是 `shell` executor 的行为。D 选项是错误的，Goroutine 是 Go 的并发原语，和容器无关。"
+        },
+        {
+          "id": "cicd-pipeline-failure-1-q3",
+          "question": "Docker-in-Docker（dind）模式下，「cannot connect to Docker daemon」随机出现的最常见根因是什么？",
+          "choices": [
+            { "id": "A", "text": "Docker 版本不兼容，主容器和 dind sidecar 使用了不同的 Docker 版本" },
+            { "id": "B", "text": "Runner 节点的防火墙阻断了主容器到 dind sidecar 的 TCP 2376 端口" },
+            { "id": "C", "text": "主容器和 dind sidecar 同时启动，主容器先就绪并执行脚本时 dind daemon 尚未初始化完成" },
+            { "id": "D", "text": "GitLab Runner 的 privileged 模式未开启，dind 无法启动内部 daemon" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 dind 最经典的竞态条件（race condition）问题。GitLab Docker executor 同时拉起主 Job 容器和 services 中定义的 dind sidecar，但两者启动速度取决于宿主机当前负载，不保证顺序。dind 内部需要启动一个 dockerd 进程，这需要 1-5 秒；而主容器可能在几百毫秒内就开始执行 CI 脚本并调用 docker build，此时 socket 或 TCP 端口还不可达，就报连接错误。「随机性」正是因为机器繁忙时 dind 更慢。D 选项（privileged 未开启）会导致**每次**都失败，而不是随机失败。"
+        },
+        {
+          "id": "cicd-pipeline-failure-1-q4",
+          "question": "以下哪段脚本能正确地在 GitLab CI Job 中等待 Docker daemon 就绪？",
+          "choices": [
+            { "id": "A", "text": "sleep 10 # 固定等待 10 秒，确保 dind 启动完成" },
+            { "id": "B", "text": "until docker info > /dev/null 2>&1; do sleep 1; done # 循环探测，就绪后立即继续" },
+            { "id": "C", "text": "docker wait docker # 等待 dind 容器进程退出" },
+            { "id": "D", "text": "systemctl is-active docker && echo ready # 检查 systemd 服务状态" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 选项是正确的「主动探测」模式：用 `docker info` 尝试连接 daemon，成功则 until 循环退出，失败则等 1 秒再试。这种方式在 dind 一就绪就立即继续，不浪费时间。A 选项固定等待 10 秒太僵化：机器快时浪费等待时间，机器慢时可能还不够。C 选项 `docker wait` 是等待容器**退出**（不是等它就绪），完全用错了命令。D 选项在容器内执行，没有 systemd，该命令会报错，而且即使在有 systemd 的环境，dind 也不是通过 systemd 管理的。"
+        },
+        {
+          "id": "cicd-pipeline-failure-1-q5",
+          "question": "kaniko 相比 Docker-in-Docker 构建镜像，最核心的优势是什么？",
+          "choices": [
+            { "id": "A", "text": "kaniko 构建速度更快，因为它使用了并行层构建技术" },
+            { "id": "B", "text": "kaniko 在用户态解析 Dockerfile 并构建镜像，完全不需要 Docker daemon，消除了 dind 启动竞态和 privileged 权限要求" },
+            { "id": "C", "text": "kaniko 支持更多 Dockerfile 指令，兼容性比 docker build 更好" },
+            { "id": "D", "text": "kaniko 内置了镜像仓库，不需要单独配置 registry" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "kaniko 的核心价值是「无 daemon」构建。它通过在用户态直接解析和执行 Dockerfile 指令（不依赖 Docker daemon）来构建镜像，这带来了两个关键好处：第一，完全消除了 dind 启动竞态问题，因为根本不需要等 daemon 启动；第二，不需要 `privileged: true` 容器权限，安全性更高（dind 需要 privileged 才能在容器内运行 daemon）。A 选项不准确，kaniko 的构建速度和 docker build 相近，没有并行层的魔法优势。C 和 D 均是虚构的特性。"
+        },
+        {
+          "id": "cicd-pipeline-failure-1-q6",
+          "question": "CI 测试阶段在本地 2 分钟完成，但在 CI 里 10 分钟超时，最不可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "测试依赖的 PostgreSQL service 容器启动慢，测试开始时数据库还未就绪导致大量连接重试" },
+            { "id": "B", "text": "Runner 节点同时运行大量并发 Job，CPU 和内存被大量占用导致测试进程执行变慢" },
+            { "id": "C", "text": "测试代码中存在语法错误，导致某些测试用例跳过未执行" },
+            { "id": "D", "text": "测试代码中有访问外部 URL 的 HTTP 请求，Runner 网络限制导致每次请求都等到超时" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "语法错误通常会导致测试**立即失败**（甚至无法启动），不会导致超时；而且「本地能跑、CI 里超时」说明代码本身没有根本性问题，只是环境差异导致执行变慢。A、B、D 都是「本地快 CI 慢」的典型成因：A 是服务启动竞态，CI 的 service 容器需要几秒启动，测试代码若没有就绪探测就会反复连接失败；B 是资源竞争，本地独享机器资源而 CI Runner 上可能同时跑十几个 Job；D 是网络差异，本地网络畅通而 Runner 网络可能有出口限制或 DNS 解析慢。"
+        },
+        {
+          "id": "cicd-pipeline-failure-1-q7",
+          "question": "GitLab CI 中 `CI_DEBUG_TRACE: \"true\"` 这个变量的作用是什么？使用时需要注意什么？",
+          "choices": [
+            { "id": "A", "text": "开启后 GitLab 会把 CI 日志上传到远程 trace 服务器进行分析，需要配置 endpoint" },
+            { "id": "B", "text": "开启后 Runner 会输出每条 shell 命令及其结果，日志量极大，排查完后应关闭，且日志中可能包含 CI 变量中的敏感信息" },
+            { "id": "C", "text": "开启后 GitLab 会对流水线执行进行性能分析，自动识别瓶颈 stage" },
+            { "id": "D", "text": "开启后 Job 失败时 GitLab 会自动重试 3 次并记录每次失败原因" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`CI_DEBUG_TRACE` 相当于给 CI 脚本开启了 `set -x` 模式——每一条 shell 命令执行前都会先打印出来（包括 before_script 和 script 中的每一步），让你能精确看到是哪一条命令卡住了、哪个命令耗了多少时间。这对排查测试超时极其有用。但有两个重要注意事项：第一，日志量可能增大数十倍，在 GitLab 界面渲染会非常慢；第二，**CI 变量（包括密码、token 等 Secret）会以明文出现在日志中**，有安全风险，排查完必须立即关闭，不能合并到主分支的 CI 配置里。"
+        },
+        {
+          "id": "cicd-pipeline-failure-1-q8",
+          "question": "部署阶段出现 `dial tcp 10.0.0.100:6443: i/o timeout` 和 `etcdserver: request timed out`，下列哪个原因最能解释「随机超时」而不是「每次都失败」的现象？",
+          "choices": [
+            { "id": "A", "text": "kubeconfig 文件格式错误，导致 kubectl 无法解析集群地址" },
+            { "id": "B", "text": "Kubernetes 集群未安装，API Server 不存在" },
+            { "id": "C", "text": "多条 Pipeline 并发部署，API Server 过载时部分请求超时，空闲时请求正常，重试时恰好赶上空闲期" },
+            { "id": "D", "text": "kubectl 版本与 K8s 服务器版本差距超过 2 个小版本，导致 API 不兼容" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "「随机超时」的关键特征是「有时好有时坏」，而非「总是失败」。A 和 B 会导致**每次**都失败，因为格式错误或服务不存在是确定性的。D 的 kubectl 版本不兼容也是确定性的（要么兼容要么不兼容）。只有 C 能解释随机性：API Server 是个共享资源，多个 CI Pipeline 同时部署时打来的请求叠加，造成瞬时过载；某些请求排队超时，另一些恰好在低谷时请求成功。`etcdserver: request timed out` 进一步印证了这一点——etcd 是 API Server 的后端存储，API Server 过载时对 etcd 的读写也会超时。"
+        },
+        {
+          "id": "cicd-pipeline-failure-1-q9",
+          "question": "Kubernetes 1.21+ 中，CI 使用 ServiceAccount token 访问 K8s API 时，以下哪种方式最适合生产 CI/CD 场景？",
+          "choices": [
+            { "id": "A", "text": "使用 `kubectl create token <sa-name>` 生成 token，每次 Job 开始时重新生成" },
+            { "id": "B", "text": "使用管理员的 `~/.kube/config` 直接作为 CI 变量，拥有集群完整权限" },
+            { "id": "C", "text": "创建专用 ServiceAccount，绑定最小权限 RBAC，并用 Secret 类型保存长期 token，或使用 GitLab Kubernetes Agent 维护长连接" },
+            { "id": "D", "text": "使用 Basic Authentication（用户名+密码）访问 K8s API Server" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "CI/CD 访问 K8s 的最佳实践遵循两个原则：最小权限和可控有效期。A 选项的短期 token（默认 1 小时）在长时间运行的 Job 中会过期，且频繁重新生成 token 需要 CI 本身有创建 token 的权限，形成循环依赖；更大的问题是 1 小时的有效窗口在高峰期可能导致随机认证失败。B 选项用管理员 kubeconfig 权限过大，是严重的安全问题，一旦泄露后果不可控。D 选项的 Basic Auth 在 Kubernetes 1.19 已被彻底移除。C 选项中，Secret 类型的 SA token 不会自动过期（需要手动 revoke），配合 RBAC 最小权限是现阶段最稳定的方案；GitLab Kubernetes Agent 方式更安全，它通过持久连接完全不需要暴露 API Server。"
+        },
+        {
+          "id": "cicd-pipeline-failure-1-q10",
+          "question": "Runner 的 `config.toml` 中 `concurrent = 10` 这个参数控制什么？将其从 10 改为 50 最可能带来什么副作用？",
+          "choices": [
+            { "id": "A", "text": "控制流水线中最多同时执行的 Stage 数量；改为 50 后每个 Pipeline 的各 Stage 会并行执行，加快单条流水线速度" },
+            { "id": "B", "text": "控制单个 Runner 进程同时处理的最大 Job 数；改为 50 后 Runner 宿主机 CPU/内存压力剧增，可能导致所有 Job 都变慢，形成「越多越慢」的恶性循环" },
+            { "id": "C", "text": "控制同时注册到 GitLab 的 Runner 实例数量；改为 50 后需要手动注册 50 个 Runner" },
+            { "id": "D", "text": "控制每个 Job 的最大并行线程数；改为 50 后测试用例会用 50 个线程并发执行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`concurrent` 是单个 GitLab Runner 进程**同时接受并执行的最大 Job 数**。设为 10 意味着这个 Runner 最多同时跑 10 个容器/进程。把它从 10 改为 50 表面上看能提高吞吐，实际上是把资源争抢问题放大了 5 倍：50 个 Job 同时在一台机器上跑，每个 Job 启动的容器都要占用内存，构建镜像会占用大量磁盘 I/O，测试进程会争夺 CPU。结果是：单个 Job 的执行时间变长（资源不够），频繁超时，触发重试，积累更多等待中的 Job，形成「越堆越慢」的恶性循环。合理的 `concurrent` 应该根据宿主机的 CPU 核数和内存大小设定，通常经验值是 CPU 核数 × 2 到 4 之间。"
+        }
+      ],
+      "references": [
+        "https://docs.gitlab.com/ee/ci/runners/",
+        "https://docs.gitlab.com/runner/configuration/advanced-configuration.html",
+        "https://docs.gitlab.com/ee/ci/docker/using_docker_build.html",
+        "https://github.com/GoogleContainerTools/kaniko",
+        "https://docs.gitlab.com/ee/user/clusters/agent/"
+      ]
+    }
+  ]
+}
