@@ -1,0 +1,157 @@
+{
+  "id": "api-rate-limiting",
+  "name": "接口限流的实现方式与配置",
+  "domain": "troubleshooting",
+  "description": "接口限流的四种算法原理、分布式限流实现方案与 Nginx/Redis 配置实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "api-rate-limiting-1",
+      "domain": "troubleshooting",
+      "type": "env-config",
+      "difficulty": 2,
+      "tags": ["rate-limiting", "nginx", "redis", "token-bucket", "microservice", "sentinel", "guava"],
+      "title": "服务在突发流量下被打垮，如何设计和配置接口限流？令牌桶和漏桶有什么区别？",
+      "content": "## 场景背景\n\n你所在团队负责一个电商平台的商品详情接口，平时 QPS 稳定在 800 左右，P99 延迟 60ms，一切正常。某天下午运营搞了一次未提前通知的限时秒杀活动，流量在 30 秒内从 800 QPS 飙到了 12000 QPS。监控大盘上红了一片：\n\n```\n[ERROR] 14:32:17 upstream connect error or disconnect/reset before headers.\n        reset reason: overflow, host: product-service:8080\n[WARN]  14:32:18 product-service pod restarted (OOMKilled), reason: memory exceeded 2Gi limit\n[ERROR] 14:32:19 Connection refused: product-service:8080 (all 3 replicas unhealthy)\n```\n\n整个商品详情服务宕机了将近 4 分钟，期间所有依赖它的下游服务——购物车、订单、推荐——全部级联超时。事后复盘，根因很简单：没有任何限流保护，突发流量把数据库连接池打满，服务开始积累请求直到 OOM。\n\n现在你需要在这个服务的各个层次加上限流保护，防止同类事故再次发生。具体要回答三个问题：\n\n1. **限流算法怎么选？** 固定窗口、滑动窗口、漏桶、令牌桶，这四种算法各适合什么场景，令牌桶和漏桶的核心区别是什么？\n\n2. **怎么实现分布式限流？** 单机限流在多实例部署下失效，如何用 Redis 实现一个准确的分布式滑动窗口限流？Lua 脚本在其中起什么作用？\n\n3. **Nginx 层如何配置限流？** `limit_req_zone` 和 `limit_req` 指令怎么用，`burst` 和 `nodelay` 参数有什么区别，配置不当会导致什么问题？\n\n请结合 Guava RateLimiter 代码示例、Redis Lua 脚本和 Nginx 配置，给出一套完整的限流方案。",
+      "answer": "## 限流是什么，为什么需要它\n\n限流（Rate Limiting）的本质是在系统入口处设置一道阀门，主动拒绝或延迟超出处理能力的请求，从而保护下游服务不被过载压垮。听起来很简单，但真正理解限流需要先理解它要解决的问题的本质。\n\n任何服务都有一个「最大吞吐量」上限，这个上限由数据库连接数、线程池大小、内存容量共同决定。在这个上限之内，延迟相对稳定；一旦超过，请求开始排队，延迟指数级上升，最终 OOM 崩溃。更糟的是，一个服务崩溃会导致调用它的上游积累大量等待中的请求，进而把上游也拖垮——也就是常说的「级联雪崩」。限流的目的就是在流量到达服务「悬崖边缘」之前把它挡住，宁可让一部分用户得到 `429 Too Many Requests`，也不要让所有用户都得到 `503 Service Unavailable`。\n\n## 四种限流算法的原理与适用场景\n\n**固定窗口（Fixed Window）** 是最简单的算法：把时间划分成固定长度的窗口（比如每秒），每个窗口内允许通过 N 个请求，超出的拒绝。实现极简，一个 Redis INCR 就够了。但它有一个致命的「窗口边界突刺」问题：假设限制每秒 100 个请求，某用户在第 0.9 秒发了 100 个请求（恰好没超限），在第 1.1 秒又发了 100 个请求（新窗口也没超限），但在这 0.2 秒内实际通过了 200 个请求，是限制值的两倍。这对数据库这类对瞬时压力敏感的下游来说是个隐患。\n\n**滑动窗口（Sliding Window）** 解决了边界突刺问题。它不再用固定的时间分桶，而是以「当前时间」为右边界，向左看固定时长内的请求总数。滑动窗口的精确实现需要记录每个请求的时间戳（用 Redis Sorted Set），内存开销比固定窗口大，但限流精度更高。还有一种折中方案叫「滑动日志窗口」，把窗口再细分成多个小时间桶（比如把 1 秒分成 10 个 100ms 的桶），精度和内存消耗介于固定窗口和精确滑动窗口之间，工程实践中用得比较多。\n\n**漏桶（Leaky Bucket）** 的模型是：请求进入一个桶，桶以固定速率向外漏水（处理请求），桶满了就拒绝新请求。漏桶的特点是**输出速率恒定**，无论输入流量有多大的波峰，出去的流量永远是匀速的。这对于保护下游的写入类接口（比如日志收集、计费系统）非常合适，因为这类系统最怕突发大量写入。但漏桶也有缺点：它不允许任何形式的突发，即使桶是空的（说明系统当前很空闲），流量也只能匀速通过，这在某些场景下会白白浪费处理能力。\n\n**令牌桶（Token Bucket）** 是漏桶的镜像模型：系统以固定速率向桶里放令牌，每个请求进来必须消耗一个令牌，桶空了就拒绝请求。令牌桶和漏桶最核心的区别在于**是否允许突发**：令牌桶的桶里平时可以积攒令牌，当突发流量来临时，可以一次性消耗掉积攒的令牌，允许短时间的流量峰值通过，只要平均速率不超限就行。这对 API 网关、公开接口保护来说更友好——正常用户偶尔的批量操作可以通过，恶意的持续高频请求会被挡住。\n\n用一句话总结两者的区别：**漏桶控制的是输出速率，令牌桶控制的是平均速率但允许突发**。生产中绝大多数「接口限流」场景用令牌桶，「流量整形」（比如向第三方 API 发请求时控制速率）用漏桶。\n\n## Guava RateLimiter：单机令牌桶的最简实践\n\nGuava 的 `RateLimiter` 是令牌桶的经典 Java 实现，API 极其简洁。它还有一个生产中很重要的特性叫**预热（Warmup）**，解决冷启动问题——服务刚启动时，如果立刻放开全速流量，连接池、缓存、JIT 编译都还没就绪，很容易被打垮；`RateLimiter.create(rate, warmupPeriod, unit)` 会在 warmupPeriod 时间内从低速逐渐爬升到目标速率。\n\n```java\nimport com.google.common.util.concurrent.RateLimiter;\n\n@RestController\npublic class ProductController {\n\n    // 创建一个每秒最多允许 1000 个请求通过的限流器\n    // warmup 5 秒：服务启动后前 5 秒速率从 ~200 QPS 线性爬升到 1000 QPS\n    private final RateLimiter rateLimiter = RateLimiter.create(1000, 5, TimeUnit.SECONDS);\n\n    @GetMapping(\"/api/product/{id}\")\n    public ResponseEntity<Product> getProduct(@PathVariable Long id) {\n        // tryAcquire(0) 立即尝试获取令牌，不等待\n        // 注意：这里用 tryAcquire 而不是 acquire，因为 acquire 会阻塞线程\n        if (!rateLimiter.tryAcquire()) {\n            // 返回 429，告诉客户端稍后重试\n            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)\n                .header(\"Retry-After\", \"1\")\n                .build();\n        }\n        return ResponseEntity.ok(productService.getById(id));\n    }\n}\n```\n\n单机 RateLimiter 有一个明显的局限：多实例部署时每个实例各自独立计数。如果你有 10 个实例，每个限制 1000 QPS，实际总限制是 10000 QPS，而不是 1000 QPS。当然，如果你的目标就是「每个实例」限流，这完全没问题；但如果你要限制「每个用户」或「全局」的请求速率，就需要分布式限流。\n\n## Redis 分布式限流：Lua 脚本保证原子性\n\n最常见的分布式限流方案是用 Redis 实现滑动窗口。原理是用 Sorted Set（有序集合）存储每个 key 的请求时间戳，score 和 value 都设为时间戳，每次请求时：先删掉窗口期之外的旧记录，然后统计剩余记录数，如果超限就拒绝，否则插入当前时间戳并放行。\n\n**为什么必须用 Lua 脚本？** 上面这三步操作（删旧记录 → 计数 → 插入）如果用普通 Redis 命令分三次执行，在高并发下会有竞态条件：线程 A 计数后还没来得及插入，线程 B 也读到了同样的计数，两个线程都认为没超限，都插入了记录，导致实际通过的请求数超过限制。Lua 脚本在 Redis 中是原子执行的——执行期间不会有其他命令插入，彻底消除竞态。\n\n```lua\n-- sliding_window_ratelimit.lua\n-- KEYS[1]: 限流 key，例如 \"ratelimit:user:12345:/api/product\"\n-- ARGV[1]: 当前时间戳（毫秒）\n-- ARGV[2]: 窗口大小（毫秒），例如 1000 表示 1 秒\n-- ARGV[3]: 窗口内允许的最大请求数\n-- 返回值：0 表示放行，1 表示限流\n\nlocal key = KEYS[1]\nlocal now = tonumber(ARGV[1])\nlocal window = tonumber(ARGV[2])\nlocal limit = tonumber(ARGV[3])\nlocal window_start = now - window\n\n-- 第一步：删除窗口期外的过期记录（score 小于 window_start 的全部删除）\nredis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)\n\n-- 第二步：统计当前窗口内的请求数\nlocal count = redis.call('ZCARD', key)\n\nif count >= limit then\n    -- 已达上限，拒绝请求\n    return 1\nend\n\n-- 第三步：记录本次请求，score 和 value 均为当前时间戳（毫秒级，加随机后缀避免重复）\n-- 同一毫秒内多个请求的 value 要唯一，否则 ZADD 会覆盖而非新增\nlocal member = now .. ':' .. math.random(100000)\nredis.call('ZADD', key, now, member)\n\n-- 设置 key 过期时间为窗口大小，避免内存泄漏\nredis.call('PEXPIRE', key, window)\n\nreturn 0\n```\n\n在 Java 中调用这个脚本：\n\n```java\n@Component\npublic class RedisRateLimiter {\n\n    @Autowired\n    private StringRedisTemplate redisTemplate;\n\n    // 脚本在应用启动时加载一次，Redis 会缓存其 SHA1 值，避免每次传输脚本内容\n    private final RedisScript<Long> script = RedisScript.of(\n        new ClassPathResource(\"scripts/sliding_window_ratelimit.lua\"), Long.class);\n\n    /**\n     * 检查是否超过限流阈值\n     * @param userId  用户 ID\n     * @param api     接口路径\n     * @param limit   窗口内最大请求数\n     * @param windowMs 窗口大小（毫秒）\n     * @return true 表示被限流，false 表示放行\n     */\n    public boolean isRateLimited(String userId, String api, int limit, long windowMs) {\n        String key = String.format(\"ratelimit:user:%s:%s\", userId, api);\n        long now = System.currentTimeMillis();\n\n        Long result = redisTemplate.execute(\n            script,\n            Collections.singletonList(key),\n            String.valueOf(now),\n            String.valueOf(windowMs),\n            String.valueOf(limit)\n        );\n\n        return result != null && result == 1L;\n    }\n}\n```\n\n这套方案的限流粒度可以非常灵活。`key` 的格式决定了限流的维度：`ratelimit:global:/api/product` 是全局限流，`ratelimit:user:12345:/api/product` 是按用户限流，`ratelimit:ip:192.168.1.1` 是按 IP 限流，`ratelimit:api:/api/product` 是按接口限流。生产中通常多个维度叠加使用——全局有一个大上限保护服务不被打垮，用户维度有一个小上限防止单个用户滥用。\n\n## Nginx 层限流：最前线的防守\n\nNginx 的限流发生在请求进入应用服务器之前，是性价比最高的防护层。`ngx_http_limit_req_module` 模块实现的是**漏桶算法**，注意这里和应用层的令牌桶不同——Nginx 控制的是请求进入 upstream 的速率，目的是平滑流量，防止 upstream 被突发请求打垮。\n\n```nginx\nhttp {\n    # 定义限流区域\n    # $binary_remote_addr: 按客户端 IP 限流（binary 格式节省内存，每个 IP 只占 4 字节）\n    # zone=api_limit:10m: 创建名为 api_limit 的共享内存区，大小 10MB（约存储 16 万个 IP 的状态）\n    # rate=100r/s: 每秒最多 100 个请求通过（即每 10ms 处理一个）\n    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=100r/s;\n\n    # 也可以按 URI + IP 联合限流，更精细\n    limit_req_zone $binary_remote_addr$uri zone=product_api:10m rate=200r/s;\n\n    # 限流触发时返回 429，默认是 503\n    limit_req_status 429;\n\n    server {\n        location /api/product/ {\n            # burst=50: 允许最多积压 50 个请求排队等待，超出则直接拒绝\n            # nodelay: 排队的请求立即处理，不按照漏桶速率延迟\n            # 去掉 nodelay 的话，burst 中的请求会被均匀地延迟处理（真正的漏桶行为）\n            limit_req zone=api_limit burst=50 nodelay;\n\n            proxy_pass http://product-service;\n        }\n\n        location /api/checkout/ {\n            # 下单接口更严格，不配 burst，超出立即 429\n            limit_req zone=api_limit;\n            proxy_pass http://order-service;\n        }\n    }\n}\n```\n\n`burst` 参数是使用 Nginx 限流最容易踩坑的地方。如果你设置 `rate=100r/s burst=50`，意味着允许瞬时最多 150 个请求同时到来，其中 100 个立即处理，50 个排队。加上 `nodelay` 后，排队的 50 个也会立即被转发给 upstream，所以 upstream 实际上可能瞬间收到 150 个请求，而不是你以为的 100 个。如果 upstream 很脆弱，`burst` 值不能设太大。去掉 `nodelay` 的话，50 个排队请求会被均匀分散在接下来 0.5 秒内处理（每 10ms 一个），upstream 看到的是平滑的 100 QPS，但客户端的延迟会增加最多 500ms。\n\n## 限流触发后的响应策略\n\n返回 `429 Too Many Requests` 只是最基础的拒绝策略。生产中更完善的做法是在响应头中告知客户端限流状态，方便客户端做重试决策：\n\n```\nHTTP/1.1 429 Too Many Requests\nRetry-After: 1\nX-RateLimit-Limit: 1000\nX-RateLimit-Remaining: 0\nX-RateLimit-Reset: 1703001600\nContent-Type: application/json\n\n{\"error\": \"rate_limit_exceeded\", \"message\": \"请求过于频繁，请 1 秒后重试\"}\n```\n\n`Retry-After` 告诉客户端等多久可以重试，客户端配合指数退避（exponential backoff）可以大幅减少无效重试对服务器的压力。对于重要的付费用户或 VIP 等级的请求，也可以不直接拒绝，而是放入一个优先级队列等待处理，让普通用户被限流的同时 VIP 用户体验不受影响。\n\n## 自适应限流与 Sentinel：真正的生产级方案\n\n静态限流阈值有一个根本性的缺陷：你无法事先准确知道服务的真实处理能力，而且这个能力会随着时间变化（JVM 热身之后吞吐量提升、依赖数据库有时快有时慢）。Alibaba Sentinel 的自适应限流解决了这个问题。\n\nSentinel 支持根据 **CPU 使用率** 和 **平均响应时间（RT）** 动态调整限流阈值：当 CPU 超过 80% 时自动触发限流，而不是等你手动调整配置文件。Sentinel 的流控规则配置非常直观：\n\n```java\n// 在 Sentinel 中定义流控规则（通常通过控制台动态推送，这里用代码演示）\nFlowRule rule = new FlowRule();\nrule.setResource(\"/api/product\");         // 资源名（接口路径或方法名）\nrule.setGrade(RuleConstant.FLOW_GRADE_QPS); // 按 QPS 限流（也可以按并发线程数）\nrule.setCount(1000);                       // QPS 上限\nrule.setControlBehavior(RuleConstant.CONTROL_BEHAVIOR_WARM_UP_RATE_LIMITER); // 预热 + 排队等待\nrule.setWarmUpPeriodSec(10);               // 预热 10 秒\nrule.setMaxQueueingTimeMs(500);            // 排队最多等待 500ms，超时则拒绝\nFlowRuleManager.loadRules(Collections.singletonList(rule));\n```\n\n限流和熔断是两个互补的机制，经常配合使用。限流在入口处控制请求量，熔断（Circuit Breaker）在出口处感知下游健康状态——当下游错误率超过阈值时自动断开调用，避免把故障请求堆积在等待队列里。Sentinel 同时支持这两种模式，在实际的微服务保护体系里，通常「Nginx 限流 + 应用层限流 + Sentinel 熔断」三层叠加使用，形成纵深防御。",
+      "keyPoints": [
+        "令牌桶允许短时间的流量突发（消耗积攒的令牌），漏桶输出速率严格恒定；前者适合接口保护，后者适合流量整形向第三方匀速发请求。",
+        "固定窗口有「窗口边界突刺」问题，相邻两个窗口边界处的 0.2 秒内实际通过量可能是限制值的两倍；滑动窗口通过记录每个请求的时间戳消除了这个问题。",
+        "Redis 分布式限流必须用 Lua 脚本将「删旧记录 → 计数 → 插入」三步原子化，否则高并发下会出现竞态导致实际通过量超限。",
+        "Nginx limit_req_zone 的 burst 参数不是「平滑」请求，加上 nodelay 后积压的请求会立即转发给 upstream，瞬时流量可能达到 rate + burst；需要根据 upstream 的承受能力谨慎设置。",
+        "Guava RateLimiter 的 warmup 功能解决冷启动问题，服务刚启动时 JIT 未热身、连接池未建立，直接放开全速流量容易崩；warmupPeriod 内速率从低到高线性爬升。",
+        "限流触发应返回 429 并携带 Retry-After 头，让客户端知道何时可以重试；配合客户端指数退避可以大幅减少无效重试的雪上加霜效应。",
+        "静态限流阈值无法适应服务能力的动态变化；Sentinel 基于 CPU 使用率或平均 RT 的自适应限流在生产中更稳健，能自动感知服务退化并收紧阀门。",
+        "限流粒度需要多维度叠加：全局限流防止服务被打垮，按用户/IP 限流防止单点滥用，按接口限流保护关键资源，三者不互斥而是互补。"
+      ],
+      "quiz": [
+        {
+          "id": "api-rate-limiting-q1",
+          "question": "令牌桶和漏桶算法最核心的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "令牌桶允许突发流量（消耗积攒的令牌），漏桶输出速率严格恒定"},
+            {"id": "B", "text": "漏桶实现比令牌桶简单，令牌桶需要额外的令牌生成线程"},
+            {"id": "C", "text": "令牌桶适合写接口，漏桶适合读接口"},
+            {"id": "D", "text": "两者本质相同，只是数学上的镜像关系，实际效果没有区别"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "令牌桶和漏桶的核心区别在于对「突发」的态度。漏桶以固定速率漏水（处理请求），无论桶里积了多少，输出永远匀速，彻底消除突发——这对保护写入类下游（日志、计费）很好，但在桶空（系统空闲）时也不能加速，浪费处理能力。令牌桶平时积累令牌，突发时可以一次性消耗积攒的令牌，允许短时间流量峰值通过，只控制平均速率不超限。所以接口限流通常用令牌桶（允许合理突发），向第三方匀速发请求用漏桶（控制输出不超对方限制）。D 选项是常见误解——虽然两者数学上有对偶关系，但在「突发」处理上行为截然不同。"
+        },
+        {
+          "id": "api-rate-limiting-q2",
+          "question": "固定窗口限流算法有一个「边界突刺」问题，以下哪个描述最准确？",
+          "choices": [
+            {"id": "A", "text": "在窗口结束时，所有积压请求会同时被放行，造成瞬时流量峰值"},
+            {"id": "B", "text": "相邻两个窗口的边界处，0.2 秒内实际通过量可能达到单窗口限制的两倍"},
+            {"id": "C", "text": "窗口越短，突刺问题越严重，所以应该用尽可能长的窗口"},
+            {"id": "D", "text": "边界突刺只在分布式部署下才会出现，单机部署没有这个问题"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "固定窗口的边界突刺是这样发生的：假设限制每秒 100 个请求，一个窗口从 T=0 到 T=1000ms。用户在 T=900ms 发了 100 个请求（没超限，全部通过），在 T=1100ms 又发了 100 个请求（新窗口，也没超限，全部通过）。但从 T=900ms 到 T=1100ms 这 200ms 内，实际通过了 200 个请求——是限制值的两倍。这是固定窗口算法本身的设计缺陷，和单机还是分布式无关（D 错）。滑动窗口通过实时统计「当前时刻往前看 1000ms 内的请求总数」解决了这个问题，代价是需要存储每个请求的时间戳，内存消耗更大。"
+        },
+        {
+          "id": "api-rate-limiting-q3",
+          "question": "Redis 分布式滑动窗口限流为什么必须用 Lua 脚本，而不能用普通的 Redis 命令分步执行？",
+          "choices": [
+            {"id": "A", "text": "Lua 脚本执行速度比普通命令快 10 倍以上，性能更好"},
+            {"id": "B", "text": "普通 Redis 命令不支持 ZREMRANGEBYSCORE 和 ZADD 这类有序集合操作"},
+            {"id": "C", "text": "「删旧记录 → 计数 → 插入」三步之间存在竞态，Lua 脚本在 Redis 中原子执行消除竞态"},
+            {"id": "D", "text": "Lua 脚本可以减少网络往返次数，这是唯一的优势"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "原子性是核心原因。如果用普通命令分三步执行，在高并发下会出现这种情况：线程 A 执行 ZREMRANGEBYSCORE 删完旧记录，执行 ZCARD 得到计数为 99（还差 1 个就达到上限），此时线程 A 还没来得及 ZADD，线程 B 也执行完了 ZCARD 同样得到 99，两个线程都认为没超限，都执行了 ZADD，结果实际插入了 101 条记录，超过了 100 的限制。Lua 脚本在 Redis 中是单线程原子执行的，执行期间不会有其他命令插入，彻底消除这个竞态窗口。减少网络往返（pipeline）也是一个好处（D 部分正确），但不是「必须用 Lua」的核心原因——pipeline 不保证原子性，仍然有竞态。"
+        },
+        {
+          "id": "api-rate-limiting-q4",
+          "question": "Nginx 配置 `limit_req zone=api_limit burst=50 nodelay;`，如果瞬间来了 200 个请求，实际会发生什么？",
+          "choices": [
+            {"id": "A", "text": "按照 rate 速率处理，多余的 150 个全部排队等待"},
+            {"id": "B", "text": "前 100 个按 rate 处理，后 100 个全部返回 429"},
+            {"id": "C", "text": "前 150 个（rate 内 + burst 内）立即转发给 upstream，剩余 50 个返回 429"},
+            {"id": "D", "text": "前 50 个立即处理，接下来 100 个均匀分散在下一秒内，剩余 50 个返回 429"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "理解 Nginx burst + nodelay 的行为很重要，很多人以为 burst 是「缓冲区」会平滑请求，实际上 nodelay 让 burst 内的请求也立即转发。假设 rate=100r/s，burst=50：在一次请求洪峰中，100 个在 rate 配额内的请求立即处理，50 个在 burst 配额内的请求也立即转发（因为 nodelay），总共 150 个请求同时打到 upstream，剩余 50 个返回 429。这意味着 upstream 瞬时可能收到 150 个请求，而不是你以为的 100 个。如果去掉 nodelay，burst 内的 50 个请求会被均匀地延迟处理（按 rate 速率消化），upstream 看到的是平滑的 100 QPS，但客户端延迟增加。burst 值设太大会导致 upstream 被突刺打垮，这是 Nginx 限流配置最常见的坑。"
+        },
+        {
+          "id": "api-rate-limiting-q5",
+          "question": "以下 Redis Lua 限流脚本中，为什么 member 的值是 `now .. ':' .. math.random(100000)` 而不是直接用 `now`？",
+          "choices": [
+            {"id": "A", "text": "加随机数是为了加密，防止攻击者猜测时间戳"},
+            {"id": "B", "text": "Redis Sorted Set 的 score 不能重复，所以 value 也必须唯一"},
+            {"id": "C", "text": "同一毫秒内多个请求的时间戳相同，直接用时间戳会导致 ZADD 覆盖而非新增记录，计数偏低"},
+            {"id": "D", "text": "这是 Lua 的语法要求，字符串拼接必须包含随机部分"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis Sorted Set 的 ZADD 命令：如果插入的 member 已存在，它会更新该 member 的 score 而不是新增一条记录。在高并发场景下，同一毫秒内可能有多个请求同时到来，它们的时间戳（now）完全相同，如果 member 直接用 now，后来的请求会覆盖前面的记录，ZCARD 的计数就会偏低，导致实际通过的请求数超过限制。加上随机数后，每条记录的 member 唯一（即使时间戳相同），ZADD 会真正新增记录，计数准确。另一种做法是用 Redis 的事务 ID 或 UUID 作为 member，效果相同。注意 Sorted Set 允许相同的 score，但要求 member 唯一，score 才是排序依据（用来实现滑动窗口的范围删除）。"
+        },
+        {
+          "id": "api-rate-limiting-q6",
+          "question": "使用 Guava RateLimiter 对接口限流，在水平扩展到 5 个实例后发现实际通过的 QPS 是预期的 5 倍，根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Guava RateLimiter 有 bug，多线程下计数不准确"},
+            {"id": "B", "text": "每个实例的 RateLimiter 独立计数，5 个实例等于 5 倍限额，无法实现全局限流"},
+            {"id": "C", "text": "Guava RateLimiter 默认是全局限流，但需要在配置文件中开启分布式模式"},
+            {"id": "D", "text": "应该用 tryAcquire(timeout) 而不是 tryAcquire()，这样可以跨实例协调"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Guava RateLimiter 是进程内的单机限流器，每个 JVM 实例各自维护独立的令牌桶。5 个实例意味着有 5 个相互独立的令牌桶，总放行量是单实例配置值的 5 倍。这不是 bug，而是单机限流器的设计边界。解决方案有两种：一是接受「每实例限流」的语义（如果你的目标是保护每个实例不过载，这完全正确）；二是改用基于 Redis 的分布式限流，所有实例共享同一个 Redis key 来统一计数。C 选项是错误的，Guava 没有分布式模式，它是一个纯本地的 Java 库。D 选项无效，tryAcquire 的超时参数只控制当前实例的等待时间，无法跨进程协调。"
+        },
+        {
+          "id": "api-rate-limiting-q7",
+          "question": "在以下场景中，应该选择漏桶还是令牌桶？「服务需要向第三方支付 API 发送请求，对方限制每秒最多接收 50 个请求，超出会被封号」",
+          "choices": [
+            {"id": "A", "text": "令牌桶，因为支付是关键业务，需要允许突发保证成功率"},
+            {"id": "B", "text": "漏桶，输出速率严格恒定，确保发往第三方的请求不超过 50r/s"},
+            {"id": "C", "text": "滑动窗口，精度比漏桶更高，更不容易触发对方限制"},
+            {"id": "D", "text": "固定窗口，实现最简单，在合规范围内效果和漏桶一样"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这个场景是「流量整形」而不是「流量保护」——目标是控制你发出去的请求速率不超过对方的限制。漏桶在这里是最合适的：它保证输出严格不超过 50r/s，即使你的系统内部有突发积压，发往第三方的请求也是匀速的，不会触发对方的封号机制。令牌桶会允许短时间突发，即使平均速率在 50r/s 以内，瞬时也可能发出 50 + burst 个请求，可能触发对方的瞬时速率检测（对方可能用的也是滑动窗口）。滑动窗口和固定窗口都是计数器算法，控制的是接收到的请求数，不直接控制输出速率，在这个「主动发送」的场景下语义不对。"
+        },
+        {
+          "id": "api-rate-limiting-q8",
+          "question": "某服务白天 QPS 正常 500，夜间重启后凌晨 2 点 QPS 突然恢复到 800（流量正常），但服务却大量报错甚至 OOM。最可能的原因是什么，如何用限流机制避免？",
+          "choices": [
+            {"id": "A", "text": "服务有内存泄漏，重启后内存清零，压力一来又泄漏；应该修复代码 bug"},
+            {"id": "B", "text": "服务冷启动时 JVM JIT 未编译、连接池未预热，800 QPS 远超此时的真实处理能力；应使用带预热功能的限流器"},
+            {"id": "C", "text": "凌晨的 800 QPS 超过了服务的设计上限，应把限流阈值调低到 500"},
+            {"id": "D", "text": "这是 Redis 限流 key 过期后重置导致的短暂流量放大，与冷启动无关"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是典型的「冷启动」问题。服务刚重启时，JVM 的 JIT 编译器还没来得及把热点代码编译成原生机器码（Hotspot 需要一定量的执行才触发编译），方法调用走解释器比编译后慢数倍；数据库和 Redis 的连接池刚创建，建立连接本身有时间开销；本地缓存是空的，缓存穿透导致大量请求直接打数据库。平时 800 QPS 没问题，是因为服务已经「热」了；重启后立刻接受 800 QPS，实际处理能力可能只有 200-300 QPS，请求积压 OOM。Guava RateLimiter.create(800, 30, TimeUnit.SECONDS) 的预热功能在 30 秒内从低速爬升到 800 QPS，给服务足够时间热身，是解决这个问题的标准做法。Sentinel 的 WarmUp 模式也是同样的原理。"
+        },
+        {
+          "id": "api-rate-limiting-q9",
+          "question": "以下关于静态限流阈值的说法，哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "应该把限流阈值设为压测得到的最大 QPS，这样既不浪费处理能力也不会过载"},
+            {"id": "B", "text": "静态阈值无法感知服务真实能力的动态变化，基于 CPU 或 RT 的自适应限流在生产中更稳健"},
+            {"id": "C", "text": "限流阈值一旦确定就不应该修改，频繁修改会导致服务行为不可预测"},
+            {"id": "D", "text": "静态阈值足够准确，自适应限流只在极少数超大规模场景才有价值"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "静态限流阈值有一个根本缺陷：服务的真实处理能力不是恒定的。依赖的数据库白天快、晚上慢（备份、统计任务占用 IO）；JVM 经历 Full GC 时吞吐量骤降；下游服务降级后响应变慢导致线程被占用，并发处理能力下降。用压测值设置静态阈值，只能保证压测那一刻的条件下服务不崩，生产环境条件变化时静态阈值就失效了——可能过于保守（浪费处理能力），也可能过于宽松（条件变差时仍被打垮）。Alibaba Sentinel 的自适应限流根据实时 CPU 使用率（超过 80% 就收紧）或平均 RT（响应时间升高说明系统在过载）动态调整，能自动感知服务退化并保护系统，这才是生产级的做法。"
+        },
+        {
+          "id": "api-rate-limiting-q10",
+          "question": "线上服务配置了 Redis 滑动窗口限流（每用户每秒 100 次），但运维发现高峰期 Redis 内存暴涨，从 2GB 涨到 8GB，最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Sorted Set 的 ZCARD 操作时间复杂度 O(1) 但内存占用大，应该改用 String + INCR"},
+            {"id": "B", "text": "Lua 脚本执行时 Redis 阻塞，导致大量请求积压在内存中"},
+            {"id": "C", "text": "PEXPIRE 设置的过期时间过长，或者没有在 Lua 脚本中设置 PEXPIRE，导致大量历史 key 未清理"},
+            {"id": "D", "text": "滑动窗口的时间戳记录本身内存效率低，应该改用固定窗口"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 Redis 分布式限流最常见的内存泄漏坑。每个用户、每个接口会创建一个独立的 Sorted Set key，高峰期可能产生数十万个 key。如果 Lua 脚本里忘记写 PEXPIRE，或者 PEXPIRE 设置的时间远大于限流窗口（比如设成了 1 小时而不是 1 秒），这些 key 就会长期驻留在 Redis 内存中积累。正确做法是在每次写入后立即执行 `PEXPIRE key window_ms`，确保 key 在窗口期过后自动清理。还需要注意：PEXPIRE 要在每次请求时调用，不能只在 key 创建时调用一次，因为活跃用户的 key 每次请求都会重新插入记录，需要持续刷新过期时间，让 key 在用户「停止请求后」的一个窗口期内自动消失。"
+        }
+      ],
+      "references": [
+        "https://nginx.org/en/docs/http/ngx_http_limit_req_module.html",
+        "https://guava.dev/releases/snapshot/api/docs/com/google/common/util/concurrent/RateLimiter.html",
+        "https://sentinelguard.io/zh-cn/docs/flow-control.html",
+        "https://redis.io/docs/manual/programmability/lua-api/"
+      ]
+    }
+  ]
+}

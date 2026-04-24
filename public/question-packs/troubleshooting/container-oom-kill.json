@@ -1,0 +1,157 @@
+{
+  "id": "container-oom-kill",
+  "name": "容器 OOMKilled 的排查与内存配置",
+  "domain": "troubleshooting",
+  "description": "K8s Pod OOMKilled 的根因分析、容器内存组成与 Java 应用内存配置最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "container-oom-kill-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["container", "oom", "kubernetes", "cgroup", "java", "memory"],
+      "title": "K8s Pod 频繁重启且 describe 显示 OOMKilled，如何排查内存使用并合理配置 limit？",
+      "content": "你是某电商平台的 SRE，负责维护一套跑在 Kubernetes 1.28 上的 Java 微服务集群。某天早晨，你收到告警：`order-service` 这个 Deployment 在过去两小时内重启了 11 次，已经进入 `CrashLoopBackOff`。你 ssh 到跳板机，第一反应是执行 `kubectl describe pod`，输出里有这么一段：\n\n```\nName:         order-service-7d6f8b9c4-xk2pq\nNamespace:    production\nNode:         node-03 / 10.0.1.23\nStatus:       Running\nContainers:\n  order-service:\n    Image:    registry.internal/order-service:v2.4.1\n    Limits:\n      cpu:     2\n      memory:  512Mi\n    Requests:\n      cpu:     500m\n      memory:  256Mi\n    Last State:  Terminated\n      Reason:    OOMKilled\n      Exit Code: 137\n      Started:   Mon, 10 Jun 2024 09:12:04 +0800\n      Finished:  Mon, 10 Jun 2024 09:14:37 +0800\n    Ready:       True\n    Restart Count: 11\nEvents:\n  Type     Reason   Age                  From     Message\n  ----     ------   ----                 ----     -------\n  Warning  BackOff  3m12s (x6 over 18m)  kubelet  Back-off restarting failed container\n```\n\n`Exit Code: 137` 加上 `Reason: OOMKilled`，说明容器是被内核 OOM Killer 杀掉的，而不是应用自己崩溃退出的。问题是：这个 Java 服务昨天还好好的，今天就开始频繁 OOMKilled，512Mi 的 memory limit 是三个月前上线时定的，当时跑得很稳定。\n\n更奇怪的是，你让开发同学看了一下应用日志，没有任何 `OutOfMemoryError`，也没有堆满的报错。开发同学一脸茫然地说：「JVM 堆只配了 `-Xmx256m`，怎么可能把 512Mi 都吃满？」\n\n这个场景你在生产环境大概率会遇到，甚至可能不止遇到一次。真正的问题在于：大部分人以为 Java 应用的内存就是 JVM 堆，但这个认知是错的。容器的 memory limit 是通过 Linux cgroup 来实现的，cgroup 统计的是整个进程组的内存使用，跟 JVM 的 `-Xmx` 设置是两个完全不同的维度。\n\n你现在的任务是：系统性地排查这次 OOMKilled 的根因，搞清楚内存究竟被什么吃掉了，并给出一份合理的 memory limit 配置方案，让这个服务在不浪费资源的前提下不再频繁重启。",
+      "answer": "## 先把基础概念搞清楚，不然排查方向会跑偏\n\n容器的内存限制本质上是 Linux cgroup（控制组）的 `memory.limit_in_bytes`。当一个容器启动时，kubelet 会在 `/sys/fs/cgroup/memory/kubepods/` 下创建一个对应的 cgroup 目录，把 Pod 的 memory limit 写入 `memory.limit_in_bytes`。一旦这个 cgroup 下所有进程的内存使用之和超过这个值，内核就会触发 OOM Killer，选择 cgroup 内的某个进程杀掉——通常是内存使用最多的那个，也就是你的业务进程。\n\n这里有个关键区别经常被混淆：**容器 OOMKilled 和系统级 OOM Killer 是两回事**。系统级 OOM Killer 是节点整体内存不足时触发的，它会选择 `oom_score_adj` 最高的进程来杀。而容器 OOMKilled 是 cgroup 级别的内存超限，跟节点整体内存够不够没关系——就算节点还剩 10GB 空闲内存，只要你的容器超了 512Mi 的 cgroup 限制，照样被杀。这就是为什么 `kubectl describe node` 看起来节点内存压力不大，但 Pod 还是一直 OOMKilled。\n\n另一个必须理解的概念是**容器内存的组成**。cgroup 统计的内存包含三部分：RSS（Resident Set Size，实际驻留在物理内存中的匿名内存，包含堆、栈、代码段）、Page Cache（文件缓存，读写文件时产生的缓存页）、以及 kernel memory（套接字缓冲区、slab 分配的内核对象等）。其中 Page Cache 是个隐患——如果你的 Java 应用频繁读写日志文件或者用 mmap 操作文件，Page Cache 会悄悄把内存吃满，但 JVM 的 `-Xmx` 完全感知不到这部分。\n\n## 排查步骤：从现象到根因，一步步缩小范围\n\n**第一步，确认 OOMKilled 的事实并看内存用了多少。** `kubectl describe pod` 已经告诉你是 OOMKilled，但你还需要知道被杀前内存到底用了多少。执行 `kubectl top pod order-service-7d6f8b9c4-xk2pq` 可以看实时内存，但如果 Pod 已经重启，你看到的是新实例的内存，意义不大。更有价值的是历史数据——去 Prometheus 查 `container_memory_working_set_bytes` 指标：\n\n```promql\ncontainer_memory_working_set_bytes{\n  namespace=\"production\",\n  pod=~\"order-service-.*\",\n  container=\"order-service\"\n} / 1024 / 1024\n```\n\n`working_set_bytes` 是 Kubernetes 计算内存使用的核心指标，它等于 RSS + 无法被回收的 Page Cache，也是 kubelet 判断是否超出 limit 的依据。如果你看到这个指标在重启前的两分钟内从 400Mi 急速涨到 512Mi，说明有突发的内存申请；如果是缓慢爬坡了几天才到顶，更可能是内存泄漏或者配置不足。\n\n**第二步，区分堆内内存和堆外内存。** 开发同学说 `-Xmx256m` 但实际内存用了 512Mi，这个差距正好说明问题出在 JVM 堆外。Java 应用在容器内的完整内存使用由以下几部分构成，加在一起才是 cgroup 看到的总量：JVM 堆（`-Xms` 到 `-Xmx` 之间浮动）、Metaspace（类元数据，JDK 8 以后从 PermGen 移出来放在 native memory 里，默认没有上限）、JIT 编译后的 code cache（默认上限 240MB，JDK 17 上调到了 512MB）、线程栈（每个线程默认 512KB 到 1MB，200 个线程就是 100-200MB）、堆外 ByteBuffer（`DirectByteBuffer`，Netty 大量使用，不受 `-Xmx` 控制）、以及 JVM 自身的 native memory。\n\n要查清楚这些，最直接的办法是进入容器用 `jcmd` 看 NMT（Native Memory Tracking）：\n\n```bash\n# 首先需要 JVM 启动时开启 NMT，加上参数：\n# -XX:NativeMemoryTracking=summary\n\n# 进入容器\nkubectl exec -it order-service-7d6f8b9c4-xk2pq -- bash\n\n# 找到 JVM 进程 PID\njps -l\n\n# 查看内存详情\njcmd <PID> VM.native_memory summary\n```\n\n输出会告诉你每个区域占了多少 native memory，类似这样：\n\n```\nTotal: reserved=1.8GB, committed=680MB\n-                 Java Heap (reserved=256MB, committed=256MB)\n-                     Class (reserved=1.1GB, committed=72MB)\n-                    Thread (reserved=146MB, committed=146MB)\n-                      Code (reserved=248MB, committed=42MB)\n-                       GC (reserved=4MB, committed=4MB)\n-                 Metaspace (reserved=128MB, committed=68MB)\n-         Symbol (reserved=18MB, committed=18MB)\n```\n\n在这个例子里，Thread 区域占了 146MB，说明这个服务跑了大约 140 个线程；Metaspace 68MB 说明类加载量中等偏多。两者加上 JVM 堆的 256MB，committed 合计已经 530MB，超出了 512Mi 的 limit，OOMKilled 就顺理成章了。\n\n如果没有 NMT，还可以用 `/proc/<PID>/smaps` 分析 native memory 分布，或者用 `cat /proc/meminfo` 结合 `ps aux` 看节点层面的内存压力。\n\n**第三步，找到内存增长的触发点。** 如果是今天才开始 OOMKilled，需要对比昨天和今天的差异。常见的突变原因有：新版本部署引入了更多依赖或者更多线程池配置、流量突增导致 Netty 的 DirectByteBuffer 分配更多、Spring Boot 懒加载的类被全量触发（首次全量流量）、定时任务在高峰期同时执行导致线程数瞬间增加。这个案例里，结合「三个月前上线时稳定」的背景，最可能的原因是业务增长导致并发请求数增加，线程池扩容，线程栈内存随之增加，最终突破了三个月前按低流量设置的 512Mi 上限。\n\n## 修复方案：合理配置 Java 容器的内存 limit\n\n排查到根因之后，配置修复要从两个方向入手：一是让 JVM 自己感知容器限制，二是把 limit 设置到合理的数值。\n\n**让 JVM 感知容器 cgroup。** JDK 8u191 之前，JVM 看不到 cgroup 限制，它读取的是节点的物理内存来计算默认堆大小，导致 `-Xmx` 自动被设置成节点内存的 25%——在一台 32GB 的节点上，这个值是 8GB，远超容器的 512Mi limit。从 JDK 8u191 开始，JVM 会正确读取 cgroup 的 `memory.limit_in_bytes`。但最好显式加上 `-XX:+UseContainerSupport`（JDK 10+ 默认开启，但 JDK 8 需要手动加），然后用 `-XX:MaxRAMPercentage=75` 替代硬编码的 `-Xmx`：\n\n```bash\n# 推荐的 JVM 启动参数（容器环境）\nJAVA_OPTS=\"\n  -XX:+UseContainerSupport \\\n  -XX:MaxRAMPercentage=75 \\\n  -XX:InitialRAMPercentage=50 \\\n  -XX:MetaspaceSize=128m \\\n  -XX:MaxMetaspaceSize=256m \\\n  -XX:NativeMemoryTracking=summary \\\n  -XX:+PrintFlagsFinal\n\"\n```\n\n`-XX:MaxRAMPercentage=75` 的意思是：JVM 堆最多使用容器 memory limit 的 75%，剩下 25% 留给 Metaspace、线程栈、JIT code cache 等堆外内存。这样当你把 limit 改成 1Gi 时，堆自动变成 768Mi，不需要改代码。\n\n**重新计算合理的 memory limit。** 通用公式是：`limit = MaxHeap / 0.75 + 堆外内存缓冲`。如果 NMT 显示堆外 committed 约 300MB，堆需要 256MB，那么理论最小值是 556MB，建议设置为 768Mi 到 1Gi 之间，留出足够的 buffer 应对流量突增。最终的 Pod 配置应该类似这样：\n\n```yaml\nresources:\n  requests:\n    memory: \"512Mi\"   # 调度用，设为正常负载下的典型使用量\n    cpu: \"500m\"\n  limits:\n    memory: \"1Gi\"     # 设为 requests 的 2x，给突发内存申请留空间\n    cpu: \"2\"\n```\n\n**关于 request 和 limit 的设置原则**，memory request 影响的是调度——Kubernetes 会保证节点有这么多内存可用。memory limit 是硬限制，超出即杀。生产上 limit 设成 request 的 1.5x 到 2x 是常见做法：太紧（limit ≈ request）会导致任何突发流量都触发 OOMKilled；太宽（limit >> request）会让节点内存超卖严重，一旦多个 Pod 同时打满 limit，节点自身就会 OOM，后果更严重。\n\n## 扩展：VPA、重启策略与长期治理\n\n如果你管的服务比较多，手动调每个服务的 memory limit 太累了。Kubernetes 的 **VPA（Vertical Pod Autoscaler）** 可以根据历史内存使用情况自动推荐 request 和 limit 值：\n\n```yaml\napiVersion: autoscaling.k8s.io/v1\nkind: VerticalPodAutoscaler\nmetadata:\n  name: order-service-vpa\nspec:\n  targetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: order-service\n  updatePolicy:\n    updateMode: \"Off\"   # 先用 Off 模式只看推荐值，不自动修改\n  resourcePolicy:\n    containerPolicies:\n    - containerName: order-service\n      minAllowed:\n        memory: 256Mi\n      maxAllowed:\n        memory: 2Gi\n```\n\n用 `Off` 模式跑一周，然后 `kubectl describe vpa order-service-vpa` 查看推荐值，再决定是否用 `Auto` 模式自动应用。\n\n关于 **OOMKilled 后的重启策略**，Pod 默认的 `restartPolicy: Always` 会让容器自动重启，但如果根因没解决，就会陷入 `CrashLoopBackOff`——重启间隔从 10 秒开始指数增长，最长 300 秒一次。这期间服务实际上是不可用的。所以 OOMKilled 不是「重启就好了」的问题，必须追根溯源，否则在流量高峰期，你的服务会周期性宕机，告警风暴接踵而至。\n\n最后一个值得注意的地方：`container_memory_working_set_bytes` 和 `container_memory_rss` 是两个不同的指标。`rss` 只统计匿名内存，`working_set_bytes = rss + 活跃 page cache`，后者才是 kubelet 用来判断是否 OOM 的数字。如果你用 `rss` 来设 limit，很可能因为忽略了 page cache 而设得过低。",
+      "keyPoints": [
+        "容器 memory limit 通过 Linux cgroup 的 `memory.limit_in_bytes` 实现，超出 cgroup 限制即触发内核 OOM Killer 杀掉容器内进程，与节点整体内存是否充裕无关。",
+        "Java 应用在容器内的完整内存占用 = JVM 堆 + Metaspace + JIT Code Cache + 线程栈 + 堆外 DirectByteBuffer + JVM native memory，所有这些都计入 cgroup，而 `-Xmx` 只控制堆的上限。",
+        "JDK 8u191 之前 JVM 无法感知 cgroup 限制，会把节点物理内存作为参考来自动设置堆大小，导致 JVM 认为可以使用远超 limit 的内存；从 JDK 8u191 起需显式加 `-XX:+UseContainerSupport` 并配合 `-XX:MaxRAMPercentage=75` 替代硬编码 `-Xmx`。",
+        "Kubernetes 用 `container_memory_working_set_bytes`（RSS + 无法回收的 Page Cache）判断容器是否超出 limit，而非仅用 RSS，因此频繁读写文件的应用也可能因 Page Cache 触发 OOMKilled。",
+        "memory limit 建议设为 requests 的 1.5x 至 2x：设得过紧会导致任何突发申请都触发 OOMKilled，设得过松会造成节点内存严重超卖，多个 Pod 同时爆发时节点本身会 OOM 引发更大范围的故障。",
+        "可以通过 JVM 启动参数 `-XX:NativeMemoryTracking=summary` 开启 NMT，再用 `jcmd <PID> VM.native_memory summary` 精确查看各内存区域的 committed 大小，是定位堆外内存异常的最直接手段。",
+        "VPA（Vertical Pod Autoscaler）的 `Off` 模式可以在不自动修改配置的情况下基于历史数据推荐合理的 request/limit 值，是管理大规模微服务集群内存配置的有效工具。"
+      ],
+      "quiz": [
+        {
+          "id": "container-oom-kill-q1",
+          "question": "容器发生 OOMKilled（Exit Code 137）的直接触发机制是什么？",
+          "choices": [
+            { "id": "A", "text": "Linux 内核检测到容器的 cgroup 内存使用超过 memory.limit_in_bytes，触发 OOM Killer 杀掉 cgroup 内的进程" },
+            { "id": "B", "text": "节点整体物理内存不足，内核选择 oom_score_adj 最高的容器进程杀掉" },
+            { "id": "C", "text": "JVM 堆空间满了触发 OutOfMemoryError，JVM 主动退出并返回 137" },
+            { "id": "D", "text": "kubelet 定期检查容器内存，发现超过 limit 后主动发送 SIGKILL 信号" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "容器 OOMKilled 是 cgroup 级别的内存超限事件。当容器的 cgroup 内所有进程的内存使用之和超过 `memory.limit_in_bytes`，Linux 内核的 OOM Killer 模块会被触发，选择 cgroup 内 `oom_score_adj` 最高的进程发送 SIGKILL（信号 9），进程以 Exit Code 137（128+9）退出。B 描述的是节点级 OOM，和容器 cgroup OOM 是两个完全独立的机制。C 是错的，JVM 的 OutOfMemoryError 只在堆或 Metaspace 满时抛出，退出码通常是 1，不是 137。D 是错的，kubelet 不会主动杀容器，它只是监控状态并在容器退出后记录原因。"
+        },
+        {
+          "id": "container-oom-kill-q2",
+          "question": "一个 Java 服务配置了 `-Xmx256m`，但容器的 memory limit 设了 512Mi，仍然频繁 OOMKilled。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "-Xmx256m 配置有 bug，JVM 实际上没有生效，堆内存超出了 256MB" },
+            { "id": "B", "text": "Metaspace、线程栈、JIT Code Cache、堆外 DirectByteBuffer 等堆外内存加起来超过了 256MB，使总内存超出 512Mi" },
+            { "id": "C", "text": "512Mi 的 limit 太小，JVM 连启动都很难完成，应该设置至少 2Gi" },
+            { "id": "D", "text": "Java 不支持运行在容器内，cgroup 限制对 JVM 没有作用" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Java 容器化最经典的陷阱。`-Xmx` 只限制 JVM 堆的上限，但 Java 进程的实际内存使用远不止堆。Metaspace（类元数据，JDK 8 后默认无上限）、JIT 编译后的 Code Cache（JDK 17 默认上限 512MB）、每个线程的栈（默认 512KB~1MB，200 个线程就是 100~200MB）、Netty 等框架使用的堆外 DirectByteBuffer，这些全都在 cgroup 的统计范围内。一个「只用了 256MB 堆」的 Java 服务，native memory 总 committed 轻松超过 256MB，加上堆就突破 512Mi 是完全正常的事。A 在正常情况下不会发生。C 是过于保守的经验规则，不是根因分析。D 是完全错误的，容器对 Java 是透明的，cgroup 照样生效。"
+        },
+        {
+          "id": "container-oom-kill-q3",
+          "question": "下列哪个 Prometheus 指标是 Kubernetes 判断容器是否超出 memory limit 的依据？",
+          "choices": [
+            { "id": "A", "text": "container_memory_rss：容器进程的 RSS（Resident Set Size）" },
+            { "id": "B", "text": "container_memory_usage_bytes：包含所有缓存的内存使用总量" },
+            { "id": "C", "text": "container_memory_working_set_bytes：RSS 加上无法被回收的 Page Cache" },
+            { "id": "D", "text": "container_memory_cache：容器使用的 Page Cache 总量" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "`container_memory_working_set_bytes` 是 kubelet 计算容器内存使用量并与 memory limit 比较的核心指标，等于 RSS 加上无法被内核主动回收的活跃 Page Cache。`container_memory_rss` 只统计匿名内存（堆、栈），忽略了 Page Cache，用它来衡量内存使用会低估真实压力。`container_memory_usage_bytes` 包含了可以被随时回收的冷 Page Cache，会高估压力，也不是 OOM 判断的依据。`container_memory_cache` 只是 Page Cache 部分。在 Grafana Dashboard 里，`kubectl top pod` 命令显示的 MEMORY 列也是 `working_set_bytes` 的值，不是 RSS。"
+        },
+        {
+          "id": "container-oom-kill-q4",
+          "question": "JDK 8 的 Java 应用部署在容器内，没有加任何特殊 JVM 参数，memory limit 设为 512Mi，但 JVM 自动设置的 `-Xmx` 很可能是多少？",
+          "choices": [
+            { "id": "A", "text": "128Mi，JVM 默认取 limit 的 25%" },
+            { "id": "B", "text": "256Mi，JVM 默认取 limit 的 50%" },
+            { "id": "C", "text": "节点物理内存的 25%，例如节点 32GB 则为 8GB，因为旧版 JVM 无法感知 cgroup" },
+            { "id": "D", "text": "512Mi，JVM 会读取 cgroup limit 并使用全部内存作为堆" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 Java 容器化早期最严重的坑之一。JDK 8u191 之前，JVM 完全无法感知 cgroup 限制，它通过读取 `/proc/meminfo` 的 `MemTotal` 来获取「可用内存」，然后默认把其中 25% 作为堆上限。在一台 32GB 内存的节点上，JVM 会把 `-Xmx` 自动设为 8GB，远远超出容器的 512Mi cgroup 限制，容器一运行就会被 OOM Killer 干掉。从 JDK 8u191 开始，JVM 支持 UseContainerSupport，但在旧版本中这个参数不存在。这也是为什么 Java 容器化必须显式加 `-XX:MaxRAMPercentage` 或者硬编码 `-Xmx` 的原因。"
+        },
+        {
+          "id": "container-oom-kill-q5",
+          "question": "以下 `jcmd` 输出片段来自一个 memory limit 为 512Mi 的容器内的 Java 进程，请判断该进程是否处于 OOMKilled 风险中：\n```\nTotal: reserved=1.5GB, committed=530MB\n- Java Heap (committed=256MB)\n- Thread  (committed=148MB)\n- Metaspace (committed=68MB)\n- Code  (committed=40MB)\n- Other  (committed=18MB)\n```",
+          "choices": [
+            { "id": "A", "text": "没有风险，committed 530MB 是 JVM 自己统计的，和 cgroup 统计的值不一样，实际 cgroup 内存更低" },
+            { "id": "B", "text": "有高风险，NMT committed 530MB 已接近 512Mi limit，任何额外内存申请都可能触发 OOMKilled" },
+            { "id": "C", "text": "没有风险，reserved 1.5GB 才是实际使用量，committed 只是虚拟地址保留" },
+            { "id": "D", "text": "需要先看 RSS，NMT 数据不能直接判断 cgroup 内存使用" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "NMT 的 `committed` 值代表 JVM 实际向操作系统申请并使用的物理内存（或已提交的虚拟内存页），与 cgroup `working_set_bytes` 的量级高度相关。530MB 已超过 512Mi（约 537MB），理论上已经处于超限边缘。`reserved` 是虚拟地址空间的预留，不消耗物理内存，不能当实际使用量看——A 和 C 都混淆了 reserved 和 committed 的概念。D 的说法有一定道理，RSS 是 cgroup 统计的依据之一，但 NMT committed 和 RSS 通常非常接近，所以 NMT 数据完全可以作为风险判断的依据。"
+        },
+        {
+          "id": "container-oom-kill-q6",
+          "question": "为什么不推荐把 memory limit 设置得和 memory request 完全相同（例如 requests.memory = limits.memory = 512Mi）？",
+          "choices": [
+            { "id": "A", "text": "Kubernetes 要求 limit 必须大于 request，相等会导致 Pod 无法调度" },
+            { "id": "B", "text": "limit 和 request 相等会让 Pod 变成 Guaranteed QoS 类，Guaranteed 类的 Pod 不会被驱逐，反而占用资源" },
+            { "id": "C", "text": "相等配置下任何超出正常水位的瞬时内存申请（GC 前的堆峰值、突发请求）都会立即触发 OOMKilled，没有任何缓冲空间" },
+            { "id": "D", "text": "limit 和 request 相等时 kubelet 不会为该 Pod 创建 cgroup，导致内存无法被正确限制" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "B 的描述其实是 Guaranteed QoS 的特性（limit = request 确实会使 Pod 成为 Guaranteed 类，这类 Pod 在节点内存压力下最后才被驱逐），但这不是「不推荐」的原因，反而有时是想要的效果。真正的问题在 C：Java 应用的内存使用并非平稳的直线，GC 之前堆会先涨到峰值再回落，突发请求会导致 Netty 分配更多 DirectByteBuffer，偶发的类加载会增加 Metaspace。如果 limit = request = 512Mi，正常运行在 480Mi，那任何一次小的波动都可能触发 OOMKilled。留出 request 到 limit 之间的 buffer（通常 1.5x~2x），就是给这些合理的瞬时峰值一个生存空间。A 是错的，Kubernetes 允许 limit = request。D 是完全错误的。"
+        },
+        {
+          "id": "container-oom-kill-q7",
+          "question": "容器 OOMKilled（cgroup 级别）和节点 OOM（系统级别）有什么本质区别？",
+          "choices": [
+            { "id": "A", "text": "两者本质相同，都是物理内存不足触发的，只是发生的层级不同" },
+            { "id": "B", "text": "容器 OOM 在节点内存充裕时也可能发生（只要 cgroup 内存超限），节点 OOM 发生时节点整体物理内存不足，两者触发条件完全独立" },
+            { "id": "C", "text": "节点 OOM 更严重，会导致整个节点宕机；容器 OOM 只影响单个 Pod，节点完全不受影响" },
+            { "id": "D", "text": "容器 OOM 是 Kubernetes 层面的概念，节点 OOM 是 Linux 内核的概念，底层实现机制完全不同" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这个区别在排查时非常重要。容器 OOM（cgroup memory 超限）与节点剩余内存完全无关——即使节点还有 50GB 空闲内存，只要某个容器的 cgroup 超出了 memory limit，内核 OOM Killer 就会杀掉该 cgroup 内的进程。节点 OOM 则发生在节点整体物理内存和 swap 都耗尽的情况下，此时内核会在所有进程中选择 oom_score_adj 最高的进程杀掉，通常是 BestEffort 和 Burstable QoS 的 Pod 会首先成为目标。C 的说法过于绝对，节点 OOM 不一定导致节点宕机，但会波及多个 Pod。D 的说法混淆了概念，两者都在 Linux 内核层面实现，容器 OOM 其实也是内核 OOM Killer 触发的，只是作用域限定在 cgroup 内。"
+        },
+        {
+          "id": "container-oom-kill-q8",
+          "question": "生产环境的 Java 服务突然开始 OOMKilled，但应用代码和 JVM 参数三个月没变，最可能的外部原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Kubernetes 版本升级导致 cgroup 计算方式改变，相同代码在新版本下内存使用更多" },
+            { "id": "B", "text": "业务流量增长，并发请求数增加导致线程池扩容，线程栈内存随之增加，突破了历史低流量时设置的 limit" },
+            { "id": "C", "text": "容器镜像被重新 build，JDK 基础镜像版本变了，新版本 JVM 的内存开销更大" },
+            { "id": "D", "text": "节点发生了内存碎片化，导致 cgroup 统计不准确，实际使用量比显示的更高" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「代码三个月没变」但「今天开始 OOMKilled」这个时间特征强烈指向外部条件变化而非代码问题。业务流量增长是最常见的根因：并发请求增多 → 线程池自动扩容（或手动线程池满载被迫创建更多线程）→ 每个线程栈 512KB~1MB，100 个新线程就是 50~100MB 额外内存 → 突破了三个月前按低流量定的 limit。除此之外，新增功能触发了更多 Spring Bean 加载（Metaspace 增加）、Netty 连接池扩大（DirectByteBuffer 增加），也是类似的流量相关变化。A 在 Kubernetes 实际升级时可能有影响，但远不如 B 常见。C 可以排查，但通常 CI/CD 会有镜像变更记录。D 是不太可能的底层问题。"
+        },
+        {
+          "id": "container-oom-kill-q9",
+          "question": "使用 `-XX:MaxRAMPercentage=75` 配置 Java 容器内存时，如果 memory limit 设为 1Gi，JVM 堆的上限大约是多少？",
+          "choices": [
+            { "id": "A", "text": "750Mi，直接按 limit 的 75% 计算" },
+            { "id": "B", "text": "768Mi，1Gi = 1024Mi，75% 约等于 768Mi" },
+            { "id": "C", "text": "512Mi，JVM 会保守地取 limit 的 50% 以确保安全" },
+            { "id": "D", "text": "1Gi，MaxRAMPercentage 只影响初始堆大小，最大堆仍然可以使用全部 limit" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "1Gi = 1024MiB，75% 即 768MiB，JVM 会将 `-Xmx` 设为约 768m。这就是 `-XX:MaxRAMPercentage=75` 的核心价值：你只需改 Kubernetes 的 memory limit，JVM 堆会自动跟着缩放，不需要同时修改 JVM 启动参数。剩下的 25%（约 256MiB）留给 Metaspace、线程栈、Code Cache 等堆外内存。在实践中，是否够用取决于具体服务，线程数多的服务（如 Tomcat 多线程模式）可能需要把这个比例调低到 65%~70%。A 的「750Mi」是把 1Gi 当 1000Mi 算的错误，混淆了 SI 单位和二进制单位。C 和 D 都是错误的描述。"
+        },
+        {
+          "id": "container-oom-kill-q10",
+          "question": "Kubernetes VPA 配置 `updateMode: \"Off\"` 时的作用是什么？为什么推荐先用这个模式而不是直接用 `Auto`？",
+          "choices": [
+            { "id": "A", "text": "Off 模式完全禁用 VPA，不收集任何数据，适合不需要自动扩缩的场景" },
+            { "id": "B", "text": "Off 模式只计算并展示推荐的 request/limit 值，不自动修改任何配置，适合先评估再决策" },
+            { "id": "C", "text": "Off 模式让 VPA 只调整 CPU request，不调整 memory，避免误杀内存密集型服务" },
+            { "id": "D", "text": "Off 模式和 Auto 模式功能相同，区别只是 Off 模式的推荐算法更保守" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "VPA 的 `updateMode: Off` 是「只读观察模式」——VPA 会持续收集容器的历史资源使用数据，计算推荐的 request 和 limit，你可以通过 `kubectl describe vpa` 查看这些推荐值，但 VPA 不会修改任何 Pod 配置。这是推荐的初期使用方式，因为 VPA 的 `Auto` 模式在需要修改资源配置时会重建 Pod（Kubernetes 目前不支持原地修改 requests），这在生产环境可能导致意外的滚动重启。先用 Off 模式观察一到两周，确认推荐值合理后，再切换到 `Recreate` 或 `Auto` 模式，可以大幅降低风险。A 是错的，Off 模式仍然收集数据和生成推荐。C 是错的，VPA 对 CPU 和 memory 都有推荐。D 是完全错误的描述。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/resize-container-resources/",
+        "https://kubernetes.io/docs/concepts/workloads/autoscaling/#vertical-scaling",
+        "https://docs.oracle.com/en/java/javase/17/gctuning/factors-affecting-garbage-collection-performance.html",
+        "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v1/memory.html"
+      ]
+    }
+  ]
+}
