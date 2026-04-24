@@ -1,0 +1,155 @@
+{
+  "id": "slab-cache-memory",
+  "name": "Slab Cache 内存占用过多的排查",
+  "domain": "troubleshooting",
+  "description": "Linux Slab 分配器的工作原理、Slab 内存过多时的诊断方法与回收策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "slab-cache-memory-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["slab", "memory", "linux", "kernel", "dentry", "inode", "cache"],
+      "title": "free -h 显示内存占用很高但进程用不了那么多，/proc/meminfo 显示 Slab 占了好几 GB，如何排查？",
+      "content": "## 场景描述\n\n线上有一台 16GB 内存的 Nginx 反向代理服务器，最近运维反馈机器内存快撑满了，但奇怪的是：用 `ps aux` 看所有进程的 RSS 加起来不超过 2GB，Nginx 本身的 worker 进程也只有几百 MB。`free -h` 的输出如下：\n\n```\n              total        used        free      shared  buff/cache   available\nMem:           15Gi        13Gi       312Mi       128Mi       2.1Gi       1.8Gi\nSwap:           2Gi       1.2Gi       824Mi\n```\n\n`used` 显示已经用了 13GB，连 swap 都开始换入了，但进程实际占用加起来才 2GB。你的同事第一反应是「是不是内存泄漏？」，随手 `kill -9` 了几个 Nginx worker，内存没有任何变化。你进一步查了 `/proc/meminfo`，发现了关键信息：\n\n```\nMemTotal:       16384000 kB\nMemFree:          319488 kB\nMemAvailable:    1843200 kB\nBuffers:          102400 kB\nCached:          1048576 kB\nSlab:            9437184 kB    ← 这行很扎眼，接近 9GB\nSReclaimable:    8912896 kB\nSUnreclaim:       524288 kB\nKernelStack:       32768 kB\n```\n\n`Slab` 行显示内核 slab 缓存占了将近 9GB，其中 `SReclaimable`（可回收部分）8.5GB，`SUnreclaim`（不可回收部分）512MB。这台机器是一个文件服务的反向代理，后端挂了大量存储节点，每天要代理访问数百万个小文件路径。\n\n**问题：**\n1. Slab 缓存是什么？它为什么会占这么多内存？\n2. 如何精确定位是哪类 slab 对象占用了这些内存？\n3. 如何安全地释放这部分内存？有什么副作用？\n4. 如何从根本上避免 slab 无限增长？",
+      "answer": "## 第一步：理解 Slab 分配器是什么\n\n要看懂这个问题，得先弄清楚 Slab 分配器在内核里扮演的角色。操作系统内核在运行过程中需要频繁地创建和销毁各种内核对象：每次你打开一个文件，内核要分配一个 `inode` 结构体；每次你访问一个目录路径，内核要分配一个 `dentry`（directory entry，目录项）结构体；每次建立一个 TCP 连接，内核要分配一个 `socket` 结构体。这些对象的大小是固定的，比如一个 `dentry` 在 Linux 5.x 内核上大约是 192 字节，一个 `ext4_inode_cache` 对象大约是 1184 字节。\n\n如果内核每次需要一个 `dentry` 就调用通用内存分配器去申请 192 字节，用完了再释放，这会带来两个严重问题：一是内存碎片化，频繁的小块申请释放会让物理页面变得千疮百孔；二是性能开销，通用分配器需要搜索合适的空闲块，而这个操作在高频调用下代价不容忽视。\n\nSlab 分配器（准确说 Linux 现在默认用的是 SLUB 分配器，SLUB 是 Slab 的改进版，2.6.23 内核起成为默认）的解法很直接：**为每种固定大小的内核对象维护一个对象池**。当你需要一个 `dentry` 时，直接从池子里取出一个已经初始化好的对象；用完了，不销毁，直接还回池子。这样分配速度接近 O(1)，而且完全没有碎片。这个对象池就叫做 slab cache，每种对象类型对应一个 cache，比如 `dentry` cache、`inode_cache`、`ext4_inode_cache`、`sock_inode_cache` 等。\n\nSlab cache 最关键的一个设计决策是：**它不会主动缩减自己的大小**。当系统内存充裕的时候，内核会允许 slab cache 无限增长，把「已经用过但现在不用的对象」保留在池子里，以备下次快速使用。从内核的视角看，这是在用空闲内存换取未来的分配性能，是一种很合理的优化。但从运维的视角看，这就变成了「内存被神秘地吃掉了但进程说自己没用那么多」。\n\n## 第二步：精准定位哪类 slab 对象是大户\n\n先用 `slabtop` 命令快速找到内存占用最高的 slab cache。`slabtop` 是一个类似 top 的实时工具，加 `-o` 参数可以输出一次性快照然后退出：\n\n```bash\n$ slabtop -o | head -20\n Active / Total Objects (% used)    : 48234560 / 49182720 (98.1%)\n Active / Total Slabs (% used)      : 1310720 / 1310720 (100.0%)\n Active / Total Caches (% used)     : 95 / 135 (70.4%)\n Active / Total Size (% used)       : 8589934.59K / 8912896.00K (96.4%)\n Minimum / Average / Maximum Object : 0.01K / 0.18K / 8.00K\n\n  OBJS ACTIVE  USE OBJ SIZE  SLABS OBJ/SLAB CACHE SIZE NAME\n43253760 42987520  99%    0.19K 1031280       42   8250240K dentry\n 3276800  3211264  98%    1.16K  81920       40   2621440K ext4_inode_cache\n  524288   511232  97%    0.62K  32768       16    524288K sock_inode_cache\n  131072   128512  98%    0.57K   8192       16    131072K inode_cache\n   65536    64256  98%    0.06K   1024       64      4096K kmalloc-64\n   32768    32000  98%    0.12K   1024       32      4096K kmalloc-128\n```\n\n一眼就能看出来：`dentry` 占了 8.25GB，`ext4_inode_cache` 占了 2.5GB，这两个加起来就是 10.75GB，和 `/proc/meminfo` 里的 `Slab` 数值高度吻合。\n\n更详细的数据可以从 `/proc/slabinfo` 获取，这个文件是内核直接暴露的 slab 统计信息：\n\n```bash\n$ cat /proc/slabinfo | awk 'NR==1 || NR==2 || /^dentry/ || /^ext4_inode/' \nslabinfo - version: 2.1\n# name            <active_objs> <num_objs> <objsize> <objperslab> <pagesperslab> ...\ndentry            42987520 43253760    192   21    1 : tunables    0    0    0 : slabdata 2059703 2059703      0\next4_inode_cache   3211264  3276800   1184   27    8 : tunables    0    0    0 : slabdata 121363 121363      0\n```\n\n`/proc/slabinfo` 里的字段含义：`active_objs` 是当前正在使用的对象数，`num_objs` 是总共分配的对象数（含缓存待用的），`objsize` 是每个对象的字节数。4300 万个 `dentry` 对象，每个 192 字节，合计 8.25GB，完全对得上。\n\n现在来分析这台机器为什么会积累这么多 `dentry`：这台服务器是文件服务的反向代理，每次 Nginx 代理请求到后端时，内核需要解析 URL 路径，把每一级目录名都缓存成一个 `dentry` 对象。比如访问 `/data/2024/01/15/img_12345.jpg`，内核会为 `data`、`2024`、`01`、`15`、`img_12345.jpg` 分别创建 `dentry` 缓存。后端有数百万个小文件路径，积累下来 4000 多万个 `dentry` 对象完全合理。\n\n## 第三步：安全地释放 slab 内存\n\n内核提供了一个「一键清除缓存」的接口 `/proc/sys/vm/drop_caches`，写入不同的值会触发不同范围的内存回收：\n\n```bash\n# 只回收 Page Cache（不动 slab）\necho 1 > /proc/sys/vm/drop_caches\n\n# 只回收 slab cache 中的可回收对象（SReclaimable）\necho 2 > /proc/sys/vm/drop_caches\n\n# 同时回收 Page Cache 和 slab（相当于 1 + 2）\necho 3 > /proc/sys/vm/drop_caches\n```\n\n在这个场景下，执行 `echo 2 > /proc/sys/vm/drop_caches` 之后，内存会快速释放。`drop_caches` 只会清理 `SReclaimable` 部分（对应 `dentry`、`inode_cache` 这类可以安全丢弃的缓存），不会动 `SUnreclaim` 部分（那些是内核正在使用的、不能丢弃的对象）。\n\n副作用要说清楚：`drop_caches` 执行后，已经缓存的 `dentry` 和 `inode` 全部失效。接下来一段时间内，所有的文件路径解析都需要重新走磁盘 IO，延迟会明显升高，直到缓存重新建立。在写 IO 密集的生产环境执行 `drop_caches` 要格外谨慎，最好在低峰期操作，并提前观察监控。另外，`drop_caches` 只是临时解法，如果根因不解决，slab 很快会再次涨回去。\n\n## 第四步：从根本上控制 slab 增长\n\n短期应急之外，更重要的是调整内核参数来控制 slab 的回收积极性。`vm.vfs_cache_pressure` 是专门为这个场景设计的参数，它控制内核在内存回收时对 VFS（虚拟文件系统）相关缓存（包括 `dentry` 和 `inode` 缓存）的「回收力度」：\n\n```bash\n# 查看当前值（默认值 100）\nsysctl vm.vfs_cache_pressure\n\n# 调高到 200，让内核更积极地回收 dentry/inode 缓存\nsysctl -w vm.vfs_cache_pressure=200\n\n# 持久化到 /etc/sysctl.conf\necho 'vm.vfs_cache_pressure=200' >> /etc/sysctl.conf\n```\n\n这个参数的语义是：值越高，内核在内存回收时越倾向于回收 VFS 缓存而不是留着它们；值越低，内核越倾向于把 VFS 缓存留在内存里。默认值 100 代表「和其他可回收内存同等优先级」。对于小文件密集访问的场景，设置成 200 甚至 500 都是合理的，代价是文件路径解析的缓存命中率会降低，但至少内存不会持续膨胀。\n\n设置成 0 是个危险操作，文档里明确说明 `vfs_cache_pressure=0` 会让内核「永远不主动回收」VFS 缓存，只有在 `drop_caches` 或系统极度内存压力时才会释放，是真正的「只进不出」。\n\n## 扩展：容器环境下的 slab 归属问题\n\n如果你在容器里观察这个问题，会发现一个让人困惑的现象：容器内部 `free -h` 显示内存使用很低，但宿主机上这个容器的 cgroup 内存统计却显示用了很多。这是因为 **cgroup v1 不对 slab 内存计费**：容器里的进程产生的 `dentry` 和 `inode` 缓存，在 cgroup v1 下是计入宿主机的全局 slab 池，不算在容器自己的内存限制里。\n\ncgroup v2 改变了这个行为，引入了 `memory.stat` 中的 `slab` 字段，把 slab 内存归属到产生它的 cgroup 下。这意味着在 cgroup v2 的容器里，如果一个容器疯狂访问大量不同路径，它的 slab 消耗也会被计入内存限制，可能触发 OOM Kill。这是从 cgroup v1 迁移到 cgroup v2 时经常踩到的坑，很多团队发现容器在 cgroup v2 下莫名其妙被 OOM 杀掉，往往就是因为 slab 的归属变了。\n\n## SReclaimable 与 SUnreclaim 的本质区别\n\n最后把 `/proc/meminfo` 里两个字段的区别讲清楚。`SReclaimable`（可回收 slab）指的是那些内容可以直接丢弃的缓存，典型的是 `dentry`、`inode_cache`——这些东西是从磁盘读来的信息在内存里的镜像，需要的时候可以重新从磁盘加载，所以可以安全释放。`SUnreclaim`（不可回收 slab）指的是内核正在活跃使用、不能释放的对象，比如 `kmalloc` 分配的内核数据结构、网络协议栈的缓冲区、进程描述符等，这些内存只有等到相关的内核操作结束才会自然释放。`drop_caches` 和内存压力触发的自动回收都只能释放 `SReclaimable` 的部分，`SUnreclaim` 如果很高，通常意味着有内核级别的内存泄漏或者某个子系统的内存使用异常。",
+      "keyPoints": [
+        "Slab 分配器（Linux 默认用 SLUB 实现）为内核对象（dentry、inode、socket 等）维护对象池，避免频繁的小内存分配释放带来的碎片和性能开销，但对象池不会主动缩减，空闲内存充裕时会持续积累。",
+        "/proc/meminfo 中 Slab = SReclaimable + SUnreclaim，SReclaimable 是可安全丢弃的缓存（如 dentry、inode_cache），SUnreclaim 是内核正在使用的不可释放对象；drop_caches 只能清理前者。",
+        "slabtop -o 按内存用量排序输出所有 slab cache 的统计，是快速定位「哪类内核对象吃了内存」的首选工具，能直接看到 dentry、ext4_inode_cache 等对象的数量和总内存占用。",
+        "大量小文件路径访问（如文件服务反向代理）是 dentry cache 暴涨的经典场景，因为内核会为每个唯一路径的每一级目录都创建一个 dentry 对象并缓存起来。",
+        "echo 2 > /proc/sys/vm/drop_caches 可以立即释放 SReclaimable 的 slab 内存，但这是应急手段，执行后缓存命中率下降会导致短暂延迟升高，且根因不解决 slab 很快会再次涨回去。",
+        "vm.vfs_cache_pressure 参数（默认值 100）控制内核回收 VFS 缓存的积极性，对小文件密集访问场景应调高到 200～500，让内核在内存紧张时更主动地回收 dentry/inode 缓存，避免内存持续膨胀。",
+        "cgroup v1 不对 slab 内存计费（容器产生的 dentry 计入宿主机全局 slab 池），cgroup v2 改变了这一行为，把 slab 归属到产生它的 cgroup，迁移到 cgroup v2 时可能导致容器莫名触发 OOM。"
+      ],
+      "quiz": [
+        {
+          "id": "slab-cache-memory-q1",
+          "question": "Linux Slab 分配器（SLUB）的核心设计目标是什么？",
+          "choices": [
+            {"id": "A", "text": "为内核中频繁创建销毁的固定大小对象维护对象池，避免碎片和重复初始化开销"},
+            {"id": "B", "text": "管理用户态进程的堆内存分配，替代 glibc 的 malloc 实现"},
+            {"id": "C", "text": "将物理内存分成固定大小的 slab 页框，用于虚拟内存映射"},
+            {"id": "D", "text": "提供内核模块之间共享内存的机制，类似于共享内存段"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Slab 分配器专门服务于内核内部的对象分配，解决的是内核频繁创建销毁 dentry、inode、socket 等固定大小结构体时的碎片化和初始化开销问题。它与用户态的 malloc 无关（B 错）；虚拟内存映射是 Buddy System 的职责（C 错）；模块间共享内存用的是专门的 shm 机制（D 错）。理解这一点是排查 slab 内存问题的基础——你要知道那些内存是内核对象缓存，不是进程在「偷」内存。"
+        },
+        {
+          "id": "slab-cache-memory-q2",
+          "question": "/proc/meminfo 中 SReclaimable 和 SUnreclaim 的本质区别是什么？",
+          "choices": [
+            {"id": "A", "text": "SReclaimable 是内核可以安全丢弃的缓存（如 dentry、inode），SUnreclaim 是内核正在活跃使用、不能释放的对象"},
+            {"id": "B", "text": "SReclaimable 是用户进程可以申请使用的 slab 内存，SUnreclaim 是只有内核才能使用的保留内存"},
+            {"id": "C", "text": "SReclaimable 是通过 drop_caches 释放的内存，SUnreclaim 是只有重启才能释放的内存"},
+            {"id": "D", "text": "SReclaimable 是匿名内存映射，SUnreclaim 是文件背景内存映射"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "SReclaimable 包含的是内容可以从持久存储重建的缓存，典型是 dentry（路径缓存）和 inode_cache（文件元数据缓存），内核在内存紧张时可以丢弃这些对象，需要时重新从磁盘加载。SUnreclaim 包含的是 kmalloc 分配的内核数据结构、内核栈等正在被使用的对象，不能随意释放，只有等对应的内核操作完成后才会自然归还。B 选项混淆了 slab 和用户内存的概念；C 选项不准确，drop_caches 只能触发 SReclaimable 的回收，但 SUnreclaim 并非「只有重启」才能释放；D 选项完全是匿名/文件内存映射的概念，与 slab 无关。"
+        },
+        {
+          "id": "slab-cache-memory-q3",
+          "question": "用哪个命令可以快速找到当前内存占用最高的 slab cache 类型？",
+          "choices": [
+            {"id": "A", "text": "slabtop -o（按内存排序输出一次性快照）"},
+            {"id": "B", "text": "vmstat -m（显示 slab 统计信息）"},
+            {"id": "C", "text": "cat /proc/buddyinfo（按 zone 显示 slab 使用情况）"},
+            {"id": "D", "text": "perf mem record（追踪内核内存分配热点）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "slabtop 是专门查看 slab 内存统计的工具，-o 参数让它输出一次性快照而不是实时刷新，默认按内存用量排序，能直观地看到 dentry、ext4_inode_cache、sock_inode_cache 等各类 cache 的对象数、对象大小和总内存占用。vmstat -m 在某些发行版上确实能看部分 slab 信息，但格式简陋且不排序；/proc/buddyinfo 展示的是 Buddy System（伙伴系统）的空闲页框分布，与 slab 无关；perf mem record 是性能追踪工具，用于分析内存访问热点，不用于统计 slab 占用。"
+        },
+        {
+          "id": "slab-cache-memory-q4",
+          "question": "echo 2 > /proc/sys/vm/drop_caches 会清理哪些内存？",
+          "choices": [
+            {"id": "A", "text": "只清理 SReclaimable 的 slab cache（dentry、inode_cache 等），不影响 Page Cache"},
+            {"id": "B", "text": "只清理 Page Cache（文件内容缓存），不影响 slab"},
+            {"id": "C", "text": "同时清理 Page Cache 和所有 slab（含 SUnreclaim）"},
+            {"id": "D", "text": "清理所有进程的用户态匿名内存和文件缓存"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "drop_caches 的三个值含义固定：echo 1 只清 Page Cache，echo 2 只清 slab（仅 SReclaimable 部分），echo 3 同时清两者。写 2 不会动 Page Cache，也不能清 SUnreclaim（内核正在使用的对象无法强行释放）。需要注意：drop_caches 会导致之前缓存的 dentry 和 inode 全部失效，之后的文件路径解析需要重新从磁盘加载，在 IO 压力大的生产环境执行前要评估延迟影响。它也绝不会清理用户态进程的匿名内存。"
+        },
+        {
+          "id": "slab-cache-memory-q5",
+          "question": "以下 slabtop 输出片段，哪个 slab cache 是内存消耗的主要来源？\n\n```\n  OBJS ACTIVE  USE OBJ SIZE  SLABS OBJ/SLAB CACHE SIZE NAME\n38400000 38100000  99%    0.19K  914286       42   7314288K dentry\n 2048000  2010000  98%    1.16K  51200       40   1638400K ext4_inode_cache\n  256000   251000  98%    0.62K  16000       16    256000K sock_inode_cache\n```",
+          "choices": [
+            {"id": "A", "text": "dentry，3800 万个目录项缓存合计约 7.3GB，通常是大量小文件路径访问的产物"},
+            {"id": "B", "text": "ext4_inode_cache，因为每个对象体积最大（1.16KB），单对象消耗最高"},
+            {"id": "C", "text": "sock_inode_cache，因为 USE 百分比最高（98%），说明使用率最高"},
+            {"id": "D", "text": "三者相当，需要等比例同时处理"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "判断内存大户要看 CACHE SIZE 列（总内存占用），不是单对象体积。dentry 的 CACHE SIZE 是 7,314,288K（约 7.3GB），ext4_inode_cache 是 1,638,400K（约 1.6GB），sock_inode_cache 是 256,000K（256MB）。dentry 虽然单个对象只有 0.19KB，但对象数量达到 3800 万，总量远超其他。ext4_inode_cache 单对象体积是最大的，但对象数量少很多，总量只有 1.6GB。USE 百分比接近（都是 98-99%），不能用来区分谁是主要问题。应该优先处理 dentry，这通常是文件路径访问密集场景的典型症状。"
+        },
+        {
+          "id": "slab-cache-memory-q6",
+          "question": "vm.vfs_cache_pressure 默认值是 100，如果把它设置为 0 会发生什么？",
+          "choices": [
+            {"id": "A", "text": "内核永远不主动回收 dentry/inode 缓存，只在极度内存压力或 drop_caches 时才释放，可能导致 slab 无限增长"},
+            {"id": "B", "text": "内核会更积极地回收 VFS 缓存，内存压力下 dentry 和 inode 缓存会被优先释放"},
+            {"id": "C", "text": "禁用 slab 分配器，所有内核对象改用通用内存分配器"},
+            {"id": "D", "text": "将 VFS 缓存的回收优先级降低到最低，但仍然会在正常内存回收中被处理"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是一个经典的「把参数设成 0 以为是关闭了某个行为，其实是走向了极端」的坑。vfs_cache_pressure=0 的语义是：内核在做内存回收时，给 VFS 缓存的压力系数为 0，也就是永远不主动回收。文档里明确写着这是「不推荐的」设置，因为它会让 dentry 和 inode 缓存只增不减，直到触发 OOM 或手动 drop_caches。正确的做法是：小文件密集访问场景调高到 200～500，不是调低或归零。生产环境修改这个参数之前，务必先在测试环境验证，并配合监控观察缓存命中率变化。"
+        },
+        {
+          "id": "slab-cache-memory-q7",
+          "question": "在 cgroup v1 环境下，容器内进程产生的 dentry 缓存计入哪里的内存配额？",
+          "choices": [
+            {"id": "A", "text": "计入宿主机的全局 slab 池，不计入容器的 cgroup 内存限制"},
+            {"id": "B", "text": "计入产生该 dentry 的容器的 cgroup 内存配额"},
+            {"id": "C", "text": "均分给宿主机和容器，各占 50%"},
+            {"id": "D", "text": "计入使用该文件路径的第一个进程所属的 cgroup"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "cgroup v1 的内存计费有一个著名的局限：内核 slab 内存（包括 dentry、inode_cache 等 VFS 缓存）是全局共享的，不归属于任何特定的 cgroup，因此不会计入容器的内存限制。这导致一个容器如果疯狂访问大量不同路径，它产生的 slab 消耗会悄悄吃掉宿主机的内存，但容器自身的 memory.usage_in_bytes 看起来完全正常。cgroup v2 修复了这个问题，引入了 slab 归属统计，把 slab 内存计入产生它的 cgroup。从 cgroup v1 升级到 v2 时，有些之前「内存很宽裕」的容器会突然触发 OOM，正是因为之前被忽略的 slab 消耗现在开始计费了。"
+        },
+        {
+          "id": "slab-cache-memory-q8",
+          "question": "一台文件服务代理服务器的 dentry cache 持续增长，每天涨 500MB 且不自动回收。以下哪种方案是治本之策？",
+          "choices": [
+            {"id": "A", "text": "把 vm.vfs_cache_pressure 从 100 调高到 500，让内核在内存回收时更积极地释放 dentry 缓存，配合监控观察缓存命中率"},
+            {"id": "B", "text": "写定时任务每小时执行一次 echo 3 > /proc/sys/vm/drop_caches"},
+            {"id": "C", "text": "升级服务器内存从 16GB 到 64GB，给 dentry 缓存更多空间"},
+            {"id": "D", "text": "把 vm.vfs_cache_pressure 设置为 0 禁止内核回收，避免频繁的缓存失效影响性能"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "治本之策是让内核的内存回收机制把 dentry 缓存纳入正常的压力管理，而不是绕过内核自己管。调高 vfs_cache_pressure 能让内核在 kswapd（内核内存回收守护进程）运行时把 VFS 缓存当成优先回收对象，在内存压力形成之前就主动释放，这是符合内核设计理念的正确做法。定时 drop_caches（B）是粗暴的应急手段，会造成周期性的缓存命中率骤降，引发 IO 毛刺；扩内存（C）只是治标，如果路径数量无上限，早晚还是会涨满；设置为 0（D）是最差选择，会让问题更严重。"
+        },
+        {
+          "id": "slab-cache-memory-q9",
+          "question": "/proc/meminfo 中 SUnreclaim 持续增长（比如每天增加 200MB 且不降），最可能意味着什么？",
+          "choices": [
+            {"id": "A", "text": "内核级别的内存泄漏或某个内核子系统（如网络协议栈、内核模块）持续分配 kmalloc 内存未释放"},
+            {"id": "B", "text": "dentry cache 增长过快，已经从 SReclaimable 溢出到了 SUnreclaim"},
+            {"id": "C", "text": "用户态进程的 RSS 内存统计有误，实际上是进程内存泄漏"},
+            {"id": "D", "text": "Page Cache 被误标记为不可回收导致的统计偏差"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "SUnreclaim 代表内核当前正在使用且不能丢弃的 slab 内存，正常情况下它的大小应该相对稳定，与运行中的内核操作规模成正比。如果 SUnreclaim 持续单调增长，通常指向两类问题：一是内核模块（自研驱动、eBPF 程序等）分配了 kmalloc 内存但没有在合适的时机释放；二是某个内核子系统（比如网络 netfilter、连接追踪 nf_conntrack）的表项无限增长。dentry 属于 SReclaimable，不会溢出到 SUnreclaim（B 错）。用户态进程内存泄漏会体现在进程的 RSS 里，不影响内核 slab 统计（C 错）。Page Cache 是独立的统计类别（D 错）。"
+        },
+        {
+          "id": "slab-cache-memory-q10",
+          "question": "运行 echo 2 > /proc/sys/vm/drop_caches 后，系统在接下来几分钟内最可能出现什么现象？",
+          "choices": [
+            {"id": "A", "text": "文件路径解析缓存失效，磁盘 IO 和系统调用延迟短暂升高，直到 dentry 和 inode 缓存重新建立"},
+            {"id": "B", "text": "所有正在运行的进程因内存映射失效而崩溃"},
+            {"id": "C", "text": "系统进入 OOM 状态，开始强制杀死进程以释放内存"},
+            {"id": "D", "text": "没有任何可观测的变化，drop_caches 是异步操作，会在后台慢慢执行"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "drop_caches 执行后，内核立即丢弃所有缓存的 dentry（路径查找缓存）和 inode（文件元数据缓存）。接下来任何需要解析文件路径的操作——open()、stat()、readdir() 等系统调用——都需要重新从磁盘读取目录项和 inode 信息，这会导致明显的磁盘 IO 升高和系统调用延迟增加，在文件服务场景下这个影响可能持续几分钟甚至更长时间。进程不会崩溃（B 错），因为进程的内存映射（mmap）和匿名内存完全不受影响，drop_caches 只动内核缓存。drop_caches 也不会触发 OOM（C 错），它是在释放内存而不是消耗内存。drop_caches 是同步操作，执行完命令就立即生效（D 错）。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/vm/slub.html",
+        "https://www.kernel.org/doc/Documentation/sysctl/vm.txt",
+        "https://man7.org/linux/man-pages/man5/proc.5.html"
+      ]
+    }
+  ]
+}

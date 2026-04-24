@@ -1,0 +1,275 @@
+{
+  "id": "thread-pool-exhaustion",
+  "name": "线程池耗尽导致服务无响应",
+  "domain": "troubleshooting",
+  "description": "Java 线程池耗尽时的排查方法、根因分析与线程池参数调优策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "thread-pool-exhaustion-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["thread-pool", "java", "jvm", "concurrency", "performance"],
+      "title": "Java 服务出现 RejectedExecutionException，请求堆积响应超时，如何排查线程池耗尽问题？",
+      "content": "## 故障现场\n\n你在某电商平台担任后端工程师，大促期间凌晨 1 点告警轰炸：订单服务的 P99 响应时间从平时的 80ms 飙升到了 42 秒，部分请求直接报 500。监控大盘显示请求积压严重，但 CPU 占用只有 15%，内存也正常。\n\n翻开应用日志，充斥着这样的异常：\n\n```\n2024-01-15 01:23:45.891 ERROR [order-service] o.s.w.s.m.m.a.ExceptionHandlerExceptionResolver\njava.util.concurrent.RejectedExecutionException: Task java.util.concurrent.FutureTask@3f2a3f2a rejected from\njava.util.concurrent.ThreadPoolExecutor@1a2b3c4d[\n  Running, pool size = 200, active threads = 200,\n  queued tasks = 1000, completed tasks = 4821937\n]\n  at java.util.concurrent.ThreadPoolExecutor$AbortPolicy.rejectedExecution(ThreadPoolExecutor.java:2063)\n  at java.util.concurrent.ThreadPoolExecutor.reject(ThreadPoolExecutor.java:833)\n  at java.util.concurrent.ThreadPoolExecutor.execute(ThreadPoolExecutor.java:1365)\n  at com.example.order.service.OrderService.createOrder(OrderService.java:87)\n```\n\n日志里写得很清楚：线程池有 200 个线程全部 active，队列里还堆了 1000 个任务等待执行，新来的任务直接被 AbortPolicy 拒绝抛出异常。\n\n但问题来了：200 个线程都在忙什么？CPU 才 15%，说明线程并没有在做大量计算，它们很可能卡在某个 IO 等待上。下游的哪个接口变慢了？是数据库？还是第三方支付系统？或者是内部的 RPC 调用超时没有设置，导致线程长时间挂起？\n\n更关键的是：这个问题在测试环境从未复现，因为压测时下游服务都很健康，线程用完能快速归还线程池。但一到大促，支付回调接口响应从 50ms 退化到了 8 秒，200 个线程全部陷在等待支付系统响应上，新来的订单请求无线程可用。\n\n**请回答**：\n\n1. 如何通过 jstack 快速定位线程卡在哪个方法调用上？\n2. `RejectedExecutionException` 的触发条件是什么，ThreadPoolExecutor 的工作流程是什么？\n3. 这种「下游变慢拖垮线程池」的根因如何从机制层面理解，又如何从根本上防范？\n4. IO 密集型服务的线程池大小应该怎么配置，与 CPU 密集型有什么区别？",
+      "answer": "## 先搞清楚：线程池是怎么工作的\n\n在看排查步骤之前，必须先把 `ThreadPoolExecutor` 的工作流程刻在脑子里，否则你看到日志里的数字不知道意味着什么。Java 的 `ThreadPoolExecutor` 有五个核心参数：`corePoolSize`（核心线程数）、`maximumPoolSize`（最大线程数）、`keepAliveTime`（空闲线程存活时间）、`workQueue`（任务队列）和 `RejectedExecutionHandler`（拒绝策略）。\n\n它的工作流程不是「来一个任务就创建一个线程」，而是有严格的优先级顺序：当一个新任务提交进来，线程池首先检查当前运行的线程数是否少于 `corePoolSize`，如果是，就立即创建一个新的核心线程来执行任务，哪怕此时有空闲线程存在——这一点经常让人误解。只有当核心线程已满，新任务才会尝试进入 `workQueue` 排队。队列满了之后，如果当前线程数还没达到 `maximumPoolSize`，才会创建新的「非核心线程」来处理任务。等队列满了、线程数也到了上限，再来新任务，就触发拒绝策略。默认的 `AbortPolicy` 会直接抛 `RejectedExecutionException`，这正是故障现场看到的异常。\n\n理解这个流程有个反直觉的地方：`workQueue` 用的如果是 `LinkedBlockingQueue`（无界队列），那 `maximumPoolSize` 形同虚设——因为队列永远不会满，线程数永远不会超过 `corePoolSize`，而队列会无限堆积，直到 OOM。故障现场的日志显示队列里有 1000 个任务，说明用的是有界队列（比如 `ArrayBlockingQueue(1000)`），这其实是正确的配置，否则问题会更严重。\n\n## 第一步：用 jstack 找出线程卡在哪里\n\n`RejectedExecutionException` 本身只是结果，真正的问题是「200 个线程都在做什么、为什么不归还」。CPU 才 15% 这个关键信息说明线程根本不在 RUNNABLE 状态，它们大概率在等待某个锁或者 IO 响应。这时候 `jstack` 是最快的诊断工具。\n\n先找到 Java 进程 PID：\n\n```bash\n# 找 order-service 的进程 ID\njps -l | grep order-service\n# 或者\nps aux | grep java | grep order-service\n```\n\n然后抓线程 dump：\n\n```bash\n# -l 参数会同时输出锁信息，对排查死锁很重要\njstack -l 12345 > /tmp/thread-dump-$(date +%H%M%S).txt\n\n# 生产环境推荐连抓三次，间隔 5 秒，对比哪些线程一直没动\njstack -l 12345 > dump1.txt && sleep 5 && jstack -l 12345 > dump2.txt && sleep 5 && jstack -l 12345 > dump3.txt\n```\n\n真实的线程 dump 片段（这就是故障现场能看到的输出）：\n\n```\n\"pool-1-thread-47\" #89 prio=5 os_prio=0 tid=0x00007f8a1c0b4000 nid=0x2d3f waiting on condition [0x00007f89f4bfe000]\n   java.lang.Thread.State: TIMED_WAITING (parking)\n        at sun.misc.Unsafe.park(Native Method)\n        - parking to wait for  <0x00000007582a3210> (a java.util.concurrent.SynchronousQueue$TransferStack)\n        at java.util.concurrent.locks.LockSupport.parkNanos(LockSupport.java:215)\n        at java.util.concurrent.SynchronousQueue$TransferStack.awaitFulfill(SynchronousQueue.java:460)\n        at java.util.concurrent.SynchronousQueue$TransferStack.transfer(SynchronousQueue.java:362)\n        at java.util.concurrent.SynchronousQueue.poll(SynchronousQueue.java:941)\n        at org.apache.http.impl.conn.PoolingHttpClientConnectionManager.getConnection(PoolingHttpClientConnectionManager.java:269)\n        at com.example.order.client.PaymentClient.charge(PaymentClient.java:134)\n        at com.example.order.service.OrderService.createOrder(OrderService.java:91)\n\n\"pool-1-thread-112\" #154 prio=5 os_prio=0 tid=0x00007f8a1c1a2800 nid=0x2e1f in Object.wait() [0x00007f89f3afd000]\n   java.lang.Thread.State: TIMED_WAITING (on object monitor)\n        at java.lang.Object.wait(Native Method)\n        - waiting on <0x00000007581b4d30> (a java.net.SocksSocketImpl)\n        at java.net.SocksSocketImpl.connect(SocksSocketImpl.java:411)\n        at java.net.Socket.connect(Socket.java:589)\n        at com.example.order.client.PaymentClient.doPost(PaymentClient.java:198)\n        at com.example.order.client.PaymentClient.charge(PaymentClient.java:134)\n        at com.example.order.service.OrderService.createOrder(OrderService.java:91)\n```\n\n看到了吗？线程 47 卡在等 HTTP 连接池里取连接（`SynchronousQueue.poll`），线程 112 卡在 socket 的 `connect` 等待上。两个都指向同一个地方：`PaymentClient.charge`，支付系统。\n\n快速统计各状态线程数量，可以用这几个命令：\n\n```bash\n# 统计各状态线程数\ngrep 'java.lang.Thread.State:' dump1.txt | sort | uniq -c | sort -rn\n\n# 输出示例：\n#   187 java.lang.Thread.State: TIMED_WAITING (on object monitor)\n#    11 java.lang.Thread.State: TIMED_WAITING (parking)\n#     2 java.lang.Thread.State: RUNNABLE\n#     1 java.lang.Thread.State: WAITING (on object monitor)\n\n# 找出阻塞在哪个调用栈上最多\ngrep -A 20 'TIMED_WAITING' dump1.txt | grep 'at com.example' | sort | uniq -c | sort -rn | head -20\n```\n\n187 个线程处于 TIMED_WAITING，几乎全在等支付系统响应。根因找到了。\n\n## 第二步：理解根因——下游变慢如何雪崩成线程池耗尽\n\n很多人会说「超时没设置」是问题所在，但这只是表面。要真正理解这个问题，需要从服务调用链的角度来看。\n\n假设线程池有 200 个线程，平时支付接口 50ms 返回，那每个线程一次请求从开始到归还线程池大约需要 80ms（含业务逻辑），单位时间内线程池能处理 200 ÷ 0.08s ≈ 2500 QPS。现在大促期间支付接口退化到 8 秒才响应，同样 200 个线程，处理能力直接降到 200 ÷ 8s = 25 QPS。但是上游的流量却因为大促增加到了 500 QPS，进来的速度远大于处理速度，线程全部被占用，队列积满，开始拒绝请求。这就是级联雪崩（cascading failure）的经典模型。\n\n更糟糕的是，被拒绝的请求如果上游有重试逻辑，重试反而加剧了积压，形成正反馈循环——系统越慢，积压越多，越慢，最终彻底无响应。\n\n这就是为什么生产环境一定要为所有外部调用设置合理的超时时间。以 Apache HttpClient 为例，需要同时设置三个超时：\n\n```java\nRequestConfig config = RequestConfig.custom()\n    // 从连接池取连接的等待超时，防止连接池耗尽时无限阻塞\n    .setConnectionRequestTimeout(200)\n    // TCP 连接建立的超时（三次握手），防止网络故障时卡死\n    .setConnectTimeout(500)\n    // 等待服务器响应数据的超时，这是最关键的，要根据下游 SLA 设置\n    .setSocketTimeout(3000)\n    .build();\n```\n\n很多人只设置了 `socketTimeout`，忘了 `connectionRequestTimeout`。当 HTTP 连接池本身耗尽（`maxTotal` 用完）时，线程会卡在等连接池还连接上，而不是等网络响应，这时候 `socketTimeout` 根本不起作用。\n\n## 第三步：线程池大小怎么配，IO 密集型和 CPU 密集型的区别\n\n确定了根因后，另一个绕不过去的问题是：线程池到底应该配多大？\n\n这要从 CPU 的工作方式说起。CPU 核心数决定了真正的并行度，假设服务器有 16 个核。对于 **CPU 密集型**任务（比如图片处理、加密计算），线程在执行期间几乎不会主动放弃 CPU，每个线程都在持续消耗 CPU 时钟。这种情况下线程池开太大是有害的：超过 CPU 核心数的线程会频繁进行上下文切换（context switch），每次切换都需要保存和恢复寄存器状态，反而浪费 CPU 时间。CPU 密集型的经典配置是 `corePoolSize = CPU核心数 + 1`，那个 +1 是为了当某个线程偶尔因缺页中断等原因暂停时，有备用线程顶上。\n\n对于 **IO 密集型**任务（数据库查询、HTTP 调用、文件读写），线程在等待 IO 响应期间会进入 WAITING 或 TIMED_WAITING 状态，主动释放 CPU。这段时间 CPU 是空闲的，完全可以让其他线程使用。所以 IO 密集型服务可以配置更多线程，经验公式是：\n\n```\ncorePoolSize = CPU核心数 × (1 + 平均IO等待时间 / 平均CPU计算时间)\n```\n\n如果一个请求平均耗时 100ms，其中 90ms 在等数据库响应（IO），10ms 在处理数据（CPU），那 IO 等待比例是 9，16 核机器的理论最优线程数是 `16 × (1 + 9) = 160`。实际配置时会在这个数字基础上做压测验证，因为线程本身也占内存（每个 Java 线程默认栈大小 512KB 到 1MB），开 1000 个线程光栈内存就 1GB 了。\n\n## 扩展：更现代的线程模型与防雪崩机制\n\n理解了 ThreadPoolExecutor 的局限，就能理解为什么 Netty 和响应式编程会出现。\n\n**Tomcat vs Netty 的线程模型**：传统 Tomcat 是每个请求一个线程（BIO 模型，虽然现在默认是 NIO，但仍然是 thread-per-request 思路），线程数直接决定并发能力。Netty 的 Reactor 模型把 IO 事件处理和业务逻辑分离：少量 IO 线程（通常等于 CPU 核心数）负责监听 `epoll` 事件和读写 socket，业务线程池只处理实际的业务逻辑。这样即使业务线程池被打满，IO 线程仍然能正常接收新连接，只是新请求无法立即处理，而不是连接都无法建立。\n\n**响应式编程（WebFlux/Project Reactor）**的本质是：把「等待 IO」这个行为从「线程阻塞等待」改成「注册回调，IO 完成后触发」。一个线程不再死等支付系统响应，而是发出 HTTP 请求后立刻去干别的事，等支付系统响应回来时再继续执行后续逻辑。这样少量线程就能处理大量并发 IO，从根本上避免线程池耗尽问题。但响应式编程有很高的心智负担，调试 dump 也更复杂，不是银弹。\n\n**线程池隔离**是另一个重要的生产实践。如果订单服务里所有的外部调用（支付、库存、物流）都共用一个线程池，支付系统变慢就会耗尽整个线程池，导致库存和物流接口也无法调用。正确的做法是为不同下游服务建立独立的线程池：\n\n```java\n// 支付线程池：最大 50 个线程，超时快速失败\nExecutorService paymentPool = new ThreadPoolExecutor(\n    20, 50, 60, TimeUnit.SECONDS,\n    new ArrayBlockingQueue<>(200),\n    new ThreadPoolExecutor.CallerRunsPolicy() // 或自定义降级逻辑\n);\n\n// 库存线程池：独立，不受支付系统影响\nExecutorService inventoryPool = new ThreadPoolExecutor(\n    10, 30, 60, TimeUnit.SECONDS,\n    new ArrayBlockingQueue<>(100),\n    new ThreadPoolExecutor.AbortPolicy()\n);\n```\n\n这就是 Hystrix/Resilience4j 线程池隔离的核心思路：为每个下游依赖设置资源上限，一个依赖出问题最多耗尽它自己的那个小线程池，不影响其他依赖。Resilience4j 的 `ThreadPoolBulkhead` 可以声明式地配置这套机制，比手写 `ThreadPoolExecutor` 更安全。\n\n**监控指标**方面，生产环境至少要监控这几个值（Micrometer + Prometheus 可以直接暴露）：活跃线程数（`active_count`）、队列长度（`queue_size`）、历史拒绝任务数（`rejected_task_count`）、已完成任务数（`completed_task_count`）。当 `active_count / maximumPoolSize > 0.8` 持续 30 秒，就应该触发告警，而不是等到请求开始被拒绝才发现问题。",
+      "keyPoints": [
+        "ThreadPoolExecutor 的任务提交优先级是：核心线程 → 任务队列 → 非核心线程 → 拒绝策略，当使用无界 LinkedBlockingQueue 时 maximumPoolSize 形同虚设，队列会无限堆积直至 OOM。",
+        "jstack -l PID 是定位线程阻塞根因的最快手段，连抓三次对比可以确认哪些线程长期停在同一调用栈，CPU 利用率低但线程全 TIMED_WAITING 是 IO 等待的典型特征。",
+        "下游服务变慢导致线程池耗尽的雪崩机制：线程持有时间从 80ms 延长到 8s，处理能力从 2500 QPS 骤降至 25 QPS，积压触发拒绝策略，上游重试加剧积压，形成不可逆的正反馈崩溃。",
+        "Apache HttpClient 必须同时配置三个超时：connectionRequestTimeout（从连接池取连接的等待超时）、connectTimeout（TCP 连接建立超时）、socketTimeout（等待响应数据超时），遗漏任何一个都可能导致线程在特定故障模式下永久阻塞。",
+        "IO 密集型服务的最优线程数理论公式为 CPU核心数 × (1 + IO等待时间/CPU计算时间)，而 CPU 密集型只需 CPU核心数 + 1，盲目增大线程数反而因上下文切换开销降低吞吐。",
+        "线程池隔离（Bulkhead 模式）是防止级联雪崩的关键：为每个下游依赖配置独立的线程池和超时策略，一个依赖故障最多耗尽该依赖专属的线程池，其他调用链路不受影响。",
+        "响应式编程（WebFlux/Reactor）通过非阻塞 IO 回调机制从根本上消除了等待 IO 时占用线程的问题，少量线程即可支撑大量并发 IO，但调试复杂度显著提升，适合 IO 密集且对延迟敏感的场景。"
+      ],
+      "quiz": [
+        {
+          "id": "thread-pool-exhaustion-q1",
+          "question": "ThreadPoolExecutor 收到新任务时，以下哪个描述正确地反映了它的处理优先级顺序？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "优先放入工作队列，队列满了才创建新线程，线程数到 maximumPoolSize 再触发拒绝策略"
+            },
+            {
+              "id": "B",
+              "text": "优先创建核心线程，核心线程满了才入队，队列满了再创建非核心线程，非核心线程也满才触发拒绝"
+            },
+            {
+              "id": "C",
+              "text": "优先使用空闲线程，没有空闲线程才创建新线程，线程数到上限才入队"
+            },
+            {
+              "id": "D",
+              "text": "优先创建线程直到 maximumPoolSize，然后才开始排队，队列满了触发拒绝策略"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 是正确的，也是最容易背错的知识点。核心线程优先于队列——即使有空闲的核心线程，只要当前运行线程数低于 corePoolSize，新任务也会触发创建新线程。A 是很常见的误解，很多人以为线程池会先尽量复用队列缓冲，但实际上核心线程数未满时会直接新建线程。C 完全错误，Java 线程池不会优先复用空闲线程来让核心线程数「停在低位」。D 也错，非核心线程（maximumPoolSize - corePoolSize 的部分）只在队列满后才创建，而不是一开始就占满所有线程数。"
+        },
+        {
+          "id": "thread-pool-exhaustion-q2",
+          "question": "以下哪种 workQueue 配置会使 maximumPoolSize 参数实际上没有任何效果？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "new ArrayBlockingQueue<>(1000)"
+            },
+            {
+              "id": "B",
+              "text": "new LinkedBlockingQueue<>()"
+            },
+            {
+              "id": "C",
+              "text": "new SynchronousQueue<>()"
+            },
+            {
+              "id": "D",
+              "text": "new PriorityBlockingQueue<>()"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`LinkedBlockingQueue` 无参构造函数创建的是容量为 `Integer.MAX_VALUE` 的无界队列，在实践中等同于无限容量。因为 maximumPoolSize 的非核心线程只有在队列满了才会创建，无界队列永远不会满，所以线程数永远不会超过 corePoolSize，maximumPoolSize 形同虚设。这是一个极危险的配置，流量高峰时队列可以堆积数百万任务，直到 OOM。`ArrayBlockingQueue` 有明确上限是正确做法，`SynchronousQueue` 容量为零，每个提交的任务必须立即有线程接收，反而会激进地创建到 maximumPoolSize，这也有其适用场景。"
+        },
+        {
+          "id": "thread-pool-exhaustion-q3",
+          "question": "用 jstack 抓到的线程 dump 中，200 个线程几乎全部显示为 `TIMED_WAITING (on object monitor)`，同时 CPU 使用率只有 10%，这最可能说明什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "发生了死锁，所有线程互相等待对方持有的锁"
+            },
+            {
+              "id": "B",
+              "text": "线程正在等待 IO 响应（如数据库查询、HTTP 调用），CPU 空闲但线程被占用"
+            },
+            {
+              "id": "C",
+              "text": "GC 频繁触发 STW，线程被暂停"
+            },
+            {
+              "id": "D",
+              "text": "线程池配置了 keepAliveTime，空闲线程在等待新任务超时退出"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "CPU 低但线程全部 TIMED_WAITING 是 IO 等待的经典特征。线程在等待 socket 响应、数据库返回结果、或 `Object.wait(timeout)` 时都会进入这个状态，它们不消耗 CPU 时钟，但占着线程不释放。死锁（A）通常表现为 BLOCKED 状态（等待获取 monitor 锁），而非 TIMED_WAITING；GC STW（C）会让所有线程短暂暂停但不会在 dump 里显示为 TIMED_WAITING；空闲线程等超时（D）同样是 TIMED_WAITING，但此时 active threads 应该是低的，而不是全部 200 个都活跃——根据日志 `active threads = 200` 可以排除这种情况。"
+        },
+        {
+          "id": "thread-pool-exhaustion-q4",
+          "question": "Apache HttpClient 使用 `PoolingHttpClientConnectionManager` 时，以下哪个超时参数的缺失会导致：当 HTTP 连接池自身的连接数耗尽时，请求线程永久阻塞？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "socketTimeout（等待响应数据超时）"
+            },
+            {
+              "id": "B",
+              "text": "connectTimeout（TCP 连接建立超时）"
+            },
+            {
+              "id": "C",
+              "text": "connectionRequestTimeout（从连接池获取连接的等待超时）"
+            },
+            {
+              "id": "D",
+              "text": "readTimeout（读取响应 body 超时）"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "`connectionRequestTimeout` 控制的是「从 HTTP 连接池中取出一个可用连接」这个步骤的等待时间。当连接池的 `maxTotal` 个连接全部被占用时，新来的请求线程会在连接池的内部队列里等待。如果没有设置这个超时（默认值为 -1，即无限等待），线程会永远等在取连接这一步，`socketTimeout` 完全派不上用场——因为还没建立连接，谈不上等响应数据。这是非常隐蔽的坑，症状上看起来像服务无响应但其实是连接池打满了。生产环境建议设置为 200-500ms，快速失败。"
+        },
+        {
+          "id": "thread-pool-exhaustion-q5",
+          "question": "以下 jstack 片段中，该线程最可能正在等待什么？\n\n```\n\"pool-1-thread-47\" #89 prio=5 os_prio=0 tid=0x00007f8a1c0b4000 nid=0x2d3f waiting on condition\n   java.lang.Thread.State: TIMED_WAITING (parking)\n        at sun.misc.Unsafe.park(Native Method)\n        at java.util.concurrent.locks.LockSupport.parkNanos(...)\n        at java.util.concurrent.SynchronousQueue$TransferStack.awaitFulfill(...)\n        at org.apache.http.impl.conn.PoolingHttpClientConnectionManager.getConnection(...)\n        at com.example.order.client.PaymentClient.charge(PaymentClient.java:134)\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "等待支付服务的 HTTP 响应数据返回"
+            },
+            {
+              "id": "B",
+              "text": "等待从 HTTP 连接池中获取一个可用的连接"
+            },
+            {
+              "id": "C",
+              "text": "等待 TCP 三次握手完成建立连接"
+            },
+            {
+              "id": "D",
+              "text": "等待 DNS 解析支付服务域名"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "调用栈从底到顶读：最深的 `SynchronousQueue$TransferStack.awaitFulfill` 是在等一个 `SynchronousQueue` 的 transfer 操作完成；它被 `PoolingHttpClientConnectionManager.getConnection` 调用——这个方法内部正是用一个类似 SynchronousQueue 的结构来协调连接的借出和归还。整个栈的含义是：线程调用了 `PaymentClient.charge`，内部尝试从 HTTP 连接池拿一个连接，但连接池已满，所以线程卡在 `parkNanos` 这个阻塞点上等待别的线程还连接回来。如果是等 HTTP 响应（A），调用栈应该会看到 `socket.read` 或 `SocketInputStream.read`；TCP 连接建立（C）会看到 `Socket.connect`；DNS 解析（D）会看到 `InetAddress.getByName`。"
+        },
+        {
+          "id": "thread-pool-exhaustion-q6",
+          "question": "一个 Java 服务配置了 `corePoolSize=50, maximumPoolSize=200, workQueue=new LinkedBlockingQueue<>()`，压测时发现即使 QPS 很高，线程数始终停在 50，从不增加到 200，这是为什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "maximumPoolSize 配置不生效，需要重启服务才能生效"
+            },
+            {
+              "id": "B",
+              "text": "LinkedBlockingQueue 无界，队列永远不会满，所以永远不会触发创建非核心线程的条件"
+            },
+            {
+              "id": "C",
+              "text": "JVM 限制了单个线程池的最大线程数为 corePoolSize 的两倍"
+            },
+            {
+              "id": "D",
+              "text": "workQueue 需要设置 fair=true 才能允许创建非核心线程"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 ThreadPoolExecutor 最著名的「无界队列陷阱」。非核心线程（corePoolSize 到 maximumPoolSize 之间的那部分线程）只有在 workQueue 放不下任务时才会被创建。`new LinkedBlockingQueue<>()` 不传容量参数，默认容量是 `Integer.MAX_VALUE`（约 21 亿），在实践中等同于无限容量。任务永远能入队，队列永远不满，maximumPoolSize 永远用不上，线程数永远不超过 corePoolSize。这个配置的危险在于：流量高峰时队列无限膨胀，最终导致 OOM 而不是快速失败。正确做法是用 `new ArrayBlockingQueue<>(有界容量)` 配合合适的拒绝策略。"
+        },
+        {
+          "id": "thread-pool-exhaustion-q7",
+          "question": "同样是 16 核服务器，以下哪种场景应该配置更多的线程数？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "图片压缩服务：每个请求需要对图片做 JPEG 编解码，CPU 密集计算，几乎无 IO 等待"
+            },
+            {
+              "id": "B",
+              "text": "订单聚合服务：每个请求需要串行调用 5 个微服务（数据库、库存、支付等），每个调用平均等待 100ms"
+            },
+            {
+              "id": "C",
+              "text": "两者应该配置相同数量的线程，都等于 CPU 核心数"
+            },
+            {
+              "id": "D",
+              "text": "取决于内存大小，与 CPU 核心数无关"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "订单聚合服务（B）应该配置更多线程。IO 密集型任务的线程在等待网络响应时主动释放 CPU，CPU 可以同时运行更多线程而不造成竞争。按公式 `16 × (1 + IO等待时间/CPU计算时间)`，如果每个请求 95% 时间在等待 IO，线程数可以配到 `16 × (1 + 19) ≈ 320`。图片压缩（A）是纯 CPU 型任务，线程多了只会增加上下文切换开销，反而降低吞吐，配 `16 + 1 = 17` 就够了。C 和 D 都不对：CPU 核心数确实是重要基准，但 IO 等待比例决定了可以超配多少倍；内存决定线程数的上限（每线程 ~512KB-1MB），但不是配置的主要依据。"
+        },
+        {
+          "id": "thread-pool-exhaustion-q8",
+          "question": "生产环境订单服务调用了支付、库存、物流三个下游服务，共用一个 200 线程的线程池。某天物流系统故障，接口响应时间从 100ms 变成 30 秒，以下哪个后果最可能发生？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "只有涉及物流查询的请求变慢，支付和库存请求不受影响"
+            },
+            {
+              "id": "B",
+              "text": "物流接口的线程耗尽整个共享线程池，导致支付和库存请求也无法处理，服务完全不可用"
+            },
+            {
+              "id": "C",
+              "text": "线程池自动熔断对物流的调用，支付和库存正常处理"
+            },
+            {
+              "id": "D",
+              "text": "JVM 检测到线程阻塞自动扩展线程池上限"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这就是共享线程池下级联雪崩的经典场景。物流接口从 100ms 变成 30 秒，每个调用物流的线程持有时间增加 300 倍，很快 200 个线程全被物流请求占满。此时即使支付请求和库存请求完全正常，它们也无线程可用，整个服务对外表现为完全不可用。线程池没有「自动熔断」能力（C），熔断需要 Hystrix/Resilience4j 等库来实现；JVM 也不会自动扩展线程池（D），这些都是应用层配置。解决方案是线程池隔离：给物流、支付、库存分别设置独立的小线程池，物流故障最多耗尽物流专属的 30 个线程，支付和库存的 70 个线程仍然正常工作。"
+        },
+        {
+          "id": "thread-pool-exhaustion-q9",
+          "question": "Resilience4j 的 `ThreadPoolBulkhead` 与 `Semaphore Bulkhead` 的核心区别是什么？什么场景下应该用线程池隔离而不是信号量隔离？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "ThreadPoolBulkhead 限制并发数，Semaphore Bulkhead 限制线程数，两者等价"
+            },
+            {
+              "id": "B",
+              "text": "ThreadPoolBulkhead 在独立线程池中执行调用（可超时取消），适合调用阻塞型下游；Semaphore Bulkhead 在调用线程上执行只限制并发数，适合非阻塞或快速失败场景"
+            },
+            {
+              "id": "C",
+              "text": "ThreadPoolBulkhead 只支持同步调用，Semaphore Bulkhead 只支持异步调用"
+            },
+            {
+              "id": "D",
+              "text": "两者功能完全相同，ThreadPoolBulkhead 只是 Semaphore Bulkhead 的线程安全版本"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Resilience4j 两种 Bulkhead 最本质的区别。`ThreadPoolBulkhead` 把实际调用提交到一个独立线程池，主调线程不阻塞，而是拿到一个 `CompletableFuture`；这样即使下游阻塞，占用的是独立线程池的资源，不影响主线程池，还能配置超时让 Future 提前取消。`SemaphoreBulkhead` 只是在调用线程上用信号量限制并发数，调用线程本身是阻塞的，下游阻塞时仍然占用着调用线程。信号量隔离开销更小，适合响应式场景或非阻塞 IO；线程池隔离开销更大（线程切换），但隔离性更彻底，适合调用传统阻塞型服务（JDBC、同步 HTTP 客户端）的场景。"
+        },
+        {
+          "id": "thread-pool-exhaustion-q10",
+          "question": "以下 ThreadPoolExecutor 的监控指标中，哪个指标触发告警的时机应该最早（即出现最轻微的问题就应告警），以便在 RejectedExecutionException 出现前就能干预？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "completedTaskCount 增长速度下降超过 50%"
+            },
+            {
+              "id": "B",
+              "text": "rejectedTaskCount > 0（已经有任务被拒绝）"
+            },
+            {
+              "id": "C",
+              "text": "activeCount / maximumPoolSize > 0.8 并持续超过 30 秒"
+            },
+            {
+              "id": "D",
+              "text": "queueSize > 0（队列中出现等待任务）"
+            }
+          ],
+          "correctAnswer": "C",
+          "explanation": "C 是最具预警价值的指标。当活跃线程数达到最大线程数的 80% 并持续超过 30 秒，说明线程池已经进入高负载状态，有明显的耗尽风险，但还没到崩溃边缘，此时干预（比如切流量、降级非核心功能）还来得及。B 是最差的时机——任务已经开始被拒绝，服务已经出现错误，只能救火而不是预警。D 过于敏感，正常流量下队列偶尔有任务等待是完全正常的，频繁告警会产生大量噪音。A 是事后分析指标，有一定滞后性，适合做趋势分析而非实时告警。生产实践中一般同时配置：queueSize > 容量 50% 触发 warning，activeCount/maximumPoolSize > 80% 触发 critical，rejectedTaskCount > 0 触发 emergency。"
+        }
+      ],
+      "references": [
+        "https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/concurrent/ThreadPoolExecutor.html",
+        "https://resilience4j.readme.io/docs/bulkhead",
+        "https://hc.apache.org/httpcomponents-client-5.4.x/current/httpclient5/apidocs/org/apache/hc/client5/http/config/RequestConfig.html"
+      ]
+    }
+  ]
+}
