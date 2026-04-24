@@ -1,0 +1,157 @@
+{
+  "id": "monitoring-q84",
+  "name": "链路追踪性能开销评估与控制",
+  "domain": "monitoring",
+  "description": "评估和控制分布式链路追踪对应用性能的影响，涵盖开销来源、采样策略、异步导出和生产调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q84",
+      "domain": "monitoring",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["distributed-tracing", "OpenTelemetry", "sampling", "performance", "overhead", "OTel", "Jaeger", "Tempo"],
+      "title": "链路追踪对应用性能的影响如何评估和控制？",
+      "content": "你的团队正在为一套核心交易服务接入 OpenTelemetry 链路追踪，技术栈是 Go 1.22，使用 OTel Go SDK v1.26，Collector 部署在同机房，后端存储是 Grafana Tempo。服务当前 QPS 约 8000，P99 延迟 12ms，对延迟极为敏感（SLA 要求 P99 ≤ 20ms）。\n\n接入前，有工程师在压测环境以 100% 采样率跑了一轮基准测试，结果不太乐观：\n\n```\n# wrk 压测结果对比（并发 200，持续 60s）\n\n## 未接入 OTel\nRequests/sec:  9842.3\nLatency P50:   8.1ms\nLatency P99:  11.4ms\nLatency P999: 18.2ms\n\n## 接入 OTel（100% 采样，sync HTTP exporter）\nRequests/sec:  7103.1  (-27.8%)\nLatency P50:  10.6ms\nLatency P99:  31.2ms   (+173%)\nLatency P999: 89.4ms\n```\n\nP99 直接翻了近 3 倍，吞吐量下降近 28%。这个数字让团队负责人直接叫停了上线计划。现在问题落到你的桌上：这些开销从哪里来？压测数据反映的是真实生产场景吗？如何在保留足够可观测性的前提下，把追踪开销控制在可接受范围内，让 P99 不超过 SLA 红线？\n\n另外，团队里有人提出「既然追踪太贵，干脆采样率设成 0.1% 算了」，但 SRE 负责人反对，认为这样会漏掉大量慢请求。你怎么看这个分歧？评估和控制追踪开销，需要系统性地从哪几个维度入手？",
+      "answer": "## 第一步：先搞清楚链路追踪是什么，以及它的开销从哪里产生\n\n分布式链路追踪（Distributed Tracing）解决的是微服务时代最痛的一个问题：一个请求穿越了 10 个服务，出问题了你不知道慢在哪里。链路追踪的核心抽象是 Span——每个服务处理请求的一段时间对应一个 Span，多个 Span 通过 TraceID 串联成一棵 Trace 树，完整还原请求的调用链路和各段耗时。\n\nOpenTelemetry（OTel）是目前业界最主流的可观测性标准框架，由 OpenCensus 和 OpenTracing 合并演化而来。它的架构分三层：SDK（嵌在应用进程里，负责创建和缓冲 Span）、Collector（独立进程，负责接收、处理和转发遥测数据）、后端存储（Jaeger、Tempo、Zipkin 等）。理解这三层的位置，是分析开销来源的前提。\n\n**追踪的开销来自三个位置，很多人只看到了其中一个。**\n\n第一个是应用进程内部的 CPU 开销。每创建一个 Span，SDK 需要：调用 `time.Now()` 两次（记录开始和结束时间）、生成 128bit 的 TraceID 和 64bit 的 SpanID（涉及随机数生成）、分配 Span 结构体的堆内存、序列化 Span 属性（key-value 对）。在 OTel Go SDK v1.26 上，单个 Span 的 CPU 开销大约在 2-5 微秒之间，内存约 1-3KB（含属性）。8000 QPS 的服务如果每个请求平均有 5 个 Span，每秒就要创建 4 万个 Span，带来的 CPU 开销约为 80-200ms/s，换算成 CPU 利用率大概是 2-4 个百分点。这个数字看起来不大，但会导致 GC 压力升高——更多的堆分配意味着更频繁的 GC，而 Go 的 GC 停顿会直接打宽 P99 延迟。\n\n第二个是上下文传播的内存开销。TraceID 需要通过 HTTP Header（`traceparent`）或 gRPC Metadata 在服务间传递，每次 HTTP 请求会多出约 100-200 字节的 Header。对于调用链很深的服务，这个开销基本可以忽略不计，但如果你在 Span 上打了过多的 Attribute（比如把整个 request body 序列化成 Span 属性），内存开销会急剧膨胀，单个 Span 可以轻松超过 50KB。这是「Span Attribute 滥用」导致的典型问题。\n\n**第三个才是压测数据里那个 +173% P99 的真正元凶：同步阻塞导出。** 压测配置用的是 `sync HTTP exporter`，这意味着每个请求在结束时，主 goroutine 会同步等待 Span 通过 HTTP POST 发送到 Collector，然后才返回响应。Collector 的处理延迟加上网络 RTT 大概在 5-20ms，这个延迟被直接叠加到了每个请求的 P99 上。这不是「追踪本来就这么贵」，这是一个配置错误——生产环境绝对不应该使用同步导出器。\n\n## 第二步：系统性地控制追踪开销\n\n### 首要修复：切换到异步批量导出器\n\n把 exporter 从 `sdktrace.NewSimpleSpanProcessor`（同步，每个 Span 立刻发送）换成 `sdktrace.NewBatchSpanProcessor`（异步批量）是最高优先级的改动，没有之一。Batch Processor 会把 Span 缓冲在内存队列里，后台 goroutine 定时批量发送，不阻塞请求主路径。\n\n```go\n// ❌ 生产环境禁止使用 SimpleSpanProcessor\ntp := sdktrace.NewTracerProvider(\n    sdktrace.WithSyncer(exporter), // 同步导出，直接打宽 P99\n)\n\n// ✅ 正确姿势：BatchSpanProcessor + 调优参数\nbsp := sdktrace.NewBatchSpanProcessor(\n    exporter,\n    sdktrace.WithMaxQueueSize(4096),      // 队列最大 Span 数，防止内存爆炸\n    sdktrace.WithMaxExportBatchSize(512), // 每批最多 512 个 Span\n    sdktrace.WithBatchTimeout(5*time.Second), // 最多等 5 秒就强制发送\n    sdktrace.WithExportTimeout(30*time.Second),\n)\ntp := sdktrace.NewTracerProvider(\n    sdktrace.WithBatcher(exporter),\n    sdktrace.WithSpanProcessor(bsp),\n)\n```\n\n切换后，追踪的端到端导出延迟完全脱离请求主路径，P99 的影响基本回到只剩 Span 创建本身的 CPU 开销（约 0.5-2ms 量级），而不是之前的 20-30ms。\n\n### 采样率：不是越高越好，但也不能盲目压低\n\n现在来正面回应「采样率降到 0.1% 就完事了」这个方案的问题。0.1% 的采样意味着 8000 QPS 下每秒只保留 8 个 Trace，慢请求发生时大概率没有被采到，排查问题的时候你手里根本没有证据。这是「丢了可观测性换来了廉价性能」的错误取舍。\n\n正确的做法是**基于头部采样（Head-based Sampling）+ 尾部采样（Tail-based Sampling）的组合策略**。\n\n头部采样在请求入口处决定是否追踪，实现最简单，开销最低，但没法根据请求结果决策，会漏掉低概率的慢请求。适合高 QPS 的正常路径：对于 8000 QPS 的服务，可以设 1-5% 的头部采样率，每秒采集 80-400 个正常 Trace，已经足够分析热路径性能。\n\n尾部采样（Tail-based Sampling）在请求结束后，根据 Trace 的实际结果决定是否保留——比如「所有 latency > 500ms 的 Trace 100% 保留」「所有包含 error Span 的 Trace 100% 保留」。这需要 OTel Collector 的 `tail_sampling` processor 支持，Collector 需要缓冲一个窗口内的所有 Span，等 Trace 完整后再做决策。\n\n```yaml\n# otel-collector-config.yaml\nprocessors:\n  tail_sampling:\n    decision_wait: 10s          # 等待 Trace 完整的超时时间\n    num_traces: 50000           # Collector 内存中最多缓冲多少 Trace\n    expected_new_traces_per_sec: 1000\n    policies:\n      - name: keep-errors       # 规则1：所有 error Trace 全保留\n        type: status_code\n        status_code: {status_codes: [ERROR]}\n      - name: keep-slow         # 规则2：P95 以上的慢 Trace 全保留\n        type: latency\n        latency: {threshold_ms: 200}\n      - name: probabilistic-rest # 规则3：其余正常请求 2% 采样\n        type: probabilistic\n        probabilistic: {sampling_percentage: 2}\n  memory_limiter:              # 防止 Collector OOM\n    check_interval: 1s\n    limit_mib: 1024\n    spike_limit_mib: 256\n```\n\n这套策略下，你不会漏掉任何一个慢请求或错误请求，同时正常请求只保留 2%，总体数据量大幅缩减。\n\n### Span Attribute 的基数爆炸问题\n\n有一个生产中非常常见的坑：工程师为了「追踪更完整」，在 Span 上加了用户 ID、订单 ID 这类高基数（High Cardinality）的 Attribute，结果 Tempo/Jaeger 的索引急剧膨胀，Collector 内存暴涨，最终 OOM。\n\nOTel Semantic Conventions 对 Attribute 有明确的指导：`http.method`、`http.status_code`、`db.system` 这类低基数的属性随便加；`user.id`、`order.id` 这类高基数属性不要加到 Span Attribute 里——如果需要，通过 Span Event（记录在 Span 的 log 里）或者关联 Log 来携带。每个 Span 的 Attribute 控制在 10 个以内，每个 value 的字符串长度不超过 256 字节。\n\n### 用 profiling 找到真正的热点插桩\n\n不是每个函数都值得插桩。用 Go pprof 定位 CPU 和内存热点，然后只在真正重要的路径上创建 Span。比如一个循环里每次迭代都创建 Span——这是典型的过度插桩，应该合并成一个 Span 记录整个循环的聚合耗时。\n\n```bash\n# 对比插桩前后的 pprof CPU profile\ngo tool pprof -http=:8080 http://localhost:6060/debug/pprof/profile?seconds=30\n# 查找 otel 相关函数的 flat/cum 占比\n# 如果 go.opentelemetry.io/otel 相关函数占 CPU > 5%，说明过度插桩\n```\n\n## 第三步：生产落地的完整建议\n\n经过上述调优，我们在压测环境复现的结果通常是这样的：切换 Batch Exporter + 头部 2% 采样 + 尾部捞慢请求，CPU 开销降至 1% 以内，P99 延迟增量 ≤ 1ms，完全在 SLA 预算内。OTel Go SDK 官方 benchmark 数据：100% 采样 + Batch Exporter 下，CPU overhead 约 1-5%（取决于 Span 密度和 Attribute 数量）；5% 采样下降至 0.1-0.3%。\n\n生产环境推荐配置清单：Batch Exporter 替代 Simple Exporter（P99 影响从 20ms 降到 < 1ms）；高 QPS 核心服务采样率设 1-5%，搭配尾部采样兜底慢请求和错误请求；Collector 侧启用 `memory_limiter` 防 OOM，`batch` processor 合并小批次减少网络往返；Span Attribute 控制在 10 个以内，严禁高基数值；每季度 review 一次插桩密度，用 pprof 确认追踪开销占比未超过 3%。\n\n最后一个值得关注的细节：在 Kubernetes 环境里，Collector 的 DaemonSet 部署（每个节点一个 Collector Pod）比 Deployment 部署（集中式 Collector）的延迟更低，因为 SDK 到 Collector 的通信是本机 loopback，而不是跨节点网络，这可以让 Batch Exporter 的队列刷新延迟从 5-10ms 降到 < 1ms。",
+      "keyPoints": [
+        "同步导出器（SimpleSpanProcessor）是最常见的性能杀手，它让每个请求同步等待 Span 发送到 Collector，直接将 Collector 网络延迟（5-20ms）叠加到 P99；生产环境必须用 BatchSpanProcessor 异步导出",
+        "OTel Go SDK 在 100% 采样 + Batch Exporter 下的 CPU overhead 约 1-5%，采样率降到 5% 后降至 0.1-0.3%；压测中 -27% 吞吐量的根因是同步导出阻塞，而非 Span 创建本身",
+        "盲目压低采样率（如 0.1%）会导致漏掉低概率的慢请求和错误，正确策略是头部采样（1-10% 正常请求）+ 尾部采样（100% 保留 error 和高延迟 Trace）组合使用",
+        "Span Attribute 高基数爆炸（如将 user_id、order_id 作为 Attribute）会导致 Collector 内存暴涨和后端索引膨胀；高基数数据应通过 Span Event 或关联 Log 携带，每个 Span 的 Attribute 控制在 10 个以内",
+        "Collector 侧的 memory_limiter processor 是防止追踪数据洪峰打垮 Collector 导致 OOM 的关键保险，需要设置合理的 limit_mib 和 spike_limit_mib",
+        "用 go pprof 定位 otel 相关函数的 CPU 占比，如超过 5% 说明过度插桩，应合并循环内重复创建的 Span，只在关键路径插桩",
+        "Kubernetes 环境下 Collector 以 DaemonSet 部署（每节点一个），SDK 到 Collector 走 loopback 而非跨节点网络，可将 Batch Exporter 的导出延迟从 5-10ms 降至 1ms 以内"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q84-q1",
+          "question": "在 OTel Go SDK 中，以下哪种 SpanProcessor 配置会将 Collector 的网络延迟直接叠加到请求 P99 延迟上？",
+          "choices": [
+            {"id": "A", "text": "sdktrace.NewBatchSpanProcessor，设置 BatchTimeout 为 5s"},
+            {"id": "B", "text": "sdktrace.NewSimpleSpanProcessor，使用同步 HTTP Exporter"},
+            {"id": "C", "text": "sdktrace.NewBatchSpanProcessor，设置 MaxQueueSize 为 4096"},
+            {"id": "D", "text": "在 Collector 侧启用 tail_sampling processor"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "SimpleSpanProcessor 是同步处理器，每个 Span 结束时立即调用 Exporter 的 ExportSpans 方法并等待完成才返回。如果 Exporter 是同步 HTTP，那么每次 Span 结束都要等一次 HTTP 请求的 RTT（通常 5-20ms），这个延迟直接叠加在请求处理链路上，导致 P99 大幅升高。BatchSpanProcessor 是异步的，Span 被放入内存队列后立刻返回，后台 goroutine 定时批量发送，完全不影响请求主路径。tail_sampling 是 Collector 侧的功能，与应用进程延迟无关。"
+        },
+        {
+          "id": "monitoring-q84-q2",
+          "question": "OTel Go SDK 在 100% 头部采样 + BatchSpanProcessor 配置下，官方基准测试的 CPU overhead 大约是多少？",
+          "choices": [
+            {"id": "A", "text": "< 0.1%，可以忽略不计"},
+            {"id": "B", "text": "1-5%，取决于 Span 密度和 Attribute 数量"},
+            {"id": "C", "text": "10-20%，追踪本身开销很大"},
+            {"id": "D", "text": "30% 以上，所以生产环境必须用 0.1% 以下的采样率"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "OTel Go SDK 官方 benchmark（otel-go/benchmark 目录）显示，100% 采样 + Batch Exporter 的 CPU overhead 约在 1-5% 之间，具体数值取决于每个 Span 的 Attribute 数量（每多一个 kv 对约多 0.5μs）和每秒 Span 创建数。这个数字对大多数服务是可接受的。A 选项低估了开销（那是极低采样率下的数字）；C 和 D 选项高估了正常配置下的开销，那种量级通常是过度插桩（如循环内创建 Span）或同步导出器导致的。"
+        },
+        {
+          "id": "monitoring-q84-q3",
+          "question": "以下关于头部采样（Head-based Sampling）和尾部采样（Tail-based Sampling）的说法，哪项是正确的？",
+          "choices": [
+            {"id": "A", "text": "头部采样能根据请求的实际延迟和错误状态决定是否保留，适合捕获慢请求"},
+            {"id": "B", "text": "尾部采样在请求入口处做决策，实现最简单且开销最低"},
+            {"id": "C", "text": "头部采样在请求开始时做采样决策，无法根据最终结果决策；尾部采样在请求结束后根据实际结果决策，能 100% 保留慢请求和错误请求"},
+            {"id": "D", "text": "两种采样方式不能同时使用，必须二选一"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "头部采样（也叫入口采样）在请求最开始时就决定是否追踪，之后所有 Span 都继承这个决策，实现简单、开销极低，但因为决策时请求还没结束，无法根据延迟或错误状态做判断——慢请求和错误请求被采到全靠概率。尾部采样在整个 Trace 完成后才做决策，可以根据 latency、status_code 等条件 100% 保留问题请求，但需要 Collector 在内存中缓冲一个时间窗口内的所有 Span（通常 10-30s），内存压力更大。两种方式可以也应该组合使用：头部采样控制正常请求的数据量，尾部采样兜底异常请求。"
+        },
+        {
+          "id": "monitoring-q84-q4",
+          "question": "OTel Collector 配置中，`memory_limiter` processor 的主要作用是什么？",
+          "choices": [
+            {"id": "A", "text": "限制应用进程中 SDK 的内存使用量，防止 Span 队列过大"},
+            {"id": "B", "text": "当 Collector 进程内存超过阈值时，拒绝新的遥测数据输入，防止 Collector OOM 崩溃"},
+            {"id": "C", "text": "限制发往后端存储（如 Tempo）的数据量，控制存储成本"},
+            {"id": "D", "text": "设置每个 Span 的最大 Attribute 数量，防止单个 Span 过大"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "memory_limiter 是 OTel Collector 的内置 processor，部署在 pipeline 的最前端（receivers 之后、其他 processors 之前）。它定期检查 Collector 进程的内存使用量，当超过 `limit_mib` 时，开始拒绝新进入的遥测数据（返回 HTTP 429 或 gRPC ResourceExhausted）；当接近 `limit_mib - spike_limit_mib` 时提前触发 GC。这是防止数据洪峰（比如某个服务误配了 100% 采样发来海量 Span）导致 Collector OOM 的关键保险。它作用于 Collector 进程，不是应用进程的 SDK，也不直接控制后端存储。"
+        },
+        {
+          "id": "monitoring-q84-q5",
+          "question": "你发现 Grafana Tempo 的索引查询越来越慢，Collector 内存也持续偏高。查看 Span 数据后发现大量 Span 带有 `user_id=U123456789` 这样的属性，共有 5000 万个不同的 user_id 值。这个问题叫什么，应该如何解决？",
+          "choices": [
+            {"id": "A", "text": "采样率过高导致数据量大，降低采样率到 0.1% 即可解决"},
+            {"id": "B", "text": "Span Attribute 高基数爆炸（Cardinality Explosion），应将高基数值改为通过 Span Event 或关联 Log 携带，Span Attribute 只保留低基数的分类属性"},
+            {"id": "C", "text": "Tempo 存储配置问题，需要增加 Tempo 的分片数量"},
+            {"id": "D", "text": "Collector 的 batch processor 批次太小，增大 send_batch_size 即可"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是经典的 Span Attribute 高基数（High Cardinality）爆炸问题。Tempo、Jaeger 等追踪后端会对 Span Attribute 建索引以支持按条件搜索，当某个 Attribute 的不同取值数量（基数）达到数千万级别时，索引大小会爆炸，导致写入慢、查询慢、内存压力大。user_id、order_id、request_id 这类业务 ID 都是高基数值，不应该放在 Span Attribute 里。正确做法是将它们记录在 Span Event（Span 的 log 条目）中，或者通过 correlation 关联到结构化 Log 里，Span Attribute 只保留 http.method、http.status_code、db.system 等低基数的分类属性（通常不超过几十个不同值）。"
+        },
+        {
+          "id": "monitoring-q84-q6",
+          "question": "以下代码片段有什么性能问题？\n\n```go\nfor i, item := range items { // len(items) 约 10000\n    _, span := tracer.Start(ctx, fmt.Sprintf(\"process_item_%d\", i))\n    processItem(item)\n    span.End()\n}\n```",
+          "choices": [
+            {"id": "A", "text": "没有问题，对每个 item 单独创建 Span 可以精确追踪每个 item 的处理耗时"},
+            {"id": "B", "text": "span 名称中包含变量 i，会导致高基数问题；但每次创建 Span 本身没有性能问题"},
+            {"id": "C", "text": "循环内每次迭代都创建 Span，10000 次迭代产生 10000 个 Span，造成严重的过度插桩；应合并为一个 Span 记录整批处理的聚合耗时，或抽样记录少量 Span"},
+            {"id": "D", "text": "tracer.Start 没有错误处理，panic 风险高"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是过度插桩（Over-instrumentation）的典型案例。循环 10000 次意味着单个请求就创建了 10000 个 Span，SDK 要分配 10000 个 Span 对象（约 10-30MB 内存），创建时间约 20-50ms，严重影响主路径性能，而且 Batch Exporter 的队列可能被这一批 Span 直接打满。B 选项提到的 Span 名称包含变量确实也是问题（会导致 Span name 高基数，影响 trace 聚合分析），但主要问题还是创建数量。正确做法是在循环外创建一个 `process_batch` Span，在 Span 上记录 `item_count` 等聚合属性，或者在循环内只对前几个和出错的 item 创建 Span。"
+        },
+        {
+          "id": "monitoring-q84-q7",
+          "question": "对于一个 QPS 8000 的高吞吐服务，以下哪种采样策略的综合效果最佳（既能保留可观测性又控制开销）？",
+          "choices": [
+            {"id": "A", "text": "100% 头部采样，保证完整可见性"},
+            {"id": "B", "text": "0.1% 头部采样，开销最小"},
+            {"id": "C", "text": "1-5% 头部采样（覆盖正常请求统计分析）+ Collector 侧尾部采样 100% 保留 error 和 latency > 200ms 的 Trace"},
+            {"id": "D", "text": "不采样，通过 Metrics 和 Log 替代 Trace 完全满足需求"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "对于高 QPS 服务，100% 头部采样（A）会产生海量数据，SDK、Collector、存储都面临压力，且成本高昂，除非是极短期的故障排查才会临时开启。0.1% 头部采样（B）每秒只保留 8 个 Trace，低概率的慢请求（比如 0.5% 的 P99.5 请求）几乎永远采不到，丧失了追踪的核心价值。不采样（D）无法还原跨服务调用链，Metrics 和 Log 不能替代 Trace 做调用链分析。C 是生产最佳实践：头部采样 1-5% 足够分析正常请求的性能分布（8000 QPS × 2% = 160 Trace/s，数据量完全可控），Collector 尾部采样再把所有异常请求捞回来，两者结合实现「正常路径低成本，异常路径无遗漏」。"
+        },
+        {
+          "id": "monitoring-q84-q8",
+          "question": "在 Kubernetes 环境中，OTel Collector 以 DaemonSet 方式部署（每个节点运行一个 Collector Pod）相比 Deployment 方式（集中式 Collector），主要优势是什么？",
+          "choices": [
+            {"id": "A", "text": "DaemonSet 部署的 Collector 数量更少，总资源占用更低"},
+            {"id": "B", "text": "DaemonSet 部署让应用 Pod 通过本机 loopback（127.0.0.1）与同节点 Collector 通信，避免跨节点网络，降低 Batch Exporter 的导出延迟和丢包风险"},
+            {"id": "C", "text": "DaemonSet 部署的 Collector 支持 tail_sampling processor，而 Deployment 方式不支持"},
+            {"id": "D", "text": "DaemonSet 部署能自动根据流量扩缩 Collector 副本数"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "DaemonSet 部署确保每个节点上都有一个 Collector 实例，应用 Pod 把 OTEL_EXPORTER_OTLP_ENDPOINT 指向 `$(HOST_IP):4317`（通过 downward API 注入节点 IP）或直接使用 `localhost`，数据完全走本机 loopback，RTT 从跨节点的 1-5ms 降至 < 0.1ms，Batch Exporter 的刷新效率大幅提升。Deployment（集中式）方式下，所有节点的 SDK 都往同一批 Collector Pod 发数据，跨节点网络增加延迟，且流量倾斜时单个 Collector Pod 压力大。注意：DaemonSet 方式的 Collector 适合做数据收集和预处理，tail_sampling 通常需要看到全量 Trace 数据，一般需要有状态的 Collector StatefulSet 来做，这是 A 选项中的陷阱点。"
+        },
+        {
+          "id": "monitoring-q84-q9",
+          "question": "BatchSpanProcessor 的 `MaxQueueSize` 参数设置过小（如 128）会导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "CPU 使用率升高，因为频繁触发批量发送"},
+            {"id": "B", "text": "当 Span 生成速率超过 Exporter 发送速率时，队列满后新 Span 会被直接丢弃（dropped），导致 Trace 不完整"},
+            {"id": "C", "text": "Collector 收到的 Span 乱序，无法正确还原调用链"},
+            {"id": "D", "text": "Span 的 EndTime 记录不准确，影响延迟统计"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "BatchSpanProcessor 内部维护一个有界内存队列（channel），Span 创建时 push 进队列，后台 goroutine 定时 pop 出来批量发送。当 Span 生成速度超过 Exporter 的处理速度时（比如 Collector 变慢、网络抖动），队列会积压。当队列满（MaxQueueSize 个 Span 都在等待）时，新来的 Span 不会阻塞调用方——而是直接被丢弃，同时 SDK 会递增 `otel.sdk.span.dropped` 计数器。OTel Go SDK 会在日志里打印警告。这意味着 Trace 可能不完整（部分 Span 缺失），用 Prometheus 监控 `otelcol_processor_dropped_spans_total` 指标可以发现这个问题。生产环境 MaxQueueSize 建议设 2048-8192，具体取决于 QPS 和每 Span 内存大小。"
+        },
+        {
+          "id": "monitoring-q84-q10",
+          "question": "你用 go pprof 对服务做 CPU profile，发现 `go.opentelemetry.io/otel/sdk/trace.(*recordingSpan).SetAttributes` 占了总 CPU 的 8%。最可能的原因是什么，应该怎么优化？",
+          "choices": [
+            {"id": "A", "text": "OTel SDK 版本太老，升级到最新版本可以解决"},
+            {"id": "B", "text": "服务 QPS 太高，必须降低采样率才能解决"},
+            {"id": "C", "text": "代码中对每个 Span 设置了大量 Attribute，或者在热路径（如高频循环）中频繁调用 SetAttributes；应减少每个 Span 的 Attribute 数量（< 10 个），避免在循环内调用，并检查是否有大字符串值（如序列化的 JSON）被设为 Attribute"},
+            {"id": "D", "text": "BatchSpanProcessor 的 MaxExportBatchSize 设置太大，减小批次大小可以降低 SetAttributes 开销"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "SetAttributes 本身是很轻量的操作（写一个 kv 对到 Span 的 slice），正常情况下不应该出现在 CPU profile top 10 里。出现在 8% 这个位置，通常有两个原因：一是代码里对每个 Span 设置了非常多的 Attribute（几十甚至上百个），导致 slice 频繁扩容和内存分配；二是在高频调用的路径里（比如处理每条消息的循环）反复调用 SetAttributes，累积调用次数极高。特别要注意把 JSON 序列化结果作为 Attribute value 的情况——一个 JSON 字符串可能是几 KB，序列化本身就有 CPU 开销，还会导致大量内存分配触发 GC。优化方向：每个 Span 的 Attribute 精简到核心的 5-10 个，value 长度不超过 256 字节，大对象改用 Span Event 记录。"
+        }
+      ],
+      "references": [
+        "https://opentelemetry.io/docs/specs/otel/performance/",
+        "https://opentelemetry.io/docs/collector/configuration/#memory_limiter-processor",
+        "https://opentelemetry.io/docs/collector/transforming-telemetry/",
+        "https://github.com/open-telemetry/opentelemetry-go/tree/main/sdk/trace",
+        "https://grafana.com/docs/tempo/latest/operations/best-practices/"
+      ]
+    }
+  ]
+}
