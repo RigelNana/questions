@@ -1,0 +1,157 @@
+{
+  "id": "monitoring-q64",
+  "name": "日志采集背压问题排查",
+  "domain": "monitoring",
+  "description": "深入讲解日志采集管道中的背压现象、Fluentd/Fluent Bit 的缓冲机制、OOM 与日志丢失的排查方法，以及 buffer 参数调优实践。",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q64",
+      "domain": "monitoring",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["fluentd", "fluent-bit", "backpressure", "buffer", "elasticsearch", "loki", "log-pipeline", "监控"],
+      "title": "日志采集的背压（Backpressure）问题如何解决？",
+      "content": "你所在的团队维护一套基于 Kubernetes 的微服务平台，日志采集方案是在每个节点上以 DaemonSet 方式运行 Fluent Bit，采集所有容器的 stdout 日志，转发给 Fluentd Aggregator，再写入 Elasticsearch 7.17 集群。平时运行毫无问题，但每逢大促活动期间，你会收到以下告警：\n\n```\n[error] [input tail] file=/var/log/containers/order-service-xxx.log \n  error: chunk would exceed total limit size\n  dropping tail input chunk\n```\n\n与此同时，Grafana 里 Fluent Bit 的 `fluentbit_input_records_total` 增速明显，但 `fluentbit_output_proc_records_total` 却停滞不前。几个小时后 order-service 的日志在 Kibana 里出现明显空白，运维同学发现节点上的 Fluent Bit Pod 内存从正常的 120MB 涨到了 950MB，随后被 OOMKilled 重启。\n\n问题在大促流量高峰（约是平时的 8 倍）出现。Elasticsearch 的写入队列监控显示 `thread_pool.write.queue` 长时间保持在 200（默认上限），bulk 请求的平均耗时从正常的 80ms 上升到了 1400ms。\n\n请分析：背压的根本原因是什么？Fluentd/Fluent Bit 的缓冲机制是如何工作的？如何一步步排查并从根本上解决这个问题？",
+      "answer": "## 背压是什么：从「水管堵塞」说起\n\n「背压」这个词来自流体力学——当下游管道因为某种原因流速降低时，压力会向上游反传，最终导致整条管道积压甚至爆管。在日志采集管道里，道理完全一样。Fluent Bit 负责从磁盘上的日志文件读取数据（tail input），然后通过网络发往 Fluentd Aggregator，Fluentd 再 bulk 写入 Elasticsearch。这条链路的处理速度取决于最慢的那个环节。大促时 Elasticsearch 写入变慢，整条链路的吞吐立刻就被这个瓶颈卡死了。\n\n很多人第一反应是「那就加大 Fluent Bit 的缓冲区呗」，但盲目加大缓冲区只会让 OOM 来得更猛、更晚，并不解决根本问题。要真正搞清楚怎么解决，必须先彻底弄明白这条链路里每一个环节的缓冲机制。\n\n## Fluent Bit 的缓冲机制：Chunk 与 Ring Buffer\n\nFluent Bit（v2.x）的 input 层使用一个 in-memory 的 ring buffer 来暂存从 tail 读取的数据。每一批数据打包成一个 **Chunk**，Chunk 有两个关键的大小限制参数：`chunk_limit_size`（单个 Chunk 的上限，默认 `1MB`）和 `total_limit_size`（所有 Chunk 加起来的内存总上限，默认 `128MB`）。\n\n当 Chunk 累积到 `total_limit_size` 时，Fluent Bit 会拒绝继续读取新数据，这就是你在日志里看到 `chunk would exceed total limit size` 的直接原因。Fluent Bit 此时有两个策略：`pause`（暂停 input，不再读取文件，文件指针停在原地等待）或 `drop`（直接丢弃新来的数据）。默认行为是 `drop`，这就是日志空白的根源。\n\n与 Fluent Bit 的纯内存缓冲不同，**Fluentd** 的缓冲机制要复杂得多，也更健壮。Fluentd 的 buffer 插件支持两种后端：`memory` 和 `file`。`memory` 类型跟 Fluent Bit 类似，快但不持久；`file` 类型会把缓冲数据写到磁盘上，进程重启后也不会丢失。生产环境里，Fluentd Aggregator 必须使用 `file` 类型的 buffer，这一点没有任何商量余地。\n\nFluentd 的 buffer 同样有 `chunk_limit_size` 和 `total_limit_size` 两个参数（含义与 Fluent Bit 类似），还有一个 `overflow_action` 参数控制满溢时的行为：`throw_exception`（抛异常，数据留在内存等待重试）、`block`（阻塞 input 不再接收，直到 buffer 有空间）、`drop_oldest_chunk`（丢弃最老的 chunk）。\n\n## 本案例的完整因果链\n\n把这些机制串起来，本案例的故障路径就非常清晰了：\n\n大促流量上升 8 倍 → Elasticsearch 写入线程池被打满（`thread_pool.write.queue = 200`）→ Fluentd 向 ES 的 bulk 请求耗时从 80ms 涨到 1400ms，实际写入吞吐骤降 → Fluentd 的 buffer 开始积压，如果配置的是 `memory` 类型且 `overflow_action = throw_exception`，Fluentd 就停止从 Fluent Bit 拉取数据 → Fluent Bit 的 output 插件（forward）无法发出数据，in-memory Chunk 持续增长 → 撞到 `total_limit_size = 128MB`，日志开始被 drop → 但如果在撞限之前 Fluent Bit 进程因为其他原因保留了太多数据（比如 `total_limit_size` 配置过大），就会触发 OOM。\n\n这个案例里 Fluent Bit Pod 内存从 120MB 涨到 950MB 后才 OOM，说明 `total_limit_size` 被改得比较大（可能是某个同学之前为了「解决」日志丢失问题而调大了），导致 Fluent Bit 在被 kill 之前吃掉了大量内存。\n\n## 排查步骤：从现象到根因\n\n**第一步：确认瓶颈在下游。** 不要一上来就调 Fluent Bit 参数。先看 Elasticsearch 的状态：\n\n```bash\n# 查看 ES 线程池状态\ncurl -s 'http://es-master:9200/_cat/thread_pool/write?v&h=node_name,queue,rejected,completed'\n\n# 输出示例（问题发生时）：\n# node_name          queue  rejected  completed\n# es-node-1          200       1823   48291034\n# es-node-2          200        912   47853201\n\n# 正常时 queue 应该接近 0，rejected 不增长\n```\n\n`rejected` 计数在增长就直接证明 ES 在主动拒绝写入请求。这时候不管你怎么调 Fluent Bit，日志都会丢，因为 ES 根本处理不过来。\n\n**第二步：检查 Fluentd 的 buffer 状态。** Fluentd 暴露了 `/api/plugins.json` 接口，可以看每个插件的 buffer 指标：\n\n```bash\ncurl -s http://fluentd:24220/api/plugins.json | python3 -m json.tool | grep -A 5 'buffer'\n\n# 关注这几个字段：\n# buffer_total_queued_size: buffer 里当前积压的总字节数\n# buffer_queue_length:      积压的 chunk 数量\n# retry_count:              当前正在重试的次数（>0 说明写入失败）\n```\n\n如果 `retry_count` 在持续增长，说明 Fluentd → ES 这段已经在反复重试失败了。\n\n**第三步：检查 Fluent Bit 的 drop 指标。**\n\n```bash\n# Fluent Bit 内置 HTTP server，开启后可以查看指标\ncurl -s http://fluent-bit-pod-ip:2020/api/v1/metrics | python3 -m json.tool\n\n# 关注：\n# input.records_drop_total  -- 已丢弃的 record 总数\n# output.retried_failed_total -- 输出重试彻底失败的次数\n```\n\n也可以直接看 Prometheus 指标（如果开了 `-s` 参数）：\n\n```\nfluentbit_input_records_total{name=\"tail.0\"} 8293401\nfluentbit_output_proc_records_total{name=\"forward.0\"} 5109233\n# 两者之差就是丢失的 record 数\n```\n\n## 解决方案：分层修复\n\n排查清楚之后，修复需要分三层来做，缺任何一层都只是治标。\n\n**第一层：解决 ES 写入瓶颈（根本原因）。** ES 线程池被打满，核心原因通常是分片数过多（每个分片都需要一个写入线程）或者硬件 I/O 跟不上。大促场景下可以临时扩容 ES 数据节点，或者在 Fluentd 里加 `slow_flush_log_threshold` 和限流逻辑。更根本的方案是用 ILM（Index Lifecycle Management）把热数据分片数控制在合理范围（生产经验：每个分片大小维持在 20-50GB，每节点分片数不超过 20 个）。\n\n**第二层：把 Fluentd 的 buffer 改成 file 类型并正确配置。** 这是防止数据丢失的关键：\n\n```xml\n<match **>\n  @type elasticsearch\n  # ... ES 连接配置 ...\n\n  <buffer tag,time>\n    @type file\n    path /var/log/fluentd/buffer/es\n\n    # 单个 chunk 大小，控制每次 bulk 请求的数据量\n    # 太小：请求频率过高；太大：单次失败影响大\n    chunk_limit_size 8MB\n\n    # 总 buffer 磁盘空间上限，要根据磁盘容量来设\n    # 公式：预估积压时长（秒）× 日志产生速率（MB/s）× 2\n    total_limit_size 2GB\n\n    # 满了之后阻塞 input，而不是丢数据\n    overflow_action block\n\n    # flush 间隔，ES 场景下 5s 是个合理值\n    flush_interval 5s\n\n    # 重试策略：指数退避，最多重试 17 次（约 131072 秒后放弃）\n    retry_type exponential_backoff\n    retry_wait 1s\n    retry_max_interval 30s\n    retry_forever false\n    retry_max_times 17\n  </buffer>\n</match>\n```\n\n`overflow_action block` 是这里最关键的改动。它告诉 Fluentd：当 buffer 写满时，停止从上游（Fluent Bit forward）接收数据，而不是丢弃。这样背压就会一级一级往上传：Fluentd 不接收 → Fluent Bit 的 forward 输出插件开始 block → Fluent Bit 停止从 tail 读取文件 → 日志文件在磁盘上自然积压（而不是被 drop）。这才是正确的背压传导方式。\n\n**第三层：正确配置 Fluent Bit 的缓冲参数。**\n\n```yaml\n# fluent-bit.conf\n[INPUT]\n    Name              tail\n    Path              /var/log/containers/*.log\n    # 暂停读取而不是丢弃，配合 Mem_Buf_Limit\n    Mem_Buf_Limit     50MB      # 每个 input 实例的内存上限\n    storage.type      filesystem  # 用文件系统缓冲而不是纯内存\n    storage.pause_on_chunks_overlimit On  # 超限时暂停而不是 drop\n\n[OUTPUT]\n    Name  forward\n    Match *\n    Host  fluentd-aggregator\n    Port  24224\n    storage.total_limit_size 200MB  # output 缓冲总上限\n```\n\n`storage.type filesystem` + `storage.pause_on_chunks_overlimit On` 是 Fluent Bit v1.9+ 的推荐配置。开启文件系统缓冲后，Fluent Bit 的数据不再只存内存，而是先写到节点本地磁盘（通常是 `/var/log/fluentd-buffers/`），内存只保留一个小的 working set。这样 Fluent Bit 的内存用量就从「积压多少数据就吃多少内存」变成了「基本恒定」，OOM 问题根本上得到解决。\n\n## 熔断模式：避免雪崩\n\n上面的方案在「下游短暂变慢」的场景下完全够用，但如果 ES 出现长时间故障（比如节点宕机需要几小时恢复），Fluentd 的 file buffer 也会被填满，最终不得不丢数据。这种情况可以引入**熔断（Circuit Breaker）** 模式。\n\n在 Fluentd 里，可以用 `fluent-plugin-circuit-breaker` 插件，或者更简单地通过 `retry_max_times` 配合 Dead Letter Queue（DLQ）模式：当重试次数用尽后，不直接丢弃数据，而是把无法处理的 chunk 路由到一个 S3 bucket 或本地文件，等 ES 恢复后再手动重放。\n\n```xml\n<label @ERROR>\n  <match **>\n    @type s3\n    s3_bucket your-dlq-bucket\n    s3_region ap-southeast-1\n    path dlq/fluentd/\n    <buffer time>\n      @type file\n      path /var/log/fluentd/dlq\n      timekey 1h\n    </buffer>\n  </match>\n</label>\n```\n\n## 监控 Buffer Fill Ratio：防患于未然\n\n修完了还不够，必须让这类问题在造成日志丢失之前就被发现。核心指标是 buffer 的填充率：\n\n```promql\n# Fluentd buffer 填充率（需要 fluent-plugin-prometheus）\n# buffer_total_queued_size / total_limit_size\nfluentd_output_status_buffer_total_bytes{plugin_id=\"elasticsearch\"} \n  / \nfluentd_output_status_buffer_total_bytes_limit{plugin_id=\"elasticsearch\"}\n```\n\n建议的告警阈值：填充率超过 60% 发 Warning，超过 85% 发 Critical。60% 的告警线给了你充足的时间去处理下游问题，而不是等到 85% 才手忙脚乱。\n\n同时要监控 Fluent Bit 的 `fluentbit_input_storage_chunks_up` 和 `fluentbit_input_storage_chunks_down` 指标（分别表示内存中和磁盘中的 chunk 数量），当 `chunks_down` 持续增长时说明内存缓冲已满、正在向磁盘溢出，这是一个早期预警信号。\n\n这套监控体系建起来之后，大促前你就能清楚地看到 buffer 水位在爬升，在真正丢日志之前就介入处理——这才是一个成熟 SRE 团队应该有的状态。",
+      "keyPoints": [
+        "背压的根本原因是下游（Elasticsearch）写入变慢，导致 buffer 积压向上游传导，最终在最薄弱的环节（Fluent Bit 内存缓冲）发生日志 drop 或 OOM",
+        "Fluent Bit 的 `total_limit_size` 控制 in-memory chunk 总量，触达上限时默认行为是 `drop` 而非 `pause`，必须将 `storage.pause_on_chunks_overlimit` 设为 `On` 才能避免无声丢日志",
+        "Fluentd 的 buffer 必须使用 `@type file` 而非 `@type memory`，并将 `overflow_action` 设为 `block`，使背压能够正确地从下游向上游传导，而不是在 Fluentd 层直接丢数据",
+        "Fluent Bit 开启 `storage.type filesystem` 后，缓冲数据写入节点本地磁盘，内存使用量趋于恒定，从根本上解决了 buffer 积压导致 OOM 的问题",
+        "`chunk_limit_size` 直接影响每次 bulk 请求的数据量，太大会导致单次 ES bulk 超时，太小会增加请求频率和开销，生产经验值是 4-16MB",
+        "ES `thread_pool.write.queue` 长时间打满（默认上限 200）是下游瓶颈的直接证据，需优先排查 ES 分片数量和节点 I/O 能力，而不是一味调整采集端参数",
+        "buffer 填充率（当前使用量 / total_limit_size）超过 60% 时应触发告警，这给出了在真正丢失日志之前干预的时间窗口",
+        "在 Fluentd 配置 Dead Letter Queue（DLQ）路由，当重试彻底耗尽时将失败数据写入 S3 而非直接丢弃，是防止极端故障场景下数据永久丢失的最后一道防线"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q64-q1",
+          "question": "在日志采集管道中，「背压（Backpressure）」现象的直接触发原因是什么？",
+          "choices": [
+            {"id": "A", "text": "日志采集端（Fluent Bit）的 CPU 使用率过高，导致处理速度下降"},
+            {"id": "B", "text": "下游存储（如 Elasticsearch）的写入吞吐低于上游日志产生速率，导致 buffer 积压"},
+            {"id": "C", "text": "Kubernetes 节点内存不足，导致 Pod 被 OOMKilled 后重新调度"},
+            {"id": "D", "text": "日志文件 rotation 导致 tail input 丢失文件指针，从头开始读取"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "背压的本质是「生产速率 > 消费速率」导致的积压。在日志管道里，Fluent Bit 读取日志的速度通常远快于 Elasticsearch 写入日志的速度，尤其在高峰期。A 选项描述的是采集端自身的性能问题，不是背压的定义；C 选项是背压的一种后果（积压数据吃光内存），而不是触发原因；D 选项是日志 rotation 引起的另一类问题。触发背压的核心永远是下游变慢，压力反向传播。"
+        },
+        {
+          "id": "monitoring-q64-q2",
+          "question": "Fluent Bit 出现 `chunk would exceed total limit size` 错误时，默认行为是什么？",
+          "choices": [
+            {"id": "A", "text": "暂停读取新日志，等待 buffer 有空间后继续（pause）"},
+            {"id": "B", "text": "将超出的数据写入节点本地磁盘作为持久缓冲"},
+            {"id": "C", "text": "直接丢弃新来的 chunk（drop）"},
+            {"id": "D", "text": "向 Fluentd 发送背压信号，请求对方降速发送"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Fluent Bit 在 `total_limit_size` 触达后的默认行为是 `drop`——直接丢弃无法放入 buffer 的数据，这正是大促时出现日志空白的直接原因。要改变这个行为，需要在 INPUT 配置中设置 `storage.pause_on_chunks_overlimit On`，此时 Fluent Bit 会暂停读取文件而不是丢弃数据。A 选项描述的是开启 pause 模式后的行为，不是默认行为；B 选项需要显式配置 `storage.type filesystem` 才会生效；D 选项中 Fluent Bit 没有向 Fluentd 发送「降速请求」这样的协议机制。"
+        },
+        {
+          "id": "monitoring-q64-q3",
+          "question": "Fluentd 的 buffer 配置中，`overflow_action block` 与 `overflow_action drop_oldest_chunk` 的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "block 会导致 Fluentd 进程阻塞卡死，而 drop_oldest_chunk 不会影响进程稳定性"},
+            {"id": "B", "text": "block 会将背压传导给上游（Fluent Bit 停止发送），而 drop_oldest_chunk 会丢失最早的日志数据"},
+            {"id": "C", "text": "block 只对 memory 类型 buffer 有效，drop_oldest_chunk 只对 file 类型 buffer 有效"},
+            {"id": "D", "text": "两者功能相同，只是 block 的性能开销更低"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`overflow_action block` 的核心价值是实现**正确的背压传导**：当 Fluentd buffer 满时，它停止从 upstream（Fluent Bit 的 forward output）接收数据，Fluent Bit 的 forward 插件随即也因为发送失败而暂停，最终 tail input 也停止读取文件。整条链路以一种可控的方式「刹车」，数据保留在磁盘上。`drop_oldest_chunk` 则是用最老的数据换新数据的空间，日志不会完全中断但会有选择性丢失。A 选项是错的，`block` 不会卡死进程，只是让 input 插件暂停接收；C 选项是错的，两者都适用于两种 buffer 类型；D 选项完全错误，两者行为截然不同。"
+        },
+        {
+          "id": "monitoring-q64-q4",
+          "question": "Fluent Bit 开启 `storage.type filesystem` 后，与默认的内存缓冲相比，最主要的优势是什么？",
+          "choices": [
+            {"id": "A", "text": "日志处理吞吐量提升，因为磁盘 I/O 比内存访问更快"},
+            {"id": "B", "text": "进程重启或 OOMKilled 后，未发送的日志数据不会丢失，可从磁盘恢复"},
+            {"id": "C", "text": "支持对日志数据进行压缩，减少网络传输带宽"},
+            {"id": "D", "text": "自动将 buffer 数据同步到其他节点，实现高可用"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "文件系统缓冲的核心价值是**持久化**。当 Fluent Bit Pod 因为 OOMKilled 或节点重启而重启后，内存里的 buffer 数据全部丢失；但文件系统 buffer 的数据保存在节点磁盘上，重启后 Fluent Bit 会从断点继续处理，避免这段时间内的日志永久丢失。同时，文件系统 buffer 让内存使用量趋于恒定（不再随积压量线性增长），从根本上解决了 OOM 问题。A 选项是错的，磁盘 I/O 远慢于内存访问，文件系统 buffer 实际上会略微降低吞吐；C 选项的压缩是 output 插件的功能，与 storage type 无关；D 选项是错的，这是多副本方案的职责，不是 storage type 能做到的。"
+        },
+        {
+          "id": "monitoring-q64-q5",
+          "question": "你查看 Elasticsearch 集群状态，发现以下输出。这说明了什么？\n\n```\nGET /_cat/thread_pool/write?v&h=node_name,queue,rejected\nnode_name   queue  rejected\nes-node-1   200     3847\nes-node-2   200     1923\nes-node-3   199     2156\n```",
+          "choices": [
+            {"id": "A", "text": "ES 集群写入队列正常，200 是健康的队列长度，rejected 是历史累计值不代表当前有问题"},
+            {"id": "B", "text": "写入线程池队列已打满（上限 200），ES 正在主动拒绝新的 bulk 写入请求"},
+            {"id": "C", "text": "ES 节点数量不足，需要立即增加数据节点来提升队列容量"},
+            {"id": "D", "text": "Fluentd 发送的 bulk 请求 payload 过大，超出了 ES 的 `http.max_content_length` 限制"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ES 写入线程池（`thread_pool.write`）的默认队列上限是 200。当 `queue` 字段持续等于 200 时，说明排队已经满了，后来的 bulk 请求会被直接拒绝（rejected）。`rejected` 字段确实是累计值，但配合 `queue` 一直等于 200 来看，可以确定当前问题仍在持续。这是日志积压的根本下游原因。A 选项的理解是错的，200/200 的满队列是明显的告警信号；C 选项方向正确（扩容可以缓解），但结论「队列容量」不准确，扩容 ES 节点是增加写入处理能力而非单纯扩大队列；D 选项是另一类问题（400 错误），与 rejected 无关。"
+        },
+        {
+          "id": "monitoring-q64-q6",
+          "question": "以下 Fluentd buffer 配置有什么问题？\n\n```xml\n<buffer>\n  @type memory\n  total_limit_size 4GB\n  overflow_action block\n</buffer>\n```",
+          "choices": [
+            {"id": "A", "text": "memory 类型 buffer 不支持 overflow_action block，会在运行时报错"},
+            {"id": "B", "text": "total_limit_size 设置为 4GB 过大，Fluentd 启动时会因为无法申请内存而崩溃"},
+            {"id": "C", "text": "使用 memory 类型 buffer 意味着 Fluentd 进程重启后所有积压数据会丢失，且 4GB 的内存占用会触发 OOMKill"},
+            {"id": "D", "text": "没有指定 flush_interval，导致数据永远不会被 flush 到 ES"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这个配置有两个叠加的风险。首先，`@type memory` 的 buffer 是纯内存的，Fluentd 进程一旦重启（无论是主动重启还是 OOMKilled），buffer 里所有积压的日志数据全部丢失，相当于无保护。其次，将 `total_limit_size` 设为 4GB 意味着 Fluentd 进程在积压场景下可能消耗高达 4GB 内存，在 Kubernetes 限制了 Pod 内存上限的环境里，这会直接触发 OOMKill。正确做法是 `@type file` + 合理的 `total_limit_size`。A 选项是错的，memory buffer 支持 overflow_action；B 选项是错的，Fluentd 不会在启动时预分配这 4GB；D 选项是错的，Fluentd 有默认的 flush_interval（60s）。"
+        },
+        {
+          "id": "monitoring-q64-q7",
+          "question": "`chunk_limit_size` 设置过大和过小分别会带来什么问题？",
+          "choices": [
+            {"id": "A", "text": "过大：单次 bulk 请求 payload 过大，ES 可能超时或返回 413；过小：请求频率过高，增加 ES 写入开销和网络 overhead"},
+            {"id": "B", "text": "过大：chunk 无法压缩，浪费存储空间；过小：无法触发 buffer flush，日志永久积压"},
+            {"id": "C", "text": "过大：日志延迟增大，因为要等 chunk 填满才 flush；过小：对日志延迟没有影响"},
+            {"id": "D", "text": "chunk_limit_size 只影响磁盘 buffer 的文件大小，对 ES 写入性能没有直接影响"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`chunk_limit_size` 直接决定了每次 flush 时发给 ES 的 bulk 请求大小。设置过大（比如 100MB）：单次 bulk 请求执行时间过长，超过 ES 的 `bulk.timeout`（默认 1 分钟）会导致 timeout 重试；也可能超过 `http.max_content_length`（默认 100MB）被拒绝。设置过小（比如 64KB）：flush 极为频繁，每次 bulk 都有固定的 HTTP 握手、索引路由开销，ES 的 indexing rate 实际上会因为小请求太多而降低。生产经验值是 4-16MB，一般推荐从 8MB 开始调整。C 选项部分正确（chunk 大确实会增加延迟），但「过小对延迟没影响」是错的；D 选项明显错误。"
+        },
+        {
+          "id": "monitoring-q64-q8",
+          "question": "大促结束后，Elasticsearch 写入恢复正常，但 Fluentd 的 file buffer 里仍积压了大量数据（约 50GB）。此时最安全的处理方式是什么？",
+          "choices": [
+            {"id": "A", "text": "立即删除 buffer 目录下的所有文件，让 Fluentd 重启后从头开始，避免历史积压影响实时日志"},
+            {"id": "B", "text": "什么都不做，Fluentd 会自动按重试策略将积压数据 flush 到 ES，只需监控 buffer 水位下降即可"},
+            {"id": "C", "text": "暂停 Fluentd 的 input，先手动把 buffer 文件导出到 S3，再清空 buffer 重启"},
+            {"id": "D", "text": "将 Fluentd 的 flush_thread_count 临时从 1 调高到 8，加速清空 buffer"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 file buffer 的核心价值时刻。Fluentd 在 ES 恢复正常后，会按照 retry 策略（指数退避）自动重新尝试 flush 积压的 chunk。50GB 的积压数据会在几小时内逐步被发送到 ES。你需要做的是：监控 `buffer_total_queued_size` 是否在持续下降、`retry_count` 是否归零、ES 的写入队列是否保持健康。A 选项是灾难性操作，会永久丢失这 50GB 的日志；C 选项过于复杂且没必要；D 选项（调高 flush_thread_count）在 ES 刚恢复时可以适当使用，但要小心不要把 ES 再次打满，需要配合 ES 的写入吞吐来判断是否可行。"
+        },
+        {
+          "id": "monitoring-q64-q9",
+          "question": "在 Fluent Bit 的 tail input 中，如果未配置 `DB` 参数（SQLite 文件路径），Pod 重启后会发生什么？",
+          "choices": [
+            {"id": "A", "text": "Fluent Bit 会从每个日志文件的开头重新读取，可能产生大量重复日志"},
+            {"id": "B", "text": "Fluent Bit 会从每个日志文件的末尾开始读取，丢失重启前未发送的日志"},
+            {"id": "C", "text": "Fluent Bit 无法启动，因为 DB 参数是必填参数"},
+            {"id": "D", "text": "Fluent Bit 会通过 inotify 机制重新获取文件偏移量，无需 DB 参数也能正确续读"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`DB` 参数让 Fluent Bit 把每个被监控文件的当前读取偏移量（offset）持久化到 SQLite 数据库中。如果不配置 `DB`，这些偏移量只存在内存里，Pod 重启后全部消失。重启后 Fluent Bit 会认为这是第一次读这些文件，默认从文件开头读取（除非配置了 `Read_From_Head Off`），导致已经发送过的日志再次被发送，在 Kibana 里产生重复条目。在背压恢复后的重启场景里，这个问题会造成大量重复日志涌入 ES。正确做法是配置 `DB /var/log/flb_kube.db` 并把这个路径挂载到 hostPath 上，让偏移量在 Pod 重启后得以保留。"
+        },
+        {
+          "id": "monitoring-q64-q10",
+          "question": "你想用 Prometheus 告警监控 Fluentd 的 buffer 填充率，当填充率超过 80% 时触发告警。以下哪条 PromQL 表达式是正确的？",
+          "choices": [
+            {"id": "A", "text": "`fluentd_output_status_buffer_total_bytes > 0.8`"},
+            {"id": "B", "text": "`fluentd_output_status_buffer_total_bytes / fluentd_output_status_buffer_total_bytes_limit > 0.8`"},
+            {"id": "C", "text": "`rate(fluentd_output_status_buffer_total_bytes[5m]) > 0.8`"},
+            {"id": "D", "text": "`fluentd_output_status_buffer_queue_length / fluentd_output_status_buffer_available_space_ratios > 0.8`"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "填充率 = 当前 buffer 使用字节数 / buffer 总容量上限，对应 `fluentd_output_status_buffer_total_bytes`（当前使用量）和 `fluentd_output_status_buffer_total_bytes_limit`（total_limit_size 配置值）的比值。当这个比值超过 0.8 时触发告警。A 选项只看绝对值，无法反映是否接近上限；C 选项用 `rate()` 计算的是增长速率，而不是当前填充比例，虽然增速告警也有用，但它回答的是另一个问题；D 选项混用了不相关的指标，`buffer_available_space_ratios` 不是这道除法的正确分母。实际生产中建议同时配置两个告警：填充率 > 60%（Warning）和填充率 > 85%（Critical）。"
+        }
+      ],
+      "references": [
+        "https://docs.fluentbit.io/manual/administration/buffering-and-storage",
+        "https://docs.fluentd.org/configuration/buffer-section",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/modules-threadpool.html",
+        "https://docs.fluentbit.io/manual/pipeline/inputs/tail"
+      ]
+    }
+  ]
+}

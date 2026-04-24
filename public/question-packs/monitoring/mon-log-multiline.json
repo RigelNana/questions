@@ -1,0 +1,158 @@
+{
+  "id": "monitoring-q60",
+  "name": "日志采集：多行日志处理",
+  "domain": "monitoring",
+  "description": "Kubernetes + Fluent Bit 场景下 Java/Python 多行日志的根因分析与完整处理方案，涵盖 containerd 16KB 分片、Fluent Bit multiline parser、Fluentd concat、Loki pipeline 及从源头规避的 JSON 日志方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q60",
+      "domain": "monitoring",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["fluent-bit", "fluentd", "loki", "multiline", "containerd", "kubernetes", "java", "python", "日志采集"],
+      "title": "日志采集中如何处理多行日志（Multiline Log）？",
+      "content": "你所在的团队使用 Kubernetes + Fluent Bit + Loki + Grafana 作为日志采集链路。技术栈：Java 17 + Spring Boot 3、Fluent Bit 2.1、Loki 2.9、Grafana 10，Fluent Bit 以 DaemonSet 方式部署，采集所有 Pod 的 stdout。\n\n某天下午，后端同学反馈订单服务出现支付回调异常，在 Grafana 里搜索 `level=\"ERROR\"` 只找到一条记录：\n\n```\n2024-03-15 14:22:31.456 ERROR [order-service,a1b2c3] c.e.s.OrderService - 支付回调处理失败\n```\n\n但堆栈信息完全找不到。换成搜索关键词 `NullPointerException` 也没有结果。同事换了个更宽泛的查询，发现日志是这样散落的：\n\n```\n{stream: {app=\"order-service\", level=\"unknown\"}}\n2024-03-15 14:22:31.457  at com.example.service.OrderService.processCallback(OrderService.java:134)\n2024-03-15 14:22:31.457  at com.example.service.OrderService.handlePayment(OrderService.java:89)\n2024-03-15 14:22:31.457  at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:897)\n2024-03-15 14:22:31.457 \\t... 47 more\n```\n\n原来，Java 堆栈的每一行都被单独存成了一条日志事件，`level` 被标记成了 `unknown`，彻底和 ERROR 首行失去了关联。复盘时大家承认，以前排查线上问题根本没法在 Grafana 找到完整堆栈，只能 SSH 到节点手动 `cat` 日志文件。\n\n更棘手的是，payment-service 的日志里还出现了这样的条目：\n\n```\n2024-03-15T14:22:31.456Z stdout P 2024-03-15 14:22:31.456 ERROR [payment-service] c.e.PaymentService - 批量对账\n2024-03-15T14:22:31.456Z stdout F 任务触发，共 15,432 笔待核查，当前进度 0%\n```\n\n第一行带有 `P` 标记，第二行带有 `F` 标记——这是 containerd CRI 格式的行分片标记，说明这条日志超过了 16KB 被截断成了两段。\n\n请分析：多行日志问题产生的根本原因是什么？在 Kubernetes + Fluent Bit + Loki 技术栈下，如何从采集层到源头完整解决这个问题？",
+      "answer": "## 第一步：理解多行日志的本质——「流式采集」与「结构化输出」的天然冲突\n\n日志采集器（Fluent Bit、Filebeat、Promtail）在底层都是按行读取日志的：读到一个换行符，就认为一条日志事件结束，立即打包发出去。这个设计对单行日志（Nginx access log、JSON 格式）非常高效，但遇到 Java 异常栈就彻底崩溃了。\n\n一个典型的 Java `NullPointerException` 在标准输出里是这样的：\n\n```\n2024-03-15 14:22:31.456 ERROR [order-service] c.e.OrderService - 支付回调处理失败\njava.lang.NullPointerException: Cannot invoke \"String.length()\" because \"str\" is null\n\\tat com.example.service.OrderService.processCallback(OrderService.java:134)\n\\tat com.example.service.OrderService.handlePayment(OrderService.java:89)\n\\tat org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:897)\n\\t... 47 more\n```\n\n没有多行处理时，Fluent Bit 会把这 50 行变成 50 条独立的日志事件。第一行因为包含 `ERROR` 关键字被正确标记，后面 `at com.example...` 开头的行则被当成普通文本输出，`level` 字段无法提取，在 Loki 里全部落到 `unknown` 流里。在 Grafana 里搜索 `ERROR`，你只能看到异常的第一行，完全无法判断根因。\n\n在 Kubernetes 里，多行问题还有一个额外的复杂度：containerd 对单行日志有 **16384 字节（16KB）** 的硬限制。当一条日志超过这个阈值，containerd 会把它拆成多个 CRI 格式的条目，每个片段带上 `P`（partial，未结束）或 `F`（final，最后片段）标记。真实的 `/var/log/pods/` 目录下的日志格式是这样的：\n\n```\n2024-03-15T14:22:31.456Z stdout P 2024-03-15 14:22:31.456 ERROR [payment-service] c.e...（前 16384 字节）\n2024-03-15T14:22:31.456Z stdout F ...（剩余部分）\n```\n\n所以在 Kubernetes 里，多行日志实际上是两个独立的问题叠加在一起：**首先是 containerd 的 16KB 分片问题，然后才是 Java/Python 应用本身的多行输出问题。** 这两个问题要在不同的层次分别解决，混为一谈会让配置越改越乱。\n\n## 第二步：Kubernetes + Fluent Bit 下的完整解决方案\n\n### Fluent Bit 的双层 multiline 配置\n\nFluent Bit 1.8 之前处理多行靠的是老旧的 `Multiline` 插件，配置繁琐且容易出 bug。从 1.8 开始，官方引入了新的 `multiline.parser` 机制，并内置了 `java`、`python`、`go` 三种解析器。对于绝大多数场景，不需要手写正则，直接引用内置解析器就够了。\n\n关键在于：**必须同时配置两层**。很多人只配了其中一层，导致问题仍然存在：\n\n```ini\n# fluent-bit.conf\n\n[INPUT]\n    Name              tail\n    Path              /var/log/pods/*/*/*.log\n    # 第一层：处理 containerd 的 16KB 分片\n    # docker 处理旧版 Docker 格式，cri 处理 containerd CRI 格式\n    multiline.parser  docker, cri\n    Tag               kube.*\n\n[FILTER]\n    Name                  multiline\n    match                 kube.*\n    # 指定从哪个字段取日志内容\n    multiline.key_content log\n    # 第二层：处理 Java/Python 应用的真正多行问题\n    multiline.parser      java,python\n```\n\n`INPUT` 阶段的 `multiline.parser docker, cri` 负责把带 `P` 标记的 containerd 分片重新拼回完整的一行，解决的是 16KB 截断问题。`FILTER` 阶段的 `multiline` 才是真正把 Java 堆栈的 50 行合并成一条事件。两层分工明确，缺少任何一层都会导致问题残留。\n\n### 自定义多行解析器：用正则描述「新日志首行的特征」\n\n内置的 `java` 解析器能处理标准的 Java 异常格式，但如果日志格式有额外包装（比如 Logback 自定义 pattern，或 MDC traceId 前缀），就需要自己写解析器。核心思路很简单：**用正则描述一条新日志的开始特征，凡是不匹配这个正则的行，一律认为是上一条日志的延续。**\n\n```ini\n# parsers_multiline.conf\n\n[MULTILINE_PARSER]\n    name          java_logback\n    type          regex\n    # 超过 5 秒无新行，强制输出当前缓冲区\n    flush_timeout 5000\n\n    # 新日志首行特征：以 ISO 时间戳开头（如 2024-03-15 14:22:31.456）\n    rule \"start_state\" \"/^\\\\d{4}-\\\\d{2}-\\\\d{2} \\\\d{2}:\\\\d{2}:\\\\d{2}\\.\\\\d{3}/\" \"cont\"\n\n    # 延续行：以 \\t、空格 + at、Caused by:、... 开头\n    rule \"cont\" \"/^(\\\\s+at |\\\\s+\\.\\\\.\\.\\\\s*\\\\d|\\\\s*Caused by:)/\" \"cont\"\n```\n\n`flush_timeout` 参数至关重要，单位是毫秒。它的作用是：当多行缓冲区里已经有数据，但在指定时间内没有收到新的行时，强制把当前缓冲区的内容作为一条完整日志输出。如果不设这个参数，日志流量低的服务在最后一条异常之后，堆栈可能在缓冲区里卡 5 分钟才输出，给排查问题带来巨大困扰。生产环境推荐设置 `5000`（5 秒）到 `10000`（10 秒）之间。\n\n### Fluentd 的 concat 插件方案\n\n如果日志链路用的是 Fluentd 而不是 Fluent Bit，处理多行的标准方案是 `fluent-plugin-concat`。它的工作原理是缓存日志条目，直到匹配到「新首行」正则或超时后，把所有缓存的行合并成一个事件输出：\n\n```ruby\n# fluent.conf\n\n<filter kubernetes.**>\n  @type concat\n  key log\n  # 新日志首行：以时间戳开头\n  multiline_start_regexp /^\\d{4}-\\d{2}-\\d{2}/\n  # 超时 5 秒强制输出，防止卡死\n  flush_interval 5\n  # 最多拼 500 行，防止内存被超长日志撑爆\n  multiline_end_regexp /^\\d{4}-\\d{2}-\\d{2}/\n  separator \"\\n\"\n  # 超时输出的不完整日志路由到 @TIMEOUT label 单独处理\n  timeout_label @TIMEOUT\n</filter>\n```\n\n`timeout_label` 参数是 Fluentd concat 比较有价值的功能。当超时强制输出时，这些「可能不完整」的日志会被路由到 `@TIMEOUT` label，而不是和正常合并的日志混在一起。你可以在 `@TIMEOUT` 里加一个标记字段，在监控中区分「正常合并日志」和「超时被迫输出的日志」，方便后续排查为什么某些堆栈会超时。\n\n### Loki 侧的 multiline pipeline\n\n如果采集层没有做好多行合并，Loki 的 Promtail/Grafana Agent pipeline 也提供了 `multiline` stage 作为补救：\n\n```yaml\n# promtail config\npipeline_stages:\n  - multiline:\n      # 新日志首行正则\n      firstline: '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}'\n      # 最长等待时间\n      max_wait_time: 3s\n      # 单条多行日志最多合并的行数，防止内存无限增长\n      max_lines: 128\n```\n\n但这种方案有明显局限性：`multiline` stage 只在 Promtail 和 Grafana Agent 里生效，直接用 Fluent Bit 推送的链路不适用。更重要的是，如果 Fluent Bit 已经做了合并，绝对不能在 Loki 侧再配一遍，否则会出现双重合并导致日志乱序的问题——采集层已经把 50 行变成 1 行，Loki 侧又试图把这 1 行「继续等待下一行」，触发超时后输出，时序完全乱掉。\n\n### Python 异常的配置示例\n\nPython 的 traceback 格式与 Java 不同：它以 `Traceback (most recent call last):` 开头，最后才是异常类型和消息。内置 `python` 解析器能处理标准 CPython 输出，但 Django、FastAPI 等框架的日志往往有额外包装层，需要自定义：\n\n```ini\n[MULTILINE_PARSER]\n    name          python_app\n    type          regex\n    flush_timeout 5000\n\n    # 新日志首行：以 ISO 时间戳或 Traceback 开头\n    rule \"start_state\" \"/^(\\\\d{4}-\\\\d{2}-\\\\d{2}|Traceback \\\\(most recent)/\" \"python_body\"\n\n    # 延续行：以空格、File \"、异常类名开头\n    rule \"python_body\" \"/^(\\\\s+|File \\\"|\\\\w+Error:|\\\\w+Exception:)/\" \"python_body\"\n```\n\n## 第三步：从源头消灭多行——JSON 单行日志方案\n\n采集层的多行处理本质上是在打补丁。它有一个无法绕过的致命弱点：**多线程并发异常会导致不同线程的堆栈行在日志文件中交错排列，任何采集层的多行拼接都无法正确处理。** 想象两个线程同时抛出异常：\n\n```\nERROR Thread-1: 订单服务异常\n    at com.example.OrderService.process(OrderService.java:87)\nERROR Thread-2: 支付服务异常           <- Thread-2 的首行插入了 Thread-1 的堆栈中间\n    at com.example.PaymentService.pay(PaymentService.java:23)\n    at com.example.OrderService.handleTimeout(OrderService.java:45)  <- 这行属于 Thread-1\n```\n\n这种情况下，多行解析器会把 Thread-2 的首行误认为是 Thread-1 的堆栈延续，或者把 Thread-1 剩余的行合并到 Thread-2 里。结果是两条堆栈都被弄乱，反而比不处理更难看懂。\n\n真正的解决方案是使用 **`logstash-logback-encoder`** 直接输出 JSON 格式日志，把整个异常堆栈压进一个 JSON 字段里，彻底消灭多行：\n\n```xml\n<!-- pom.xml 依赖 -->\n<dependency>\n    <groupId>net.logstash.logback</groupId>\n    <artifactId>logstash-logback-encoder</artifactId>\n    <version>7.4</version>\n</dependency>\n```\n\n```xml\n<!-- logback-spring.xml -->\n<appender name=\"JSON_STDOUT\" class=\"ch.qos.logback.core.ConsoleAppender\">\n    <encoder class=\"net.logstash.logback.encoder.LogstashEncoder\">\n        <!-- 控制堆栈深度，防止超长堆栈撑爆 Loki 单条日志大小限制 -->\n        <throwableConverter class=\"net.logstash.logback.stacktrace.ShortenedThrowableConverter\">\n            <!-- 每个 cause 最多输出 20 帧 -->\n            <maxDepthPerCause>20</maxDepthPerCause>\n            <!-- 省略 JDK 内部反射调用帧 -->\n            <exclude>sun\\\\.reflect\\\\..*</exclude>\n            <exclude>java\\\\.lang\\\\.reflect\\\\..*</exclude>\n        </throwableConverter>\n    </encoder>\n</appender>\n```\n\n这样输出的每条日志都是完整的单行 JSON，包含 `stack_trace` 字段，Fluent Bit 直接用 JSON parser 解析，不需要任何多行处理：\n\n```json\n{\"@timestamp\":\"2024-03-15T14:22:31.456Z\",\"level\":\"ERROR\",\"logger_name\":\"c.e.s.OrderService\",\"message\":\"支付回调处理失败\",\"stack_trace\":\"java.lang.NullPointerException: Cannot invoke...\\n\\tat com.example.service.OrderService.processCallback(OrderService.java:134)\\n\\tat ...\"}\n```\n\n在 Fluent Bit 里只需要配一个 JSON parser，堆栈完整地存在 `stack_trace` 字段里，在 Grafana 里用 `|= \"stack_trace\"` 过滤，直接展开就能看到完整的异常信息。这是生产环境中处理 Java 日志的最优解——**从源头消灭多行，而不是在采集层打补丁**。\n\n对于 Python 应用，等效的方案是用 `python-json-logger` 库：\n\n```python\n# 安装：pip install python-json-logger\nimport logging\nfrom pythonjsonlogger import jsonlogger\n\nhandler = logging.StreamHandler()\n# exc_info=True 时，异常堆栈会作为 exc_info 字段输出到同一行 JSON\nformatter = jsonlogger.JsonFormatter(\n    fmt='%(asctime)s %(name)s %(levelname)s %(message)s',\n    datefmt='%Y-%m-%dT%H:%M:%S'\n)\nhandler.setFormatter(formatter)\nlogging.getLogger().addHandler(handler)\n```\n\n总结一下处理优先级：**首选 JSON 单行输出（从源头解决）→ 其次 Fluent Bit 双层 multiline（采集层补救）→ 最后 Loki pipeline multiline（最后手段）**。三种方案不要混用，尤其是前两种加在一起已经能覆盖 99% 的场景，不需要再在 Loki 侧叠加第三层。",
+      "keyPoints": [
+        "日志采集器默认按行读取，每个换行符视为一条日志结束，Java 异常栈的每一行都会被拆成独立事件，导致 Grafana 里只能看到 ERROR 首行而找不到完整堆栈",
+        "containerd 对单行日志有 16KB 硬限制，超长行会被拆分成带 「P」（partial）和 「F」（final）标记的多个 CRI 条目，这是 Kubernetes 环境中多行问题的额外复杂度，需要在 Fluent Bit INPUT 阶段单独处理",
+        "Fluent Bit 1.8+ 的 multiline 分两层配置缺一不可：INPUT 阶段 multiline.parser 设置 docker, cri 负责拼合 containerd 的 16KB 分片，FILTER 阶段 multiline 设置 java,python 负责拼合应用层真正的多行逻辑",
+        "自定义多行解析器的核心是用正则描述「新日志首行的特征」，凡不匹配该正则的行一律视为上一条的延续；flush_timeout 参数（建议 5000ms）防止低流量时缓冲区长期卡住不输出",
+        "Fluentd 用 fluent-plugin-concat 插件处理多行，timeout_label 参数可将超时强制输出的不完整缓冲单独路由到指定 label，方便区分正常合并日志与异常截断日志",
+        "Loki 的 Promtail pipeline 支持 multiline stage，但与采集层的多行处理不能叠加使用，否则会引发双重合并导致日志乱序",
+        "多线程并发异常会导致不同线程的堆栈行在日志文件中交错排列，采集层的任何多行拼接都无法正确处理，根本解决方案是使用 logstash-logback-encoder 或 python-json-logger 在源头输出单行 JSON，把堆栈压进一个字段里彻底消灭多行"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q60-q1",
+          "question": "日志采集器（Fluent Bit、Filebeat）在处理 Java 异常堆栈时产生「堆栈被拆散」问题的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "采集器按行读取日志，每遇到换行符就把当前内容打包成一条独立事件，Java 堆栈的每一行都变成了单独的日志条目"},
+            {"id": "B", "text": "Java 程序输出堆栈时使用了 System.err 而非 System.out，采集器无法采集 stderr"},
+            {"id": "C", "text": "Loki 对单条日志的大小有限制，自动截断了超长的堆栈日志"},
+            {"id": "D", "text": "Java 异常堆栈包含特殊字符，被采集器的 JSON parser 解析失败后拆分输出"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "采集器的流式按行读取是多行问题的根本原因。Fluent Bit 的 tail 插件在底层使用 inotify 监听文件变化，每检测到换行符就把当前缓冲区的内容作为一条完整日志事件发出。对于 Nginx access log 或 JSON 单行日志，这个设计非常高效；但对于 Java 异常堆栈，50 行就会产生 50 个独立事件。B 选项错误：Kubernetes 中容器的 stdout/stderr 都被统一写入同一个日志文件，采集器不区分。C 选项错误：Loki 的大小限制是真实存在的，但不是「拆散」问题的根本原因。D 选项错误：堆栈本身不含 JSON 特殊字符，解析失败不会导致拆散。"
+        },
+        {
+          "id": "monitoring-q60-q2",
+          "question": "在 Kubernetes 集群中查看 `/var/log/pods/` 下的日志文件，发现某些行带有 `P` 标记，另一些带有 `F` 标记。`P` 标记表示什么？",
+          "choices": [
+            {"id": "A", "text": "该行是一条完整日志的中间片段（partial），containerd 因为日志超过 16KB 而将其截断，`F`（final）标记的才是最后一个片段"},
+            {"id": "B", "text": "该行来自 Python 程序的输出，`P` 是 Python 的首字母标识符"},
+            {"id": "C", "text": "该行是优先级（priority）较高的日志，需要优先处理"},
+            {"id": "D", "text": "该行来自 stdout（`P` = print），与来自 stderr 的 `E` 标记相对应"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "containerd 在实现 CRI（Container Runtime Interface）日志格式时，对单行日志有 16384 字节（16KB）的硬限制。当一条日志超过这个限制时，containerd 会把它拆成多个条目：除最后一个外的所有片段都带 `P`（partial）标记，最后一个片段带 `F`（final）标记。完整的 CRI 日志格式是：`<时间戳> <流(stdout/stderr)> <标记(P/F)> <内容>`。如果 Fluent Bit 不处理这个分片，一条超过 16KB 的普通 INFO 日志也会被截断成多个条目，导致内容不完整。B、C、D 三个选项均为无关干扰，`P/F` 是 CRI 规范定义的分片标记，与日志来源和优先级无关。"
+        },
+        {
+          "id": "monitoring-q60-q3",
+          "question": "在 Fluent Bit 配置中，INPUT 阶段的 `multiline.parser docker, cri` 与 FILTER 阶段的 `multiline` 插件各自负责处理哪个层次的问题？",
+          "choices": [
+            {"id": "A", "text": "INPUT 阶段处理 containerd/Docker 的 16KB 行分片（P/F 标记），FILTER 阶段处理 Java/Python 应用逻辑上的多行堆栈拼接，两者解决的是不同层次的问题"},
+            {"id": "B", "text": "两者处理的是同一个问题，配置两层是为了冗余容错；只配 INPUT 阶段就够了"},
+            {"id": "C", "text": "INPUT 阶段适用于文件来源，FILTER 阶段适用于网络来源（如 TCP/UDP）；按日志来源选择其一配置"},
+            {"id": "D", "text": "FILTER 阶段已经被废弃，Fluent Bit 2.0 之后所有多行处理都应该在 INPUT 阶段完成"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Fluent Bit 多行处理中最常见的误解。两层配置解决的是完全不同层次的问题：INPUT 阶段的 `multiline.parser docker, cri` 负责识别 CRI 日志格式中的 `P`/`F` 标记，把被 containerd 16KB 限制截断的行重新拼合成完整的单行。FILTER 阶段的 `multiline` 插件才是真正处理 Java/Python 堆栈的多行拼接——它通过正则识别新日志的首行特征，把不匹配的后续行缓存后合并成一个事件。只配 INPUT 层会导致 Java 堆栈仍然被按行拆散；只配 FILTER 层会导致超过 16KB 的行仍然被截断。两层必须同时配置。"
+        },
+        {
+          "id": "monitoring-q60-q4",
+          "question": "Fluent Bit 自定义多行解析器中的 `flush_timeout` 参数设置为 `5000`，其作用是什么？",
+          "choices": [
+            {"id": "A", "text": "当多行缓冲区已有内容，但 5000 毫秒内没有收到新的行时，强制把当前缓冲区的所有内容作为一条完整日志输出，防止低流量时日志长期卡在缓冲区"},
+            {"id": "B", "text": "设置 Fluent Bit 与 Loki 之间网络连接的超时时间为 5000 毫秒"},
+            {"id": "C", "text": "当缓冲区等待超过 5000 毫秒时，丢弃当前缓冲区的内容并重新开始，避免内存泄漏"},
+            {"id": "D", "text": "控制 Fluent Bit 每隔 5000 毫秒检查一次新的日志文件，调节采集频率"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "flush_timeout 是多行处理中极其重要但容易被忽略的参数。多行解析器在缓冲一个事件时，必须「等待」后续行才能确认当前事件是否结束——它通过首行正则来判断新事件的开始。对于一个活跃的服务，这没问题，因为很快就会有下一条日志到来，触发「新首行」检测并把之前的缓冲输出。但对于日志量较少的服务，最后一条异常之后可能很长时间没有新日志，缓冲区就永远无法正常输出。flush_timeout 正是为了解决这个问题：超过指定时间后强制输出。建议设置 5000-10000 毫秒。C 选项描述的「丢弃」行为是危险的，实际行为是输出而不是丢弃。"
+        },
+        {
+          "id": "monitoring-q60-q5",
+          "question": "以下 Fluent Bit 多行解析器配置中，`rule \"start_state\" \"/^\\\\d{4}-\\\\d{2}-\\\\d{2}/\" \"cont\"` 里的 `\"cont\"` 表示什么含义？",
+          "choices": [
+            {"id": "A", "text": "当解析器处于 `cont` 状态时，收到不匹配 start_state 正则的行，该行被追加到当前缓冲区中（作为多行日志的延续行）"},
+            {"id": "B", "text": "`cont` 是 continue 的缩写，表示找到首行后立即结束当前事件并继续读取下一条"},
+            {"id": "C", "text": "`cont` 是另一个解析器的名字，匹配首行后会切换到名为 `cont` 的解析器处理后续内容"},
+            {"id": "D", "text": "`cont` 表示延续行也要重新匹配 start_state 正则，匹配成功才追加，不匹配则丢弃"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Fluent Bit multiline 解析器是一个有限状态机（FSM）。每条 rule 定义了：「在某个状态下，如果当前行匹配某个正则，就转移到另一个状态」。`rule \"start_state\" \"/^\\d{4}/\" \"cont\"` 的意思是：在 start_state（初始状态）下，如果一行匹配时间戳正则，就把这行视为新日志的首行，并把状态切换到 `cont`。随后的行：只要不匹配 start_state 的正则，都会在 `cont` 状态下被当作延续行追加到缓冲区。当遇到下一行再次匹配 start_state 的正则时，解析器才会把已有缓冲区输出为一条完整事件，同时把新行视为新事件的首行。B 选项完全相反，`cont` 不表示终止。C 选项错误，`cont` 是状态名，不是解析器名。"
+        },
+        {
+          "id": "monitoring-q60-q6",
+          "question": "处理 Java 服务多行日志问题，下列哪个方案是「从源头解决」而非「在采集层打补丁」？",
+          "choices": [
+            {"id": "A", "text": "使用 logstash-logback-encoder 配置 JSON 格式输出，将整个异常堆栈压入 stack_trace 字段，每条日志输出为单行 JSON，Fluent Bit 只需用 JSON parser 解析，无需多行处理"},
+            {"id": "B", "text": "将 containerd 的日志行限制从 16KB 提高到 1MB，让堆栈不被截断"},
+            {"id": "C", "text": "在 Elasticsearch/Loki 侧配置多行合并规则，在存储层重新拼接被拆散的堆栈"},
+            {"id": "D", "text": "配置 Java 的 log4j2 把所有异常捕获后不打印堆栈，只输出异常类名和消息"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "从源头解决多行问题的核心思路是：不让应用输出多行日志，而不是在下游想办法拼接。logstash-logback-encoder 是 Java 生态里最成熟的 JSON 日志方案，它把完整的堆栈信息序列化到 stack_trace 字段里，整条日志是一行 JSON。这样做有几个额外好处：结构化字段（traceId、userId 等 MDC 字段）自动提取；堆栈深度可控（ShortenedThrowableConverter）；多线程并发异常不再有交错问题。B 选项虽然能缓解 16KB 截断问题，但不解决 Java 多行的根本问题，且修改 containerd 配置需要重启节点，影响面大。C 选项在存储层合并会消耗大量计算资源且实现复杂。D 选项会损失排查信息，不可接受。"
+        },
+        {
+          "id": "monitoring-q60-q7",
+          "question": "Fluentd 的 fluent-plugin-concat 插件中，`timeout_label @TIMEOUT` 参数的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "当等待超时时，把尚未完成的多行缓冲路由到 @TIMEOUT label 单独处理，而不是和正常合并的日志混在一起，方便区分「正常完成」和「超时强制输出」的日志"},
+            {"id": "B", "text": "设置超时时间的单位为毫秒（@TIMEOUT 是毫秒的别名）"},
+            {"id": "C", "text": "将所有超时的日志标记为 ERROR 级别并丢弃，不再向下游传递"},
+            {"id": "D", "text": "指定哪些 label 的日志需要应用超时规则，@TIMEOUT 以外的 label 不受超时影响"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "timeout_label 是 fluent-plugin-concat 提供的一个精细化运维能力。多行处理中的「超时输出」可能有两种情况：正常情况（服务日志量少，最后一条堆栈之后很久没有新日志）；异常情况（首行正则写错了，导致合并永远无法正常触发，只能靠超时输出）。这两种情况输出的日志质量是不同的——前者是完整的，后者可能是只有部分行的「半截堆栈」。通过 timeout_label，你可以把超时输出的日志路由到一个独立的处理分支，在那里打上额外的标记字段（如 `multiline_timeout: true`），存储到单独的 Loki 流里，方便后续监控和排查。A 选项是准确描述。B、C、D 均为无关干扰项，concat 插件没有这些语义。"
+        },
+        {
+          "id": "monitoring-q60-q8",
+          "question": "生产环境中，两个 Java 线程几乎同时抛出异常，导致两个堆栈的行在日志文件中交错排列。在这种情况下，Fluent Bit 的多行 parser 会如何处理？",
+          "choices": [
+            {"id": "A", "text": "多行 parser 会错误地把不同线程的堆栈行混合拼接，产生「张冠李戴」的堆栈，或者在 Thread-2 的首行出现时提前截断 Thread-1 的堆栈"},
+            {"id": "B", "text": "Fluent Bit 会检测到 MDC 中不同的 thread 字段，自动按线程分开拼接，确保堆栈正确归属"},
+            {"id": "C", "text": "多行 parser 会等待两个堆栈都完整输出后，再按时间戳排序并分别合并"},
+            {"id": "D", "text": "Fluent Bit 会检测到交错并放弃合并，把所有行都作为独立事件输出，不做错误的拼接"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是多行处理中最棘手的边界情况，也是「采集层打补丁」方案的根本局限性。Fluent Bit 的多行 parser 是无状态的正则匹配，它只能识别「这一行是新事件的开头还是延续」，无法感知哪些行属于同一个逻辑线程。当 Thread-2 的 ERROR 首行出现时，parser 认为 Thread-1 的堆栈已经结束，把已有缓冲（含 Thread-1 的部分堆栈）输出，然后开始收集 Thread-2 的行——而 Thread-1 剩余的堆栈行因为不匹配首行正则，会被错误地合并到 Thread-2 的事件里。这就是为什么高并发场景下仅靠采集层多行处理是不可靠的，必须从源头用 JSON 单行输出解决。"
+        },
+        {
+          "id": "monitoring-q60-q9",
+          "question": "在 Loki 的 Promtail pipeline 中配置了 `multiline` stage，同时 Fluent Bit 也配置了 FILTER 阶段的多行合并。这种双重配置会导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "Fluent Bit 已将 50 行堆栈合并成 1 行，Loki 的 multiline stage 会把这 1 行当作「等待后续行」的首行继续缓冲，最终只能靠 max_wait_time 超时输出，导致日志延迟增加且可能乱序"},
+            {"id": "B", "text": "双重处理会使堆栈信息更完整，两层合并互为补充，建议同时开启"},
+            {"id": "C", "text": "Promtail 的 multiline stage 会自动检测数据已被合并，跳过处理不产生副作用"},
+            {"id": "D", "text": "双重配置会导致 Loki 存储容量翻倍，因为相同内容被写入了两次"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "两层多行处理叠加是一个典型的误配置场景。Fluent Bit FILTER 阶段已经把 50 行 Java 堆栈合并成了 1 行，这 1 行虽然内容包含换行符转义序列，但作为日志事件它只有一行。当这条「1 行日志」到达 Promtail 的 multiline stage 时，stage 会用 `firstline` 正则匹配它——如果匹配成功（时间戳开头），就把它放入缓冲区，等待下一条「不匹配首行」的延续行。但下一条日志也是正常的 INFO 单行日志，也匹配首行正则，于是之前的缓冲被输出。整个过程引入了额外的 max_wait_time 延迟，在低流量时影响尤其明显。更严重的是，如果两者的首行正则识别不一致，会出现部分事件被二次拆分的情况。正确做法：选择一层处理，不要叠加。"
+        },
+        {
+          "id": "monitoring-q60-q10",
+          "question": "你已经在 Fluent Bit 配置了多行处理，但在 Grafana 里仍然看到 Java 堆栈被拆成多个独立日志条目。应该首先排查哪个方向？",
+          "choices": [
+            {"id": "A", "text": "检查 INPUT 阶段是否配置了 `multiline.parser cri`——若未配置，containerd 的 16KB 分片会使行在进入 FILTER 阶段前就已经被截断破坏，导致 FILTER 的首行正则无法正确匹配"},
+            {"id": "B", "text": "重启 Loki 服务清除缓存，旧数据中的碎片日志有时会影响新日志的展示"},
+            {"id": "C", "text": "增大 Fluent Bit 的 `Mem_Buf_Limit` 参数，内存不足会导致多行缓冲被强制截断"},
+            {"id": "D", "text": "检查 Loki 的 `retention_period` 配置，日志保留时间太短会导致部分行被提前清除"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Fluent Bit 多行调试中最常见的陷阱。当 INPUT 阶段没有配置 `multiline.parser cri` 时，containerd 的 16KB 分片中带 `P` 标记的行会作为单独的原始行进入后续处理管道。这些 `P` 标记行的内容是截断后的片段，可能不完整，而且 `F` 标记行的内容是剩余部分，两者连起来才是完整的一行。FILTER 阶段的首行正则通常是匹配完整的时间戳，但 `P` 行的末尾可能恰好截断在时间戳中间，导致下一个 `F` 行无法被正确识别为延续行。排查步骤：先用 `kubectl exec` 直接 `cat` 原始日志文件确认是否有 `P`/`F` 标记，再检查 Fluent Bit 配置的 INPUT 部分，确认两层 multiline 都已配置。"
+        }
+      ],
+      "references": [
+        "https://docs.fluentbit.io/manual/administration/configuring-fluent-bit/multiline-parsing",
+        "https://docs.fluentbit.io/manual/pipeline/filters/multiline-stacktrace",
+        "https://github.com/fluent-plugins-nursery/fluent-plugin-concat",
+        "https://grafana.com/docs/loki/latest/send-data/promtail/stages/multiline/",
+        "https://github.com/logfellow/logstash-logback-encoder",
+        "https://github.com/madzak/python-json-logger"
+      ]
+    }
+  ]
+}
