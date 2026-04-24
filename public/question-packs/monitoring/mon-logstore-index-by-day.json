@@ -1,0 +1,156 @@
+{
+  "id": "monitoring-q71",
+  "name": "日志索引策略：按天切分 Index",
+  "domain": "monitoring",
+  "description": "理解 Elasticsearch 日志索引按天切分的核心原因，掌握 ILM 策略、索引模板与 Rollover API 的完整配置方法",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q71",
+      "domain": "monitoring",
+      "type": "env-config",
+      "difficulty": 2,
+      "tags": ["elasticsearch", "ILM", "index-lifecycle", "logging", "kibana", "shard-sizing", "rollover"],
+      "title": "日志索引为什么要按天切分，怎么用 ILM 配置？",
+      "content": "你的团队维护一套基于 Elasticsearch 8.x 的日志平台，目前所有服务日志都统一写入一个名为 `app-logs` 的单一索引。该索引运行三个月后已累积约 820GB 的数据，主分片数为 5，副本数为 1。近期出现以下三个问题，已影响到日常运维：\n\n1. 时间范围查询性能严重劣化：`@timestamp: [now-7d TO now]` 的响应时间从最初的 200ms 劣化到 4.2s，偶发超时\n2. 历史日志清理极其耗时：每次用 `delete_by_query` 删除 30 天前的日志，单次操作耗时超过 45 分钟，且期间集群 CPU 持续飙升至 85%\n3. `forcemerge` 操作失控：每天凌晨的 forcemerge 作业耗时从最初 30 分钟增长到 4 小时以上，已开始与正常写入窗口重叠\n\n下面是当前的索引配置：\n\n```json\nPUT /app-logs\n{\n  \"settings\": {\n    \"number_of_shards\": 5,\n    \"number_of_replicas\": 1,\n    \"refresh_interval\": \"1s\"\n  },\n  \"mappings\": {\n    \"properties\": {\n      \"@timestamp\": { \"type\": \"date\" },\n      \"level\":      { \"type\": \"keyword\" },\n      \"service\":    { \"type\": \"keyword\" },\n      \"message\":    { \"type\": \"text\" }\n    }\n  }\n}\n```\n\n请分析：为什么应该将这个单一索引改为按天切分策略？改造后如何配置 ILM 策略、索引模板和 Rollover API？单分片应该控制在多大？如果业务日志量某天暴增 10 倍，纯时间切分和 Rollover API 哪种方式更稳健？请给出完整的配置示例和说明。",
+      "answer": "## 为什么单一巨型索引是个性能陷阱\n\n题目里描述的三个问题——查询变慢、删除耗时、forcemerge 失控——不是偶然现象，它们是所有日志平台在坚持使用单一索引策略时必然会走向的终点。820GB 的 `app-logs` 只是一个中间状态，如果不改造，六个月后就是 1.6TB，一年后就是 3TB，问题会指数级恶化。\n\n理解为什么要按天切分，要先理解 Elasticsearch 的分片（shard）查询模型。一个 ES 索引被切分成若干个主分片，每个分片本质上是一个独立的 Lucene 实例，内部由多个不可变的 segment 文件组成。当你执行 `@timestamp: [now-7d TO now]` 这样的时间范围查询时，如果整个 820GB 都在一个索引里，ES 必须并行扫描所有 5 个分片的所有 segment 文件——即使其中 90% 的数据是 30 天前的历史日志，对这次查询毫无价值，它们也必须被扫到。这就是查询劣化到 4.2s 的直接原因。\n\n而按天切分后，索引变成 `app-logs-2024.01.15`、`app-logs-2024.01.16` 这样的序列，每个约 25-30GB。查询「过去 7 天」只需命中 7 个索引，更重要的是，Elasticsearch 的查询规划器会利用「索引剪枝（index pruning）」在执行阶段直接跳过所有日期不匹配的索引，根本不打开它们的分片。这是时间序列数据在任何现代数据库中都使用时间分区的核心原因：ClickHouse 的 partition by toYYYYMMDD，TimescaleDB 的 hypertable chunk，以及 ES 的按天索引，本质上都是同一个思路。\n\n按天切分的第二个巨大优势是生命周期管理的成本降至极低。`delete_by_query` 要找到每条文档、写入删除标记、等待下次 segment merge 才能真正释放磁盘空间，这个过程是 O(文档数) 的扫描，820GB 对应数亿条日志，耗时 45 分钟完全正常。但 `DELETE /app-logs-2024.12.01` 删除整个索引只需要不到 1 秒——ES 只是删除 Lucene segment 文件和集群元数据，没有任何文档级别的扫描。这一点对于有合规要求（日志保留 90 天后必须彻底删除）的团队来说尤为关键，drop index 是唯一能保证数据彻底删除的方式。\n\n## ILM 策略：四阶段生命周期的完整配置\n\n理解了为什么要切分，下一步是用 ILM（Index Lifecycle Management）把整个过程自动化。ILM 是 Elasticsearch 7.0 引入的官方生命周期管理方案，把索引的一生分为四个阶段：`hot`（写入活跃期）、`warm`（只读查询期）、`cold`（低频冷访问期）和 `delete`（到期销毁期）。每个阶段可以设置触发条件和自动执行的操作。\n\n针对每天写入约 20-30GB 日志的场景，一套经过生产验证的 ILM 配置如下：\n\n```json\nPUT _ilm/policy/logs-policy\n{\n  \"policy\": {\n    \"phases\": {\n      \"hot\": {\n        \"min_age\": \"0ms\",\n        \"actions\": {\n          \"rollover\": {\n            \"max_age\": \"1d\",\n            \"max_primary_shard_size\": \"50gb\"\n          },\n          \"set_priority\": { \"priority\": 100 }\n        }\n      },\n      \"warm\": {\n        \"min_age\": \"1d\",\n        \"actions\": {\n          \"forcemerge\": { \"max_num_segments\": 1 },\n          \"shrink\":     { \"number_of_shards\": 1 },\n          \"allocate\":   { \"require\": { \"data\": \"warm\" } },\n          \"set_priority\": { \"priority\": 50 }\n        }\n      },\n      \"cold\": {\n        \"min_age\": \"7d\",\n        \"actions\": {\n          \"allocate\": { \"require\": { \"data\": \"cold\" } },\n          \"freeze\":   {},\n          \"set_priority\": { \"priority\": 0 }\n        }\n      },\n      \"delete\": {\n        \"min_age\": \"30d\",\n        \"actions\": {\n          \"delete\": {}\n        }\n      }\n    }\n  }\n}\n```\n\n`hot` 阶段的 rollover 同时设了 `max_age: 1d` 和 `max_primary_shard_size: 50gb` 两个条件，任意一个触发都会创建新索引。50GB 是 Elastic 官方建议的单个主分片上限，Lucene 在这个尺寸以内的 segment merge 和 page cache 效率最优，超过后 forcemerge 耗时会急剧上升。这就是为什么有必要同时设大小条件：业务大促期间单日流量可能暴增，仅靠时间条件会产生一个 300GB 的怪物索引，而双条件保证每片始终可控。\n\n`warm` 阶段的 `forcemerge + shrink` 组合是只读索引的标准优化套餐。forcemerge 把该索引的所有 segment 文件强制合并成 1 个——由于索引已不再写入，单 segment 能消除 segment 合并的后台开销，并显著提升查询的 segment 扫描效率。shrink 把分片数从 5 个缩减到 1 个（要求源索引所有分片在同一节点上），直接减少 cluster state 中的分片元数据体积，对大规模集群的 master 节点 GC 压力有明显改善。`cold` 阶段的 `freeze` 会关闭索引的 translog 和 fielddata 内存结构，使索引进入按需加载模式，访问时才会把数据载入内存。这对低频访问的冷数据非常划算，代价是首次查询会有几百毫秒的加载延迟。\n\n## 索引模板：让每次 Rollover 的新索引自动继承配置\n\n仅有 ILM 策略还不够，还需要一个索引模板（index template）让 rollover 创建的每个新索引都自动继承正确的配置和映射：\n\n```json\nPUT _index_template/logs-template\n{\n  \"index_patterns\": [\"app-logs-*\"],\n  \"template\": {\n    \"settings\": {\n      \"number_of_shards\": 3,\n      \"number_of_replicas\": 1,\n      \"index.lifecycle.name\": \"logs-policy\",\n      \"index.lifecycle.rollover_alias\": \"app-logs\",\n      \"index.routing.allocation.require.data\": \"hot\"\n    },\n    \"mappings\": {\n      \"properties\": {\n        \"@timestamp\": { \"type\": \"date\" },\n        \"level\":      { \"type\": \"keyword\" },\n        \"service\":    { \"type\": \"keyword\" },\n        \"message\":    { \"type\": \"text\", \"norms\": false }\n      }\n    }\n  },\n  \"priority\": 200\n}\n```\n\n`index.lifecycle.rollover_alias: \"app-logs\"` 是整个机制的关键所在。你的应用程序（Filebeat、Logstash 或者自研 SDK）始终向别名 `app-logs` 写入日志，ILM 在触发 rollover 时会自动创建 `app-logs-000001`、`app-logs-000002` 这样编号递增的物理索引，并把写别名切换到最新索引。应用程序完全不感知索引的切换，这就是 rollover 别名设计的核心价值。还要注意 `message` 字段设置了 `norms: false`——norms 是 Lucene 用于全文相关性评分的字段级别权重信息，日志场景通常不需要评分排序，关掉 norms 可以节省约 15-20% 的存储空间，写入量大的集群里这个数字相当可观。\n\n初始化时需要手动创建第一个写索引并绑定别名：\n\n```bash\n# 创建初始索引，is_write_index: true 表示这是当前活跃的写入目标\nPUT app-logs-000001\n{\n  \"aliases\": {\n    \"app-logs\": {\n      \"is_write_index\": true\n    }\n  }\n}\n```\n\n之后的 rollover 由 ILM 全程接管，无需人工干预。\n\n## Rollover API 与纯时间切分的选择依据\n\n不少同学会问：Filebeat 本身支持按日期命名写入索引（`app-logs-%{+YYYY.MM.dd}` 这种 date math 格式），为什么不直接用这种方式？对于写入量稳定的场景，两种方式都可以工作；但 Rollover API 的优势在于同时管控时间和大小两个维度。业务大促期间某天日志量从 25GB 暴增到 250GB，纯时间切分会让你得到一个单分片 250GB / 5 = 50GB 但总体 250GB 的巨型索引，forcemerge 和 warm 迁移都会成为噩梦。而 Rollover API 会在这一天触发多次 rollover，自动切出多个 50GB 以内的索引，整个集群始终处于可控状态。\n\n## 常见的两类反模式\n\n最后有两个在生产环境里反复出现的错误值得专门说一下。第一类是**切分粒度过细**：有团队按「服务名 + 日期 + 小时」切分日志，一天产生几百个索引，数周后集群的 cluster state（存储在 master 节点 JVM 堆内存中的全量元数据）体积急剧膨胀，master 节点频繁 Full GC，整个集群开始出现随机超时。Elastic 的经验法则是：集群每 GB JVM 堆不超过 20 个分片（比如 master 节点 30GB 堆，集群总分片数建议不超过 600），单集群索引数通常不要超过几万。第二类是**切分粒度过粗**：有团队用一个月一个索引、主分片 10 个的配置，结果单个分片达到 80-100GB，不仅 warm 阶段的 forcemerge 以天计，cold 阶段的 freeze 操作也极度缓慢。50GB per primary shard 这个上限不是随便说说的，它是 Lucene 在内存映射、segment merge 调度和 OS page cache 利用率上综合表现最优的拐点区间。",
+      "keyPoints": [
+        "按天切分索引让 ES 在时间范围查询时利用索引剪枝（index pruning）直接跳过不相关的索引，避免扫描全量分片，是查询从秒级降回毫秒级的根本机制",
+        "删除历史日志时 DELETE 整个索引只需不到 1 秒，而 delete_by_query 需要标记文档并等待 segment merge 才真正释放空间，820GB 索引耗时 45 分钟属于正常现象",
+        "ILM 四阶段（hot/warm/cold/delete）配合 rollover 双条件（max_age + max_primary_shard_size），同时管控时间和大小，防止业务流量波动导致单索引体积失控",
+        "单个主分片 50GB 是 Elastic 官方推荐上限，超过后 Lucene segment merge 效率下降，forcemerge 耗时从分钟级升至小时级",
+        "rollover_alias 配置使应用程序始终向固定别名写入，ILM 在后台自动管理物理索引的创建与别名切换，写入方无需感知索引名变化",
+        "warm 阶段的 forcemerge（合并成单 segment）+ shrink（缩减分片数）是只读索引降低存储和 cluster state 压力的标准组合操作",
+        "按小时 + 服务名切分是典型的过度切分反模式，会导致集群分片总数爆炸，master 节点 cluster state 膨胀引发 Full GC，进而造成整个集群随机超时"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q71-q1",
+          "question": "Elasticsearch 按天切分日志索引后，`@timestamp: [now-7d TO now]` 查询性能提升的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "ES 的索引剪枝机制可以在查询规划阶段直接跳过日期不匹配的索引，7 天查询只需扫描 7 个索引的分片而非全量数据"},
+            {"id": "B", "text": "按天切分后每个索引的 segment 数量减少，Lucene 的 segment 合并更快"},
+            {"id": "C", "text": "按天切分后索引使用了更多副本，并行查询能力提升"},
+            {"id": "D", "text": "按天切分后 refresh_interval 自动调整，实时性更好导致查询命中缓存的概率更高"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "按天切分后 ES 能利用索引剪枝（index pruning）在查询规划阶段将不在时间范围内的索引完全排除，根本不打开这些索引的分片。这与 ClickHouse 的分区裁剪、MySQL 的分区表裁剪原理相同——让存储引擎在数据扫描前就通过元数据过滤掉无关分区。B 选项混淆了 segment 数量与性能的关系，segment 数量影响的是合并开销而非查询跳过能力。C 选项与切分策略无关，副本数配置独立于索引切分方式。D 选项完全错误，refresh_interval 不会因切分策略改变，缓存命中率也与此无关。"
+        },
+        {
+          "id": "monitoring-q71-q2",
+          "question": "为什么 `DELETE /app-logs-2024.12.01` 删除整个索引的速度远快于 `delete_by_query` 删除同等数据量的文档？",
+          "choices": [
+            {"id": "A", "text": "delete_by_query 是同步操作而 DELETE index 是异步操作"},
+            {"id": "B", "text": "DELETE index 直接删除 Lucene segment 文件和元数据，无需扫描文档；delete_by_query 需要标记每条文档为已删除并等待 segment merge 才能真正释放空间"},
+            {"id": "C", "text": "delete_by_query 执行时需要获取全局写锁，而 DELETE index 不需要"},
+            {"id": "D", "text": "两者速度相同，区别只在于 DELETE index 会立即释放别名绑定"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Lucene（ES 的底层存储引擎）中的文档删除本质上是「软删除」：delete_by_query 只是在 segment 的删除位图（del bitmap）中把对应文档标记为已删除，数据并未真正从磁盘消失，需要等到下次 segment merge 时才会被物理清除。对于 820GB 的索引，merge 过程可能耗时数十分钟，期间 I/O 和 CPU 都在高负载。而 DELETE index 相当于删除整个文件夹，ES 直接调用文件系统的 unlink 操作移除所有 segment 文件，时间复杂度是 O(文件数) 而非 O(文档数)，通常不到 1 秒。A 选项错误，两者都有同步确认机制。C 选项的「全局写锁」说法不准确，ES 的锁粒度在分片级别。"
+        },
+        {
+          "id": "monitoring-q71-q3",
+          "question": "ILM rollover 配置了 `max_age: 1d` 和 `max_primary_shard_size: 50gb` 两个条件，下列描述正确的是？",
+          "choices": [
+            {"id": "A", "text": "必须两个条件同时满足才会触发 rollover"},
+            {"id": "B", "text": "任意一个条件满足即触发 rollover，哪个先达到哪个生效"},
+            {"id": "C", "text": "max_age 优先级高于 max_primary_shard_size，只有 max_age 到期后才检查大小"},
+            {"id": "D", "text": "max_primary_shard_size 指的是所有分片的总大小，不是单个分片"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ILM 的 rollover 条件采用 OR 逻辑，任意一个条件满足即触发。这种双条件设计正是为了应对流量不均匀的场景：正常日子 max_age（1 天）先到期触发 rollover；大促期间流量暴增，max_primary_shard_size（50GB）先达到，当天可能触发多次 rollover，避免单索引体积失控。A 选项的 AND 逻辑是错误理解，如果要求两个条件都满足，大流量时单索引可能远超 50GB 才触发切分，失去了大小保护的意义。C 选项的优先级说法不存在于 ES 的实现中。D 选项错误，max_primary_shard_size 指的是单个主分片的最大大小，超过这个阈值就触发 rollover。"
+        },
+        {
+          "id": "monitoring-q71-q4",
+          "question": "索引模板中配置 `index.lifecycle.rollover_alias: \"app-logs\"` 的核心作用是什么？",
+          "choices": [
+            {"id": "A", "text": "让查询请求自动路由到最新的物理索引，提升查询性能"},
+            {"id": "B", "text": "标记这个别名为写别名，ILM 在 rollover 时会自动创建新物理索引并将写别名切换到新索引，应用程序无需感知索引名变化"},
+            {"id": "C", "text": "定义索引的命名规则，ILM 会按照别名+日期的格式自动生成索引名"},
+            {"id": "D", "text": "将多个物理索引合并展示为一个逻辑索引，方便 Kibana 查询"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "rollover_alias 是 ILM rollover 机制的写入路由核心。应用程序（Filebeat、Logstash 等）始终向固定别名 `app-logs` 写入，完全不关心底层物理索引是 app-logs-000001 还是 app-logs-000023。ILM 在 rollover 时会：1）创建新物理索引（如 app-logs-000024）；2）将 is_write_index 从旧索引切换到新索引；3）旧索引保留在别名中但只可读。整个切换过程无需重启应用或修改配置，做到了写入方与索引生命周期的完全解耦。A 选项描述的是查询别名的功能，与写 rollover 无关。C 选项错误，ILM 使用自增数字编号（000001、000002）而非日期格式。D 选项是 Kibana index pattern 通配符的功能，不是 rollover_alias 的作用。"
+        },
+        {
+          "id": "monitoring-q71-q5",
+          "question": "在 warm 阶段同时执行 `forcemerge（max_num_segments: 1）` 和 `shrink（number_of_shards: 1）` 的目的分别是什么？",
+          "choices": [
+            {"id": "A", "text": "forcemerge 用于节省磁盘空间，shrink 用于提升写入性能"},
+            {"id": "B", "text": "forcemerge 将所有 segment 合并成单个 segment 消除后台 merge 开销并提升查询效率，shrink 减少分片数降低 cluster state 体积和 master 节点的元数据压力"},
+            {"id": "C", "text": "forcemerge 和 shrink 功能相同，只是针对不同版本的 ES 的兼容写法"},
+            {"id": "D", "text": "forcemerge 用于将数据从热节点迁移到暖节点，shrink 用于压缩索引编码格式"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "两个操作针对的是不同层面的优化。forcemerge 操作在 Lucene 层面把该索引的所有 segment 文件合并成 1 个：由于 warm 阶段的索引不再接受写入，不需要担心频繁合并影响写入性能，单 segment 消除了 Lucene 的多 segment 扫描和后台合并调度开销，查询时只需遍历一个 segment 的倒排索引。shrink 操作在 ES 层面把 5 个主分片缩减为 1 个（前提是所有分片已迁移到同一节点）：每个分片在 cluster state 中都有元数据记录，大量小分片会让 master 节点的内存占用和序列化开销显著增加。A 选项错误，shrink 不会提升已经只读的索引的写入性能。C 选项完全错误，两者操作的对象不同。D 选项错误，迁移到暖节点是通过 allocate 操作完成的。"
+        },
+        {
+          "id": "monitoring-q71-q6",
+          "question": "某团队将日志按「服务名 + 日期 + 小时」切分，三个月后集群出现 master 节点频繁 Full GC 导致随机超时。最可能的直接原因是？",
+          "choices": [
+            {"id": "A", "text": "按小时切分导致每天产生数百个索引，集群 cluster state 体积暴增，master 节点 JVM 堆因频繁序列化 cluster state 而被撑满"},
+            {"id": "B", "text": "小时级索引的 segment 数量多，数据节点写入时产生大量小文件导致 PageCache 被打满"},
+            {"id": "C", "text": "Kibana 的 index pattern 匹配了过多索引，前端渲染超时引发 master 超时"},
+            {"id": "D", "text": "按小时切分时 ILM 的 rollover 检查频率变高，大量 ILM 轮询任务占满了 master 的线程池"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "cluster state 是 Elasticsearch master 节点在 JVM 堆内存中维护的全量集群元数据，包含所有索引的 settings、mappings、shard 路由表等信息。每个索引有 N 个分片，每个分片在 cluster state 中都有独立条目。假设 20 个服务每天按小时切分，一天产生 20 × 24 = 480 个索引，每个索引 3 主 1 副共 4×3 = 12 个分片条目，一天新增约 5760 个分片。保留 90 天就是约 52 万个分片的元数据。master 节点每次序列化 cluster state 同步给其他节点都要处理这些数据，JVM 频繁 Full GC 几乎是必然结果。Elastic 的参考上限是每 GB master 堆不超过 20 个分片。B 选项的 PageCache 问题通常出现在数据节点而非 master 节点。C、D 选项描述的机制不成立。"
+        },
+        {
+          "id": "monitoring-q71-q7",
+          "question": "相较于 Filebeat 的 date math 索引命名（每天自动写入 `app-logs-2024.01.15` 格式的新索引），使用 ILM Rollover API 最主要的额外优势是什么？",
+          "choices": [
+            {"id": "A", "text": "Rollover API 支持 Kibana 通配符查询而 date math 不支持"},
+            {"id": "B", "text": "Rollover API 可以同时按时间和分片大小双条件触发切分，在流量波动场景下防止单索引因某天写入量暴增而体积失控"},
+            {"id": "C", "text": "Rollover API 创建的索引命名更规范，便于运维人员识别"},
+            {"id": "D", "text": "只有使用 Rollover API 才能配置 warm/cold/delete 阶段，date math 方式不支持 ILM"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "date math 命名方式（如 Logstash 的 `%{+YYYY.MM.dd}` 模板）确实能实现按天切分，在写入量稳定的场景下是可行选项。但它无法控制单索引的大小——某天活动期间日志写入量从 25GB 暴增到 250GB，该天的索引会积累 250GB 而不会自动切分。Rollover API 的双条件（max_age OR max_primary_shard_size）在这一天会触发 5 次 rollover，最终产生 5 个约 50GB 的索引，每个都处于 Lucene 性能最优区间。A 选项错误，两种方式创建的索引都可以用 Kibana 通配符查询。C 选项是主观偏好，不是技术优势。D 选项错误，date math 命名的索引同样可以配置 ILM 策略，只是没有 rollover 条件的 size 保护。"
+        },
+        {
+          "id": "monitoring-q71-q8",
+          "question": "Elasticsearch 官方建议单个主分片的大小上限为 50GB，这个推荐值主要基于哪个维度的考量？",
+          "choices": [
+            {"id": "A", "text": "网络传输限制：超过 50GB 的分片在节点迁移时容易超时"},
+            {"id": "B", "text": "Lucene 在 segment merge 调度、OS page cache 利用率和 forcemerge 耗时等方面在 50GB 以内综合表现最优，超过后性能指标明显拐点下行"},
+            {"id": "C", "text": "JVM 堆内存限制：单个 50GB 分片需要约 5GB JVM 堆，超过后 GC 压力倍增"},
+            {"id": "D", "text": "磁盘寻址限制：单个 segment 文件超过 50GB 时文件系统 inode 读取效率下降"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "50GB per primary shard 的建议来自 Elastic 工程团队基于大量生产集群的实测经验。在 Lucene 层面，超大 shard 主要影响三个方面：第一是 segment merge 的时间和 I/O——forcemerge 一个 100GB shard 可能需要数小时，期间持续占用磁盘 I/O 带宽影响写入；第二是 OS page cache 的碎片化——Lucene 通过 mmap 访问 segment 文件，超大文件会使 page cache 命中率下降；第三是 warm/cold 迁移时间——shrink 操作需要将所有数据读写到目标节点，超大 shard 使迁移窗口延长。A 选项混淆了 shard 迁移超时（这是由 cluster.routing.allocation 超时配置控制的）和大小推荐的关系。C 选项不准确，JVM 堆缓存的是 fielddata 和 filter cache 而不是原始数据大小，两者不是线性关系。D 选项的 inode 说法不成立，Lucene 使用多个 segment 文件而非单个巨型文件。"
+        },
+        {
+          "id": "monitoring-q71-q9",
+          "question": "在 Kibana 中要让时间选择器（time picker）正确过滤 `app-logs-000001` 到 `app-logs-000050` 等多个物理索引，需要如何配置 index pattern？",
+          "choices": [
+            {"id": "A", "text": "为每个物理索引单独创建一个 index pattern，然后在 Discover 中手动切换"},
+            {"id": "B", "text": "创建 `app-logs-*` 通配符 index pattern，Kibana 会自动匹配所有符合模式的物理索引，时间选择器通过 @timestamp 字段过滤跨索引结果"},
+            {"id": "C", "text": "使用 `app-logs-?` 问号通配符，精确匹配单字符后缀"},
+            {"id": "D", "text": "直接输入别名 `app-logs` 作为 index pattern，Kibana 会自动展开别名下的所有索引"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kibana 的 index pattern 支持 `*` 通配符，`app-logs-*` 会匹配所有以 `app-logs-` 开头的物理索引，无论它们是按编号还是按日期命名。创建 index pattern 时选择 `@timestamp` 作为 time field，Kibana 在执行搜索时会将时间选择器的范围转换为对各索引的时间过滤条件，并结合 ES 的索引剪枝来跳过时间范围外的索引。A 选项极其低效，索引数增长后会变得不可维护。C 选项的 `?` 只匹配单个字符，无法匹配 000001 这样的 6 位编号。D 选项在 Kibana 8.x 中通过别名创建 index pattern 是支持的，但通配符模式更通用且不依赖别名配置，是标准做法。"
+        },
+        {
+          "id": "monitoring-q71-q10",
+          "question": "配置完 ILM 和索引模板后，应用程序向别名 `app-logs` 写入日志，但 5 天后发现所有数据仍然写入 `app-logs-000001` 而没有发生 rollover，最可能的原因是？",
+          "choices": [
+            {"id": "A", "text": "ILM 策略的 `min_age` 设置为 0ms，导致索引创建后立即进入 warm 阶段，无法接受写入"},
+            {"id": "B", "text": "`app-logs-000001` 在创建时没有将 `is_write_index` 设为 true，别名中没有指定活跃写索引，ILM 的 rollover 操作因找不到写索引而跳过执行"},
+            {"id": "C", "text": "rollover 需要手动调用 API 触发，ILM 无法自动执行 rollover"},
+            {"id": "D", "text": "索引模板的 priority 设置为 200 太高，与内置模板冲突导致 ILM 策略未被正确应用"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 ILM rollover 配置中最常见的初始化陷阱。rollover 操作要求别名中必须有且仅有一个索引被标记为 `is_write_index: true`，ILM 通过这个标记来确定当前活跃的写索引，并在 rollover 时将写标记从旧索引转移到新索引。如果初始化时没有设置 `is_write_index: true`，ES 会拒绝执行 rollover，并在 `.kibana` 的 ILM explain API 中返回类似 `\"step_info\": {\"reason\": \"index.lifecycle.rollover_alias does not point to index\"}` 的错误信息。排查命令：`GET app-logs-000001/_ilm/explain` 查看 ILM 执行状态，`GET _alias/app-logs` 确认别名配置是否含 `is_write_index`。A 选项错误，min_age: 0ms 表示进入该阶段没有等待时间，不会影响 hot 阶段的写入。C 选项错误，ILM 会按 `indices.lifecycle.poll_interval`（默认 10 分钟）自动轮询执行。D 选项的 priority 冲突不会以这种方式体现。"
+        }
+      ],
+      "references": [
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/index-lifecycle-management.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/ilm-rollover.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/index-templates.html",
+        "https://www.elastic.co/blog/how-many-shards-should-i-have-in-my-elasticsearch-cluster"
+      ]
+    }
+  ]
+}
