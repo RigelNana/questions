@@ -1,0 +1,167 @@
+{
+  "id": "monitoring-q30",
+  "name": "Prometheus Staleness 机制",
+  "domain": "monitoring",
+  "description": "深入解析 Prometheus 如何通过 Staleness Marker 处理消失的时间序列，以及对 PromQL 查询、告警评估、federation 和 remote_write 的影响",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q30",
+      "domain": "monitoring",
+      "type": "principle",
+      "difficulty": 4,
+      "tags": ["prometheus", "staleness", "tsdb", "promql", "alerting", "federation", "remote_write", "stale-nan"],
+      "title": "Prometheus 的 Staleness 机制是如何处理消失的时间序列的？",
+      "content": "你在维护一套 Prometheus + Alertmanager 的监控系统。某天下午，一台服务器下线了，上面跑着 node_exporter。几分钟后你发现一个奇怪的现象：Grafana 面板显示「No data」，但同时你配置的「主机宕机」告警（基于 `up == 0`）没有触发，而是从「Firing」直接变成了「Resolved」，然后彻底从 Alertmanager 里消失了。\n\n再看另一个场景：你用 PromQL 查询一个刚刚从 scrape 列表中移除的指标，在某个时间点之后 `rate()` 函数突然返回空，而不是继续用最后一个已知值计算。这两个现象背后，指向同一个机制：Staleness。\n\n大部分工程师知道 Prometheus 有「5 分钟 lookback 窗口」，但很少有人能说清楚 staleness marker 的本质是什么、它和「数据缺失」有什么区别，以及为什么 federation 集群的告警行为会和单机 Prometheus 不一样。\n\n以下是一个触发 staleness 的典型场景：\n\n```\n# 正常采集时（scrape_interval=15s）\nnode_cpu_seconds_total{cpu=\"0\",mode=\"idle\"} 12345.6  @1700000000\nnode_cpu_seconds_total{cpu=\"0\",mode=\"idle\"} 12346.8  @1700000015\nnode_cpu_seconds_total{cpu=\"0\",mode=\"idle\"} 12348.1  @1700000030\n\n# target 下线，下一次 scrape 时该 metric 从响应中消失\n# Prometheus 在 @1700000045 主动写入：\nnode_cpu_seconds_total{cpu=\"0\",mode=\"idle\"} <StaleNaN>  @1700000045\n\n# 此后 PromQL 查询结果：\n# instant query @1700000060 → 返回空（not NaN，而是 no data）\n# rate(node_cpu_seconds_total[5m]) @1700000060 → 返回空\n```\n\n请解释：Prometheus 的 staleness 机制是如何工作的？Staleness marker 与数据缺失（gap）有何本质区别？当 target 完全失联时又是什么行为？它对告警评估、federation 和 remote_write 分别有什么影响？",
+      "answer": "## Prometheus 的采集模型与 TSDB 基础\n\nPrometheus 是一个拉取式（pull-based）监控系统，每隔 `scrape_interval`（通常配置为 15s 或 30s）主动向 target 发起 HTTP 请求，解析返回的 text exposition format，然后把每个 `{metric_name + label_set}` 组合作为一条独立的时间序列写入本地 TSDB。\n\nTSDB 的底层是以 chunk 为单位的压缩存储：每条序列的样本按时间排列，连续的浮点数用 Gorilla XOR delta 编码压缩存储在 2 小时的 chunk 文件中。每个样本是一个 `(timestamp int64, value float64)` 的二元组。注意这里的 `value` 是标准 IEEE 754 的 `float64`，这个细节对理解 staleness marker 的实现至关重要。\n\nPrometheus 用标签集（label set）唯一标识一条时间序列。`node_cpu_seconds_total{cpu=\"0\",mode=\"idle\",instance=\"10.0.0.1:9100\",job=\"node\"}` 是一条独立序列，其 label fingerprint 用于在内存的倒排索引和磁盘的 chunk 文件里定位数据。当你停掉 node_exporter，或者在采集配置里移除某个 target，Prometheus 就再也收不到这条序列的新样本了。TSDB 的问题随之而来：它怎么区分「这条序列彻底结束了」和「这条序列暂时没有数据（网络抖动）」？这正是 staleness 机制要解决的核心问题。\n\n## Staleness Marker：一个特殊的 NaN 墓碑\n\nPrometheus 的解法是在检测到序列消失时主动写入一个特殊的 float64 值，也就是 **staleness marker**。它的本质是一个特定 bit pattern 的 IEEE 754 NaN 值，在 Prometheus 源码（`model/value.go`）里被命名为 `StaleNaN`，其 bit 表示为 `0x7ff0000000000002`，可以用 Go 代码 `math.Float64frombits(0x7ff0000000000002)` 复现。之所以选用特殊 NaN 而不是普通 NaN（`0x7ff8000000000001`），是因为用户业务数据里也可能出现 NaN（比如 0/0 这样的计算），Prometheus 需要区分「用户数据里的合法 NaN」和「系统注入的序列终止标记」。\n\nPromQL 引擎遇到 staleness marker 时的行为很特别：它不把这个值当作可查询的样本，而是把它当作一个「墓碑（tombstone）」信号，告诉引擎「这条序列在这个时间点之后就不存在了」。即时查询（instant query）和范围查询（range query）如果查询窗口覆盖了 staleness marker 的时间点，该序列会从结果集中完全消失，返回的不是 NaN，而是 no data——这就是为什么你会看到 Grafana 面板显示「No data」而不是一条值为 NaN 的折线。\n\n**staleness marker 的注入时机**：当一次 scrape 成功完成，但上次 scrape 里存在的某条序列在本次响应中不见了，Prometheus 就会为那条消失的序列写入 staleness marker，时间戳等于本次 scrape 的时间。这发生在两种场景下：target 整体被从配置里移除（比如 k8s pod 被删除后服务发现更新），或者 target 仍在但某些指标 label 组合消失了（比如某个磁盘设备被移除，`node_disk_io_seconds_total{device=\"sdb\"}` 就消失了）。\n\n## Gap 与 Staleness：被动等待 vs 主动终止\n\nStaleness marker 和数据缺失（gap）的本质区别在于主动性：**gap 是被动的**，Prometheus 在 `--query.lookback-delta`（默认 5 分钟）内找不到样本时返回空；**staleness marker 是主动的**，写入后无论 lookback-delta 设置多大，在 marker 之后都不会有数据。\n\n用三种具体情况对比，设 `scrape_interval=15s`，`lookback-delta=5m`：\n\n**情况 A — 网络抖动（gap）**：@T 时刻 scrape 超时失败，@T+15s 成功恢复。在 @T+30s 查询时，PromQL 向前回溯 5 分钟能找到 @T+15s 的样本，返回正常值。这是 gap，Prometheus 不写任何 staleness marker。\n\n**情况 B — 序列消失（staleness marker）**：@T 时刻 scrape 成功，但响应里 `node_cpu_seconds_total{cpu=\"2\"}` 不见了（CPU 被热插拔移除）。Prometheus 在 TSDB 里为该序列写入 staleness marker @T。之后任何查询，哪怕 lookback-delta 是 1 小时，也看不到这条序列。\n\n**情况 C — Target 完全失联**：target 宕机后 Prometheus 发出 HTTP 请求但连接超时，scrape 直接失败。此时 Prometheus 什么都不写，包括不写 staleness marker。`up` 指标会被写为 0（Prometheus 为无法连接的 target 主动写入 `up=0`），但其他指标（如 `node_cpu_seconds_total`）会进入 gap 状态，在 5 分钟 lookback-delta 内仍然可查，超过后才变成 no data。\n\n这个区别在生产中非常重要：如果你的 target 是「优雅停止后被从服务发现移除」（情况 B），和「突然宕机」（情况 C），PromQL 和告警的行为是完全不同的。\n\n## 对告警评估的影响：一个隐蔽的坑\n\nStaleness 机制对告警的影响是面试中最常考到的坑，也是生产中最容易出错的地方。考虑这条告警：\n\n```yaml\n- alert: InstanceDown\n  expr: up == 0\n  for: 2m\n```\n\n当一个 k8s pod 被 kubectl delete 删除后，Prometheus 的 kubernetes_sd 立刻感知到 target 消失，停止 scrape，并为 `up{instance=\"pod-ip:port\"}` 序列写入 staleness marker。告警引擎在下一次评估（默认每 1 分钟）时，计算 `up == 0`，由于 `up` 序列已被 staleness marker 终止，表达式返回 no data，而不是 `up=0`。告警条件不成立，告警直接进入 inactive 状态，从 Alertmanager 里 resolve 掉，整个过程完全没有经历 pending → firing 的阶段。\n\n如果你的告警策略依赖「先 firing 再收到 resolve 通知」来触发工单或页面呼叫，这种行为会让你静默地漏掉通知。解决方案是用 `absent()` 函数，它在序列完全消失时返回 1：\n\n```yaml\n- alert: InstanceMissing\n  expr: absent(up{job=\"api-server\"})\n  for: 1m\n  annotations:\n    summary: \"API server target 从服务发现中消失\"\n```\n\n更完整的方案是同时配置两条规则：`up == 0` 处理 target 存活但无响应的情况，`absent(up{job=\"api-server\"})` 处理 target 从服务发现消失的情况。\n\n## Federation 和 Remote Write 的行为差异\n\nFederation 和 remote_write 对 staleness marker 的处理方式截然不同，理解这个差异是区分「懂 Prometheus 原理」和「只会用 Prometheus」的分水岭。\n\n**Federation** 通过 `/federate` 接口以 text exposition format 暴露数据给下游 Prometheus。Text format 是纯文本协议，没有任何机制可以表达 StaleNaN。因此，当一条序列在上游 Prometheus 消失后，下游 federate Prometheus 收不到任何「这条序列终止了」的信号，它只看到这条序列不再出现在响应里，进而按照「数据缺失/gap」逻辑处理：在 lookback-delta（5 分钟）内仍然使用旧值，超过后才变成 no data。这意味着在 federation 多层架构中，边缘层的 staleness marker 无法传播到全局聚合层，全局层感知序列消失最多有 5 分钟延迟。\n\n**Remote Write** 使用 Protocol Buffer 格式（`remote.pb`）将数据发送到 Thanos、Cortex、VictoriaMetrics 等远端存储。在 Prometheus 的 remote write 协议里，StaleNaN 以特殊 float64 NaN 的形式直接编码在 `TimeSeries` 消息中发出。但各远端存储对 StaleNaN 的处理并不一致：Thanos 从 0.15.0 版本起正确处理 remote write 的 staleness marker；VictoriaMetrics 则会直接忽略 StaleNaN 样本，把它当作无效值丢弃，序列的消失感知完全依赖 VictoriaMetrics 自身默认的 30 分钟过期窗口（`--search.maxStalenessInterval`）。如果你的告警依赖 VictoriaMetrics 或 Grafana Mimir 的 ruler，要明确测试 staleness 行为是否符合预期。\n\n## 生产中的高频坑与最佳实践\n\nKubernetes 滚动更新场景是 staleness 问题最集中的地方。每次 `kubectl rollout`，旧 pod 的指标序列被 staleness marker 终止，新 pod 的序列从零开始。如果你的 recording rule 用了 5 分钟范围的 `rate()`，在滚动更新完成后的几分钟内，覆盖了旧序列 staleness marker 时间点的查询窗口会出现计算结果为空或突变，导致监控仪表盘出现与发布节奏完全吻合的周期性数据断点。解决方案是在 label 设计上引入稳定的聚合维度（比如用 job/service 而不是 pod 级别做 recording rule），或者在 Grafana 里设置合理的「Connect null values」策略区分滚动更新引起的正常间断和真实故障。\n\n另一个常见坑是 `scrape_timeout` 配置过长。如果 `scrape_timeout >= scrape_interval`（比如都配成 30s），网络偶发抖动导致 scrape 超时时，Prometheus 要等满 30s 才宣告失败，下一次 scrape 才开始。这不会触发 staleness marker，但会造成最多 `scrape_timeout + scrape_interval` 的告警延迟。生产实践中，`scrape_timeout` 应设为 `scrape_interval` 的 80% 以下，比如 `scrape_interval: 15s` 配 `scrape_timeout: 10s`，既能过滤网络抖动，又能保证及时探测故障。",
+      "keyPoints": [
+        "Staleness marker 是一个特殊 bit pattern 的 float64 NaN（`0x7ff0000000000002`，即 StaleNaN），由 Prometheus 在检测到已有序列从 scrape 响应中消失时主动写入，作为序列终止的显式墓碑信号，与用户数据中的普通 NaN（`0x7ff8000000000001`）区分开来",
+        "Staleness marker 与数据缺失（gap）的本质区别在于主动性：gap 是 Prometheus 在 lookback-delta（默认 5 分钟）内找不到样本时的被动行为，可被旧值填充；staleness marker 是主动写入的终止标记，任何 lookback-delta 设置都无法跨越它查到数据",
+        "Target 完全失联（scrape 超时或 TCP 连接失败）不会触发 staleness marker，而是产生 gap 并写入 `up=0`；只有 scrape 成功但某条序列从响应中消失，或 target 被从配置中完全移除时，才会注入 staleness marker",
+        "当告警依赖的序列被 staleness marker 终止后，告警表达式（如 `up == 0`）的评估结果变为「no data」而非 0，告警会直接 resolve 而不经历 pending → firing 阶段；应使用 `absent()` 函数补充检测序列消失的告警",
+        "Federation 使用 text exposition format 暴露数据，无法传递 staleness marker，下游 Prometheus 只能依赖 lookback-delta 感知序列消失，最多有 5 分钟延迟；这是多层 federation 架构中全局告警延迟的根本原因",
+        "Remote write 以 Protocol Buffer 格式发送 StaleNaN，但各远端存储实现不一致：Thanos 0.15+ 正确支持，VictoriaMetrics 直接丢弃 StaleNaN 并依赖自身 30 分钟过期窗口，使用前需明确验证",
+        "Kubernetes 滚动更新中 pod 替换触发 staleness marker，跨越该时间点的 `rate()` 或 `increase()` 查询窗口会出现数据断点；应在 recording rule 层面用 job/service 级聚合而非 pod 级别来消除滚动更新噪声"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q30-q1",
+          "question": "Prometheus 的 staleness marker 在 TSDB 中的本质是什么？",
+          "choices": [
+            {"id": "A", "text": "一个特殊 bit pattern 的 float64 NaN 值（StaleNaN，`0x7ff0000000000002`），与用户数据中的普通 NaN 区分开来"},
+            {"id": "B", "text": "一个值为 -1 的特殊浮点样本，PromQL 引擎见到 -1 就停止回溯"},
+            {"id": "C", "text": "一条特殊 label 为 `__stale__=\"true\"` 的样本，标记序列终止"},
+            {"id": "D", "text": "TSDB 的 chunk TTL 过期机制，chunk 写满 2 小时后自动标记过期"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Staleness marker 的本质是 IEEE 754 float64 的一种特殊 NaN bit pattern，Prometheus 源码（`model/value.go`）中定义为 `StaleNaN = math.Float64frombits(0x7ff0000000000002)`。之所以不用普通 NaN（`0x7ff8000000000001`），是因为用户业务计算也可能产生 NaN，需要区分。B 选项（-1）和 C 选项（特殊 label）都是错误的，它们无法在 float64 sample value 层面透明地实现墓碑语义。D 选项混淆了 TSDB 的 chunk 管理机制与 staleness，两者完全无关。",
+          "relatedConcepts": ["StaleNaN", "IEEE 754 NaN", "TSDB chunk"]
+        },
+        {
+          "id": "monitoring-q30-q2",
+          "question": "以下哪种情况会触发 Prometheus 为某条序列写入 staleness marker？",
+          "choices": [
+            {"id": "A", "text": "Prometheus 成功 scrape 了 target，但本次响应中某条之前存在的序列不再出现"},
+            {"id": "B", "text": "Prometheus 发出 HTTP 请求后等待超时，scrape 失败"},
+            {"id": "C", "text": "target 的 CPU 使用率超过 90%，scrape 响应延迟超过 scrape_timeout"},
+            {"id": "D", "text": "TSDB 的 2 小时 chunk 写满，开始将该 chunk 刷盘"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Staleness marker 只在 scrape 成功但某条序列从响应中消失时写入——这是一个主动的信号，代表「这条序列干净地结束了」。B 选项（scrape 超时失败）是一个被动失败，Prometheus 此时不写任何数据，包括不写 staleness marker，表现为 gap。C 选项类似 B，scrape_timeout 触发时 scrape 失败，无 staleness marker 写入。D 选项（chunk 刷盘）是 TSDB 内部的存储管理行为，与 staleness 机制完全无关。理解「scrape 成功但序列消失」和「scrape 失败」的区别是掌握 staleness 的关键。",
+          "relatedConcepts": ["scrape lifecycle", "staleness marker injection", "gap vs stale"]
+        },
+        {
+          "id": "monitoring-q30-q3",
+          "question": "`--query.lookback-delta`（默认 5 分钟）控制的是什么行为？",
+          "choices": [
+            {"id": "A", "text": "PromQL 即时查询（instant query）向前回溯寻找最近样本的最大时间窗口，超过这个窗口则返回 no data"},
+            {"id": "B", "text": "TSDB 保留历史数据的最大时长，超过则删除旧 chunk"},
+            {"id": "C", "text": "staleness marker 的有效生命周期，超过后序列从内存索引中清除"},
+            {"id": "D", "text": "告警规则从 pending 状态升级到 firing 状态的最大等待时长"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`--query.lookback-delta` 控制的是 PromQL instant query 在查找某条序列「当前值」时，向前回溯的最大范围。比如查询 @T，如果最后一个样本在 @T-4m，只要 4m < lookback-delta（5m），PromQL 就会使用该样本作为当前值。这个参数只影响 gap 场景；staleness marker 是显式墓碑，无论 lookback-delta 多大都无法跨越。B 选项描述的是 `--storage.tsdb.retention.time`。C 选项是常见误解，staleness marker 在 TSDB 里是普通样本，由 retention 控制清理，不是自动过期。D 选项描述的是告警规则里的 `for` 字段。",
+          "relatedConcepts": ["lookback-delta", "instant query", "gap"]
+        },
+        {
+          "id": "monitoring-q30-q4",
+          "question": "一个 target 因网络抖动连续 3 次 scrape 失败（每次间隔 15s），第 4 次 @T+45s 恢复正常。此时该 target 上的指标序列处于什么状态？",
+          "choices": [
+            {"id": "A", "text": "序列处于 gap 状态，PromQL 在 lookback-delta（5 分钟）内仍能用最后成功采集的值，rate() 等函数正常工作，第 4 次采集后恢复正常数据流"},
+            {"id": "B", "text": "序列已被 staleness marker 终止，第 4 次采集的数据会创建一条全新序列"},
+            {"id": "C", "text": "TSDB 会自动补齐 3 个缺失的时间点样本，保持序列连续"},
+            {"id": "D", "text": "Prometheus 检测到连续失败，会自动降低该 target 的 scrape 频率到原来的 1/3"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "连续 3 次 scrape 失败（超时或连接错误）不会触发 staleness marker，只会产生 gap。因为 scrape 失败意味着 Prometheus 收不到任何数据，无法判断序列是否真的消失，所以它什么都不写。在 45 秒的 gap 内，查询 lookback-delta（5 分钟）仍能找到最后成功采集的值。第 4 次 scrape 成功后数据流自然恢复，不需要创建新序列。B 选项是典型误解：只有 scrape 成功但序列消失才触发 staleness marker。C 选项（补齐样本）Prometheus 完全不做。D 选项（降频）不是 Prometheus 的行为，Prometheus 的采集频率由配置决定，不动态调整。",
+          "relatedConcepts": ["gap", "scrape failure", "staleness marker injection"]
+        },
+        {
+          "id": "monitoring-q30-q5",
+          "question": "执行 PromQL 查询 `rate(http_requests_total[5m])` 时，如果 `http_requests_total` 序列在查询时间点的 1 分钟前被注入了 staleness marker，查询结果是什么？",
+          "choices": [
+            {"id": "A", "text": "返回空（no data），rate() 的查询窗口内遇到 staleness marker，序列被视为已终止，从结果集中消失"},
+            {"id": "B", "text": "返回 NaN，因为 staleness marker 本身是 NaN 值"},
+            {"id": "C", "text": "正常计算 staleness marker 之前 5 分钟内的 rate，忽略 marker"},
+            {"id": "D", "text": "返回 0，表示请求速率归零"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "PromQL 引擎在处理范围查询（range query）时，如果查询窗口内包含 staleness marker，会把整条序列从结果中移除，返回 no data 而不是 NaN。这是 staleness marker 作为「墓碑」的核心行为：它不仅让 instant query 返回空，也让任何覆盖其时间点的范围函数（rate、increase、delta 等）返回空。B 选项是常见误解：PromQL 不会把 StaleNaN 作为普通 NaN 值暴露给用户。C 选项忽略了 staleness marker 的语义，staleness marker 不是普通样本，不会被 rate() 的计算逻辑忽略。D 选项（返回 0）也不正确。",
+          "relatedConcepts": ["rate()", "range query", "staleness marker semantics"]
+        },
+        {
+          "id": "monitoring-q30-q6",
+          "question": "以下关于 federation 架构中 staleness marker 传播的说法，哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "Federation 使用 text exposition format 暴露数据，无法编码 staleness marker；下游 Prometheus 感知序列消失依赖 lookback-delta，最多有 5 分钟延迟"},
+            {"id": "B", "text": "Federation 使用 Protocol Buffer 格式，staleness marker 可以完整传递到下游"},
+            {"id": "C", "text": "Federation 会在上游序列消失后立即向所有下游发送 DELETE 请求清除该序列"},
+            {"id": "D", "text": "下游 Prometheus 通过检查 `/federate` 响应的 ETag 头来检测上游序列消失"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Federation 的 `/federate` 接口以 Prometheus text exposition format 返回数据，这是一种纯文本协议，无法表达 StaleNaN 这样的特殊浮点值。当上游某条序列消失时，它只是不出现在响应里，下游 Prometheus 无法区分「序列消失了」和「这次响应里刚好没有这条序列」。下游只能依赖 lookback-delta（默认 5 分钟）来感知序列不再更新，在这段时间内仍会使用旧值。这对多层 federation 的全局告警准确性有直接影响。B 选项描述的是 remote_write 的行为，不是 federation。C 和 D 选项在 Prometheus 协议中均不存在。",
+          "relatedConcepts": ["federation", "text exposition format", "staleness propagation"]
+        },
+        {
+          "id": "monitoring-q30-q7",
+          "question": "使用 VictoriaMetrics 作为 Prometheus 的 remote_write 目标时，VictoriaMetrics 如何处理收到的 staleness marker？",
+          "choices": [
+            {"id": "A", "text": "直接丢弃 StaleNaN 样本，序列消失完全依赖 VictoriaMetrics 自身的过期窗口（默认 `--search.maxStalenessInterval` 30 分钟）"},
+            {"id": "B", "text": "正确识别并传播 staleness marker，行为与原生 Prometheus TSDB 完全一致"},
+            {"id": "C", "text": "将 StaleNaN 转换为普通 NaN（`0x7ff8000000000001`）存储，PromQL 查询返回 NaN"},
+            {"id": "D", "text": "将 StaleNaN 转换为 +Inf 存储，导致告警误报"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "VictoriaMetrics 的设计决策是忽略 StaleNaN 样本，视其为无效数据点直接丢弃（这在 VictoriaMetrics 的 FAQ 和 changelog 中有明确说明）。这意味着当你把 Prometheus 作为 agent 通过 remote_write 将数据发到 VictoriaMetrics 时，序列消失不会立即反映在 VictoriaMetrics 的查询结果中；VictoriaMetrics 依赖其自身的过期机制（`--search.maxStalenessInterval`，默认 30 分钟）来处理消失的序列。这导致 VictoriaMetrics 上基于告警的 resolve 速度可能比原生 Prometheus 慢 25 分钟以上。Thanos 0.15+ 版本则正确实现了 staleness marker 处理。B 选项是 Thanos 的行为，不是 VictoriaMetrics。",
+          "relatedConcepts": ["VictoriaMetrics", "remote_write", "StaleNaN", "maxStalenessInterval"]
+        },
+        {
+          "id": "monitoring-q30-q8",
+          "question": "配置了告警 `up{job=\"api\"} == 0 for: 2m`。当 Kubernetes 删除一个 api pod 后，k8s 服务发现立即更新，Prometheus 停止 scrape 该 pod 并为 `up` 序列注入 staleness marker。告警的最终状态是什么？",
+          "choices": [
+            {"id": "A", "text": "告警直接进入 inactive 状态（resolve），不会经历 pending → firing 阶段，因为 up 序列被 staleness marker 终止后表达式返回 no data"},
+            {"id": "B", "text": "告警正常经历 pending（2 分钟）→ firing → resolve 的完整流程"},
+            {"id": "C", "text": "告警停在 pending 状态，因为序列消失导致 for 计时器无法完成倒计时"},
+            {"id": "D", "text": "告警变为 firing 但永远不 resolve，需要手动在 Alertmanager 里清除"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 staleness 机制在告警层面最典型的「坑」。当 `up` 序列被 staleness marker 终止后，PromQL 计算 `up == 0` 时，这条序列根本不出现在结果集里（返回 no data），而不是返回值为 0 的向量元素。告警引擎找不到符合条件的时间序列，认为告警条件不成立，直接将告警状态设为 inactive（resolve）。整个过程没有 firing，Alertmanager 可能甚至不会发送任何通知（取决于你的 resolve 通知配置）。正确的补救方式是同时配置 `absent(up{job=\"api\"})` 告警来检测序列消失事件。",
+          "relatedConcepts": ["alert evaluation", "absent()", "staleness and alerting"]
+        },
+        {
+          "id": "monitoring-q30-q9",
+          "question": "以下哪种方案能正确地在 pod 从服务发现消失时触发告警，弥补 `up == 0` 因 staleness marker 而失效的问题？",
+          "choices": [
+            {"id": "A", "text": "`absent(up{job=\"api\"}) == 1 for: 1m`，使用 absent() 在序列消失时返回 1 来触发告警"},
+            {"id": "B", "text": "`up{job=\"api\"} < 1 for: 2m`，用 < 1 代替 == 0 绕过 staleness"},
+            {"id": "C", "text": "增大 `--query.lookback-delta` 到 30 分钟，让旧值在序列消失后持续更长时间可查"},
+            {"id": "D", "text": "在 scrape_config 里设置 `honor_timestamps: false`，让 Prometheus 不写 staleness marker"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`absent()` 函数的语义是：如果传入的向量为空（no data），则返回值为 1 的向量；否则返回空。当 `up{job=\"api\"}` 序列因 staleness marker 消失后，`absent(up{job=\"api\"})` 返回 1，告警条件成立，可以正常触发。B 选项（`< 1`）和 A 选项有同样的问题：staleness marker 让整条序列从结果集消失，不存在「值 < 1」的向量元素可以匹配，依然返回 no data。C 选项增大 lookback-delta 无法帮助，staleness marker 是显式墓碑，lookback-delta 对其无效。D 选项（`honor_timestamps`）控制的是是否使用 target 暴露的时间戳，与 staleness marker 无关。",
+          "relatedConcepts": ["absent()", "alert design", "staleness workaround"]
+        },
+        {
+          "id": "monitoring-q30-q10",
+          "question": "有如下 recording rule：`record: job:http_requests:rate5m`，`expr: rate(http_requests_total[5m])`。当某个 job 的所有 target 因 staleness marker 消失后，这条 recording rule 的输出序列会怎样？",
+          "choices": [
+            {"id": "A", "text": "recording rule 的输出序列也会被注入 staleness marker，因为评估结果为 no data，Prometheus 会为该 recording rule 序列写入 staleness marker"},
+            {"id": "B", "text": "recording rule 序列会保留最后一次计算的值，直到 TSDB retention 期满"},
+            {"id": "C", "text": "recording rule 会持续写入 0 值，直到 target 恢复"},
+            {"id": "D", "text": "recording rule 评估报错并停止，直到 target 恢复后重新启动"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "当 recording rule 的 expr 评估结果为 no data（空向量）时，Prometheus 会为该 recording rule 之前输出过的序列自动注入 staleness marker——这是 Prometheus 2.x 版本对 recording rule 的一项重要设计。具体行为是：上一次评估中存在于结果集里的序列，本次评估结果中消失了，Prometheus 就为那条序列写入 staleness marker。这意味着 staleness 语义会沿着 recording rule 链传播：上游指标消失 → recording rule 输出消失 → 依赖该 recording rule 的告警也看到 no data。这对基于 recording rule 设计的多层告警架构有重要影响，需要在每一层都考虑 absent() 的配套告警。",
+          "relatedConcepts": ["recording rules", "staleness propagation", "rule evaluation"]
+        }
+      ],
+      "references": [
+        "https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness",
+        "https://github.com/prometheus/prometheus/blob/main/model/value.go",
+        "https://docs.victoriametrics.com/faq/#what-is-staleness-in-prometheus-and-how-does-victoriametrics-handle-it",
+        "https://thanos.io/tip/components/receive.md/",
+        "https://prometheus.io/blog/2021/11/16/agent/"
+      ]
+    }
+  ]
+}

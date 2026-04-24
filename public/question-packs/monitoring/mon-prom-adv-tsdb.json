@@ -1,0 +1,166 @@
+{
+  "id": "monitoring-q31",
+  "name": "Prometheus TSDB 存储结构详解",
+  "domain": "monitoring",
+  "description": "深入讲解 Prometheus TSDB 的 Block、Chunk、WAL 三层存储结构及 Gorilla 压缩、倒排索引、compaction 机制",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q31",
+      "domain": "monitoring",
+      "type": "principle",
+      "difficulty": 4,
+      "tags": ["prometheus", "tsdb", "wal", "block", "chunk", "gorilla", "compaction", "index", "tombstone"],
+      "title": "Prometheus TSDB 的存储结构（Block、Chunk、WAL）详解",
+      "content": "Prometheus 在生产环境里每秒能摄入数百万条时间序列样本，但它的存储引擎 TSDB 并不是一个普通的数据库——它在 2017 年由 Fabian Reinartz 从头重写，专门为时序数据的写入模式做了极致优化。\n\n如果你只是会写 PromQL 查数据，对底层存储结构一无所知，那么面对以下几个真实场景时你一定会束手无策：\n\nPrometheus 重启后发现最近几分钟的数据丢失了，但磁盘上明明有文件；`tsdb_head_chunks` 指标持续增长，磁盘占用一直上涨，但 `tsdb_blocks_loaded` 不动；查询两周前的数据速度极慢，但查最近1小时非常快；执行 `curl -X POST http://localhost:9090/api/v1/admin/tsdb/delete_series` 删除了一批数据，磁盘空间却没有释放。\n\n要真正回答这些问题，你需要深入理解 TSDB 的三层存储结构。请从以下维度详细展开：\n\n**WAL 机制**：预写日志的文件组织方式、Record 类型分类（Series / Samples / Tombstones），以及它如何保证 Prometheus 崩溃后的数据恢复。\n\n**Head Block**：内存热块的内部结构，它如何维护内存倒排索引以支撑毫秒级标签查询，以及 headChunk 的封闭时机。\n\n**Gorilla XOR 编码**：双重 delta 时间戳压缩和浮点 XOR 压缩的具体原理，为什么能达到约 1.37 字节/样本的压缩率。\n\n**落盘 Block 的目录结构**：`/var/lib/prometheus/data/` 下各目录和文件的作用，index 文件中 Symbol Table、Postings、Series 三段的格式。\n\n**Tombstone 文件**：为什么删除数据不是立即物理删除，tombstone 如何参与查询过滤。\n\n**Compaction 策略**：分级合并的指数增长机制（2h→8h→24h→72h），以及它对历史数据查询性能的具体影响。",
+      "answer": "## Prometheus TSDB 是什么，为什么需要专门的存储引擎\n\nPrometheus 的核心不是告警规则，也不是 PromQL，而是一个从零设计的时序数据库引擎 TSDB。在 2017 年之前，Prometheus 用的是基于 LevelDB 的旧存储方案，那个版本在几十万时间序列的规模下会出现严重的写入放大和查询抖动。Fabian Reinartz 重写 TSDB 时，针对时序数据的本质特征做了专项优化：数据总是按时间顺序到达（几乎没有乱序写入）、每个时间序列的采样间隔固定（通常 15 秒）、查询通常按时间范围切片、旧数据极少被修改。这些特征让 TSDB 可以抛弃通用数据库的设计，选择更激进的存储结构。\n\n理解 TSDB 的方法是跟着一条数据从写入到最终落盘的完整路径走一遍。\n\n## WAL：持久性的第一道防线\n\n当 Prometheus scrape 到一批新样本时，它做的第一件事不是写内存，而是写 WAL（Write-Ahead Log，预写日志）。WAL 位于 `{data_dir}/wal/` 目录下，以 128 MB 为单位分段，文件名是 `00000000`、`00000001` 这样的序列号。WAL 的写入是 `fsync` 级别的持久化，每批样本先序列化成 Record 格式追加到当前 WAL 段，完成后才更新内存中的 Head Block。\n\nWAL 里的 Record 有三种类型：Series Record 记录新时间序列的完整标签集并分配一个整数 RefID（比如 `job=\"node_exporter\", instance=\"10.0.0.1:9100\"` → RefID 42）；Samples Record 只记录 RefID 加上时间戳和浮点值，避免重复存储标签字符串；Tombstones Record 记录删除标记的时间范围。注意 WAL 里存的样本是原始未压缩值，这是为了让重放时能完整重建 Head Block 的状态。\n\n这个写入顺序保证了：即使 Prometheus 在内存写入成功之后、在数据落盘 Block 之前崩溃，重启时通过重放 WAL 依然能恢复最近的数据。这也解释了为什么 Prometheus 重启后偶尔会「丢失」几秒钟的数据——那几秒的 WAL record 还没来得及 fsync 就断电了。WAL 目录的大小不受 `--storage.tsdb.retention.time` 控制，它由 compaction 触发的 checkpoint 机制独立管理：每当 Head Block 的数据成功落盘后，TSDB 会在 `wal/checkpoint.XXXXXXXX/` 目录生成检查点，并清理比检查点更旧的 WAL 段文件。如果 compaction 卡住，WAL 会无限增长，这是生产环境中磁盘占用异常的常见根因之一。\n\n## Head Block：内存里的热数据与倒排索引\n\n内存中常驻的是 Head Block，它承载最近 2 小时（对应 `--storage.tsdb.min-block-duration`，默认 2h）的数据。Head Block 内部按时间序列组织：每个活跃序列维护一个正在追加的 `headChunk`，每 128 个样本或每 2 小时会被封闭成一个不可变的 Chunk 对象，等待后续落盘。这个「封闭」机制意味着即使在 Head Block 还没有整体落盘之前，已封闭的 Chunk 也可以单独被 compaction 处理，减少内存压力。\n\nHead Block 还同时维护一个内存倒排索引，key 是 `label_name=label_value` 对（比如 `job=\"node_exporter\"`），value 是包含该标签的所有时间序列 RefID 的有序列表。当你执行 `{job=\"node_exporter\", instance=~\"10\\..*\"}` 这样的查询时，Prometheus 先用倒排索引查出所有 `job=\"node_exporter\"` 的序列集合，再对 `instance` 做正则过滤，最后取交集，整个过程不需要全量扫描所有序列。正是这个内存索引让 Head Block 的查询性能如此优秀——查询最近 2 小时内的数据，Prometheus 完全从内存提供服务。一旦查询范围跨越 2 小时边界，就需要同时访问内存和磁盘上的历史 Block，这是历史数据查询更慢的底层原因。\n\n## Gorilla XOR：达到惊人 1.37 字节/样本的压缩算法\n\nTSDB 的 Chunk 使用来自 Facebook Gorilla 论文（2015年）的 XOR 压缩算法，专门针对时序数据的两个规律：时间戳通常是等差数列（固定采样间隔），相邻样本值变化幅度很小。\n\n对于时间戳，Gorilla 使用双重 delta 编码：先对相邻时间戳求差值（delta，比如 15000ms），再对相邻 delta 求差值（delta of delta，通常为0）。如果采样间隔完全规律，delta of delta 为0，用 1 个 bit 就能表示。即使有轻微抖动，也只需要少量 bit 存储非零的 delta of delta。\n\n对于浮点样本值，Gorilla 利用 IEEE 754 格式：将相邻两个样本做 XOR，如果值几乎不变（比如一个稳定的 CPU idle 指标在 95.x% 附近波动），XOR 结果的前导零和尾随零会非常多，存储时只存有效位数和有效位的长度。Facebook 在论文中报告的平均压缩率是 1.37 字节/样本，相比原始的 16 字节（8 字节时间戳 + 8 字节 float64）有接近 12 倍的压缩效果。这就是为什么同样保存 30 天数据，Prometheus 的实际磁盘占用远低于直觉估算——工程上通常用「每秒 sample 数 × 86400 × 30 × 1.5 字节」来估算30天存储，1.5 字节留了合理余量。\n\n## 落盘 Block：目录结构与索引格式\n\nHead Block 中超过 2 小时的数据被 compactor 持久化后，生成一个不可变的 Block 目录。目录名是 ULID（Universally Unique Lexicographically Sortable Identifier），比如 `01GXYZABC123DEF456GHI789J0`，它同时包含时间戳和随机部分，按字典序排列时自动按时间顺序，方便 TSDB 快速定位某个时间范围内的 Block。\n\n```\n/var/lib/prometheus/data/\n├── wal/                             # WAL 段文件\n│   ├── 00000001\n│   ├── 00000002\n│   └── checkpoint.000001/           # Compaction 后的 WAL 检查点\n├── 01GXYZABC123DEF456GHI789J0/      # 一个2h Block\n│   ├── meta.json                    # Block 元数据（时间范围、样本数量、版本）\n│   ├── chunks/\n│   │   └── 000001                   # Gorilla 压缩的 Chunk 数据文件\n│   ├── index                        # 倒排索引二进制文件\n│   └── tombstones                   # 软删除标记文件\n└── 01H0ABCDEF123456789ABCDE01/      # 经 compaction 合并后的更大 Block\n    ├── meta.json\n    ├── chunks/\n    │   └── 000001\n    ├── index\n    └── tombstones\n```\n\nBlock 内部的 `index` 文件是 TSDB 查询性能的核心，它由三段组成。Symbol Table 是所有出现过的标签名和标签值的去重字符串表，后面的索引只需要引用字符串的整数 ID，而不用重复存储原始字符串。Postings 是倒排索引的主体，每个 `label_name=label_value` 对（比如 `job=\"api-server\"`）对应一个有序的时间序列 ID 列表，这个列表支持二分查找和集合运算（AND/OR/NOT）。Series 段记录每个时间序列的完整标签集（通过 Symbol Table 的 ID 引用）以及它在 `chunks/` 文件中的偏移量和时间范围，是根据 Series ID 找到实际数据的最后一跳。查询时，TSDB 先在 Postings 段做标签过滤和集合求交，拿到匹配的 Series ID 列表，再去 Series 段查每个序列在目标时间范围内有哪些 Chunk，最后按偏移量从 `chunks/` 文件读取实际压缩数据并解压返回。\n\n## Tombstone：删除不是真的删除\n\n当你调用 Prometheus admin API 删除某个时间序列时，TSDB 不会立刻修改 Chunk 文件。原因很简单——Chunk 文件是不可变的，随机删除一段数据需要重写整个文件，代价极高。TSDB 的做法是在 Block 目录里写 `tombstones` 文件，记录「时间序列 X 在时间范围 [t1, t2] 的数据视为已删除」。查询时，TSDB 在返回结果前会过滤掉被 tombstone 标记的样本点，从用户视角看数据已经消失了，但磁盘上的 Chunk 文件完整保留。真正的物理删除要等到下一次 compaction 把这个 Block 合并时才发生——compactor 在合并多个 Block 时会读取 tombstone 文件，跳过被标记的样本，合并后的新 Block 里就彻底没有这些数据了。所以执行删除 API 后磁盘空间没有立即释放是完全符合预期的行为，你可以通过 `--storage.tsdb.allow-overlapping-blocks` 和手动触发 compact API 来加速这个过程。\n\n## Compaction：分级合并与查询性能\n\nTSDB 的 compaction 遵循类似 LSM Tree 的分级合并策略。刚落盘的 Block 是 2h 跨度的「Level-0 Block」，compactor 会把相邻的若干个小 Block 合并成更大的 Block，时间跨度遵循指数增长：2h → 8h → 24h → 72h（Prometheus 2.x 的默认策略最终可产生最大 `retention/10` 跨度的 Block，上限 31 天）。\n\n这个分级结构对查询性能有直接的正面影响。查询最近 6 小时的数据时，可能需要访问 3 个独立的 2h Block（3 次 index 文件读取，3 次 chunks 文件 I/O）；而查询两个月前某一天的数据，只需要访问 1 个 24h Block。合并后的大 Block 不仅减少了需要访问的文件数量，还让 OS 的 page cache 更高效——一个大 Block 的 index 文件在内存中是连续的，预读效果更好。Compaction 期间会在内存中同时持有新旧 Block 的数据，在数据量较大时会导致短暂的内存峰值，这是在 Kubernetes 上为 Prometheus 配置 `resources.limits.memory` 时需要留出余量的原因。\n\n## 生产环境的关键认知\n\n理解了 TSDB 的存储结构后，一些生产问题就有了清晰的解释路径。`tsdb_symbol_table_size_bytes` 指标过大，通常意味着有人把 user_id、request_id 之类的高基数字段放进了标签，内存倒排索引会因此膨胀到 GB 级别，最终导致 OOM——这是 Prometheus 内存问题最常见的根因，排查时先看这个指标。WAL 目录异常增大，通常说明 compaction 卡住了，检查 `prometheus_tsdb_compactions_failed_total` 计数器。在非 SSD 存储（比如 NFS 或 HDD）上部署 Prometheus 时，Block compaction 的随机 I/O 会与正常的 scrape 写入争抢 I/O 带宽，导致 scrape 超时率上升，监控数据出现空洞。",
+      "keyPoints": [
+        "WAL（预写日志）位于 `wal/` 目录，以 128MB 分段顺序追加，包含 Series Record（标签集+RefID）、Samples Record（RefID+时间戳+值）、Tombstones Record 三种类型，Prometheus 重启时通过重放 WAL 恢复最近的 Head Block 数据",
+        "Head Block 是内存中承载最近 2 小时热数据的结构，同时维护内存倒排索引（label=value → RefID 有序列表），使标签选择器查询可在毫秒内完成集合求交，不需要全量扫描时间序列",
+        "Gorilla XOR 算法对时间戳使用双重 delta 编码（等差采样时 delta of delta 为0，仅需 1 bit）、对浮点值使用 XOR 压缩只存有效位，实测平均 1.37 字节/样本，相比原始 16 字节有约 12 倍压缩率",
+        "落盘 Block 目录名为 ULID（含时间戳，字典序即时间顺序），内含 `chunks/`（Gorilla 压缩数据）、`index`（Symbol Table + Postings 倒排索引 + Series 元数据）、`tombstones`（软删除标记）三个关键文件",
+        "删除操作只向 `tombstones` 文件写入时间范围标记，不立即修改 Chunk 文件；物理删除在下次 compaction 合并 Block 时发生，执行删除 API 后磁盘空间不会立即释放是完全符合预期的行为",
+        "Compaction 遵循指数增长的分级合并策略（2h→8h→24h→72h），合并后大 Block 减少查询需要访问的文件数量，显著提升历史数据查询性能，但 compaction 期间会产生短暂的内存峰值",
+        "标签基数爆炸（cardinality explosion）——把 user_id、request_id 等高基数字段放入标签——是 Prometheus 内存 OOM 最常见的根因，可通过监控 `tsdb_symbol_table_size_bytes` 和 `prometheus_tsdb_head_series` 提前发现"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q31-q1",
+          "question": "Prometheus TSDB 的 WAL 文件以多大为单位分段？",
+          "choices": [
+            {"id": "A", "text": "128 MB"},
+            {"id": "B", "text": "512 MB"},
+            {"id": "C", "text": "64 MB"},
+            {"id": "D", "text": "1 GB"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "WAL 段文件默认以 128MB 为单位分割，文件名为零填充的序列号如 `00000000`、`00000001`。这个大小的选择是写入吞吐与文件管理开销之间的平衡——太小会导致大量小文件，太大会导致 checkpoint 清理时单次 I/O 过重。B 选项 512MB 是很多人凭感觉猜测的值；C 选项 64MB 偏小；D 选项 1GB 会导致 WAL 清理时需要一次性处理过多数据。知道这个具体数值的人通常真正读过 TSDB 源码或官方文档。",
+          "relatedConcepts": ["WAL", "TSDB", "持久化"]
+        },
+        {
+          "id": "monitoring-q31-q2",
+          "question": "Prometheus Head Block 默认在内存中保留多长时间的热数据？",
+          "choices": [
+            {"id": "A", "text": "1 小时"},
+            {"id": "B", "text": "6 小时"},
+            {"id": "C", "text": "2 小时"},
+            {"id": "D", "text": "24 小时"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Head Block 默认保留最近 2 小时的数据在内存中，对应 `--storage.tsdb.min-block-duration` 参数的默认值 `2h`。这个 2 小时窗口直接决定了「纯内存查询」和「需要访问磁盘」的分界线——查询最近 2 小时内的数据完全从内存提供，速度极快；一旦查询跨越这个边界就需要读磁盘 Block，延迟会明显上升。A 选项 1 小时会导致过于频繁的落盘 compaction；B 选项 6 小时虽然可以通过参数调整到这个值，但不是默认值；D 选项 24 小时会让内存中常驻大量数据，对内存压力过大。",
+          "relatedConcepts": ["Head Block", "内存存储", "compaction"]
+        },
+        {
+          "id": "monitoring-q31-q3",
+          "question": "Gorilla XOR 压缩算法对时间戳采用的是什么编码方式？",
+          "choices": [
+            {"id": "A", "text": "RLE（游程编码），相同值连续出现时只存一次"},
+            {"id": "B", "text": "双重 delta 编码，先求相邻时间戳差值，再求相邻差值之间的差值"},
+            {"id": "C", "text": "Huffman 编码，高频时间戳值用短编码表示"},
+            {"id": "D", "text": "LZ4 字节流压缩，对时间戳字节序列做通用压缩"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Gorilla 对时间戳使用双重 delta（delta of delta）编码。第一步求相邻时间戳的差值（delta，比如固定 15000ms）；第二步求相邻 delta 之间的差值（delta of delta，采样间隔规律时为0）。如果采样间隔完全规律，delta of delta 为0，用 1 个 bit 就能表示，极度高效。即使偶有抖动（比如 ±1ms），也只需要很少的 bit 存储非零值。A 选项的 RLE 适合连续重复值场景，时间戳是单调递增的不适合；C 选项 Huffman 需要预先统计频率分布，不适合流式写入；D 选项通用压缩算法无法利用时序数据的特殊规律，压缩率远不如双重 delta。",
+          "relatedConcepts": ["Gorilla", "XOR 压缩", "时间序列编码"]
+        },
+        {
+          "id": "monitoring-q31-q4",
+          "question": "Prometheus TSDB 落盘后的 Block 目录命名使用的是什么格式的标识符？",
+          "choices": [
+            {"id": "A", "text": "UUID v4（随机生成，无时间信息）"},
+            {"id": "B", "text": "ULID（同时包含时间戳和随机部分，字典序即时间顺序）"},
+            {"id": "C", "text": "Block 起始时间的 Unix 时间戳（秒级）"},
+            {"id": "D", "text": "SHA256 哈希值的前 16 字节的十六进制表示"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Block 目录名使用 ULID（Universally Unique Lexicographically Sortable Identifier）。ULID 的前 48 bit 是毫秒级 Unix 时间戳，后 80 bit 是随机数，总长度 26 字符的 Base32 编码。ULID 的关键优势是：字典序排列时自动按创建时间顺序排列，TSDB 在扫描目录定位某个时间范围内的 Block 时可以直接用字典序做二分查找，而不需要逐一读取 `meta.json`。A 选项 UUID v4 全随机，没有时间信息；C 选项纯时间戳在并发生成时可能冲突；D 选项哈希值无时间信息且不可读。如果你在生产环境 `ls /var/lib/prometheus/data/` 看到那些长 ID 目录，现在你知道为什么了。",
+          "relatedConcepts": ["ULID", "Block", "目录结构"]
+        },
+        {
+          "id": "monitoring-q31-q5",
+          "question": "调用 Prometheus Admin API 删除时间序列后，磁盘空间没有立即释放，最根本的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "删除操作只写入 tombstones 文件做软标记，物理删除等待下次 compaction 合并 Block 时才发生"},
+            {"id": "B", "text": "Prometheus 的 Admin API 有内部缓存，需要等缓存过期后才真正执行删除"},
+            {"id": "C", "text": "WAL 文件中还保留了被删除时间序列的 Series Record，必须等 WAL 清理才能释放"},
+            {"id": "D", "text": "需要重启 Prometheus 进程才能触发磁盘上的物理删除"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "TSDB 的 Chunk 文件是不可变的（immutable），直接在文件中随机删除一段数据需要重写整个文件，代价极高，设计上不允许。删除 API 的实现是在目标 Block 目录下写入或更新 `tombstones` 文件，记录「时间序列 X 在时间范围 [t1, t2] 的数据视为已删除」。后续查询时，TSDB 读取 tombstones 过滤结果，用户看不到被删除的数据，但 Chunk 文件完整保留在磁盘上。只有当 compaction 将包含 tombstone 的 Block 与其他 Block 合并时，compactor 才会跳过被标记的样本，生成不含这些数据的新 Block，旧 Block 被删除后磁盘空间才真正释放。可以通过调用 `/api/v1/admin/tsdb/clean_tombstones` 触发立即清理，或通过 `--storage.tsdb.allow-overlapping-blocks` 配合手动 compact 加速。",
+          "relatedConcepts": ["tombstones", "软删除", "compaction"]
+        },
+        {
+          "id": "monitoring-q31-q6",
+          "question": "查询最近 30 分钟的 Prometheus 数据时，数据从哪里提供？",
+          "choices": [
+            {"id": "A", "text": "直接从磁盘 Block 的 chunks/ 文件读取，内存 Head Block 只是写缓冲"},
+            {"id": "B", "text": "完全从内存 Head Block 提供，不需要任何磁盘 I/O"},
+            {"id": "C", "text": "先从 WAL 文件重放最新数据，再从 Head Block 补充"},
+            {"id": "D", "text": "从内存 Head Block 和最近的一个落盘 Block 合并提供，以确保数据完整性"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Head Block 默认保留最近 2 小时的数据在内存中。查询最近 30 分钟的数据时，目标时间范围完全落在 Head Block 的覆盖范围内，TSDB 直接从内存读取，不需要任何磁盘 I/O。这是 Prometheus 查询近期数据极快的根本原因。A 选项说法错误，Head Block 是主要的服务来源不是单纯的写缓冲；C 选项也错误，WAL 只在重启时用于恢复，正常运行时不参与查询；D 选项在查询时间范围完全覆盖在 Head Block 内时不需要访问磁盘 Block，只有查询范围跨越 Head Block 边界时才需要同时访问磁盘 Block。",
+          "relatedConcepts": ["Head Block", "查询路径", "内存存储"]
+        },
+        {
+          "id": "monitoring-q31-q7",
+          "question": "Prometheus TSDB Block 内部的 `index` 文件主要包含哪三个核心部分？",
+          "choices": [
+            {"id": "A", "text": "WAL 引用表、Chunk 文件偏移索引、时间范围 B 树索引"},
+            {"id": "B", "text": "Symbol Table（去重字符串表）、Postings（标签倒排索引）、Series（序列元数据）"},
+            {"id": "C", "text": "标签哈希表、样本统计摘要、Gorilla 压缩元数据"},
+            {"id": "D", "text": "LSM 分层索引、Bloom Filter、Range Index"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "index 文件由三段组成，各司其职。Symbol Table 是所有标签名和标签值的去重字符串表，后续段落通过整数 ID 引用字符串，避免重复存储大量相似字符串。Postings 是倒排索引的核心，每个 `label=value` 对映射到一个有序的时间序列 ID 列表，这使得 `{job=\"api-server\", env=\"prod\"}` 这样的多标签查询可以分别拿到两个 Postings 列表后做集合求交，复杂度远低于全量扫描。Series 段记录每个时间序列的完整标签集（通过 Symbol Table ID 引用）和它在 chunks/ 文件中的 Chunk 偏移量与时间范围，是从 Series ID 找到实际数据的最后一跳。理解这三段的层次关系，才能真正理解 Prometheus 查询为什么快。",
+          "relatedConcepts": ["倒排索引", "Postings", "Symbol Table"]
+        },
+        {
+          "id": "monitoring-q31-q8",
+          "question": "生产环境中 Prometheus 内存持续增长最常见的根因是什么？",
+          "choices": [
+            {"id": "A", "text": "WAL 文件没有及时 checkpoint 清理，被 mmap 映射到内存导致虚拟内存增长"},
+            {"id": "B", "text": "标签基数爆炸（cardinality explosion），高基数标签导致内存倒排索引膨胀"},
+            {"id": "C", "text": "Gorilla 压缩算法在内存解压时需要大量临时缓冲区"},
+            {"id": "D", "text": "Block compaction 期间需要在内存中同时加载多个 Block 的全量数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "标签基数爆炸是 Prometheus 内存 OOM 最常见、破坏力最强的根因。当有人把 user_id、request_id、trace_id 之类的高基数字段放进标签时（比如每个 HTTP 请求一个唯一 ID），每个唯一标签值都会在内存倒排索引中占一个条目，并且每个时间序列都需要在 Head Block 维护 headChunk 和内存指针，内存使用量会以指数级增长。一个拥有 100 万个活跃时间序列的 Prometheus，内存占用通常在 4-8 GB。排查时首先看 `prometheus_tsdb_head_series` 和 `tsdb_symbol_table_size_bytes` 指标，找出哪个 job 或 metric 的基数异常高。A 选项的 WAL mmap 影响有限；C 选项 Gorilla 解压缓冲很小且短暂；D 选项 compaction 确实有内存峰值但是暂时的，不是持续增长的原因。",
+          "relatedConcepts": ["cardinality explosion", "内存倒排索引", "OOM"]
+        },
+        {
+          "id": "monitoring-q31-q9",
+          "question": "关于 Prometheus TSDB 的 compaction 分级合并策略，以下哪个描述最准确？",
+          "choices": [
+            {"id": "A", "text": "每次 compaction 只合并严格相邻的两个 Block，每合并一次跨度精确翻倍，永远不会跳级合并"},
+            {"id": "B", "text": "多个 2h Block 按指数增长的跨度逐级合并（2h→8h→24h→72h），最终可产生跨度数天的大 Block"},
+            {"id": "C", "text": "Compaction 只在磁盘使用率超过 80% 时触发，正常情况下不会主动合并"},
+            {"id": "D", "text": "每次 compaction 都会对所有 Block 重建全局倒排索引，查询时只需访问一个统一的索引文件"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "TSDB compaction 遵循基于时间跨度的分级策略，合并比例大约是1:4：4个相邻的 2h Block 合并成一个 8h Block，3个相邻的 8h Block 合并成一个 24h Block，以此类推，最终可产生跨度长达数天乃至数周的大 Block（上限为 retention 时间的 1/10 或 31 天取小者）。A 选项说「精确翻倍且只合并两个」是错误的，实际上是多对一合并且比例不固定；C 选项错误，compaction 是后台持续运行的，不依赖磁盘使用率；D 选项错误，每个 Block 保留独立的 index 文件，查询时需要访问时间范围内所有相关 Block 的 index，这也是为什么大 Block 能减少查询需要访问的文件数量。",
+          "relatedConcepts": ["compaction", "Block 合并", "查询性能"]
+        },
+        {
+          "id": "monitoring-q31-q10",
+          "question": "在 Kubernetes 上将 Prometheus 的数据目录挂载到 NFS 存储时，最可能出现什么问题？",
+          "choices": [
+            {"id": "A", "text": "ULID 目录命名冲突，因为 NFS 不支持超过 26 字符的文件名"},
+            {"id": "B", "text": "WAL 的顺序写性能下降，但 compaction 和查询不受影响"},
+            {"id": "C", "text": "Block compaction 的大量随机 I/O 与 scrape 写入争抢带宽，导致 scrape 超时率上升，监控数据出现空洞"},
+            {"id": "D", "text": "Tombstone 文件因 NFS 文件锁问题无法创建，导致数据删除 API 报错"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "NFS 的性能特点是顺序大块读写尚可，但随机小块 I/O 延迟很高（通常比本地 SSD 高一到两个数量级）。Prometheus 的 scrape 写入是顺序追加 WAL，对 NFS 友好；但 compaction 需要同时读多个 Block 的 chunks 文件（随机读）、构建新 Block 的 index（随机写），在 NFS 上这些操作会非常缓慢。更糟糕的是，TSDB 的 compaction 是后台 goroutine 在同一个进程内进行的，compaction 的 I/O 等待会占用 goroutine 调度资源，间接影响 scrape goroutine 的调度及时性。最终现象是 `prometheus_target_scrape_pool_exceeded_target_limit_total` 计数上涨，部分 target 的 scrape 超时，数据出现间隔性空洞。生产建议：Prometheus 必须使用本地 SSD，最好是 NVMe。如果必须用网络存储，Ceph RBD 或 AWS EBS 的随机 I/O 性能都远好于 NFS。",
+          "relatedConcepts": ["NFS", "compaction I/O", "scrape 可靠性"]
+        }
+      ],
+      "references": [
+        "https://prometheus.io/docs/prometheus/latest/storage/",
+        "https://fabxc.org/tsdb/",
+        "https://www.vldb.org/pvldb/vol8/p1816-teller.pdf",
+        "https://github.com/prometheus/prometheus/tree/main/tsdb"
+      ]
+    }
+  ]
+}
