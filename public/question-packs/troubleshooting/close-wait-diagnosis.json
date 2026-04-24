@@ -1,0 +1,156 @@
+{
+  "id": "close-wait-diagnosis",
+  "name": "CLOSE_WAIT 状态堆积的诊断",
+  "domain": "troubleshooting",
+  "description": "TCP CLOSE_WAIT 连接堆积的根因分析与应用层排查方法",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "close-wait-diagnosis-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["tcp", "close-wait", "network", "linux", "connection-leak"],
+      "title": "服务器上 CLOSE_WAIT 连接越来越多，这说明什么问题？如何排查根因？",
+      "content": "## 故障现象\n\n凌晨两点，你的手机收到了 PagerDuty 告警：某个 Java 微服务的连接数持续攀升，当前已持有 **4,800** 个 TCP 连接，告警阈值是 5,000。你登上服务器，跑了一条 `ss -s`，发现输出里有一行让你眉头紧锁：\n\n```\nTotal: 6241 (kernel 6312)\nTCP:   4923 (estab 112, closed 4, orphan 0, synrecv 0, timewait 87/0), ports 0\n\nTransport Total     IP        IPv6\n*         6241      -         -\nRAW       0         0         0\nUDP       8         7         1\nTCP       4923      4910      13\nINET      4931      4917      14\nFRAG      0         0         0\n```\n\n`ss -s` 没有直接按状态分类，你再跑一条更精确的：\n\n```bash\nss -tan | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn\n```\n\n输出结果如下：\n\n```\n4721 CLOSE-WAIT\n  98 ESTABLISHED\n  87 TIME-WAIT\n  12 LISTEN\n   5 SYN-SENT\n```\n\n几乎所有的连接都是 `CLOSE-WAIT` 状态，而且你观察了五分钟，这个数字还在缓慢上涨。与此同时，运营反馈部分用户请求开始出现超时报错，错误日志里出现了大量 `java.net.SocketException: Too many open files`。\n\n这台服务器运行的是一个 Java 8 + Spring Boot 2.7 的 HTTP 服务，对外暴露 REST API，同时作为客户端调用下游的多个 gRPC 服务和一个 MySQL 数据库。服务已稳定运行了三个月，这个现象是从今天下午五点左右开始出现的，恰好和一次代码上线时间吻合。\n\n你需要回答三个问题：\n1. `CLOSE_WAIT` 是什么状态？它在 TCP 生命周期的哪个阶段产生？\n2. 为什么连接会一直停留在这个状态不释放，而且数量越来越多？\n3. 具体应该怎么排查是哪段代码或哪个组件导致了这个问题？",
+      "answer": "## 先把 TCP 四次挥手说清楚\n\nTCP 连接的关闭过程分四步，教科书上叫「四次挥手」，理解这四步是搞清楚 `CLOSE_WAIT` 的前提。假设客户端主动关闭连接，整个过程是这样的：客户端发送 `FIN` 给服务端，表示「我这边数据发完了，我要关了」；服务端收到 `FIN` 之后立刻回一个 `ACK`，表示「收到，你先等我」；然后服务端把自己还没发完的数据发完，再发一个 `FIN` 给客户端；最后客户端收到服务端的 `FIN` 后回一个 `ACK`，进入 `TIME_WAIT` 等待 2MSL 后彻底关闭。\n\n`CLOSE_WAIT` 就发生在这个过程里的第二步和第三步之间。具体来说：服务端收到客户端的 `FIN`，内核层面已经回了 `ACK`，这时服务端从 `ESTABLISHED` 状态进入 `CLOSE_WAIT` 状态。`CLOSE_WAIT` 的字面意思是「等待关闭」——内核在等应用程序调用 `close()` 来关闭这一端的连接。一旦应用程序调用了 `close()`，内核就会发出第三个 `FIN`，服务端状态变为 `LAST_ACK`，等到客户端回来 `ACK` 之后整个连接就彻底释放了。\n\n这里有一个关键点需要牢记：**`CLOSE_WAIT` 是应用层的事，不是内核层的事**。内核已经完成了它该做的事（收到 `FIN`、回了 `ACK`），现在球在应用程序手里——应用程序必须主动调用 `close()` 或 `shutdown()` 来推进挥手流程。如果应用程序迟迟不调用，这个连接就永远卡在 `CLOSE_WAIT`，不会自动消失。\n\n## CLOSE_WAIT 堆积的根本原因：这是应用程序 Bug\n\n当你看到服务器上几千个 `CLOSE_WAIT` 连接时，结论几乎是确定的：**应用程序的某处代码在某个分支下没有正确关闭连接**。这不是内核问题，不是网络问题，不是配置问题，就是应用层 Bug。\n\n最常见的触发模式有几种。第一种是异常分支遗漏 `close()`。Java 代码里最经典的写法是：\n\n```java\n// 有问题的写法 — 抛异常时 connection 不会被关闭\nHttpURLConnection conn = (HttpURLConnection) url.openConnection();\ntry {\n    InputStream in = conn.getInputStream();\n    // 处理响应...\n    in.close();\n    conn.disconnect(); // 只有正常路径才能走到这里\n} catch (IOException e) {\n    log.error(\"请求失败\", e);\n    // 忘记 disconnect()！连接就此泄漏\n}\n```\n\n正确的写法是把 `disconnect()` 放进 `finally` 块，或者用 try-with-resources。第二种是连接池的 `eviction` 策略配置不当。以 Apache HttpClient 为例，如果你用了连接池但没有配置 `evictIdleConnections` 或 `setConnectionTimeToLive`，那些已经被对端关闭的连接会继续待在池子里，等到下次被取出来用的时候才发现连接已死——而在此之前，这些连接一直处于 `CLOSE_WAIT` 状态。第三种是框架层面的连接管理 Bug，比如某个版本的 OkHttp 或 Retrofit 在特定的响应码下不会正确消费响应体，导致底层连接无法被连接池回收。\n\n题目描述里有一条很关键的线索：**故障和代码上线时间吻合**。这说明很可能是新上线的代码引入了连接泄漏，优先去看这次变更的 diff。\n\n## 排查步骤：从现象到代码\n\n第一步，用 `ss` 找到持有这些连接的进程。`ss` 是现代 Linux 上替代 `netstat` 的工具，查询更快，支持 `-p` 参数显示进程信息：\n\n```bash\n# -t: TCP, -a: all states, -n: 不解析域名, -p: 显示进程\nss -tanp state close-wait\n```\n\n输出示例：\n\n```\nNetid  State       Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process\ntcp    CLOSE-WAIT  1       0       10.0.1.42:47832    10.0.2.100:8080    users:(\"java\",pid=12847,fd=234)\ntcp    CLOSE-WAIT  1       0       10.0.1.42:47891    10.0.2.100:8080    users:(\"java\",pid=12847,fd=235)\ntcp    CLOSE-WAIT  1       0       10.0.1.42:48012    10.0.2.100:3306    users:(\"java\",pid=12847,fd=301)\n# ... 4718 更多行\n```\n\n从这里可以看到两个信息：所有连接都属于 PID `12847`（就是你的 Java 服务），连接的对端 IP 分别是 `10.0.2.100:8080`（下游 HTTP 服务）和 `10.0.2.100:3306`（MySQL）。现在你知道了泄漏方向。\n\n第二步，用 `lsof` 看这个进程的文件描述符情况，确认是否已经逼近 fd 上限：\n\n```bash\n# 查看进程当前打开的 fd 数量\nlsof -p 12847 | wc -l\n\n# 查看系统对这个进程的 fd 上限\ncat /proc/12847/limits | grep 'open files'\n```\n\n如果 `lsof -p 12847` 的输出里有大量 `CLOSE_WAIT` 状态的 socket fd，而且数量接近 `/proc/12847/limits` 里 `Max open files` 的值，那 `Too many open files` 错误就解释清楚了——fd 资源耗尽，新请求根本无法建立连接。\n\n第三步，定位到具体代码。结合 `ss` 的输出，对端是 `10.0.2.100:8080`，说明问题出在调用这个下游服务的代码路径上。去看这次上线的 diff，重点检查：有没有新增的 HTTP 调用没有放在 try-with-resources 里？有没有某个异常处理分支直接 `return` 或 `throw` 而跳过了资源释放？连接池的配置有没有被改动？\n\n如果不确定泄漏的调用栈，可以在 Java 服务的日志里开启连接池的 debug 日志，或者用 `jstack 12847 > thread-dump.txt` 抓一个线程快照，看看有没有大量线程卡在 socket read 操作上。\n\n## 与 TIME_WAIT 的本质区别\n\n很多人把 `CLOSE_WAIT` 和 `TIME_WAIT` 混为一谈，但它们的性质截然不同。**`TIME_WAIT` 是正常的，`CLOSE_WAIT` 是 Bug。**\n\n`TIME_WAIT` 是主动关闭方在四次挥手完成后进入的状态，持续 2MSL（约 60 秒），目的是让网络中可能滞留的旧数据包过期失效，防止它们影响新连接。`TIME_WAIT` 数量多说明服务器在频繁地主动关闭连接，这在高并发的短连接场景下很常见，通过调整 `tcp_tw_reuse` 等内核参数可以缓解。但 `TIME_WAIT` 会自动消失，不需要人工干预。\n\n`CLOSE_WAIT` 完全不同——它没有超时机制，不会自动消失。只要应用程序不调用 `close()`，这个状态就永远持续，对应的 fd 永远不释放。所以一旦发现 `CLOSE_WAIT` 在持续增长，唯一的解法是找到并修复应用层的 Bug，而不是调内核参数。\n\n## 框架层面的连接生命周期管理\n\n在生产环境里，HTTP 连接通常由连接池托管，手动管理连接的情况越来越少。以 Spring Boot 默认的 Apache HttpClient 连接池为例，正确的配置应该包括：\n\n```java\nHttpClientConnectionManager connManager = new PoolingHttpClientConnectionManager();\n// 设置连接的最大存活时间，防止连接被对端关闭后仍留在池中\n((PoolingHttpClientConnectionManager) connManager).setConnectionTimeToLive(30, TimeUnit.SECONDS);\n\nCloseableHttpClient httpClient = HttpClients.custom()\n    .setConnectionManager(connManager)\n    // 定期驱逐过期和空闲连接，这是最关键的配置\n    .evictExpiredConnections()\n    .evictIdleConnections(30, TimeUnit.SECONDS)\n    .build();\n```\n\n`evictExpiredConnections()` 会在后台定期扫描连接池，把已经被对端关闭（收到了 `FIN`，进入 `CLOSE_WAIT`）的连接主动清理掉。如果没有这个配置，这些「僵尸连接」会一直占据连接池的槽位和系统的 fd。\n\n对于 gRPC 连接（题目里提到服务还调用了 gRPC 下游），gRPC-Java 内部使用 Netty 管理连接，`ManagedChannel` 必须在服务停止或不再使用时显式调用 `shutdown()` 并等待 `awaitTermination()`，否则底层 Netty channel 不会关闭，同样会造成 `CLOSE_WAIT` 堆积。\n\n最后值得一提的是 `SO_KEEPALIVE`。开启 TCP keepalive 探测可以让内核定期向对端发送探测包，如果对端已经消失（比如宕机），内核会在几次探测失败后主动关闭连接，从而避免连接永远处于 `CLOSE_WAIT`。Linux 上可以通过 `/proc/sys/net/ipv4/tcp_keepalive_time` 等参数调整 keepalive 的间隔，但这只是最后一道防线，根本解法仍然是应用层的正确资源管理。",
+      "keyPoints": [
+        "CLOSE_WAIT 状态在 TCP 四次挥手中产生于「对端发送 FIN、本端内核回了 ACK」之后，等待应用程序调用 close() 才能推进到 LAST_ACK；内核无法自动推进这一步，CLOSE_WAIT 没有超时机制，不会自动消失。",
+        "CLOSE_WAIT 堆积几乎可以断定是应用程序 Bug：某个代码路径在异常或特殊分支下跳过了连接关闭操作，导致 fd 没有被释放，系统文件描述符被持续耗尽，最终引发 Too many open files 错误。",
+        "排查时优先使用 `ss -tanp state close-wait` 找出持有这些连接的进程和对端 IP，再用 `lsof -p <PID>` 确认该进程的 fd 使用情况，结合对端 IP 定位是哪个下游服务的调用链路存在泄漏。",
+        "CLOSE_WAIT 与 TIME_WAIT 性质截然不同：TIME_WAIT 是正常的、主动关闭方进入的临时状态，会在 2MSL（约 60 秒）后自动消失；CLOSE_WAIT 是被动关闭方的异常滞留，只能靠修复应用层 Bug 来消除，调内核参数无效。",
+        "Java 代码中最常见的 CLOSE_WAIT 触发原因是异常分支跳过了 disconnect()/close()，正确做法是始终在 finally 块或 try-with-resources 中释放连接，确保无论正常路径还是异常路径都能执行关闭操作。",
+        "连接池必须配置 evictExpiredConnections() 和 evictIdleConnections()，否则已被对端关闭的连接（CLOSE_WAIT 状态）会一直留在池中占用 fd；Apache HttpClient、OkHttp、gRPC ManagedChannel 等都有各自的连接生命周期管理 API，需要显式配置。",
+        "TCP keepalive 探测（SO_KEEPALIVE）可以作为最后一道防线，当对端异常消失时由内核主动探测并关闭连接，但它无法替代应用层的正确 close() 调用，并且默认的 keepalive 间隔（tcp_keepalive_time = 7200 秒）对于生产服务来说远远太长，需要调整到分钟级别。"
+      ],
+      "quiz": [
+        {
+          "id": "close-wait-diagnosis-1-q1",
+          "question": "在 TCP 四次挥手过程中，被动关闭方（服务端）什么时候进入 CLOSE_WAIT 状态？",
+          "choices": [
+            {"id": "A", "text": "服务端发送完所有数据，主动发送 FIN 之后"},
+            {"id": "B", "text": "服务端收到客户端的 FIN 并回复 ACK 之后，尚未发送自己的 FIN"},
+            {"id": "C", "text": "服务端收到客户端的 SYN 请求但连接尚未建立完成时"},
+            {"id": "D", "text": "服务端发送 FIN 之后等待客户端 ACK 期间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "CLOSE_WAIT 是被动关闭方的状态，发生在四次挥手的第二步和第三步之间。客户端（主动关闭方）发送 FIN 表示自己数据发完了；服务端内核收到这个 FIN 后立即回复 ACK，此时服务端从 ESTABLISHED 进入 CLOSE_WAIT，字面含义就是「等待（应用层调用 close() 来）关闭」。选项 A 描述的是服务端发完 FIN 后的 FIN_WAIT 或 LAST_ACK 状态；选项 D 描述的是主动关闭方发完 FIN 后的 FIN_WAIT_1 状态，都不是 CLOSE_WAIT。"
+        },
+        {
+          "id": "close-wait-diagnosis-1-q2",
+          "question": "服务器上出现大量 CLOSE_WAIT 连接，最可能的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "内核的 tcp_fin_timeout 配置过大，导致连接关闭超时"},
+            {"id": "B", "text": "服务器带宽不足，FIN 包发送失败"},
+            {"id": "C", "text": "应用程序存在 Bug，在某些代码路径下没有调用 close() 关闭连接"},
+            {"id": "D", "text": "客户端异常断开后没有发送 FIN，导致服务端无法感知"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "CLOSE_WAIT 状态的推进完全依赖应用层调用 close()，内核在收到对端 FIN 并回 ACK 后就「停下来等」应用层操作，没有任何超时机制会自动推进。所以 CLOSE_WAIT 大量堆积且持续增长，几乎可以确定是应用层 Bug。选项 A 的 tcp_fin_timeout 控制的是 FIN_WAIT_2 的超时，与 CLOSE_WAIT 无关。选项 D 描述的是如果客户端没有发 FIN，服务端根本不会进入 CLOSE_WAIT，而是保持 ESTABLISHED。"
+        },
+        {
+          "id": "close-wait-diagnosis-1-q3",
+          "question": "执行 `ss -tan | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn` 的目的是什么？",
+          "choices": [
+            {"id": "A", "text": "列出所有 TCP 连接的详细信息，包括进程名称"},
+            {"id": "B", "text": "统计各 TCP 连接状态的数量，用于快速判断哪种状态异常"},
+            {"id": "C", "text": "按照连接的 Recv-Q 大小排序，找出积压最严重的连接"},
+            {"id": "D", "text": "检测当前服务器上所有处于 SYN_RECV 状态的连接，用于判断是否有 SYN Flood 攻击"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这条命令用 ss -tan 获取所有 TCP 连接（-t），显示绝对状态（-a），不解析域名（-n），然后 awk 跳过表头取第一列（状态列），sort + uniq -c 统计每种状态出现的次数，最后 sort -rn 按数量降序排列。结果类似「4721 CLOSE-WAIT, 98 ESTABLISHED」，是判断连接状态分布的快捷方式。若要看进程信息需要加 -p 参数；若要看 Recv-Q 则无需 awk 处理。"
+        },
+        {
+          "id": "close-wait-diagnosis-1-q4",
+          "question": "发现大量 CLOSE_WAIT 后，以下哪条命令可以找到持有这些连接的进程 PID？",
+          "choices": [
+            {"id": "A", "text": "netstat -s | grep CLOSE_WAIT"},
+            {"id": "B", "text": "ss -tanp state close-wait"},
+            {"id": "C", "text": "tcpdump -i eth0 'tcp[13] & 1 != 0'"},
+            {"id": "D", "text": "cat /proc/net/tcp | grep '08'"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ss -tanp state close-wait 是最直接的命令：-p 参数让 ss 显示每条连接对应的进程信息（PID 和进程名），state close-wait 直接过滤出 CLOSE_WAIT 状态的连接，输出里的 users 字段会显示 (\"java\",pid=12847,fd=234) 这样的信息。选项 A 的 netstat -s 是统计数据，没有进程信息。选项 C 的 tcpdump 是抓包工具，能看到 FIN 包但看不到当前状态堆积。选项 D 需要手动解析十六进制状态码，繁琐且容易出错。"
+        },
+        {
+          "id": "close-wait-diagnosis-1-q5",
+          "question": "以下 Java 代码中，哪种情况会导致 CLOSE_WAIT 连接泄漏？",
+          "choices": [
+            {"id": "A", "text": "try { conn.disconnect(); } catch (Exception e) { log.error(e); conn.disconnect(); }"},
+            {"id": "B", "text": "try { doRequest(conn); } catch (IOException e) { log.error(e); return; } finally { conn.disconnect(); }"},
+            {"id": "C", "text": "try { doRequest(conn); } catch (IOException e) { log.error(e); return; } conn.disconnect();"},
+            {"id": "D", "text": "try (HttpURLConnection conn = open(url)) { doRequest(conn); }"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "选项 C 是经典的连接泄漏写法：conn.disconnect() 写在了 try-catch 块外面，但 catch 块里有 return 语句。当 doRequest 抛出 IOException 时，代码进入 catch 执行 log.error 后 return 退出方法，conn.disconnect() 这行永远不会被执行，连接就此泄漏。选项 B 用了 finally 块，无论是否抛异常都会执行 disconnect()，是正确写法。选项 D 用了 try-with-resources，JVM 会自动调用 close()，同样安全。"
+        },
+        {
+          "id": "close-wait-diagnosis-1-q6",
+          "question": "CLOSE_WAIT 和 TIME_WAIT 最本质的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "TIME_WAIT 在主动关闭方出现，会自动消失；CLOSE_WAIT 在被动关闭方出现，不会自动消失"},
+            {"id": "B", "text": "TIME_WAIT 表示连接异常，CLOSE_WAIT 表示连接正常关闭中"},
+            {"id": "C", "text": "两者都会在 2MSL 后自动消失，TIME_WAIT 持续时间更长"},
+            {"id": "D", "text": "CLOSE_WAIT 在主动关闭方出现，TIME_WAIT 在被动关闭方出现"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是区分这两个状态最重要的认知。TIME_WAIT 出现在主动发起关闭的一方（通常是客户端），完成四次挥手后进入 TIME_WAIT，等待 2MSL（约 60 秒）后内核自动清理，目的是让网络中残留的旧数据包过期。大量 TIME_WAIT 是正常的高并发短连接场景的表现。CLOSE_WAIT 出现在被动关闭方（通常是服务端），由应用层 Bug 引发，没有超时机制，必须修代码才能消除。选项 C 完全错误，CLOSE_WAIT 不会自动消失。"
+        },
+        {
+          "id": "close-wait-diagnosis-1-q7",
+          "question": "使用 Apache HttpClient 连接池时，以下哪个配置最能防止 CLOSE_WAIT 连接在池中堆积？",
+          "choices": [
+            {"id": "A", "text": "增大连接池的 maxTotal 参数，从 200 调整到 1000"},
+            {"id": "B", "text": "调小 socket timeout，从 30 秒改为 5 秒"},
+            {"id": "C", "text": "调用 evictExpiredConnections() 和 evictIdleConnections(30, SECONDS) 启用后台驱逐"},
+            {"id": "D", "text": "将 HTTP 版本从 1.1 降级为 1.0，禁用 Keep-Alive"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "evictExpiredConnections() 会启动一个后台线程，定期扫描连接池并清理已被对端关闭的连接（即那些已经收到 FIN 但应用层未 close 的 CLOSE_WAIT 连接）。evictIdleConnections(30, SECONDS) 进一步清理长时间空闲的连接。这两个配置组合是 Apache HttpClient 官方推荐的防止连接泄漏的最佳实践。增大 maxTotal 只是推迟问题爆发而不解决根因；禁用 Keep-Alive 会导致每次请求都建立新连接，性能损失巨大且同样无法根治泄漏。"
+        },
+        {
+          "id": "close-wait-diagnosis-1-q8",
+          "question": "一个 Spring Boot 服务调用了下游 gRPC 服务，下线时出现大量 CLOSE_WAIT。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "gRPC 使用 HTTP/2，不支持 TCP 四次挥手，所以无法正常关闭"},
+            {"id": "B", "text": "ManagedChannel 没有在服务停止时调用 shutdown() 和 awaitTermination()，Netty 底层连接未被关闭"},
+            {"id": "C", "text": "gRPC 连接是 UDP 协议，不会产生 CLOSE_WAIT 状态"},
+            {"id": "D", "text": "下游 gRPC 服务主动断开了连接，本服务应该调用 reconnect() 而非 shutdown()"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "gRPC-Java 的 ManagedChannel 底层使用 Netty 管理 TCP 长连接，ManagedChannel 是对这些连接的高层抽象。如果在服务停止时没有显式调用 channel.shutdown() 并等待 channel.awaitTermination(timeout, SECONDS)，底层的 Netty channel 不会被关闭，对端（gRPC server）发来的 GOAWAY 帧和 FIN 包得不到响应，导致 CLOSE_WAIT 残留。在 Spring Boot 中，应将 ManagedChannel 的关闭逻辑注册到 @PreDestroy 或 ApplicationListener<ContextClosedEvent> 中。"
+        },
+        {
+          "id": "close-wait-diagnosis-1-q9",
+          "question": "开启 TCP keepalive（SO_KEEPALIVE）对 CLOSE_WAIT 堆积问题的帮助是什么？它的局限性是什么？",
+          "choices": [
+            {"id": "A", "text": "可以完全解决 CLOSE_WAIT 问题；无局限性，是最佳解法"},
+            {"id": "B", "text": "当对端正常关闭时可以防止 CLOSE_WAIT；但对应用层忘记调用 close() 的情况无效"},
+            {"id": "C", "text": "keepalive 只在 ESTABLISHED 状态有效，处于 CLOSE_WAIT 的连接不会发送 keepalive 探测"},
+            {"id": "D", "text": "keepalive 可以让 CLOSE_WAIT 连接在 2 小时后自动关闭，等同于超时机制"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个细节陷阱。TCP keepalive 探测只在连接处于 ESTABLISHED 状态时才由内核自动发送。一旦连接进入 CLOSE_WAIT 状态，说明内核已经收到了对端的 FIN、完成了被动关闭的第一步，此时对端已经处于 FIN_WAIT_2 或更高状态，keepalive 探测的场景（检测对端是否存活）已经不适用了。所以 keepalive 并不能清理 CLOSE_WAIT 连接。Keepalive 真正能帮助的场景是：中间防火墙或 NAT 设备悄悄丢弃了连接但没有发 FIN，这种情况下 keepalive 可以探测到并主动关闭，防止 ESTABLISHED 连接永久悬空。"
+        },
+        {
+          "id": "close-wait-diagnosis-1-q10",
+          "question": "排查 CLOSE_WAIT 问题时，以下哪个诊断步骤的顺序是最合理的？",
+          "choices": [
+            {"id": "A", "text": "先重启服务清空连接 → 再调整 tcp_fin_timeout → 最后看代码"},
+            {"id": "B", "text": "先用 ss -tanp state close-wait 定位持有连接的进程和对端 → 再用 lsof -p PID 确认 fd 消耗 → 最后检查对端 IP 对应的代码路径是否有 close() 遗漏"},
+            {"id": "C", "text": "先抓包分析 FIN 包的序列号 → 再用 strace 跟踪系统调用 → 最后修改内核参数"},
+            {"id": "D", "text": "先检查 /var/log/messages 里的内核日志 → 再查 iptables 规则 → 最后重启网络服务"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考的是 CLOSE_WAIT 排查的「最短路径」思维。因为 CLOSE_WAIT 几乎肯定是应用层问题，正确的路径是快速锁定「是哪个进程、连接了哪个对端」，然后直接去看对应的代码。ss -tanp 一条命令就能给出进程和对端信息；lsof -p 确认 fd 是否快耗尽（判断紧急程度）；最后到代码里找对应调用路径的 close() 遗漏。选项 A 的重启是治标不治本，调 tcp_fin_timeout 对 CLOSE_WAIT 无效。选项 C 的 strace 和抓包是在你不确定问题层次时才用的，这里方向已经明确，不需要。"
+        }
+      ],
+      "references": [
+        "https://www.rfc-editor.org/rfc/rfc793",
+        "https://hpbn.co/building-blocks-of-tcp/#connection-termination",
+        "https://hc.apache.org/httpcomponents-client-5.2.x/migration-guide/index.html",
+        "https://grpc.github.io/grpc-java/javadoc/io/grpc/ManagedChannel.html"
+      ]
+    }
+  ]
+}
