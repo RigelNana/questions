@@ -1,0 +1,169 @@
+{
+  "id": "monitoring-q73",
+  "name": "Elasticsearch 查询性能优化",
+  "domain": "monitoring",
+  "description": "Elasticsearch 查询与索引调优的核心手段，涵盖 filter context、分片策略、fielddata、force merge、bulk 写入优化等生产实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q73",
+      "domain": "monitoring",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["elasticsearch", "性能调优", "查询优化", "索引管理", "JVM", "分片策略"],
+      "title": "Elasticsearch 查询性能优化有哪些常见手段？",
+      "content": "公司运营着一套基于 Elasticsearch 7.17 的日志平台，负责收集来自 200 个微服务的应用日志和 APM 追踪数据。每天写入约 30 亿条文档，集群规模是 12 个数据节点，每节点 32 核 64GB 内存，挂载 3TB SSD，按天滚动索引。\n\n最近两周，业务侧反馈查询响应时间明显变慢。SRE 团队从 Kibana Monitoring 页面看到以下数据：\n\n```\n# 查询延迟\nsearch_query_time_in_millis P99：12,847ms（一周前：843ms）\nsearch_fetch_time_in_millis P99：3,212ms（一周前：234ms）\n\n# JVM 堆\nheap_used_percent：87%（告警阈值：75%）\ngc.old.collection_count 持续上升\n\n# 集群分片\nnumber_of_shards：18,240（一周前：6,120）\nunassigned_shards：0\n```\n\n研发团队在过去两周做了几件事：开始在日志 `message` 字段上使用 `wildcard` 做模糊搜索；把每日索引的分片数从 3 片改成了 9 片，理由是「数据量增加了三倍」；在一个高基数 `keyword` 字段 `trace_id` 上开启了 `fielddata: true` 做聚合统计；此外 bulk 写入时 `refresh_interval` 保持默认的 `1s`，副本数为 1。\n\n作为这个集群的负责人，你接到任务：P99 查询延迟必须在本周内降回 2 秒以内，JVM 堆压力必须控制在 70% 以下。请给出你的诊断思路和具体的优化方案，包括查询层、索引层和集群配置层。",
+      "answer": "## 第一步：先搞清楚 Elasticsearch 查询引擎的工作模型\n\nElasticsearch 的查询分两个阶段执行，官方叫 scatter/gather 模式。query 阶段，协调节点把请求广播给所有相关分片，每个分片在本地 Lucene 里执行搜索，返回匹配文档的 ID 和排序得分，协调节点汇总后取 top-N；fetch 阶段，协调节点再向持有这些文档的分片发请求，拉取完整 `_source` 数据返回给客户端。理解这个两阶段模型很关键，因为协调开销随分片数线性增长，而 fetch 阶段的性能则受 segment 结构影响极大。\n\nLucene 底层的存储单元是倒排索引，每个字段有自己的 posting list，记录哪些文档包含某个词。查询时 Lucene 遍历 posting list、计算相关性得分、按分数排序返回结果集。几乎所有 ES 查询性能问题都能追溯到同一个根因：「某个查询子句让 Lucene 做了超出必要的工作」。ES 的查询分两种上下文：query context 里的子句会计算相关性得分（`_score`），filter context 里的子句只判断文档是否匹配、不计算得分，而且结果会被 Lucene 的 segment-level bitset 缓存起来，下次完全命中缓存。对于日志系统里的 `level: ERROR`、`service_name: payment`、时间范围这类过滤条件，放进 `filter` 而不是 `must` 是最低成本的性能优化，同一条件第二次查询命中缓存后速度快 10 倍以上。\n\n## 第二步：逐一拆解这个集群的四个根本问题\n\n### 过度分片是万恶之源\n\n监控数据里最刺眼的数字是 `number_of_shards: 18,240`。每个分片是一个独立的 Lucene 实例，需要占用 JVM heap（通常每个分片 50–100MB），18,240 个分片光是元数据和 shard state 就要消耗 1–2GB heap，这是 `heap_used_percent` 飙升的直接原因之一。更糟的是查询时协调节点需要向所有相关分片发 scatter 请求并等待响应，分片越多协调开销越大，tail latency 越高。官方建议每 1GB heap 对应不超过 20 个分片，每个节点 64GB 内存分配约 30GB heap，最多承载 600 个分片，12 个节点健康上限约 7,200 个分片，而 18,240 已经超出两倍多。\n\n把每日索引的分片数从 3 改成 9 是典型的过度分片误操作。正确的规划逻辑是：每天写入约 300GB 压缩后数据（30 亿条，压缩比约 3:1），目标单分片大小 20–50GB，那么 3–5 个分片就足够，绝不需要 9 个。短期解法是新建索引恢复 3 分片；对已经存在的过量分片索引，可以使用 `_shrink` API 在低峰期把分片数缩减，或者配合 ILM（Index Lifecycle Management，索引生命周期管理）的 delete 策略及时清理过期数据。\n\n### 前导通配符是灾难性查询\n\n研发团队在 `message` 字段上使用 `wildcard: \"*error*\"` 做模糊搜索，这几乎可以确定是查询 P99 从 843ms 飙升到 12,847ms 的直接原因。`wildcard` 查询本身并不是洪水猛兽，`error*`（后缀通配）还好，Lucene 可以利用 FST（Finite State Transducer，有限状态转换机，ES 词典的底层数据结构）做高效前缀遍历。但是 `*error*`（前导通配符）是灾难性的：Lucene 必须从头扫描整个 Terms Dictionary，逐一检查每个词是否以 `error` 结尾，复杂度退化到 O(V)，V 是词典词汇量。在一个有几十亿条日志的索引里，`message` 字段的词典可能有上亿个词，一次前导通配符查询轻松耗时 5–10 秒。\n\n解决方案有两条路：一是把需要模糊搜索的字段在 Mapping 里定义为 `search_as_you_type` 类型，ES 会自动生成 2-gram 到 4-gram 的子字段；二是手动配置 `ngram tokenizer`（n 元分词器，把每个词切成所有连续 n 个字符的子串存入倒排表）在索引时就把所有子串预存下来，查询时转换成精确的 term 匹配。代价是索引体积增大 3–5 倍，但查询从 O(V) 降到 O(1) 级别的 term lookup，性能提升 100 倍以上。\n\n### fielddata 是 JVM heap 压力的另一个凶手\n\n在高基数 `keyword` 字段 `trace_id` 上开启 `fielddata: true` 来做聚合，这是教科书级别的配置错误。fielddata 是 ES 4.x 时代的遗留机制，它在查询时把字段数据从磁盘的行式倒排索引里读出来，在内存里转置成列式结构加载进 JVM heap。`trace_id` 是高基数字段，可能有几亿个唯一值，把它全部加载进 heap 可能消耗 10–20GB，直接触发 Old GC，这正是监控里 `gc.old.collection_count 持续上升` 的根因。\n\n正确的方式是 doc_values（文档值）。doc_values 是 ES 5.x 之后所有非 `text` 字段默认开启的列式存储格式，在索引阶段就以列式布局写入磁盘的 `.dvd/.dvm` 文件，查询时利用操作系统的 page cache 按需加载，完全不占用 JVM heap。`keyword`、`numeric`、`date` 字段默认 `doc_values: true`，应该始终用 doc_values 做聚合和排序，永远不要在 `keyword` 字段上开 `fielddata`。立即执行的修复操作：关掉 `trace_id` 字段的 `fielddata`，重建索引，JVM heap 压力会在数小时内回落。\n\n### 用 Profile API 定位任何查询的性能根因\n\n当你知道某个查询慢但不确定慢在哪个子句时，`_profile` API 是最直接的工具。在查询 body 里加上 `\"profile\": true`，ES 会返回每个查询子句在每个分片上的纳秒级耗时分解：\n\n```json\nGET /logs-*/_search\n{\n  \"profile\": true,\n  \"query\": {\n    \"bool\": {\n      \"must\": [{\"wildcard\": {\"message\": \"*error*\"}}],\n      \"filter\": [{\"range\": {\"@timestamp\": {\"gte\": \"now-1h\"}}}]\n    }\n  }\n}\n```\n\n返回结果中 `profile.shards[].searches[].query[].time_in_nanos` 会精确告诉你每个子句分别耗时多少。在 wildcard 前缀查询的典型 profile 输出里，`WildcardQuery` 子句的 `next_doc` 耗时通常占总耗时的 95% 以上，因为所有时间都花在了遍历 posting list 上。这个数据能帮你向研发团队直接证明问题所在，而不是靠猜。\n\n## 第三步：索引结构优化与写入调优的生产实践\n\n### 时序索引配置 index sorting 加速 early termination\n\n日志系统的查询几乎都带时间范围过滤，可以在索引 Mapping 里配置 `index.sort.field: [\"@timestamp\"]` 加上 `index.sort.order: [\"desc\"]`。index sorting 会在 Lucene segment 写入时按时间字段排序存储文档。这样做的好处是：当查询带时间范围过滤时，Lucene 在扫描 segment 时一旦发现当前 segment 里文档的时间戳已经超出查询范围，就可以提前中断（early termination），直接跳过整个 segment。在只需要最新 N 条日志的场景下，IO 减少量可以达到 70–80%。这个优化只在索引创建时生效，不能对已有索引追加，所以要在新建索引模板里配置。\n\n### force merge 让只读索引的查询飞起来\n\nLucene 的 segment 在写入过程中会不断 merge，但在索引进入只读状态后可能还残留十几到几十个小 segment。每个 segment 都是独立的文件描述符和元数据，查询时需要逐个 segment 扫描再合并结果。对于按天滚动的历史索引，一旦进入只读状态（比如 T-2 之前的索引），可以手动 force merge 成 1 个 segment：\n\n```bash\n# 合并成单个 segment，释放文件句柄、提升 filter cache 效率\nPOST /logs-2024.01.01/_forcemerge?max_num_segments=1\n```\n\n合并成单个 segment 后查询只需打开一个文件、一次顺序读，filter bitset cache 也更高效，通常查询速度提升 20–50%。注意 force merge 是 IO 密集型操作，必须在业务低峰期执行，绝对不能对正在写入的热索引执行，否则会把写入吞吐量打到接近零。生产环境建议通过 ILM 策略在 warm phase 自动触发 force merge。\n\n### Bulk 写入时暂停 refresh 和副本\n\n如果需要做大批量历史数据导入，有两个立竿见影的优化。第一，把 `index.refresh_interval` 设为 `-1`，写入期间完全禁用 refresh（refresh 是把 in-memory buffer 刷到 Lucene segment 并对搜索可见的操作，默认每秒一次，频繁 refresh 会产生大量小 segment，增加 merge 压力）。第二，把 `number_of_replicas` 临时设为 `0`，消除写副本的网络 IO 开销。写入完成后恢复这两个参数并手动触发一次 refresh：\n\n```bash\n# 写入前：关闭 refresh、取消副本\nPUT /my-index/_settings\n{\"index\": {\"refresh_interval\": \"-1\", \"number_of_replicas\": 0}}\n\n# 写入完成后：恢复配置（refresh_interval 建议设成 30s 而非默认 1s）\nPUT /my-index/_settings\n{\"index\": {\"refresh_interval\": \"30s\", \"number_of_replicas\": 1}}\n\nPOST /my-index/_refresh\n```\n\n这两个优化组合，bulk 写入吞吐量通常提升 3–5 倍。即使是日常写入，也建议把日志索引的 `refresh_interval` 从默认 `1s` 调整到 `30s`，降低 segment 碎片化速度，减少 merge 频率。日志查询通常接受 30 秒的可见性延迟。\n\n### Circuit Breaker 是 ES 的自我保护机制，不是 bug\n\nES 有一套熔断器（circuit breaker）机制，防止单个查询把整个 JVM heap 打爆。`indices.breaker.fielddata.limit`（默认 40% heap）是 fielddata 的专属上限，`indices.breaker.request.limit`（默认 60% heap）是单次请求的内存上限，`indices.breaker.total.limit`（默认 70% heap）是所有请求的总上限。当一个聚合查询尝试加载超过 fielddata limit 的数据时，ES 会直接抛出 `CircuitBreakingException` 并返回 HTTP 429，而不是让 JVM OOM 崩溃。\n\n当你在生产中看到 `Data too large, data for [<fielddata>] would be larger than limit of [12345678 bytes]` 这样的报错，正确的处理方式不是提高熔断器阈值，而是从根本上排查为什么这个字段还在用 fielddata，把它改成 doc_values。熔断器阈值提高只是掩盖问题，最终会在某次大查询时真正 OOM。\n\n把以上手段系统化之后，针对文章开头的那个场景，执行顺序应该是：先立刻关掉 `trace_id` 的 fielddata（降 heap 压力）、先立刻把新建索引的分片数改回 3（防止问题继续恶化）、再把 `must` 改为 `filter` 并禁止前导 wildcard（降查询延迟），最后在低峰期对历史索引做 force merge，并在新的索引模板里加上 index sorting。按这个顺序，一周内把 P99 降回 2 秒以内是完全可实现的。",
+      "keyPoints": [
+        "filter context 里的子句不计算相关性得分且结果被 Lucene bitset 缓存，所有不需要评分的过滤条件（时间范围、状态字段、枚举值）必须放进 filter 而非 must，同条件第二次查询直接命中缓存可快 10 倍以上",
+        "前导通配符查询（如 `*error*`）会强制遍历整个 Lucene Terms Dictionary，复杂度 O(V)，在亿级词典上单次查询耗时可达 5–10 秒，应改用 ngram tokenizer 在索引时预存子串、查询时转换为精确 term 匹配",
+        "fielddata 在查询时把字段数据反转加载进 JVM heap，高基数字段上开启 fielddata 可能消耗数十 GB heap 引发 Old GC；所有 keyword/numeric/date 字段应使用默认开启的 doc_values（列式存储，走 OS page cache，不占 JVM heap）做聚合和排序",
+        "每个分片是独立 Lucene 实例，过度分片（over-sharding）导致 JVM 堆元数据膨胀和协调节点 scatter 开销指数级上升；单分片目标大小 20–50GB，每 1GB heap 对应不超过 20 个分片是生产可参考的分片规划基准",
+        "对只读历史索引执行 `POST /index/_forcemerge?max_num_segments=1` 可将所有 segment 合并为一个，减少文件句柄开销并提升 filter cache 效率，通常提升查询性能 20–50%，但只能在索引关闭写入后的低峰期执行",
+        "时序数据索引配置 `index.sort.field: [\"@timestamp\"]` 开启 index sorting 后，Lucene 在扫描 segment 时可提前中断（early termination）跳过时间范围外的 segment，大幅减少 IO，在只取最新 N 条记录的查询场景下效果尤为显著",
+        "Bulk 大批量写入前将 `refresh_interval` 设为 `-1` 并把 `number_of_replicas` 临时设为 `0`，可将写入吞吐量提升 3–5 倍；日常写入建议把 `refresh_interval` 从默认 `1s` 调高到 `30s` 降低 segment 碎片化速度",
+        "Circuit Breaker 抛出 CircuitBreakingException 是 ES 的自我保护机制而非 bug；看到 fielddata breaker 触发的正确响应是排查并消除 fielddata 用法，而非提高阈值——提高阈值只会在某次更大的查询时彻底 OOM"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q73-quiz-1",
+          "question": "以下哪种写法能让「level=ERROR」这个过滤条件利用 Elasticsearch 的 filter cache？",
+          "choices": [
+            {"id": "A", "text": "bool.must: [{term: {level: \"ERROR\"}}]"},
+            {"id": "B", "text": "bool.filter: [{term: {level: \"ERROR\"}}]"},
+            {"id": "C", "text": "bool.should: [{term: {level: \"ERROR\"}}]"},
+            {"id": "D", "text": "match: {level: \"ERROR\"}"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "只有 filter context（bool.filter 或 bool.must_not）里的子句才会被 Lucene 的 segment-level bitset 缓存，下次相同条件查询直接命中缓存，跳过 posting list 遍历。must 和 should 都处于 query context，会计算相关性得分，既有 CPU 开销又无法缓存。match 查询默认也在 query context 里，同样不会缓存。对于日志系统里 level、service_name 这类固定枚举值的过滤条件，filter context 是唯一正确的选择。"
+        },
+        {
+          "id": "monitoring-q73-quiz-2",
+          "question": "在一个有 10 亿条日志的 Elasticsearch 索引里，执行 `{\"wildcard\": {\"message\": \"*timeout*\"}}` 查询慢的根本原因是什么？",
+          "choices": [
+            {"id": "A", "text": "wildcard 查询不支持并行执行，只能在单线程里运行"},
+            {"id": "B", "text": "前导通配符（*timeout*）导致 Lucene 必须遍历整个 Terms Dictionary，时间复杂度退化到 O(V)"},
+            {"id": "C", "text": "wildcard 查询会触发 full _source 加载，IO 压力过大"},
+            {"id": "D", "text": "ES 对 wildcard 查询的结果不会缓存，每次都重新计算"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "前导通配符（`*xxx*` 或 `*xxx`）是性能杀手，因为 Lucene 没有任何索引结构可以利用。FST（有限状态转换机）能高效做前缀查找（`xxx*`），但对于需要匹配任意位置子串的前导通配符，Lucene 只能扫描整个词典，遍历每一个词逐一判断，复杂度 O(V)。选项 A 错误，wildcard 实际上会在所有相关分片并行执行。选项 C 错误，慢在词典遍历阶段而非 fetch 阶段。选项 D 是次要问题，即使缓存了结果，首次查询的惩罚也是数秒级的。"
+        },
+        {
+          "id": "monitoring-q73-quiz-3",
+          "question": "在 `keyword` 类型字段上做 terms 聚合时，以下哪种做法是正确的？",
+          "choices": [
+            {"id": "A", "text": "开启 fielddata: true，让 ES 在查询时把字段数据加载进 JVM heap 做聚合"},
+            {"id": "B", "text": "使用 doc_values（keyword 字段默认开启），聚合数据走 OS page cache 不占 JVM heap"},
+            {"id": "C", "text": "把字段类型改成 text 并开启 fielddata，text 字段的 fielddata 比 keyword 效率更高"},
+            {"id": "D", "text": "使用 script 动态计算聚合值，这样不需要预存列式数据"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "keyword 字段默认开启 doc_values，这是 ES 5.x 之后的推荐做法。doc_values 在索引阶段就以列式格式写入磁盘，查询时通过 OS page cache 按需读取，完全不占用 JVM heap，是 ES 聚合和排序的正确底层机制。选项 A 的 fielddata 是遗留机制，在高基数 keyword 字段上开启会消耗大量 heap 并触发 GC，应该完全避免。选项 C 更糟，text 字段的 fielddata 会分词后加载所有词条，内存消耗更大。选项 D 的 script 聚合是最慢的方式，每条文档都要运行脚本，CPU 消耗极高。"
+        },
+        {
+          "id": "monitoring-q73-quiz-4",
+          "question": "一个 ES 集群共 12 个数据节点，每节点分配 30GB JVM heap。按照官方建议，该集群健康的分片总数上限约为多少？",
+          "choices": [
+            {"id": "A", "text": "约 720 个（每个节点 60 个）"},
+            {"id": "B", "text": "约 3,600 个（每个节点 300 个）"},
+            {"id": "C", "text": "约 7,200 个（每个节点 600 个）"},
+            {"id": "D", "text": "约 36,000 个（每个节点 3,000 个）"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "官方推荐每 1GB JVM heap 对应不超过 20 个分片。单节点 30GB heap × 20 = 600 个分片，12 个节点上限约 7,200 个分片。这个数字不是硬上限，而是保持 heap 开销和协调开销在合理范围内的经验值。超过这个上限后，分片元数据的 heap 消耗开始显著，协调节点的 scatter-gather 延迟也会明显上升。选项 A 太保守，选项 D 是 5 倍过量，在生产中会导致 heap 压力极大和查询 tail latency 飙升，和文章中的 18,240 分片问题类似。"
+        },
+        {
+          "id": "monitoring-q73-quiz-5",
+          "question": "对按天滚动的日志索引，以下哪个场景最适合执行 force merge？",
+          "choices": [
+            {"id": "A", "text": "每天凌晨对当天正在写入的热索引执行 force merge，减少写入时的 segment 碎片"},
+            {"id": "B", "text": "在写入高峰期对历史索引执行 force merge，充分利用集群 IO 能力"},
+            {"id": "C", "text": "在业务低峰期对已关闭写入的历史只读索引执行 force merge，合并成 1 个 segment"},
+            {"id": "D", "text": "集群出现 unassigned shard 时执行 force merge，帮助恢复分片分配"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "force merge 是 IO 密集型操作，会把多个 segment 读入内存、合并、写回磁盘，期间 IO 和 CPU 消耗极高。对正在写入的热索引执行 force merge 会严重阻塞写入，可能导致写入延迟飙升甚至 bulk 队列堆积。正确的使用时机是：索引已经关闭写入（比如前一天或更早的历史索引），在业务低峰期执行，合并成 `max_num_segments=1` 的单个 segment，之后该索引的查询性能可提升 20–50%。unassigned shard 是分片分配问题，与 force merge 没有任何关系。"
+        },
+        {
+          "id": "monitoring-q73-quiz-6",
+          "question": "为一个日志索引配置 `\"index.sort.field\": [\"@timestamp\"], \"index.sort.order\": [\"desc\"]` 的主要性能收益是什么？",
+          "choices": [
+            {"id": "A", "text": "写入时自动按时间排序，磁盘顺序 IO 性能提升 10 倍"},
+            {"id": "B", "text": "查询时 Lucene 可对时间范围外的 segment 提前中断（early termination），减少不必要的 IO"},
+            {"id": "C", "text": "时间字段被压缩存储，索引体积减小 50%"},
+            {"id": "D", "text": "消除了对 @timestamp 字段建倒排索引的需要，释放磁盘空间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Index sorting 的核心收益在于 early termination（提前中断）。Lucene 扫描 segment 时，如果 segment 内的文档已经按 @timestamp 降序排列，那么当遇到时间戳超出查询范围的文档时，可以立即中断扫描并跳过该 segment，不需要扫描到 segment 末尾。这对「取最新 N 条日志」和「固定时间窗口查询」场景效果最明显，IO 减少量可达 70–80%。选项 A 错误，写入 IO 反而会因为维护排序而略有增加。选项 C 和 D 都是无关的错误描述，index sorting 不影响压缩比，时间字段的倒排索引仍然存在。"
+        },
+        {
+          "id": "monitoring-q73-quiz-7",
+          "question": "生产环境中 ES 查询返回了如下错误：`CircuitBreakingException: [fielddata] Data too large, data for [trace_id] would be larger than limit`，正确的处理方式是什么？",
+          "choices": [
+            {"id": "A", "text": "把 `indices.breaker.fielddata.limit` 从 40% 提高到 80%，给 fielddata 更多 heap 空间"},
+            {"id": "B", "text": "重启 ES 节点清空 fielddata cache，问题会自动消失"},
+            {"id": "C", "text": "排查并消除 trace_id 字段上的 fielddata 用法，改为使用 doc_values 做聚合"},
+            {"id": "D", "text": "降低该索引的副本数，把释放出来的内存分给 fielddata"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "CircuitBreakingException 是 ES 的自我保护机制，它阻止了一个可能导致 JVM OOM 的操作。正确的响应是从根本上消除问题：把 trace_id 字段的 `fielddata: true` 配置去掉（需要重建索引），让 ES 走默认的 doc_values 路径做聚合，彻底解决 heap 压力。选项 A 是治标不治本，提高阈值只是推迟了 OOM，某次更大的查询仍然会打爆 heap。选项 B 是临时缓解，重启后第一次相同聚合查询依然会触发 OOM。选项 D 副本数和 heap 内存分配没有直接关系，降副本不会释放更多 heap 给 fielddata。"
+        },
+        {
+          "id": "monitoring-q73-quiz-8",
+          "question": "需要向 ES 集群做一次 5TB 的历史数据全量导入，以下哪个配置组合能最大化写入吞吐量？",
+          "choices": [
+            {"id": "A", "text": "refresh_interval: \"1s\"，number_of_replicas: 1（保持默认，确保数据安全）"},
+            {"id": "B", "text": "refresh_interval: \"-1\"，number_of_replicas: 0（导入完成后恢复）"},
+            {"id": "C", "text": "refresh_interval: \"60s\"，number_of_replicas: 2（多副本提升读性能）"},
+            {"id": "D", "text": "refresh_interval: \"-1\"，number_of_replicas: 3（更多副本分担 IO 压力）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Bulk 全量导入的黄金配置是 `refresh_interval: \"-1\"` 加 `number_of_replicas: 0`。关闭 refresh 消除了每秒产生新 segment 和触发 merge 的开销；number_of_replicas 设为 0 消除了把每条数据通过网络写到副本分片的 IO 开销，写入量直接减半。两者组合吞吐量可提升 3–5 倍。导入完成后必须恢复 refresh_interval 和 replicas，并手动触发 `POST /index/_forcemerge` 做一次合并。选项 C 的多副本在导入阶段是纯粹的额外 IO 开销。选项 D 更糟，3 个副本意味着每条数据写 4 次（1 主 + 3 副），写入速度会显著下降。"
+        },
+        {
+          "id": "monitoring-q73-quiz-9",
+          "question": "使用 `_profile` API 分析一个慢查询时，返回结果中 `WildcardQuery` 子句的 `next_doc` 指标耗时占比高达 97%，这说明什么？",
+          "choices": [
+            {"id": "A", "text": "该查询匹配了太多文档，fetch 阶段需要加载大量 _source"},
+            {"id": "B", "text": "wildcard 查询遍历 posting list 的时间占主导，通常意味着前导通配符扫描了整个词典"},
+            {"id": "C", "text": "段合并（segment merge）线程占用了 IO，干扰了查询执行"},
+            {"id": "D", "text": "该字段的 fielddata 未命中缓存，需要从磁盘重新加载"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`next_doc` 是 Lucene 查询器遍历 posting list（倒排表，记录哪些文档包含某个词）的核心操作，97% 的时间耗在这里说明查询花了几乎所有时间在遍历词典和文档列表。对于前导通配符（`*xxx*`），Lucene 必须把词典里匹配的每一个词对应的 posting list 都合并遍历，词典越大、匹配词越多，`next_doc` 耗时越长。这个 profile 数据是定向解决 wildcard 问题的有力证据。选项 A 描述的是 fetch 阶段问题，会体现在 `search_fetch_time` 里。选项 C 的 segment merge 不会直接体现在 profile 子句耗时里。选项 D 的 fielddata 加载延迟体现在聚合阶段，不在 query 子句的 next_doc 里。"
+        },
+        {
+          "id": "monitoring-q73-quiz-10",
+          "question": "把日志索引的 `refresh_interval` 从默认的 `1s` 改成 `30s`，会带来什么直接后果？",
+          "choices": [
+            {"id": "A", "text": "历史数据会被删除，只保留最近 30 秒的日志"},
+            {"id": "B", "text": "新写入的文档最多延迟 30 秒才对搜索可见，但写入性能提升，segment 碎片减少"},
+            {"id": "C", "text": "所有查询的响应时间增加 30 秒，因为每次查询前都需要等待 refresh 完成"},
+            {"id": "D", "text": "索引副本同步延迟从 1 秒增加到 30 秒，主副本一致性降低"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "refresh 操作把内存缓冲区（in-memory buffer）的数据刷到新的 Lucene segment，使其对搜索可见。refresh_interval 控制的是「数据写入后多久可以被搜索到」的可见性延迟，不影响数据持久性（数据写入时就已经通过 translog 持久化了）。把间隔从 1s 改成 30s 意味着新写入的日志最多延迟 30 秒才能被查到，但好处是显著减少了 segment 产生速度，降低 merge 压力和 IO 抖动，写入吞吐量提升明显。对于日志系统，30 秒的查询可见性延迟通常完全可以接受。选项 C 是常见误解，查询本身不等待 refresh，只是可能查不到最近 30 秒内写入的数据。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Elasticsearch 官方文档：调优搜索速度",
+          "url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/tune-for-search-speed.html"
+        },
+        {
+          "title": "Elasticsearch 官方文档：调优索引速度",
+          "url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/tune-for-indexing-speed.html"
+        },
+        {
+          "title": "Elasticsearch 官方文档：Circuit Breaker 熔断器设置",
+          "url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/circuit-breaker.html"
+        },
+        {
+          "title": "Elasticsearch 官方文档：Profile API",
+          "url": "https://www.elastic.co/guide/en/elasticsearch/reference/current/search-profile.html"
+        }
+      ]
+    }
+  ]
+}
