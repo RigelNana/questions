@@ -1,0 +1,158 @@
+{
+  "id": "docker-daemon-performance",
+  "name": "Docker daemon 性能问题与调优",
+  "domain": "troubleshooting",
+  "description": "大量容器场景下 Docker daemon 性能下降的原因分析与调优策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "docker-daemon-performance-1",
+      "domain": "troubleshooting",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["docker", "daemon", "containerd", "performance", "container", "overlay2"],
+      "title": "宿主机运行数百个容器后 docker 命令响应很慢，如何分析和优化 Docker daemon 性能？",
+      "content": "## 场景描述\n\n你负责维护一台物理机，上面跑着约 350 个容器，部署的是公司内部的微服务集群。最近开发团队开始抱怨：`docker ps` 要等 8-12 秒才出结果，`docker stats` 第一屏数据要等将近 20 秒，启动一个新容器从 `docker run` 到容器真正 ready 要 30 秒以上，而在容器少的时候这些操作都是秒级完成的。\n\n你登上这台宿主机，发现磁盘用量已经到了 85%，`/var/lib/docker` 目录下有大量历史镜像和已停止的容器残留。运行 `docker system df` 得到如下输出：\n\n```\nTYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\nImages          142       38        87.3GB    61.2GB (70%)\nContainers      412       350       18.4GB    3.1GB (16%)\nLocal Volumes   89        54        34.6GB    12.8GB (36%)\nBuild Cache     0         0         0B        0B\n```\n\n与此同时，你注意到宿主机的 CPU 并不高，内存也还有富余，`iostat` 看磁盘 I/O 在高峰期 `%util` 持续在 92% 以上，`/var/lib/docker` 所在的磁盘是一块机械硬盘（HDD）。\n\n你需要回答以下几个问题：Docker daemon 为什么在容器数量增多后性能会系统性下降？瓶颈在哪里？有哪些具体的调优手段？如果从架构层面彻底解决这个问题，应该怎么考虑？",
+      "answer": "## 一、先搞清楚 Docker daemon 是什么\n\n在分析性能问题之前，我们需要先把 Docker 的架构说清楚，因为很多人对「Docker」的理解停留在「一个容器工具」这个层面，实际上它在 Docker 18.09（2018年底）之后已经演化成了一个分层的三进程架构。\n\n当你安装 Docker 并运行 `systemctl start docker` 时，实际上启动的是两个守护进程：`dockerd` 和 `containerd`。`dockerd` 是面向用户的 API 层，它暴露 Docker REST API（监听在 `/var/run/docker.sock`），负责处理所有的 CLI 请求，包括镜像管理、网络管理、卷管理、以及把你的 `docker run` 指令翻译成容器创建操作。`containerd` 是实际的容器运行时管理器，它负责容器生命周期的管理、镜像的拉取与存储、以及与底层 OCI 运行时（也就是 `runc`）的交互。当需要创建一个容器时，`dockerd` 会通过 gRPC 调用 `containerd`，`containerd` 再 fork 出一个 `containerd-shim` 进程，由这个 shim 进程调用 `runc` 来实际创建 namespace 和 cgroup，创建完成后 `runc` 退出，shim 继续存在作为容器进程的「保姆」，负责收集 exit code 等信息。\n\n这个分层关系可以用一行命令验证：\n\n```bash\n# 查看进程树，每个容器对应一个 containerd-shim\nps aux | grep containerd-shim | wc -l\n# 输出应该接近你的容器数量，比如 350\n```\n\n理解这个架构的关键点是：**`dockerd` 本身是单进程、单线程处理 API 请求的中心节点**。所有的 `docker ps`、`docker stats`、`docker run` 请求都要经过这个进程，而且在处理某些重量级操作时，它会持有全局锁（比如列举所有容器时需要遍历容器状态），导致后续请求排队等待。容器越多，这个瓶颈就越明显。\n\n## 二、性能瓶颈在哪里\n\n回到题目中的场景，`docker ps` 要等 8-12 秒，问题出在几个地方。\n\n**第一个瓶颈：dockerd 的串行处理与全局锁。** `docker ps` 这个命令看起来很简单，实际上 `dockerd` 要遍历所有容器（包括已停止的），从磁盘读取每个容器的元数据文件（存放在 `/var/lib/docker/containers/<id>/config.v2.json`），然后汇总返回。题目中有 412 个容器（350 运行中 + 62 已停止），就是 412 次 I/O 读取，再叠加磁盘 I/O 压力，慢就合理了。而且如果同时有其他 API 请求，比如某个监控 Agent 在持续调用 `docker stats`，它们会互相阻塞。\n\n**第二个瓶颈：overlay2 文件系统的 lookup 开销。** Docker 默认使用 overlay2 作为存储驱动。overlay2 是一种联合文件系统，它把镜像的多个只读层叠加在一起，再加一个可写层，形成容器看到的完整文件系统视图。每个镜像层都存在 `/var/lib/docker/overlay2/` 下的一个目录里。题目中有 142 个镜像，如果每个镜像平均有 10 层，就有将近 1400 个目录需要管理。当容器数量多、镜像层数多时，内核在做目录项缓存（dentry cache）的查找时压力也会增大，再加上 HDD 的随机 I/O 性能本就不高（通常只有 100-200 IOPS），`%util` 到 92% 完全说得通。\n\n**第三个瓶颈：`/var/lib/docker` 磁盘空间告急。** 磁盘使用率 85%，文件系统的空闲 inode 和空闲块都在减少。Linux 在磁盘使用率超过 80% 后，文件系统的性能会明显下降，这是因为碎片化更严重、分配新块时需要更长时间搜索空闲块。更直接的影响是：如果某个写操作（比如容器日志写入）触发磁盘满，`dockerd` 可能会卡住甚至崩溃。\n\n## 三、调优方案：从最简单的开始\n\n### 第一步：清理垃圾，立竿见影\n\n`docker system df` 已经告诉你有 61.2GB 的镜像可以回收，这是最快见效的操作：\n\n```bash\n# 删除所有未被任何容器引用的镜像，包括悬空镜像（dangling）和未使用镜像\ndocker system prune -af --volumes\n\n# 如果不确定，可以先只清理悬空镜像（已经没有 tag 的中间层镜像）\ndocker image prune -f\n\n# 只清理已停止的容器（不删镜像和 volumes）\ndocker container prune -f\n\n# 清理后再看空间变化\ndocker system df\n```\n\n清理完成后，题目中 62 个已停止的容器对应的元数据目录消失，`docker ps` 要遍历的容器数量从 412 降到 350，I/O 读取减少 15%。更重要的是，磁盘使用率从 85% 降到可能的 50%-60%，文件系统性能会明显恢复。\n\n**这一步要形成习惯，最好加入 crontab 定期执行**：\n\n```bash\n# 每天凌晨 3 点清理，删除超过 24 小时未使用的资源\n0 3 * * * /usr/bin/docker system prune -f --filter \"until=24h\" >> /var/log/docker-prune.log 2>&1\n```\n\n### 第二步：控制容器日志大小，减少磁盘 I/O\n\n默认情况下，Docker 使用 `json-file` 日志驱动，每个容器的标准输出都会被写入 `/var/lib/docker/containers/<id>/<id>-json.log`，没有大小限制。350 个容器如果都在疯狂打日志，这 350 个文件的写入 I/O 叠加在一起就能把 HDD 打满。\n\n修改 `/etc/docker/daemon.json`（这是 Docker daemon 的核心配置文件）：\n\n```json\n{\n  \"log-driver\": \"json-file\",\n  \"log-opts\": {\n    \"max-size\": \"50m\",\n    \"max-file\": \"3\"\n  },\n  \"storage-driver\": \"overlay2\",\n  \"storage-opts\": [\n    \"overlay2.override_kernel_check=true\"\n  ],\n  \"max-concurrent-downloads\": 5,\n  \"max-concurrent-uploads\": 3\n}\n```\n\n这个配置中，`max-size: 50m` 让每个容器日志文件最大 50MB，`max-file: 3` 表示最多保留 3 个轮转文件，也就是每个容器最多用 150MB 存日志。350 个容器最坏情况下用 52.5GB，和没有限制时的无底洞相比好多了。修改 daemon.json 后需要重启 Docker daemon（`systemctl reload docker` 或 `systemctl restart docker`），但注意这会短暂中断所有容器。\n\n如果想把日志完全从 Docker 的职责中剥离出去，可以改用 `none` 驱动或者 `fluentd`/`loki` 驱动，把日志送到专门的日志系统，彻底消除 `/var/lib/docker` 的日志写入压力。\n\n### 第三步：限制 `docker stats` 的调用频率\n\n`docker stats` 是一个非常重量级的操作，它需要读取每个容器的 cgroup 文件（在 `/sys/fs/cgroup/` 下）来获取 CPU 和内存数据。350 个容器就是 350 次 cgroup 读取，而且 `docker stats` 默认是流式输出（每秒刷新一次），意味着每秒都有 350 次读取持续进行。如果你的监控系统（比如 Prometheus + cAdvisor）也在做类似的事，再加上人工运行 `docker stats`，I/O 压力会被放大。\n\n正确做法是用 cAdvisor（Google 开源的容器监控工具）替代直接调用 `docker stats`，cAdvisor 会自己管理读取频率并做缓存，比 `docker stats` 高效很多。\n\n## 四、从架构层面看这个问题\n\n上面的调优手段都是治标的，真正的问题是：**在数百个容器的规模下，单机 `dockerd` 作为中心节点本身就是架构上的瓶颈**。这也是为什么 Kubernetes 在 1.24 版本（2022年5月发布）彻底移除了对 dockershim 的支持。\n\ndockershim 是 K8s 内嵌的一个垫片，它把 K8s 的 CRI（Container Runtime Interface，容器运行时接口）调用翻译成 Docker API 调用。整个链路是：`kubelet → CRI → dockershim → dockerd → containerd → runc`，中间多了 `dockerd` 这一跳，既增加了延迟，又意味着 K8s 要对一个它不控制的进程（`dockerd`）负责。\n\n移除 dockershim 之后，K8s 推荐的运行时是直接使用 `containerd`（通过 `containerd` 原生支持的 CRI 插件），链路变成：`kubelet → CRI → containerd → runc`，少了一层 `dockerd`，启动延迟降低，而且 `containerd` 本身的设计比 `dockerd` 更适合被编排系统控制——它是多租户的，可以同时服务于多个 namespace，API 是 gRPC 而非 REST，并发性能更好。\n\n在这个背景下，如果你要继续在命令行操作容器（比如调试），可以用 `nerdctl`（NERD CTL，containerd 的 docker 兼容 CLI）：\n\n```bash\n# nerdctl 的命令和 docker 几乎完全兼容\nnerdctl ps\nnerdctl run -d nginx:latest\nnerdctl system df\n\n# 用 nerdctl 直接操作 containerd，完全绕过 dockerd\n# 速度在大量容器场景下比 docker cli 快 3-5 倍\n```\n\n`nerdctl` 的底层直接调用 `containerd` 的 gRPC API，不经过 `dockerd`，因此在容器数量很多时响应速度明显更快。\n\n## 五、查空间和排查工具备忘\n\n遇到 Docker 性能问题时，有几个命令是必须掌握的：\n\n```bash\n# 查看 Docker 空间使用详情（-v 展开每个镜像/容器的细节）\ndocker system df -v\n\n# 查看哪些镜像层最大\ndu -sh /var/lib/docker/overlay2/* | sort -rh | head -20\n\n# 查看 dockerd 的 API 响应时间（通过 strace 或 debug 日志）\n# 修改 daemon.json 开启 debug 模式\n# \"debug\": true\n# 然后 journalctl -u docker -f 观察每个请求的处理时间\n\n# 查看每个容器占用的日志大小\ndu -sh /var/lib/docker/containers/*/\\*-json.log | sort -rh | head -20\n\n# 统计当前 containerd-shim 进程数（= 运行中容器数）\nps aux | grep -c containerd-shim\n```\n\n这道题的考察核心，其实是对 Docker 整体架构的理解，以及在遇到性能问题时能否系统性地分析瓶颈而不是盲目重启。一个有经验的工程师看到 `docker ps` 慢的第一反应应该是：「dockerd 在做什么？磁盘 I/O 是什么情况？有没有悬挂的 API 调用？」而不是「重启一下 docker 试试」。",
+      "keyPoints": [
+        "Docker daemon（dockerd）是单进程的中心节点，所有 API 请求经过它串行处理，容器越多全局锁持有时间越长，这是大量容器场景下性能退化的根本原因。",
+        "Docker 的三层架构是 dockerd → containerd → runc：dockerd 处理 Docker API，containerd 管理容器生命周期，runc 实际创建 namespace 和 cgroup，每个运行中的容器对应一个 containerd-shim 进程。",
+        "overlay2 存储驱动把每个镜像层存为独立目录，镜像数量和层数越多，/var/lib/docker/overlay2/ 下的目录越多，内核 dentry cache 压力越大，在 HDD 上表现为随机 I/O 高。",
+        "daemon.json 中 log-driver 的 max-size 和 max-file 参数至关重要，不配置会导致容器日志无限增长，数百个容器的持续写入会将 HDD 的 %util 打满并蚕食 /var/lib/docker 空间。",
+        "docker system prune 是快速释放空间的首选命令，可以一次性清理悬空镜像、已停止容器、未使用 volume，在磁盘使用率过高的场景下能立竿见影地改善性能。",
+        "Kubernetes 1.24 废弃 dockershim 的根本原因是 dockerd 作为中间层带来的延迟和不稳定性，直接使用 containerd 作为 CRI runtime 可以减少一层调用，更适合大规模编排场景。",
+        "nerdctl 是 containerd 的 docker 兼容 CLI，命令与 docker 几乎相同但直接调用 containerd gRPC API，在容器数量多的场景下响应速度比 docker cli 快 3-5 倍。",
+        "docker stats 是高资源消耗操作，每次刷新需读取所有容器的 cgroup 文件；在生产环境应用 cAdvisor 替代直接调用 docker stats，避免监控 Agent 与人工操作叠加打满磁盘 I/O。"
+      ],
+      "quiz": [
+        {
+          "id": "docker-daemon-performance-q1",
+          "question": "在标准 Docker 安装中，`dockerd` 和 `containerd` 的关系是？",
+          "choices": [
+            { "id": "A", "text": "dockerd 是 containerd 的子进程，由 containerd 统一管理所有容器" },
+            { "id": "B", "text": "dockerd 暴露 Docker REST API，通过 gRPC 调用 containerd 来执行实际的容器生命周期操作" },
+            { "id": "C", "text": "containerd 只在 Kubernetes 环境中使用，单机 Docker 直接使用 runc" },
+            { "id": "D", "text": "dockerd 和 containerd 是完全独立的两个项目，功能重叠，二选一即可" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "dockerd 是用户侧的 API 网关，负责处理 Docker CLI 发来的 REST 请求（通过 /var/run/docker.sock），而容器的实际创建、启动、停止则委托给 containerd 通过 gRPC 完成。containerd 再调用 containerd-shim，最终由 runc 操作 Linux namespace 和 cgroup。选项 A 反了，dockerd 不是 containerd 的子进程，它们平级，但控制流是 dockerd → containerd。选项 C 错误，单机 Docker 同样使用 containerd，Docker 18.09 之后 containerd 就是标准组件。选项 D 错误，二者职责分工明确，不能互相替代。"
+        },
+        {
+          "id": "docker-daemon-performance-q2",
+          "question": "`docker system df` 的输出中，「Reclaimable」列表示什么？",
+          "choices": [
+            { "id": "A", "text": "当前正在使用的存储空间，释放会影响运行中的容器" },
+            { "id": "B", "text": "可以通过 docker system prune 安全回收的空间，包括未被任何运行中容器引用的镜像和已停止的容器" },
+            { "id": "C", "text": "Docker 预分配但尚未使用的磁盘配额" },
+            { "id": "D", "text": "只包含悬空镜像（dangling image）占用的空间" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Reclaimable 列告诉你「不影响当前运行状态的前提下，最多可以回收多少空间」。对于 Images，它包括所有没有被任何容器（包括已停止容器）引用的镜像；对于 Containers，它包括已停止容器的存储层；对于 Volumes，它包括没有被任何容器挂载的 volume。选项 A 描述的是已使用空间，正好相反。选项 C 的「预分配配额」概念在 Docker 默认配置中不存在。选项 D 的范围过窄，悬空镜像只是 Reclaimable 镜像的子集，没有 tag 但仍被容器引用的镜像不能被回收。"
+        },
+        {
+          "id": "docker-daemon-performance-q3",
+          "question": "以下 daemon.json 配置中，哪一项能有效防止容器日志无限增长导致磁盘被打满？",
+          "choices": [
+            { "id": "A", "text": "设置 `\"storage-driver\": \"overlay2\"` 并指定 overlay2 的配额" },
+            { "id": "B", "text": "设置 `\"log-driver\": \"json-file\"` 加 `\"log-opts\": {\"max-size\": \"50m\", \"max-file\": \"3\"}`" },
+            { "id": "C", "text": "设置 `\"max-concurrent-downloads\": 1` 减少并发拉取" },
+            { "id": "D", "text": "设置 `\"live-restore\": true` 让 daemon 重启时容器继续运行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "json-file 是 Docker 默认的日志驱动，它把容器的 stdout/stderr 写入 /var/lib/docker/containers/<id>/<id>-json.log。如果不设置 max-size，这个文件会无限增长。max-size: 50m 加 max-file: 3 意味着最多保留 3 个 50MB 的轮转文件，每个容器日志上限 150MB。选项 A 的 overlay2 quota 控制的是容器文件系统层（可写层）的大小，与日志无关；日志文件写在容器元数据目录下，不受 overlay2 quota 限制。选项 C 控制镜像拉取并发数，与日志无关。选项 D 的 live-restore 让 dockerd 重启时容器继续运行，是高可用功能，与磁盘空间无关。"
+        },
+        {
+          "id": "docker-daemon-performance-q4",
+          "question": "为什么大量容器场景下 `docker ps` 会非常慢，而宿主机 CPU 和内存并不高？",
+          "choices": [
+            { "id": "A", "text": "docker ps 需要通过网络请求每个容器内部的 agent 来获取状态" },
+            { "id": "B", "text": "dockerd 需要遍历所有容器的元数据文件（磁盘 I/O），且持有全局锁期间其他 API 请求无法并发执行" },
+            { "id": "C", "text": "docker ps 会触发 overlay2 文件系统对所有镜像层做完整性校验" },
+            { "id": "D", "text": "容器数量超过内核 namespace 限制时，查询会触发 swap" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "docker ps 的实现是 dockerd 遍历 /var/lib/docker/containers/ 下的每个容器目录，读取 config.v2.json 文件来获取容器的元数据（名称、状态、端口映射等）。400 个容器就是 400 次磁盘读取，在 HDD 上的随机 I/O 性能只有约 100-200 IOPS，读取延迟累积起来就是几秒到十几秒。同时 dockerd 在处理这个请求时会持有锁，其他并发的 API 调用（比如监控 Agent 的 docker stats）会被阻塞排队。选项 A 完全错误，Docker 不会向容器内发请求。选项 C 错误，docker ps 不做镜像校验。选项 D 错误，namespace 数量限制远高于数百个，且超限会直接失败而非触发 swap。"
+        },
+        {
+          "id": "docker-daemon-performance-q5",
+          "question": "以下 `docker system df` 输出说明什么问题？\n\n```\nImages    142    38    87.3GB    61.2GB (70%)\n```",
+          "choices": [
+            { "id": "A", "text": "142 个镜像都是正常的，70% 的可回收率是 Docker 的正常碎片率" },
+            { "id": "B", "text": "只有 38 个镜像在被运行中的容器使用，另外 104 个镜像（61.2GB）没有被引用，可以安全删除" },
+            { "id": "C", "text": "61.2GB 的可回收空间包含正在运行的容器写入层，删除可能导致容器崩溃" },
+            { "id": "D", "text": "这说明镜像 pull 失败了，需要重新拉取这 104 个镜像" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "docker system df 的 ACTIVE 列表示当前被至少一个容器（运行中或已停止）引用的镜像数量。TOTAL=142，ACTIVE=38，意味着 142-38=104 个镜像完全没有被任何容器引用，可以用 docker image prune -a -f 或 docker system prune -af 安全删除，释放约 61.2GB 空间。这些通常是历史版本镜像（比如 nginx:1.23、nginx:1.24 已经被 nginx:1.25 替代但忘记删了）。选项 A 的「正常碎片率」说法不存在，70% 的可回收率是典型的镜像堆积问题。选项 C 错误，可回收的镜像层不包含正在运行容器的可写层，删镜像不影响运行中的容器。选项 D 的推断完全没有根据。"
+        },
+        {
+          "id": "docker-daemon-performance-q6",
+          "question": "以下关于 docker system prune 命令的说法，哪个是常见的误解？",
+          "choices": [
+            { "id": "A", "text": "`docker system prune` 不加 `-a` 只删除悬空镜像（没有 tag 的层），不删有 tag 的未使用镜像" },
+            { "id": "B", "text": "`docker system prune -af --volumes` 会同时删除未使用的 volume，可能导致数据丢失" },
+            { "id": "C", "text": "`docker system prune` 会删除所有镜像，包括正在运行容器使用的镜像，导致容器崩溃" },
+            { "id": "D", "text": "`docker system prune` 不会删除正在运行的容器" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是最常见的误解，也是很多人不敢执行 prune 的原因。实际上 Docker 在删除镜像时会检查引用计数，任何被容器（运行中或已停止）引用的镜像都不会被删除。docker system prune -af 只会删除「没有被任何容器引用的」镜像，运行中容器的镜像绝对安全。选项 A 是正确的行为描述：不加 -a 时，prune 只删 dangling image（比如 docker build 产生的 <none>:<none> 中间层），加了 -a 才删所有未使用镜像。选项 B 也是正确的警告，--volumes 参数确实会删除没有被容器挂载的 volume，如果 volume 里有重要数据要小心。选项 D 也是正确的，prune 不会强制停止运行中的容器。"
+        },
+        {
+          "id": "docker-daemon-performance-q7",
+          "question": "Kubernetes 1.24 废弃 dockershim 改用 containerd 作为默认运行时，核心原因是什么？",
+          "choices": [
+            { "id": "A", "text": "containerd 比 dockerd 支持更多的容器镜像格式（OCI、Docker、LXC）" },
+            { "id": "B", "text": "使用 containerd 可以直接支持 Windows 容器，而 dockerd 只支持 Linux" },
+            { "id": "C", "text": "dockershim 让 K8s 调用链多了一层 dockerd，增加延迟且由 K8s 社区维护这个垫片成本高；直接用 containerd 实现 CRI 接口更简洁高效" },
+            { "id": "D", "text": "dockerd 的开源协议与 Kubernetes 不兼容，存在法律风险" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "dockershim 是 K8s 内嵌的垫片，把 CRI 调用转成 Docker API，再由 dockerd 转给 containerd。链路是 kubelet→dockershim→dockerd→containerd→runc，比直接用 containerd（kubelet→containerd→runc）多了两跳。维护 dockershim 需要 K8s 社区持续跟踪 Docker API 变化，成本高且容易引入 bug，KEP-2221 明确说明这是废弃的主要原因。选项 A 错误，镜像格式支持与是否使用 dockerd 无关，containerd 本身支持 OCI 标准。选项 B 错误，Windows 容器支持与此无关，且 dockerd 本身也支持 Windows。选项 D 纯属虚构，Docker Engine（Moby 项目）使用 Apache 2.0 协议，与 K8s 的 Apache 2.0 完全兼容。"
+        },
+        {
+          "id": "docker-daemon-performance-q8",
+          "question": "生产环境中有 300 个容器持续运行，你发现某工程师写了一个监控脚本每 10 秒执行一次 `docker stats --no-stream`，这会造成什么问题？",
+          "choices": [
+            { "id": "A", "text": "docker stats 是只读操作，不会对 dockerd 造成任何负担" },
+            { "id": "B", "text": "每次执行需要读取 300 个容器的 cgroup 文件，10 秒间隔意味着 cgroup I/O 持续高位，同时 dockerd 在处理这个请求时无法并发响应其他 API 调用" },
+            { "id": "C", "text": "docker stats 只会增加网络流量，对磁盘 I/O 没有影响" },
+            { "id": "D", "text": "这个脚本会导致容器内的进程被暂停用于采集数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "docker stats 需要读取每个容器的 cgroup 统计文件，比如 /sys/fs/cgroup/memory/docker/<id>/memory.usage_in_bytes 和 /sys/fs/cgroup/cpuacct/docker/<id>/cpuacct.stat 等，300 个容器就是数百次 cgroup 文件读取。虽然 cgroup 文件是内存文件系统（cgroupfs），读取本身不走磁盘，但 dockerd 在处理这个请求时持有的锁会导致同时段的 docker ps、docker run 等操作被排队。10 秒一次意味着这个请求还没处理完下一次又进来了。正确做法是用 cAdvisor 或 Prometheus + cadvisor exporter，它们有缓存机制，比直接调 dockerd API 高效。选项 A 错误，只读不代表无开销，全局锁是关键。选项 C 错误，cgroup 读取不走网络也不走磁盘，但 CPU 和内存有消耗。选项 D 完全错误，stats 采集不会暂停容器进程。"
+        },
+        {
+          "id": "docker-daemon-performance-q9",
+          "question": "overlay2 存储驱动中，一个容器的文件系统是如何组成的？",
+          "choices": [
+            { "id": "A", "text": "每个容器有一份完整的镜像副本（完全复制），修改文件直接在副本上操作" },
+            { "id": "B", "text": "多个只读的镜像层通过联合挂载叠加，加上一个容器独有的可写层（upper layer），容器看到的是这些层合并后的视图" },
+            { "id": "C", "text": "overlay2 把所有容器的文件系统合并到一个共享目录，通过文件锁区分容器边界" },
+            { "id": "D", "text": "镜像层以 tarball 形式存储，每次容器启动时解压到内存" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "overlay2 是一种联合文件系统（union filesystem）。每个镜像由多个只读层（lower layers）组成，这些层存在 /var/lib/docker/overlay2/<layer-id>/diff/ 下。当创建容器时，overlay2 在这些只读层之上叠加一个可写层（upper layer），容器内的所有写操作都发生在这个 upper layer 里，读操作则按层从上到下查找（先 upper，再各 lower layer）。多个容器可以共享同一组镜像的 lower layer，节省磁盘空间，这是 overlay2 相比完全复制的核心优势。选项 A 描述的是早期 aufs 或 devicemapper thin-clone 的一种粗暴实现，overlay2 不是这样工作的。选项 C 错误，每个容器有独立的可写层，不共享。选项 D 错误，层是目录形式存储在磁盘，不是 tarball（tarball 是镜像传输格式，落地后会解包）。"
+        },
+        {
+          "id": "docker-daemon-performance-q10",
+          "question": "你接手一台宿主机，`docker ps` 要等 15 秒，`iostat` 显示 /dev/sdb（/var/lib/docker 所在磁盘）的 %util 持续 95%。以下排查步骤哪个顺序最合理？",
+          "choices": [
+            { "id": "A", "text": "立刻重启 dockerd → 观察是否恢复 → 如果没有就重启宿主机" },
+            { "id": "B", "text": "先执行 docker system df 评估磁盘占用 → 执行 docker system prune 释放空间 → 检查 daemon.json 日志配置 → 考虑迁移到 SSD 或迁移到 containerd" },
+            { "id": "C", "text": "先升级 Docker 到最新版本 → 重新部署所有容器 → 修改内核参数 vm.dirty_ratio" },
+            { "id": "D", "text": "先调大 dockerd 的 ulimit 文件句柄数 → 增加 swap 空间 → 重建 overlay2 存储" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "排查和调优的黄金法则是「先测量再行动，从最小代价的操作开始」。docker system df 是零副作用的只读命令，先用它摸清楚问题规模。如果有大量可回收空间（题目中有 61GB），prune 是成本最低、效果最直接的操作，磁盘使用率降下来后 %util 通常会显著下降。检查 daemon.json 确保日志有大小限制，防止问题复发。最后才考虑硬件升级或架构迁移。选项 A 的重启方向完全没有摸清病因就用最激进手段，重启后问题大概率复现。选项 C 的升级 Docker 无法解决磁盘 I/O 问题，vm.dirty_ratio 调整对这种随机小 I/O 场景帮助有限。选项 D 的 ulimit 和 swap 都是错误方向，磁盘 I/O 满不是文件句柄不够，增加 swap 在 I/O 瓶颈场景下只会更慢。"
+        }
+      ],
+      "references": [
+        "https://docs.docker.com/config/daemon/",
+        "https://docs.docker.com/storage/storagedriver/overlayfs-driver/",
+        "https://github.com/containerd/nerdctl",
+        "https://kubernetes.io/blog/2022/02/17/dockershim-faq/",
+        "https://docs.docker.com/config/containers/logging/json-file/"
+      ]
+    }
+  ]
+}
