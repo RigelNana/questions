@@ -1,0 +1,156 @@
+{
+  "id": "monitoring-q69",
+  "name": "Loki 为什么不对日志做全文索引",
+  "domain": "monitoring",
+  "description": "深入理解 Loki 的索引哲学：标签流索引 + 暴力 grep 的设计取舍、写放大代价、chunk 压缩机制，以及 bloom filter 实验性优化。",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q69",
+      "domain": "monitoring",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["loki", "logging", "indexing", "observability", "grafana", "logql"],
+      "title": "Loki 为什么不对日志内容做全文索引？",
+      "content": "你们团队刚把日志系统从 Elasticsearch 迁移到 Loki，运维同学配置完成后跑了第一条 LogQL 查询：\n\n```logql\n{app=\"payment-service\"} |= \"NullPointerException\"\n```\n\n查询返回了正确结果，但他注意到一个现象：同样是搜索关键词「NullPointerException」，Elasticsearch 几乎是瞬间返回（因为它有倒排索引），而 Loki 在日志量较大时明显慢一些。他问了一个很好的问题：**Loki 为什么不像 Elasticsearch 那样对日志内容建全文索引？这不是显而易见的优化吗？**\n\nLoki 是 Grafana Labs 于 2018 年开源的日志聚合系统，定位是「为 Prometheus 用户设计的日志系统」，核心理念用一句话概括就是：**只对标签（label）建索引，不对日志内容建索引**。这个设计一开始让很多从 ELK 栈迁过来的工程师感到不适应，甚至觉得是功能缺失。但 Grafana Labs 的工程师们是有意为之的，背后涉及一套完整的成本哲学。\n\n请解释 Loki 不对日志内容做全文索引的根本原因，包括：全文索引的实际代价是多少、Loki 用什么替代方案来搜索日志内容、chunk 压缩如何让暴力搜索变得可接受，以及这个设计在什么情况下会遇到瓶颈。",
+      "answer": "## 先理解全文索引的真实代价\n\n全文索引听起来很美好——「任意关键词瞬间命中」——但要实现它，你要付出的代价远比直觉上大。以 Elasticsearch 为例，它的日志索引底层是 Apache Lucene 的倒排索引（inverted index）。倒排索引的数据结构是：对每一个出现过的词（term），记录它在哪些文档的哪些位置出现了，也就是 `term → [docId, position, ...]` 这样的映射。\n\n这带来了两个硬性代价。第一是**写放大（write amplification）**：每写入一条日志，Elasticsearch 不只是把这条日志存下来，还要把日志里的每一个词都提取出来，更新对应的倒排链表，然后定期做 segment merge（将小 segment 合并成大 segment，避免小文件过多）。实际上，一条日志写入触发的磁盘 I/O 可能是日志本身大小的 3 到 5 倍。在日志量大的场景下，这意味着你的存储 I/O 带宽大部分消耗在索引维护上，而不是业务数据本身。第二是**索引存储膨胀**：倒排索引本身占多大？经验数据是：Elasticsearch 的索引大小通常是原始日志数据的 1.5 到 3 倍，加上 `_source` 字段（存储原始文档的副本）可以达到 2 到 5 倍。你存了 1TB 的日志，可能需要 2-5TB 的磁盘空间，其中大部分是索引本身。\n\n更关键的问题是：这些代价值不值得？Grafana Labs 在设计 Loki 时做了一个关键判断：**日志搜索 90% 的时间是先按时间范围 + 服务标签缩小范围，然后在这个小范围内搜关键词**。真正需要「在全量日志中任意关键词全文检索」的场景其实很少。换句话说，为了支持一个低频的全量全文检索需求，付出 3-5 倍的存储代价，是不划算的。\n\n## Loki 的替代方案：标签索引 + 暴力 grep\n\nLoki 的索引策略非常克制：它只对**标签（label）**建索引，不碰日志内容本身。所谓标签，就是描述这条日志来自哪里的元数据，比如 `{app=\"payment-service\", env=\"prod\", pod=\"payment-7d4b9c-xyz\"}`。Loki 在底层维护一个**流索引（stream index）**，每一个唯一的标签组合就是一个「流」（stream），流索引记录了每个流对应的 chunk 存储位置。这部分索引极小——在 Loki 2.x 之后甚至可以用纯内存实现（`tsdb` 索引格式），整个索引可能只有几十 MB。\n\n当你执行 `{app=\"payment-service\"} |= \"NullPointerException\"` 时，Loki 的执行分两步走。第一步用标签查询流索引，快速定位到 `app=payment-service` 的所有流，拿到对应的 chunk 列表——这一步非常快，因为标签索引小，全在内存里。第二步把这些 chunk 拉过来，逐行扫描（实际上是用 Go 的 `bytes.Contains` 或正则），找出包含「NullPointerException」的日志行——这一步本质上是暴力 grep。\n\n是的，就是暴力 grep。Loki 的核心赌注是：**如果你用标签把范围缩得足够小，暴力 grep 的代价完全可以接受**。\n\n## chunk 压缩如何让暴力 grep 变得高效\n\n光说「暴力 grep」可能让人觉得一定很慢，但 Loki 有一个关键设计让这件事比想象中高效得多：**chunk 压缩**。\n\nLoki 的存储模型是把同一个流的日志按时间顺序批量压缩成一个 chunk，默认使用 Snappy 或 Gzip 压缩（可配置），压缩率通常在 5 到 10 倍。一个 1GB 的日志流，在磁盘上可能只占 100-200MB 的 chunk 存储。这带来了两个直接好处：\n\n第一，**I/O 放大被大幅压缩**。从对象存储（S3/GCS）或本地磁盘读取 chunk 时，你读的是压缩后的数据。100MB 的 chunk 解压后变 1GB，但你只从网络/磁盘传输了 100MB。这意味着相同的 I/O 带宽能处理更多的日志数据。第二，**内存效率更高**。Loki 的 querier 组件在执行查询时，会把 chunk 流式解压，逐批匹配，不需要把全量数据都 load 到内存里。Loki 2.0 之后引入了 chunk 内部的行级别 bloom filter（后文会详细说），进一步加速了过滤。\n\n实际效果如何？Grafana Labs 自己的生产数据（在 grafana.com/blog 上有发表）显示：在合理使用标签缩小范围后，一个 3 节点的 Loki 集群处理每天 50GB 原始日志的 p99 查询延迟在 2-5 秒内，存储成本只有同等规模 Elasticsearch 集群的 1/5 到 1/10。对于「看日志排查问题」这个主要用例，2-5 秒的延迟完全可以接受。\n\n## 这个设计什么时候会出问题\n\n「不做全文索引 + 暴力 grep」这个策略有两个已知的软肋。\n\n**第一是标签高基数（high cardinality）问题**。「高基数」是指某个标签有非常多的唯一值，比如把 `user_id` 或 `request_id` 作为标签。如果你有 1000 万个用户，`user_id` 这个标签就有 1000 万个唯一值，流索引里就会有 1000 万个流。Loki 的流索引在内存中维护，高基数会导致内存暴涨，ingester 组件会 OOM 崩溃。这是 Loki 最常见的生产故障原因，Loki 官方文档专门有一节叫「Cardinality gotchas」。正确做法是把高基数字段放到日志内容里，用 `| json` 或 `| logfmt` 解析，而不是作为标签。\n\n**第二是超大范围内容搜索**。如果你的标签过于宽泛（比如只有 `{env=\"prod\"}`，囊括了所有生产服务的日志），然后做全内容关键词搜索，Loki 需要扫描所有生产日志 chunk，这个查询可能跑几十秒甚至超时。在 Elasticsearch 里，同样的查询因为有全文索引，可以毫秒级返回。这个差距是真实存在的，是 Loki 设计上的取舍，不是 bug。\n\n## Loki 的 bloom filter 实验：打破暴力 grep 的边界\n\n从 Loki 2.9（2023 年底）开始，Grafana Labs 引入了一个实验性特性：**bloom compactor** 和 **chunk bloom filter**。\n\nBloom filter（布隆过滤器）本质上是一个概率型数据结构：你往里面插入很多字符串（比如日志行里出现的所有 n-gram 或 token），然后可以用 O(1) 的时间判断「这个词**可能**出现在这个 chunk 里」或者「这个词**一定没有**出现在这个 chunk 里」。误判率存在（可能误报「存在」），但不会漏报（一定不存在的绝对过滤掉）。\n\nLoki 的 bloom filter 方案是：在 compactor 阶段，对每个 chunk 构建一个 bloom filter，记录这个 chunk 里出现过哪些词。查询时，在拉取 chunk 之前先查 bloom filter，如果词不在 bloom filter 里，这个 chunk 直接跳过，不需要下载解压。这样可以大幅减少需要真正 grep 的 chunk 数量，把「暴力 grep」变成「过滤后的精准 grep」。\n\n截至 Loki 3.0（2024 年），这个特性仍标记为实验性（需要在配置中显式启用 `bloom_compactor`），还没有在大规模生产中广泛验证。但它代表了 Loki 在「不做全文索引」和「纯暴力 grep」之间找到的一条中间道路。\n\n## 实际使用的查询优化建议\n\n理解了 Loki 的工作原理后，使用上有几个实用原则可以直接改善查询性能。\n\n**给查询加时间范围**：每次查询都指定尽可能短的时间窗口，因为 Loki 按时间切割 chunk，时间范围直接决定需要扫描多少 chunk。在 Grafana UI 里把时间范围从「过去 24 小时」缩到「过去 1 小时」，查询速度可以提升 20 倍以上。\n\n**设计合理的标签体系**：好的标签设计是「足够精准但不过度细化」。`{app, env, region}` 这三个标签组合通常就足够把范围缩到几十 GB 以内。不要把动态值（`pod_name`、`instance_id`）作为标签——这是走向高基数的深渊。\n\n**用 LogQL 的结构化过滤替代纯文本搜索**：如果你的日志是 JSON 格式，优先用 `| json | level="error"` 而不是 `|= "\"level\":\"error\""` 这样的文本匹配。前者在 Loki 的执行计划里有优化路径，后者是纯字符串扫描。\n\n**理解 `|=` 与 `|~` 的性能差距**：`|= \"keyword\"` 是字节级的 `Contains` 检查，极快；`|~ \"regexp\"` 是正则匹配，慢 5-10 倍。能用字符串匹配就不用正则。\n\n归根结底，Loki 的「不做全文索引」是一个经过仔细权衡的工程决策，而不是功能缺失。它用「存储便宜 + 查询慢一点」换取了「操作简单 + 总成本低」，对于大多数「看日志排查问题」的用例来说，这个交换是值得的。理解了这个哲学，你在写 LogQL 查询、设计标签体系时才会知道「顺势而为」是什么感觉。",
+      "keyPoints": [
+        "Elasticsearch 全文倒排索引会带来 3-5 倍写放大和 2-5 倍存储膨胀，每写入一条日志需要提取所有词更新倒排链表并做 segment merge",
+        "Loki 只对标签（label）建流索引（stream index），流索引极小可完全放入内存，标签过滤这一步是亚毫秒级的",
+        "日志内容搜索通过暴力 grep（bytes.Contains / 正则）实现，先用标签缩小到目标 chunk 集合，再逐行扫描",
+        "chunk 默认使用 Snappy/Gzip 压缩，压缩率 5-10 倍，I/O 传输的是压缩数据，大幅降低了 grep 的实际网络和磁盘开销",
+        "高基数标签（如 user_id、request_id）会导致流数量爆炸，ingester 内存 OOM，是 Loki 生产故障最常见原因，高基数字段应放入日志内容而非标签",
+        "Loki 2.9+ 引入实验性 bloom compactor，对每个 chunk 构建 bloom filter，在拉取 chunk 之前先过滤，可大幅减少需要实际 grep 的 chunk 数量",
+        "查询性能优化核心是「缩小扫描范围」：精准的时间窗口 + 合理的标签体系，|= 字符串匹配比 |~ 正则快 5-10 倍"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q69-quiz-1",
+          "question": "Loki 的「流索引（stream index）」索引的是什么？",
+          "choices": [
+            { "id": "A", "text": "每条日志行里出现的所有词，用于全文检索" },
+            { "id": "B", "text": "每个唯一标签组合（如 app=xxx, env=yyy）及其对应的 chunk 位置" },
+            { "id": "C", "text": "日志文件的文件名和行号" },
+            { "id": "D", "text": "每条日志的时间戳和哈希值" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Loki 的流（stream）是由唯一的标签组合定义的，比如 `{app=\"payment\", env=\"prod\"}` 就是一个流。流索引记录的是「哪些标签组合存在」以及「每个流的日志被压缩存储在哪些 chunk 里」。这个索引极小，Loki 2.x 的 tsdb 索引格式在大多数情况下可以完全放入内存。A 选项描述的是 Elasticsearch 的倒排索引，不是 Loki 的设计。C 和 D 选项是干扰项，Loki 不索引文件名、行号或单条日志的哈希。"
+        },
+        {
+          "id": "monitoring-q69-quiz-2",
+          "question": "Loki 执行 `{app=\"api\"} |= \"timeout\"` 时，正确的执行顺序是什么？",
+          "choices": [
+            { "id": "A", "text": "在全量日志中搜索「timeout」关键词，然后过滤 app=api 的结果" },
+            { "id": "B", "text": "先用标签索引定位 app=api 的所有 chunk，然后逐行暴力 grep「timeout」" },
+            { "id": "C", "text": "查询全文索引找到所有包含「timeout」的文档 ID，再按标签过滤" },
+            { "id": "D", "text": "把查询分发到所有 ingester 节点，每个节点全量扫描自己负责的日志" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Loki 的查询执行是严格的两阶段：第一阶段用标签查询流索引，这是极快的内存操作，定位到 `app=api` 对应的所有 chunk；第二阶段把这些 chunk 拉过来，逐行执行字节级的 Contains 检查。关键点是第一阶段能把需要扫描的数据量大幅缩小，所以第二阶段的暴力 grep 才是可接受的。A 选项是反过来的，先全量搜词再过滤，会读取所有日志，效率极差。C 选项是 Elasticsearch 的工作方式，Loki 没有全文索引。D 选项描述的分发是存在的，但 ingester 只扫描自己负责的流，不是全量扫描。"
+        },
+        {
+          "id": "monitoring-q69-quiz-3",
+          "question": "Elasticsearch 建立全文倒排索引时，典型的存储放大倍数是多少？",
+          "choices": [
+            { "id": "A", "text": "10% 左右，索引开销极小" },
+            { "id": "B", "text": "和原始数据差不多，1:1 左右" },
+            { "id": "C", "text": "2 到 5 倍，包含倒排索引和 _source 字段的存储" },
+            { "id": "D", "text": "固定 100MB，与数据量无关" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Elasticsearch 的存储放大主要来自两部分：倒排索引本身（通常是原始数据的 1-2 倍）和 `_source` 字段（存储原始 JSON 文档的副本，占 1 倍）。加上分片副本，总存储通常是原始日志数据的 2 到 5 倍。这是 Loki 官方在对比文章中使用的数字，也与生产实践吻合。A 选项严重低估了索引开销。B 选项不正确，仅 _source 就已经是 1:1 了，加上索引必然超过。D 选项是无意义的说法。"
+        },
+        {
+          "id": "monitoring-q69-quiz-4",
+          "question": "Loki 的 chunk 压缩对查询性能有什么直接帮助？",
+          "choices": [
+            { "id": "A", "text": "压缩后数据更小，从存储读取时 I/O 量减少 5-10 倍，显著降低查询延迟" },
+            { "id": "B", "text": "压缩数据可以直接匹配关键词，不需要解压" },
+            { "id": "C", "text": "压缩算法内置了全文索引，可以快速定位关键词" },
+            { "id": "D", "text": "压缩只影响存储成本，对查询速度没有影响" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Loki 使用 Snappy 或 Gzip 压缩日志 chunk，压缩率通常在 5-10 倍。在执行查询时，Loki 需要把 chunk 从对象存储（如 S3）或本地磁盘读取到 querier 内存，再解压后 grep。由于从网络/磁盘读取的是压缩后的小文件，I/O 传输量大幅减少，这直接改善了查询速度。B 选项错误，压缩数据必须先解压才能做字符串匹配。C 选项是无中生有，Snappy/Gzip 是通用压缩算法，没有任何索引语义。D 选项错误，压缩直接影响 I/O 量，自然影响查询速度。"
+        },
+        {
+          "id": "monitoring-q69-quiz-5",
+          "question": "在 Loki 中，下面哪种标签设计会导致严重的生产故障？",
+          "choices": [
+            { "id": "A", "text": "labels: {app, env, region} — 三个低基数标签" },
+            { "id": "B", "text": "labels: {app, pod_name} — pod_name 包含随机后缀，有数千个唯一值" },
+            { "id": "C", "text": "labels: {app, level} — level 只有 info/warn/error 三个值" },
+            { "id": "D", "text": "labels: {app, namespace} — Kubernetes 命名空间，通常十几个" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "高基数（high cardinality）标签是 Loki 最典型的生产故障原因。`pod_name` 这类标签在 Kubernetes 环境中会有数千甚至数万个唯一值（每次 Pod 重启都会生成新的随机后缀）。Loki 为每个唯一的标签组合创建一个流，流索引在 ingester 内存中维护。高基数标签会导致流数量爆炸，ingester 内存持续增长直到 OOM 崩溃。正确做法是把 `pod_name` 这类字段放入日志内容或用 JSON 结构化解析，而不是作为标签。A、C、D 都是合理的低基数标签设计。"
+        },
+        {
+          "id": "monitoring-q69-quiz-6",
+          "question": "执行 `{app=\"api\"} |~ \"error.*timeout\"` 比 `{app=\"api\"} |= \"error\"` 慢很多，主要原因是什么？",
+          "choices": [
+            { "id": "A", "text": "正则表达式需要先建立全文索引才能执行" },
+            { "id": "B", "text": "|~ 会触发全量日志扫描，而 |= 只扫描索引命中的日志" },
+            { "id": "C", "text": "正则匹配需要逐字符状态机匹配，比字节级 Contains 检查慢 5-10 倍" },
+            { "id": "D", "text": "Loki 不支持正则表达式，会退化为全表扫描" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "`|=` 使用 Go 标准库的 `bytes.Contains`，本质是 Boyer-Moore 或 KMP 算法的字节级搜索，非常快。`|~` 需要编译正则表达式（虽然 Loki 会缓存编译结果），然后对每一行执行 NFA/DFA 状态机匹配，CPU 开销是字节搜索的 5-10 倍。两种方式都需要扫描相同的 chunk 集合（都是先用标签过滤），所以 B 选项「|= 只扫描索引命中」是错误的。A 选项完全错误，Loki 没有全文索引。D 选项也错误，Loki 完全支持正则，使用 Go 的 RE2 引擎。"
+        },
+        {
+          "id": "monitoring-q69-quiz-7",
+          "question": "与 Elasticsearch 相比，Loki 的核心设计取舍是什么？",
+          "choices": [
+            { "id": "A", "text": "Loki 更快但存储成本更高" },
+            { "id": "B", "text": "Loki 存储成本低、操作简单，但 ad-hoc 关键词搜索比 Elasticsearch 慢" },
+            { "id": "C", "text": "Loki 功能更全，在所有维度上都优于 Elasticsearch" },
+            { "id": "D", "text": "Loki 只能查询最近 7 天的日志，Elasticsearch 没有此限制" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Loki 设计哲学的核心。Loki 不做全文索引，所以存储成本是 Elasticsearch 的 1/5 到 1/10，运维复杂度也大幅降低（没有 index template、mapping、shard 管理等概念）。代价是：如果你需要在没有精准标签过滤的情况下做全量日志关键词搜索，Loki 明显慢于 Elasticsearch。但 Grafana Labs 的判断是：大多数日志查询都是「先确定时间范围和服务，再找关键词」，这种模式下 Loki 完全够用。A 选项描述反了。C 选项不现实，没有任何系统在所有维度都最优。D 选项是错误的，Loki 的数据保留期限由存储配置决定，没有固定 7 天限制。"
+        },
+        {
+          "id": "monitoring-q69-quiz-8",
+          "question": "生产环境中 Loki 查询超时，最可能的根本原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Loki 版本太旧，需要升级" },
+            { "id": "B", "text": "查询时间范围太大或标签过于宽泛，导致需要扫描的 chunk 数量过多" },
+            { "id": "C", "text": "Loki 对每个查询有固定的 1 秒超时限制" },
+            { "id": "D", "text": "日志内容中包含中文字符，导致 grep 失败" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Loki 查询超时的根本原因几乎总是「扫描范围太大」。两个典型场景：一是时间范围设置为「过去 30 天」但只需要看「最近 1 小时」，二是标签只有 `{env=\"prod\"}` 涵盖了所有服务，导致需要扫描海量 chunk 进行暴力 grep。解决方法是缩小时间范围（最直接有效）、增加精准的标签过滤（`app=xxx`），或者用 `limit` 限制返回行数。A 选项不是主要原因，大部分超时和版本无关。C 选项错误，Loki 超时时间可配置，默认是 30 秒，不是 1 秒。D 选项是无关干扰，Loki 的 grep 对字节流操作，中文完全支持。"
+        },
+        {
+          "id": "monitoring-q69-quiz-9",
+          "question": "Loki 2.9+ 引入的 bloom filter 实验性特性，主要解决什么问题？",
+          "choices": [
+            { "id": "A", "text": "为 Loki 添加完整的倒排索引，实现毫秒级全文检索" },
+            { "id": "B", "text": "在拉取和解压 chunk 之前，用概率过滤器快速排除不含目标词的 chunk，减少无效 I/O" },
+            { "id": "C", "text": "压缩日志数据，降低存储成本" },
+            { "id": "D", "text": "替换标签索引，用 bloom filter 索引所有标签" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Bloom filter 是一种概率型数据结构：对于给定的查询词，它可以确定地告诉你「这个 chunk 里一定没有这个词」（不需要下载），或者「可能有」（需要下载验证）。Loki 的 bloom compactor 在 compaction 阶段为每个 chunk 构建 bloom filter，记录 chunk 里出现的 token。查询时先查 bloom filter，能确定「一定没有」的 chunk 直接跳过，只下载「可能有」的 chunk 进行真正的 grep。这是暴力 grep 和完整倒排索引之间的中间方案，I/O 减少了，但没有引入倒排索引的写放大和存储膨胀。A 选项错误，bloom filter 不是倒排索引。C 和 D 选项都与 bloom filter 实际功能无关。"
+        },
+        {
+          "id": "monitoring-q69-quiz-10",
+          "question": "以下哪条 LogQL 查询的写法在性能上最优？",
+          "choices": [
+            { "id": "A", "text": "{env=\"prod\"} |~ \"payment.*error\" — 宽标签 + 正则" },
+            { "id": "B", "text": "{app=\"payment-service\", env=\"prod\"} |= \"error\" — 精准标签 + 字符串匹配" },
+            { "id": "C", "text": "{app=\"payment-service\"} | json | level=~\"error|warn\" — 结构化解析 + 正则" },
+            { "id": "D", "text": "{app=~\"payment.*\"} |= \"error\" — 标签正则 + 字符串匹配" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 选项在多个维度上都是最优的：精准的多标签组合 `{app=..., env=...}` 能把流索引命中范围缩到最小（只有一个流），`|=` 字符串匹配是最快的内容过滤方式。A 选项的 `{env=\"prod\"}` 标签过于宽泛，会命中所有生产服务的流，然后用正则 grep 海量数据，性能极差。C 选项用 `|~` 正则比 `|=` 慢，且 `| json` 解析有额外开销，虽然不是最差但不是最优。D 选项的 `app=~\"payment.*\"` 是标签值正则匹配，Loki 需要扫描流索引里所有流来匹配，比精准标签匹配慢。总原则：精准标签 > 标签正则 > 宽泛标签；字符串匹配 > 正则匹配。"
+        }
+      ],
+      "references": [
+        "https://grafana.com/docs/loki/latest/get-started/labels/",
+        "https://grafana.com/blog/2020/08/27/the-concise-guide-to-labels-in-loki/",
+        "https://grafana.com/docs/loki/latest/operations/bloom-filters/",
+        "https://grafana.com/blog/2023/12/11/grafana-loki-2.9-release/"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,157 @@
+{
+  "id": "monitoring-q66",
+  "name": "Elasticsearch 倒排索引原理",
+  "domain": "monitoring",
+  "description": "深入解析 ES 倒排索引的构建流程、Segment 不可变性、BKD 树、doc_values 及 mapping 类型对日志搜索性能的影响",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q66",
+      "domain": "monitoring",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["elasticsearch", "inverted-index", "full-text-search", "segment", "analysis-pipeline", "doc_values", "mapping", "logging"],
+      "title": "Elasticsearch 的倒排索引（Inverted Index）原理是什么？",
+      "content": "## Elasticsearch 与倒排索引\n\nElasticsearch（以下简称 ES）是基于 Apache Lucene 构建的分布式全文搜索与分析引擎，广泛用于日志收集（ELK Stack）、APM 追踪、安全审计等可观测性场景。它的核心竞争力就是对海量文本做毫秒级检索，而这一切的基础正是**倒排索引（Inverted Index）**。\n\n你向 ES 写入一条日志：\n\n```json\n{\n  \"@timestamp\": \"2024-03-15T10:23:45.123Z\",\n  \"level\": \"ERROR\",\n  \"service\": \"payment-api\",\n  \"message\": \"connection refused to postgres://db-primary:5432\"\n}\n```\n\nES 几乎立刻就能让你用 `connection refused` 搜到这条日志。但如果你把同样的数据存 MySQL，`SELECT * FROM logs WHERE message LIKE '%connection refused%'` 在千万级数据量时会触发全表扫描，慢到无法接受。\n\nES 是如何做到的？它在写入时做了什么？为什么全文搜索很快，但频繁更新单条记录又很慢？mapping 里 `text` 和 `keyword` 类型的选择又会带来什么影响？\n\n请从倒排索引的基本结构出发，深入解释 ES 的索引构建流程（分析管道：char filter → tokenizer → token filter）、Segment 的不可变性与合并机制、数值/地理字段使用的 BKD 树、聚合查询依赖的 doc_values，以及这些机制对日志搜索性能的实际影响。",
+      "answer": "## 第一步：先搞清楚 Elasticsearch 是什么，以及它的基础工作方式\n\nElasticsearch 是一个分布式 RESTful 搜索引擎，底层封装了 Apache Lucene。它以「索引（Index）」组织数据，每个索引被分成若干「分片（Shard）」，每个分片就是一个完整的 Lucene 实例。你通过 HTTP API 写入 JSON 文档，ES 负责把文档分发到对应的分片并建立索引结构。\n\n最基础的写入和查询长这样：\n\n```bash\n# 写入一条日志文档\ncurl -X POST 'http://localhost:9200/app-logs-2024.03.15/_doc' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"level\":\"ERROR\",\"message\":\"connection refused to postgres\"}'\n\n# 全文搜索\ncurl -X GET 'http://localhost:9200/app-logs-2024.03.15/_search' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"query\":{\"match\":{\"message\":\"connection refused\"}}}'\n```\n\nES 之所以能做到毫秒级全文检索，根本原因是它在**写入时**就把工作做完了——把文本拆成词项，建一张「词项 → 文档列表」的反向映射表，这就是倒排索引。查询时直接查这张表，不需要扫描任何文档正文。\n\n## 第二步：倒排索引的核心结构与构建流程\n\n### 倒排索引是什么\n\n传统的「正排索引」是「文档 → 字段值」的映射：给定文档 ID，快速找到它的内容。倒排索引反过来，是「词项（Term）→ 包含它的文档列表（Posting List）」的映射。\n\n假设有三条日志：\n\n```\nDoc 1: \"connection refused to postgres\"\nDoc 2: \"connection timeout on redis\"\nDoc 3: \"postgres slow query detected\"\n```\n\n倒排索引的核心结构如下：\n\n```\n词项（Term）       文档列表（Posting List）\n─────────────────────────────────────────\nconnection      → [Doc1 (pos:0), Doc2 (pos:0)]\nrefused         → [Doc1 (pos:1)]\npostgres        → [Doc1 (pos:3), Doc3 (pos:0)]\ntimeout         → [Doc2 (pos:1)]\nredis           → [Doc2 (pos:3)]\nslow            → [Doc3 (pos:1)]\nquery           → [Doc3 (pos:2)]\ndetected        → [Doc3 (pos:3)]\n```\n\n每个词项的 Posting List 里不只存文档 ID，还会存词频（TF）、词项在文档中的位置（position）、偏移量（offset）——这些数据是 BM25 相关性打分和高亮功能的基础。词项列表本身用「词项字典（Term Dictionary）」存储，配合「词项索引（Term Index，一个 FST 有限状态转换器）」做前缀压缩，Posting List 用差值编码（delta encoding）+ FOR 压缩，使得整个结构既省空间又能做快速 AND/OR 集合运算。\n\n用 `connection AND refused` 查询时，ES 实际上是：查词典找到 `connection` 的 Posting List `[Doc1, Doc2]`，找到 `refused` 的 Posting List `[Doc1]`，做集合交运算，直接得到 `[Doc1]`。整个过程不扫描任何文档正文，时间复杂度接近 O(命中数量) 而非 O(总文档数量)。\n\n### 分析管道：文本是如何被拆成词项的\n\n把原始文本「connection refused to postgres://db-primary:5432」变成上面那些词项，ES 会经过一条分析管道（Analysis Pipeline），分三个阶段执行：\n\n**第一阶段：字符过滤器（Char Filter）**。在分词前对原始字符流做预处理。例如 `html_strip` 过滤器会把 `<b>ERROR</b>` 变成 `ERROR`，`mapping` 过滤器可以把 `&amp;` 替换成 `&`。对于包含 URL 的日志字段，通常会在这一步把 `://` 这类标点规整化，避免分词器把 `postgres://db-primary:5432` 当作一个整体。\n\n**第二阶段：分词器（Tokenizer）**。这是管道的核心，把字符流切分成词项流。ES 内置了多种分词器，`standard` 分词器按 Unicode 单词边界切分并去掉标点，`whitespace` 只按空格切，`keyword` 完全不切（整个字段值作为一个词项），`icu_tokenizer` 支持中日韩语言的正确分词。`standard` 处理 `connection refused to postgres` 后得到 `[connection, refused, to, postgres]`。\n\n**第三阶段：词项过滤器（Token Filter）**。对词项流做变换。`lowercase` 把所有词项转小写（所以 `ERROR` 和 `error` 能互相命中），`stop` 过滤器删掉「to」「the」等无意义的停用词，`stemmer` 过滤器把 `running`、`runs` 统一还原成 `run`，方便模糊匹配。你可以自定义这条管道，把多个过滤器串联起来。\n\n这套管道的关键在于：**查询时也走同一条管道**。你搜索 `\"Connection REFUSED\"` 时，ES 会把这个查询字符串也经过 lowercase + stop 处理，变成 `[connection, refused]`，再去倒排索引里查。这就是为什么大小写不敏感的全文搜索能正常工作。\n\n### Segment 不可变性与后台合并\n\n理解了倒排索引的结构，接下来要理解 ES 的写入机制，否则你会对「为什么频繁更新很贵」完全摸不着头脑。\n\nES 的每个分片（Shard）由多个「Segment（段）」组成。Segment 一旦写入磁盘就**永远不可修改**，这是 Lucene 的核心设计决策。每次 `refresh`（默认每 1 秒一次），ES 把内存中的写入缓冲区（in-memory buffer）刷到一个新的 Segment 文件里。这个新 Segment 对搜索可见，但还没有调用 `fsync` 落盘，速度极快。每隔一段时间或手动调用 `flush`，ES 才会把 Segment `fsync` 到磁盘并写 translog checkpoint。\n\n既然 Segment 不可变，那删除和更新怎么处理？**删除**：在 `.del` 文件里打一个「逻辑删除」标记，查询结果里把这条文档过滤掉，但磁盘空间并不立刻释放。**更新**：先逻辑删除旧版本，再写入一条新文档到当前 Segment——本质上是「删 + 插」，所以更新和删除都不会改动任何已有 Segment。\n\n随着写入积累，分片里会有几十甚至几百个小 Segment，每次搜索要对所有 Segment 做归并，开销线性增长。ES 后台有一个 **Segment Merge（段合并）** 进程，按「分层合并」策略把小 Segment 合并成大 Segment，同时真正删除被标记为已删除的文档，回收磁盘空间。合并期间 CPU 和 IO 开销显著，你在生产 ES 的 `_cat/segments` API 里经常能看到合并进行中：\n\n```bash\nGET /_cat/segments/app-logs-*?v&h=index,shard,segment,size,docs.count,docs.deleted\n\nindex              shard segment   size docs.count docs.deleted\napp-logs-2024.03  0     _0       1.2mb      45231        1204\napp-logs-2024.03  0     _1       890kb      38001         892\napp-logs-2024.03  0     _2       23.4mb    891203           0   ← 已合并的大段\n```\n\n`docs.deleted` 列显示的就是等待被合并清理掉的逻辑删除文档。如果你的业务有大量 update，这个数字会居高不下，导致磁盘利用率低下。\n\n## 第三步：进阶机制——BKD 树、doc_values 与 mapping 选型\n\n### 数值和地理字段：BKD 树而非倒排索引\n\n倒排索引对全文搜索完美，但对「timestamp >= 2024-03-15T10:00:00」这类范围查询就力不从心了——时间戳有几乎无数个不同的值，词项字典会膨胀得非常大。ES 7.0 起对数值（integer、long、float）、日期、geo_point 字段默认使用 **BKD 树（Block KD-Tree）**，一种平衡的多维 KD 树变体，专为范围查询优化。BKD 树把数值空间递归二分，每个叶子节点存一个文档 ID 数组块，范围查询只需遍历覆盖目标区间的叶子节点，时间复杂度 O(log N + 命中数量)，与倒排索引做词项精确匹配的效率相当。日志场景里大量的「时间窗口过滤」正是靠 BKD 树高效完成的。\n\n### 聚合查询的秘密：doc_values\n\n倒排索引是「词项 → 文档」方向，天然适合查找「哪些文档包含这个词」。但聚合（aggregation）需要反过来做「对每个文档，取出这个字段的值，然后统计」。如果用倒排索引来做聚合，要先扫描所有词项，再反查文档，效率极差。\n\nES 为此引入了 **doc_values**——本质上是「文档 → 字段值」的列式存储，按文档顺序把同一字段的所有值连续存在磁盘上。当你做 `terms aggregation` 统计 `service.keyword` 字段的 Top N 时，ES 直接顺序扫描 doc_values 列，完全绕开倒排索引，充分利用顺序 IO 和 CPU 缓存。doc_values 默认对除 `text` 以外的所有字段开启。`text` 字段如果需要聚合，要开启 `fielddata`（把数据加载到堆内存），内存开销极大，生产上几乎不这么做。\n\n### text vs keyword：mapping 选型对搜索性能的影响\n\n`text` 类型会经过完整的分析管道分词后建倒排索引，支持全文搜索但不支持精确匹配和聚合（不开 fielddata 的情况下）。`keyword` 类型不分词，整个字段值作为单一词项，支持精确匹配、范围查询和 doc_values 聚合，但不支持全文模糊搜索。\n\n日志场景里最常见的 mapping 误区是把所有字段都设成 `text`。假设你有一个 `trace_id` 字段，存的是 `4bf92f3577b34da6a3ce929d0e0e4736` 这样的固定格式字符串，如果用 `text`，`standard` 分词器会把它拆成若干片段（取决于字符边界），你用精确值查询反而找不到。正确做法是用 `keyword`。\n\n对于需要「既能全文搜索又能精确匹配/聚合」的字段（比如 `message`），ES 的标准做法是「multi-fields」：\n\n```json\n\"message\": {\n  \"type\": \"text\",          // 分词，用于全文搜索\n  \"analyzer\": \"standard\",\n  \"fields\": {\n    \"keyword\": {\n      \"type\": \"keyword\",   // 不分词，用于精确过滤和聚合\n      \"ignore_above\": 256 // 超过 256 字符的值不索引，避免 keyword 字段膨胀\n    }\n  }\n}\n```\n\n### 对日志搜索性能的实际影响\n\n理解了上面这些机制，几个生产上的常见性能问题就有了明确解释。第一，refresh 间隔太短会产生大量小 Segment，搜索性能下降，解决方案是把 `index.refresh_interval` 从默认 `1s` 调大到 `5s` 甚至 `30s`，日志场景对实时性要求通常没那么高。第二，高基数 keyword 字段（比如 `user_id`）做 terms aggregation 时，doc_values 扫描量大，可以配合 `eager_global_ordinals: true` 预构建全局序数表，把 agg 延迟从秒级降到百毫秒。第三，动态 mapping 开启时，ES 会对新出现的字段自动生成 `text` + `keyword` 双字段，在字段数量爆炸的日志场景（字段数超过 1000）会导致 mapping 膨胀，分片元数据 OOM，务必用 `dynamic: strict` 或 `dynamic: false` 配合显式 mapping 管控字段数量。",
+      "keyPoints": [
+        "倒排索引的核心结构是「词项（Term）→ Posting List（文档 ID + 词频 + 位置）」的映射，全文搜索时直接做词项集合运算，跳过文档正文扫描，时间复杂度接近 O(命中数量)",
+        "ES 写入文本时经过三阶段分析管道：char filter（字符预处理）→ tokenizer（切词）→ token filter（词项变换如 lowercase/stemmer），查询时也走同一管道，保证搜索结果一致",
+        "Segment 一旦写入就永久不可修改，删除和更新均为「逻辑标记 + 写新文档」，后台 Merge 进程负责合并小 Segment 并清理逻辑删除文档，这是频繁更新成本高的根本原因",
+        "数值、日期、geo_point 字段使用 BKD 树（Block KD-Tree）而非倒排索引，支持高效范围查询；日志场景的时间窗口过滤依赖 BKD 树而非倒排索引",
+        "doc_values 是与倒排索引并列的列式存储结构，存储「文档 → 字段值」方向的数据，聚合（aggregation）靠顺序扫描 doc_values 实现，`text` 字段默认不建 doc_values",
+        "`text` 类型分词后建倒排索引适合全文搜索，`keyword` 类型整体作词项适合精确匹配和聚合；对同一字段同时需要两种能力时，使用 multi-fields 定义 `text` + `keyword` 子字段",
+        "高基数 keyword 字段聚合可开启 `eager_global_ordinals` 预热加速；动态 mapping 字段爆炸场景要用 `dynamic: strict` 显式管控，防止 mapping 膨胀导致 OOM"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q66-quiz-1",
+          "question": "ES 倒排索引的核心数据结构是什么？",
+          "choices": [
+            {"id": "A", "text": "词项（Term）→ 包含该词项的文档 ID 列表（Posting List）"},
+            {"id": "B", "text": "文档 ID → 该文档所有字段的值（类似 MySQL 主键索引）"},
+            {"id": "C", "text": "B+ 树，按词项字典序排列，支持范围查询"},
+            {"id": "D", "text": "哈希表，以文档 ID 为 key，字段值为 value"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "倒排索引的核心是「词项 → 文档列表」的反向映射，这也是「倒排」名称的由来——与正排索引（文档→内容）方向相反。B 选项描述的是正排索引，类似 MySQL 聚簇索引。C 选项描述的是 B+ 树，ES 确实用 B+ 树类似结构（FST）管理词项字典，但那只是词典的索引层，不是倒排索引本身。D 选项的哈希表结构无法支持前缀查询和模糊查询，不适合词项检索。"
+        },
+        {
+          "id": "monitoring-q66-quiz-2",
+          "question": "ES 分析管道（Analysis Pipeline）中，以下执行顺序正确的是？",
+          "choices": [
+            {"id": "A", "text": "char filter → tokenizer → token filter"},
+            {"id": "B", "text": "tokenizer → char filter → token filter"},
+            {"id": "C", "text": "token filter → tokenizer → char filter"},
+            {"id": "D", "text": "tokenizer → token filter → char filter"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "分析管道的执行顺序是固定的：首先 char filter 对原始字符流做预处理（比如剥除 HTML 标签、替换特殊字符），然后 tokenizer 把处理后的字符流切分成词项流，最后 token filter 对词项流做变换（比如 lowercase、stemmer、stop words 过滤）。这个顺序不可颠倒，因为 tokenizer 依赖已经被 char filter 清理过的字符流，而 token filter 依赖 tokenizer 已经切好的词项流。"
+        },
+        {
+          "id": "monitoring-q66-quiz-3",
+          "question": "以下关于 ES Segment 的描述，哪项是正确的？",
+          "choices": [
+            {"id": "A", "text": "Segment 写入磁盘后永不可修改，删除操作只打逻辑删除标记"},
+            {"id": "B", "text": "Segment 支持原地更新，update 操作会直接修改已有 Segment 中的文档"},
+            {"id": "C", "text": "每次写入一条文档就立刻生成一个新 Segment 并 fsync 到磁盘"},
+            {"id": "D", "text": "Segment 合并时只合并小文件，不会清理逻辑删除的文档"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Segment 不可变性是 Lucene 最核心的设计约束。删除操作在 `.del` 文件中打标记，查询时过滤掉被标记文档，但磁盘空间直到 Merge 时才真正释放。B 选项错误，update 实际上是「逻辑删除旧文档 + 写入新文档」。C 选项错误，ES 先把写入缓冲在内存 in-memory buffer 中，每 1s（默认 refresh_interval）才刷新到新 Segment，此时对搜索可见但还没 fsync；flush 操作才做 fsync。D 选项错误，Merge 的重要目的之一就是真正删除逻辑标记的文档。"
+        },
+        {
+          "id": "monitoring-q66-quiz-4",
+          "question": "ES 中数值字段（long/integer）和日期字段的范围查询，底层依赖的数据结构是什么？",
+          "choices": [
+            {"id": "A", "text": "BKD 树（Block KD-Tree）"},
+            {"id": "B", "text": "倒排索引，把每个数值当词项处理"},
+            {"id": "C", "text": "B+ 树，与 MySQL 的索引结构相同"},
+            {"id": "D", "text": "跳表（Skip List），类似 Redis 的 ZSet 底层实现"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "ES 7.0 起，数值、日期、geo_point 字段默认使用 BKD 树（Block KD-Tree）而非倒排索引。BKD 树是平衡多维 KD 树的变体，把数值空间递归二分，每个叶子节点存一个 doc ID 块，范围查询只遍历覆盖目标区间的叶子，效率极高。用倒排索引存数值（选项 B）会导致词项字典膨胀，时间戳字段每毫秒一个不同值，词项数量会爆炸。选项 C 的 B+ 树是 InnoDB 的设计，Lucene 没有直接使用 B+ 树做数值索引。选项 D 的跳表用于有序集合遍历，不适合多维范围检索。"
+        },
+        {
+          "id": "monitoring-q66-quiz-5",
+          "question": "以下 ES mapping 片段中，`message.keyword` 子字段的 `ignore_above: 256` 参数起什么作用？\n\n```json\n\"message\": {\n  \"type\": \"text\",\n  \"fields\": {\n    \"keyword\": {\n      \"type\": \"keyword\",\n      \"ignore_above\": 256\n    }\n  }\n}\n```",
+          "choices": [
+            {"id": "A", "text": "超过 256 个字符的 message 值不会被 keyword 子字段索引，但 text 字段仍然正常分词索引"},
+            {"id": "B", "text": "超过 256 个字符的 message 整条文档会被丢弃，不写入 ES"},
+            {"id": "C", "text": "keyword 字段最多存储 256 个字符，超出部分会被截断后索引"},
+            {"id": "D", "text": "ignore_above 控制 text 字段的分词数量上限，超过 256 个词项后停止分析"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`ignore_above` 是 keyword 类型的专属参数。当字段值的字符数超过该阈值时，keyword 子字段不对该值建索引（不写入倒排索引，也不写入 doc_values），但 text 主字段不受影响，仍然正常分词索引，整条文档也正常写入。这个参数的设计目的是防止日志中超长字符串（比如 stack trace 整个存一个字段）被 keyword 索引，避免 Segment 膨胀。B 选项错误，文档不会被丢弃。C 选项错误，是不索引而非截断。D 选项错误，ignore_above 与 text 分词无关。"
+        },
+        {
+          "id": "monitoring-q66-quiz-6",
+          "question": "为什么 ES 中对 `text` 类型字段做聚合（aggregation）默认会报错，而 `keyword` 字段可以正常聚合？",
+          "choices": [
+            {"id": "A", "text": "text 字段默认不建 doc_values，聚合需要 doc_values 列式存储；keyword 字段默认开启 doc_values"},
+            {"id": "B", "text": "text 字段已经分词，单个词项无法代表原始字段值，keyword 字段整体存储，可以还原原始值"},
+            {"id": "C", "text": "只有 A 是正确的"},
+            {"id": "D", "text": "A 和 B 都是正确的，两者共同解释了为什么 text 不支持聚合而 keyword 支持"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "text 字段默认不支持聚合有两个原因，A 和 B 都对。第一，text 字段默认不建 doc_values（聚合引擎依赖 doc_values 做列式扫描），如果强制开启 fielddata（把倒排索引反转加载到堆内存）虽然技术上能聚合，但内存开销极大，生产上通常禁止。第二，即使强制用 fielddata 聚合，得到的也是分词后的词项（如「connection」「refused」），而不是原始字段值（如「connection refused to postgres」），结果没有意义。keyword 字段同时满足两个条件：默认建 doc_values，且存储原始字符串不分词。"
+        },
+        {
+          "id": "monitoring-q66-quiz-7",
+          "question": "一个存储 user_id（类似 `u_4bf92f3577b34da6a3ce929d0e0e4736`，高基数 UUID 格式）的字段应该用 `text` 还是 `keyword` 类型，原因是？",
+          "choices": [
+            {"id": "A", "text": "keyword，因为 user_id 需要精确匹配，分词会把 UUID 拆碎导致无法精确查找，同时支持聚合统计用户维度数据"},
+            {"id": "B", "text": "text，因为全文搜索更灵活，可以用前缀匹配部分 UUID"},
+            {"id": "C", "text": "两者都行，ES 自动适配"},
+            {"id": "D", "text": "keyword，但要关闭 doc_values 节省存储空间，高基数字段聚合没有意义"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "user_id 是典型的精确匹配字段，必须用 keyword。standard 分词器会把 `u_4bf92f3577b34da6a3ce929d0e0e4736` 按非字母字符边界切分（`_` 是分隔符），原始 UUID 值反而无法精确查找。keyword 字段把整个值作为单一词项，`term` 查询直接命中。选项 B 的「text + 前缀匹配」做法不仅精确查找失效，而且对 UUID 做全文搜索毫无意义。选项 D 提到关闭 doc_values，虽然高基数字段确实聚合成本高，但关闭 doc_values 会导致脚本聚合和排序都失效，通常不是正确做法，应该用 `eager_global_ordinals` 优化高频聚合场景。"
+        },
+        {
+          "id": "monitoring-q66-quiz-8",
+          "question": "生产环境中一个 ES 日志索引的 `_cat/segments` 显示 `docs.deleted` 数量占总文档数的 40%，这意味着什么，应该如何处理？",
+          "choices": [
+            {"id": "A", "text": "大量文档被逻辑删除但未被 Segment Merge 清理，磁盘空间浪费；可以手动调用 `forcemerge` 触发合并并清理已删除文档"},
+            {"id": "B", "text": "40% 的数据已损坏，需要从备份恢复"},
+            {"id": "C", "text": "这是正常现象，`docs.deleted` 表示已过期的时序数据，不影响性能"},
+            {"id": "D", "text": "索引写入速度太慢导致缓冲积压，需要增加 Shard 数量"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "ES 的删除/更新操作只打逻辑删除标记，实际文档仍占用磁盘空间，直到 Segment Merge 时才被物理清理。`docs.deleted` 占 40% 意味着接近一半的磁盘空间被无效数据占用，且每次搜索都要过滤这些文档，轻微影响查询性能。解决方法：可以手动调用 `POST /index-name/_forcemerge?max_num_segments=1` 强制合并，或者等待 ES 的自动 Merge 策略处理（推荐后者，forcemerge 会消耗大量 IO）。对于日志场景，更好的实践是用 ILM（Index Lifecycle Management）定期滚动删除旧索引，整个索引删除比逐条删除高效得多。"
+        },
+        {
+          "id": "monitoring-q66-quiz-9",
+          "question": "以下关于 `refresh_interval` 参数的描述，哪项是正确的？",
+          "choices": [
+            {"id": "A", "text": "refresh_interval 控制内存 buffer 刷新到新 Segment 的频率，设置越小实时性越高但会产生更多小 Segment，增加 Merge 压力"},
+            {"id": "B", "text": "refresh_interval 控制 Segment 的 fsync 频率，设置越小数据越安全"},
+            {"id": "C", "text": "refresh_interval 设为 -1 会禁用所有写入，用于只读索引"},
+            {"id": "D", "text": "refresh_interval 只影响文档可见性，不影响 Segment 数量和搜索性能"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "refresh 操作把 in-memory buffer 的数据写入一个新的 Segment 文件，此时文档对搜索可见（near real-time，NRT）。refresh_interval 越小，新 Segment 生成越频繁，Segment 数量积累越快，每次搜索需要合并扫描的 Segment 越多，整体搜索开销越高。B 选项描述的是 flush（fsync）而非 refresh，两者是不同操作。C 选项错误，`refresh_interval: -1` 禁用的是自动 refresh，可以手动调用 refresh，常用于批量写入时临时关闭以提升写入吞吐，而非禁用写入。D 选项错误，大量小 Segment 会显著影响搜索性能。"
+        },
+        {
+          "id": "monitoring-q66-quiz-10",
+          "question": "在日志场景下，ES 的 `dynamic: true`（默认开启动态 mapping）可能引发什么生产问题？",
+          "choices": [
+            {"id": "A", "text": "当日志字段数量爆炸（如 JSON 嵌套展开后超过 1000 个字段），mapping 膨胀导致 Master 节点 OOM，整个集群不可用"},
+            {"id": "B", "text": "动态 mapping 会导致全文搜索变慢，因为每次写入都需要重新构建词典"},
+            {"id": "C", "text": "动态 mapping 只对 keyword 字段有影响，text 字段不受波及"},
+            {"id": "D", "text": "动态 mapping 已经在 ES 8.0 中默认关闭，不再有这个问题"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "动态 mapping 是 ES 的「mapping 爆炸（mapping explosion）」问题的根源。日志中如果包含 JSON 格式的字段（比如 Kubernetes 的 labels、HTTP 请求的 query params），ES 会自动展开所有嵌套 key 作为独立字段。实践中曾遇到一个集群因为某个应用 JSON 日志字段不规范，单个索引的 mapping 里字段数量超过 10000，导致 cluster state 体积超过 512MB，Master 节点频繁 GC 最终 OOM，整个集群不可读写。生产建议：对日志索引一律设置 `dynamic: false` 或 `dynamic: strict`，配合显式 mapping 和 `index_template` 管控字段；对需要全字段查询的场景，把整个 JSON 存入 `message` 的 text 字段。"
+        }
+      ],
+      "references": [
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/inverted-index.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/analysis-overview.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/doc-values.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-types.html",
+        "https://lucene.apache.org/core/9_10_0/core/org/apache/lucene/codecs/lucene99/package-summary.html"
+      ]
+    }
+  ]
+}
