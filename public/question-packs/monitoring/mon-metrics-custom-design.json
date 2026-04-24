@@ -1,0 +1,157 @@
+{
+  "id": "monitoring-q91",
+  "name": "微服务自定义 Metrics 设计",
+  "domain": "monitoring",
+  "description": "从 RED/USE/业务 SLO 出发，掌握 Prometheus 自定义指标的完整设计方法论，涵盖指标类型选择、命名规范、label 基数控制与 Go 落地实现",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q91",
+      "domain": "monitoring",
+      "type": "open-ended",
+      "difficulty": 2,
+      "tags": ["prometheus", "metrics", "SLO", "RED", "USE", "cardinality", "client_golang", "histogram", "counter"],
+      "title": "如何为一个微服务设计自定义 Metrics？",
+      "content": "你刚加入一个团队，接手一个核心的 Go 订单服务（`order-service`）。服务已接入 Prometheus，但只有框架层面的默认指标（`go_goroutines`、`process_cpu_seconds_total` 等）和 HTTP 中间件注入的 `http_request_duration_seconds`，完全没有业务层面的自定义 Metrics。三周后团队要上线秒杀活动，SRE 要求在上线前把关键 Metrics 补齐，以便在出问题时能在 1 分钟内定位根因。\n\n服务的核心请求链路如下：\n\n```\nHTTP 入口\n  → 参数校验\n  → 检查库存（Redis，正常 P99 ≈ 2ms）\n  → 扣减库存（MySQL 写入，正常 P99 ≈ 8ms，高峰可涨至 50ms）\n  → 创建订单记录（MySQL）\n  → 发布「订单创建」事件到 Kafka\n  → 返回响应\n```\n\n约束：Prometheus label 基数（cardinality）预算上限为 10 万条时间序列，Go 版本 1.22，使用 `github.com/prometheus/client_golang` v1.19，Grafana 和 Alertmanager 均已就绪。\n\n请描述你的完整设计方案：\n\n1. 你会从哪里出发决定「量什么」？是从技术指标出发，还是从业务 SLO 出发？\n2. 针对这条链路，你会设计哪些 Prometheus 指标？选择哪种指标类型（Counter/Gauge/Histogram/Summary），理由是什么？\n3. 命名规范和 label 怎么设计，如何控制基数不超预算？\n4. 给出关键指标的 Go `client_golang` 实现代码。\n5. 如果需要监控 Kafka 发布队列和 Redis 缓存，埋点方式有什么不同？",
+      "answer": "## 第一步：先搞清楚「量什么」——Metrics 设计的方法论基础\n\n在真正开始设计之前，先说清楚「Metrics 是什么」。Prometheus Metrics 是一种时间序列数据，每条序列由指标名加上一组 label 键值对唯一标识，Prometheus Server 定时（默认 15s）从服务的 `/metrics` 端点拉取（pull）数据，存入本地 TSDB。与日志不同，Metrics 不记录单次事件的细节，而是记录「系统在某个时刻的状态快照」或「某类事件的累计计数」。它的价值在于低存储成本下实现高频聚合查询——你可以在 Grafana 里画出过去 1 小时每秒订单量的曲线，但你不可能从日志里实时算这个数字。\n\n最常见的错误是：拿到「补充监控」的任务，第一反应就是打开编辑器写 `prometheus.NewCounter`，随手定义一堆「看起来有用」的指标。这会导致什么结果？两种极端：要么指标太少，出了问题翻遍 Grafana 也找不到根因；要么指标太多，每次告警都要在几十个 Panel 里来回找，效率比没有监控更差。\n\n正确的起点是方法论。监控领域有两套互补的框架：**RED 方法**适用于「服务」视角，由 Tom Wilkie 在 2015 年提出，三个字母代表 Rate（吞吐量，每秒处理多少请求）、Errors（错误率，每秒有多少请求失败）、Duration（延迟分布，每个请求耗了多长时间）。任何对外提供服务的组件，RED 这三类指标都必须覆盖。**USE 方法**由性能专家 Brendan Gregg 提出，专注于「资源」视角：Utilization（利用率）、Saturation（饱和度，如队列积压深度）、Errors（错误数），用来描述 CPU、内存、连接池、消息队列这类基础设施层的健康状态。\n\n但光有 RED/USE 还不够。对于 `order-service`，SRE 真正关心的是**业务 SLO**——用户能不能下单成功，库存扣减有没有出错，支付转化率是多少。`http_request_duration_seconds` 这个框架指标告诉你有多少请求、延迟是多少，但它不能告诉你「这次失败是因为库存不足返回了 400，还是因为数据库超时返回了 500」。区别藏在业务逻辑里，框架层的指标看不到。\n\n所以在开始设计之前，我会先问：秒杀期间最关注哪个业务指标？哪种失败需要立刻告警（库存耗尽可以接受，数据库超时必须告警）？P99 延迟的 SLO 是多少？有了这些答案，才能反推出需要在哪里埋点。从这条链路来看，核心测量点是：订单创建成功率（业务 SLO）、库存扣减延迟分布（RED 的 Duration，对应 MySQL 写入）、Kafka 本地缓冲队列深度（USE 的 Saturation）、Redis 缓存命中率（USE 的 Utilization）。\n\n## 第二步：四种指标类型——选错了比没有还糟\n\nPrometheus 有四种基础类型，理解每种类型的语义是正确选择的前提。\n\n**Counter（计数器）**是单调递增的累计值，只能增不能减，进程重启归零。它适合表示「某类事件总共发生了多少次」：订单创建总次数、失败总次数、缓存请求总次数。使用 Counter 几乎总是配合 `rate()` 函数算每秒速率，或配合 `increase()` 算一段时间内的增量。Counter 本身的绝对值没什么意义，意义在于变化速率——用 `rate(orders_created_total[5m])` 算最近 5 分钟的平均下单速率，这才是有用的数字。\n\n**Gauge（仪表盘）**是可以随意增减的当前快照值，表示「现在是多少」。Kafka 本地缓冲队列深度、Redis 连接池活跃连接数、当前正在处理中的请求数，这些都是 Gauge。Gauge 不需要 `rate()`，直接读原始值就有意义。一个常见错误是把「已处理消息总数」设计成 Gauge，写一个定时任务去 set 它——这不但丢失了中间的变化信息，处理速率还没法算。「总数」是 Counter 的语义，「当前值」才是 Gauge 的语义。\n\n**Histogram（直方图）**是延迟监控的标准选择。它把每次观测值分配到预定义的桶（bucket）里，同时记录所有观测值的总和（`_sum`）和总次数（`_count`）。核心优势是「在 PromQL 侧计算百分位」——多个实例的 Histogram 桶计数可以先聚合再算 P99，这在分布式场景下至关重要。桶的位置要覆盖你的 SLO 阈值：SLO 是 P99 < 50ms，那 50ms 附近就必须有桶，否则 `histogram_quantile(0.99)` 的插值精度会很差（它会在相邻两个桶之间做线性插值，桶之间跨度越大，误差越大）。针对这条链路，我会用这组桶：`{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0}`，单位是秒（Prometheus 约定时间统一用秒，不用毫秒）。\n\n**Summary（摘要）**在客户端直接计算百分位，代价是无法在多实例之间聚合。如果有 10 个 `order-service` 实例，你没法把它们各自的 P99 数字合并成全局 P99——两个百分位数值不能做算术平均，这在数学上是无效的。实际规则是：**优先用 Histogram，只有在 Prometheus 服务端计算压力确实成为瓶颈时再考虑 Summary**。\n\n## 第三步：命名规范与 label 设计——防止 cardinality 炸掉 Prometheus\n\nPrometheus 官方命名格式是 `{namespace}_{subsystem}_{name}_{unit}`，全部 snake_case，单词间用下划线连接。单位必须写进指标名：时间用 `_seconds`（不是 `_ms` 或 `_milliseconds`），字节用 `_bytes`，纯计数不加单位，**Counter 的最后一个词必须是 `_total`**。这是 Prometheus v2 以后的强制约定，`promtool lint` 会校验不符合规范的命名。\n\n对于 `order-service`，命名示例：`order_service_orders_created_total`（Counter）、`order_service_inventory_deduct_duration_seconds`（Histogram）、`order_service_kafka_queue_depth`（Gauge）、`order_service_cache_operations_total`（Counter）。\n\nLabel 设计是最容易出事的地方，也是最能体现经验的地方。**Label 的每个唯一组合产生一条时间序列**，cardinality = 所有 label 可能值的笛卡尔积。运维给的预算是 10 万条时间序列，听起来很多，但一旦放入高基数字段就会瞬间爆炸：把 `user_id` 放进 label，100 万用户就是 100 万条序列，Prometheus 内存直接 OOM，这种事故在生产中真实发生过。\n\n正确的 label 只能是「有界的低基数枚举值」。对于这条链路：`status` 取 `success` 或 `failure`，基数 2；`failure_reason` 取 `inventory_insufficient`、`db_timeout`、`mq_publish_failed`、`param_invalid`，基数 4；`payment_method` 取 `alipay`、`wechat`、`card`，基数 3；`cache_result` 取 `hit` 或 `miss`，基数 2。这些组合起来的基数完全可控，远低于 10 万的预算。**绝对不能**放进 label 的：`user_id`、`order_id`、`trace_id`、任何来自用户输入的字符串、任何无界的数值型字段。这类高基数数据属于分布式 tracing 系统（Jaeger、Tempo）的职责范围，不是 Prometheus 该干的事。\n\n## Go 代码落地：`client_golang` 的正确姿势\n\n用 `promauto` 包可以在声明时自动完成注册，省去手动 `MustRegister` 的步骤，生产项目普遍使用这种方式：\n\n```go\npackage metrics\n\nimport (\n    \"github.com/prometheus/client_golang/prometheus\"\n    \"github.com/prometheus/client_golang/prometheus/promauto\"\n)\n\nvar (\n    // Counter：订单创建总次数，按状态和失败根因分类\n    // Help string 写得像 runbook——oncall 看一眼就知道含义和告警阈值\n    OrdersCreatedTotal = promauto.NewCounterVec(\n        prometheus.CounterOpts{\n            Namespace: \"order\",\n            Subsystem: \"service\",\n            Name:      \"orders_created_total\",\n            Help:      \"订单创建总次数。status=success 为成功，status=failure 时 reason 标识根因（inventory_insufficient/db_timeout/mq_publish_failed/param_invalid）。失败率 > 1% 触发 P2 告警。\",\n        },\n        []string{\"status\", \"reason\"},\n    )\n\n    // Histogram：库存扣减端到端延迟，桶位覆盖 SLO 阈值（P99 < 50ms）\n    InventoryDeductDuration = promauto.NewHistogram(\n        prometheus.HistogramOpts{\n            Namespace: \"order\",\n            Subsystem: \"service\",\n            Name:      \"inventory_deduct_duration_seconds\",\n            Help:      \"库存扣减操作耗时（从发出 MySQL 写请求到收到响应）。P99 SLO = 50ms，P99 > 100ms 触发 P1 告警。\",\n            Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},\n        },\n    )\n\n    // Gauge：Kafka 本地内存缓冲队列深度，随发布速率可增可减\n    KafkaQueueDepth = promauto.NewGaugeVec(\n        prometheus.GaugeOpts{\n            Namespace: \"order\",\n            Subsystem: \"service\",\n            Name:      \"kafka_queue_depth\",\n            Help:      \"待发布到 Kafka 的本地内存缓冲队列深度（条）。持续 > 1000 说明 Kafka 吞吐跟不上生产速度，需扩容或限流。\",\n        },\n        []string{\"topic\"},\n    )\n\n    // Counter：Redis 缓存操作次数，命中和未命中分别计数，用于计算命中率\n    CacheOperationsTotal = promauto.NewCounterVec(\n        prometheus.CounterOpts{\n            Namespace: \"order\",\n            Subsystem: \"service\",\n            Name:      \"cache_operations_total\",\n            Help:      \"Redis 缓存操作次数。result=hit 为命中，result=miss 为未命中。命中率 = rate(hit[5m]) / (rate(hit[5m]) + rate(miss[5m]))，低于 85% 触发告警。\",\n        },\n        []string{\"cache_name\", \"result\"},\n    )\n)\n```\n\n业务代码里的埋点方式同样关键，成功路径和失败路径都要覆盖：\n\n```go\nfunc (s *OrderService) CreateOrder(ctx context.Context, req *CreateOrderRequest) (*Order, error) {\n    start := time.Now()\n\n    if err := s.deductInventory(ctx, req.ProductID, req.Quantity); err != nil {\n        // 失败时必须带 reason label，方便在 Grafana 按根因下钻\n        reason := classifyError(err) // 返回 \"db_timeout\" 或 \"inventory_insufficient\" 等\n        metrics.InventoryDeductDuration.Observe(time.Since(start).Seconds())\n        metrics.OrdersCreatedTotal.WithLabelValues(\"failure\", reason).Inc()\n        return nil, err\n    }\n\n    metrics.InventoryDeductDuration.Observe(time.Since(start).Seconds())\n    // 成功时 reason 传空字符串——WithLabelValues 参数数量必须与 label 定义一致，否则 panic\n    metrics.OrdersCreatedTotal.WithLabelValues(\"success\", \"\").Inc()\n    return order, nil\n}\n```\n\n这里有一个设计取舍：成功时 `reason` 传空字符串，会产生一条 `{status=\"success\", reason=\"\"}` 的序列，PromQL 里用 `{status=\"failure\"}` 就能只看失败。另一种更严格的方案是把成功和失败拆成两个独立 Counter（成功的无 reason label，失败的有 reason label），在基数预算非常紧张时可以减少序列数，代价是 PromQL 查询要写两条表达式做 union。\n\n## 队列和缓存的埋点模式\n\nKafka 消费侧最重要的指标是 consumer lag（消费滞后量）——积压了多少条消息还没被消费。但这个数字在 broker 侧才能算，通常由 Kafka Exporter 暴露给 Prometheus，应用层不需要自行实现。应用层关注的是自己的消费速率（用 Counter 记录处理成功/失败的消息数）和每条消息的处理耗时（用 Histogram，桶位根据你的消费 SLO 设计）。生产侧如果有本地内存缓冲队列，用 Gauge 记录队列深度是最简洁的方案，深度持续攀升意味着下游 Kafka 集群出现了写入瓶颈。\n\nRedis 缓存的命中率是派生指标，不应该维护一个「当前命中率」的 Gauge，而应该通过两个 Counter 在 PromQL 里实时计算：`rate(order_service_cache_operations_total{result=\"hit\"}[5m]) / rate(order_service_cache_operations_total[5m])`。这种方式比 Gauge 更灵活——可以按 `cache_name` label 分别看不同缓存的命中情况，也可以随时调整时间窗口，Alertmanager 告警规则也可以直接基于这条 PromQL 设置阈值。\n\n## 进阶实践：避免 Metric 爆炸与 Help String 的工程价值\n\nMetric 爆炸（cardinality explosion）是 Prometheus 最常见的生产事故之一，通常表现为 Prometheus 内存用量持续增长，最终 OOM 重启，历史数据丢失。最经典的场景：有人把 HTTP 路径 `/api/users/123456/orders` 直接放进 label，没有做路由模板化，每个不同的 user_id 都产生一条时间序列。有 100 万用户访问，就有 100 万条序列。修复方式是在路由中间件层提取「路由模式」而非原始路径，把 `/api/users/123456/orders` 规范化为 `/api/users/{user_id}/orders`。另一个隐蔽的爆炸场景是在 `switch` 或 `if-else` 里拼接错误消息字符串作为 label 值，错误消息里可能带有 request ID、时间戳等动态内容，同样会产生无界基数。\n\n最后一点最常被忽视：**Help string 是给凌晨三点半被告警叫醒的 oncall 工程师看的**。不要只写「库存扣减延迟」，要写清楚：这个指标量的是哪段操作（从发出 MySQL 请求到收到响应），P99 的 SLO 是多少（50ms），超过什么阈值应该告警（100ms 触发 P1），超标代表什么问题（MySQL 写入变慢，可能是锁竞争或慢查询）。Help string 写好了，Grafana panel 的 tooltip 就是一份随时可查的 runbook，这不是锦上添花，是让监控系统真正可用的最后一公里。",
+      "keyPoints": [
+        "设计自定义 Metrics 应从 RED 方法（Rate/Errors/Duration）和业务 SLO 出发，先明确「量什么」再决定「怎么量」，避免随手埋点导致告警时无法定位根因",
+        "Counter 只能单调递增，适合「发生了多少次」类事件，配合 rate() 使用；Gauge 表示当前快照值可增可减；Histogram 支持跨实例聚合百分位，是延迟监控的首选；Summary 无法跨实例聚合，一般优先选 Histogram",
+        "Counter 必须以 _total 结尾，时间单位必须用 _seconds（不是 _ms），命名格式为 {namespace}_{subsystem}_{name}_{unit}，这些是 Prometheus v2 以后的强制约定，promtool lint 会校验",
+        "Label 的每个唯一组合产生一条时间序列，user_id、order_id、trace_id 等高基数字段绝对不能放进 label，只有「有界枚举值」（status/failure_reason/payment_method）才安全，否则会触发 cardinality explosion 导致 Prometheus OOM",
+        "Redis 缓存命中率应通过两个 Counter（cache_operations_total{result=\"hit/miss\"}）在 PromQL 里派生计算，比维护一个命中率 Gauge 更灵活，可以任意切割时间窗口和维度",
+        "Histogram 的桶（bucket）位置必须覆盖 SLO 阈值，P99 SLO = 50ms 则桶里必须有 50ms 附近的边界，否则 histogram_quantile() 的线性插值误差会很大",
+        "Help string 要写成「给凌晨三点半 oncall 看的 runbook 条目」——说明测量的操作范围、SLO 数值、告警阈值和可能的根因，不只是一个简短的名词描述"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q91-q1",
+          "question": "下面四种 Prometheus 指标类型中，哪种最适合用来追踪「当前 Kafka 消费队列的积压消息数」？",
+          "choices": [
+            {"id": "A", "text": "Counter——它能单调递增地记录累计消费消息数，通过 rate() 算出速率"},
+            {"id": "B", "text": "Gauge——队列积压数是随时可增可减的当前快照值"},
+            {"id": "C", "text": "Histogram——可以观测积压数的分布情况，更精确"},
+            {"id": "D", "text": "Summary——可以在客户端计算积压数的百分位，性能更好"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "队列积压数是一个随时可增可减的「当前快照值」——消息被消费了就减少，新消息进来就增加。这正是 Gauge 的语义：表示「现在是多少」。Counter 只能单调递增，无法表示减少，适合的是「总共消费了多少条消息」这类计数，而不是「现在还剩多少」。Histogram 用于观测值的分布（比如延迟、大小），不适合用来追踪队列深度这种单一瞬时值。Summary 同样是用于分布计算，也不合适。很多初学者混淆「已消费消息总数」（Counter 语义）和「当前积压消息数」（Gauge 语义）这两个概念，这道题考察的正是这个区别。"
+        },
+        {
+          "id": "monitoring-q91-q2",
+          "question": "RED 方法中三个字母分别代表什么？",
+          "choices": [
+            {"id": "A", "text": "Response time（响应时间）、Error rate（错误率）、Data throughput（数据吞吐量）"},
+            {"id": "B", "text": "Rate（吞吐量）、Errors（错误率）、Duration（延迟分布）"},
+            {"id": "C", "text": "Request count（请求数）、Error count（错误数）、Delay（平均延迟）"},
+            {"id": "D", "text": "Reliability（可靠性）、Efficiency（效率）、Durability（持久性）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "RED 方法由 Tom Wilkie 在 2015 年 KubeCon 提出，专门用于衡量「服务」的健康状态。Rate 是每秒请求数，即吞吐量；Errors 是每秒出错的请求数，通常换算为错误率；Duration 是请求延迟的分布，强调「分布」而非平均值——因为平均延迟会掩盖尾部问题，P99 才能反映真实用户体验。选项 A 的「Response time」和「Data throughput」只是换了说法，但「Data throughput」不够准确（RED 里的 Rate 是请求数，不是字节数）；选项 C 的「平均延迟」漏掉了「分布」的语义；选项 D 完全是另一个概念，属于 SRE 可靠性工程的词汇范畴，与 RED 方法无关。"
+        },
+        {
+          "id": "monitoring-q91-q3",
+          "question": "根据 Prometheus 官方命名规范，Counter 类型的指标名必须以什么结尾？",
+          "choices": [
+            {"id": "A", "text": "_count，如 http_requests_count"},
+            {"id": "B", "text": "_total，如 http_requests_total"},
+            {"id": "C", "text": "_counter，如 http_requests_counter"},
+            {"id": "D", "text": "_sum，如 http_requests_sum"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Prometheus v2 以后的官方约定要求所有 Counter 类型的指标名必须以 `_total` 结尾，例如 `http_requests_total`、`orders_created_total`。`promtool lint` 命令会对不符合规范的 Counter 命名报 WARNING。`_count` 是 Histogram 和 Summary 自动生成的子指标（如 `request_duration_seconds_count`，表示观测次数），不是手动定义 Counter 时用的后缀；`_sum` 同样是 Histogram/Summary 的自动子指标（表示观测值总和）；`_counter` 完全不是规范的一部分。这个细节在实际面试和代码 review 中经常被考察，写错了 promtool 会告警，也会让熟悉 Prometheus 规范的人觉得代码不专业。"
+        },
+        {
+          "id": "monitoring-q91-q4",
+          "question": "设计 Histogram 的桶（bucket）时，以下哪种做法是正确的？",
+          "choices": [
+            {"id": "A", "text": "直接用 Prometheus 的 DefBuckets 默认桶，社区已验证这是最优解，不需要自定义"},
+            {"id": "B", "text": "尽可能密集地加桶（如每 1ms 一个，1ms 到 10000ms），精度越高越好"},
+            {"id": "C", "text": "桶的位置必须覆盖 SLO 阈值，否则 histogram_quantile() 的插值精度会很差"},
+            {"id": "D", "text": "不需要预定义桶，Histogram 会在运行时根据实际观测值自动调整桶边界"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "`histogram_quantile()` 在 Prometheus 里使用线性插值计算百分位，精度取决于目标分位数落在哪个桶区间里。如果 SLO 是 P99 < 50ms，但桶里 50ms 附近没有边界（比如只有 10ms 和 100ms），那么大量观测值都挤在 10~100ms 这个宽区间里，`histogram_quantile(0.99)` 的误差可能高达数十毫秒。Prometheus 的默认桶（DefBuckets）是通用桶，设计用于毫秒到秒级延迟的 HTTP 请求，对于你的具体业务 SLO 未必合适。无限增加桶会增加存储和计算开销，每个桶都是一条独立的时间序列，过多的桶会让 cardinality 膨胀。Histogram 的桶是静态预定义的，不会动态调整——Prometheus 的设计哲学是低基数、可预测，自适应桶是 OpenMetrics 未来的方向，目前的 Prometheus 还不支持。"
+        },
+        {
+          "id": "monitoring-q91-q5",
+          "question": "以下哪种 label 设计会导致 Prometheus 出现严重的 cardinality 问题？",
+          "choices": [
+            {"id": "A", "text": "{status=\"success\", payment_method=\"alipay\"}"},
+            {"id": "B", "text": "{http_method=\"GET\", route=\"/api/orders\"}"},
+            {"id": "C", "text": "{order_id=\"order_20240801_12345678\"}"},
+            {"id": "D", "text": "{failure_reason=\"db_timeout\"}"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "`order_id` 是高基数字段，每个订单都有全局唯一的 ID。如果系统每天产生 10 万个订单，这个 label 就会产生 10 万条新的时间序列，几天后 Prometheus 的内存和磁盘都会撑爆。Prometheus 的每条时间序列都需要在内存中维护索引和当前值，高基数 label 是 Prometheus 运维中最常见的灾难来源之一。A/B/D 中的 label 值都是有界枚举：payment_method 只有几种支付方式，http_method 只有 GET/POST 等，failure_reason 也只有固定几个枚举值，这些都是安全的低基数 label。高基数数据（order_id、user_id、trace_id）属于分布式 tracing 系统（Jaeger/Tempo）的职责范围，Prometheus 做的是聚合统计，不是单次事件记录。"
+        },
+        {
+          "id": "monitoring-q91-q6",
+          "question": "一个工程师这样设计 label：`url=\"/api/users/123456/orders\"`（直接使用原始请求 URL）。这会导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "Histogram 无法正常工作，URL 中含有数字和斜杠会导致 label 解析失败"},
+            {"id": "B", "text": "不会有问题，这是监控 HTTP 接口最精确的方式"},
+            {"id": "C", "text": "每个不同的用户 ID 都会产生新的时间序列，导致 cardinality 爆炸并可能 OOM"},
+            {"id": "D", "text": "URL 过长会导致 Prometheus 的抓取请求超时，影响监控数据完整性"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "原始 URL 包含路径参数（如 user_id `123456`），每个用户访问都会产生一条不同的时间序列。有 100 万用户就有 100 万条序列，这是最经典的 cardinality 爆炸场景。正确做法是在路由中间件层提取「路由模式」而非原始路径，把 `/api/users/123456/orders` 规范化为 `/api/users/{user_id}/orders`，这样所有用户的请求都归入同一条序列。URL 中的特殊字符（选项 A）不会导致解析失败——Prometheus label 值是 UTF-8 字符串，只有 `{`, `}`, `\\n`, `\"`, `\\` 需要转义，数字和斜杠都是合法字符。选项 D 关于抓取超时的描述与 label 问题无关，cardinality 爆炸影响的是内存而非网络超时。"
+        },
+        {
+          "id": "monitoring-q91-q7",
+          "question": "在多实例微服务场景（10 个 Pod）中，为什么通常推荐 Histogram 而非 Summary 来监控请求延迟？",
+          "choices": [
+            {"id": "A", "text": "Histogram 的 CPU 计算开销比 Summary 低 10 倍以上，Summary 会显著增加服务的 CPU 使用率"},
+            {"id": "B", "text": "Summary 在客户端直接计算百分位，无法在多实例之间聚合，而 Histogram 的桶计数可以跨实例合并后再算全局百分位"},
+            {"id": "C", "text": "Summary 不支持自定义百分位，只能固定计算 P50 和 P99"},
+            {"id": "D", "text": "Histogram 的精度比 Summary 高，因为 Summary 内部使用了蓄水池采样（reservoir sampling）算法"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Histogram 和 Summary 最核心的区别。Summary 在每个服务实例本地计算百分位（如「实例 A 的 P99 = 10ms」，「实例 B 的 P99 = 15ms」），但你没法把这两个数值合并成全局 P99——两个百分位数值做算术平均在数学上是错误的（平均值依赖于样本量和分布形状）。Histogram 记录的是桶计数（「1~5ms 区间有 100 次请求」），多实例的桶计数可以直接相加，然后对合并后的直方图执行 `histogram_quantile()` 算出准确的全局百分位。选项 A 有一定道理（Summary 确实有滑动窗口维护的开销），但这不是推荐 Histogram 的主要原因。选项 C 是错误的，Summary 支持配置任意百分位。选项 D 关于精度的说法是混淆视听。"
+        },
+        {
+          "id": "monitoring-q91-q8",
+          "question": "要在 Grafana 中展示 Redis 缓存过去 5 分钟的命中率，应使用哪条 PromQL 表达式？（指标为 `order_service_cache_operations_total{result=\"hit/miss\"}`）",
+          "choices": [
+            {"id": "A", "text": "order_service_cache_operations_total{result=\"hit\"} / order_service_cache_operations_total"},
+            {"id": "B", "text": "rate(order_service_cache_operations_total{result=\"hit\"}[5m]) / rate(order_service_cache_operations_total[5m])"},
+            {"id": "C", "text": "increase(order_service_cache_operations_total{result=\"hit\"}[5m]) / sum(order_service_cache_operations_total)"},
+            {"id": "D", "text": "histogram_quantile(0.99, order_service_cache_operations_total)"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Counter 的绝对值（累计总数）在计算命中率时没有意义——随时间单调增长的两个数相除得到的值会趋近于历史命中率而非近期命中率，重启后还会产生跳变。正确方式是用 `rate()` 计算最近 5 分钟内的每秒增量速率，再做除法：命中率 = rate(hit[5m]) / (rate(hit[5m]) + rate(miss[5m]))，等价于 rate(hit[5m]) / rate(all[5m])（因为分母包含所有 result 值的序列之和）。选项 A 用的是原始 Counter 值，在 Prometheus 重启（Counter 归零）后会出现断崖式下跌，然后再缓慢回升，完全反映不了真实的近期命中率。选项 C 的写法混用了 `increase()` 和 `sum()`，语义不正确。选项 D 是 Histogram 专用函数，用在 Counter 类型指标上没有意义。"
+        },
+        {
+          "id": "monitoring-q91-q9",
+          "question": "Prometheus 的 Counter 在服务进程重启后归零，用 rate() 绘制趋势图时会产生什么现象？",
+          "choices": [
+            {"id": "A", "text": "图表会显示一个巨大的负值峰值，因为新值比旧采样值小，需要手动过滤"},
+            {"id": "B", "text": "rate() 和 increase() 内置了 Counter 重置检测，会自动修正，图表不会出现异常尖刺"},
+            {"id": "C", "text": "该时间序列会消失，Prometheus 会删除重置前的所有历史数据"},
+            {"id": "D", "text": "Counter 重置会导致 Prometheus 报 scrape 错误，产生数据空洞"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Prometheus 的 `rate()` 和 `increase()` 函数内置了 Counter 重置检测逻辑：当检测到当前采样值小于前一次采样值时，函数会认为发生了重置，并把当前值视为「从 0 开始的新增量」来计算，而不是算一个斜率为负的大跌。这个行为在 Prometheus 官方文档中有明确说明，是 Counter 类型设计的基础保障。所以服务重启对 `rate()` 图表来说是透明的，不会出现负值尖刺（选项 A 描述的现象不会发生）。选项 C 是错误的，时间序列在 Prometheus 的保留期内不会被删除，只是值重置了。选项 D 也是错误的，Counter 重置是正常的应用生命周期事件，不会触发 scrape 错误。"
+        },
+        {
+          "id": "monitoring-q91-q10",
+          "question": "秒杀活动开始后 2 分钟，告警显示「订单失败率突增至 5%」。你第一步应该查哪个自定义指标来快速定位根因？",
+          "choices": [
+            {"id": "A", "text": "go_goroutines——goroutine 数量暴涨说明出现了协程泄漏或请求堆积"},
+            {"id": "B", "text": "process_cpu_seconds_total——CPU 飙高可能导致服务处理变慢进而失败"},
+            {"id": "C", "text": "order_service_orders_created_total{status=\"failure\"} 按 reason label 下钻，确认是库存不足、数据库超时还是 MQ 发布失败"},
+            {"id": "D", "text": "http_request_duration_seconds——延迟升高通常先于失败率升高，从延迟入手找瓶颈"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这正是在 Counter 上设计 `reason` label 的核心价值。`orders_created_total{status=\"failure\"}` 加上 `by (reason)` 分组，在 Grafana 里一眼就能看到失败主要集中在哪个根因。如果 `reason=\"inventory_insufficient\"` 飙高，说明库存正常耗尽，是预期内的业务现象，不需要紧急技术响应；如果 `reason=\"db_timeout\"` 飙高，说明 MySQL 撑不住了，需要立即介入；如果 `reason=\"mq_publish_failed\"`，说明 Kafka 集群出了问题。这是「业务指标比基础设施指标更有诊断价值」的具体体现。选项 A/B 的 go_goroutines 和 CPU 能反映系统压力，但无法直接告诉你是哪个业务环节出错。选项 D 的延迟指标也是有价值的下一步验证手段，但诊断顺序应该是：先看业务失败分类（what is failing）→ 再根据 reason 决定去看哪个基础设施指标（why is it failing）。"
+        }
+      ],
+      "references": [
+        "https://prometheus.io/docs/practices/naming/",
+        "https://prometheus.io/docs/practices/instrumentation/",
+        "https://www.brendangregg.com/usemethod.html",
+        "https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/",
+        "https://pkg.go.dev/github.com/prometheus/client_golang/prometheus"
+      ]
+    }
+  ]
+}

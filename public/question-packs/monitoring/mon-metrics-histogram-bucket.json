@@ -1,0 +1,157 @@
+{
+  "id": "monitoring-q95",
+  "name": "Histogram Bucket 边界设置",
+  "domain": "monitoring",
+  "description": "深入讲解 Prometheus Histogram bucket 边界对百分位数精度的影响，以及如何基于 SLO 和真实延迟分布设计合理的桶边界。",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q95",
+      "domain": "monitoring",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["prometheus", "histogram", "bucket", "SLO", "延迟监控", "cardinality", "native-histogram", "histogram_quantile"],
+      "title": "Histogram Bucket 的边界值如何合理设置？",
+      "content": "你负责一个用户搜索服务，P99 延迟的 SLO 是「200ms 以内」。你用 Prometheus + Grafana 监控，报警规则设置为 `histogram_quantile(0.99, rate(search_request_duration_seconds_bucket[5m])) > 0.2`，超过就触发告警。\n\n服务上线半年，报警一次都没有触发过，团队对这套监控很有信心。直到有一天，一位用户在 Slack 上反馈搜索「有时候特别慢」，你拉出 access log 分析，发现过去两周里有大约 3% 的请求延迟超过了 300ms——SLO 早就被违反了，但报警从来没响过。\n\n你检查了 Prometheus 的指标配置，发现用的是默认的 `prometheus.DefBuckets`，其中搜索延迟所在区间的两个相邻桶边界分别是 `0.1`（100ms）和 `0.25`（250ms）。真实 P99 落在 180ms 到 210ms 之间，但这个范围完全在 100ms 到 250ms 这个宽桶里，`histogram_quantile` 在这个宽桶里做线性插值，算出来的结果严重偏离真实值，导致 SLO 违反悄悄溜过去了。\n\n以下是当前的 Histogram 配置：\n\n```go\nsearchDuration := prometheus.NewHistogramVec(\n    prometheus.HistogramOpts{\n        Name:    \"search_request_duration_seconds\",\n        Help:    \"搜索请求延迟分布\",\n        Buckets: prometheus.DefBuckets, // 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10\n    },\n    []string{\"index_type\"},\n)\n```\n\n通过 access log 分析得到的真实延迟分布如下：P50 约 45ms，P90 约 130ms，P95 约 165ms，P99 约 195ms，P999 约 420ms，MAX 约 1200ms（索引重建时偶发慢查询）。SLO 定义是：99% 的请求延迟 ≤ 200ms，99.9% 的请求延迟 ≤ 500ms。`index_type` 标签有 `full_text`、`semantic`、`hybrid` 三个取值。\n\n**问题：如何重新设计这个 Histogram 的 bucket 边界，使 `histogram_quantile` 能准确反映 P99 和 P999？在设计方案时还需要考虑哪些工程约束？如果有更优的替代方案，应该怎么选择？**",
+      "answer": "## 第一步：先把 Prometheus Histogram 的底层机制讲清楚\n\nPrometheus Histogram 是监控延迟分布的核心工具，但它的工作方式和你直觉里的「记录每一条请求的延迟」完全不同。Histogram 不存储原始值，而是把所有观测值按照预先定义好的 bucket（桶）边界进行**分桶计数**。每个桶记录的是「有多少次观测值落在 0 到这个边界以内」，这是一个累计计数（cumulative）。\n\n最基础的用法是这样的：\n\n```go\n// 定义 Histogram，指定桶边界\nhttpDuration := prometheus.NewHistogramVec(\n    prometheus.HistogramOpts{\n        Name:    \"http_request_duration_seconds\",\n        Help:    \"HTTP 请求延迟分布\",\n        Buckets: []float64{0.01, 0.05, 0.1, 0.2, 0.5, 1.0},\n    },\n    []string{\"handler\"},\n)\n\n// 在请求完成后记录一次观测\nstart := time.Now()\n// ... 处理请求 ...\nhttpDuration.WithLabelValues(\"/search\").Observe(time.Since(start).Seconds())\n```\n\nPrometheus 会为每个桶边界生成一条带 `le` 标签的时间序列，比如 `http_request_duration_seconds_bucket{handler=\"/search\",le=\"0.1\"}` 表示「延迟 ≤ 100ms 的请求总数」。除了 `_bucket` 系列，还有 `_count`（总请求数）和 `_sum`（所有延迟之和）两条辅助序列，`le=\"+Inf\"` 始终等于 `_count`。\n\n查询 P99 延迟时你会写 `histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))`。`histogram_quantile` 的计算方式是：先找到累计分布中对应 99% 分位的那个桶，然后在该桶的上下两个边界之间做**线性插值**——它假设落在某个桶里的所有观测值均匀分布在该桶的整个范围内。这个「均匀分布」假设，就是一切问题的根源。\n\n## 第二步：为什么默认桶让你的 P99 报警「瞎了眼」\n\n`prometheus.DefBuckets` 是 Prometheus 开发团队预设的通用桶配置：`.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10`（单位：秒）。这组配置的设计目标是「对大多数 HTTP 服务有合理的覆盖」，范围从 5ms 到 10s，乍看很全面。\n\n但问题出在**桶的间隔过宽**。以题目场景为例，100ms 到 250ms 之间是整整 150ms 的跨度，而服务的 P99 真实值偏偏落在这个区间的 195ms 附近。`histogram_quantile` 在插值时会假设这 150ms 区间里的所有请求均匀分布，然后按比例算出一个位置。如果 P99 百分位对应的请求「刚好」落在这个桶的末尾，算出来的值可能是 230ms，而真实值是 195ms，误差 18%，报警条件 `> 0.2` 就再也不会被触发了。这不是小问题，这是系统性的精度缺陷。\n\n更糟糕的是，这种误差不是恒定的，它会随着真实分布的微小变化而漂移，让你的报警变得完全不可预测——有时候高估，有时候低估，唯一确定的是它不准。\n\n**分析真实分布是设计桶边界的前提**。不要在没有数据的情况下拍脑袋设桶。可以临时用 access log 分析出关键百分位数：\n\n```bash\n# 从 nginx access log 中提取请求延迟（假设最后一列是延迟，单位秒）\nawk '{print $NF}' /var/log/nginx/access.log | sort -n | awk '\nBEGIN { count = 0 }\n{ data[count++] = $1 }\nEND {\n    printf \"P50:  %.3f s\\n\", data[int(count * 0.50)]\n    printf \"P90:  %.3f s\\n\", data[int(count * 0.90)]\n    printf \"P95:  %.3f s\\n\", data[int(count * 0.95)]\n    printf \"P99:  %.3f s\\n\", data[int(count * 0.99)]\n    printf \"P999: %.3f s\\n\", data[int(count * 0.999)]\n    printf \"MAX:  %.3f s\\n\", data[count - 1]\n}'\n```\n\n或者也可以先临时部署一个粒度很细的 Histogram（20-30 个桶，覆盖完整范围），跑一两天采集真实分布，再根据数据精简桶边界。\n\n**SLO 驱动的核心原则是：把桶边界放在你关心的 SLO 阈值附近**。如果 SLO 是 P99 ≤ 200ms，那么 200ms 附近必须有密集的桶：160ms、180ms、200ms、220ms、250ms。这样 `histogram_quantile` 在 200ms 附近做插值时，插值区间只有 20ms，误差会控制在 5% 以内，报警阈值才有实际意义。\n\n针对题目中的搜索服务，合理的 bucket 配置应该这样设计：\n\n```go\nsearchDuration := prometheus.NewHistogramVec(\n    prometheus.HistogramOpts{\n        Name: \"search_request_duration_seconds\",\n        Help: \"搜索请求延迟分布\",\n        // 设计依据：\n        // - 在 P90 区间 (100-165ms) 密集设桶，捕捉正常波动\n        // - 在 P99 SLO 阈值 (200ms) 两侧密集设桶，保证报警精度\n        // - 在 P999 SLO 阈值 (500ms) 两侧密集设桶\n        // - 覆盖偶发慢查询到 1.5s\n        Buckets: []float64{\n            0.01, 0.025, 0.05,              // 10ms, 25ms, 50ms（正常快速路径）\n            0.075, 0.1, 0.13, 0.15,         // 75ms, 100ms, 130ms, 150ms（P50-P90 区间）\n            0.165, 0.18, 0.2, 0.22, 0.25,  // 165ms, 180ms, 200ms, 220ms, 250ms（P99 SLO 两侧）\n            0.35, 0.42, 0.5, 0.6,           // P999 SLO 两侧\n            0.75, 1.0, 1.5,                 // 慢查询区间\n        },\n    },\n    []string{\"index_type\"},\n)\n```\n\n**指数桶辅助函数**的适用场景是延迟横跨多个数量级的情况。`prometheus.ExponentialBuckets(start, factor, count)` 从 `start` 开始，每个桶是上一个乘以 `factor`，共生成 `count` 个桶。对于数据库查询这类从 1ms 到 1s 都有分布的场景，指数桶是比手工设桶更自然的选择：\n\n```go\n// 数据库查询：从 1ms 开始，因子 2，共 12 个桶\n// 生成：1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 64ms, 128ms, 256ms, 512ms, 1024ms, 2048ms\nBuckets: prometheus.ExponentialBuckets(0.001, 2, 12),\n\n// 更细粒度版本，因子 1.5\n// 生成：1ms, 1.5ms, 2.25ms, 3.4ms, 5ms, 7.6ms, 11.4ms ... 约 86ms（12 个桶）\nBuckets: prometheus.ExponentialBuckets(0.001, 1.5, 12),\n```\n\n## 第三步：Cardinality 代价、不同服务类型的实战配置与 Native Histogram\n\n**桶不是越多越好，每个桶都有代价。** 每个桶边界会产生一条独立的时间序列。一个带 18 个桶的 Histogram，加上 `_count` 和 `_sum`，会产生 20 条序列。如果还有 3 个 `index_type` label 取值，就是 60 条序列。这个数字本身不大，但如果整个服务有 50 个 Histogram 指标，总序列数就达到 3000 条。在大型系统中，Prometheus 的存储和查询压力与活跃时间序列数量线性正相关，过多的桶会直接影响 Prometheus 的性能和存储成本。**经验上，每个 Histogram 保持 10-20 个桶是合理范围**，超过 25 个桶就需要认真评估必要性了。\n\n不同服务类型的延迟分布差异很大，适合不同的桶策略。HTTP API 服务通常延迟集中在几十到几百毫秒，可以这样配置：\n\n```go\n// HTTP API：关注 P99 ≤ 200ms 和 P999 ≤ 500ms 的 SLO\nBuckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 2.5},\n```\n\n数据库查询有两个特点：正常路径非常快（几毫秒），但存在慢查询长尾（可能到秒级），适合指数桶来均匀覆盖多个数量级：\n\n```go\n// DB 查询：指数桶从 0.5ms 起，因子 2，共 14 个桶（覆盖到 ~4s）\nBuckets: prometheus.ExponentialBuckets(0.0005, 2, 14),\n```\n\n批处理任务的延迟单位是秒甚至分钟，和实时服务完全不同量级：\n\n```go\n// 批处理：秒级到分钟级，SLO 通常是「95% 的任务在 5 分钟内完成」\nBuckets: []float64{1, 5, 10, 30, 60, 120, 300, 600, 1800},\n```\n\n**Native Histogram 是从根本上解决这个问题的方案**。Prometheus 2.40 引入了 Native Histogram（原生直方图），它的核心设计是：不再由用户预定义桶边界，而是由客户端库自动使用指数方案，并且只传输有数据的非空桶（稀疏编码），大幅降低了 cardinality 代价。\n\n```go\nhttpDuration := prometheus.NewHistogramVec(\n    prometheus.HistogramOpts{\n        Name: \"http_request_duration_seconds\",\n        Help: \"HTTP 请求延迟\",\n        // NativeHistogramBucketFactor 控制精度：相邻桶的比值\n        // 1.1 意味着相邻桶边界之差约为 10%，精度远高于手工设桶\n        // 越接近 1.0 精度越高，但桶数量越多\n        NativeHistogramBucketFactor:     1.1,\n        NativeHistogramMaxBucketNumber:  100,  // 内存中最多保留多少非空桶\n        NativeHistogramMinResetDuration: time.Hour,\n    },\n    []string{\"handler\"},\n)\n```\n\nNative Histogram 的 `histogram_quantile` 查询语法完全不变，但精度本质上提升了——因为桶边界是自动细化的，不再存在「宽桶插值误差」的问题。截至 2024 年底，Prometheus 2.47+ 和 Grafana 10.x 对 Native Histogram 的支持已经相对完善。新项目建议直接采用 Native Histogram；已有项目迁移时，可以同时开启传统 Histogram 和 Native Histogram，验证 downstream 工具（Grafana、Alertmanager、VictoriaMetrics）完全支持后再切换。\n\n**最后一个容易忽略的坑**：Histogram 的 `_sum` 对慢查询异常敏感。如果偶发一次 120 秒的请求，`_sum` 会被这一条数据拉偏，通过 `rate(_sum) / rate(_count)` 算出来的平均延迟会在接下来 5 分钟里严重虚高，但 P99 完全不受影响。所以用 Histogram 监控延迟时，**应该以 `histogram_quantile` 为主要 SLO 指标，不要依赖平均延迟**，因为平均延迟在有长尾请求的服务上没有意义。",
+      "keyPoints": [
+        "`histogram_quantile` 在两个相邻 bucket 边界之间做线性插值，假设观测值在桶内均匀分布，因此桶越宽、真实 P99 落在桶中间时，计算误差越大，可能高达 10-20%",
+        "Prometheus 默认的 `DefBuckets`（.005 到 10 秒，共 11 个桶）是为通用 HTTP 服务设计的，100ms 到 250ms 之间是 150ms 的宽桶，对 P99 SLO ≤ 200ms 的服务完全不适用",
+        "设计 bucket 边界前必须先分析真实延迟分布，通过 access log 或临时粗粒度 Histogram 拿到 P50/P90/P99/P999 的实际数值，再据此规划桶位置",
+        "SLO 驱动的核心原则是在 SLO 阈值两侧密集设桶：若 SLO 是 P99 ≤ 200ms，则在 160ms、180ms、200ms、220ms、250ms 附近都要有桶，将插值区间压缩到 20ms 以内",
+        "`prometheus.ExponentialBuckets(start, factor, count)` 适合延迟分布跨多个数量级的场景（如数据库查询），因子 1.5 到 2 之间可以在合理桶数量下覆盖广泛范围",
+        "每个 bucket 边界产生一条独立时间序列，桶数 × label 基数 = 时间序列数，超过 25 个桶的 Histogram 需要评估 Prometheus 存储和查询的 cardinality 代价",
+        "Prometheus 2.40+ 的 Native Histogram 通过自动指数桶 + 稀疏编码，从根本上消除了手工设桶的精度问题，`NativeHistogramBucketFactor` 控制精度，新项目应优先考虑采用"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q95-quiz-1",
+          "question": "`histogram_quantile` 函数在计算百分位数时，对于落在某个 bucket 内的观测值，它做了什么假设？",
+          "choices": [
+            {"id": "A", "text": "假设桶内所有观测值均匀分布在该桶的范围内，并用线性插值计算分位数位置"},
+            {"id": "B", "text": "假设桶内所有观测值都等于该桶的上边界（le 值），取最大值"},
+            {"id": "C", "text": "假设桶内观测值服从正态分布，用高斯插值计算精确位置"},
+            {"id": "D", "text": "假设桶内所有观测值都等于桶上下边界的几何平均值"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`histogram_quantile` 使用线性插值，假设落入某个桶的观测值在该桶的 `(下边界, 上边界]` 范围内均匀分布。这个假设在桶很窄时误差小，但当桶很宽（如 100ms 到 250ms 之间），而真实 P99 恰好落在这个宽桶中时，插值误差可能高达 15-20%。B 选项是常见误解——如果取上边界，所有落在宽桶里的请求都会被「高估」到 250ms，而实际情况更复杂。C 和 D 选项描述的算法 Prometheus 并未采用，高斯插值需要更多分布信息，Prometheus 的设计目标是保持计算简单。"
+        },
+        {
+          "id": "monitoring-q95-quiz-2",
+          "question": "`prometheus.DefBuckets` 定义的默认桶边界是哪组值（单位：秒）？",
+          "choices": [
+            {"id": "A", "text": ".001, .005, .01, .05, .1, .5, 1, 5, 10, 30"},
+            {"id": "B", "text": ".005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10"},
+            {"id": "C", "text": ".01, .05, .1, .5, 1, 5, 10, 30, 60"},
+            {"id": "D", "text": ".001, .002, .005, .01, .025, .05, .1, .25, .5, 1"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`prometheus.DefBuckets` 是 `.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10` 共 11 个桶，覆盖从 5ms 到 10 秒的范围。这组配置是为「通用 HTTP 服务」设计的，在 100ms 到 250ms 之间有 150ms 的宽间隔，对于 SLO 阈值落在这个区间的服务来说，精度严重不足。A 选项的间隔更细但覆盖范围有限；C 选项桶数太少，常见于 Grafana 示例但非官方默认；D 选项在毫秒级更密集，是某些数据库监控中常见的配置，但不是 Prometheus 的官方默认值。"
+        },
+        {
+          "id": "monitoring-q95-quiz-3",
+          "question": "`prometheus.ExponentialBuckets(0.001, 2, 10)` 会生成哪组 bucket 边界？",
+          "choices": [
+            {"id": "A", "text": "0.001, 0.003, 0.005, 0.007, 0.009, 0.011, 0.013, 0.015, 0.017, 0.019（等差数列）"},
+            {"id": "B", "text": "0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512（每次乘以 2）"},
+            {"id": "C", "text": "0.001, 0.01, 0.1, 1, 2, 3, 4, 5, 6, 7（从 0.001 到 7 均匀分布）"},
+            {"id": "D", "text": "0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01（线性增长）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`ExponentialBuckets(start, factor, count)` 从 `start` 开始，每个桶边界是前一个乘以 `factor`，生成 `count` 个桶。所以 `(0.001, 2, 10)` 生成：0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512，即 1ms 到 512ms，以 2 的指数增长。这种配置特别适合数据库查询这类延迟分布跨越多个数量级的场景——在毫秒级有密集的桶捕捉快速路径，在百毫秒到秒级也有足够覆盖捕捉慢查询。A 和 D 选项描述的是等差/线性数列，C 选项的跳跃方式不对应任何 `ExponentialBuckets` 调用。"
+        },
+        {
+          "id": "monitoring-q95-quiz-4",
+          "question": "一个 Histogram 定义了 15 个 bucket 边界，带有 2 个 label（`method` 有 3 个取值，`status` 有 4 个取值），请问这个 Histogram 总共会产生多少条 Prometheus 时间序列？",
+          "choices": [
+            {"id": "A", "text": "15 条（只有 bucket 序列）"},
+            {"id": "B", "text": "180 条（(15 + 1 + 1 + 1) × 12 = 216，计算有误的常见答案）"},
+            {"id": "C", "text": "216 条（(15 个桶 + le=\"+Inf\" + _count + _sum) × (3 × 4) = 18 × 12）"},
+            {"id": "D", "text": "204 条（15 × 12 + 12 + 12，分别加上 _count 和 _sum）"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Histogram 每个 label 组合会产生：15 个用户定义的 bucket 序列 + 1 个 `le=\"+Inf\"` 的 bucket 序列（等于 `_count`）+ 1 条 `_count` 序列 + 1 条 `_sum` 序列，共 18 条序列。label 组合数量是 3 × 4 = 12。所以总序列数是 18 × 12 = 216 条。这个数字本身不大，但如果系统有 50 个 Histogram 指标，总序列数就接近 11000 条。在有高基数 label（如 user_id）的场景下，Histogram 的 cardinality 爆炸风险极高，这是 D 选项计算逻辑错误的原因——它遗漏了 `le=\"+Inf\"` 这条额外的 bucket 序列。"
+        },
+        {
+          "id": "monitoring-q95-quiz-5",
+          "question": "某服务真实 P99 延迟是 195ms。Histogram 的桶边界在 100ms 和 250ms 之间没有其他桶。`histogram_quantile(0.99)` 在 5 分钟内收到了 1000 个请求，其中 850 个 ≤ 100ms，150 个在 100ms 到 250ms 之间，0 个 > 250ms。`histogram_quantile` 会输出什么结果？",
+          "choices": [
+            {"id": "A", "text": "195ms（histogram_quantile 能精确计算出真实 P99）"},
+            {"id": "B", "text": "250ms（取 P99 所在桶的上边界）"},
+            {"id": "C", "text": "约 225ms（线性插值：100ms + (0.99 - 0.85) / (1.0 - 0.85) × (250ms - 100ms) = 100 + 140ms）"},
+            {"id": "D", "text": "100ms（取 P99 所在桶的下边界）"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "`histogram_quantile` 的线性插值公式是：`lower_bound + (quantile - lower_count_ratio) / (upper_count_ratio - lower_count_ratio) × (upper_bound - lower_bound)`。在这个例子中：lower_bound = 0.1s，upper_bound = 0.25s，lower_count_ratio = 850/1000 = 0.85，upper_count_ratio = 1.0。代入：0.1 + (0.99 - 0.85) / (1.0 - 0.85) × (0.25 - 0.1) = 0.1 + (0.14 / 0.15) × 0.15 = 0.1 + 0.14 = 0.24s = **240ms**（严格计算），这与真实值 195ms 相差 45ms，误差约 23%。这就是宽桶导致报警失效的直接原因——阈值 200ms 的报警永远不会在这种桶配置下准确触发。"
+        },
+        {
+          "id": "monitoring-q95-quiz-6",
+          "question": "为了让 P99 更精确，一个工程师把 bucket 数量从 15 个增加到了 50 个。这个决定有什么主要风险？",
+          "choices": [
+            {"id": "A", "text": "桶数增加后，`histogram_quantile` 的计算时间复杂度会变成 O(n²)，查询性能会严重下降"},
+            {"id": "B", "text": "每个桶对应一条 Prometheus 时间序列，50 个桶会显著增加 Prometheus 的活跃序列数，推高存储和内存成本，在有多个 label 取值时 cardinality 爆炸风险极高"},
+            {"id": "C", "text": "桶数超过 32 个后，Prometheus 客户端库会抛出异常，无法完成注册"},
+            {"id": "D", "text": "桶数增加后，`_sum` 的计算精度会降低，导致平均延迟计算不准确"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "每个 bucket 边界生成一条带 `le` 标签的时间序列，50 个桶加上 `le=\"+Inf\"`、`_count`、`_sum` 共产生 53 条序列。如果这个 Histogram 还有 4 个 label 各有 5 个取值（即 625 个 label 组合），总序列数高达 33000 条，仅这一个指标就能对 Prometheus 造成显著压力。Prometheus 官方文档也建议每个 Histogram 保持在 10-20 个桶。A 选项是错误的——`histogram_quantile` 的时间复杂度是 O(n log n)（因为需要排序桶）但实际影响微乎其微；C 选项是子虚乌有的限制；D 选项中 `_sum` 的计算与桶数完全无关。"
+        },
+        {
+          "id": "monitoring-q95-quiz-7",
+          "question": "Prometheus Histogram 和 Summary 都可以用来监控延迟，它们最本质的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "Histogram 在服务端存储原始数据再计算分位数，Summary 在客户端实时计算分位数，所以 Histogram 更精确"},
+            {"id": "B", "text": "Summary 在客户端滑动窗口内流式计算分位数，精确但无法在多实例间聚合；Histogram 在客户端只计数分桶，精度受桶边界影响，但多实例聚合完全正确"},
+            {"id": "C", "text": "Histogram 只能监控延迟，Summary 可以监控任意数值分布"},
+            {"id": "D", "text": "两者完全等价，只是 API 设计不同，Summary 是 Histogram 的语法糖"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是面试高频考点。Summary 的分位数（如 `{quantile=\"0.99\"}`）在客户端计算，基于滑动时间窗口内的所有观测值，结果精确，但你**无法在 Prometheus 中对多个实例的 Summary 做聚合**——把 3 个实例的 P99 加总再除以 3 得到的不是真实的聚合 P99。Histogram 的 `_bucket` 是可以直接 `sum()` 聚合的累计计数，`histogram_quantile` 对聚合后的桶数据计算分位数，结果在数学上是正确的。代价是精度受桶边界约束。生产环境中有多个副本的服务**必须用 Histogram**，因为你需要整个服务的 P99，而不是单个实例的 P99。A 选项完全搞反了——Summary 是客户端计算，Histogram 是服务端通过 `histogram_quantile` 计算。"
+        },
+        {
+          "id": "monitoring-q95-quiz-8",
+          "question": "你的团队正在为一个新的支付服务设计 Histogram bucket，SLO 是「P99 延迟 ≤ 500ms，P999 延迟 ≤ 2s」。以下哪个桶配置最合理？",
+          "choices": [
+            {"id": "A", "text": "prometheus.DefBuckets，使用默认配置就够了，简单省事"},
+            {"id": "B", "text": "[0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.75, 1.0, 1.5, 2.0, 3.0]，在 500ms 和 2s 两侧各有密集的桶"},
+            {"id": "C", "text": "prometheus.ExponentialBuckets(0.001, 10, 7)，生成 1ms, 10ms, 100ms, 1s, 10s, 100s, 1000s"},
+            {"id": "D", "text": "[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]，覆盖范围最广"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 选项在 P99 SLO 阈值（500ms）两侧有密集的桶：400ms、500ms、600ms，插值区间约 100ms，误差在 10% 以内；在 P999 SLO 阈值（2s）两侧也有 1.5s 和 3s，满足要求。A 选项的 DefBuckets 在 500ms 和 1s 之间有 500ms 的宽间隔，P99 落在这个区间时误差极大，不适用。C 选项的 factor=10 过大，相邻桶之间跨度是 10 倍，在 100ms 到 1s 之间完全没有桶，P99 = 500ms 时会有 80% 的误差。D 选项在 100ms 到 500ms 之间完全没有桶，同样无法准确监控 P99 SLO。设计 bucket 的原则就是：**先确定 SLO 阈值，然后在阈值两侧密集设桶**。"
+        },
+        {
+          "id": "monitoring-q95-quiz-9",
+          "question": "Prometheus 2.40+ 引入的 Native Histogram 中，`NativeHistogramBucketFactor: 1.1` 这个参数的含义是什么？",
+          "choices": [
+            {"id": "A", "text": "相邻桶边界之间的比值为 1.1，即每个桶上边界约是下边界的 1.1 倍，factor 越接近 1.0 精度越高但桶数越多"},
+            {"id": "B", "text": "Histogram 的总桶数固定为 1.1 × 100 = 110 个"},
+            {"id": "C", "text": "第一个桶的起始边界是 0.1ms，即 1.1 × 0.1 = 0.11ms"},
+            {"id": "D", "text": "每次桶数超过 NativeHistogramMaxBucketNumber 时，桶会被合并，合并比例系数为 1.1"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Native Histogram 使用指数桶方案，`NativeHistogramBucketFactor` 控制相邻桶边界的比值。factor = 1.1 意味着每个桶的上边界是下边界的 1.1 倍，例如有边界 100ms 时，下一个桶边界约为 110ms，再下一个约为 121ms。这样在任何延迟范围内，桶宽约为观测值的 10%，`histogram_quantile` 的相对误差约为 5%，远优于手工设桶的 15-20% 误差。factor 越接近 1.0，精度越高，但潜在桶数越多（由 `NativeHistogramMaxBucketNumber` 控制上限）；factor = 2.0 时精度较低但桶数极少。B 选项混淆了 factor 和桶数上限；C 选项描述的是起始边界而非 factor 的含义；D 选项描述的是合并触发时的行为，但合并比例不是 factor 的含义。"
+        },
+        {
+          "id": "monitoring-q95-quiz-10",
+          "question": "线上 `histogram_quantile(0.99, rate(api_duration_seconds_bucket[5m]))` 查询结果在过去 10 分钟内突然从稳定的 150ms 跳到了 248ms 并持续高位，但同时查询 `rate(api_duration_seconds_count[5m])` 显示请求量正常，错误率没有上升。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Prometheus 发生了内存溢出，计算结果不可信"},
+            {"id": "B", "text": "248ms 是 P99 真正恶化到了接近 250ms 的桶边界，服务确实变慢了，需要立即排查"},
+            {"id": "C", "text": "P99 从 150ms 区间跳到了 100ms 到 250ms 的宽桶区间，histogram_quantile 对宽桶做线性插值，真实 P99 可能在 160ms 到 245ms 之间的任意位置，「248ms」是插值计算的结果，并不等于真实 P99"},
+            {"id": "D", "text": "rate() 函数的时间窗口 [5m] 设置太短，需要改成 [15m] 才能消除抖动"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "当 P99 的真实值从某个细粒度桶区间（比如 140ms-160ms）漂移到宽桶区间（100ms-250ms）时，`histogram_quantile` 的线性插值结果会出现大幅跳动——不是因为服务真的变慢了那么多，而是因为插值基于的桶太宽，微小的分布变化会导致计算结果剧烈波动。「248ms」非常接近 250ms 这个桶的上边界，这是插值结果在宽桶末尾的典型表现。正确的排查方式是：查看 `_count` 分布（哪些 le 的增量最多）来判断真实分布是否有变化，同时对照 access log 验证。这个现象也说明宽桶配置会导致监控图表出现虚假的「毛刺」，进一步降低 on-call 工程师对报警的信任度。"
+        }
+      ],
+      "references": [
+        "https://prometheus.io/docs/practices/histograms/",
+        "https://prometheus.io/docs/concepts/metric_types/#histogram",
+        "https://prometheus.io/blog/2022/11/29/native-histograms/",
+        "https://grafana.com/blog/2022/03/01/how-summary-metrics-work-in-prometheus/",
+        "https://promlabs.com/blog/2020/12/17/promql-queries-for-exploring-your-metrics"
+      ]
+    }
+  ]
+}
