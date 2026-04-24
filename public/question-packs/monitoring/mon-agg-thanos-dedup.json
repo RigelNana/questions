@@ -1,0 +1,157 @@
+{
+  "id": "monitoring-q174",
+  "name": "Thanos Query 去重机制",
+  "domain": "monitoring",
+  "description": "深入解析 Thanos Query 的 Deduplication 机制：replica labels 识别副本、penalty-based merge 算法、查询时与压缩时去重的本质差异",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q174",
+      "domain": "monitoring",
+      "type": "principle",
+      "difficulty": 4,
+      "tags": ["thanos", "prometheus", "deduplication", "ha", "monitoring", "replica-labels", "compactor"],
+      "title": "Thanos Query 的 Deduplication 机制是如何工作的？",
+      "content": "在生产环境中部署 Thanos 做长期存储时，高可用（HA）配置几乎是标配：两个 Prometheus 实例以完全相同的抓取配置覆盖同一批 targets，分别通过 external labels 打上 `replica=\"a\"` 和 `replica=\"b\"` 加以区分。任何一个实例挂掉，另一个还在持续收数据，监控不会出现盲区。\n\n但这个设计天然地带来一个让人头疼的副作用：当 Thanos Query 同时向两个 Prometheus Sidecar 发起查询时，同一个指标会出现两条时间序列，它们的标签集除了 `replica` 这一个字段之外完全相同。在 Grafana 里画一条请求量折线图，你会看到两条几乎完全重叠的线——这就是重复序列（duplicate series）的问题。更危险的情况发生在聚合运算时：如果你写 `sum(rate(http_requests_total[5m]))`，结果会直接翻倍，让你误以为流量突然暴增了一倍，实际上只是把两个副本的数据叠加在一起了。\n\nThanos Query 的 Deduplication（去重）机制专门解决这个问题，在查询时将「同一指标的不同副本序列」合并成一条。\n\n理解这个机制需要回答几个关键问题：Thanos 如何判断哪些序列属于副本关系？合并两条副本序列时，如果某个时间点只有一个副本有数据怎么处理？如果两个副本的采样时间戳存在细微偏移会发生什么？去重是在查询时做还是在压缩时做，两者有什么本质差异？在 Thanos Receive 架构下去重配置有何不同？\n\n请深入解释 Thanos Deduplication 机制的完整工作原理，包括 `--query.replica-labels`、penalty-based merge 算法、gap tolerance、以及查询时去重与压缩时去重的设计取舍。",
+      "answer": "## Thanos 架构与 HA 部署的去重需求\n\nThanos 是一套扩展 Prometheus 能力的组件集合，核心目标是提供跨多个 Prometheus 实例的全局查询视图和长期存储能力。在典型的 HA 部署中，架构由以下几个角色组成：Sidecar 附着在每个 Prometheus 实例旁边，暴露 StoreAPI 供 Query 查询；Query 作为统一的查询入口，聚合来自多个 StoreAPI 的数据；Store Gateway 负责从对象存储（S3、GCS 等）读取历史数据；Compactor 负责对对象存储中的 TSDB block 做压缩和降采样。\n\n在 HA 部署下，两个 Prometheus 实例 `prometheus-a` 和 `prometheus-b` 配置完全相同，external labels 分别设置为 `replica=\"a\"` 和 `replica=\"b\"`。当 Thanos Query 收到一个 PromQL 查询时，它同时向两个 Sidecar 发请求，拿到的数据里同一个指标会有两条序列：\n\n```\nhttp_requests_total{job=\"api-server\", instance=\"10.0.0.1:8080\", replica=\"a\"} ...\nhttp_requests_total{job=\"api-server\", instance=\"10.0.0.1:8080\", replica=\"b\"} ...\n```\n\n这两条序列从业务含义上说是同一个东西，只是「谁在采集」不同。去重的目标就是把它们合并成一条，对外暴露的查询结果里不含 `replica` 标签，用户看到的就是干净的单条序列。\n\n## `--query.replica-labels` 的工作原理\n\n去重的核心开关是 `--query.replica-labels` 这个启动参数。在启动 Thanos Query 时告诉它哪些标签代表副本身份：\n\n```bash\nthanos query \\\n  --http-address=0.0.0.0:9090 \\\n  --store=prometheus-a-sidecar:10901 \\\n  --store=prometheus-b-sidecar:10901 \\\n  --query.replica-labels=replica\n```\n\n启用后，Thanos Query 在合并来自多个 StoreAPI 的数据时，会把 replica-labels 里指定的标签从序列的标签集中「剥离」，然后按剩余标签做分组。剥离后标签集完全相同的序列被判定为副本关系，进入合并流程，最终作为一条序列输出。这个机制可以同时指定多个标签，比如 `--query.replica-labels=replica --query.replica-labels=region`，用于处理多维度副本（同时存在 HA 副本和多地域副本）的场景。\n\n这里有一个容易踩的坑：replica-labels 是「永久剥离」，一旦把某个标签加进去，查询结果里就彻底看不到这个维度的区分了。如果某个标签既有副本标识含义又有真正的业务含义，错误地加入 replica-labels 会导致不同业务实体的数据被强行合并，产生错误的聚合结果。\n\n## Penalty-based Merge 算法\n\n确定了哪些序列是副本关系之后，Thanos 面临的下一个挑战是：如何把两条（或更多）时间线合并成一条完整的序列？最朴素的策略是随机取其一，但这在某个副本有缺口时会引入不必要的数据空洞。\n\nThanos 采用的是基于惩罚分（penalty score）的合并算法，实现在 `pkg/dedup/iter.go` 中。算法核心思路是遍历时间轴的同时，为每个副本序列维护一个惩罚分，每当某个时间点该序列缺少样本（gap），其惩罚分就会递增。在多个副本序列同时有数据的时间点，优先选择惩罚分最低（历史上缺口最少）的那条的数据；在某个时间点只有单个序列有数据时，无条件使用它。\n\n用一个具体例子来说明。假设两个副本在某段时间的采样情况如下（O 代表有样本，X 代表缺失）：\n\n```\n时间点:      T1  T2  T3  T4  T5  T6  T7  T8\nreplica-a:   O   O   X   X   O   O   O   O\nreplica-b:   O   O   O   O   X   O   O   O\n```\n\nT1、T2 两个副本都有数据，惩罚分相同，按字典序取 replica-a 的数据。T3、T4 只有 replica-b 有数据，直接使用 replica-b，同时 replica-a 因连续缺口累积惩罚分。T5 只有 replica-a 有数据，直接使用 replica-a，replica-b 开始积累惩罚。T6 之后两者都有数据，比较惩罚分后选择较优的那条。最终合并出一条在 T1-T8 全程都有样本的完整序列，两段各自的缺口被对方副本填补。这正是 HA 部署的价值所在：单点故障窗口内的数据不丢失。\n\n## 采样时间戳偏移与 Gap Tolerance\n\n实际生产中还有一个更微妙的问题：两个 Prometheus 实例的采样时间戳不完全对齐。即使配置了相同的 `scrape_interval: 15s`，实际采样时刻也可能因为 scrape 目标的响应延迟差异相差几百毫秒甚至几秒。如果去重时严格要求时间戳精确匹配，两个副本的数据点永远不会被认定为「同一时间点的样本」，penalty-based 算法就无法正常合并，合并结果里会出现数据点密度是正常值两倍的现象。\n\nThanos 的解决方案是引入 gap tolerance（容差窗口）。对于原始（raw）数据，默认容差是 `5 × scrape_interval`，即 scrape_interval 为 15s 时容差为 75 秒。在这个窗口范围内，来自两个副本的时间戳可以被视为「对应同一采样周期」而进行匹配合并。对于降采样后的数据（5m resolution 和 1h resolution），容差自然更大，因为降采样本身就模糊了原始采样时刻。\n\n这个容差机制在大多数场景下表现良好，但如果两个 Prometheus 实例的系统时钟有明显偏差（超过 NTP 同步精度），或者 scrape_interval 设置得很短（5s 以内），就可能出现去重效果下降的情况。这是为什么 HA 部署强烈建议两个 Prometheus 实例都用 NTP 同步时钟，时钟偏差控制在几十毫秒以内。\n\n## 查询时去重 vs 压缩时去重\n\n这是一个让很多人混淆但非常重要的架构区分，两种方式有着截然不同的性能特性。\n\n查询时去重（Query-time deduplication）是默认行为，发生在 Thanos Query 组件内部。每次查询时，Query 从所有副本的 StoreAPI 拉取完整的原始序列数据，在内存中完成 penalty-based merge，再把去重后的结果返回给调用方。它的优点是实时生效、无需预配置存储端，任何时候修改 replica-labels 都立即生效；缺点是每次查询都要从多个副本拉取完整数据，对象存储的 I/O 是副本数倍，Query 节点的内存和 CPU 压力随副本数线性增长。\n\n压缩时去重（Compaction-time deduplication）发生在 Thanos Compactor 运行期间。Compactor 把对象存储里同一时间窗口内来自不同副本的 TSDB block 合并为一个去重后的单副本 block，实际写入时丢弃重复样本只保留一份。配置方式是在 Compactor 启动时加 `--deduplication.replica-label=replica`。之后对这段历史数据的查询就只需要读取单个 block，I/O 和 Query 内存开销都减半甚至更多。\n\n实践中两种机制通常协同工作：最近几小时的「热数据」还在 Prometheus 本地存储，尚未上传到对象存储，Compactor 还没处理，全靠 Query-time 去重；几小时前上传并经过 Compactor 处理的「冷数据」已经是合并后的单副本 block，Query 读到的天然就是去重结果，Query-time 去重此时对这部分数据近乎零开销。\n\n## Thanos Receive 场景下的去重\n\n使用 Thanos Receive（远程写入模式，Prometheus 通过 remote_write 向 Receive 推送数据，不用 Sidecar）时，HA 配置略有不同。Receive 组件有 `--receive.replication-factor=2` 参数，表示每条写入的数据会被分发到 hashring 中的 2 个节点，实现数据冗余。这 2 个节点上存储的是相同的数据，同样会产生副本序列，Query-time 去重完全适用，配置方式与 Sidecar 模式相同。关键是 Prometheus 的 remote_write 配置里必须设置能区分副本的 external label（通常在不同 Prometheus 实例的配置里写入不同的 `replica` 值），然后在 Thanos Query 的 `--query.replica-labels` 里声明这个标签。\n\n## 调试去重问题\n\n生产中最常见的去重失效场景有三类。第一，`--query.replica-labels` 漏填了某个副本标签，两条序列没有被识别为副本关系，查询结果里仍然出现两条线。第二，两个 Prometheus 实例的 external labels 完全相同（配置时忘记给它们写不同的 replica 值），Thanos 无法区分两者，去重逻辑找不到可以剥离的副本标签。第三，某个 Exporter 自己打了一个与 replica-labels 同名的标签，但其含义是业务维度而非副本身份，导致本不是副本关系的序列被错误合并。\n\n调试时可以用 `--log.level=debug` 启动 Thanos Query，日志中会输出每次合并决策的详细信息，包括识别出的副本序列组和合并后丢弃的数据点。也可以在 Thanos Query UI 的查询 URL 中加上 `&dedup=false` 参数，临时关闭去重后直接查看原始多副本数据，对比哪些序列本应被合并。如果发现两条序列里始终有一条有明显更多的缺口，问题通常不在去重配置而在那个 Prometheus 实例的抓取健康状况——去重机制填补缺口的能力有上限，真正的高可用还是要靠每个副本自身的稳定。",
+      "keyPoints": [
+        "Prometheus HA 部署下两个副本同时抓取相同 targets，产生只有 replica 标签不同的重复序列，直接做 sum 聚合会导致数值翻倍，这是 Thanos 去重机制需要解决的核心问题",
+        "`--query.replica-labels` 告诉 Thanos Query 哪些标签是副本身份标识，查询时剥离这些标签后，标签集完全相同的序列被判定为副本关系并触发合并",
+        "Penalty-based merge 算法为每个副本序列维护「惩罚分」，历史缺口越多惩罚分越高，合并时优先使用惩罚分最低的副本数据，使最终合并序列尽可能无缺口",
+        "两个 Prometheus 副本的采样时间戳存在偏移，Thanos 用 gap tolerance（默认 5 × scrape_interval）处理时间戳偏移，窗口内的数据点可以跨副本匹配合并",
+        "查询时去重（Query-time）每次查询都从所有副本拉取完整数据在内存中合并，实时生效但 I/O 是副本数倍；压缩时去重（Compaction-time）在 Compactor 阶段将多副本 block 合并为单副本，后续查询 I/O 减半",
+        "将真正的业务维度标签误加入 `--query.replica-labels` 是最危险的配置错误，会导致不同业务实体的数据被永久合并，聚合结果出现逻辑错误",
+        "Thanos Receive 场景下 `--receive.replication-factor` 控制数据写入几个 hashring 节点，副本间去重仍由 Query-time deduplication 处理，Prometheus 的 external labels 里必须写入区分副本的字段",
+        "调试去重问题时用 `--log.level=debug` 查看合并决策日志，或在 Query URL 中加 `&dedup=false` 临时关闭去重，对比原始多副本数据来定位配置问题"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q174-q1",
+          "question": "在 Thanos Query 中，`--query.replica-labels=replica` 参数的核心作用是什么？",
+          "choices": [
+            { "id": "A", "text": "告诉 Thanos Query 在合并序列时忽略指定标签，将剩余标签集相同的序列识别为副本关系并合并" },
+            { "id": "B", "text": "将来自多个 StoreAPI 的数据按 replica 标签分组，每组分别聚合后再相加" },
+            { "id": "C", "text": "过滤掉所有带有 replica 标签的序列，只保留没有该标签的原始序列" },
+            { "id": "D", "text": "控制 Thanos Compactor 在压缩时保留几个副本的数据" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "选项 A 正确。`--query.replica-labels` 的作用是在合并时「剥离」指定标签，将剩余标签集完全相同的序列识别为副本关系，然后通过 penalty-based merge 算法合并成一条序列输出，结果中不含 replica 标签。选项 B 混淆了去重与聚合的概念，去重是在分组内选择最优样本，而不是把多组结果相加。选项 C 完全错误，过滤掉带 replica 标签的序列意味着 HA 副本都丢弃了，恰好相反。选项 D 混淆了 Query 和 Compactor 的职责，Compactor 的去重配置是 `--deduplication.replica-label`，与 Query 的 `--query.replica-labels` 是两个独立参数。"
+        },
+        {
+          "id": "monitoring-q174-q2",
+          "question": "两个 Prometheus 副本的 external labels 完全相同，都是 `{cluster=\"prod\", env=\"production\"}`，没有 replica 字段。在 Thanos Query 配置了 `--query.replica-labels=replica` 的情况下，会发生什么？",
+          "choices": [
+            { "id": "A", "text": "Thanos Query 会报错，提示找不到 replica 标签，拒绝启动" },
+            { "id": "B", "text": "去重不会生效，查询结果里仍然出现两条重复序列，聚合结果翻倍" },
+            { "id": "C", "text": "Thanos Query 会自动生成 replica 标签，分别赋值 0 和 1，然后正常去重" },
+            { "id": "D", "text": "两个 Sidecar 的数据被视为同一数据源，Thanos Query 只查询其中一个" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 正确。去重的前提是副本序列之间存在可以被「剥离」的区分标签。如果两个 Prometheus 副本的 external labels 完全相同，来自它们的序列标签集本来就完全一致，剥离 replica 标签（本来就没有）后标签集仍然相同，两条序列会被识别为副本并合并——但实际上它们在时间轴上完全重叠，合并结果理论上没问题。不过更常见的真实问题是：两个副本 external labels 相同时，Thanos Compactor 在做 block 去重时会无法区分来源，可能产生错误的压缩结果。最佳实践是每个 Prometheus 实例必须有唯一的 external labels 组合。选项 A、C、D 描述的行为都不存在，Thanos Query 不会因为序列缺少指定的 replica 标签就报错或自动补全。"
+        },
+        {
+          "id": "monitoring-q174-q3",
+          "question": "关于 Thanos 的 penalty-based merge 算法，以下描述最准确的是？",
+          "choices": [
+            { "id": "A", "text": "算法总是取字典序最小的副本作为主序列，忽略其他副本，只有主序列有缺口时才用其他副本补充" },
+            { "id": "B", "text": "算法为每个副本维护惩罚分，每个缺口使惩罚分递增，合并时优先选用惩罚分最低的副本数据，使最终序列尽可能无缺口" },
+            { "id": "C", "text": "算法对同一时间点的所有副本样本求平均值，确保合并结果是所有副本的统计中位数" },
+            { "id": "D", "text": "算法选取每个时间窗口内样本值最大的副本，以防止单个副本采集到偏低的异常值影响监控准确性" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 正确。Penalty-based merge 算法的设计目标是产生一条缺口最少的合并序列。它通过动态维护每个副本的惩罚分（历史缺口累积值）来决定在任意时间点使用哪个副本的数据，优先选择过去表现更稳定（缺口更少）的副本。当某个时间点只有单个副本有数据时直接使用，不要求所有副本都存在数据。选项 A 描述的是简单的主备选择策略，不能利用两个副本都有数据的优势做缺口填补。选项 C 描述的是均值合并，这对于 counter 类型的指标会产生严重错误（counter 值是累计单调递增的，求均值没有意义）。选项 D 描述的是最大值选取策略，同样对 counter 类型无效，也不符合 Thanos 的实现。"
+        },
+        {
+          "id": "monitoring-q174-q4",
+          "question": "Thanos Query 对原始数据（raw resolution）的 gap tolerance 默认值是多少？",
+          "choices": [
+            { "id": "A", "text": "固定 30 秒，不依赖 scrape_interval 的配置" },
+            { "id": "B", "text": "固定 5 分钟，与 Prometheus 的默认 scrape 超时时间对齐" },
+            { "id": "C", "text": "5 × scrape_interval，例如 scrape_interval=15s 时容差为 75 秒" },
+            { "id": "D", "text": "等于 scrape_interval 本身，一个采集周期内的偏差视为同一时间点" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "选项 C 正确。Thanos 对原始数据的 gap tolerance 默认值为 `5 × scrape_interval`。这个设计是为了容纳两个 Prometheus 实例因采样时刻漂移、scrape 目标响应延迟差异等原因导致的时间戳偏移。以最常见的 scrape_interval=15s 为例，容差为 75 秒，意味着在 75 秒窗口内两个副本的样本点可以被视为「同一周期」的数据进行匹配合并。选项 A 和 B 描述的是固定容差值，Thanos 的实际实现是动态基于 scrape_interval 计算的，固定值在不同 scrape 频率下会失效。选项 D 描述的容差太小，一个 scrape_interval 内的偏差只能容纳时钟完全精确的情况，在网络延迟或时钟轻微偏差下就会失效。"
+        },
+        {
+          "id": "monitoring-q174-q5",
+          "question": "你在 Grafana 中查询 `sum(rate(http_requests_total{job=\"api\"}[5m]))` 发现结果是预期值的两倍。以下哪种情况最可能导致这个问题？",
+          "choices": [
+            { "id": "A", "text": "Prometheus 的 scrape_interval 设置过短，同一个 target 在 5 分钟窗口内被采集了两次" },
+            { "id": "B", "text": "Thanos Query 没有配置 `--query.replica-labels`，两个 HA 副本的序列都参与了 sum 聚合" },
+            { "id": "C", "text": "Grafana 的数据源配置了两次相同的 Thanos Query 地址，查询结果被加了两遍" },
+            { "id": "D", "text": "`rate()` 函数在有缺口的序列上会自动填充，导致计算结果偏高" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 正确。这是 Thanos HA 部署下最经典的问题表现。当 `--query.replica-labels` 未配置或配置了错误的标签时，来自 replica-a 和 replica-b 的序列都是独立的，`sum()` 会把两条序列都加进去，结果正好是单副本的两倍。解决方法是在 Thanos Query 启动参数里加上 `--query.replica-labels=replica`（假设副本通过 replica 标签区分），去重后 sum 就只会看到一条合并后的序列。选项 A 描述的情况会让 rate() 结果偏高，但不会精确翻倍，而且 Prometheus 不会对同一 target 在同一 scrape_interval 内采集两次。选项 C 有可能导致翻倍，但这是 Grafana 配置问题，不是 Thanos 去重问题。选项 D 对 rate() 函数的描述有误，rate() 遇到缺口会导致结果偏低，不会偏高。"
+        },
+        {
+          "id": "monitoring-q174-q6",
+          "question": "团队在 `--query.replica-labels` 里错误地加入了 `env` 标签（staging 和 production 共享一套 Thanos Query），会产生什么后果？",
+          "choices": [
+            { "id": "A", "text": "staging 和 production 的相同指标序列会被合并成一条，查询结果混合了两个环境的数据，无法区分环境" },
+            { "id": "B", "text": "查询时只返回其中一个环境的数据，另一个环境的数据被静默丢弃" },
+            { "id": "C", "text": "Thanos Query 会报错，提示 env 不是有效的 replica 标签，拒绝执行查询" },
+            { "id": "D", "text": "staging 和 production 各自内部的 HA 副本能正常去重，两个环境之间不受影响" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "选项 A 正确，这是一个非常危险的配置错误。当 `env` 被加入 replica-labels 后，Thanos 在识别副本关系时会忽略 `env` 标签的值，staging 的 `http_requests_total{job=\"api\", env=\"staging\", replica=\"a\"}` 和 production 的 `http_requests_total{job=\"api\", env=\"production\", replica=\"a\"}` 在剥离 env 和 replica 后标签集完全相同，被识别为副本关系并合并。合并结果混入了两个环境的数据，但查询方看不到任何错误提示，这是一种「静默的数据错误」，在生产事故排查时会产生严重误导。选项 B 只丢弃一个环境的数据是 Thanos 的实际行为，因为合并时会选择其中一个副本的数据点。选项 C 错误，Thanos 不会校验 replica-labels 是否合理，任何标签名都可以配置。选项 D 错误，一旦 env 被列入 replica-labels，所有含 env 标签的序列都会参与跨环境合并。"
+        },
+        {
+          "id": "monitoring-q174-q7",
+          "question": "关于查询时去重（Query-time deduplication）和压缩时去重（Compaction-time deduplication）的对比，以下说法正确的是？",
+          "choices": [
+            { "id": "A", "text": "压缩时去重会删除对象存储中的原始副本数据，无法恢复；查询时去重不修改存储，只影响查询结果" },
+            { "id": "B", "text": "两者都只能处理最近 2 小时的数据，超过 2 小时的历史数据无法去重" },
+            { "id": "C", "text": "查询时去重比压缩时去重精度更高，因为查询时可以看到所有副本的原始数据" },
+            { "id": "D", "text": "压缩时去重在 Thanos Query 组件中运行，查询时去重在 Thanos Compactor 中运行" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "选项 A 正确。这是两种机制最本质的区别。查询时去重是只读操作，Thanos Query 从多个 StoreAPI 拉取原始的多副本数据，在内存中完成合并后返回结果，对象存储中的原始数据完全不动；如果发现去重配置有误，修改参数重启 Query 即可立即纠正。压缩时去重是写操作，Thanos Compactor 读取多个副本的 block，合并后写入新的单副本 block，然后删除原始多副本 block；如果去重配置错误导致数据错误合并，原始数据已经丢失，无法回滚。这也是为什么压缩时去重的 `--deduplication.replica-label` 配置需要非常谨慎。选项 B 错误，两者都可以处理任意时间范围的数据。选项 C 虽然查询时去重确实能看到原始数据，但两者在合并算法上是相同的（都是 penalty-based），精度不存在差异。选项 D 把两者的组件搞反了。"
+        },
+        {
+          "id": "monitoring-q174-q8",
+          "question": "在 Thanos Receive 模式下配置 `--receive.replication-factor=3`，以下理解正确的是？",
+          "choices": [
+            { "id": "A", "text": "每条写入数据会被发送到 hashring 中的 3 个节点，Thanos Query 查询时需要配置 replica-labels 来对这 3 份数据去重" },
+            { "id": "B", "text": "Receive 节点会自动合并来自 3 个节点的数据，Query 查询时无需额外配置就能得到去重后的结果" },
+            { "id": "C", "text": "replication-factor=3 表示 Receive 集群内有 3 个 zone，每个 zone 各保存一份副本，Query 只从一个 zone 查询" },
+            { "id": "D", "text": "replication-factor=3 只影响写入的持久化保证，对查询侧的去重行为没有任何影响" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "选项 A 正确。`--receive.replication-factor=3` 意味着每条时间序列数据会被 Receive Router 分发到 hashring 中的 3 个 Ingester 节点，3 个节点各自存储一份相同的数据（这是 Receive 的高可用保证机制）。当 Thanos Query 查询这 3 个 Ingester 时，同一条序列会出现 3 次，需要配置 `--query.replica-labels` 来去重。具体做法是在 Prometheus 远程写入配置的 external labels 里加入区分副本的标签（通常每个 Prometheus 实例用不同的值），然后在 Thanos Query 里声明该标签为 replica-label。选项 B 错误，Receive 节点不做查询侧去重，数据合并是 Query 的职责。选项 C 混淆了 replication-factor 和 zone 的概念。选项 D 错误，replication-factor 直接决定了查询时需要去重的副本数量。"
+        },
+        {
+          "id": "monitoring-q174-q9",
+          "question": "Thanos Compactor 开启降采样（downsampling）后，降采样数据（5m resolution 和 1h resolution）的去重是如何处理的？",
+          "choices": [
+            { "id": "A", "text": "降采样发生在去重之前：先对每个副本单独降采样，再对降采样后的数据做 Query-time 去重" },
+            { "id": "B", "text": "Compactor 在做压缩时先完成 block 级别的去重，再对去重后的单副本 block 做降采样，降采样数据天然是单副本的" },
+            { "id": "C", "text": "降采样数据不支持去重，必须关闭 `--query.replica-labels` 才能正确查询降采样数据" },
+            { "id": "D", "text": "Query 通过 `--query.auto-downsampling` 标志在查询时自动选择降采样 resolution，但去重只对 raw 数据有效" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 正确，这是 Thanos Compactor 设计的一个重要细节。Compactor 的处理顺序是：先在 2 小时 block 级别完成副本去重（将多副本 block 合并为单副本 block），再在单副本 block 的基础上做降采样，生成 5m 和 1h resolution 的 block。因此降采样 block 在被创建时就已经是去重后的数据，Query 查询这些 block 时理论上不存在重复序列，Query-time 去重对这部分数据的开销可以忽略。这个设计使得对历史数据的大时间范围查询非常高效：既用了降采样减少了数据点数量，又因为 Compaction-time 去重不需要拉取多份副本数据。选项 A 描述的顺序相反，Compactor 是先去重再降采样。选项 C 错误，降采样数据完全支持 Query-time 去重。选项 D 中 `--query.auto-downsampling` 确实控制自动选择 resolution，但描述中「去重只对 raw 有效」是错误的。"
+        },
+        {
+          "id": "monitoring-q174-q10",
+          "question": "你怀疑 Thanos Query 的去重没有按预期工作，想验证两个副本序列是否被正确合并。以下哪个方法最直接有效？",
+          "choices": [
+            { "id": "A", "text": "重启 Thanos Query，查看启动日志是否有 replica-labels 相关的 INFO 日志确认配置已加载" },
+            { "id": "B", "text": "用 `--log.level=debug` 启动 Thanos Query 查看合并决策日志，同时在 Query UI 的查询 URL 中加 `&dedup=false` 对比关闭去重前后的序列条数" },
+            { "id": "C", "text": "直接查询 Thanos Compactor 的 HTTP metrics 接口，查看 `thanos_compact_dedup_ratio` 指标" },
+            { "id": "D", "text": "在 Prometheus 侧通过 `recording rules` 预先聚合数据，规避 Thanos Query 的去重问题" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 B 正确，这是调试 Thanos 去重问题最直接的两步组合拳。`--log.level=debug` 会让 Thanos Query 在日志中输出每次 series merge 的决策细节，包括识别出了哪些序列对属于副本关系以及合并时丢弃了哪些样本点，可以精确定位是「副本识别失败」还是「识别正确但合并逻辑有问题」。在 Query UI 里加 `&dedup=false` 临时关闭去重后，你能直接看到多少条「原始」重复序列，和开启去重后的序列数做对比，立刻就能判断去重是否生效。选项 A 只能确认参数被读取，无法验证去重是否实际工作。选项 C 混淆了 Compactor 和 Query 的职责，`thanos_compact_dedup_ratio` 这个指标反映的是 Compactor 做 block 去重的效果，与 Query-time 去重无关。选项 D 是用 workaround 规避问题，而不是定位和解决问题。"
+        }
+      ],
+      "references": [
+        "https://thanos.io/tip/components/query.md/#deduplication",
+        "https://thanos.io/tip/components/compact.md/#deduplication",
+        "https://thanos.io/tip/components/receive.md/#replication",
+        "https://github.com/thanos-io/thanos/blob/main/pkg/dedup/iter.go"
+      ]
+    }
+  ]
+}
