@@ -1,0 +1,157 @@
+{
+  "id": "deadlock-diagnosis",
+  "name": "死锁的检测与排查",
+  "domain": "troubleshooting",
+  "description": "JVM 内死锁与分布式死锁的检测方法、根因分析与预防策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "deadlock-diagnosis-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["deadlock", "java", "jvm", "database", "distributed", "jstack", "innodb", "lock"],
+      "title": "服务请求永远不返回，jstack 发现线程 BLOCKED，如何确认和解决死锁问题？",
+      "content": "你们公司有一套微服务架构，核心是三个 Java 服务：`order-service`、`inventory-service` 和 `payment-service`，它们之间通过 Feign 客户端互相调用，共享同一套 MySQL 数据库（InnoDB 引擎）。某个周一早上，告警群突然炸锅：多个用户反馈「下单之后一直转圈，永远没有结果」。你打开监控，发现这三个服务的活跃线程数在过去半小时内从正常的 20 条爬升到了 200 条，而 HTTP 请求的 P99 延迟直接打到了 60 秒超时上限。\n\n你登上其中一台 `order-service` 的机器，用 `jstack -l <PID>` 抓了一份线程快照，发现大量线程状态是 `BLOCKED`，而不是 `WAITING` 或 `TIMED_WAITING`。以下是其中一段典型输出：\n\n```\n\"http-nio-8080-exec-47\" #89 daemon prio=5 os_prio=0 tid=0x00007f3c580e7800 nid=0x4a21 waiting for monitor entry [0x00007f3c380f4000]\n   java.lang.Thread.State: BLOCKED (on object monitor)\n        at com.example.order.service.OrderService.createOrder(OrderService.java:142)\n        - waiting to lock <0x000000076b8e3a10> (a java.lang.Object)\n        - locked <0x000000076b8e2f80> (a java.lang.Object)\n        at com.example.order.controller.OrderController.placeOrder(OrderController.java:67)\n        ...\n\n\"http-nio-8080-exec-23\" #65 daemon prio=5 os_prio=0 tid=0x00007f3c580a1800 nid=0x4a05 waiting for monitor entry [0x00007f3c37ef2000]\n   java.lang.Thread.State: BLOCKED (on object monitor)\n        at com.example.order.service.OrderService.createOrder(OrderService.java:142)\n        - waiting to lock <0x000000076b8e2f80> (a java.lang.Object)\n        - locked <0x000000076b8e3a10> (a java.lang.Object)\n        at com.example.order.controller.OrderController.placeOrder(OrderController.java:67)\n        ...\n```\n\n两个线程互相持有对方需要的锁，谁也无法推进。与此同时，DBA 告诉你数据库侧也有异常：MySQL 的慢查询日志里出现了大量 `Lock wait timeout exceeded; try restarting transaction`，而 `information_schema.innodb_trx` 表中有多行事务的 `trx_state` 是 `LOCK WAIT`，已经卡了超过 30 秒。\n\n更诡异的是，即便没有 JVM 内死锁，某些跨服务的请求也会永远卡住：`order-service` 在一个数据库事务里调用了 `inventory-service` 的扣库存接口，而 `inventory-service` 在另一个事务里又回调了 `order-service` 的状态更新接口——两个服务各自持有数据库行锁，互相等待对方释放，形成了跨越两个 JVM 的分布式死锁。\n\n请你描述完整的排查思路：如何区分 JVM 内死锁、数据库层死锁和分布式死锁？每种死锁分别用什么工具确认、如何定位根因、怎么做到快速止血和长期预防？",
+      "answer": "## 死锁是什么，以及为什么这道题值得认真对待\n\n死锁（Deadlock）是并发系统中最经典的活性问题之一。它的学术定义是：两个或更多线程（或进程）各自持有一部分资源，同时又在等待其他线程释放另一部分资源，导致所有线程永远阻塞。这个定义里隐藏着四个缺一不可的必要条件，Coffman 在 1971 年就总结清楚了：**互斥**（资源同一时刻只能被一个线程使用）、**持有并等待**（线程在持有资源的同时等待其他资源）、**非抢占**（已持有的资源不能被强制剥夺）、**循环等待**（线程之间形成闭合的等待环）。四个条件同时满足，死锁就会发生。反过来说，破坏任意一个条件，死锁就不会出现——这是所有死锁预防策略的理论基础。\n\n很多人觉得死锁是教科书上的概念，现实中很少碰到。但实际上，只要有并发、有锁、有跨资源操作，死锁随时都可能发生，而且在分布式系统里比单机 JVM 更难发现。这道题的场景——三个 Java 服务共享数据库、互相 Feign 调用——几乎就是生产环境的标准拓扑，死锁在这里的形式会更加隐蔽。\n\n---\n\n## 第一步：JVM 内死锁的确认与定位\n\n`jstack` 输出里的 `BLOCKED` 状态就是排查 JVM 内死锁的起点。`BLOCKED` 的含义是线程正在竞争一个 `synchronized` 锁（或者 `java.util.concurrent` 包里基于 AQS 的锁），而锁现在被其他线程持有。它和 `WAITING`、`TIMED_WAITING` 的区别很关键：`WAITING` 是线程主动放弃 CPU 等待某个条件（比如调用了 `Object.wait()` 或 `LockSupport.park()`），`BLOCKED` 是线程想要推进但被锁挡住了，无法主动让步。\n\n好消息是，JVM 内死锁 `jstack` 能直接帮你发现。运行 `jstack -l <PID>` 时，`-l` 参数会同时打印每把锁的额外信息（ownable synchronizer），JVM 的死锁检测器会在输出末尾直接告诉你：\n\n```\nFound 1 deadlock.\n=================\n\n\"http-nio-8080-exec-47\":\n  waiting to lock monitor 0x000000076b8e3a10 (object 0x000000076b8e3a10, a java.lang.Object),\n  which is held by \"http-nio-8080-exec-23\"\n\n\"http-nio-8080-exec-23\":\n  waiting to lock monitor 0x000000076b8e2f80 (object 0x000000076b8e2f80, a java.lang.Object),\n  which is held by \"http-nio-8080-exec-47\"\n\nJava stack information for the threads listed above:\n===================================================\n\"http-nio-8080-exec-47\":\n        at com.example.order.service.OrderService.createOrder(OrderService.java:142)\n        - waiting to lock <0x000000076b8e3a10> (a java.lang.Object)\n        - locked <0x000000076b8e2f80> (a java.lang.Object)\n\n\"http-nio-8080-exec-23\":\n        at com.example.order.service.OrderService.createOrder(OrderService.java:142)\n        - waiting to lock <0x000000076b8e2f80> (a java.lang.Object)\n        - locked <0x000000076b8e3a10> (a java.lang.Object)\n```\n\n看到 `Found 1 deadlock` 之后，你需要做的事情是沿着堆栈往上追：`OrderService.java:142` 是代码发生问题的地方。打开源码，你会发现一个经典的反模式——代码在两种情况下以不同的顺序获取 `lockA` 和 `lockB`：\n\n```java\n// 订单创建路径：先锁 lockA，再锁 lockB\npublic void createOrder(String orderId, String inventoryId) {\n    synchronized (lockA) {           // exec-47 持有 lockA\n        // ... 一些业务逻辑 ...\n        synchronized (lockB) {       // exec-47 等待 lockB（被 exec-23 持有）\n            // ...\n        }\n    }\n}\n\n// 订单取消路径：先锁 lockB，再锁 lockA\npublic void cancelOrder(String orderId, String inventoryId) {\n    synchronized (lockB) {           // exec-23 持有 lockB\n        // ...\n        synchronized (lockA) {       // exec-23 等待 lockA（被 exec-47 持有）\n            // ...\n        }\n    }\n}\n```\n\n这就是死锁的根因：锁的获取顺序不一致。修复方案很直接——统一所有代码路径的锁获取顺序，比如永远先锁 `lockA` 再锁 `lockB`，不管是创建还是取消。如果锁的顺序无法预先确定（比如按照用户 ID 动态排序），可以用 `System.identityHashCode()` 建立一个全局稳定的排序规则，所有线程按相同顺序申请锁。\n\n如果使用的是 `ReentrantLock` 而不是 `synchronized`，还有另一种选择：用 `tryLock(timeout, TimeUnit)` 代替 `lock()`。`tryLock` 在超时后会返回 `false` 并释放已持有的锁，避免死锁的同时也能感知到竞争压力：\n\n```java\nif (lockA.tryLock(500, TimeUnit.MILLISECONDS)) {\n    try {\n        if (lockB.tryLock(500, TimeUnit.MILLISECONDS)) {\n            try {\n                // 正常业务逻辑\n            } finally {\n                lockB.unlock();\n            }\n        } else {\n            // 获取 lockB 超时，记录日志并重试或抛异常\n        }\n    } finally {\n        lockA.unlock();\n    }\n}\n```\n\n---\n\n## 第二步：数据库层死锁的确认与定位\n\nMySQL InnoDB 有自己的死锁检测机制，默认开启（`innodb_deadlock_detect=ON`）。当 InnoDB 检测到死锁时，它会主动选择一个「代价较小」的事务作为牺牲品（victim），将其回滚并返回错误码 1213：`Deadlock found when trying to get lock; try restarting transaction`。这是数据库层死锁与 JVM 内死锁的一个重要区别——InnoDB 会自动化解，而 JVM 内死锁没有任何自救机制。\n\n但 InnoDB 的自动回滚只解决了「当下」的问题，根因还在。排查数据库死锁最直接的命令是：\n\n```sql\nSHOW ENGINE INNODB STATUS\\G\n```\n\n在输出的 `LATEST DETECTED DEADLOCK` 部分，你能看到导致死锁的两个事务的完整信息：\n\n```\n------------------------\nLATEST DETECTED DEADLOCK\n------------------------\n2024-03-15 03:42:17 0x7f2c8c0ab700\n*** (1) TRANSACTION:\nTRANSACTION 421938, ACTIVE 12 sec starting index read\nmysql tables in use 1, locked 1\nLOCK WAIT 3 lock struct(s), heap size 1136, 2 row lock(s)\nMySQL thread id 1089, OS thread handle 139828539088640, query id 284721 192.168.1.10 order_svc\nUPDATE inventory SET stock = stock - 1 WHERE item_id = 'ITEM-001' AND stock > 0\n\n*** (1) HOLDS THE LOCK(S):\nRECORD LOCKS space id 231 page no 4 n bits 72 index PRIMARY of table `shop`.`orders`\nlock_mode X locks rec but not gap\nRecord lock, heap no 7 PHYSICAL RECORD: n_fields 5; compact format; info bits 0\n 0: len 8; hex 000000000001a2b3; asc         ;;\n\n*** (1) WAITING FOR THIS LOCK TO BE GRANTED:\nRECORD LOCKS space id 234 page no 3 n bits 80 index PRIMARY of table `shop`.`inventory`\nlock_mode X locks rec but not gap\nRecord lock, heap no 12 PHYSICAL RECORD: n_fields 4; compact format; info bits 0\n 0: len 8; hex 000000000000a001; asc         ;;\n\n*** (2) TRANSACTION:\nTRANSACTION 421937, ACTIVE 14 sec starting index read\nmysql tables in use 1, locked 1\nLOCK WAIT 3 lock struct(s), heap size 1136, 2 row lock(s)\nMySQL thread id 1087, OS thread handle 139828538025728, query id 284719 192.168.1.11 inventory_svc\nUPDATE orders SET status = 'CONFIRMED' WHERE order_id = 'ORD-0x1a2b3'\n\n*** (2) HOLDS THE LOCK(S):\nRECORD LOCKS space id 234 page no 3 n bits 80 index PRIMARY of table `shop`.`inventory`\nlock_mode X locks rec but not gap\n\n*** (2) WAITING FOR THIS LOCK TO BE GRANTED:\nRECORD LOCKS space id 231 page no 4 n bits 72 index PRIMARY of table `shop`.`orders`\nlock_mode X locks rec but not gap\n\n*** WE ROLL BACK TRANSACTION (1)\n```\n\n这段输出清楚地告诉你：事务 421938（来自 `order-service`）持有 `orders` 表的行锁，等待 `inventory` 表的行锁；事务 421937（来自 `inventory-service`）持有 `inventory` 表的行锁，等待 `orders` 表的行锁。两个事务形成了跨表的循环等待。InnoDB 最终回滚了事务 421938。\n\n数据库层死锁的根因通常有几类：多个事务以不同顺序访问多张表、在一个长事务里混杂了大量不相关的写操作、在事务内发起了外部 HTTP 调用（这是这个场景最严重的反模式，HTTP 调用可能耗时数百毫秒甚至超时，期间数据库行锁一直占着）。针对这道题的场景，最关键的修复是**不要在数据库事务内部发起远程调用**。\n\n---\n\n## 第三步：分布式死锁——最难发现的那种\n\n分布式死锁不会出现在任何一个单独服务的 `jstack` 里，也不会被 InnoDB 自动检测到，因为它跨越了 JVM 边界和数据库边界。它的形态是：服务 A 在自己的数据库事务里持有行锁，同时调用服务 B；服务 B 在自己的数据库事务里持有另一把锁，同时回调服务 A。两个服务互相等待对方的 HTTP 响应，而 HTTP 响应要等数据库事务提交，数据库事务要等对方的行锁释放——死循环。\n\n排查分布式死锁必须依赖**分布式链路追踪**（Distributed Tracing）。在 Jaeger 或 Zipkin 的追踪界面，搜索那些持续时间接近超时上限的 Trace，展开调用链，你会看到这样的结构：\n\n```\nTrace ID: 4a7f3b2c1d9e0f8a\n\n[order-service] placeOrder          0ms ────────────────────────────── 60s (TIMEOUT)\n  ├─ [DB] BEGIN TRANSACTION          1ms\n  ├─ [DB] UPDATE orders SET ...      2ms → 持有 orders 行锁\n  ├─ [inventory-service] deductStock 5ms ───────────────────────────── (等待响应)\n  │     ├─ [DB] BEGIN TRANSACTION    6ms\n  │     ├─ [DB] UPDATE inventory ... 7ms → 持有 inventory 行锁\n  │     ├─ [order-service] updateStatus 10ms ── (等待响应)\n  │     │     └─ [DB] UPDATE orders ... → 等待 orders 行锁 ← 被第一个事务持有！\n  │     └─ (永远等待)\n  └─ (永远等待)\n```\n\n这个调用链清楚地展示了循环依赖。定位到根因之后，解决方案是从架构层面打破环形调用：引入消息队列（比如 Kafka）将「通知」和「同步调用」解耦，`order-service` 创建订单成功后发布一个 `OrderCreated` 事件，`inventory-service` 消费该事件执行库存扣减，扣减成功后再发布 `StockDeducted` 事件，`order-service` 消费后更新订单状态——整条链路变成单向的事件流，彻底消除了循环等待。\n\n短期止血的方案是给所有 Feign 客户端配置合理的超时时间，同时在数据库事务外部发起远程调用：\n\n```java\n// 错误：在 @Transactional 方法内调用远程服务\n@Transactional\npublic void createOrder(OrderRequest req) {\n    orderRepository.save(buildOrder(req));   // 持有行锁\n    inventoryClient.deduct(req.getItemId()); // HTTP 调用，可能耗时很长！\n}\n\n// 正确：先完成本地事务，再做远程调用\npublic void createOrder(OrderRequest req) {\n    Order order = transactionTemplate.execute(status -> {\n        return orderRepository.save(buildOrder(req)); // 行锁快速释放\n    });\n    inventoryClient.deduct(req.getItemId()); // 事务已提交，不再持有锁\n}\n```\n\n---\n\n## 扩展：死锁预防、检测算法与相关陷阱\n\n从理论角度，预防死锁有两条主路：一是破坏「循环等待」条件，方法是给所有锁定义一个全局顺序，所有线程按照相同顺序申请锁；二是破坏「持有并等待」条件，方法是线程要么一次性申请所有需要的资源，要么在等待新资源时先释放已持有的资源。前者在代码层面更容易实现，后者在实践中往往需要重新设计业务流程。\n\n死锁检测算法本质上是在资源分配图（Resource Allocation Graph）中寻找环。资源分配图是一个有向图：节点分为进程节点和资源节点，进程节点到资源节点的边表示「申请」，资源节点到进程节点的边表示「分配」。如果图中存在环，就存在死锁。对于单实例资源（每种资源只有一个实例），有环等价于有死锁；对于多实例资源（如数据库连接池），需要用 Banker's Algorithm 做更复杂的分析。\n\nRedis 分布式锁有一个著名的死锁陷阱：如果你用 `SET key value NX` 加锁，但忘记设置过期时间（`EX` 参数），一旦持有锁的服务进程崩溃，锁就永远不会释放，后续所有争抢该锁的进程都会被饿死。正确的加锁命令是原子操作 `SET key value NX EX 30`，不要拆成两条命令。即便如此，如果持有锁的逻辑耗时超过了 30 秒，锁会自动过期而逻辑还没结束，造成并发安全问题——这就是为什么 Redisson 引入了「看门狗」（Watchdog）机制，定期续期锁的 TTL。\n\n数据库事务死锁发生后，正确的重试策略是：捕获 `SQLTransientException`（错误码 1213），加一个随机抖动（random jitter）后重试整个事务，而不是只重试最后一条 SQL。抖动的目的是避免多个事务在同一时刻重试，再次形成竞争。Spring 的 `@Retryable` 注解配合 `@Transactional` 可以很好地实现这一点。\n\n最后要区分三个容易混淆的概念：**死锁**（Deadlock）是永远卡住，谁也推进不了；**活锁**（Livelock）是线程一直在动但没有推进——比如两个人在走廊相遇，同时向同一方向让步，然后又同时换方向，反复循环；**饥饿**（Starvation）是某个低优先级的线程因为高优先级线程不断插队，长期得不到资源。活锁和饥饿都不会让线程阻塞，但同样无法完成任务，在面试中经常被混淆成死锁。",
+      "keyPoints": [
+        "死锁的四个必要条件是互斥、持有并等待、非抢占、循环等待，四者缺一不可，预防死锁的本质是破坏其中任意一个条件。",
+        "JVM 内死锁可以通过 `jstack -l <PID>` 直接发现，输出末尾会有 `Found N deadlock` 的明确提示，并列出参与死锁的线程和锁的对象地址。",
+        "数据库层死锁可通过 `SHOW ENGINE INNODB STATUS` 的 `LATEST DETECTED DEADLOCK` 部分查看，InnoDB 会自动选择代价较小的事务回滚，但根因（通常是多表加锁顺序不一致）需要手动修复。",
+        "分布式死锁跨越 JVM 和数据库边界，单靠 jstack 或 InnoDB 状态无法发现，必须借助分布式链路追踪（Jaeger/Zipkin）分析调用链中的循环等待。",
+        "在 `@Transactional` 方法内发起远程 HTTP 调用是典型的死锁诱因，因为 HTTP 调用耗时不可控，期间数据库行锁持续占用，与其他事务形成竞争窗口。",
+        "Redis 分布式锁必须原子性地设置锁值和过期时间（`SET key value NX EX seconds`），缺少过期时间会导致进程崩溃后锁永久不释放，形成死锁。",
+        "死锁（永久阻塞）、活锁（不断重试但无法推进）和饥饿（低优先级线程长期得不到资源）是三种不同的活性问题，在系统设计和面试中需要准确区分。"
+      ],
+      "quiz": [
+        {
+          "id": "deadlock-diagnosis-1-q1",
+          "question": "在 `jstack` 输出中，线程状态 `BLOCKED` 最准确的含义是什么？",
+          "choices": [
+            {"id": "A", "text": "线程正在等待获取一个 synchronized 锁或进入 synchronized 代码块，该锁当前被其他线程持有"},
+            {"id": "B", "text": "线程调用了 Object.wait() 或 LockSupport.park()，主动释放 CPU 等待某个条件"},
+            {"id": "C", "text": "线程正在执行 I/O 操作，等待操作系统返回结果"},
+            {"id": "D", "text": "线程被调度器暂停，正在等待分配 CPU 时间片"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`BLOCKED` 状态专指线程在尝试进入 `synchronized` 代码块或方法时，发现锁被其他线程持有，因此被阻塞在锁入口。这与 `WAITING`/`TIMED_WAITING` 有本质区别：`WAITING` 是线程主动放弃 CPU、等待被唤醒（通过 `notify()` 或 `unpark()`）；而 `BLOCKED` 的线程是被动等待，一旦锁被释放就会自动参与竞争。I/O 等待通常表现为 `RUNNABLE`（因为 JVM 不区分用户态运行和内核态 I/O 等待），等待时间片是操作系统层面的概念，不会在 jstack 中体现。"
+        },
+        {
+          "id": "deadlock-diagnosis-1-q2",
+          "question": "以下哪个命令能最直接地确认 JVM 内是否存在死锁，并列出参与死锁的线程？",
+          "choices": [
+            {"id": "A", "text": "`jstack -l <PID>`，输出末尾会有 `Found N deadlock` 的明确报告"},
+            {"id": "B", "text": "`jmap -histo <PID>`，查看堆内对象数量判断是否有锁对象堆积"},
+            {"id": "C", "text": "`jstat -gcutil <PID>`，GC 停顿时间过长说明有死锁"},
+            {"id": "D", "text": "`top -H -p <PID>`，找到 CPU 使用率为 100% 的线程"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`jstack -l` 是排查 JVM 内死锁的首选工具，`-l` 参数会额外打印 ownable synchronizer 的信息，JVM 的死锁检测器会在输出末尾生成一份 `Found N deadlock` 的报告，包含死锁线程列表、每个线程持有的锁和等待的锁的对象地址。`jmap -histo` 用于分析堆内存对象分布，与锁状态无关。`jstat -gcutil` 监控 GC 指标，死锁线程不会消耗 CPU，因此 GC 不会异常。`top -H` 找高 CPU 线程适用于排查 CPU 飙升，死锁线程因为都在阻塞等待，CPU 使用率反而接近 0。"
+        },
+        {
+          "id": "deadlock-diagnosis-1-q3",
+          "question": "以下哪条 SQL 可以查看 MySQL InnoDB 最近一次死锁的详细信息，包括参与死锁的事务、持有的锁和等待的锁？",
+          "choices": [
+            {"id": "A", "text": "`SHOW ENGINE INNODB STATUS\\G`，查看 `LATEST DETECTED DEADLOCK` 部分"},
+            {"id": "B", "text": "`SELECT * FROM information_schema.innodb_trx`，查看所有活跃事务"},
+            {"id": "C", "text": "`SELECT * FROM information_schema.innodb_locks`，查看当前等待中的锁"},
+            {"id": "D", "text": "`SHOW PROCESSLIST`，查看所有活跃连接的状态"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`SHOW ENGINE INNODB STATUS` 是 InnoDB 的诊断命令，输出的 `LATEST DETECTED DEADLOCK` 部分会保留最近一次死锁的完整快照，包括参与死锁的所有事务编号、每个事务执行的 SQL、持有的行锁记录和等待中的行锁记录，以及最终被回滚的事务编号。`innodb_trx` 视图显示当前所有活跃事务，可以发现长时间处于 `LOCK WAIT` 状态的事务，但不包含死锁的历史信息。`innodb_locks` 和 `innodb_lock_waits`（MySQL 5.7）或 `performance_schema.data_locks`（MySQL 8.0）可以看到当前等待关系，但只有 `INNODB STATUS` 才有死锁的「事后报告」。"
+        },
+        {
+          "id": "deadlock-diagnosis-1-q4",
+          "question": "关于 InnoDB 的死锁处理机制，以下说法正确的是？",
+          "choices": [
+            {"id": "A", "text": "InnoDB 默认开启死锁检测，检测到死锁时自动回滚「代价较小」的事务，并返回错误码 1213"},
+            {"id": "B", "text": "InnoDB 没有死锁检测机制，只能依靠 `innodb_lock_wait_timeout` 超时后自动重试"},
+            {"id": "C", "text": "InnoDB 检测到死锁时会同时回滚所有参与死锁的事务"},
+            {"id": "D", "text": "InnoDB 的死锁检测默认关闭，需要手动设置 `innodb_deadlock_detect=ON`"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "InnoDB 从设计上就内置了死锁检测（`innodb_deadlock_detect` 默认为 `ON`），它会维护一个等待图，周期性检查是否有环。一旦发现死锁，InnoDB 会选择「代价最小」的事务（通常是修改行数最少的事务）作为牺牲品（victim）并回滚，让其他事务得以继续，同时向该事务的连接返回错误 1213。它不会同时回滚所有事务，因为只需要打破环就够了。`innodb_lock_wait_timeout`（默认 50 秒）是另一个机制：当一个事务等待锁超时时自动报错，这是死锁检测的兜底手段，在 `innodb_deadlock_detect=OFF` 时特别重要（高并发场景有时会关掉死锁检测以减少开销）。"
+        },
+        {
+          "id": "deadlock-diagnosis-1-q5",
+          "question": "在 `SHOW ENGINE INNODB STATUS` 的死锁报告中，`*** WE ROLL BACK TRANSACTION (1)` 这行文字说明了什么？",
+          "choices": [
+            {"id": "A", "text": "InnoDB 选择事务 1 作为死锁牺牲品并回滚，以解除死锁让事务 2 得以继续"},
+            {"id": "B", "text": "事务 1 主动调用了 ROLLBACK 语句"},
+            {"id": "C", "text": "事务 1 的锁等待超时（lock wait timeout），被系统强制回滚"},
+            {"id": "D", "text": "两个事务都被回滚，这行是打印其中一个回滚操作"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这行文字是 InnoDB 死锁检测器的自动决策结果。当检测到死锁时，InnoDB 会在所有参与死锁的事务中选择一个代价最小的事务回滚，然后打印这行信息说明它的选择。「代价」的衡量标准主要是事务修改的行数和日志量，修改越少的事务越可能被选中回滚，因为回滚它的代价更低。这不是主动 ROLLBACK（那种情况 INNODB STATUS 不会记录），也不是锁等待超时（超时错误是 1205，死锁是 1213，两者是不同的错误路径）。只有一个事务被回滚，另一个事务在锁释放后会继续执行。"
+        },
+        {
+          "id": "deadlock-diagnosis-1-q6",
+          "question": "以下 Java 代码在多线程并发调用时，为什么会导致死锁？",
+          "choices": [
+            {"id": "A", "text": "createOrder 和 cancelOrder 两个方法以相反的顺序获取 lockA 和 lockB，形成循环等待"},
+            {"id": "B", "text": "两个方法都使用了 synchronized 关键字，synchronized 本身不支持可重入，会导致自锁"},
+            {"id": "C", "text": "lockA 和 lockB 是实例变量，多线程共享同一个 OrderService 实例时会发生并发问题"},
+            {"id": "D", "text": "嵌套的 synchronized 块是不允许的，编译器会报错"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是经典的「锁顺序反转」死锁模式。`createOrder` 先锁 `lockA` 再锁 `lockB`，`cancelOrder` 先锁 `lockB` 再锁 `lockA`。当线程 T1 执行 `createOrder` 持有 `lockA` 并等待 `lockB`，同时线程 T2 执行 `cancelOrder` 持有 `lockB` 并等待 `lockA`，就形成了循环等待。`synchronized` 是完全支持可重入的（同一线程重复进入自己持有锁的方法不会阻塞），嵌套 `synchronized` 也是合法的语法。实例变量共享确实会带来并发问题，但那是数据竞争，不是死锁；死锁的本质是锁获取顺序不一致。修复方法是统一所有代码路径的锁获取顺序。"
+        },
+        {
+          "id": "deadlock-diagnosis-1-q7",
+          "question": "以下哪种做法能有效预防分布式死锁，同时也是微服务架构的推荐实践？",
+          "choices": [
+            {"id": "A", "text": "将同步的环形调用改为消息队列驱动的单向事件流，服务 A 发布事件，服务 B 消费并异步处理"},
+            {"id": "B", "text": "给所有 Feign 客户端设置更长的超时时间（比如 120 秒），给事务更多时间完成"},
+            {"id": "C", "text": "将所有服务合并成一个单体应用，消除服务间调用"},
+            {"id": "D", "text": "增加数据库连接池大小，让更多事务可以并发执行"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "分布式死锁的根因是服务之间的循环依赖：A 等 B、B 等 A。消息队列（如 Kafka）将同步调用解耦为异步事件流，A 在完成本地事务后发布事件，B 消费事件后独立处理，整条链路变成单向的数据流，从架构层面消除了循环等待的可能性。加长超时时间只是推迟了超时报错，不能解决死锁，反而会让连接线程池更快耗尽；合并成单体可以消除分布式死锁，但牺牲了可伸缩性，而且 JVM 内死锁依然存在；增加连接池只是让更多事务同时运行，在死锁场景下只会让争抢更激烈，加速问题暴露而不是解决问题。"
+        },
+        {
+          "id": "deadlock-diagnosis-1-q8",
+          "question": "在 Spring Boot 应用中，以下哪种写法更容易导致数据库死锁，原因是什么？",
+          "choices": [
+            {"id": "A", "text": "`@Transactional` 方法内部调用了 Feign 远程接口，HTTP 调用期间数据库行锁持续占用"},
+            {"id": "B", "text": "在 Service 类上而不是方法上标注 `@Transactional`"},
+            {"id": "C", "text": "同一个 Service 类中的方法互相调用，导致事务传播失效"},
+            {"id": "D", "text": "使用 `@Transactional(readOnly = true)` 执行了一条 UPDATE 语句"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是生产环境中最高频的死锁诱因之一。`@Transactional` 方法在整个方法执行期间都持有数据库连接和行锁，如果方法内部发起了 Feign（或任何 HTTP）调用，整个 HTTP 请求-响应周期（可能数百毫秒，也可能因为对方服务压力大而超时）都会占着数据库行锁。当两个服务互相调用时，就会形成分布式死锁。正确的模式是先完成本地事务（`TransactionTemplate.execute()` 或将远程调用挪到 `@Transactional` 方法之外），事务提交后再发起远程调用。在 Service 类上标注 `@Transactional` 会给所有 public 方法加事务，可能导致意料之外的长事务，但不直接造成死锁；事务传播失效是 Spring AOP 代理问题，是另一个问题；`readOnly = true` 下执行写操作会在提交时报错，不是死锁。"
+        },
+        {
+          "id": "deadlock-diagnosis-1-q9",
+          "question": "使用 Redis 分布式锁时，以下哪种写法存在死锁风险？",
+          "choices": [
+            {"id": "A", "text": "`SET lock_key value NX`，没有设置过期时间，持有锁的进程崩溃后锁永远不会释放"},
+            {"id": "B", "text": "`SET lock_key value NX EX 30`，原子性地设置锁值和 30 秒过期时间"},
+            {"id": "C", "text": "使用 Redisson 的 `RLock.lock()` 并依赖 Watchdog 自动续期"},
+            {"id": "D", "text": "`SET lock_key value NX PX 30000`，使用毫秒级过期时间"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis 分布式锁必须同时设置锁的过期时间（TTL）。`SET key value NX` 只加锁但不设置过期，一旦持有锁的进程在释放锁之前崩溃（比如 JVM OOM、机器断电），该锁就会永久存在于 Redis 中，所有后续争抢该锁的进程都会一直等待——这是一种死锁。`SET key value NX EX 30` 是原子操作，同时设置锁和 TTL，是正确写法；分成两步（先 SET NX 再 EXPIRE）则会有竞态条件，也不安全。Redisson 的 Watchdog 机制在持有锁的线程存活期间每 10 秒续期一次，TTL 默认 30 秒，是生产级的分布式锁实现。`PX` 参数指定毫秒级 TTL，和 `EX`（秒级）效果相同，也是安全的。"
+        },
+        {
+          "id": "deadlock-diagnosis-1-q10",
+          "question": "以下关于死锁、活锁和饥饿的描述，哪一项是正确的？",
+          "choices": [
+            {"id": "A", "text": "死锁是所有相关线程永远阻塞无法推进；活锁是线程一直在执行但彼此互相谦让导致实际上无法推进；饥饿是某个线程因长期得不到资源而无法执行"},
+            {"id": "B", "text": "活锁和死锁本质相同，都会导致线程永久阻塞"},
+            {"id": "C", "text": "饥饿是死锁的一种特殊情况，发生在只有一个资源竞争者时"},
+            {"id": "D", "text": "活锁只发生在多进程系统中，不会发生在多线程应用里"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "三种活性问题需要明确区分。死锁（Deadlock）：参与的线程全部进入阻塞状态，没有任何一个能推进，`jstack` 里线程状态是 `BLOCKED` 或 `WAITING`，CPU 使用率接近零。活锁（Livelock）：线程一直处于运行状态，CPU 有消耗，但因为反复互相「礼让」（比如两个事务检测到冲突后同时回退重试，然后再次同时重试冲突），实际上没有任何进展；典型场景是设计不当的冲突重试逻辑，加随机抖动（jitter）可以有效解决。饥饿（Starvation）：某个低优先级线程一直在等待，但等待的资源不断被高优先级线程抢走，理论上有推进的可能但实际上长期被饿到；使用公平锁（`new ReentrantLock(true)`）可以缓解饥饿。活锁确实可以在多线程应用中发生，不局限于多进程。"
+        }
+      ],
+      "references": [
+        "https://docs.oracle.com/en/java/javase/17/troubleshoot/troubleshooting-hanging-or-looping-processes.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-deadlocks.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/show-engine.html",
+        "https://redis.io/docs/manual/patterns/distributed-locks/",
+        "https://redisson.org/glossary/java-lock.html"
+      ]
+    }
+  ]
+}

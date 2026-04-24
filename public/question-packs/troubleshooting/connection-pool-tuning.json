@@ -1,0 +1,157 @@
+{
+  "id": "connection-pool-tuning",
+  "name": "数据库连接池参数调优",
+  "domain": "troubleshooting",
+  "description": "数据库连接池耗尽时的排查方法、核心参数含义与调优策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "connection-pool-tuning-1",
+      "domain": "troubleshooting",
+      "type": "tuning",
+      "difficulty": 2,
+      "tags": ["connection-pool", "database", "hikaricp", "java", "performance"],
+      "title": "高峰期数据库连接池耗尽，如何调优连接池参数？连接池大小设多少合适？",
+      "content": "你接到告警：线上 Java 服务在每天早上 9 点到 10 点的业务高峰期，频繁出现以下错误：\n\n```\ncom.zaxxer.hikari.pool.HikariPool$PoolInitializationException:\n  Failed to obtain connection from pool within 30000ms\nCaused by: java.sql.SQLTransientConnectionException:\n  HikariPool-1 - Connection is not available, request timed out after 30007ms\n```\n\n服务是一套 Spring Boot 微服务，部署在 Kubernetes 上，每个服务有 4 个 Pod，每个 Pod 分配了 4 核 CPU。数据库是 PostgreSQL 14，`max_connections = 200`。\n\n当前 HikariCP 配置如下：\n\n```yaml\nspring:\n  datasource:\n    hikari:\n      maximum-pool-size: 10\n      minimum-idle: 10\n      connection-timeout: 30000\n      idle-timeout: 600000\n      max-lifetime: 1800000\n```\n\n你登录 Grafana，看到 HikariCP 的监控指标在高峰期呈现以下状态：\n\n```\nhikaricp_pending_threads    →  最高 47\nhikaricp_active_connections →  10（持续满载）\nhikaricp_idle_connections   →  0\nhikaricp_connection_acquire_ms_p99 → 28000ms（接近超时阈值）\n```\n\n此时你会怎么分析这个问题？`maximum-pool-size` 直接调大到 100 能解决问题吗？正确的调优思路是什么？",
+      "answer": "## 连接池是什么，为什么需要它\n\n在理解如何调优之前，要先搞清楚连接池到底在解决什么问题。每次应用程序与数据库建立连接，底层都要完成一次 TCP 三次握手，PostgreSQL 还需要为这个连接 fork 一个独立的后端进程（是真的 fork，不是线程）。这个过程在局域网内通常需要 1-5ms，听起来不多，但如果你的服务每秒处理 1000 个请求，每个请求都要新建连接，光建连就要花掉 1-5 秒的 CPU 时间，这显然是不可接受的。\n\n连接池的核心思路很简单：预先建立一批 TCP 连接放在池子里，请求来了直接「借」一条连接用，用完「还」回去。这样就把每次请求的连接建立开销从 O(请求数) 降到了 O(1)——只在服务启动时建连一次。HikariCP 是 Java 生态里公认最快的连接池实现，它的核心优势在于用 ConcurrentBag（一个专门为连接池设计的无锁数据结构）代替传统的阻塞队列，在高并发场景下锁竞争极小。\n\nHikariCP 的几个核心参数：`minimumIdle` 控制池中维持的最少空闲连接数，`maximumPoolSize` 是池中最大连接数（包括活跃和空闲），`connectionTimeout` 是线程等待获取连接的最长时间（超过则抛异常），`idleTimeout` 是空闲连接超过这个时间会被回收，`maxLifetime` 是一条连接的最长存活时间（防止数据库侧踢掉旧连接）。\n\n## 先诊断：瓶颈在池大小还是数据库处理能力\n\n遇到「Connection pool exhausted」，很多工程师的第一反应是「调大 maximum-pool-size」。这个操作有时有效，有时反而让情况更糟。在动手改参数之前，需要先回答一个关键问题：**请求积压是因为池子太小，还是因为数据库处理请求太慢、连接被长时间占用？**\n\n区分这两种情况很重要。如果是池子太小，增大 `maximumPoolSize` 确实能立竿见影。但如果是数据库处理慢（比如存在慢查询、锁等待、I/O 饱和），那么增大连接池只是让更多请求同时打到数据库，反而会让数据库更拥堵，进入「更多连接 → 更多竞争 → 更慢 → 需要更多连接」的死循环。\n\n看题目中的监控数据，`hikaricp_active_connections` 持续维持在 10（也就是 `maximumPoolSize` 的上限），`hikaricp_pending_threads` 最高达到 47。这说明连接被占用的时间相当长，至少在高峰期 10 条连接同时被长时间持有。下一步要看的是这些连接在做什么：\n\n```sql\n-- 在 PostgreSQL 上执行，查看当前活跃连接正在跑什么\nSELECT pid, usename, application_name, state, query_start,\n       now() - query_start AS duration, query\nFROM pg_stat_activity\nWHERE state != 'idle'\nORDER BY duration DESC;\n```\n\n如果输出里有大量 `state = 'active'` 的连接，query 是普通的业务查询，duration 在几十到几百毫秒，那说明是正常的业务负载，连接池确实太小了。如果 duration 动辄几秒甚至几十秒，或者看到 `state = 'idle in transaction'`，那说明有慢查询或事务泄漏，这时候先别急着调连接池，先解决查询问题。\n\n## 连接池大小的计算公式\n\n假设确认是正常业务负载导致连接池不够用，那 `maximumPoolSize` 应该设多少？HikariCP 的作者 Brett Wooldridge 在官方 Wiki 里给出了一个反直觉的结论：**数据库连接池不是越大越好，大多数情况下一个较小的连接池配合请求队列的效果优于一个超大的连接池。**\n\n他推荐的公式是：\n\n```\nconnections = (core_count × 2) + effective_spindle_count\n```\n\n其中 `core_count` 是数据库服务器的 CPU 核心数，`effective_spindle_count` 是磁盘主轴数（对于 SSD 通常取 1，对于机械磁盘 RAID 阵列则取实际主轴数）。这个公式背后的道理是：数据库处理一个查询时，大部分时间要么在做 CPU 计算，要么在等 I/O。当一个连接在等 I/O 时，CPU 可以切换去处理另一个连接的 CPU 计算阶段。`×2` 就是考虑了这种 CPU-I/O 交叠。\n\n举个具体例子：数据库服务器是 8 核 CPU，SSD 存储，那么理想的连接数约为 `8 × 2 + 1 = 17`。这个数字会让很多人觉得不可思议——只有 17 条连接？但实际测试表明，17 条连接在 8 核数据库上的吞吐量，往往高于 100 条连接，因为 100 条连接会在数据库侧产生大量的上下文切换和锁竞争开销。\n\n回到题目的场景：4 个微服务 Pod，数据库是 `max_connections = 200`。需要注意的是，`maximumPoolSize` 是「单个 Pod 的连接池大小」，所有 Pod 的总连接数是 `maximumPoolSize × Pod数量`。当前配置是 `10 × 4 = 40` 条总连接，而 `max_connections = 200`，看起来还有余量。但问题是，随着 K8s 扩容，Pod 数量可能从 4 个变成 10 个、20 个，`maximumPoolSize × Pod数量` 就可能突破 200 这条红线，导致新连接被拒绝。\n\n**正确的计算方式应该是：先确定数据库能支撑多少连接，减去其他服务和管理工具占用的连接数，再除以最大 Pod 数量，得出单个 Pod 的 `maximumPoolSize` 上限。** 比如数据库保留 20 条给 pg_admin 等工具，剩余 180 条，按最大 10 个 Pod 算，每个 Pod 上限是 18 条，可以设 `maximumPoolSize: 15` 留一点余量。\n\n对于题目的场景，推荐的配置调整如下：\n\n```yaml\nspring:\n  datasource:\n    hikari:\n      # 单个 Pod 连接数，× 4 Pod = 60 总连接，在 200 限制内有余量\n      maximum-pool-size: 15\n      # 空闲连接数设低一些，减少数据库侧的空闲连接开销\n      minimum-idle: 5\n      # 超时时间稍微缩短，快速失败而不是让请求积压 30s\n      connection-timeout: 10000\n      # 空闲连接 10 分钟回收\n      idle-timeout: 600000\n      # 连接最长存活 30 分钟，避免被数据库侧超时断开\n      max-lifetime: 1800000\n      # 连接泄漏检测：超过 5s 还没归还则打印警告日志\n      leak-detection-threshold: 5000\n```\n\n## 连接泄漏检测：leakDetectionThreshold\n\n`leakDetectionThreshold` 是一个容易被忽视但非常有价值的参数。它的作用是：如果一条连接被借出去后，超过这个时间（单位毫秒）还没有被归还，HikariCP 会在日志里打印一条警告，并附上这条连接被借出时的完整堆栈。这对于排查「连接泄漏」（比如代码里忘了关闭 ResultSet 导致连接没有归还）极为有用。\n\n```\nWARN  com.zaxxer.hikari.pool.ProxyLeakTask - Connection leak detection triggered\nfor com.mysql.cj.jdbc.ConnectionImpl@1b6d3586 on thread http-nio-8080-exec-3,\nstack trace follows\njava.lang.Exception: Apparent connection leak detected\n    at com.example.service.UserService.getUserById(UserService.java:47)\n    at com.example.controller.UserController.getUser(UserController.java:31)\n    ...\n```\n\n看到这条日志，直接定位到 `UserService.java:47`，十有八九是那行代码里 Connection 或 Statement 没有在 finally 块里关闭，或者没有用 try-with-resources。这比你在 10 万行代码里盲目排查要高效得多。\n\n## 扩展：PgBouncer、微服务乘积效应与 K8s 下的连接管理\n\n当微服务实例数增多时，会出现一个「乘积效应」问题：假设有 10 个不同的微服务，每个服务最多 20 个 Pod，每个 Pod 的连接池大小是 10，那么这个数据库最多会同时承受 `10 × 20 × 10 = 2000` 条连接。大多数数据库的 `max_connections` 默认值是 100-300，根本撑不住。\n\n这时候需要引入连接池中间件。**PgBouncer** 是 PostgreSQL 生态里最常用的方案，它部署在应用和数据库之间，所有微服务都连接 PgBouncer，PgBouncer 再维护一个指向真实数据库的连接池。它支持三种模式：Session Mode（连接独占到会话结束，兼容性最好）、Transaction Mode（事务结束即归还，连接复用率最高，推荐）、Statement Mode（每条 SQL 后归还，限制最多但基本不用）。在 Transaction Mode 下，PgBouncer 可以用 100 条真实数据库连接支撑 1000 个应用连接，大幅降低数据库的连接压力。\n\n**MySQL 生态里对应的是 ProxySQL**，它除了连接池功能外，还支持读写分离路由——写操作自动路由到主库，读操作路由到从库，在应用层完全透明。配置读写分离的连接池时，需要为读操作和写操作分别配置 DataSource，避免把大量只读查询也打到主库。\n\nK8s 环境下还有一个特殊的挑战：HPA（Horizontal Pod Autoscaler）会根据 CPU 或自定义指标自动扩缩容。当负载突然飙升，HPA 在几十秒内从 4 个 Pod 扩到 16 个 Pod，新 Pod 启动时会立即尝试建立 `minimumIdle` 个数据库连接。如果 `minimumIdle = 10`，16 个 Pod 同时启动就会瞬间申请 160 条新连接，可能直接打爆数据库的 `max_connections`。因此在 K8s 环境下，**强烈建议把 `minimumIdle` 设得比 `maximumPoolSize` 小很多**，甚至可以设为 1-2，让连接池按需建连而不是提前预建大量连接。同时要在 `maximumPoolSize × 最大Pod数` 与 `数据库max_connections` 之间保持至少 20% 的余量作为缓冲。\n\n最后说一个关于 `testOnBorrow` 的坑。某些老版本的连接池（比如 DBCP、C3P0）支持 `testOnBorrow`，每次从池中取出连接时先发一条 `SELECT 1` 验证连接是否有效。这个功能听起来很安全，但代价是每次取连接都要多一次网络往返，QPS 高的情况下这个开销相当可观。HikariCP 的设计哲学是：不做 `testOnBorrow`，而是通过 `keepaliveTime`（默认 0，即关闭，可设为 30000ms）定期发送 keepalive 包维持连接活性。只要 `maxLifetime` 设置合理（通常比数据库的 `wait_timeout` 短 30-60 秒），绝大多数「获取到失效连接」的情况都可以避免，而且连接活性是后台线程异步维护的，不影响请求路径的延迟。",
+      "keyPoints": [
+        "连接池的核心价值是复用 TCP 连接，避免每次请求都经历 TCP 握手和数据库 fork 进程的开销，HikariCP 使用 ConcurrentBag 无锁数据结构实现极低的获取延迟。",
+        "遇到连接池耗尽告警，第一步不是调大 maximumPoolSize，而是用 pg_stat_activity 查看活跃连接的 duration 和 query，判断瓶颈在池子太小还是慢查询/事务泄漏占用连接过久。",
+        "HikariCP 官方推荐连接池大小公式为 (core_count × 2) + effective_spindle_count，这个公式考虑了 CPU-I/O 交叠，连接数过多反而会加剧数据库侧的上下文切换和锁竞争开销。",
+        "微服务架构下连接数存在乘积效应：总连接数 = maximumPoolSize × Pod数量 × 服务数量，必须确保这个乘积不超过数据库的 max_connections，K8s 扩容时尤其需要预留余量。",
+        "leakDetectionThreshold 参数能在连接被借出超过指定时间后打印持有连接的完整堆栈，是排查连接泄漏（未关闭 Connection/ResultSet）最直接的手段。",
+        "K8s 环境下应将 minimumIdle 设置远小于 maximumPoolSize，防止 HPA 触发批量扩容时新 Pod 同时预建大量连接而瞬间打爆数据库的 max_connections 限制。",
+        "PgBouncer 以 Transaction Mode 运行时可用少量真实数据库连接支撑大量应用连接，是微服务实例数较多时解决连接乘积效应的标准方案；ProxySQL 在 MySQL 生态中同时提供连接池和读写分离路由能力。",
+        "HikariCP 不推荐使用 testOnBorrow 式的连接校验，而是通过合理设置 maxLifetime（比数据库 wait_timeout 短 30-60 秒）和 keepaliveTime 来异步维持连接活性，避免影响请求路径延迟。"
+      ],
+      "quiz": [
+        {
+          "id": "connection-pool-tuning-1-q1",
+          "question": "HikariCP 中 `maximum-pool-size: 10` 表示什么含义？",
+          "choices": [
+            {"id": "A", "text": "池中最多允许 10 条空闲连接，活跃连接不受限制"},
+            {"id": "B", "text": "池中同时存在的活跃连接与空闲连接总数上限为 10"},
+            {"id": "C", "text": "每秒最多从池中借出 10 条连接"},
+            {"id": "D", "text": "应用启动时预建 10 条连接，之后不再增加"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "maximumPoolSize 是连接池的总容量上限，包含当前被应用使用中的活跃连接（active）和闲置在池中等待使用的空闲连接（idle）之和。A 选项混淆了 maximumPoolSize 和 minimumIdle 的含义；minimumIdle 才是控制最少维持多少空闲连接的参数。C 选项描述的是吞吐量概念，与连接池大小无关。D 选项描述的是 minimumIdle 等于 maximumPoolSize 时的启动行为，但连接池在需要时会动态增长到上限，并非启动后固定不变。"
+        },
+        {
+          "id": "connection-pool-tuning-1-q2",
+          "question": "当 `hikaricp_pending_threads` 持续大于 0 时，最可能说明什么？",
+          "choices": [
+            {"id": "A", "text": "数据库服务器的 CPU 使用率过高"},
+            {"id": "B", "text": "有业务线程在等待从连接池中获取连接，连接池已满载"},
+            {"id": "C", "text": "HikariCP 正在销毁过期的空闲连接"},
+            {"id": "D", "text": "连接池中有连接正在执行数据库迁移脚本"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "hikaricp_pending_threads 指标统计的是正在阻塞等待连接池释放一条可用连接的应用线程数量。当所有连接都被占用（active_connections = maximum-pool-size）时，新来的请求线程就会进入等待队列，pending_threads 随之上升。该值持续大于 0 是连接池出现瓶颈的明确信号。A 选项是数据库侧的问题，从 HikariCP 监控无法直接反映；C 选项对应的是 idle_connections 下降，不会引起 pending_threads 上升；D 选项与 pending_threads 指标无关。"
+        },
+        {
+          "id": "connection-pool-tuning-1-q3",
+          "question": "HikariCP 官方推荐的连接池大小计算公式中，`effective_spindle_count` 对于纯 SSD 存储的数据库服务器应取什么值？",
+          "choices": [
+            {"id": "A", "text": "取 SSD 的数量，比如 4 块 SSD 就取 4"},
+            {"id": "B", "text": "取 0，因为 SSD 没有物理主轴"},
+            {"id": "C", "text": "取 1"},
+            {"id": "D", "text": "取 CPU 核心数的一半"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "effective_spindle_count 这个概念源自机械磁盘的「主轴」，代表存储子系统的并行 I/O 能力。机械磁盘 RAID 阵列有多少主轴就取多少，因为每根主轴可以并行处理一个 I/O 请求。SSD 虽然没有物理主轴，但 HikariCP 文档建议将其视为 1，因为 SSD 的 I/O 延迟极低，并发 I/O 能力对公式影响不大，取 1 是一个合理的保守估计。取 0 会使公式退化为 core_count × 2，忽略了磁盘 I/O 的影响；取 SSD 数量会过高估计磁盘并行能力，导致建议连接数偏大。"
+        },
+        {
+          "id": "connection-pool-tuning-1-q4",
+          "question": "在 PostgreSQL 中，每个数据库连接底层会产生什么操作？这与 MySQL 有何不同？",
+          "choices": [
+            {"id": "A", "text": "PostgreSQL 和 MySQL 都为每个连接创建一个操作系统线程"},
+            {"id": "B", "text": "PostgreSQL 为每个连接 fork 一个独立进程，MySQL 为每个连接创建一个线程"},
+            {"id": "C", "text": "PostgreSQL 使用异步 I/O 处理所有连接，不需要 fork 进程"},
+            {"id": "D", "text": "PostgreSQL 和 MySQL 都使用线程池，连接数不等于线程数"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PostgreSQL 采用进程模型（process-per-connection），每个新连接都会触发操作系统的 fork() 系统调用，产生一个独立的 postgres 后端进程。进程间内存隔离，上下文切换开销比线程大。这也是 PostgreSQL 比 MySQL 更需要连接池中间件（如 PgBouncer）的原因之一：当连接数很多时，PostgreSQL 的进程数量膨胀会消耗大量内存和 CPU。MySQL 采用线程模型（thread-per-connection），线程比进程轻量，但同样不推荐无限制地增加连接数。理解这个区别有助于解释为什么 PostgreSQL 的 max_connections 通常设置得远比 MySQL 保守。"
+        },
+        {
+          "id": "connection-pool-tuning-1-q5",
+          "question": "观察以下 PostgreSQL 监控输出，最可能的问题原因是什么？\n\n```\npg_stat_activity 中有 8 条连接满足以下条件：\n  state = 'idle in transaction'\n  duration > 45s\n  query = 'UPDATE orders SET status=... WHERE id=...'\n```",
+          "choices": [
+            {"id": "A", "text": "数据库磁盘 I/O 饱和，UPDATE 语句写入速度过慢"},
+            {"id": "B", "text": "应用代码开启了事务但未及时提交或回滚，连接被长时间占用"},
+            {"id": "C", "text": "PostgreSQL 的 autovacuum 进程与这些事务发生了锁竞争"},
+            {"id": "D", "text": "maximumPoolSize 设置过小导致这些查询在排队等待连接"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "state = 'idle in transaction' 表示这条连接当前处于一个已开启但尚未结束的事务中，暂时没有在执行 SQL，但也没有提交或回滚。duration > 45s 说明这个事务已经开着超过 45 秒了。这几乎肯定是应用代码的问题：最常见的场景是在事务中调用了一个耗时的外部服务（HTTP 请求、RPC 调用），或者代码逻辑分支漏掉了 commit/rollback，导致事务「挂」在那里。这些连接虽然是 idle 状态，但持有数据库行锁，会阻塞其他事务。这种情况下加大连接池只会让问题更严重，应该用 leakDetectionThreshold 或 pg_stat_activity 的 idle_in_transaction_session_timeout 参数来强制终止长时间挂起的事务。"
+        },
+        {
+          "id": "connection-pool-tuning-1-q6",
+          "question": "以下哪种做法会导致 K8s 扩容时瞬间耗尽数据库连接数？",
+          "choices": [
+            {"id": "A", "text": "将 minimumIdle 设置为 1，maximumPoolSize 设置为 15"},
+            {"id": "B", "text": "将 minimumIdle 和 maximumPoolSize 都设置为 15，HPA 触发扩容从 4 Pod 变为 16 Pod"},
+            {"id": "C", "text": "将 connectionTimeout 设置为 5000ms 而不是默认的 30000ms"},
+            {"id": "D", "text": "将 maxLifetime 设置为 1800000ms（30 分钟）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "当 minimumIdle 等于 maximumPoolSize 时，每个 Pod 启动后会立即尝试建立 minimumIdle 数量的数据库连接，以维持「最少空闲连接数」这个约束。HPA 触发扩容从 4 Pod 变为 16 Pod，12 个新 Pod 同时启动，每个 Pod 立刻请求 15 条连接，总计瞬间新增 180 条连接请求。如果数据库 max_connections = 200，加上原有的 4 × 15 = 60 条，总需求 240 条，已超出数据库限制，新连接会直接被拒绝。正确做法是把 minimumIdle 设为较小的值（如 2-5），让连接按需建立，避免批量扩容时的连接洪峰。A 选项就是推荐的做法；C、D 选项与扩容时的连接数问题无关。"
+        },
+        {
+          "id": "connection-pool-tuning-1-q7",
+          "question": "PgBouncer 的 Transaction Mode 与 Session Mode 相比，主要优势和限制各是什么？",
+          "choices": [
+            {"id": "A", "text": "Transaction Mode 更快，且完全兼容所有 PostgreSQL 特性"},
+            {"id": "B", "text": "Transaction Mode 连接复用率更高，但不支持 SET 命令设置会话级变量和 LISTEN/NOTIFY"},
+            {"id": "C", "text": "Session Mode 性能更好，Transaction Mode 只适合读操作"},
+            {"id": "D", "text": "Transaction Mode 要求应用必须使用连接池，不能直接使用 JDBC"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PgBouncer Transaction Mode 的核心优势是：每次事务结束后连接立即归还给 PgBouncer 的内部池，下一个事务可以使用任意一条可用的真实数据库连接，而不是绑定到同一条。这意味着 100 条真实数据库连接可以服务远超 100 个并发应用连接，连接复用率极高。代价是：应用不能依赖连接级别的状态，例如通过 SET search_path 设置 schema 变量后，下一个事务可能使用不同的连接，SET 的效果消失了。LISTEN/NOTIFY 机制也不兼容，因为它需要连接在整个监听生命周期内保持固定。使用 Transaction Mode 前必须仔细审查应用是否依赖这些会话级特性。"
+        },
+        {
+          "id": "connection-pool-tuning-1-q8",
+          "question": "某 Java 服务的 HikariCP 配置为 `maximumPoolSize=20`，数据库服务器是 4 核 CPU + SSD。按照 HikariCP 推荐公式，这个连接池大小设置是否合理？",
+          "choices": [
+            {"id": "A", "text": "合理，20 条连接能保证高并发时有足够的连接可用"},
+            {"id": "B", "text": "偏大，推荐值约为 9（4×2+1），过多连接会加剧数据库侧竞争"},
+            {"id": "C", "text": "偏小，生产环境一般建议设置为 CPU 核数的 10 倍"},
+            {"id": "D", "text": "无法判断，连接池大小只取决于应用的 QPS，与 CPU 核数无关"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "按照 HikariCP 推荐公式：connections = (core_count × 2) + effective_spindle_count = (4 × 2) + 1 = 9。设置 20 条连接超出了数据库侧的最优并发处理能力。额外的连接不仅不能提升吞吐量，反而会导致更多的进程/线程上下文切换、锁等待和 CPU 缓存抖动。这个结论在 HikariCP 官方 Wiki 的 About-Pool-Sizing 文章中有详细的基准测试数据支撑：在某些场景下，把连接数从 100 降到 15，吞吐量反而提升了 35%，P99 延迟从 400ms 降到 8ms。当然，这个公式是针对数据库服务器本身的，如果数据库已经过 PgBouncer 等中间件，还需要结合实际情况调整。"
+        },
+        {
+          "id": "connection-pool-tuning-1-q9",
+          "question": "`leakDetectionThreshold` 设置为 5000ms 时，以下哪种情况会触发连接泄漏警告？",
+          "choices": [
+            {"id": "A", "text": "一条 SQL 查询执行时间超过 5000ms"},
+            {"id": "B", "text": "连接池中空闲超过 5000ms 的连接被 HikariCP 自动回收"},
+            {"id": "C", "text": "一条连接被借出后，持有时间超过 5000ms 仍未被归还给连接池"},
+            {"id": "D", "text": "应用线程等待获取连接的时间超过 5000ms"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "leakDetectionThreshold 监控的是「连接从池中借出到归还」这段时间的长度。如果一条连接被借出后超过阈值时间（这里是 5000ms）还没有调用 close() 归还给池，HikariCP 会打印一条 WARN 级别的日志，内容包含「Apparent connection leak detected」以及借出连接时的完整线程堆栈。注意这只是警告，连接并不会被强制回收。A 选项描述的是 queryTimeout 或 slow query 的概念；B 选项是 idleTimeout 的行为；D 选项是 connectionTimeout 超时时抛出异常的场景。leakDetectionThreshold 建议设置为业务正常处理时间的 2-3 倍，太短会误报，太长会让泄漏问题累积。"
+        },
+        {
+          "id": "connection-pool-tuning-1-q10",
+          "question": "一个使用 HikariCP 的 Spring Boot 服务，在压测时发现连接池耗尽但数据库 CPU 只有 15%，pg_stat_activity 显示大量连接 `state = 'active'`，每条连接的 duration 均在 200-500ms。最可能的根本原因和正确处理方式是什么？",
+          "choices": [
+            {"id": "A", "text": "数据库连接数设置过少，应将 max_connections 提高到 1000"},
+            {"id": "B", "text": "存在 N+1 查询问题，每个请求触发了大量串行 SQL，导致单次请求占用连接时间过长；应优化查询合并为 JOIN 或批量查询"},
+            {"id": "C", "text": "HikariCP 版本过旧，应升级到最新版本并开启 connectionInitSql 预热连接"},
+            {"id": "D", "text": "Spring Boot 的线程池太小，增大 server.tomcat.threads.max 即可"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "关键信息：数据库 CPU 只有 15%，说明数据库侧完全没有到达瓶颈；连接 duration 在 200-500ms，说明每条请求的数据库交互时间偏长；连接池耗尽说明大量请求同时长时间持有连接。这种组合最典型的场景就是 N+1 查询：比如查询一个列表返回 100 条数据，然后对每条数据再单独查询关联信息，触发 101 条 SQL。每条 SQL 单独执行很快，但串行叠加导致总时间 200-500ms，连接被长时间占用。解决方案是用 JOIN 或 IN 查询批量获取，或在 ORM 层（Hibernate/MyBatis）开启关联对象的批量加载。增大连接池只是治标，甚至会让数据库承受更多并发查询压力。"
+        }
+      ],
+      "references": [
+        "https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing",
+        "https://github.com/brettwooldridge/HikariCP/wiki/Pool-Analysis",
+        "https://www.pgbouncer.org/config.html",
+        "https://github.com/brettwooldridge/HikariCP#rocket-initialization"
+      ]
+    }
+  ]
+}
