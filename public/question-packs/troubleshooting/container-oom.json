@@ -1,0 +1,162 @@
+{
+  "id": "container-oom",
+  "name": "容器 OOMKilled 排查",
+  "domain": "troubleshooting",
+  "description": "排查 Kubernetes Pod OOMKilled 问题，理解 Java 进程内存构成与容器内存限制调优",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "container-oom-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["kubernetes", "oom", "java", "jvm", "container-memory"],
+      "title": "JVM 堆只设了 512MB 但 Pod 限制 1GB 还是 OOMKilled，为什么？如何排查？",
+      "content": "你是一名 SRE，某天收到告警：生产环境 Kubernetes 集群中一个 Java 微服务 Pod 每隔两三个小时就自动重启。你登录查看，发现 `kubectl describe pod <pod-name>` 输出中，上一次容器退出原因明确写着 `OOMKilled`，Exit Code 为 137。\n\n你找到对应的开发同学，他一脸困惑地说：「我明明在启动脚本里设了 `-Xmx512m`，堆内存只有 512MB，而 Pod 的 `resources.limits.memory` 配置的是 `1Gi`，有整整 1GB 的空间，按理说绰绰有余，怎么还会被 OOM Kill 掉？」\n\n该服务是一个基于 Spring Boot + Netty 构建的 RPC 服务，线上连接数较多，日志中偶尔能看到大量类被动态加载的记录（使用了 Groovy 脚本引擎做规则计算）。Pod 的资源配置如下：\n\n```yaml\nresources:\n  requests:\n    memory: \"512Mi\"\n  limits:\n    memory: \"1Gi\"\n```\n\nJVM 启动参数为：\n\n```\n-Xms256m -Xmx512m -server\n```\n\n请你作为 SRE 对此问题进行完整的排查与分析：为什么 `-Xmx512m` 的 JVM 进程实际占用内存会超过 1GB？应该如何一步步定位根因？最终如何通过调整 JVM 参数和容器资源配置解决这一问题？",
+      "answer": "## 一、基础概念：cgroups 内存限制与 JVM 内存的关系\n\nKubernetes 底层依赖 Linux cgroups 实现容器资源隔离。当你为 Pod 设置 `resources.limits.memory: 1Gi` 时，Kubernetes 会在该容器对应的 cgroup 中写入 `memory.limit_in_bytes = 1073741824`。Linux 内核会实时追踪该 cgroup 下所有进程的内存消耗，一旦总用量触及这个上限，内核的 OOM Killer 便会被触发，选择并杀死 cgroup 中占用内存最多的进程，这就是容器收到 `SIGKILL`（Exit Code 137）并以 `OOMKilled` 状态退出的根本原因。\n\n这里最关键也最容易被误解的一点是：**容器内存限制约束的是 JVM 进程的全部内存用量，而不只是 Java 堆**。`-Xmx512m` 只控制了 Java 对象堆（Heap）的上限，而 JVM 进程本身还会消耗大量堆以外的内存区域，这些区域加在一起完全可能把 1GB 的 limit 撑爆。\n\n---\n\n## 二、核心解答：Java 进程内存构成与排查步骤\n\n### Java 进程为何堆只有 512MB 但总内存可能超 1GB\n\nJVM 进程的实际内存由以下几个部分共同构成：\n\n**Java Heap（`-Xmx 512m`）**：这是 `new` 出来的 Java 对象的存放区域，受 `-Xmx` 硬性约束，不会超过 512MB，这部分开发同学的理解没有错。\n\n**Metaspace（方法区）**：存放类的元数据，包括类结构、方法字节码、常量池等。与 JDK 7 的 PermGen 不同，Metaspace 默认没有大小上限，使用的是本地内存（Native Memory）。该服务使用了 Groovy 脚本引擎，每次执行脚本都可能动态编译并加载新的 Class，若脚本实例未被复用，Metaspace 会持续增长，极端情况下单独消耗数百 MB。\n\n**Code Cache（JIT 编译缓存）**：JVM 的 JIT 编译器会将热点字节码编译成本地机器码并缓存，默认大小约为 240MB（JDK 8），同样属于 Native Memory。\n\n**线程栈**：每创建一个 Java 线程，JVM 就会分配一段栈空间，默认大小通常在 512KB 到 1MB 之间（取决于平台和 `-Xss` 设置）。该服务是基于 Netty 的 RPC 服务，线程池加上 Netty 的 worker 线程很容易达到 200-300 个线程，仅线程栈就可能消耗 150-300MB。\n\n**Direct Buffer（堆外内存）**：Netty 大量使用 `DirectByteBuffer` 直接在堆外分配内存，以避免数据在 JVM 堆与操作系统之间的拷贝。这部分内存完全不受 `-Xmx` 控制，`-XX:MaxDirectMemorySize` 默认值等于 `-Xmx`，即在本场景中还有额外的 512MB 堆外空间可以被消耗。\n\n**Native Memory（JNI、GC 内部结构）**：GC 算法的内部数据结构（如 G1 的 Remembered Set、Card Table），以及 JNI 调用所使用的内存，均属于 Native Memory。\n\n把这些部分粗略相加：512m（Heap） + 256m（Metaspace，Groovy 持续加载） + 200m（Code Cache） + 200m（线程栈，250 个线程） + 256m（Direct Buffer，Netty 默认值） ≈ 1.4GB，超过 1GB 的 limit 是完全可能发生的。\n\n### 排查步骤\n\n**第一步**：确认问题确为 OOMKilled，排除其他退出原因。\n\n```bash\nkubectl describe pod <pod-name> -n <namespace>\n# 关注 Last State 中的 Reason: OOMKilled 与 Exit Code: 137\n```\n\n**第二步**：通过 `kubectl top` 观察内存增长趋势，判断是稳定泄漏还是突发峰值。\n\n```bash\nkubectl top pod <pod-name> -n <namespace> --containers\n```\n\n**第三步**：在 Pod 重启前，进入容器内使用 `jcmd` 查看 JVM 各内存区域的实际占用，这是定位根因的核心手段。\n\n```bash\nkubectl exec -it <pod-name> -- jcmd 1 VM.native_memory summary\n```\n\n典型的 NMT 输出示例如下（需提前在 JVM 参数中加入 `-XX:NativeMemoryTracking=summary`）：\n\n```\nNative Memory Tracking:\n\nTotal: reserved=2,456,789KB, committed=1,124,456KB\n-                 Java Heap (reserved=524288KB, committed=524288KB)\n                            (mmap: reserved=524288KB, committed=524288KB)\n-                     Class (reserved=312,456KB, committed=198,234KB)   ← Metaspace 过大\n                            (classes #31,204)                           ← 3 万多个类！\n-                    Thread (reserved=204,800KB, committed=204,800KB)   ← 200 个线程\n                            (thread #200)\n-                      Code (reserved=245,760KB, committed=195,432KB)\n-                        GC (reserved=45,678KB, committed=45,678KB)\n-                  Internal (reserved=12,345KB, committed=12,345KB)\n-                    Symbol (reserved=32,456KB, committed=32,456KB)\n```\n\n从上面可以清晰看到：Class 区域（Metaspace）占用了接近 200MB，且加载了超过 3 万个类，这正是 Groovy 脚本引擎反复生成 Class 导致的。\n\n**第四步**：若怀疑有内存泄漏，使用 `jmap` 生成堆快照并用 MAT（Eclipse Memory Analyzer Tool）分析对象引用链，找出 GC Root 持有的大对象或异常增长的集合类。\n\n```bash\nkubectl exec -it <pod-name> -- jmap -dump:format=b,file=/tmp/heap.hprof 1\nkubectl cp <pod-name>:/tmp/heap.hprof ./heap.hprof\n```\n\n### 解决方案\n\n针对本场景，推荐的 JVM 参数配置如下：\n\n```\n-Xms512m\n-Xmx512m\n-XX:MetaspaceSize=128m\n-XX:MaxMetaspaceSize=256m\n-XX:ReservedCodeCacheSize=128m\n-XX:MaxDirectMemorySize=256m\n-XX:NativeMemoryTracking=summary\n-XX:+UseContainerSupport\n-XX:+PrintGCDetails\n```\n\n同时将 Pod 的 `limits.memory` 调整为 `2Gi`，`requests.memory` 调整为 `1Gi`，给 JVM 各非堆区域留出足够的空间：\n\n```yaml\nresources:\n  requests:\n    memory: \"1Gi\"\n  limits:\n    memory: \"2Gi\"\n```\n\n**`-XX:+UseContainerSupport`** 是 JDK 8u191 之后引入的关键参数，它让 JVM 能够感知 cgroup 内存限制，从而基于容器 limit 而不是宿主机总内存来动态计算默认的堆大小，避免 JVM 以为自己有几十 GB 可用而放开胃口。\n\n---\n\n## 三、扩展知识\n\n**cgroups v1 与 v2 的差异**：cgroups v1 下，`memory.limit_in_bytes` 只统计匿名内存和 swap，文件 Page Cache 可能不计入限制，导致观测到的内存使用与实际 limit 之间存在偏差。cgroups v2 统一了内存统计口径，`memory.current` 包含 Page Cache，行为更加一致和可预测。\n\n**CPU 核数感知**：与内存问题类似，JVM 默认会读取宿主机的 CPU 核数来决定 GC 线程数、JIT 编译线程数等，在核数较多的宿主机上运行的小容器会创建过多线程导致资源浪费甚至争抢。使用 `-XX:ActiveProcessorCount=N` 或依赖 `-XX:+UseContainerSupport` 可以让 JVM 正确感知容器的 CPU 配额。\n\n**Go 程序的内存问题**：Go 运行时有自己的内存管理，`GOGC` 环境变量（默认 100）控制 GC 触发阈值，设置过高会导致内存常驻过大。排查 Go 容器内存问题时，应开启 `pprof` 的 heap profile：`go tool pprof http://localhost:6060/debug/pprof/heap`，重点关注 `inuse_space` 指标。\n\n**VPA（Vertical Pod Autoscaler）**：在资源用量难以精确预估的场景下，可以部署 VPA，它会基于历史 metrics 自动推荐并（可选地）更新 Pod 的 `requests` 和 `limits`，减少人工调参的负担，但需要注意 VPA 更新 limits 时会触发 Pod 重建。",
+      "keyPoints": [
+        "容器内存限制由 Linux cgroups 的 `memory.limit_in_bytes` 实现，超出限制时内核 OOM Killer 会直接杀死进程，容器退出码为 137，这与 JVM 自身的内存管理完全无关。",
+        "`-Xmx` 只限制 Java 对象堆（Heap）的大小，JVM 进程的实际内存还包括 Metaspace、Code Cache、线程栈、Direct Buffer 和 Native Memory，这些堆外内存加在一起极易超过容器 limit。",
+        "Metaspace 默认没有上限，动态类加载场景（如 Groovy、动态代理、CGLIB）会导致 Metaspace 持续增长，必须通过 `-XX:MaxMetaspaceSize` 加以限制。",
+        "Netty 等 NIO 框架大量使用 `DirectByteBuffer`，其内存不受 `-Xmx` 约束，受 `-XX:MaxDirectMemorySize` 控制，该参数默认值等于 `-Xmx`，需要单独评估和限制。",
+        "排查 JVM 内存问题的核心工具是 `jcmd <pid> VM.native_memory summary`，它能按区域展示 JVM 各部分的内存预留与实际提交量，需在启动时加入 `-XX:NativeMemoryTracking=summary` 参数才能使用。",
+        "JDK 8u191 引入的 `-XX:+UseContainerSupport` 使 JVM 能够正确感知 cgroup 的内存和 CPU 限制，而不是读取宿主机总资源，是容器化 Java 应用的必备参数。",
+        "合理的容器 limit 应为 `-Xmx` 的 1.5 到 2 倍，并同时配置 `-XX:MaxMetaspaceSize`、`-XX:ReservedCodeCacheSize`、`-XX:MaxDirectMemorySize` 等参数，将 JVM 各内存区域全部纳入可控范围。"
+      ],
+      "quiz": [
+        {
+          "id": "container-oom-1-q1",
+          "type": "single",
+          "question": "Kubernetes 容器出现 OOMKilled 时，对应的进程退出码是多少？",
+          "options": ["1", "9", "137", "255"],
+          "answer": "137",
+          "explanation": "OOMKilled 意味着进程被内核 OOM Killer 以 SIGKILL（信号 9）强制终止。在 shell 中，被信号 N 杀死的进程退出码为 128 + N，因此 128 + 9 = 137。这个退出码是判断容器是否被 OOM Kill 的重要依据，在 `kubectl describe pod` 的 `Last State` 中可以看到 `Exit Code: 137` 与 `Reason: OOMKilled` 同时出现。"
+        },
+        {
+          "id": "container-oom-1-q2",
+          "type": "single",
+          "question": "Linux 内核通过哪个 cgroup 参数限制容器的内存使用上限？",
+          "options": [
+            "memory.usage_in_bytes",
+            "memory.limit_in_bytes",
+            "memory.max_usage_in_bytes",
+            "memory.soft_limit_in_bytes"
+          ],
+          "answer": "memory.limit_in_bytes",
+          "explanation": "`memory.limit_in_bytes` 是 cgroups v1 中设置内存硬限制的参数，Kubernetes 在创建容器时会将 `resources.limits.memory` 的值写入该文件。`memory.usage_in_bytes` 是只读的当前用量统计，`memory.soft_limit_in_bytes` 是软限制（不强制触发 OOM），`memory.max_usage_in_bytes` 记录历史峰值。在 cgroups v2 中对应参数改为 `memory.max`。"
+        },
+        {
+          "id": "container-oom-1-q3",
+          "type": "multiple",
+          "question": "以下哪些 JVM 内存区域不受 `-Xmx` 参数控制？（多选）",
+          "options": [
+            "Java Heap（对象堆）",
+            "Metaspace（元空间）",
+            "Direct Buffer（直接缓冲区）",
+            "Code Cache（JIT 编译缓存）"
+          ],
+          "answer": ["Metaspace（元空间）", "Direct Buffer（直接缓冲区）", "Code Cache（JIT 编译缓存）"],
+          "explanation": "`-Xmx` 只约束 Java 对象堆的最大大小。Metaspace 使用本地内存，由 `-XX:MaxMetaspaceSize` 控制；Direct Buffer 使用堆外内存，由 `-XX:MaxDirectMemorySize` 控制；Code Cache 存放 JIT 编译的本地机器码，由 `-XX:ReservedCodeCacheSize` 控制。这三者都属于 Native Memory，均计入容器的 cgroup 内存统计，是导致「堆小但容器 OOM」的核心原因。"
+        },
+        {
+          "id": "container-oom-1-q4",
+          "type": "single",
+          "question": "使用 `jcmd` 查看 JVM 各内存区域详细分布，需要在 JVM 启动时添加哪个参数？",
+          "options": [
+            "-XX:+PrintGCDetails",
+            "-XX:NativeMemoryTracking=summary",
+            "-XX:+HeapDumpOnOutOfMemoryError",
+            "-Xss512k"
+          ],
+          "answer": "-XX:NativeMemoryTracking=summary",
+          "explanation": "NMT（Native Memory Tracking）是 JVM 内置的内存追踪机制，需要在启动时通过 `-XX:NativeMemoryTracking=summary`（汇总模式）或 `-XX:NativeMemoryTracking=detail`（详细模式）开启。开启后，可以通过 `jcmd <pid> VM.native_memory summary` 命令查看 Heap、Class（Metaspace）、Thread、Code 等各区域的内存预留量与提交量。注意 NMT 本身会带来约 5-10% 的内存开销，生产环境建议使用 summary 模式。"
+        },
+        {
+          "id": "container-oom-1-q5",
+          "type": "single",
+          "question": "JDK 8u191 引入 `-XX:+UseContainerSupport` 的主要作用是什么？",
+          "options": [
+            "让 JVM 支持 Docker 镜像格式",
+            "让 JVM 基于 cgroup 限制而非宿主机总资源计算默认堆大小",
+            "自动限制 Metaspace 大小",
+            "开启容器内的 JMX 远程监控"
+          ],
+          "answer": "让 JVM 基于 cgroup 限制而非宿主机总资源计算默认堆大小",
+          "explanation": "在容器环境中，JVM 默认会读取 `/proc/meminfo` 获取宿主机总内存（例如 64GB），并基于此计算默认的 `-Xmx`（约为总内存的 1/4，即 16GB）。这远超容器的 limit，会导致 JVM 认为内存充裕而不触发 GC，最终被 OOM Kill。`-XX:+UseContainerSupport` 使 JVM 读取 cgroup 的 `memory.limit_in_bytes`，从而基于容器真实可用内存进行自适应配置。JDK 10+ 默认开启此参数。"
+        },
+        {
+          "id": "container-oom-1-q6",
+          "type": "single",
+          "question": "某容器中 Java 服务设置了 `-Xmx512m`，在连接数较高的 Netty 应用中，以下哪个内存区域最可能意外消耗大量内存？",
+          "options": [
+            "Eden 区",
+            "Old Gen（老年代）",
+            "Direct Buffer（堆外直接内存）",
+            "Survivor 区"
+          ],
+          "answer": "Direct Buffer（堆外直接内存）",
+          "explanation": "Netty 默认使用 `PooledDirectByteBuf` 在堆外分配内存，以避免数据拷贝提升 I/O 性能。这些 Direct Buffer 完全绕过 JVM 堆，直接通过 `sun.misc.Unsafe.allocateMemory` 分配操作系统内存。`-XX:MaxDirectMemorySize` 的默认值等于 `-Xmx`（本例为 512m），加上 Java 堆本身，两者相加就已达到 1GB limit。在高并发场景下 Direct Buffer 池增长，极易触发容器 OOM。"
+        },
+        {
+          "id": "container-oom-1-q7",
+          "type": "single",
+          "question": "排查容器内存问题时，`kubectl top pod` 显示的内存使用量对应 cgroup 的哪个指标？",
+          "options": [
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+            "memory.max_usage_in_bytes",
+            "memory.soft_limit_in_bytes"
+          ],
+          "answer": "memory.usage_in_bytes",
+          "explanation": "`kubectl top pod` 通过 metrics-server 采集数据，最终读取的是容器 cgroup 的 `memory.usage_in_bytes`，它反映的是该 cgroup 当前实际使用的内存量（包含匿名内存和文件 Page Cache）。这个值是动态变化的实时数据。`memory.max_usage_in_bytes` 记录的是历史峰值，也是排查问题时的重要参考，可以通过 `cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes` 在容器内直接查看。"
+        },
+        {
+          "id": "container-oom-1-q8",
+          "type": "single",
+          "question": "使用 Groovy 脚本引擎执行动态规则时，不加以控制最容易导致哪个 JVM 内存区域无限增长？",
+          "options": [
+            "Java Heap",
+            "Thread Stack",
+            "Metaspace",
+            "Code Cache"
+          ],
+          "answer": "Metaspace",
+          "explanation": "Groovy 脚本引擎每次编译执行一段脚本时，都会动态生成一个新的 Java Class 并加载到 JVM 中，这些 Class 的元数据存放在 Metaspace。如果每次请求都创建新的脚本实例而不复用，且旧的 ClassLoader 没有被 GC 回收，Metaspace 会持续增长直到耗尽 Native Memory。解决方案包括：设置 `-XX:MaxMetaspaceSize` 触发保护性 Full GC、复用已编译的脚本实例，或使用带缓存的 `GroovyClassLoader`。"
+        },
+        {
+          "id": "container-oom-1-q9",
+          "type": "single",
+          "question": "在 Kubernetes 中，VPA（Vertical Pod Autoscaler）的主要作用是什么？",
+          "options": [
+            "自动水平扩缩 Pod 副本数",
+            "自动调整 Pod 的 CPU 和内存 requests/limits",
+            "自动迁移 Pod 到资源充裕的节点",
+            "自动重启内存超限的容器"
+          ],
+          "answer": "自动调整 Pod 的 CPU 和内存 requests/limits",
+          "explanation": "VPA（Vertical Pod Autoscaler）通过分析 Pod 的历史资源使用数据，自动推荐或直接更新 `resources.requests` 和 `resources.limits` 的值，实现「纵向扩缩」。与 HPA（Horizontal Pod Autoscaler）通过增加副本数扩容不同，VPA 调整的是单个 Pod 的资源配额。使用 VPA 时需注意：在 `updateMode: Auto` 模式下，VPA 会驱逐并重建 Pod 来应用新的资源配置，可能造成短暂的服务中断，建议结合 PodDisruptionBudget 使用。"
+        },
+        {
+          "id": "container-oom-1-q10",
+          "type": "single",
+          "question": "以下哪组 JVM 参数配置最适合在 `-Xmx512m` 的容器化 Java 服务中避免 OOMKilled？",
+          "options": [
+            "-Xmx512m -XX:+UseG1GC",
+            "-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=128m -XX:MaxDirectMemorySize=256m -XX:+UseContainerSupport",
+            "-Xmx512m -Xms512m -XX:+PrintGCDetails",
+            "-Xmx512m -XX:+HeapDumpOnOutOfMemoryError -verbose:gc"
+          ],
+          "answer": "-Xmx512m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=128m -XX:MaxDirectMemorySize=256m -XX:+UseContainerSupport",
+          "explanation": "正确答案对 JVM 的四个主要内存区域都做了约束：`-Xmx512m` 限制堆、`-XX:MaxMetaspaceSize=256m` 限制元空间防止动态类加载撑大、`-XX:ReservedCodeCacheSize=128m` 限制 JIT 编译缓存、`-XX:MaxDirectMemorySize=256m` 限制堆外直接内存防止 Netty 等框架无限申请。同时 `-XX:+UseContainerSupport` 确保 JVM 基于 cgroup 限制而非宿主机内存运行。这四项参数合计约束了容器内 JVM 的全部主要内存来源，配合约 1.5GB 的 limit 可有效避免 OOMKilled。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+        "https://docs.oracle.com/en/java/javase/11/tools/jcmd.html",
+        "https://www.eclipse.org/mat/",
+        "https://docs.oracle.com/javase/8/docs/technotes/guides/troubleshoot/tooldescr007.html",
+        "https://kubernetes.io/docs/tasks/run-application/vertical-pod-autoscale/"
+      ]
+    }
+  ]
+}
