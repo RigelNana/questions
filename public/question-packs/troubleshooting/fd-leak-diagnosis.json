@@ -1,0 +1,156 @@
+{
+  "id": "fd-leak-diagnosis",
+  "name": "文件描述符泄漏的诊断与定位",
+  "domain": "troubleshooting",
+  "description": "生产环境出现 too many open files 错误时，系统性诊断文件描述符泄漏的工具与方法",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "fd-leak-diagnosis-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["fd", "file-descriptor", "lsof", "linux", "leak", "ulimit", "proc"],
+      "title": "服务运行几天后报 too many open files 错误，如何诊断是否存在文件描述符泄漏？",
+      "content": "## 故障背景\n\n你们团队维护着一个 Java 编写的 HTTP 数据聚合服务，部署在 4 台 CentOS 7 机器上，每台跑一个进程，日常 QPS 约 800，P99 延迟稳定在 30ms 左右。服务启动后头两天一切正常，但通常到第三天深夜，监控开始告警：部分请求返回 500，日志里出现了这样的错误：\n\n```\n2024-03-15 02:47:33 ERROR [http-nio-8080-exec-23] o.a.t.u.n.NioEndpoint - Socket accept failed\njava.io.IOException: Too many open files\n    at sun.nio.ch.ServerSocketChannelImpl.accept0(Native Method)\n    at sun.nio.ch.ServerSocketChannelImpl.accept(ServerSocketChannelImpl.java:422)\n    at sun.nio.ch.ServerSocketChannelImpl.accept(ServerSocketChannelImpl.java:250)\n    at org.apache.tomcat.util.net.NioEndpoint.serverSocketAccept(NioEndpoint.java:469)\n```\n\n重启服务后立刻恢复正常，但再过两三天又会复现。你的同事第一反应是「把 ulimit -n 调大一点不就行了」，但你隐约感觉这不是调参能解决的问题——服务不应该随着时间推移越用越多文件描述符。\n\n现在是凌晨三点，你 SSH 上了其中一台服务器，发现服务 PID 是 `18423`，运行已经 52 小时。你打算怎么确认是否真的存在文件描述符泄漏，并定位到泄漏的根源？\n\n## 已知环境信息\n\n- OS：CentOS 7.9，内核 3.10.0-1160\n- JDK：OpenJDK 11.0.18\n- 当前进程 ulimit -n（soft limit）：65535\n- 服务启动时 fd 数量（从监控历史可以看到）：约 300 个\n- 当前 fd 数量：运行 `ls /proc/18423/fd | wc -l` 结果为 61847\n- 服务每小时处理约 288 万次请求\n\n请描述你的完整排查思路，包括使用哪些命令、如何解读输出、以及如何定位到代码层面的泄漏位置。",
+      "answer": "## 文件描述符是什么，为什么它会「泄漏」\n\n在 Linux 内核中，文件描述符（file descriptor，简称 fd）是进程访问一切 I/O 资源的统一抽象。不只是磁盘上的文件——网络 socket、管道、设备节点、eventfd、timerfd 全都用 fd 来表示。内核为每个进程维护一张 fd 表，表里的每一行是一个整数索引（0、1、2 分别是标准输入、输出、错误），指向内核中的一个「打开文件描述」（open file description）结构体。每次调用 `open()`、`socket()`、`accept()` 等系统调用，内核就从这张表里分配一个新的整数，并填入对应的资源指针。调用 `close()` 时，内核回收这个整数，资源引用计数减一。\n\n「泄漏」的本质是：进程打开了资源，却从未调用 `close()`，导致 fd 表里的条目只增不减。fd 表是有上限的，这个上限就是 `ulimit -n` 显示的那个 soft limit（当前是 65535）。当进程持有的 fd 数量逼近这个上限时，任何需要新建 fd 的操作——accept 新连接、打开文件、创建 socket——都会收到 `EMFILE`（Too many open files）错误，这就是日志里那个 `IOException` 的来源。\n\n你同事说「把 ulimit 调大」从短期看确实能推迟崩溃，但治标不治本。如果真有泄漏，调大 ulimit 只是让服务多跑几天再崩。而且系统还有一个全局上限 `fs.file-max`（可以用 `cat /proc/sys/fs/file-max` 查看，通常是几百万），单个进程的 fd 数量无论如何也不应该爬到几万的量级。\n\n## 第一步：确认泄漏存在，观察增长趋势\n\n已知服务启动时 fd 数量约 300，运行 52 小时后已经到了 61847，这个数字本身就已经很可疑了。但「可疑」不等于「一定是泄漏」——某些服务在启动后确实会预热连接池，建立大量长连接，fd 数会先爬升后稳定。真正的泄漏特征是 **fd 数量单调递增，没有回落，增速与请求量正相关**。\n\n验证这一点最直接的方法是每隔 10 秒采样一次 fd 数量，看趋势：\n\n```bash\n# 每10秒打印一次当前fd数量，观察是否持续增长\nwatch -n 10 'ls /proc/18423/fd | wc -l'\n```\n\n如果每次采样都比上次多，而且没有明显的高峰低谷，基本可以确认是泄漏。为了更精确，可以结合请求量一起看：如果 fd 增长速度和 RPS 严格正相关（比如每处理 100 个请求就多 1 个 fd），泄漏就发生在请求处理路径上。\n\n此时查看 `/proc/18423/fd` 目录的内容，你会看到大量的符号链接：\n\n```\n$ ls -la /proc/18423/fd | head -20\nlr-x------ 1 app app 64 Mar 15 02:47 0 -> /dev/null\nlrwx------ 1 app app 64 Mar 15 02:47 1 -> /var/log/app/stdout.log\nlrwx------ 1 app app 64 Mar 15 02:47 2 -> /var/log/app/stderr.log\nlrwx------ 1 app app 64 Mar 15 02:47 3 -> socket:[34821076]\nlrwx------ 1 app app 64 Mar 15 02:47 4 -> socket:[34821077]\nlrwx------ 1 app app 64 Mar 15 02:47 5 -> anon_inode:[eventpoll]\nlrwx------ 1 app app 64 Mar 15 02:47 256 -> /data/config/app.properties\nlrwx------ 1 app app 64 Mar 15 02:47 257 -> /data/config/app.properties\nlrwx------ 1 app app 64 Mar 15 02:47 258 -> /data/config/app.properties\n...\n$ ls -la /proc/18423/fd | wc -l\n61849\n```\n\n注意这里有个细节：同一个文件 `/data/config/app.properties` 出现了几百次，fd 编号连续递增。这不是正常的配置文件读取——正常情况下读一次配置文件，`open()` 之后 `close()`，fd 就释放了。这里的重复出现说明每次读取都没有 `close()`。\n\n## 第二步：用 lsof 精确统计泄漏类型，缩小范围\n\n`/proc/18423/fd` 给了你 fd 的数量，但要分析「哪类资源泄漏最严重」，需要用 `lsof` 来解析。`lsof`（list open files）会显示每个 fd 对应的文件路径、类型、协议等详细信息：\n\n```bash\n# -p 指定PID，输出这个进程所有打开的fd\nlsof -p 18423\n```\n\n这个命令在 fd 数量六万的进程上可能需要几秒钟。输出格式大致如下：\n\n```\nCOMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF      NODE NAME\njava    18423  app  256r   REG              253,1     2048 134217831 /data/config/app.properties\njava    18423  app  257r   REG              253,1     2048 134217831 /data/config/app.properties\njava    18423  app  258r   REG              253,1     2048 134217831 /data/config/app.properties\njava    18423  app  512u  IPv4          34821312      0t0       TCP 10.0.1.23:52341->10.0.2.45:3306 (ESTABLISHED)\njava    18423  app  513u  IPv4          34821313      0t0       TCP 10.0.1.23:52342->10.0.2.45:3306 (ESTABLISHED)\n...\n```\n\n`TYPE` 列告诉你每个 fd 对应的资源类型：`REG` 是普通文件，`IPv4`/`IPv6` 是网络 socket，`FIFO` 是管道，`CHR` 是字符设备。要快速看清楚各类型的 fd 数量分布，用 awk 统计：\n\n```bash\n# 统计各TYPE的fd数量，找出哪类资源泄漏最严重\nlsof -p 18423 | awk 'NR>1 {print $5}' | sort | uniq -c | sort -rn\n```\n\n输出示例：\n\n```\n  54821 REG\n   6891 IPv4\n    127 CHR\n      4 IPv6\n      2 FIFO\n      1 DIR\n```\n\n`REG` 类型有 54821 个，远超正常值。再进一步看这些 `REG` 类型的 fd 都指向哪些文件：\n\n```bash\n# 只看REG类型，统计各文件被打开的次数\nlsof -p 18423 | awk '$5==\"REG\" {print $NF}' | sort | uniq -c | sort -rn | head -20\n```\n\n输出：\n\n```\n  54819 /data/config/app.properties\n      1 /usr/lib/jvm/java-11-openjdk/lib/modules\n      1 /usr/lib/jvm/java-11-openjdk/lib/tzdb.dat\n```\n\n案情非常清晰了：`/data/config/app.properties` 这个文件被打开了 54819 次，而且从没被关闭。\n\n## 第三步：用 strace 追踪系统调用，定位代码路径\n\n知道了是哪个文件在泄漏，下一步是找到代码里哪个地方在打开这个文件却没有关闭。对于正在运行的进程，最直接的办法是用 `strace` 追踪 `open` 和 `close` 系统调用：\n\n```bash\n# -p 附加到运行中的进程，-e 只追踪open/openat/close，-f 跟踪子线程\n# -T 显示每次调用耗时，-tt 显示时间戳\nstrace -p 18423 -e trace=open,openat,close -f -T -tt 2>&1 | grep -A2 'app.properties'\n```\n\n输出会类似这样：\n\n```\n02:51:34.123456 [pid 18531] openat(AT_FDCWD, \"/data/config/app.properties\", O_RDONLY) = 61848 <0.000234>\n02:51:34.124012 [pid 18531] openat(AT_FDCWD, \"/data/config/app.properties\", O_RDONLY) = 61849 <0.000198>\n02:51:34.124891 [pid 18531] openat(AT_FDCWD, \"/data/config/app.properties\", O_RDONLY) = -1 EMFILE (Too many open files) <0.000089>\n```\n\n可以看到：`openat` 调用返回的 fd 编号在持续递增（61848、61849……），却始终没有对应的 `close(61848)` 调用出现。这证实了每次打开这个文件之后，对应的 fd 从未被关闭。\n\nstrace 输出里有线程 PID（这里是 18531），说明泄漏发生在 JVM 的某个特定线程里。结合 Java 的线程 dump 来看（`kill -3 18423` 或者 `jstack 18423`），可以找到这个线程在执行什么代码。\n\n实际上在 Java 里，打开文件最常见的方式是 `FileInputStream`、`BufferedReader`、`FileReader` 等。如果代码里有类似这样的逻辑：\n\n```java\n// 错误示范：每次请求都读取配置文件，且没有关闭流\npublic Properties loadConfig() {\n    Properties props = new Properties();\n    // FileInputStream 被创建但从未 close()\n    FileInputStream fis = new FileInputStream(\"/data/config/app.properties\");\n    props.load(fis);\n    return props;  // fis 超出作用域，但 GC 不一定会立即调用 finalize() 来关闭它\n}\n```\n\n这段代码在低 QPS 时可能「侥幸」不报错，因为 JVM 的 GC 偶尔会通过 `finalize()` 关闭流，但这不是可靠的保证。在高 QPS 下，GC 来不及 finalize，fd 就会快速积累。\n\n正确的写法是用 try-with-resources，Java 7 之后就支持了：\n\n```java\n// 正确写法：try-with-resources 确保 stream 一定被关闭\npublic Properties loadConfig() throws IOException {\n    Properties props = new Properties();\n    try (FileInputStream fis = new FileInputStream(\"/data/config/app.properties\")) {\n        props.load(fis);\n    }\n    return props;\n}\n```\n\n不过更根本的问题是：为什么每次请求都要重新读取配置文件？配置文件应该在启动时加载一次，缓存在内存里，如果需要热更新可以用 `inotify` 或者定时轮询，而不是每次请求都 `open()` 一次。\n\n## 常见泄漏场景与预防\n\n文件描述符泄漏在生产环境里有几个高频的根因模式，理解这些模式有助于在 Code Review 时主动拦截问题。\n\n第一类是异常分支跳过了 `close()`。代码在 `open()` 之后，如果在 `close()` 之前抛出了异常，而异常处理代码里没有 finally 块来确保关闭，fd 就会泄漏。这是最常见的情况，在 Python 里就是没有用 `with open() as f` 语法，在 Go 里是没有 `defer f.Close()`。\n\n第二类是连接池配置不当。数据库连接池、HTTP 连接池底层都是 socket fd。如果池化的连接在出错时没有被正确销毁，而是被默默丢弃（从池里拿出来后因为连接断开了，扔掉不用，但也没有 close），fd 就会慢慢积累。这类泄漏的特征是 `lsof` 输出里有大量处于 `CLOSE_WAIT` 状态的 socket。\n\n第三类是第三方库的坑。有些老版本的 HTTP client 库、数据库驱动在特定错误情况下（比如读取响应超时）会不关闭底层 socket。比如 Apache HttpClient 4.x 在某些超时场景下如果没有正确消费 response body 就 close connection，会导致连接无法归还连接池，底层 socket fd 也无法释放。\n\n预防的关键有三点：**代码层面**用语言提供的资源管理机制（try-with-resources、`defer`、`with` 语句）确保每个 `open` 都有对应的 `close`；**监控层面**把进程的 fd 数量纳入监控，设置告警阈值（比如超过 ulimit 的 70% 就告警），让问题在还没崩溃时就暴露；**压测层面**在上线前做持续几小时的压测，观察 fd 数量是否在压测过程中持续增长而不稳定。",
+      "keyPoints": [
+        "文件描述符是 Linux 中进程访问所有 I/O 资源（文件、socket、管道等）的统一整数抽象，fd 表的上限由 ulimit -n（进程级 soft limit）控制，系统全局上限由 /proc/sys/fs/file-max 控制。",
+        "fd 泄漏的本质是 open() 调用有去无回——进程持续打开资源却从不 close()，导致 fd 表条目单调递增，最终耗尽 ulimit 限额触发 EMFILE 错误；单纯调大 ulimit 只是延迟崩溃，无法根治泄漏。",
+        "确认 fd 泄漏的方法是观察增长趋势：用 `watch -n 10 'ls /proc/PID/fd | wc -l'` 采样，若 fd 数量单调递增、与请求量正相关且无回落，即可确认泄漏存在。",
+        "lsof -p PID 可以列出进程所有打开的 fd 及其类型（REG/IPv4/FIFO 等）和路径，配合 awk 统计各类型 fd 的数量分布，能快速定位「哪类资源泄漏最严重、泄漏的具体路径是什么」。",
+        "strace -p PID -e trace=open,openat,close 可以实时追踪进程的文件打开和关闭系统调用，若看到 openat 返回的 fd 编号持续递增却始终没有对应的 close 调用，就是泄漏的直接证据。",
+        "Java 中 FileInputStream、BufferedReader 等流对象如果不显式 close()，依赖 GC 的 finalize() 机制来关闭是不可靠的——在高 QPS 下 GC 来不及 finalize，fd 会快速积累；正确做法是始终使用 try-with-resources 语法。",
+        "生产环境预防 fd 泄漏的关键三点是：代码层面用语言内置的资源管理机制确保 close 必然执行；监控层面把进程 fd 数量纳入告警（超过 ulimit 70% 告警）；发布前做持续压测并观察 fd 数量是否稳定。"
+      ],
+      "quiz": [
+        {
+          "id": "fd-leak-diagnosis-q1",
+          "question": "在 Linux 中，下列哪类资源不会占用进程的文件描述符？",
+          "choices": [
+            { "id": "A", "text": "TCP socket 连接" },
+            { "id": "B", "text": "进程的虚拟地址空间中的匿名内存页（malloc 分配的堆内存）" },
+            { "id": "C", "text": "通过 pipe() 创建的匿名管道" },
+            { "id": "D", "text": "通过 timerfd_create() 创建的定时器" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Linux 中文件描述符是进程访问「内核资源」的句柄，它代表的是内核对象的引用，包括普通文件、socket、管道（pipe）、设备节点、eventfd、timerfd 等——这些都是内核维护的对象，创建时都需要分配一个 fd。而 malloc 分配的堆内存是进程的用户态虚拟地址空间，完全由 libc 和操作系统的匿名 mmap 管理，不经过 fd 机制，也不占用 fd 配额。混淆这一点会导致误判内存问题为 fd 问题。"
+        },
+        {
+          "id": "fd-leak-diagnosis-q2",
+          "question": "以下关于 ulimit -n 的描述，哪一项是正确的？",
+          "choices": [
+            { "id": "A", "text": "ulimit -n 修改的是系统全局的文件描述符上限，所有进程共享这个配额" },
+            { "id": "B", "text": "ulimit -n 修改的是当前 shell 及其子进程的 fd 上限，子进程继承这个限制" },
+            { "id": "C", "text": "ulimit -n 设置的 hard limit 可以由普通用户随意调高到任意值" },
+            { "id": "D", "text": "ulimit -n 65535 会立刻影响系统上所有正在运行的进程" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ulimit 是 shell 的内置命令，它修改的是当前 shell 进程的资源限制，新创建的子进程会继承这些限制。系统全局的 fd 上限是 /proc/sys/fs/file-max，这两者是不同的概念。关于 A：file-max 才是全局上限，ulimit 是进程级别的。关于 C：普通用户可以把 soft limit 调低或调高（不超过 hard limit），但调高 hard limit 需要 root 权限。关于 D：ulimit 只影响当前 shell 及之后 fork 的子进程，不会影响已在运行的其他进程。"
+        },
+        {
+          "id": "fd-leak-diagnosis-q3",
+          "question": "`ls /proc/18423/fd | wc -l` 的输出是 61847，这个数字代表什么？",
+          "choices": [
+            { "id": "A", "text": "进程 18423 当前打开的文件描述符数量，等于 fd 目录下的符号链接数量" },
+            { "id": "B", "text": "进程 18423 自启动以来累计打开过的文件描述符总数（包括已关闭的）" },
+            { "id": "C", "text": "系统内核中与进程 18423 相关的所有内核对象数量" },
+            { "id": "D", "text": "进程 18423 的最大 fd 编号值，实际打开数量可能更少" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "/proc/PID/fd 目录下的每一个符号链接对应进程当前「正在持有」的一个文件描述符，链接的名字就是 fd 的整数编号，链接目标是对应的资源（文件路径、socket 信息等）。这个目录是内核实时维护的，fd 一旦被 close()，对应的符号链接就消失。所以 `ls | wc -l` 统计的是当前时刻进程实际持有的 fd 数量，而非历史累计。选项 D 是常见误解——fd 编号确实在增长（因为新 fd 分配时用「当前最小可用整数」，而已 close 的编号会被复用），但 /proc/PID/fd 里只有当前存活的 fd。"
+        },
+        {
+          "id": "fd-leak-diagnosis-q4",
+          "question": "执行 `lsof -p 18423 | awk '$5==\"REG\" {print $NF}' | sort | uniq -c | sort -rn | head -5` 的目的是什么？",
+          "choices": [
+            { "id": "A", "text": "统计进程 18423 所有 fd 的总数量" },
+            { "id": "B", "text": "找出被进程反复打开次数最多的普通文件（REG 类型），排名靠前的就是泄漏嫌疑对象" },
+            { "id": "C", "text": "列出进程 18423 最近修改过的 5 个文件" },
+            { "id": "D", "text": "统计进程 18423 所有 socket 连接的状态分布" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这条命令的逻辑是：lsof -p 18423 列出所有打开的 fd，awk '$5==\"REG\"' 过滤出类型为「普通文件」的行（TYPE 列是第5列），print $NF 打印最后一列也就是文件路径，然后 sort | uniq -c 统计每个路径出现的次数，sort -rn 按次数降序排列，head -5 取前5名。如果某个文件路径出现了几万次，就说明这个文件被打开了几万次却从未关闭，是泄漏的直接证据。$5==\"REG\" 中 $5 对应 lsof 输出的 TYPE 列，不是 IPv4/IPv6 也不是 socket。"
+        },
+        {
+          "id": "fd-leak-diagnosis-q5",
+          "question": "使用 strace 追踪进程时，观察到以下输出：\n```\nopenat(AT_FDCWD, \"/data/config/app.properties\", O_RDONLY) = 61848\nopenat(AT_FDCWD, \"/data/config/app.properties\", O_RDONLY) = 61849\nopenat(AT_FDCWD, \"/data/config/app.properties\", O_RDONLY) = -1 EMFILE\n```\n这段输出说明了什么？",
+          "choices": [
+            { "id": "A", "text": "配置文件 app.properties 正在被并发修改，需要加文件锁" },
+            { "id": "B", "text": "每次 openat 调用返回的 fd 编号持续递增且没有对应的 close 调用，说明文件打开后从未被关闭，已到达 fd 上限触发 EMFILE" },
+            { "id": "C", "text": "进程打开文件太频繁，触发了内核的文件访问速率限制" },
+            { "id": "D", "text": "app.properties 文件的 inode 被删除，需要重建文件" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "strace 输出中 openat 返回的整数是分配给这次 open 的 fd 编号。fd 编号从小到大分配「当前进程最小可用整数」。如果编号在持续增大（61848、61849……）且始终没有出现 close(61848)、close(61849) 这样的调用，说明旧的 fd 从未被释放，新的 fd 在继续分配。最终当编号到达 ulimit -n 的上限时，内核无法再分配新 fd，openat 返回 -1 并设置 errno = EMFILE（错误码 24，Too many open files）。这是 fd 泄漏最直接的内核层面证据。"
+        },
+        {
+          "id": "fd-leak-diagnosis-q6",
+          "question": "以下 Java 代码在高 QPS 下为什么会导致 fd 泄漏？\n```java\npublic Properties loadConfig() throws IOException {\n    Properties props = new Properties();\n    FileInputStream fis = new FileInputStream(\"/data/config/app.properties\");\n    props.load(fis);\n    return props;\n}\n```",
+          "choices": [
+            { "id": "A", "text": "FileInputStream 不是线程安全的，在并发调用时会互相覆盖 fd" },
+            { "id": "B", "text": "fis 没有显式 close()，依赖 GC 的 finalize() 来关闭流，但 GC 调用 finalize 的时机不确定，高 QPS 下积累速度超过 GC 回收速度" },
+            { "id": "C", "text": "每次调用都会创建新的 Properties 对象，导致内存泄漏而非 fd 泄漏" },
+            { "id": "D", "text": "FileInputStream 内部使用了连接池，不需要手动 close()" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Java 中 FileInputStream 底层对应一个操作系统的 fd。当 fis 对象没有显式 close()，只能依靠 JVM 垃圾回收器在回收对象时调用 finalize() 方法来关闭底层 fd。但 finalize() 的调用时机完全由 JVM 决定，没有实时性保证。在高 QPS 下，每秒可能产生几千个未关闭的 FileInputStream，而 GC 来不及及时回收，fd 就会快速积累到 ulimit 上限。正确做法是使用 try-with-resources：`try (FileInputStream fis = new FileInputStream(...)) { ... }`，这会在代码块退出时（无论正常还是异常）立即调用 close()，确保 fd 及时释放。"
+        },
+        {
+          "id": "fd-leak-diagnosis-q7",
+          "question": "以下哪种监控指标最能有效提前预警 fd 泄漏，在服务崩溃前就发出告警？",
+          "choices": [
+            { "id": "A", "text": "JVM 堆内存使用率超过 80%" },
+            { "id": "B", "text": "进程的 fd 数量（/proc/PID/fd 条目数）持续增长并超过 ulimit -n 值的 70%" },
+            { "id": "C", "text": "磁盘 I/O 读写速率超过阈值" },
+            { "id": "D", "text": "CPU 使用率持续超过 90%" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "fd 泄漏的直接表现就是进程持有的 fd 数量持续增长。通过 Prometheus 的 process_open_fds 指标（或自定义采集 /proc/PID/fd 目录的条目数）并设置告警规则「当前 fd 数 / ulimit soft limit > 70%」，可以在服务真正崩溃（fd 耗尽）之前提前几十分钟到几小时发出告警。而堆内存、磁盘 I/O、CPU 都是不同问题的指标，fd 泄漏不一定会导致这些指标异常——服务可能还在正常处理请求，只是 fd 在悄悄增长，直到某一刻突然爆掉。"
+        },
+        {
+          "id": "fd-leak-diagnosis-q8",
+          "question": "lsof 输出中，某 fd 的 TYPE 列显示为 `IPv4`，NAME 列显示为 `10.0.1.23:52341->10.0.2.45:3306 (CLOSE_WAIT)`，这意味着什么？",
+          "choices": [
+            { "id": "A", "text": "这是一个正在建立中的 TCP 连接，等待三次握手完成" },
+            { "id": "B", "text": "这是一个 TCP 连接，远端（MySQL 服务器）已经关闭了连接，但本端还没有 close() 这个 socket，fd 仍被进程持有" },
+            { "id": "C", "text": "这个 socket 已经被内核回收，fd 可以安全地重新使用" },
+            { "id": "D", "text": "这是一个 UDP socket，CLOSE_WAIT 表示正在等待对端的 ACK" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "TCP 的 CLOSE_WAIT 状态是四次挥手中的中间态：对端发送了 FIN（主动关闭方），本端回复了 ACK，进入 CLOSE_WAIT 状态等待本端应用层也调用 close()。如果应用层没有调用 close()，TCP 连接就会永远停在 CLOSE_WAIT 状态，对应的 socket fd 也永远不会释放。这是连接池泄漏的典型特征——连接池里的连接因为对端已断开变成了 CLOSE_WAIT，但连接池没有正确检测并销毁这些死连接，它们的 socket fd 就这样一直被进程持有。大量 CLOSE_WAIT 出现时，应检查连接池的健康检测配置和超时参数。"
+        },
+        {
+          "id": "fd-leak-diagnosis-q9",
+          "question": "在 Go 语言编写的 HTTP 服务中，以下哪种写法最可能导致 fd 泄漏？",
+          "choices": [
+            { "id": "A", "text": "`defer resp.Body.Close()` 写在 `resp, err := http.Get(url)` 的错误检查之后" },
+            { "id": "B", "text": "在发起 HTTP 请求后，没有读取完整的 response body 就直接 close，但仍然调用了 resp.Body.Close()" },
+            { "id": "C", "text": "`resp, err := http.Get(url); if err != nil { return err }` 之后忘记写 `defer resp.Body.Close()`" },
+            { "id": "D", "text": "使用 http.DefaultClient 发送请求而不是创建自定义的 http.Client" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Go 的 net/http 包中，每次 http.Get 等调用成功后返回的 resp.Body 是一个 ReadCloser，底层持有 TCP 连接的 socket fd。如果忘记调用 resp.Body.Close()，这个 socket fd 就无法被释放，也无法归还给连接池（keep-alive 连接），导致 fd 泄漏和连接池耗尽。选项 A 描述的是正确写法（先判断 err != nil，err 时没有 resp.Body 需要关闭，err 为 nil 时才 defer close）。选项 B 没有 fd 泄漏问题，但没读完 body 会导致连接无法复用（不能 keep-alive）。选项 D 用 DefaultClient 本身不会泄漏，只是不推荐在生产环境用（缺少超时设置）。"
+        },
+        {
+          "id": "fd-leak-diagnosis-q10",
+          "question": "服务的 fd 数量在凌晨低峰期（RPS 约 50）也在持续增长，白天高峰期（RPS 约 800）增速约是低峰期的 16 倍，这个现象最可能说明什么？",
+          "choices": [
+            { "id": "A", "text": "泄漏与请求量无关，是后台定时任务（cron job）在固定间隔打开文件" },
+            { "id": "B", "text": "泄漏发生在请求处理路径上，每个请求都会泄漏固定数量的 fd，增速与 RPS 正相关" },
+            { "id": "C", "text": "fd 增长是正常的连接池预热行为，不是泄漏" },
+            { "id": "D", "text": "服务在高峰期使用了不同的代码路径，泄漏只在特定接口上发生" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "增速与 RPS 呈 16 倍的比例关系（800/50=16），这是非常典型的「每请求泄漏」模式：每处理一个请求就泄漏固定数量的 fd，所以 fd 的增速与 RPS 直接成正比。这能帮助我们缩小排查范围——泄漏一定在请求处理的主路径上，而不是在后台线程或启动逻辑里。选项 A 描述的定时任务泄漏应该呈「阶梯状」增长（每隔固定时间增加固定量），而不是与 RPS 正相关。选项 D 也有可能，但「特定接口」仍然是请求处理路径的一部分，且会导致增速与该接口的 RPS 成比例，核心结论仍是 B。连接池预热（选项 C）发生在启动后的短时间内，不会持续几天增长。"
+        }
+      ],
+      "references": [
+        "https://man7.org/linux/man-pages/man8/lsof.8.html",
+        "https://man7.org/linux/man-pages/man1/strace.1.html",
+        "https://man7.org/linux/man-pages/man5/proc.5.html",
+        "https://docs.oracle.com/javase/tutorial/essential/exceptions/tryResourceClose.html"
+      ]
+    }
+  ]
+}
