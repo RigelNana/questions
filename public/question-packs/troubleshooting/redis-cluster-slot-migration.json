@@ -1,0 +1,156 @@
+{
+  "id": "redis-cluster-slot-migration",
+  "name": "Redis Cluster 槽位迁移原理",
+  "domain": "troubleshooting",
+  "description": "深入理解 Redis Cluster 分片机制、槽位迁移流程与 MOVED/ASK 重定向",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "redis-cluster-slot-migration-1",
+      "domain": "troubleshooting",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["redis", "cluster", "slot", "migration", "sharding", "gossip", "moved", "ask"],
+      "title": "Redis Cluster 扩容时槽位迁移是如何不停服实现的？",
+      "content": "## Redis Cluster 是如何做数据分片的？扩容时槽位迁移不停服是如何实现的？\n\nRedis Cluster 是 Redis 官方提供的分布式集群解决方案，从 Redis 3.0 开始正式引入。在此之前，团队如果要横向扩展 Redis，只能依赖客户端分片（如 Jedis 的 ShardedJedisPool）或代理层（如 Twemproxy、Codis），这些方案各有缺陷：客户端分片无法动态扩容，代理层引入额外跳数和单点风险。Redis Cluster 的出现让 Redis 具备了原生的水平扩展能力。\n\n现在假设你们团队的 Redis 集群跑了一年，数据量从最初的 20GB 涨到了 180GB，3 主 3 从的架构撑不住了，决定加入 3 台新节点扩容到 6 主 6 从。运维同学说可以在业务高峰期做，不需要停服——这让你有点困惑：数据在迁移过程中，客户端的请求怎么处理？某个 key 可能同时在旧节点和新节点上，这种中间态怎么保证正确性？\n\n你用 `redis-cli` 查看了一下当前集群状态：\n\n```bash\n$ redis-cli -c -h 10.0.1.1 -p 6379 cluster nodes\n3e3a6cb0d9a9e0e0e123456789abcdef node1:6379@16379 master - 0 1700000000000 1 connected 0-5460\na17ef384be6b0f4a5cf36f082af3cbc0 node2:6380@16380 master - 0 1700000000001 2 connected 5461-10922\n0d0f5b4b2c9f4a5d6e7f8a9b0c1d2e3f node3:6381@16381 master - 0 1700000000002 3 connected 10923-16383\n# ... 对应的 slave 节点略\n```\n\n三个 master 各自均匀持有约 5461 个槽。扩容后每个 master 应该持有约 2730 个槽。槽位迁移过程中，如果客户端来访问一个正在迁移的 key，会发生什么？`MOVED` 错误和 `ASK` 错误又是什么意思，有什么区别？这是面试中考察 Redis Cluster 理解深度的经典切入点。",
+      "answer": "## 一、Redis Cluster 的分片基础：先把地图画清楚\n\nRedis Cluster 把整个 key 空间分成 **16384 个槽（slot）**，每个 key 通过 `CRC16(key) % 16384` 计算出它属于哪个槽，每个 master 节点负责其中一段连续（或不连续）的槽范围。16384 这个数字不是随意选的——它是 2 的 14 次方，让 CRC16 的 16 位结果可以通过简单的位掩码截断（`hash & 0x3FFF`），同时 16384 个槽用 2KB 的 bitmap 就能表示，足够通过 Gossip 协议在节点间高效同步。\n\n理解这个分片模型，有一个细节很多人忽略：**映射的对象是槽，不是节点**。key → slot 的映射关系是固定的（由 CRC16 决定），slot → node 的映射关系才是可变的。槽位迁移改变的是 slot → node 这层映射，key 的哈希值本身不变。这个设计让扩缩容变得优雅：你只需要重新分配槽的归属，不需要重新 rehash 所有 key。\n\n**Hash Tag** 是这套机制的一个重要补充。如果 key 里包含花括号 `{}`，那么只取花括号里的内容参与哈希计算。比如 `{user:1001}.name` 和 `{user:1001}.age` 因为都取 `user:1001` 做哈希，所以保证落在同一个槽上，从而支持对这两个 key 的原子操作（MGET、事务、Lua 脚本）。如果不用 Hash Tag，同一个用户的两个字段可能分散在不同节点，`MGET` 就会报 `CROSSSLOT` 错误。\n\n节点间通信依赖 **Gossip 协议**，每个节点周期性地随机选几个邻居，互相交换集群视图（各节点持有哪些槽、是否存活）。Gossip 消息有四种：`PING` 用于健康检测和信息交换，`PONG` 是对 PING 的响应，`MEET` 用于把新节点介绍进集群，`FAIL` 用于广播某个节点已宕机。这套协议的好处是去中心化，不依赖任何协调者；缺点是集群状态更新有延迟，节点数越多延迟越明显（通常几百毫秒到几秒内收敛）。\n\n## 二、MOVED 和 ASK：两种重定向，截然不同的语义\n\n在讲迁移流程之前，必须先把这两个错误的区别说清楚，否则后面的迁移原理就无从理解。\n\n当你向 Redis Cluster 发送一个命令，节点发现这个 key 不属于自己管辖的槽时，会返回 `MOVED` 错误：\n\n```\n127.0.0.1:6379> GET user:1001\n(error) MOVED 7638 10.0.1.2:6380\n```\n\n`MOVED 7638` 说明 key `user:1001` 属于 slot 7638，而 slot 7638 现在由 `10.0.1.2:6380` 负责。`MOVED` 是一个**永久性的路由更新信号**——客户端收到它，应该更新本地的槽位路由表（slot → node 的映射），然后重新向正确的节点发请求。之后遇到属于 slot 7638 的任何 key，都直接去 `10.0.1.2:6380`，不再走弯路。\n\n`ASK` 的语义完全不同：\n\n```\n127.0.0.1:6379> GET migrating_key\n(error) ASK 3999 10.0.1.4:6382\n```\n\n`ASK` 是一个**临时性的、针对单次请求的重定向**。客户端收到 `ASK` 后，必须先向目标节点发送 `ASKING` 命令，再重新发送原始命令，而且**不能更新本地路由表**。下次再访问属于 slot 3999 的 key，还是先去原来的节点问。`ASK` 的语义是：「这个 key 正在迁移途中，这次临时去目标节点找，但迁移还没完成，槽的归属还没正式变更」。\n\n这个区别的核心在于**路由表要不要更新**。`MOVED` 说路由表已经过时了，更新它；`ASK` 说路由表还没过时，这次只是特殊情况，不要更新。\n\n## 三、槽位迁移的完整流程：六步走\n\n现在来看扩容时槽位迁移的实际过程。以把 slot 3999 从源节点 `node1`（ID: `3e3a6cb0...`）迁移到目标节点 `node4`（ID: `f1a2b3c4...`）为例：\n\n**第一步：目标节点进入 IMPORTING 状态。** 在 `node4` 上执行：\n\n```bash\nredis-cli -h node4 -p 6382 CLUSTER SETSLOT 3999 IMPORTING 3e3a6cb0d9a9e0e0e123456789abcdef\n```\n\n这告诉 `node4`：「slot 3999 正在从 `3e3a6cb0...` 迁入，准备好接收数据」。\n\n**第二步：源节点进入 MIGRATING 状态。** 在 `node1` 上执行：\n\n```bash\nredis-cli -h node1 -p 6379 CLUSTER SETSLOT 3999 MIGRATING f1a2b3c4...\n```\n\n这告诉 `node1`：「slot 3999 正在向 `f1a2b3c4...` 迁出，遇到已经迁走的 key 要返回 ASK」。\n\n**第三步：循环搬运 key。** 不断执行：\n\n```bash\n# 每次取最多 100 个 key（生产中通常用 100-200，太大会阻塞）\nredis-cli -h node1 -p 6379 CLUSTER GETKEYSINSLOT 3999 100\n# 返回: [\"user:1001\", \"order:2002\", \"session:abc\", ...]\n\n# 用 MIGRATE 原子迁移整批 key\nredis-cli -h node1 -p 6379 MIGRATE node4 6382 \"\" 0 5000 KEYS user:1001 order:2002 session:abc ...\n```\n\n`MIGRATE` 命令是这套流程的核心。它在源节点执行 `DUMP` 序列化 key，通过 TCP 连接发到目标节点，目标节点执行 `RESTORE` 反序列化写入，如果一切顺利，源节点删除该 key。整个过程对于单个 key 是原子的：要么源节点有、目标节点没有；要么源节点没有、目标节点有。不会出现两边都有或两边都没有的中间态（`REPLACE` 参数可以覆盖目标节点上已存在的同名 key）。\n\n**第四步：迁移中的访问如何处理（不停服的关键）。** 这是整个机制最精妙的地方。在 `node1` 处于 MIGRATING 状态期间，客户端来访问 slot 3999 的某个 key：\n\n- 如果这个 key **还没迁走**，`node1` 正常处理，返回结果，一切如常。\n- 如果这个 key **已经迁走**，`node1` 本地找不到，但它知道自己处于 MIGRATING 状态，于是返回 `ASK node4:6382`，而不是 `MOVED`。客户端收到 `ASK` 后发 `ASKING` 给 `node4`，`node4` 因为处于 IMPORTING 状态，会接受这个请求并返回数据。\n\n在 `node4` 处于 IMPORTING 状态时，`node4` 正常情况下不会接受对 slot 3999 的请求（它还没有槽的所有权），但如果客户端先发了 `ASKING`，`node4` 就知道这是一次合法的重定向访问，会破例处理这次请求。\n\n**第五步：通知集群更新路由。** 当 slot 3999 的所有 key 全部迁完后，向集群中**每一个节点**执行：\n\n```bash\nredis-cli -h node1 -p 6379 CLUSTER SETSLOT 3999 NODE f1a2b3c4...\nredis-cli -h node2 -p 6380 CLUSTER SETSLOT 3999 NODE f1a2b3c4...\nredis-cli -h node3 -p 6381 CLUSTER SETSLOT 3999 NODE f1a2b3c4...\nredis-cli -h node4 -p 6382 CLUSTER SETSLOT 3999 NODE f1a2b3c4...\n# ... 所有节点都执行\n```\n\n执行完毕后，slot 3999 的归属正式从 `node1` 变为 `node4`，MIGRATING 和 IMPORTING 状态清除。之后客户端再访问 slot 3999 的 key，`node1` 会返回 `MOVED`（永久路由更新），客户端更新路由表，后续直接访问 `node4`。\n\n**第六步：`redis-cli --cluster reshard` 自动化上述过程。** 实际生产中不会手工执行上面那些命令，而是：\n\n```bash\nredis-cli --cluster reshard 10.0.1.1:6379 \\\n  --cluster-from 3e3a6cb0d9a9e0e0e123456789abcdef \\\n  --cluster-to f1a2b3c4... \\\n  --cluster-slots 2730 \\\n  --cluster-yes\n```\n\n`reshard` 会自动计算需要迁移哪些槽、每次搬运多少 key，把上述六步封装成一个流程。\n\n## 四、生产环境的坑与进阶实践\n\n**迁移速率控制。** 默认情况下 `reshard` 会尽可能快地迁移，这在业务高峰期可能造成明显的性能抖动——`MIGRATE` 命令会阻塞源节点处理其他命令（虽然阻塞时间极短，单个 key 通常在微秒级），但如果一个 slot 里有几十万个 key，累积起来的影响不可忽视。可以通过 `--cluster-pipeline` 参数控制每次批量迁移的 key 数量，或者在迁移脚本里加 `sleep` 限速。\n\n**迁移结果验证。** 迁移完成后必须执行检查：\n\n```bash\nredis-cli --cluster check 10.0.1.1:6379\n# 关注输出中是否有:\n# [OK] All nodes agree about slots configuration.\n# [OK] All 16384 slots covered.\n```\n\n如果出现 `[ERR] Not all 16384 slots are covered`，说明有槽没有节点负责，写入这些槽的 key 会报 `CLUSTERDOWN Hash slot not served` 错误，这是生产事故级别的问题。\n\n**槽位不均衡时的 rebalance。** 有时候因为历史原因或手工操作，各节点持有的槽数差异很大（有的节点 8000 个槽，有的只有 2000 个），可以用 `--cluster rebalance` 自动均衡：\n\n```bash\nredis-cli --cluster rebalance 10.0.1.1:6379 --cluster-use-empty-masters\n```\n\n**Cluster 的局限性。** 理解了槽位机制之后，Cluster 的限制也自然清楚了。`MGET`、`MSET` 要求所有 key 在同一个槽，否则报 `CROSSSLOT` 错误（Hash Tag 是绕过这个限制的标准做法）。`MULTI/EXEC` 事务只能操作同一槽的 key。Lua 脚本同理，所有 key 必须在同一槽（因为脚本在单节点上执行）。这些限制在架构设计时需要提前考虑，而不是上线后再来踩坑。",
+      "keyPoints": [
+        "Redis Cluster 将 key 空间划分为 16384 个槽，每个 key 通过 CRC16(key) % 16384 映射到槽，slot → node 的映射关系可变，key → slot 的映射固定，扩容时只需重新分配槽归属而不需要 rehash 所有 key。",
+        "Hash Tag 机制通过取花括号 {} 内的内容做哈希，保证 {user:1001}.name 和 {user:1001}.age 落在同一个槽，从而支持跨字段的原子操作，是绕过 CROSSSLOT 限制的标准做法。",
+        "节点间通过 Gossip 协议（PING/PONG/MEET/FAIL 消息）交换集群视图，去中心化设计避免了单点依赖，但集群状态更新有秒级延迟，节点数越多收敛越慢。",
+        "MOVED 是永久性路由更新信号，表示槽的归属已经确定变更，客户端收到后必须更新本地路由表；ASK 是临时性单次重定向，表示 key 正在迁移途中，客户端不能更新路由表，只对这次请求特殊处理。",
+        "槽位迁移的核心是先在目标节点设置 IMPORTING 状态、源节点设置 MIGRATING 状态，再循环执行 CLUSTER GETKEYSINSLOT + MIGRATE 搬运 key，MIGRATE 命令保证单个 key 的原子迁移（源 DUMP + 目标 RESTORE + 源 DEL）。",
+        "迁移中的不停服能力来源于：源节点处于 MIGRATING 状态时，对于已迁走的 key 返回 ASK 而非 MOVED，客户端持有 ASKING 令牌去目标节点取数据，整个过程对业务透明。",
+        "Redis Cluster 的局限性包括：MGET/MSET 要求所有 key 同槽（否则 CROSSSLOT 报错）、事务和 Lua 脚本只能操作同槽 key，大规模 key 迁移对源节点有性能影响，生产中需要通过控制 pipeline 大小来限速。"
+      ],
+      "quiz": [
+        {
+          "id": "redis-cluster-slot-migration-q1",
+          "question": "Redis Cluster 总共有多少个槽（slot）？key 到槽的映射公式是什么？",
+          "choices": [
+            { "id": "A", "text": "16384 个槽，通过 CRC16(key) % 16384 计算" },
+            { "id": "B", "text": "65536 个槽，通过 CRC32(key) % 65536 计算" },
+            { "id": "C", "text": "16384 个槽，通过 MD5(key) % 16384 计算" },
+            { "id": "D", "text": "32768 个槽，通过 CRC16(key) % 32768 计算" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 固定使用 16384 个槽，映射公式是 `CRC16(key) % 16384`。16384 是 2 的 14 次方，让 CRC16 的 16 位结果可以用位掩码截断（`hash & 0x3FFF`），同时 16384 个槽用 2KB bitmap 即可表示，方便 Gossip 协议在心跳包中携带完整的槽位信息。B 选项的 65536 是有人混淆了端口号或其他协议的范围。C 选项 MD5 计算开销比 CRC16 大得多，Redis 不使用。D 选项的 32768 不存在于 Redis Cluster 规范中。"
+        },
+        {
+          "id": "redis-cluster-slot-migration-q2",
+          "question": "以下哪组 key 一定会落在同一个槽？",
+          "choices": [
+            { "id": "A", "text": "{user:1001}.name 和 {user:1001}.age" },
+            { "id": "B", "text": "user:1001:name 和 user:1001:age" },
+            { "id": "C", "text": "user_name_1001 和 user_age_1001" },
+            { "id": "D", "text": "key_slot_100 和 key_slot_101" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Hash Tag 机制：key 中如果包含花括号 `{}`，则只取括号内的内容参与哈希计算。`{user:1001}.name` 和 `{user:1001}.age` 都取 `user:1001` 做哈希，所以一定同槽。B 选项的两个 key 都是完整字符串参与哈希，结果可能相同也可能不同，不能保证同槽。C 和 D 同理，没有 Hash Tag 就是完整 key 哈希，不保证同槽。Hash Tag 是实现同用户数据原子操作（MGET、事务、Lua）的必要手段，没有它就会遇到 CROSSSLOT 错误。"
+        },
+        {
+          "id": "redis-cluster-slot-migration-q3",
+          "question": "Redis Cluster 节点间通信使用的是哪种协议？其消息类型不包括以下哪项？",
+          "choices": [
+            { "id": "A", "text": "SYNC —— 用于主从全量同步" },
+            { "id": "B", "text": "PING —— 用于健康检测和信息交换" },
+            { "id": "C", "text": "MEET —— 用于把新节点引入集群" },
+            { "id": "D", "text": "FAIL —— 用于广播节点宕机消息" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Redis Cluster 节点间通信使用 Gossip 协议，核心消息类型是 PING、PONG、MEET 和 FAIL。SYNC 是 Redis 主从复制（Replication）的协议命令，用于全量同步，不属于 Cluster Gossip 消息。Gossip 的设计去中心化，每个节点随机选邻居交换集群视图，好处是不依赖中心节点，坏处是状态更新有延迟。MEET 消息是扩容时把新节点加入集群的入口，管理员执行 `CLUSTER MEET <ip> <port>` 后，节点会发送 MEET 消息，之后的信息扩散通过 Gossip 自动完成。"
+        },
+        {
+          "id": "redis-cluster-slot-migration-q4",
+          "question": "槽位迁移时，以下操作的正确顺序是什么？",
+          "choices": [
+            { "id": "A", "text": "目标节点 IMPORTING → 源节点 MIGRATING → 循环 GETKEYSINSLOT+MIGRATE → 所有节点 SETSLOT NODE" },
+            { "id": "B", "text": "源节点 MIGRATING → 目标节点 IMPORTING → 循环 GETKEYSINSLOT+MIGRATE → 所有节点 SETSLOT NODE" },
+            { "id": "C", "text": "所有节点 SETSLOT NODE → 源节点 MIGRATING → 循环 GETKEYSINSLOT+MIGRATE → 目标节点 IMPORTING" },
+            { "id": "D", "text": "循环 GETKEYSINSLOT+MIGRATE → 源节点 MIGRATING → 目标节点 IMPORTING → 所有节点 SETSLOT NODE" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确顺序是先在目标节点设置 IMPORTING 状态（准备好接收），再在源节点设置 MIGRATING 状态（准备好迁出），然后循环搬运 key，最后通知所有节点更新槽的归属。顺序不能反：如果先设 MIGRATING 再设 IMPORTING，中间窗口期内源节点对已迁走的 key 返回 ASK，客户端去目标节点取数据，但目标节点还没进入 IMPORTING 状态，会直接拒绝请求。C 选项在 key 还没迁移完就更新路由是错误的，会导致新请求去目标节点但数据还在源节点。"
+        },
+        {
+          "id": "redis-cluster-slot-migration-q5",
+          "question": "客户端收到以下响应，应该如何处理？\n\n```\n(error) ASK 7638 10.0.1.4:6382\n```",
+          "choices": [
+            { "id": "A", "text": "更新本地路由表，把 slot 7638 的节点记为 10.0.1.4:6382，后续所有 slot 7638 的请求都发到该节点" },
+            { "id": "B", "text": "向 10.0.1.4:6382 发送 ASKING 命令，再重新发送原始命令，但不更新路由表" },
+            { "id": "C", "text": "等待 1 秒后重试原节点，ASK 表示节点暂时繁忙" },
+            { "id": "D", "text": "直接向 10.0.1.4:6382 重发原始命令，不需要先发 ASKING" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "收到 ASK 的正确处理是：先向目标节点（10.0.1.4:6382）发送 ASKING 命令，再重新发送原始命令，但**不能更新路由表**。ASK 是临时重定向，说明该 key 正在迁移途中，槽的归属还未正式变更，路由表仍然正确。A 选项是 MOVED 的处理方式，用在 ASK 场景会导致后续同槽其他未迁走 key 访问错误节点。D 选项少了 ASKING 命令，目标节点在 IMPORTING 状态下会拒绝没有 ASKING 的请求，因为它还没有该槽的所有权。C 是完全错误的理解。"
+        },
+        {
+          "id": "redis-cluster-slot-migration-q6",
+          "question": "MOVED 错误和 ASK 错误的本质区别是什么？",
+          "choices": [
+            { "id": "A", "text": "MOVED 是节点故障时的重定向，ASK 是正常情况下的路由更新" },
+            { "id": "B", "text": "MOVED 是永久路由更新（槽归属已确定变更），ASK 是临时单次重定向（槽正在迁移中）" },
+            { "id": "C", "text": "MOVED 用于读操作重定向，ASK 用于写操作重定向" },
+            { "id": "D", "text": "MOVED 由 master 节点返回，ASK 由 slave 节点返回" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "MOVED 和 ASK 的核心区别在于「要不要更新路由表」。MOVED 表示槽的归属已经正式变更，客户端的路由表过时了，需要更新，之后该槽的所有请求都应该去新节点。ASK 表示槽正在迁移中，归属还没有正式变更，这次只是临时帮你找到数据，路由表仍然正确，不能更新。A 选项把故障场景和迁移场景搞混了；节点故障时 Redis Cluster 走的是 slave 选主（failover）机制，不是 MOVED。C 选项按读写区分是完全错误的，两者都与读写无关。D 选项也是错误的，slave 只读，路由重定向由 master 发出。"
+        },
+        {
+          "id": "redis-cluster-slot-migration-q7",
+          "question": "`MIGRATE` 命令在槽位迁移中的作用是什么？它的原子性如何保证？",
+          "choices": [
+            { "id": "A", "text": "MIGRATE 只是把 key 复制到目标节点，源节点需要单独执行 DEL 删除，两步操作不是原子的" },
+            { "id": "B", "text": "MIGRATE 是一条原子命令：源节点 DUMP 序列化 key，发到目标节点执行 RESTORE，成功后源节点删除该 key，整个过程对单个 key 是原子的" },
+            { "id": "C", "text": "MIGRATE 使用两阶段提交协议，通过 PREPARE 和 COMMIT 两个阶段保证原子性" },
+            { "id": "D", "text": "MIGRATE 依赖 Redis 事务（MULTI/EXEC）保证原子性，迁移失败会自动回滚" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "MIGRATE 是 Redis 提供的原子性跨节点迁移命令，内部流程是：源节点对目标 key 执行 DUMP 序列化，通过 TCP 连接发到目标节点执行 RESTORE 反序列化写入，目标节点返回 OK 后源节点删除该 key。对于单个 key 而言，这是原子的：不存在两边都有或两边都没有的中间态。A 选项是错误的，MIGRATE 自带删除源 key 的逻辑，不需要单独 DEL。C 选项的两阶段提交是分布式事务协议，Redis 没有实现这个机制。D 选项 MULTI/EXEC 只能在单节点内使用，跨节点场景无法使用。"
+        },
+        {
+          "id": "redis-cluster-slot-migration-q8",
+          "question": "生产环境中执行大规模槽位迁移时，以下哪个实践是正确的？",
+          "choices": [
+            { "id": "A", "text": "一次性迁移所有槽，速度最快，对业务影响时间最短" },
+            { "id": "B", "text": "控制每批 MIGRATE 的 key 数量（如 100-200 个），避免在业务高峰期大量迁移，迁移后执行 cluster check 验证" },
+            { "id": "C", "text": "迁移前先停写，等所有读请求完成后再开始迁移，保证数据一致性" },
+            { "id": "D", "text": "只需在源节点和目标节点执行 SETSLOT，不需要通知其他节点，Gossip 协议会自动同步" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "生产迁移的最佳实践是限速+验证。MIGRATE 命令会短暂阻塞源节点（每个 key 通常微秒级，但大批量累积影响不可忽视），控制 pipeline 大小（`--cluster-pipeline` 参数）可以避免高峰期对 P99 延迟造成尖刺。迁移完成后必须执行 `redis-cli --cluster check` 确认所有 16384 个槽都有节点负责，否则写入无主槽的 key 会报 CLUSTERDOWN 错误。A 选项一次性迁移会瞬间给源节点带来大量 MIGRATE 请求，性能抖动明显。C 选项停写是完全不必要的，槽位迁移机制本身就设计为支持在线迁移。D 选项错误：SETSLOT NODE 必须在所有节点上执行，否则各节点的路由视图不一致，部分节点仍然认为槽在旧节点，客户端会收到错误的 MOVED 重定向。"
+        },
+        {
+          "id": "redis-cluster-slot-migration-q9",
+          "question": "以下哪个操作在 Redis Cluster 中会报 CROSSSLOT 错误？",
+          "choices": [
+            { "id": "A", "text": "GET {user:1001}.name（单 key 操作）" },
+            { "id": "B", "text": "MGET {user:1001}.name {user:1001}.age（两个 key 同槽）" },
+            { "id": "C", "text": "MGET user:1001:name user:1002:name（两个 key 可能不同槽）" },
+            { "id": "D", "text": "SET {order:2001}.status pending（单 key 写操作）" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "CROSSSLOT 错误在多 key 命令（MGET、MSET、MULTI/EXEC、Lua 脚本）操作的 key 分布在不同槽时触发。`user:1001:name` 和 `user:1002:name` 没有 Hash Tag，各自取完整字符串做哈希，极大概率落在不同槽，所以 MGET 会报 CROSSSLOT。A 和 D 是单 key 操作，Redis Cluster 只需把请求路由到正确节点，不涉及跨槽问题。B 选项两个 key 都有 `{user:1001}` Hash Tag，保证同槽，MGET 正常执行。解决 CROSSSLOT 的标准方法是用 Hash Tag 把相关联的 key 约束到同一槽，但需要注意不要让 Hash Tag 导致数据倾斜（比如所有 key 都用同一个 tag 会导致单节点热点）。"
+        },
+        {
+          "id": "redis-cluster-slot-migration-q10",
+          "question": "执行 `redis-cli --cluster check` 后出现 `[ERR] Not all 16384 slots are covered`，这意味着什么，应该怎么处理？",
+          "choices": [
+            { "id": "A", "text": "说明有节点 CPU 过高，部分槽暂时无法服务，等节点负载下降会自动恢复" },
+            { "id": "B", "text": "说明有槽没有归属任何节点，写入这些槽的 key 会报 CLUSTERDOWN 错误，需要用 CLUSTER ADDSLOTS 将无主槽手工分配给某个节点" },
+            { "id": "C", "text": "说明有 slave 节点宕机，槽的副本数不足，需要补充 slave" },
+            { "id": "D", "text": "说明客户端路由表过期，需要重启客户端刷新路由" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「Not all 16384 slots are covered」是 Redis Cluster 的严重故障信号，意味着某些槽号没有任何 master 节点负责，当客户端请求 hash 到这些槽的 key 时，会收到 `CLUSTERDOWN Hash slot not served` 错误，业务写入和读取都会失败。常见原因是：槽位迁移中途节点宕机、手工 CLUSTER DELSLOTS 操作失误、或节点被强制移除前未完成槽的转移。处理方式是先用 `redis-cli --cluster check` 找出哪些槽无主，再用 `CLUSTER ADDSLOTS <slot>` 或 `redis-cli --cluster fix` 修复。A 选项的负载问题不会导致槽未覆盖。C 选项 slave 宕机不影响槽覆盖（slave 不持有槽所有权）。D 选项重启客户端解决不了服务端的槽未分配问题。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/manual/scaling/",
+        "https://redis.io/commands/cluster-setslot/",
+        "https://redis.io/commands/migrate/",
+        "https://redis.io/docs/reference/cluster-spec/"
+      ]
+    }
+  ]
+}

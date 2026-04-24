@@ -1,0 +1,157 @@
+{
+  "id": "postgresql-vacuum",
+  "name": "PostgreSQL VACUUM 机制与表膨胀",
+  "domain": "troubleshooting",
+  "description": "理解 PostgreSQL MVCC 与 VACUUM 的工作原理，解决表膨胀和 autovacuum 配置问题",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "postgresql-vacuum-1",
+      "domain": "troubleshooting",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["postgresql", "vacuum", "mvcc", "bloat", "autovacuum"],
+      "title": "PostgreSQL 删除大量数据后表空间不释放，如何理解 VACUUM 机制并解决膨胀问题？",
+      "content": "你接手了一个运行两年的电商平台的 DBA 工作。其中一张核心的 `orders` 表承载着历史订单数据，业务方每季度会定期清理三年前的旧订单，最近一次清理删除了约 2000 万行数据。\n\n但是奇怪的事情发生了：用 `du -sh` 看 PostgreSQL 数据目录，`orders` 表对应的文件大小依然是 38GB，删数据前后几乎没有变化。业务方非常困惑，明明 `SELECT COUNT(*)` 只剩下 300 万行了，磁盘怎么还是满的？更糟的是，最近两周针对 `orders` 表的范围查询越来越慢，执行计划也从原来的索引扫描变成了顺序扫描，EXPLAIN ANALYZE 显示 cost 异常高。\n\n你的前任 DBA 留下了一句注释：「这张表有 bloat 问题，小心 autovacuum」，但没有更多说明。\n\n**你需要回答以下问题：**\n\n1. 为什么 PostgreSQL 删除大量数据后，磁盘空间不会立即释放？这与 MySQL InnoDB 的行为有什么本质区别？\n2. VACUUM 和 VACUUM FULL 各自的作用是什么？为什么生产环境通常不直接用 VACUUM FULL？\n3. 如何用 `pg_stat_user_tables` 和 `pgstattuple` 量化当前的膨胀程度？\n4. autovacuum 为什么没有及时清理？哪些参数决定了它的触发时机和清理速度？\n5. 除了 autovacuum 配置调优，还有哪些工具和手段可以在不中断业务的情况下回收空间？",
+      "answer": "## 先从 PostgreSQL 的 MVCC 说起\n\n要理解表膨胀，必须先搞清楚 PostgreSQL 的多版本并发控制（MVCC，Multi-Version Concurrency Control）是怎么实现的。很多人知道 PostgreSQL 有 MVCC，但不知道它和 MySQL InnoDB 的实现方式有一个根本性的区别——这个区别直接导致了「删了数据磁盘不缩小」这个现象。\n\nInnoDB 的 MVCC 是通过 undo log 来实现的。旧版本的数据存在 undo 段里，行本身是原地更新的，undo log 会定期被清理（purge）掉。所以 MySQL 的 `DELETE` 操作在事务提交后，行标记为删除，purge 线程会异步回收这些空间，表文件不会无限膨胀。\n\nPostgreSQL 的做法完全不同。它把旧版本的数据直接存在原始的表文件（heap）里，通过在每一行的头部记录两个字段来控制可见性：`xmin`（创建这行的事务 ID）和 `xmax`（删除这行的事务 ID，如果为 0 表示这行没被删除）。当你执行 `UPDATE` 时，PostgreSQL 不是修改原来那行，而是把旧行的 `xmax` 设为当前事务 ID，然后在另一个地方插入一行新记录。当你执行 `DELETE` 时，同样只是把被删除行的 `xmax` 设为当前事务 ID，这行数据还安静地躺在表文件里，只是对新事务不可见了。\n\n这些对任何事务都已经不可见的旧行，就是所谓的「dead tuples（死行）」。它们占据着磁盘空间，却不携带任何有效数据。删除 2000 万行之后，这 2000 万行 dead tuples 就这样留在文件里，表文件自然不会缩小。\n\n## VACUUM 是什么，它到底做了什么\n\nVACUUM 的核心职责就是清理这些 dead tuples。但理解 VACUUM 有一个非常重要的认知：**普通 VACUUM 只是把 dead tuples 占据的空间标记为「可重用」，并不会把空间归还给操作系统。** 换句话说，执行完普通 VACUUM 之后，表文件大小依然是 38GB，但这 38GB 里有大量的「空洞」，下次插入数据时可以复用这些空洞，不需要再扩大文件。从 `du -sh` 的视角看，你看不到任何变化。\n\n真正能压缩表文件、把空间归还给操作系统的是 `VACUUM FULL`。它会把表里所有有效行重写到一个全新的文件里，然后删除旧文件，整个过程类似于「整理碎片」。执行后你会看到表文件显著缩小。\n\n但 `VACUUM FULL` 有一个致命缺点：它需要对表加 **ACCESS EXCLUSIVE 锁**，也就是排他锁。这意味着在 `VACUUM FULL` 运行期间，任何针对这张表的读写操作都会被阻塞。对于一张核心的 `orders` 表，这在生产环境中是无法接受的。对于 38GB 的表，`VACUUM FULL` 可能需要运行几十分钟，这段时间内所有订单查询都会超时。\n\n普通 `VACUUM`（不带 FULL）则不会阻塞正常的读写操作，它只持有一个非常轻量的锁。这就是为什么生产环境通常依赖 autovacuum 自动触发普通 VACUUM，而不是手动跑 VACUUM FULL。\n\n## 量化膨胀程度：先看数据再做决策\n\n在动手之前，先用 `pg_stat_user_tables` 看一下实际情况：\n\n```sql\n-- 查看 orders 表的 dead tuples 和 live tuples 比例\nSELECT\n  schemaname,\n  relname AS table_name,\n  n_live_tup,                    -- 当前有效行数\n  n_dead_tup,                    -- dead tuples 数量\n  ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_ratio,\n  last_vacuum,                   -- 上次手动 VACUUM 时间\n  last_autovacuum,               -- 上次 autovacuum 时间\n  last_analyze,\n  last_autoanalyze\nFROM pg_stat_user_tables\nWHERE relname = 'orders';\n```\n\n典型的膨胀场景输出可能长这样：\n\n```\n table_name | n_live_tup | n_dead_tup | dead_ratio | last_autovacuum\n------------+------------+------------+------------+------------------------\n orders     |  3000000   |  20500000  |   87.23    | 2024-01-15 03:22:17\n```\n\n87% 的 dead ratio 意味着表里几乎都是垃圾数据，这解释了为什么顺序扫描那么慢——PostgreSQL 需要扫描大量无效行才能找到有效数据。\n\n如果想更精确地知道膨胀比例和实际空间浪费，可以用 `pgstattuple` 扩展（需要先 `CREATE EXTENSION pgstattuple`）：\n\n```sql\n-- 需要超级用户或表所有者权限，会全表扫描，生产环境注意性能影响\nSELECT\n  table_len,                     -- 表文件总大小（字节）\n  tuple_count,                   -- 有效行数\n  tuple_len,                     -- 有效行占用空间\n  dead_tuple_count,              -- dead tuples 数量\n  dead_tuple_len,                -- dead tuples 占用空间\n  ROUND(dead_tuple_percent, 2) AS dead_pct,\n  free_space,                    -- 已被 VACUUM 标记为可重用的空间\n  ROUND(free_percent, 2) AS free_pct\nFROM pgstattuple('orders');\n```\n\n## autovacuum 为什么没有及时清理\n\n你会发现 `last_autovacuum` 是几天前的，但表里已经积累了 2000 万个 dead tuples，这说明 autovacuum 的触发条件配置得太保守了。autovacuum 触发 VACUUM 的条件是：\n\n```\n触发阈值 = autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × 表的行数\n```\n\n默认值：`autovacuum_vacuum_threshold = 50`，`autovacuum_vacuum_scale_factor = 0.2`。对于一张有 2200 万行（删除前的 2500 万行里还活着的）的表，触发阈值是 `50 + 0.2 × 22000000 = 4400050` 行变化才会触发。一次性删了 2000 万行确实超过了这个阈值，应该触发了 autovacuum，但问题可能出在清理速度上。\n\n`autovacuum_vacuum_cost_delay` 是限速参数，默认在 PostgreSQL 13 及之前是 20ms，PostgreSQL 14 之后改成了 2ms。这意味着 autovacuum 每处理一小批数据后就会休眠 20ms，对一张 38GB 的表来说，这会让 autovacuum 需要跑很长时间。如果期间有其他高优先级操作，autovacuum 甚至可能被强制中断（autovacuum 会主动让位给用户操作）。\n\n对于大表，建议在表级别单独调整 autovacuum 参数，不要改全局配置影响所有表：\n\n```sql\n-- 针对 orders 表单独调整 autovacuum 参数\nALTER TABLE orders SET (\n  autovacuum_vacuum_scale_factor = 0.01,    -- 1% 的行变化就触发，而不是 20%\n  autovacuum_vacuum_threshold = 1000,       -- 基础阈值降低\n  autovacuum_vacuum_cost_delay = 2,         -- 限速延迟降低到 2ms，让清理更快\n  autovacuum_analyze_scale_factor = 0.005   -- analyze 也更频繁触发，保持统计信息新鲜\n);\n```\n\n还有一个常被忽略的问题：**长事务会阻止 VACUUM 清理 dead tuples**。VACUUM 的清理逻辑是：只有当一个 dead tuple 的 `xmax`（删除它的事务 ID）比系统中所有活跃事务的 `xmin` 都小，才能被安全清理。如果有一个跑了 6 小时的长事务，它的 `xmin` 很小，那这 6 小时内产生的所有 dead tuples 都无法被清理，哪怕它们理论上应该已经过期了。\n\n用这个查询找出长事务：\n\n```sql\n-- 找出运行时间超过 5 分钟的活跃事务\nSELECT\n  pid,\n  usename,\n  state,\n  age(clock_timestamp(), xact_start) AS duration,\n  query\nFROM pg_stat_activity\nWHERE xact_start IS NOT NULL\n  AND age(clock_timestamp(), xact_start) > INTERVAL '5 minutes'\nORDER BY duration DESC;\n```\n\n## 事务 ID 回卷：比表膨胀更可怕的危机\n\nPostgreSQL 的事务 ID（XID）是一个 32 位无符号整数，最大值约 42 亿。当 XID 用完后会从头开始，这就是「XID 回卷（wraparound）」。一旦发生回卷而没有提前处理，PostgreSQL 会进入保护模式，拒绝所有写操作，只允许 VACUUM 运行来恢复，这是灾难级别的故障。\n\nautovacuum 有一个特殊模式叫「anti-wraparound vacuum」，当表的最老 XID 距离回卷阈值（默认 2 亿，由 `autovacuum_freeze_max_age` 控制）足够近时，会强制触发。你可以用这个查询监控回卷风险：\n\n```sql\n-- 检查距离 XID 回卷最近的表\nSELECT\n  schemaname,\n  relname,\n  age(relfrozenxid) AS xid_age,  -- 距离回卷还剩多少 XID\n  pg_size_pretty(pg_total_relation_size(oid)) AS size\nFROM pg_class\nWHERE relkind = 'r'\nORDER BY age(relfrozenxid) DESC\nLIMIT 10;\n```\n\n当 `xid_age` 超过 15 亿时，应该立刻重视；超过 18 亿时，PostgreSQL 会自动进入更激进的 autovacuum 模式；超过 20 亿时，数据库会停止写入。\n\n## 在线回收空间：pg_repack 才是正确答案\n\n回到最初的问题：orders 表有 87% 的 dead ratio，需要真正释放空间，但又不能用 VACUUM FULL 锁表几十分钟。这时候应该用 **pg_repack**。\n\npg_repack 是一个 PostgreSQL 扩展，它能在不持有排他锁的情况下重建表。它的原理是：先在后台创建一张影子表，把有效数据复制过去，同时用触发器记录期间发生的变更，等复制完成后把增量变更也同步进去，最后在一个极短的窗口内（通常不超过 1 秒）把两张表的名字互换。整个过程中原表对外部完全可读可写。\n\n```bash\n# 安装 pg_repack\napt install postgresql-15-repack\n# 或\npg_config --version && make && make install\n\n# 使用方式\npg_repack -h localhost -U postgres -d mydb -t orders\n\n# 如果只想重建索引（索引也会膨胀）\npg_repack -h localhost -U postgres -d mydb -t orders --only-indexes\n```\n\n相比 VACUUM FULL，pg_repack 是生产环境在线整理表膨胀的标准工具。\n\n## HOT 更新与减少膨胀的设计技巧\n\nPostgreSQL 有一个叫 HOT（Heap Only Tuple）的优化机制，可以减少 UPDATE 产生的膨胀。当一次 UPDATE 只修改了非索引列的字段，并且修改后的新行能放入同一个数据页（page）时，PostgreSQL 不会更新索引，而是在页内建立一个「HOT 链」，旧行指向新行。VACUUM 清理时只需要清理页内的旧行，不需要动索引。\n\nHOT 更新能否发生取决于页内是否有空闲空间，这由 `fillfactor` 参数控制（默认 100，即页面写满）。对于更新频繁的表，把 `fillfactor` 设为 70-80，预留 20-30% 的空间给 HOT 更新，可以显著减少表和索引的膨胀：\n\n```sql\n-- 对 orders 表设置 fillfactor，之后的数据写入会预留空间\nALTER TABLE orders SET (fillfactor = 80);\n-- 立刻生效需要 VACUUM FULL 或 CLUSTER 重建表，或等下次 pg_repack\n```\n\n最后补充一个 `VACUUM ANALYZE` 的用法：普通 VACUUM 只清理 dead tuples，不更新统计信息。而查询计划器依赖统计信息来选择执行计划——这也是为什么删了大量数据后查询计划从索引扫描变成了顺序扫描，因为统计信息还以为表有 2500 万行，认为顺序扫描比索引扫描便宜。执行 `VACUUM ANALYZE orders` 可以同时完成清理和统计信息更新，一步到位。",
+      "keyPoints": [
+        "PostgreSQL 的 MVCC 通过在行头部存储 xmin/xmax 事务 ID 实现版本控制，DELETE/UPDATE 只是设置 xmax 而不物理删除数据，旧版本行（dead tuples）就地保留在表文件中，这是与 MySQL InnoDB 通过 undo log 实现 MVCC 的根本区别。",
+        "普通 VACUUM 只将 dead tuples 占用的空间标记为可重用，不会缩小表文件或归还空间给操作系统；只有 VACUUM FULL 才能真正压缩文件，但代价是需要持有 ACCESS EXCLUSIVE 排他锁，会阻塞所有读写操作。",
+        "autovacuum 的触发阈值由 autovacuum_vacuum_scale_factor（默认 0.2，即 20% 行变化才触发）控制，对于亿级大表这意味着需要 2000 万行变化才触发清理，应针对大表单独调低此参数到 0.01 左右。",
+        "长事务是 VACUUM 无法清理 dead tuples 的最常见隐性原因：VACUUM 只能清理 xmax 早于系统中所有活跃事务最小 xmin 的 dead tuples，一个运行 6 小时的长事务会导致这 6 小时内所有 dead tuples 无法被清理。",
+        "PostgreSQL 的事务 ID（XID）是 32 位整数，约 42 亿后发生回卷，若 anti-wraparound vacuum 未在此前完成，数据库会进入只读保护模式拒绝写入，需要用 pg_class.relfrozenxid 的 age 函数持续监控回卷风险。",
+        "生产环境在线回收表空间的正确工具是 pg_repack，它通过影子表 + 触发器捕获增量的方式在不持有排他锁的情况下重建表，锁定窗口通常不超过 1 秒，远优于 VACUUM FULL 的长时间锁表。",
+        "HOT（Heap Only Tuple）更新机制能在页内有空闲空间时避免更新索引，将 fillfactor 从默认 100 调低到 70-80 可以为频繁更新的表预留空间，从源头减少表和索引的膨胀速率。"
+      ],
+      "quiz": [
+        {
+          "id": "postgresql-vacuum-q1",
+          "question": "PostgreSQL 执行 DELETE 删除一行数据时，底层实际发生了什么？",
+          "choices": [
+            {"id": "A", "text": "该行数据被立即从磁盘上物理删除，空间立刻释放"},
+            {"id": "B", "text": "该行的 xmax 字段被设置为当前事务 ID，数据仍保留在磁盘原位"},
+            {"id": "C", "text": "该行数据被移动到 undo log 段，等待后台 purge 线程清理"},
+            {"id": "D", "text": "该行被标记为删除并写入 WAL 日志，事务提交时才移除"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PostgreSQL 的 MVCC 实现方式是在行头部存储 xmin 和 xmax 两个事务 ID 字段。DELETE 操作只是把被删行的 xmax 设为执行 DELETE 的事务 ID，数据本身仍然原封不动地留在表文件（heap）中。这条记录对于 xmin > xmax 的后续事务不可见，但物理上还在磁盘上占着空间，成为「dead tuple」。A 选项描述的是物理删除，PostgreSQL 不这样做。C 选项描述的是 MySQL InnoDB 的 undo log 机制，PostgreSQL 没有独立的 undo 段。D 选项混淆了 WAL 与数据存储的关系。"
+        },
+        {
+          "id": "postgresql-vacuum-q2",
+          "question": "执行 VACUUM（不带 FULL）之后，下列哪个说法是正确的？",
+          "choices": [
+            {"id": "A", "text": "表文件（.relation 文件）会缩小，磁盘占用立刻减少"},
+            {"id": "B", "text": "dead tuples 被物理删除，其占用的空间被标记为可重用，但表文件大小不变"},
+            {"id": "C", "text": "所有索引会被重建，索引膨胀问题一并解决"},
+            {"id": "D", "text": "表上的统计信息会自动更新，查询计划会立刻优化"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "普通 VACUUM 的作用是清理 dead tuples，把它们占据的 page 空间标记为「可重用（FSM，Free Space Map）」，后续的 INSERT/UPDATE 可以复用这些空洞而不必扩大文件。但表文件本身的大小并不会缩小，因为 PostgreSQL 不会把中间的空闲 page 还给操作系统（只有文件末尾的连续空闲页才会归还）。A 选项描述的是 VACUUM FULL 的效果。C 选项错误，VACUUM 会清理索引中的 dead entries，但不会重建索引。D 选项是 ANALYZE 的功能，普通 VACUUM 不更新统计信息，需要用 VACUUM ANALYZE 才能同时完成两件事。"
+        },
+        {
+          "id": "postgresql-vacuum-q3",
+          "question": "autovacuum 的默认配置 autovacuum_vacuum_scale_factor = 0.2 在生产大表上最主要的问题是什么？",
+          "choices": [
+            {"id": "A", "text": "0.2 太小，autovacuum 会过于频繁地触发，占用大量 I/O 资源"},
+            {"id": "B", "text": "对于千万级大表，需要 20% 的行变化才触发，意味着数百万行 dead tuples 积累后才开始清理，膨胀早已严重"},
+            {"id": "C", "text": "scale_factor 只对 INSERT 生效，DELETE 产生的 dead tuples 由另一套参数控制"},
+            {"id": "D", "text": "autovacuum_vacuum_scale_factor 在 PostgreSQL 14 已被废弃，应使用新参数 autovacuum_vacuum_insert_scale_factor"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "autovacuum 触发 VACUUM 的条件是：变化行数 > autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × 表总行数。对于一张有 2000 万行的表，触发阈值是 50 + 0.2 × 20000000 = 4000050 行，也就是说需要 400 万行发生变化才会触发清理。如果业务一次性删除了 2000 万行，虽然超过了阈值，但在此之前 dead tuples 已经大量积累。对于大表，应将 scale_factor 调低至 0.01 甚至 0.005，通过表级 ALTER TABLE 单独设置，避免影响小表。A 选项理解反了，0.2 太大而非太小。C 和 D 选项均为错误信息。"
+        },
+        {
+          "id": "postgresql-vacuum-q4",
+          "question": "为什么生产环境一般不直接对业务核心表执行 VACUUM FULL？",
+          "choices": [
+            {"id": "A", "text": "VACUUM FULL 只在 PostgreSQL 9.x 版本有效，新版本已不支持"},
+            {"id": "B", "text": "VACUUM FULL 会持有 ACCESS EXCLUSIVE 锁，运行期间阻塞所有读写操作"},
+            {"id": "C", "text": "VACUUM FULL 无法处理有外键约束的表，会抛出异常"},
+            {"id": "D", "text": "VACUUM FULL 会删除所有索引，需要手动重建，风险极高"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "VACUUM FULL 在运行期间需要对目标表持有 ACCESS EXCLUSIVE 锁，这是 PostgreSQL 锁级别中最高的排他锁，会阻塞针对该表的所有操作，包括 SELECT。对于 10GB 以上的表，VACUUM FULL 可能需要运行数十分钟，在此期间所有业务查询都会被挂起等待，等同于计划外停机。这就是为什么需要 pg_repack 这类工具——它通过后台重建 + 触发器同步增量的方式，将锁定窗口压缩到不足 1 秒。A 选项错误，VACUUM FULL 在所有版本都存在。C 选项和 D 选项均为虚构的限制。"
+        },
+        {
+          "id": "postgresql-vacuum-q5",
+          "question": "以下是 pg_stat_user_tables 的查询结果，你能从中得出什么结论？\n\n```\ntable_name | n_live_tup | n_dead_tup | last_autovacuum\n-----------+------------+------------+-----------------------------\norders     | 3000000    | 19800000   | 2024-03-01 02:30:00\n```\n今天是 2024-03-15。",
+          "choices": [
+            {"id": "A", "text": "表状态健康，n_live_tup 有 300 万行说明数据量正常，autovacuum 两周前刚运行过"},
+            {"id": "B", "text": "表存在严重膨胀：dead tuples 数量是 live tuples 的 6.6 倍，且 14 天未触发 autovacuum，需要立刻介入"},
+            {"id": "C", "text": "dead tuples 说明有大量长事务未提交，需要找到这些事务并终止"},
+            {"id": "D", "text": "n_dead_tup 数字不可靠，pg_stat_user_tables 的计数器会有延迟，需要用 SELECT COUNT(*) 重新统计"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "从这份数据可以明确判断：orders 表有 1980 万 dead tuples，而有效行只有 300 万，dead ratio 高达 87%。这意味着表里绝大多数空间都被垃圾数据占据，顺序扫描时 PostgreSQL 需要扫过海量无效行，索引扫描的代价估算也会因为膨胀而偏高。更值得注意的是 last_autovacuum 是 14 天前，说明在这次大批量删除之后 autovacuum 没有重新触发，可能是参数配置过于保守或有长事务阻碍。A 选项忽视了 dead tuples 的严重性。C 选项混淆了 dead tuples 和未提交事务，dead tuples 是已提交的删除/更新遗留的旧版本。D 选项错误，pg_stat_user_tables 的计数虽然是估算值，但在这种数量级下足够可靠。"
+        },
+        {
+          "id": "postgresql-vacuum-q6",
+          "question": "下列哪种情况会导致 autovacuum 无法清理 dead tuples，即使 autovacuum 已经在运行？",
+          "choices": [
+            {"id": "A", "text": "表上有 NOT NULL 约束或 CHECK 约束"},
+            {"id": "B", "text": "数据库中存在一个运行了 12 小时的长事务，其 xmin 早于这些 dead tuples 的 xmax"},
+            {"id": "C", "text": "autovacuum_vacuum_cost_delay 设置过低，导致清理速度过快跳过了某些页"},
+            {"id": "D", "text": "表文件超过 1GB 后 autovacuum 会自动跳过，需要手动 VACUUM"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "VACUUM 判断一个 dead tuple 能否被清理的标准是：该行的 xmax（删除它的事务 ID）必须早于系统中所有活跃事务的最小 xmin（称为 OldestXmin）。如果有一个事务在很早之前启动并且还没有提交或回滚，它持有一个非常小的 xmin，导致 OldestXmin 无法推进。在这个 xmin 之后产生的所有 dead tuples 都无法被清理，VACUUM 会扫描它们、发现它们还在 OldestXmin「保护」范围内，只能跳过。这是生产环境中 dead tuples 积累的最常见隐性原因，必须通过 pg_stat_activity 找到并终止或等待这些长事务。A、C、D 选项均为虚构的限制条件。"
+        },
+        {
+          "id": "postgresql-vacuum-q7",
+          "question": "pg_repack 相比 VACUUM FULL 的核心优势是什么？",
+          "choices": [
+            {"id": "A", "text": "pg_repack 速度更快，通常比 VACUUM FULL 快 10 倍以上"},
+            {"id": "B", "text": "pg_repack 不需要安装额外扩展，是 PostgreSQL 内置工具"},
+            {"id": "C", "text": "pg_repack 通过影子表 + 触发器方式重建表，不需要持有长时间排他锁，业务表在整个过程中保持可读可写"},
+            {"id": "D", "text": "pg_repack 可以跨主从复制，主库和从库同时在线压缩，效率翻倍"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "pg_repack 的设计核心就是「在线重建」：它先创建一张与原表结构相同的影子表，把原表有效数据复制进去，同时在原表上创建触发器捕获复制期间发生的所有 INSERT/UPDATE/DELETE，再把这些增量操作也在影子表上重放一遍。当影子表与原表数据趋于一致后，在一个极短的时间窗口（通常 < 1s）内对两张表做名字交换（rename），然后删除旧表。在这个过程中，原表始终可以被正常读写，只有最后交换名字那一刻需要短暂的排他锁。这与 VACUUM FULL 在整个重写过程中持有排他锁的方式有本质区别。A 选项错误，pg_repack 不一定更快，因为它需要复制数据两次。B 选项错误，pg_repack 是需要安装的第三方扩展。D 选项是虚构功能。"
+        },
+        {
+          "id": "postgresql-vacuum-q8",
+          "question": "一张高频 UPDATE 的表（每秒约 500 次更新），你该如何从源头减少表膨胀的产生速率？",
+          "choices": [
+            {"id": "A", "text": "将表的 fillfactor 从默认 100 调低到 70，为 HOT 更新预留页内空间，减少索引更新次数"},
+            {"id": "B", "text": "将表迁移到 UNLOGGED 模式，跳过 WAL 写入从而减少膨胀"},
+            {"id": "C", "text": "对每一列单独建立索引，让 HOT 更新机制覆盖所有列"},
+            {"id": "D", "text": "将 autovacuum_vacuum_scale_factor 调低到 0，让 autovacuum 在每次事务后立刻清理"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "HOT（Heap Only Tuple）更新是 PostgreSQL 减少 UPDATE 膨胀的关键机制：当一次 UPDATE 只修改非索引列，并且新版本行能放入同一个 page 的空闲空间时，PostgreSQL 在 page 内建立「旧行 → 新行」的 HOT 链，不更新索引，大幅减少了 dead tuple 积累。HOT 更新能否发生的关键就是 page 内是否有空闲空间，而 fillfactor 控制了页面写满的比例，默认 100 表示写满，没有预留空间供 HOT 更新使用。把 fillfactor 调到 70-80，牺牲约 20-30% 的存储密度，换来 HOT 更新的高命中率，总体上能显著降低膨胀速率。B 选项 UNLOGGED 表数据库崩溃后会丢失数据，不适合业务表。C 选项正好相反，索引越多，HOT 更新越难触发（因为要更新的列可能在索引里）。D 选项 scale_factor=0 会让 autovacuum 永不停歇，拖垮数据库 I/O。"
+        },
+        {
+          "id": "postgresql-vacuum-q9",
+          "question": "关于 PostgreSQL 事务 ID（XID）回卷问题，下列说法正确的是？",
+          "choices": [
+            {"id": "A", "text": "XID 是 64 位整数，理论上永远不会回卷，无需担心"},
+            {"id": "B", "text": "XID 是 32 位整数，约 42 亿后回卷，autovacuum 的 anti-wraparound vacuum 必须在此前冻结旧事务 ID，否则数据库会停止写入"},
+            {"id": "C", "text": "XID 回卷会导致最近插入的数据被误判为历史数据，触发自动删除"},
+            {"id": "D", "text": "XID 回卷是 PostgreSQL 的设计缺陷，PostgreSQL 15 已彻底修复"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PostgreSQL 的事务 ID 使用 32 位无符号整数，最大值约 42 亿（实际上 PostgreSQL 用模 2^32 的比较，把 XID 空间看作一个环，每个事务能看到「之前」约 21 亿个事务）。当 XID 即将用尽时，PostgreSQL 通过 VACUUM 的「冻结（freeze）」机制把旧行的 xmin 替换为特殊值 FrozenTransactionId（2），使其对所有未来事务都可见，从而让 XID 可以安全回绕。如果某张表的最老 XID（relfrozenxid）距离回卷阈值太近且 anti-wraparound vacuum 还没运行，PostgreSQL 会在超过 autovacuum_freeze_max_age 限制后拒绝向该表写入，直到 VACUUM 完成冻结。监控 age(relfrozenxid) 并在超过 15 亿时告警是生产环境的必要实践。A 选项描述的是 PostgreSQL 14 引入的 64 位 XID 支持（实验性），但默认仍是 32 位。C 选项描述了回卷的一种危害表现，但说「触发自动删除」不准确。D 选项是虚构信息。"
+        },
+        {
+          "id": "postgresql-vacuum-q10",
+          "question": "线上 PostgreSQL 数据库，pg_stat_activity 显示有一个事务已运行 8 小时，同时 pg_stat_user_tables 显示某张表的 n_dead_tup 在快速增长却没有被清理。两者是否有关联？如何验证？",
+          "choices": [
+            {"id": "A", "text": "两者无关，dead tuples 增长是 autovacuum 配置问题，长事务是应用层问题，需要独立处理"},
+            {"id": "B", "text": "有直接关联：8 小时前的长事务持有一个很旧的 xmin，导致 OldestXmin 无法推进，该 xmin 之后产生的所有 dead tuples 都无法被 VACUUM 清理；可以查询 pg_stat_activity 的 backend_xmin 来验证"},
+            {"id": "C", "text": "有关联，但只影响 autovacuum，手动执行 VACUUM 可以绕过长事务限制强制清理"},
+            {"id": "D", "text": "有关联，应该立刻 kill 这个长事务，PostgreSQL 会自动触发清理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个需要理解 PostgreSQL VACUUM 内部机制的典型问题。VACUUM 在决定是否清理某个 dead tuple 时，会参考 OldestXmin——系统中所有活跃事务（包括 idle in transaction 状态的事务）的最小 backend_xmin。长事务的 backend_xmin 是它启动时的快照点，一旦这个值被「钉住」，VACUUM 就无法推进清理窗口，导致在这个时间点之后产生的所有 dead tuples 都积压着无法清理。验证方法：\n```sql\nSELECT pid, usename, xact_start, state, backend_xmin\nFROM pg_stat_activity\nWHERE backend_xmin IS NOT NULL\nORDER BY backend_xmin;\n```\n如果某个 pid 的 backend_xmin 非常旧，且对应 xact_start 是 8 小时前，那就是元凶。C 选项错误，手动 VACUUM 同样受 OldestXmin 限制，无法绕过。D 选项 kill 事务本身是对的，但「立刻」kill 需要评估业务影响，且应先确认是否真的是阻碍 VACUUM 的元凶。"
+        }
+      ],
+      "references": [
+        "https://www.postgresql.org/docs/current/routine-vacuuming.html",
+        "https://www.postgresql.org/docs/current/mvcc-intro.html",
+        "https://www.postgresql.org/docs/current/storage-page-layout.html",
+        "https://reorg.github.io/pg_repack/",
+        "https://www.postgresql.org/docs/current/pgstattuple.html"
+      ]
+    }
+  ]
+}

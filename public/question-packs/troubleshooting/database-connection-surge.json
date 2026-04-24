@@ -1,0 +1,158 @@
+{
+  "id": "database-connection-surge",
+  "name": "数据库连接数突增处理",
+  "domain": "troubleshooting",
+  "description": "大促场景下数据库连接数暴增的应急处理方案与连接池架构优化",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "database-connection-surge-1",
+      "domain": "troubleshooting",
+      "type": "open-ended",
+      "difficulty": 3,
+      "tags": ["database", "mysql", "connection-pool", "proxysql", "pgbouncer", "architecture"],
+      "title": "大促期间数据库连接数暴增接近上限，如何应急处理和架构优化？",
+      "content": "## 故障背景\n\n你在某头部电商公司担任 SRE，今天是「双十一」开门红，凌晨零点整秒峰值到来。你的手机同时收到三条报警：数据库监控显示主库连接数在 30 秒内从正常的 **200** 飙升至 **2000**，接近 MySQL 配置的 `max_connections=2500` 上限；与此同时，应用日志开始批量出现以下报错：\n\n```\n[ERROR] HikariPool-1 - Connection is not available, request timed out after 30000ms\ncom.mysql.cj.jdbc.exceptions.CommunicationsException: \n  Too many connections (errno 1040)\n```\n\n监控大盘显示下单服务的错误率从 0.1% 跳到了 18%，P99 延迟从 80ms 涨到了 4200ms。你打开 Grafana，发现连接数仍在以每秒约 50 个的速度继续上涨。\n\n**系统背景**：整套下单链路由 6 个微服务组成，部署在 Kubernetes 上，弹性伸缩已在凌晨 23:50 提前触发，各服务副本数从平时的 5 个扩到了 30 个。数据库是 MySQL 8.0.32，部署在阿里云 RDS 规格 16C64G，`max_connections` 按官方建议配置为 2500。应用侧使用 HikariCP 连接池，每个服务实例配置了 `maximumPoolSize=10`。\n\n**问题要求**：\n\n请分析：连接数为什么会在短时间内从 200 暴涨到 2000？在这个紧急场景下，你的应急处理步骤是什么？事后应该从架构层面做哪些改造，让这类问题不再复生？\n\n回答时请结合具体命令和配置参数，不要停留在概念层面。面试官希望听到你真正处理过这类问题的经验，而不是念一遍数据库文档。",
+      "answer": "## 先理解为什么会爆：连接数的本质公式\n\n很多人第一反应是「大促流量大，所以连接数多」，但这个回答绕过了真正的问题所在。连接数突增的本质公式只有一行：**总连接数 = 应用实例数 × 每实例连接池最大连接数**。\n\n在这个场景里，算术非常清楚：弹性扩容把 6 个服务的副本数从 5 扩到了 30，变化量是 25 个副本；每个副本配置 `maximumPoolSize=10`；6 × 30 × 10 = **1800**，再加上原本 200 个正常连接，总数轻松破 2000。更糟糕的是，HikariCP 的默认行为是启动时就预热连接池，也就是说每个新副本一起来就会立刻尝试建立 10 条连接，而不是等到真正有请求才建。弹性扩容的瞬间，数百条新建连接请求同时打到 MySQL，这就是那条 30 秒内从 200 涨到 2000 的曲线。\n\n理解这个公式很重要，因为它告诉你：**这不是数据库的问题，是架构设计时没有把「弹性扩容」和「数据库连接容量」放在一起考虑**。团队计算了服务能扛多少 QPS，却忘了算扩容后总连接数会不会撑爆数据库。\n\n数据库连接是真正的稀缺资源。每条 MySQL 连接在服务端会创建一个独立的操作系统线程（使用 one-thread-per-connection 模式），占用约 256KB 的线程栈内存，加上连接状态、缓存等，实际开销通常在 1-2MB 之间。2500 条连接意味着 MySQL 要同时维护 2500 个线程，光内存就去掉 2-5GB，再加上线程调度开销，数据库的性能早就在连接数到达上限前就开始明显下降了。\n\n---\n\n## 应急处理：先止血，再排查\n\n报警到来的那一刻，你的首要目标不是彻底修复，而是把错误率从 18% 降下来，让大促能继续跑。止血分三步走。\n\n**第一步，摸清现场**。登录数据库，第一条命令就是 `SHOW PROCESSLIST`，但这个命令在 2000 条连接下输出会非常长，更实用的是直接查 `information_schema`：\n\n```sql\n-- 按用户和来源 host 统计连接数，快速找到异常来源\nSELECT user, host, count(*) AS cnt, \n       SUM(IF(command='Sleep', 1, 0)) AS idle_cnt\nFROM information_schema.processlist\nGROUP BY user, host\nORDER BY cnt DESC;\n```\n\n这条查询通常会直接告诉你是哪几个服务的哪些实例在占用最多连接。`idle_cnt` 特别重要——如果一个 host 有 100 条连接但 90 条都是 Sleep 状态，说明这些连接根本没在干活，只是连接池持有着不释放。\n\n同时查一下全局状态，确认当前 threads_connected：\n\n```sql\nSHOW STATUS LIKE 'Threads_connected';\nSHOW STATUS LIKE 'Threads_running';  -- 真正在执行查询的线程数\n```\n\n`Threads_connected` 是总连接数，`Threads_running` 才是真正在跑 SQL 的线程数。如果 connected=2000 但 running=30，说明大量连接是空闲的，可以直接 KILL。\n\n**第二步，紧急释放连接**。对于大量空闲（Sleep）的连接，直接 KILL 是最快的方法。注意不要 KILL 所有连接，只 KILL Sleep 时间较长的那些：\n\n```sql\n-- 生成 KILL 语句并执行，KILL Sleep 超过 60 秒的连接\nSELECT CONCAT('KILL ', id, ';') \nFROM information_schema.processlist\nWHERE command = 'Sleep' \n  AND time > 60\n  AND user != 'replication'  -- 不要 KILL 复制线程\nINTO OUTFILE '/tmp/kill_conns.sql';\n\nSOURCE /tmp/kill_conns.sql;\n```\n\n与此同时，临时上调 `max_connections` 争取更多喘息时间：\n\n```sql\n-- 这是一个临时的救命操作，记得评估内存是否够用\n-- 16C64G 的实例，3000 条连接约多占 1-2GB 内存，通常没问题\nSET GLOBAL max_connections = 3000;\n```\n\n**第三步，从应用侧限流**。光在数据库侧 KILL 连接是治标不治本，新连接还在源源不断地进来。需要同时通知应用层限流：在 Kubernetes 里快速缩减副本数，或者触发限流降级开关，让部分请求快速失败（fail fast）而不是排队等待连接，避免请求堆积导致雪崩。如果公司有服务网格（比如 Istio），可以直接在 VirtualService 里临时调低对数据库服务的并发限制。\n\n---\n\n## 中期方案：在应用和数据库之间加一层代理\n\n应急过后，最重要的架构改造是引入**连接代理（Connection Proxy）**。这一层的核心价值是「连接复用」——它把应用侧的大量短生命周期连接，收拢成数据库侧少量的长连接。\n\n**ProxySQL** 是 MySQL 生态最成熟的代理方案。它的连接复用原理是这样的：应用连接到 ProxySQL（通常监听 6033 端口），ProxySQL 维护一个到后端 MySQL 的连接池。1000 个应用连接可以复用 50 条到数据库的真实连接，因为大多数应用连接在任意时刻都是空闲的。ProxySQL 还额外提供了读写分离、SQL 路由、查询缓存、故障自动转移等能力，是一个值得在生产中长期维护的组件。\n\n```\n# ProxySQL 连接复用架构示意\n\n应用层（K8s）                ProxySQL              MySQL 主库\n─────────────                ─────────             ──────────\nService-A × 30 ──┐                                \nService-B × 30 ──┤──→ 6033端口 ──→ 连接池复用 ──→  max 50 条真实连接\nService-C × 30 ──┤   (900个应用连接)  │\nService-D × 30 ──┘                   └──→ 读库\n                                          max 50 条真实连接\n\n效果：数据库侧真实连接从 900 → 50 + 50 = 100\n```\n\nProxySQL 的配置核心在 `mysql_variables` 表中控制后端连接池大小：\n\n```sql\n-- 设置 ProxySQL 到后端 MySQL 的最大连接数\nUPDATE global_variables \nSET variable_value = '50' \nWHERE variable_name = 'mysql-max_connections';\n\n-- 每个 hostgroup（主库/从库）的连接数上限\nINSERT INTO mysql_servers (hostgroup_id, hostname, port, max_connections)\nVALUES (0, '10.0.0.1', 3306, 50),   -- 主库\n       (1, '10.0.0.2', 3306, 200);  -- 从库（读流量大，可以给多一些）\n\nLOAD MYSQL SERVERS TO RUNTIME;\nSAVE MYSQL SERVERS TO DISK;\n```\n\n**PgBouncer** 是 PostgreSQL 生态对应的方案，但它的连接池模式值得特别理解，因为面试官非常爱问这个。PgBouncer 有三种模式，性能和兼容性刚好是反比关系。Session 模式下，客户端连接和后端连接一一对应，连接复用效果最差，但完全兼容所有 PostgreSQL 特性，包括 `SET` 语句和临时表。Transaction 模式下，一条后端连接可以被多个客户端连接轮流使用，但每次只服务一个事务，这是生产中最常用的模式，复用率极高，不过不支持事务外的 `PREPARE` 语句。Statement 模式是最激进的，每条 SQL 执行完就释放后端连接，复用率最高，但几乎不兼容任何有状态的操作。大多数业务选 Transaction 模式，Serverless 场景或者短连接很多的场景下才考虑 Statement。\n\n---\n\n## 架构层面的根治：连接数也需要容量规划\n\n根本解法是把「数据库最大连接数」纳入容量规划体系，和 CPU、内存一样对待。几个具体动作：\n\n**一，缩小应用侧连接池**。HikariCP 的 `maximumPoolSize` 不是越大越好。HikariCP 作者 Brett Wooldridge 的建议是：`pool_size = ((core_count * 2) + effective_spindle_count)`。对于一个 8C 的服务实例，连接池大小设 10 已经足够，很多场景设 5 反而能减少锁竞争提升吞吐量。大家习惯性配 50 甚至 100，往往是「以防万一」的心理，实际上是在浪费数据库资源。\n\n**二，弹性伸缩策略要考虑数据库容量上限**。在 HPA 配置里加上上限约束，或者在应用启动时从配置中心读取「当前允许的最大实例数」，让业务侧和 DBA 侧共同维护这个上限值。\n\n**三，读写分离**。把读流量（通常占 70-80%）切到只读副本，主库只承担写流量，连接数自然大幅下降。MySQL 8.0 的 Group Replication 加上 ProxySQL 的读写分离规则，可以在不改应用代码的情况下实现透明的读写分离。\n\n**四，Serverless 场景的特殊处理**。如果你的服务部署在 AWS Lambda 或者阿里云函数计算上，每个函数实例都会持有独立连接，实例数可能弹到几千个，这时候即使每个实例只有 1 条连接也会把数据库打穿。AWS 的 RDS Proxy 就是专门为这个场景设计的，它在数据库前面提供了一个托管的连接代理层，Lambda 连接 RDS Proxy 而不是直连 RDS，有效解决 Serverless 的连接数爆炸问题。",
+      "keyPoints": [
+        "数据库连接数突增的本质是「应用实例数 × 每实例连接池最大连接数 = 总连接数」，弹性扩容时忘记考虑数据库侧容量上限是最常见的根因。",
+        "每条 MySQL 连接对应一个 OS 线程，占用约 1-2MB 内存并带来线程调度开销，连接数过多会在到达 max_connections 之前就导致性能显著下降。",
+        "应急处理的核心三步是：用 information_schema.processlist 定位异常连接来源、KILL 空闲超时连接、临时上调 max_connections 并同时从应用侧触发限流降级。",
+        "ProxySQL 和 PgBouncer 等连接代理通过连接复用将「N 个应用连接映射到 M 个数据库连接（N >> M）」，是解决连接数瓶颈最高效的中期架构方案。",
+        "PgBouncer 的 Transaction 模式是生产中最常用的，它以事务为粒度复用后端连接，但不支持事务外的 PREPARE 语句；Session 模式兼容性最好但复用率最低。",
+        "HikariCP 连接池的 maximumPoolSize 推荐参考公式「核心数 × 2 + 有效磁盘数」，而不是凭经验拍一个大数字，过大的连接池反而会因锁竞争降低吞吐量。",
+        "Serverless 场景下每个函数实例持有独立连接，弹性实例数可达数千，必须通过 RDS Proxy（AWS）或等效的托管连接代理来解决，直连数据库是不可行的。",
+        "读写分离可以将占 70-80% 的读流量从主库迁移到只读副本，直接降低主库连接压力；结合 ProxySQL 的路由规则，读写分离可以做到对应用代码完全透明。"
+      ],
+      "quiz": [
+        {
+          "id": "database-connection-surge-1-q1",
+          "question": "某服务有 20 个实例，每个实例 HikariCP 配置 `maximumPoolSize=15`，数据库 `max_connections=400`。此时运营触发弹性扩容到 40 个实例，理论上数据库将收到多少连接请求？",
+          "choices": [
+            { "id": "A", "text": "400 条，受 max_connections 限制不会超过" },
+            { "id": "B", "text": "600 条，40 × 15 = 600，超过 max_connections 导致部分连接建立失败" },
+            { "id": "C", "text": "300 条，扩容前 20 × 15 = 300，扩容后新实例复用已有连接" },
+            { "id": "D", "text": "200 条，HikariCP 默认 minimumIdle=10，所以总连接数是 40 × 10 = 400，再减掉旧实例释放的 200" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "HikariCP 启动时默认会预热连接池到 maximumPoolSize（除非配置了 minimumIdle 更小的值），也就是说每个新实例启动后会立刻尝试建立 15 条数据库连接，40 个实例合计 600 条。这超过了 max_connections=400 的上限，超出部分的连接请求会收到「Too many connections」错误，导致部分服务实例连接池初始化失败甚至启动失败。选项 A 的错误在于 max_connections 是服务端拒绝新连接的阈值，不会替客户端「限流」；选项 C 错误地认为连接池会跨实例复用；选项 D 混淆了 minimumIdle（空闲时维持的最小连接数）和实际建立的连接数。"
+        },
+        {
+          "id": "database-connection-surge-1-q2",
+          "question": "以下哪条 SQL 能最快速地判断数据库中哪个来源 IP 占用了最多连接，以及其中有多少是空闲（Sleep）的？",
+          "choices": [
+            { "id": "A", "text": "SHOW PROCESSLIST" },
+            { "id": "B", "text": "SHOW STATUS LIKE 'Threads_connected'" },
+            { "id": "C", "text": "SELECT host, count(*) as total, SUM(IF(command='Sleep',1,0)) as idle FROM information_schema.processlist GROUP BY host ORDER BY total DESC" },
+            { "id": "D", "text": "SELECT * FROM performance_schema.threads WHERE type='FOREGROUND'" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "选项 C 直接按 host 聚合并区分了活跃连接和空闲连接，一条查询就能定位「谁占了最多连接、其中多少是空闲的」，是应急场景下最高效的手段。选项 A（SHOW PROCESSLIST）在连接数上千时输出会非常长，逐行看效率极低，而且无法直接聚合统计。选项 B 只给出一个全局总数，无法区分来源。选项 D 查的是 performance_schema，信息更全但也更复杂，且 performance_schema 默认可能没有开启或者开启了也有性能开销，应急时不是最优先的工具。"
+        },
+        {
+          "id": "database-connection-surge-1-q3",
+          "question": "执行 `SET GLOBAL max_connections = 3000` 之后，重启 MySQL 实例，max_connections 会是多少？",
+          "choices": [
+            { "id": "A", "text": "3000，SET GLOBAL 会永久生效" },
+            { "id": "B", "text": "恢复到 my.cnf 中配置的值，SET GLOBAL 只是运行时临时修改，重启后失效" },
+            { "id": "C", "text": "151，MySQL 的默认值" },
+            { "id": "D", "text": "取决于操作系统的 ulimit -n 设置，可能比 3000 小" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SET GLOBAL 修改的是 MySQL 运行时的内存变量，重启后 MySQL 会重新读取 my.cnf（或 my.ini），使用配置文件中的值。如果 my.cnf 里写的是 max_connections=2500，重启后就还是 2500，临时改的 3000 就没了。所以应急操作之后，如果确认需要保留更高的连接数上限，必须同时修改 my.cnf 并持久化。选项 A 是常见误解；选项 C 不正确，151 是 MySQL 的编译默认值，但 RDS 等托管服务通常会按规格自动调整；选项 D 说的是另一个知识点（ulimit 会影响 MySQL 能打开的文件描述符数，进而影响连接数上限），但不是重启后 max_connections 的取值逻辑。"
+        },
+        {
+          "id": "database-connection-surge-1-q4",
+          "question": "ProxySQL 实现连接复用的核心机制是什么？",
+          "choices": [
+            { "id": "A", "text": "把多个应用的 SQL 合并成批量请求，减少数据库往返次数" },
+            { "id": "B", "text": "在应用和数据库之间维护少量到数据库的长连接，多个应用连接共享这些长连接，空闲时后端连接不释放" },
+            { "id": "C", "text": "把数据库连接序列化存入 Redis，应用需要时从 Redis 反序列化取出" },
+            { "id": "D", "text": "通过 MySQL 协议的 multiplexing 特性，在一条 TCP 连接上并发发送多条查询" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ProxySQL 的连接复用本质是「多路复用后端连接」：ProxySQL 自己维护一个到 MySQL 的连接池（比如 50 条长连接），当应用侧有 1000 条连接进来时，ProxySQL 调度这 1000 条请求分时共享这 50 条后端连接。因为绝大多数应用连接在任意时刻都是空闲的，50 条后端连接足以满足实际并发查询需求。选项 A 描述的是批量优化，不是连接复用；选项 C 是无稽之谈，连接是有状态的 TCP 会话，无法序列化到 Redis；选项 D 描述的是 HTTP/2 的多路复用概念，MySQL 协议本身不支持这种机制。"
+        },
+        {
+          "id": "database-connection-surge-1-q5",
+          "question": "数据库监控显示：`Threads_connected=1800`，`Threads_running=12`，`Threads_cached=0`。这组数据说明了什么问题？",
+          "choices": [
+            { "id": "A", "text": "数据库压力极大，1800 个线程都在处理查询，是性能瓶颈" },
+            { "id": "B", "text": "绝大多数连接处于空闲状态（1800 个连接中只有 12 个在执行查询），连接数虚高是因为应用侧连接池持有连接不释放" },
+            { "id": "C", "text": "thread_cache_size 设置为 0，导致每次查询都要新建线程，性能差" },
+            { "id": "D", "text": "数据库遇到了锁等待，1800 - 12 = 1788 个线程都在等锁" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Threads_running 表示当前真正在执行 SQL 的线程数，Threads_connected 是所有已建立的连接数（包括空闲连接）。1800 connected vs 12 running，说明有 1788 条连接处于 Sleep（空闲等待）状态，是应用侧连接池的长连接在「占着茅坑」。这是典型的「连接数虚高」场景，数据库本身的 CPU 和 IO 压力不一定大，但占用了大量文件描述符和内存。选项 A 混淆了 connected 和 running；选项 C 关于 thread_cache 的描述混淆了概念，Threads_cached=0 只是说线程缓存中没有缓存的空闲线程，不代表 thread_cache_size=0；选项 D 锁等待会体现在 Threads_waiting 或者 SHOW PROCESSLIST 的 State 列，不能仅从 connected-running 推断。"
+        },
+        {
+          "id": "database-connection-surge-1-q6",
+          "question": "HikariCP 的 `minimumIdle` 参数设置为 2，`maximumPoolSize` 设置为 20。在低流量时段，这个连接池通常会维持多少条到数据库的连接？",
+          "choices": [
+            { "id": "A", "text": "20 条，maximumPoolSize 是连接池大小，始终维持满额" },
+            { "id": "B", "text": "2 条，低流量时连接池会缩减到 minimumIdle 配置的下限" },
+            { "id": "C", "text": "0 条，没有请求时连接池会完全关闭所有连接" },
+            { "id": "D", "text": "10 条，HikariCP 默认取 minimumIdle 和 maximumPoolSize 的平均值" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "HikariCP 在低流量时会将连接池收缩到 minimumIdle 配置的数量，空闲超过 idleTimeout（默认 600 秒）的连接会被关闭，直到达到 minimumIdle 下限。这是 HikariCP 的动态连接池特性，有助于在低峰期减少对数据库的资源占用。但这也带来一个生产常见的坑：minimumIdle 设得太小（比如 0 或 1），低峰期所有连接被回收，流量突然上来时需要重新建立连接，有短暂的连接建立耗时（通常 10-50ms），可能导致第一批请求延迟突增。HikariCP 官方推荐直接把 minimumIdle 设成和 maximumPoolSize 一样，使用固定大小的连接池，避免动态收缩带来的问题。"
+        },
+        {
+          "id": "database-connection-surge-1-q7",
+          "question": "PgBouncer 的 Transaction 模式和 Session 模式的核心区别是什么？",
+          "choices": [
+            { "id": "A", "text": "Transaction 模式性能更高，且完全向下兼容 Session 模式，生产应该总是优先选 Transaction 模式" },
+            { "id": "B", "text": "Session 模式下客户端连接独占后端连接直到断开，Transaction 模式下后端连接在每个事务结束后释放回池，复用率更高但不支持事务外的 SET 和 PREPARE" },
+            { "id": "C", "text": "Transaction 模式只支持只读事务，Session 模式支持读写事务" },
+            { "id": "D", "text": "两者区别只在于空闲超时时间，Transaction 模式超时更短" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 PgBouncer 最重要的概念区分。Session 模式下，客户端一旦建立连接，就独占一条到 PostgreSQL 的后端连接，直到客户端断开，这和没有代理几乎等价，连接复用效果很差。Transaction 模式下，每次事务提交或回滚后，后端连接就归还到连接池，下一个请求可以用它。复用率可以从 1:1 提升到几十:1。但 Transaction 模式有一个关键限制：不能在事务外使用 PREPARE/EXECUTE（prepared statements）、不能使用 `SET` 修改会话变量、不能使用监听/通知（LISTEN/NOTIFY）。很多使用 ORM 的应用会在连接建立后执行 `SET timezone`、`SET search_path` 等语句，这些在 Transaction 模式下会失效。选项 A 的「完全兼容」表述是错误的，这个陷阱在生产迁移时非常容易踩到。"
+        },
+        {
+          "id": "database-connection-surge-1-q8",
+          "question": "在大促期间，DBA 建议「临时把 wait_timeout 从 28800 秒改成 30 秒」，这个操作的目的和潜在风险是什么？",
+          "choices": [
+            { "id": "A", "text": "目的是让 MySQL 更快地关闭空闲连接释放资源；风险是可能断掉正在执行长事务的连接" },
+            { "id": "B", "text": "目的是提升查询速度；风险是缩短了 SQL 执行超时时间导致正常查询失败" },
+            { "id": "C", "text": "目的是减少慢查询；风险是过短的超时会导致所有超过 30 秒的 SQL 强制中断" },
+            { "id": "D", "text": "目的是强制应用重连以刷新连接池；风险是短时间内大量重连会造成二次连接风暴" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "wait_timeout 控制的是非交互式连接（应用程序连接）的空闲超时时间，超过这个时间没有任何请求的连接会被 MySQL 服务端主动关闭。把它从 28800 秒（8 小时）改成 30 秒，意味着空闲超过 30 秒的连接会被踢掉，能快速清除那些「占着茅坑」的空闲连接，是应急释放连接数的有效手段。主要风险有两点：一是如果应用有真正在执行的长事务（比如跑了 60 秒的批量更新），空闲判断可能不会触发（因为有活跃查询），但需要谨慎确认；二是选项 D 提到的重连风暴确实是潜在风险，但 30 秒的超时下，连接是逐渐断开而不是同时断开，通常不会造成同步的重连风暴。注意 wait_timeout 和 interactive_timeout（控制 MySQL 客户端的空闲超时）是两个不同参数。"
+        },
+        {
+          "id": "database-connection-surge-1-q9",
+          "question": "AWS Lambda 函数直连 RDS MySQL，并发执行 500 个 Lambda 函数实例，每个实例创建 1 条数据库连接。此时 RDS 的连接数是多少？如何解决？",
+          "choices": [
+            { "id": "A", "text": "500 条连接；通过 Lambda 层（Lambda Layer）共享连接池来解决" },
+            { "id": "B", "text": "500 条连接；使用 RDS Proxy，让 Lambda 连接 RDS Proxy 而非直连 RDS，Proxy 负责连接复用" },
+            { "id": "C", "text": "1 条连接；Lambda 函数共享同一个执行环境，天然共享连接" },
+            { "id": "D", "text": "500 条连接；把 RDS 换成 Aurora Serverless 自动解决连接数问题" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "AWS Lambda 每个并发实例是独立的执行环境，每个实例有自己的内存空间，无法共享 TCP 连接，所以 500 个并发实例就是 500 条连接，Lambda 并发峰值能到几千，直连 RDS 的连接数会直接把数据库打穿。RDS Proxy 是 AWS 为这个场景专门提供的托管连接代理，Lambda 连接 RDS Proxy（毫秒级建连）而不是直连 RDS，RDS Proxy 内部维护少量到 RDS 的长连接并做复用。选项 A 的 Lambda Layer 是代码共享机制，不能跨实例共享连接；选项 C 是错误的，Lambda 实例之间完全隔离；选项 D 的 Aurora Serverless v2 确实可以自动扩缩容，但连接数问题依然存在，它并不内置连接复用，大量并发同样会超过 max_connections。"
+        },
+        {
+          "id": "database-connection-surge-1-q10",
+          "question": "事后复盘时，你发现某个微服务的 HikariCP 日志中频繁出现 `Connection is not available, request timed out after 30000ms`，但此时数据库连接数只有 150，远未到上限。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "网络延迟过高导致连接超时" },
+            { "id": "B", "text": "该服务的 maximumPoolSize 配置过小，连接池里所有连接都在忙，新请求排队等待超时" },
+            { "id": "C", "text": "MySQL 的 max_connections 配置有误，实际上限比显示的低" },
+            { "id": "D", "text": "HikariCP 版本过低存在 Bug，需要升级" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「Connection is not available, request timed out」是 HikariCP 连接池耗尽的经典报错，含义是「等待从池中获取一条可用连接，等了 connectionTimeout（默认 30 秒）还没等到，放弃」。数据库总连接数 150 只是全局视角，对于单个服务实例来说，如果它的 maximumPoolSize=5，但当前有 5 条连接都被慢查询或者事务长时间占用，第 6 个请求就会等待，超时后就报这个错。排查方向是：查看这个服务实例的 HikariCP metrics（jmx 或 prometheus 暴露的 hikaricp_connections_active 和 hikaricp_connections_pending），如果 active 长期等于 maximumPoolSize 而 pending 在累积，就是连接池配置太小或者有慢查询/长事务在拖着连接不释放。"
+        }
+      ],
+      "references": [
+        "https://proxysql.com/documentation/",
+        "https://www.pgbouncer.org/",
+        "https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing",
+        "https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/too-many-connections.html"
+      ]
+    }
+  ]
+}
