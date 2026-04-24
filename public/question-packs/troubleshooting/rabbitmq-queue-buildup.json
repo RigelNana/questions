@@ -1,0 +1,159 @@
+{
+  "id": "rabbitmq-queue-buildup",
+  "name": "RabbitMQ 队列堆积排查",
+  "domain": "troubleshooting",
+  "description": "排查 RabbitMQ 消息大量堆积的原因，掌握 prefetch、惰性队列与消费者扩容策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "rabbitmq-queue-buildup-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["rabbitmq", "queue", "prefetch", "consumer", "memory", "backlog", "lazy-queue"],
+      "title": "RabbitMQ 队列堆积 50 万消息且内存告警，如何排查和快速恢复？",
+      "content": "## 故障现象\n\n凌晨三点，告警群里炸了。你们的 RabbitMQ 管理界面（`http://mq-host:15672`）显示订单处理队列 `order.process` 的 **Messages Ready** 数字突破了 50 万，并且还在以每秒数百条的速度爬升。更糟糕的是，内存告警也随之触发了——RabbitMQ 节点的内存使用率已经超过了阈值，管理界面顶部出现了红色横幅：`memory alarm`。\n\n此时的系统状态是这样的：生产者服务（订单服务集群，8 个实例）运行正常，日志里看不到任何报错，消息发送速率维持在 **1200 msg/s**。消费者服务（库存扣减服务，4 个实例）也都在线，`rabbitmqctl list_consumers` 显示 4 个消费者都处于 `active` 状态，但消费速率只有可怜的 **80 msg/s**——生产速度是消费速度的 15 倍。\n\n堆积还在增长，内存告警已经触发，但你不知道问题出在哪里。消费者看起来活着，但为什么消费这么慢？你首先应该做什么？\n\n```\n# 管理界面此时的队列状态大致如下\nname             messages   consumers   state\norder.process    512847     4           running\norder.dead       23         0           running\n```\n\n你打开其中一个消费者实例的日志，没有看到任何异常。你连上 RabbitMQ 节点执行 `rabbitmqctl list_queues name messages_ready messages_unacknowledged consumers`，发现了一个有意思的数字。请描述你完整的排查思路和恢复步骤。",
+      "answer": "## RabbitMQ 基础：消息从生产到消费的完整旅程\n\nRabbitMQ 的消息流转模型乍看简单，但正是这个模型的细节决定了队列堆积时问题出在哪里。消息从生产者发出后，首先进入 **Exchange**（交换机）。Exchange 本身不存储消息，它根据类型（direct、topic、fanout、headers）和 binding key 把消息路由到一个或多个 **Queue**。Queue 才是消息真正的存放地，消费者通过 AMQP 协议订阅 Queue，RabbitMQ 把消息推送给消费者。\n\n队列有两个关键属性经常被忽视。第一个是 **durable**（持久化声明）：`durable=true` 只意味着队列本身在 RabbitMQ 重启后还存在，但队列里的消息默认是不持久化的。要让消息也在重启后保留，生产者发送时必须把消息的 `delivery_mode` 设为 2（persistent）。这两个开关是独立的，很多人以为声明了 durable 队列就万事大吉，结果 Broker 重启后消息全没了。第二个是消费者的 **prefetch count**，也叫 `basic.qos`。这个参数控制 RabbitMQ 在收到消费者的 ack 之前，最多可以推送给该消费者多少条「未确认」消息。\n\nprefetch count 是理解本次故障的核心。当你声明 `channel.basic_qos(prefetch_count=500)` 时，意味着 RabbitMQ 可以一次性把 500 条消息推给这个消费者，而不等待 ack。消费者把这 500 条消息放在本地缓冲区里慢慢处理，在这期间其他消费者是拿不到这 500 条消息的——它们对 Broker 来说处于「已投递未确认」状态（unacknowledged）。\n\n这就直接连到了 RabbitMQ 的内存告警机制。RabbitMQ 默认有一个参数 `vm_memory_high_watermark`，默认值是 `0.4`，意思是当节点内存使用量达到系统总内存的 40% 时，RabbitMQ 会触发 **flow control**，开始 **block 所有生产者连接**。注意是 block，不是报错：生产者的 TCP 连接会被暂停，发送调用会阻塞住，直到内存压力降低。如果你不了解这个机制，看到生产者突然「卡住」会非常困惑。\n\n## 排查步骤：从现象到根因\n\n拿到这个告警之后，第一步不是乱改配置，而是先把现状摸清楚。\n\n**第一步，看节点健康状态。** 执行 `rabbitmq-diagnostics status` 或 `rabbitmqctl status`，重点关注 `memory` 和 `disk_free` 两个数字。如果内存告警已经触发，你会看到类似 `{memory_alarm,true}` 的输出。同时注意磁盘剩余空间——RabbitMQ 还有一个 `disk_free_limit`，默认要求磁盘剩余不低于 50MB，磁盘不够同样会触发告警并阻塞生产者。\n\n**第二步，细看队列的 unack 数量。** 这是关键命令：\n\n```bash\n# 查看每个队列的详细状态\nrabbitmqctl list_queues name messages messages_ready messages_unacknowledged consumers\n\n# 预期输出（问题场景）\nname                  messages   messages_ready   messages_unacknowledged   consumers\norder.process         512847     510847           2000                      4\norder.dead            23         23               0                         0\n```\n\n看到这个输出，关键信息就出来了：512847 条消息里，有 2000 条处于 unacknowledged 状态，正好是 4 个消费者 × 500 prefetch。其他 510847 条消息虽然在队列里，但此刻处于 ready 状态——也就是说，消费者根本没有在积极消费。\n\n**第三步，看消费者的具体状态。**\n\n```bash\n# 查看消费者的 prefetch 和 ack 模式\nrabbitmqctl list_consumers\n\n# 输出示例（每行代表一个消费者）\nqueue        consumer_tag  channel_pid  ack_required  prefetch_count  active\norder.process  ctag-1       <0.123.0>   true          500             true\norder.process  ctag-2       <0.124.0>   true          500             true\norder.process  ctag-3       <0.125.0>   true          500             true\norder.process  ctag-4       <0.126.0>   true          500             true\n```\n\n`ack_required=true` 说明是手动 ack 模式，prefetch_count=500。这意味着每个消费者拿走了 500 条消息后，如果处理速度慢，就不会释放 ack，其他消费者也拿不到新消息。4 个消费者各拿 500 条，共 2000 条消息被「锁」在了消费者端。但整个队列有 50 万条，为什么只有 2000 条被消费者持有？\n\n真正的根因往往在这里：消费者的下游依赖出了问题。库存扣减服务需要调用数据库，如果数据库响应变慢（比如出现了慢查询、连接池耗尽），消费者处理每条消息从正常的 10ms 变成了 6 秒。4 个消费者 × 500 prefetch，每条处理 6 秒，吞吐量就只有 4×500/6 ≈ 333 msg/s。但我们看到的是 80 msg/s，说明处理时间更长，或者有消费者根本卡住了在等待 ack。\n\n还有一种常见场景：代码里因为异常分支导致消息永远没有被 ack，消费者把 prefetch count 的配额全部占满之后进入「假死」状态——看起来 active，但实际上在等待那批永远不会完成的消息超时。\n\n## 恢复措施：按轻重缓急操作\n\n排查清楚根因之后，恢复分两个层次：先快速止血，再彻底修复。\n\n**临时止血——扩消费者实例。** 如果下游依赖的慢查询是偶发的，或者你能判断消费者处理能力确实不够，最快的方式是扩容消费者实例。新实例启动后会注册新的消费者，RabbitMQ 会把 ready 消息分发给它们。\n\n**修复 prefetch count——这是最重要的配置修复。** prefetch=500 的问题在于一旦消费者处理变慢，大量消息被「锁」在消费者端，其他消费者无法接手。生产环境的推荐配置是 prefetch=1（保证完全公平调度，任何一个消费者只有 ack 了当前消息才会收到下一条）或者根据处理速度设置一个合理的小值（比如 10-50）。修改方式：\n\n```python\n# Python pika 示例\nimport pika\n\nconnection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))\nchannel = connection.channel()\n\n# 关键：在 basic_consume 之前设置 prefetch\n# prefetch_count=1 保证公平调度，消费者处理完一条才接收下一条\nchannel.basic_qos(prefetch_count=1)\n\ndef callback(ch, method, properties, body):\n    # 处理消息\n    process_message(body)\n    # 必须手动 ack，否则消息在消费者断开后才会重新入队\n    ch.basic_ack(delivery_tag=method.delivery_tag)\n\nchannel.basic_consume(queue='order.process', on_message_callback=callback)\nchannel.start_consuming()\n```\n\n```java\n// Java Spring AMQP 示例\n@Bean\npublic SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(\n        ConnectionFactory connectionFactory) {\n    SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();\n    factory.setConnectionFactory(connectionFactory);\n    // 设置合理的 prefetch，避免消息堆积在消费者本地\n    factory.setPrefetchCount(10);\n    // 手动 ack 模式\n    factory.setAcknowledgeMode(AcknowledgeMode.MANUAL);\n    return factory;\n}\n```\n\n**处理已堆积的消息。** 如果 50 万消息是有效的、必须处理的，那就扩容消费者慢慢消化。如果是测试数据或者已经过期的消息，可以用 `rabbitmqctl purge_queue order.process` 直接清空——这个操作是不可逆的，谨慎执行。更优雅的方案是为队列设置 `x-message-ttl`（消息过期时间）和死信队列（DLX），让超时消息自动流入死信队列而不是永远堆积。\n\n**处理内存告警。** 如果内存告警导致生产者被阻塞，有两个临时手段：一是调高 watermark 阈值，`rabbitmqctl set_vm_memory_high_watermark 0.6`（临时生效，重启失效）；二是手动触发垃圾回收，`rabbitmqctl eval 'erlang:garbage_collect().'`。但这都是临时措施，根本解法还是降低队列的内存占用。\n\n## 进阶：惰性队列、死信队列与高可用\n\n解决了眼前的堆积问题之后，有几个架构层面的优化值得认真考虑。\n\n**惰性队列（Lazy Queue）** 是 RabbitMQ 3.6 引入的特性，在 3.12 之后成为默认行为。普通队列会把消息尽可能保存在内存里（以提高吞吐量），惰性队列则相反——消息直接写到磁盘，只在消费者需要时才加载到内存。对于像订单处理这类消息量大、消费可能滞后的场景，惰性队列能大幅降低内存压力：\n\n```bash\n# 声明惰性队列\nrabbitmqctl set_policy lazy-policy \"^order\\.\" \\\n  '{\"queue-mode\":\"lazy\"}' --apply-to queues\n```\n\n**死信队列（DLX，Dead Letter Exchange）** 是处理消费失败消息的标准做法。当一条消息被消费者 nack 并且 `requeue=false`、或者消息 TTL 过期、或者队列已满，消息会被路由到 DLX 关联的队列。通过 DLX 可以实现：失败消息不丢失（进死信队列等待人工处理）、消息延迟重试（TTL + DLX 的经典组合）等能力。\n\n**关于高可用队列的选择。** RabbitMQ 3.8 引入了 **Quorum Queue**（仲裁队列），用 Raft 协议代替了老的 Classic Mirrored Queue（镜像队列）。镜像队列的问题在于同步是异步的，leader 宕机时 follower 可能有数据丢失；Quorum Queue 要求多数节点确认才算写入成功，数据安全性更高。3.9 之后官方明确建议新场景用 Quorum Queue，镜像队列已进入 deprecated 状态。如果你的 RabbitMQ 还在用镜像队列，这是一个应该计划迁移的技术债。\n\n最后一个容易忽视的细节：`x-max-length` 和溢出策略。为高优先级队列设置最大长度上限，配合 `x-overflow: drop-head`（丢弃最旧消息）或 `x-overflow: reject-publish`（拒绝新消息），可以作为堆积失控时的最后防线，避免 RabbitMQ 节点因内存耗尽而崩溃。",
+      "keyPoints": [
+        "RabbitMQ 消息流转为「生产者 → Exchange → Queue → 消费者」，Exchange 不存储消息只做路由，消费者通过 AMQP 订阅 Queue，Broker 主动推送消息给消费者。",
+        "队列 durable 和消息 delivery_mode=2 是两个独立配置，durable 只保证队列元数据持久化，消息本身持久化需要生产者单独设置 persistent，两者缺一不可。",
+        "prefetch count（basic.qos）控制 Broker 在等待 ack 之前最多推送给单个消费者的消息数量，设置过大会导致消息集中在少数消费者的本地缓冲区而无法被其他消费者消费，造成虚假堆积。",
+        "RabbitMQ 内存告警阈值 vm_memory_high_watermark 默认为 0.4，超过时 Broker 会 block 所有生产者连接而非报错，生产者发送调用会阻塞等待，这是很多人第一次遇到时困惑的根源。",
+        "排查队列堆积的关键命令是 rabbitmqctl list_queues name messages messages_ready messages_unacknowledged consumers，messages_unacknowledged 过高说明消费者拿走了消息但没有 ack，通常是 prefetch 过大或消费者处理卡死。",
+        "惰性队列（Lazy Queue）将消息直接写磁盘而非保存在内存，RabbitMQ 3.12 之后为默认模式，适合消息量大、消费可能滞后的场景，能有效避免因队列堆积导致的内存告警。",
+        "Quorum Queue 使用 Raft 协议实现多数派写入确认，数据安全性高于老的 Classic Mirrored Queue，RabbitMQ 3.9 之后官方明确推荐新场景使用 Quorum Queue，镜像队列已进入废弃状态。",
+        "死信队列（DLX）配合消息 TTL 是实现延迟重试和过期消息兜底的标准模式，消费失败的消息 nack 后路由到 DLX，避免消息堆积在原队列或直接丢失。"
+      ],
+      "quiz": [
+        {
+          "id": "rabbitmq-queue-buildup-q1",
+          "question": "RabbitMQ 中，生产者发送的消息经过什么路径最终到达消费者？",
+          "choices": [
+            { "id": "A", "text": "生产者 → Queue → Exchange → 消费者" },
+            { "id": "B", "text": "生产者 → Exchange → Queue → 消费者" },
+            { "id": "C", "text": "生产者 → Broker → 消费者（Queue 是可选的）" },
+            { "id": "D", "text": "生产者 → Exchange → 消费者（Exchange 直接存储消息）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "RabbitMQ 的标准消息流转是「生产者 → Exchange → Queue → 消费者」。Exchange 是路由层，根据类型（direct/topic/fanout）和 binding key 决定消息去哪个 Queue，Exchange 本身不存储消息。Queue 才是消息真正的存放地，消费者订阅 Queue 后由 Broker 主动推送消息。选项 A 把 Exchange 和 Queue 的顺序搞反了；选项 C 说 Queue 是可选的，实际上消息必须经过 Queue 才能被消费；选项 D 说 Exchange 直接存储消息，完全错误。"
+        },
+        {
+          "id": "rabbitmq-queue-buildup-q2",
+          "question": "声明一个 durable=true 的队列，并在生产者发送消息时不设置 delivery_mode，RabbitMQ 重启后会发生什么？",
+          "choices": [
+            { "id": "A", "text": "队列和消息都能恢复，因为 durable=true 已经保证了所有持久化" },
+            { "id": "B", "text": "队列元数据能恢复，但队列里的消息全部丢失" },
+            { "id": "C", "text": "队列和消息都丢失，因为单独设置 durable 无效" },
+            { "id": "D", "text": "队列能恢复，消息有 50% 的概率丢失（取决于是否触发了刷盘）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "durable=true 和消息持久化是两个独立配置，经常被混淆。durable 只让 RabbitMQ 在重启后重建队列的元数据（队列定义、binding 关系等），队列本身不会消失。但消息本身默认是 transient（delivery_mode=1），保存在内存中，节点重启后内存数据清空，消息随之消失。要让消息也在重启后保留，生产者必须在发布时把消息属性的 delivery_mode 设为 2（persistent）。两个配置缺一不可。"
+        },
+        {
+          "id": "rabbitmq-queue-buildup-q3",
+          "question": "执行 rabbitmqctl list_queues name messages messages_ready messages_unacknowledged consumers 后发现：messages=500000，messages_ready=498000，messages_unacknowledged=2000，consumers=4。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "消费者全部离线，消息无法被消费" },
+            { "id": "B", "text": "每个消费者设置了 prefetch_count=500，2000 条消息被 4 个消费者各自持有但处理极慢" },
+            { "id": "C", "text": "RabbitMQ 内存告警导致消息推送暂停，所以 unack 数量很低" },
+            { "id": "D", "text": "队列使用了惰性模式，消息在磁盘上无法快速推送给消费者" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "consumers=4 排除了选项 A（消费者存在）。messages_unacknowledged=2000 恰好是 4 个消费者 × 500 prefetch_count 的结果，这是 prefetch 过大导致消息「锁」在消费者本地的典型特征。消费者拿走了 2000 条消息在本地慢慢处理，而剩余的 498000 条 ready 消息因为消费者的 prefetch 配额已满而无法被新推送。选项 C 有迷惑性，内存告警会阻塞生产者而非影响消息推送到消费者。选项 D 惰性队列影响的是内存使用，不会直接造成这种 unack 分布。"
+        },
+        {
+          "id": "rabbitmq-queue-buildup-q4",
+          "question": "RabbitMQ 的 vm_memory_high_watermark 默认值是 0.4，触发告警后 Broker 会如何响应？",
+          "choices": [
+            { "id": "A", "text": "Broker 立即停止服务，需要手动重启并清空队列" },
+            { "id": "B", "text": "Broker 开始丢弃新进入的消息，直到内存压力降低" },
+            { "id": "C", "text": "Broker 阻塞所有生产者连接，暂停接收新消息，但消费者仍可继续消费" },
+            { "id": "D", "text": "Broker 自动把内存中的消息 spill 到磁盘，不影响生产者" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 RabbitMQ 内存保护机制的关键细节，很多人误以为 Broker 会直接崩溃或丢消息。实际上触发 vm_memory_high_watermark 后，RabbitMQ 会向所有生产者发送 AMQP block 信号（Connection.Blocked），生产者的 TCP 连接被暂停，发送调用会阻塞等待，而不是报错或丢消息。与此同时，消费者仍然可以继续从队列中消费消息，消费行为不受影响。这个设计的目的是给 Broker 一个喘息的机会：通过消费者慢慢消化队列里的消息来释放内存，而不是让 Broker 因内存耗尽而直接崩溃。"
+        },
+        {
+          "id": "rabbitmq-queue-buildup-q5",
+          "question": "以下 rabbitmqctl list_consumers 的输出中，哪个消费者的配置最容易导致队列堆积且难以发现？\n\n```\nconsumer_tag  ack_required  prefetch_count\nctag-A        false         0\nctag-B        true          1\nctag-C        true          500\nctag-D        true          0\n```",
+          "choices": [
+            { "id": "A", "text": "ctag-A（ack_required=false 即自动 ack，消息可能被处理前就丢失）" },
+            { "id": "B", "text": "ctag-B（prefetch=1 会导致吞吐量极低，形成速度堆积）" },
+            { "id": "C", "text": "ctag-C（prefetch=500 消费者一次拿走 500 条，处理慢时其他消费者无法接手）" },
+            { "id": "D", "text": "ctag-D（prefetch=0 表示无限制，消费者会把所有消息一次性全拉走导致内存爆炸）" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "prefetch_count=0 在 RabbitMQ 中表示不限制，Broker 会把队列中所有 ready 的消息全部推给这个消费者。在有 50 万条消息的场景下，这个消费者瞬间就会拿走几十万条消息全部放在本地内存缓冲区，同时 Broker 端这些消息状态变为 unacknowledged，其他消费者完全拿不到消息。更危险的是消费者端的内存会急剧膨胀，可能导致消费者进程 OOM。ctag-C 的 prefetch=500 虽然也偏大，但还有上限；ctag-A 的自动 ack 是消息可靠性风险而非堆积风险；ctag-B 的 prefetch=1 会降低吞吐但不会造成堆积。"
+        },
+        {
+          "id": "rabbitmq-queue-buildup-q6",
+          "question": "消费者代码使用手动 ack 模式（ack_required=true），但由于一个 try-catch 块把异常吞掉了，导致某些消息的处理函数退出时既没有调用 basic_ack 也没有调用 basic_nack。这些消息会怎样？",
+          "choices": [
+            { "id": "A", "text": "消息立即重新进入队列变成 ready 状态，可以被其他消费者消费" },
+            { "id": "B", "text": "消息永远保持 unacknowledged 状态，直到该消费者的 TCP 连接断开或 channel 关闭" },
+            { "id": "C", "text": "消息在 30 秒超时后自动被 broker 确认并丢弃" },
+            { "id": "D", "text": "消息触发 basic_return，被路由到 alternate exchange" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是手动 ack 模式最常见的坑。RabbitMQ 不会对 unacknowledged 消息设置超时（除非配置了 consumer_timeout，默认不启用）。消息会一直保持 unacknowledged 状态，持续占用消费者的 prefetch 配额和 Broker 的内存，直到该消费者的 TCP 连接或 channel 关闭。连接关闭后，这批消息才会重新进入队列变成 ready。这就是为什么一个有 bug 的消费者可能导致大量消息被「锁死」——消费者看起来活着（连接在线），但那批消息永远不会被 ack，prefetch 配额被占满后消费者也不会收到新消息。排查时一定要对比 messages_unacknowledged 和 prefetch_count 的关系。"
+        },
+        {
+          "id": "rabbitmq-queue-buildup-q7",
+          "question": "在 prefetch_count=1 和 prefetch_count=100 两种配置下，假设消费者处理每条消息需要 10ms，单个消费者的最大理论吞吐量哪个更高？",
+          "choices": [
+            { "id": "A", "text": "两者相同，因为处理速度取决于消费者代码，prefetch 只影响分发策略" },
+            { "id": "B", "text": "prefetch=1 更高，因为公平调度减少了消息积压" },
+            { "id": "C", "text": "prefetch=100 更高，因为消费者可以流水线式处理，减少了等待 Broker 推送消息的网络 RTT" },
+            { "id": "D", "text": "prefetch=100 更高，但只有消费者是多线程时才有效" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "prefetch 本质上是一个流水线深度控制。prefetch=1 时，消费者处理完消息发 ack，然后等待 Broker 推送下一条，每条消息之间有一个网络 RTT（通常 0.5~2ms）。prefetch=100 时，Broker 可以提前把 100 条消息推到消费者本地缓冲区，消费者处理完一条立刻可以开始下一条，不需要等网络。如果处理时间是 10ms，网络 RTT 是 1ms，prefetch=1 的实际吞吐约 1000/11≈90 msg/s，prefetch=100 的吞吐约 1000/10=100 msg/s，差距约 10%。当然 prefetch 并非越大越好——过大会导致消息集中在单个消费者，多消费者场景下负载不均衡。实践中推荐 prefetch=10~50 作为起点，根据实际测试调整。"
+        },
+        {
+          "id": "rabbitmq-queue-buildup-q8",
+          "question": "生产环境 RabbitMQ 队列消息堆积到 100 万，下游消费者服务刚刚修复了一个导致处理慢的 bug，现在需要快速消化积压。以下哪个方案最合适？",
+          "choices": [
+            { "id": "A", "text": "执行 rabbitmqctl purge_queue 清空队列，然后重新让生产者发送消息" },
+            { "id": "B", "text": "临时增加消费者实例数量，同时适当调大 prefetch_count（如从 1 调到 20），待积压消化后缩回" },
+            { "id": "C", "text": "调高 vm_memory_high_watermark 到 0.9，给队列更多内存空间" },
+            { "id": "D", "text": "重启 RabbitMQ 节点清空内存，再通过日志重放消息" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "选项 A（purge_queue）会直接丢失 100 万条有效消息，在生产环境中几乎不可接受，除非明确确认这些消息可以丢弃。选项 C 调高内存水位只是缓解了内存告警，并不能加快消费速度，而且让 Broker 使用更多内存本身有风险。选项 D 重启 Broker 会造成服务中断，而且内存中未持久化的消息会丢失。选项 B 是最合理的：增加消费者实例直接提升并发消费能力，适当增大 prefetch 可以减少网络往返提升单消费者吞吐，两者组合能大幅加快积压消化速度，待恢复正常后再缩容回去，对业务影响最小。"
+        },
+        {
+          "id": "rabbitmq-queue-buildup-q9",
+          "question": "关于惰性队列（Lazy Queue），以下描述正确的是？",
+          "choices": [
+            { "id": "A", "text": "惰性队列消息完全不使用内存，所有读写都走磁盘 I/O，吞吐量比普通队列低 90%+" },
+            { "id": "B", "text": "惰性队列把消息直接写入磁盘，减少内存占用，适合消息量大或消费可能滞后的场景，RabbitMQ 3.12 后成为默认行为" },
+            { "id": "C", "text": "惰性队列只对持久化消息（delivery_mode=2）生效，非持久化消息仍存内存" },
+            { "id": "D", "text": "惰性队列是 RabbitMQ 4.0 的新特性，3.x 版本不支持" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "惰性队列（Lazy Queue）是 RabbitMQ 3.6 引入的特性，核心行为是：消息进入队列后立即写到磁盘，而不是先放内存再按策略换出。这大幅减少了队列在堆积场景下的内存占用，代价是每条消息都有一次磁盘写入的开销。选项 A 夸大了性能损失，实际上现代 SSD 的顺序写性能很高，在多数场景下惰性队列的吞吐量下降是可接受的。选项 C 错误，惰性模式对所有消息生效，与 delivery_mode 无关。选项 D 错误，惰性队列从 3.6 就有，3.12 之后成为默认模式（通过 queue_index_embed_msgs_below 等参数控制）。"
+        },
+        {
+          "id": "rabbitmq-queue-buildup-q10",
+          "question": "Classic Mirrored Queue 和 Quorum Queue 在高可用实现上的核心区别是什么？RabbitMQ 官方现在推荐使用哪种？",
+          "choices": [
+            { "id": "A", "text": "镜像队列用同步复制，Quorum Queue 用异步复制，镜像队列数据更安全，官方推荐镜像队列" },
+            { "id": "B", "text": "镜像队列复制是异步的可能丢数据，Quorum Queue 用 Raft 协议要求多数派确认，更安全，官方推荐 Quorum Queue" },
+            { "id": "C", "text": "两者都用 Raft 协议，Quorum Queue 只是镜像队列的更新版本名称" },
+            { "id": "D", "text": "镜像队列支持跨数据中心复制，Quorum Queue 只支持同一集群，官方按场景推荐不同方案" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Classic Mirrored Queue（镜像队列）的复制是异步的：leader 写入消息后立即返回给生产者，再异步同步给 follower。如果 leader 在同步完成前宕机，follower 上可能缺少最近的一批消息，造成数据丢失。Quorum Queue 基于 Raft 协议，写入操作需要集群中多数节点（超过半数）确认后才返回给生产者，保证了数据安全性，代价是写延迟稍高。RabbitMQ 3.8 引入 Quorum Queue，3.9 之后官方文档明确将镜像队列标记为 deprecated，建议所有新场景使用 Quorum Queue，现有镜像队列应该计划迁移。"
+        }
+      ],
+      "references": [
+        "https://www.rabbitmq.com/queues.html",
+        "https://www.rabbitmq.com/consumers.html#prefetch",
+        "https://www.rabbitmq.com/memory.html",
+        "https://www.rabbitmq.com/lazy-queues.html",
+        "https://www.rabbitmq.com/quorum-queues.html",
+        "https://www.rabbitmq.com/dlx.html"
+      ]
+    }
+  ]
+}
