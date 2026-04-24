@@ -1,0 +1,158 @@
+{
+  "id": "monitoring-q130",
+  "name": "监控数据诊断 Redis 大 Key 问题",
+  "domain": "monitoring",
+  "description": "通过 Prometheus 指标、Redis INFO 输出与 SLOWLOG 数据，识别、定位并安全处理 Redis 大 Key 问题",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q130",
+      "domain": "monitoring",
+      "type": "real-data",
+      "difficulty": 2,
+      "tags": ["redis", "big-key", "slowlog", "lazyfree", "memory-fragmentation", "redis-cli", "keyspace-notifications"],
+      "title": "通过监控数据判断 Redis 是否存在大 Key 问题",
+      "content": "你们团队的 Redis 实例是一台 8 核 32GB 的单机部署（Redis 6.2），主要用于缓存用户 Session 和商品详情数据，平时 QPS 约 8000，P99 延迟稳定在 2ms 以内。\n\n今天早上 10:00 起业务方反馈部分接口响应变慢，你打开 Grafana 查看 Redis 监控面板，以下是 **10:15 时刻**的 Prometheus 指标快照：\n\n```\nredis_slowlog_length{instance=\"redis-prod-01\"}                    = 847\n# 该指标正常基线 < 5，代表 slowlog 队列中积压的条数\n\nredis_mem_fragmentation_ratio{instance=\"redis-prod-01\"}           = 3.21\n# 正常健康范围 1.0–1.5\n\nredis_net_output_bytes_per_sec{instance=\"redis-prod-01\"}          = 52428800\n# ≈ 50 MB/s，平时约 5 MB/s，出现 10 倍带宽尖峰\n\nredis_commands_duration_seconds_total{cmd=\"hgetall\"} rate(1m)     → 均值耗时 180ms\nredis_commands_duration_seconds_total{cmd=\"smembers\"} rate(1m)    → 均值耗时 220ms\nredis_commands_duration_seconds_total{cmd=\"get\"} rate(1m)         → 均值耗时 0.3ms（正常）\n```\n\n同时你在服务器上执行 `redis-cli INFO` 得到以下片段：\n\n```\n# Memory\nused_memory_human:18.52G\nused_memory_rss_human:59.51G\nmem_fragmentation_ratio:3.21\n\n# Stats\nrdb_last_bgsave_time_sec:38        # 平时约 4 秒\naof_last_rewrite_time_sec:52       # 平时约 6 秒\n```\n\n执行 `SLOWLOG GET 5` 输出如下：\n\n```\n1) 1) (integer) 14523\n   2) (integer) 1689123015\n   3) (integer) 198432          # 耗时 198ms（单位：微秒）\n   4) 1) \"HGETALL\"\n      2) \"user:profile:bulk:v2\"\n2) 1) (integer) 14522\n   2) (integer) 1689123014\n   3) (integer) 213871          # 耗时 213ms\n   4) 1) \"SMEMBERS\"\n      2) \"product:tags:category:electronics\"\n3) 1) (integer) 14521\n   2) (integer) 1689123013\n   3) (integer) 156234\n   4) 1) \"DEL\"\n      2) \"user:profile:bulk:v2\"\n```\n\n根据以上监控数据，请回答：\n\n1. 这些数据揭示了什么核心问题？指出每一组指标异常背后的具体含义。\n2. 如何用命令行工具进一步确认并精准定位大 Key 的位置与大小？\n3. 在不影响业务的前提下，应如何安全删除这些大 Key？从 Redis 4.0 的 lazyfree 机制说起。",
+      "answer": "## 第一步：读懂这份监控数据——大 Key 的体征识别\n\n所谓大 Key，并不是指 key 名字很长，而是指某个 key 所持有的 value 数据量过大。比如一个 Hash 存了 50 万个字段、一个 Set 存了 20 万个成员、或者一个 String value 达到几十 MB。Redis 的命令执行是单线程的——准确说是网络 I/O 和命令处理共用一个主线程，一条命令没执行完，后面所有命令都得等。这就是大 Key 危险的根本原因：当你对一个拥有 10 万个字段的 Hash 执行 `HGETALL`，Redis 要把这 10 万条数据全部序列化然后一次性写入 socket，这个过程可能持续几百毫秒，期间其他客户端的请求全部被阻塞。\n\n回到这份监控数据，第一个值得关注的信号是**命令耗时的分化**：`HGETALL` 均值 180ms、`SMEMBERS` 均值 220ms，而 `GET` 只有 0.3ms。三者同样在 Redis 主线程执行，`GET` 却快得多，因为它只返回一个 String value，而前两者要把整个集合类型的所有元素搬出来。这种「聚合命令慢、原子命令快」的分化模式，是大 Key 问题最直接的监控特征。\n\n`redis_slowlog_length = 847` 则是量化了这个问题的严重程度。Redis slowlog 记录执行时间超过 `slowlog-log-slower-than`（默认 10ms）的命令，正常情况下这个队列几乎是空的。积压 847 条说明在此之前大量命令持续超时，主线程被反复阻塞。\n\n`redis_net_output_bytes_per_sec = 50 MB/s`（平时 5 MB/s）这个带宽 10 倍尖峰同样是大 Key 的典型症状。`HGETALL` 一个存了 3 万个字段的 Hash，返回数据可能就有几十 MB，十几个客户端并发请求这个 key，出口带宽瞬间就被打满了。\n\n`mem_fragmentation_ratio = 3.21` 意味着 RSS（操作系统视角的物理内存占用）是 Redis 自报 used_memory 的 3.2 倍——RSS 59GB，used_memory 仅 18GB，差了超过 40GB。内存碎片率高的一个重要原因正是频繁分配和释放大块内存：当一个大 Key 被删除时，jemalloc 分配器释放掉一大块内存，但这块内存的地址空间不会立即归还给操作系统，而是留在进程的堆里等待复用。如果后续申请的内存块大小不匹配，这块空间就变成了碎片。\n\n最后，`rdb_last_bgsave_time_sec = 38`（正常 4 秒）和 `aof_last_rewrite_time_sec = 52`（正常 6 秒）揭示了另一个危害。RDB 持久化通过 `fork` 子进程来做快照，AOF rewrite 同理。这两个子进程都需要把 Redis 内存里的数据序列化到磁盘，大 Key 在序列化时耗时成倍增加——一个几十 MB 的 Hash 字段就需要逐个字段写入，直接拖慢了整体持久化时间。持久化时间越长，`fork` 造成的 Copy-on-Write 内存膨胀就越大，进一步恶化内存状况。\n\n## 第二步：工具链定位——从怀疑到确证\n\n监控数据给了我们方向，SLOWLOG 输出也点名了两个可疑 key：`user:profile:bulk:v2` 和 `product:tags:category:electronics`。但生产环境中大 Key 可能不止这两个，需要系统性扫描。\n\n**`redis-cli --bigkeys`** 是最直接的扫描工具，它在内部使用 `SCAN` 命令做全量遍历，记录每种数据类型中最大的 key，扫完后汇报摘要：\n\n```bash\n# 加 -i 0.1 控制扫描间隔，避免 SCAN 速率过高影响业务\nredis-cli -h redis-prod-01 -p 6379 -i 0.1 --bigkeys\n\n# 典型输出：\n# Biggest hash found so far 'user:profile:bulk:v2' with 52341 fields\n# Biggest set  found so far 'product:tags:category:electronics' with 38920 members\n# Biggest string found so far 'banner:image:homepage' with 4194304 bytes\n```\n\n确认了可疑 key 之后，用 `MEMORY USAGE` 命令（Redis 4.0+ 提供）获取精确内存占用：\n\n```bash\n# MEMORY USAGE 返回该 key 及其所有元素占用的实际字节数（含元数据开销）\nMEMORY USAGE user:profile:bulk:v2\n# (integer) 47185920  →  约 45 MB\n\nMEMORY USAGE product:tags:category:electronics\n# (integer) 12582912  →  约 12 MB\n```\n\n配合 `OBJECT ENCODING` 和 `OBJECT IDLETIME` 可以进一步了解内部结构和访问热度：\n\n```bash\nOBJECT ENCODING user:profile:bulk:v2\n# \"hashtable\"  →  字段数超过 hash-max-listpack-entries(128) 阈值，已升级为哈希表\n\nOBJECT IDLETIME user:profile:bulk:v2\n# (integer) 3  →  3 秒前刚被访问，是热 key\n```\n\n如果想对所有 key 做更精细的分析，可以用 `redis-cli --memkeys` 或 `rdb` 工具离线解析 RDB 文件——后者的优势是完全不影响线上实例，对着备份文件分析即可。\n\n**Redis keyspace notifications** 是另一种主动监测手段：在 `redis.conf` 中配置 `notify-keyspace-events \"Kx\"`，Redis 会在每次 key 过期或被删除时往 `__keyevent@0__:expired` channel 发布消息，业务代码或专门的监控 agent 订阅这个 channel，配合 `MEMORY USAGE` 就能实时采集大 Key 的生命周期。这种方式比 `--bigkeys` 扫描更实时，但有额外的 CPU 开销，适合把阈值设高一点（比如只关注超过 1MB 的 key）。\n\n## 第三步：处理大 Key——安全删除与根治\n\n定位到大 Key 之后，第一反应是删掉它，但直接执行 `DEL user:profile:bulk:v2` 是个陷阱。`DEL` 是同步操作：删一个包含 5 万个字段的 Hash，Redis 要在主线程里逐个释放每个 field 的内存，这个过程可能阻塞主线程 100ms 以上，比不删还糟糕。\n\nRedis 4.0 引入的 **lazyfree** 机制彻底解决了这个问题。`UNLINK` 命令是 `DEL` 的异步版本：它先把 key 从 keyspace 中摘除（这步很快，主线程执行），然后把实际的内存释放任务丢给一个后台线程（`bio_lazy_free`）来做，主线程立刻返回。对调用方来说 key 已经不存在了，但内存的释放在后台静默完成，不影响任何其他命令的执行。\n\n```bash\n# 替代 DEL，用 UNLINK 安全异步删除大 Key\nUNLINK user:profile:bulk:v2\nUNLINK product:tags:category:electronics\n```\n\n除了手动 `UNLINK`，还可以在 `redis.conf` 开启全局 lazyfree 策略，让过期、驱逐、flush 等操作都自动走异步路径：\n\n```conf\nlazyfree-lazy-eviction yes    # 内存不足触发驱逐时异步释放\nlazyfree-lazy-expire yes      # key 过期时异步释放\nlazyfree-lazy-server-del yes  # 隐式 DEL（如 SET 覆盖旧值）时异步释放\nreplica-lazy-flush yes        # replica 全量同步前 flush 时异步\n```\n\n**但删除只是治标，根治需要从数据模型入手**。`user:profile:bulk:v2` 这个命名暴露了问题：一个 Hash key 存了所有用户的 profile，字段名是用户 ID，字段值是 profile JSON。正确的做法是按用户 ID 分散存储：`user:profile:{uid}`，每个用户一个 Hash，字段是 profile 的各个属性。这样单个 key 的大小永远有界。\n\n对 Set 类型的大 Key，如果业务只需要分页访问而不需要全量 `SMEMBERS`，可以用 `SSCAN` 替代：`SSCAN product:tags:category:electronics 0 COUNT 100`，每次只取 100 个成员，让大 Set 的访问也变成 O(N/batch) 而不是 O(N)。\n\n最后一定要给大 Key 设置 TTL。很多大 Key 之所以无限膨胀，是因为业务代码只写不设过期时间。用 `TTL user:profile:bulk:v2` 检查，如果返回 -1（永不过期），立刻用 `EXPIRE` 补上合理的过期时间，让 Redis 的 lazyfree 过期机制自动清理。",
+      "keyPoints": [
+        "「聚合命令慢、原子命令快」是大 Key 最直接的监控特征：HGETALL/SMEMBERS 耗时几百 ms 而 GET 仍正常，说明数据结构本身体积过大而非 Redis 整体过载",
+        "redis_slowlog_length 持续高于基线（>5）是主线程反复被阻塞的量化信号，应作为大 Key 告警的核心指标，通过 SLOWLOG GET 可直接看到阻塞命令和 key 名",
+        "出口带宽尖峰（net_output_bytes 10 倍暴涨）是大 Key 被高频读取的典型症状，因为 HGETALL/SMEMBERS 会将全量字段一次性写入 socket",
+        "mem_fragmentation_ratio 过高（>2.0）与大 Key 频繁创建/删除直接相关，大块内存释放后 jemalloc 难以复用，留下大量碎片导致 RSS 远超 used_memory",
+        "大 Key 拖慢 RDB bgsave 和 AOF rewrite：fork 子进程必须序列化这些巨型 value，持久化耗时从秒级变成分钟级，同时加剧 COW 内存膨胀",
+        "redis-cli --bigkeys 配合 -i 0.1 限速扫描可全量发现各类型最大 Key；Redis 4.0+ 的 MEMORY USAGE 命令返回 key 的精确内存占用（含元数据）",
+        "直接 DEL 大 Key 会在主线程同步释放所有子元素内存，阻塞时间可达 100ms 以上；应使用 UNLINK 命令（Redis 4.0+）将内存释放异步化到后台 bio_lazy_free 线程",
+        "根治大 Key 要从数据模型入手：按业务维度拆分（如按 uid 分散 Hash），用 SSCAN/HSCAN 替代全量读取，并强制为所有 key 设置合理 TTL"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q130-q1",
+          "question": "Redis 中「大 Key」的准确定义是什么？",
+          "choices": [
+            {"id": "A", "text": "key 名字符串长度超过 256 字节"},
+            {"id": "B", "text": "key 对应的 value 数据量过大，导致单次命令执行耗时过长或网络传输数据量过大"},
+            {"id": "C", "text": "该 key 的访问频率（QPS）超过 Redis 实例总 QPS 的 10%"},
+            {"id": "D", "text": "key 的 TTL 超过 30 天"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "大 Key 的「大」指的是 value 的数据量，而不是 key 名的长度、访问频率或 TTL。具体表现为：String value 超过几 MB、Hash/Set/List/ZSet 的成员数量超过几万甚至几十万。key 名再长也只是影响 keyspace 内存开销，不会造成命令阻塞。A 混淆了 key 名和 value 的概念。C 描述的是「热 Key」问题，与大 Key 是两个不同维度的问题，热 Key 可能很小但被高频访问。D 与大 Key 没有任何关系。"
+        },
+        {
+          "id": "monitoring-q130-q2",
+          "question": "题目中 HGETALL 耗时 180ms 而 GET 仅 0.3ms，最准确的解释是？",
+          "choices": [
+            {"id": "A", "text": "Redis 对 HGETALL 命令有性能限流，优先级低于 GET"},
+            {"id": "B", "text": "HGETALL 需要通过网络从主节点同步数据，GET 直接读本地"},
+            {"id": "C", "text": "Redis 主线程执行 HGETALL 时需要遍历整个 Hash 的所有字段并序列化，字段数量巨大导致耗时长"},
+            {"id": "D", "text": "HGETALL 命令触发了磁盘 I/O，从 AOF 文件中读取数据"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Redis 的命令执行是单线程的，HGETALL 的时间复杂度是 O(N)，N 是 Hash 的字段数。当一个 Hash 有 5 万个字段时，HGETALL 要逐个取出每个 field 和 value 并编码进回包，这个 CPU 密集型操作就要几百毫秒。GET 是 O(1)，取一个 String 值直接返回，所以快得多。A 不存在命令优先级机制。B 这是单机实例，且 Redis 读主从复制与命令耗时无关。D Redis 命令执行完全在内存中进行，不会实时读取 AOF 文件。"
+        },
+        {
+          "id": "monitoring-q130-q3",
+          "question": "redis_mem_fragmentation_ratio = 3.21，意味着什么？",
+          "choices": [
+            {"id": "A", "text": "Redis 实例内存使用率达到 321%，需要立即扩容"},
+            {"id": "B", "text": "操作系统分配给 Redis 进程的物理内存（RSS）是 Redis 自报 used_memory 的 3.21 倍，存在大量内存碎片"},
+            {"id": "C", "text": "Redis 内存命中率为 3.21%，缓存效果极差"},
+            {"id": "D", "text": "Redis 内部有 3.21GB 的数据等待持久化到磁盘"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "mem_fragmentation_ratio = used_memory_rss / used_memory。used_memory 是 Redis 认为自己用了多少字节，used_memory_rss 是操作系统实际分配给该进程的物理内存页。比率为 3.21 说明 OS 分配了 59GB 但 Redis 实际存了 18GB，差值约 40GB 是内存碎片——这些碎片空间已经被分配器（jemalloc）持有但 Redis 无法有效利用。大 Key 频繁分配和释放大块内存是碎片率飙高的主要原因之一。A 混淆了碎片率和使用率的概念。C 是缓存命中率，是另一个指标。D 与碎片率没有关系。"
+        },
+        {
+          "id": "monitoring-q130-q4",
+          "question": "redis-cli --bigkeys 命令的工作原理是什么？它有什么使用注意事项？",
+          "choices": [
+            {"id": "A", "text": "执行 KEYS * 获取全部 key 列表，然后对每个 key 执行 DEBUG OBJECT 获取大小，数据量大时会阻塞 Redis"},
+            {"id": "B", "text": "使用 SCAN 命令分批遍历所有 key，对每个 key 根据类型执行 STRLEN/LLEN/SCARD 等命令获取大小，不阻塞但会有一定 QPS 开销"},
+            {"id": "C", "text": "直接读取 RDB 文件进行离线分析，对线上实例完全无影响"},
+            {"id": "D", "text": "通过订阅 Redis 的 keyspace notifications 被动收集大 Key 信息，需要等待 key 被访问才能发现"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "--bigkeys 使用非阻塞的 SCAN 命令做全量遍历，每个 cursor 步进只扫描少量 key，对每个 key 调用对应类型的 size 命令（String 用 STRLEN，List 用 LLEN，Hash 用 HLEN，Set 用 SCARD，ZSet 用 ZCARD）统计大小。关键注意事项：① 加 -i 0.1 参数控制每批 SCAN 之间的间隔，避免密集扫描影响业务 QPS；② 它只能找出「成员数量最多的 key」而不是「内存占用最大的 key」，需要配合 MEMORY USAGE 做精确测量。A 的 KEYS * 是阻塞命令，生产环境绝对不能用。C 描述的是 rdb 工具的工作方式，不是 --bigkeys。"
+        },
+        {
+          "id": "monitoring-q130-q5",
+          "question": "SLOWLOG GET 输出中第三个字段的单位是什么？题目数据中 198432 代表多少延迟？",
+          "choices": [
+            {"id": "A", "text": "毫秒（ms），198432 ms ≈ 3.3 分钟"},
+            {"id": "B", "text": "微秒（μs），198432 μs ≈ 198ms"},
+            {"id": "C", "text": "纳秒（ns），198432 ns ≈ 0.2ms"},
+            {"id": "D", "text": "秒（s），198432 s ≈ 55 小时"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Redis SLOWLOG 记录命令耗时的单位是微秒（microseconds，μs）。198432 μs = 198.432 ms，也就是将近 200ms。Redis 的 slowlog-log-slower-than 配置项默认值也是以微秒为单位，默认值 10000 代表 10ms。这个单位设计是合理的，因为 Redis 命令通常在亚毫秒级别完成，用微秒可以精确区分 0.1ms 和 1ms 的差距，用毫秒则都会被记录为 0ms 或 1ms。读 SLOWLOG 时要注意这个单位，避免把 198432 误读为 198 秒或 198 毫秒。"
+        },
+        {
+          "id": "monitoring-q130-q6",
+          "question": "为什么不能直接用 DEL 命令删除大 Key？UNLINK 的原理是什么？",
+          "choices": [
+            {"id": "A", "text": "DEL 命令有 key 数量上限，超过 128 个字段的 Hash 无法删除，必须用 UNLINK"},
+            {"id": "B", "text": "DEL 在主线程同步释放所有子元素内存（O(N) 复杂度），删除大 Key 会阻塞主线程；UNLINK 先从 keyspace 摘除 key（O(1)），再异步在后台线程释放内存"},
+            {"id": "C", "text": "DEL 不会释放内存只是标记删除，需要等 UNLINK 执行后才真正回收；两者语义相同但 UNLINK 更彻底"},
+            {"id": "D", "text": "DEL 只能删除 String 类型，UNLINK 支持所有类型"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "DEL 的内部实现是 dictDelete，它在主线程中递归释放 key 的所有内存：对于一个有 5 万个字段的 Hash，要循环 5 万次 free() 调用，每次释放一个 field 和 value。这整个过程发生在主线程，期间阻塞所有其他命令。200ms 的阻塞在 Redis 中是非常严重的。UNLINK（Redis 4.0+）的设计是「先摘除，再释放」：主线程只是把这个 key 从 dict 中摘除（O(1)），然后把待释放的对象引用加入 bio_lazy_free 后台任务队列，由专门的 bio 线程异步完成实际的内存回收，主线程不阻塞。A 是完全错误的，DEL 没有字段数量限制。C 混淆了两者语义，DEL 确实会立即释放内存，只是会阻塞。"
+        },
+        {
+          "id": "monitoring-q130-q7",
+          "question": "redis-cli --bigkeys 扫描结果显示「最大 Hash 有 52341 个字段」，但 MEMORY USAGE 返回该 key 仅占 2MB，这正常吗？这说明什么？",
+          "choices": [
+            {"id": "A", "text": "不正常，说明 MEMORY USAGE 命令有 bug，返回值不准确"},
+            {"id": "B", "text": "正常，因为 --bigkeys 统计的是成员数量而非内存占用，如果每个字段的 value 都很短（如单字节），5 万个字段也可能只占 2MB；成员数量多 ≠ 内存占用大"},
+            {"id": "C", "text": "不正常，Redis 的 Hash 每个字段有 128 字节的固定开销，5 万字段至少 6.4GB"},
+            {"id": "D", "text": "正常，因为 Redis 会自动压缩 Hash 数据，压缩率通常在 90% 以上"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个重要的认知坑：--bigkeys 用来发现「成员数量最多的 key」，而真正影响性能的维度有两个——成员数量（影响遍历命令耗时）和内存占用（影响网络传输和持久化）。一个有 5 万个字段但每个 value 只有 1-2 字节的 Hash，内存可能确实只有 2MB，但 HGETALL 仍然需要序列化 5 万个字段，CPU 耗时依然很高。反之，一个只有 10 个字段但每个 value 是 10MB 图片的 Hash，--bigkeys 可能不会报告它，但 MEMORY USAGE 会显示 100MB。因此正确的做法是同时关注成员数量和 MEMORY USAGE，两个维度都要检查。"
+        },
+        {
+          "id": "monitoring-q130-q8",
+          "question": "业务要求对 user:profile:bulk:v2（一个存了所有用户 profile 的超大 Hash）做数据模型改造，下列哪种方案最合理？",
+          "choices": [
+            {"id": "A", "text": "将整个 Hash 序列化成一个 JSON String 存储，用 SET user:profile:bulk:v2 取代 HGETALL"},
+            {"id": "B", "text": "把大 Hash 拆分为按用户 ID 分散的独立 key（如 user:profile:{uid}），每个用户单独存一个 Hash 或 String，并设置 TTL"},
+            {"id": "C", "text": "增加 Redis 内存到 256GB，让大 Key 有足够的存储空间"},
+            {"id": "D", "text": "给该 key 设置 OBJECT FREQ 限制访问频率，防止频繁的 HGETALL 请求"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考的是数据建模思维。原始设计用一个 Hash 存所有用户 profile（field = uid，value = profile JSON），随着用户增长这个 Hash 无限膨胀。正确做法是按业务边界拆分：每个用户一个独立 key（user:profile:{uid}），访问某个用户只需要 HGETALL user:profile:{uid}，数据量有界，并且可以针对每个用户单独设置 TTL 控制缓存过期。A 只是换了数据类型，大 String 同样是大 Key，且失去了按字段读取的能力。C 是治标不治本，而且内存扩容无法解决单命令阻塞问题。D Redis 没有 OBJECT FREQ 限流命令，OBJECT FREQ 是 LFU 淘汰策略中查看访问频率的命令，不能限速。"
+        },
+        {
+          "id": "monitoring-q130-q9",
+          "question": "redis.conf 中配置 lazyfree-lazy-expire yes 的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "让 key 的过期检查从主动过期变为只有在访问时才触发（惰性过期），减少后台扫描开销"},
+            {"id": "B", "text": "key 过期后，在主线程中延迟一段时间再删除，避免过期风暴"},
+            {"id": "C", "text": "key 到达 TTL 被删除时，内存释放操作由后台线程异步完成，主线程不阻塞"},
+            {"id": "D", "text": "开启后 TTL 的精度从毫秒降低到秒，减少过期定时器的 CPU 开销"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "lazyfree-lazy-expire yes 控制的是 key 过期时的内存释放路径。Redis 本身一直有「惰性过期」（访问时发现过期才删除）和「主动过期」（定期随机扫描删除过期 key）两种机制，这两种机制都不受此参数影响。lazyfree-lazy-expire 影响的是：当一个 key 被判定为过期要删除时，释放其内存的动作是在主线程同步执行（原始行为）还是交给后台 bio_lazy_free 线程异步执行（开启后的行为）。对于带 TTL 的大 Key，这个配置至关重要——否则大 Key 过期时同样会在主线程产生几百毫秒的阻塞，和主动 DEL 一样危险。A 描述的是另一个已有的惰性过期机制。"
+        },
+        {
+          "id": "monitoring-q130-q10",
+          "question": "如果想实时监测线上 Redis 中哪些 key 的删除/过期操作耗时较长，除了 SLOWLOG，还可以使用哪种机制？",
+          "choices": [
+            {"id": "A", "text": "开启 Redis keyspace notifications，订阅 __keyevent@0__:del 频道，结合 MEMORY USAGE 获取被删除 key 的大小"},
+            {"id": "B", "text": "使用 MONITOR 命令实时打印所有命令，过滤 DEL/UNLINK/EXPIRE 操作"},
+            {"id": "C", "text": "配置 Redis 的 latency monitoring（latency-monitor-threshold），通过 LATENCY HISTORY 分析慢事件"},
+            {"id": "D", "text": "A 和 C 都是可行方案，各有适用场景"}
+          ],
+          "correctAnswer": "D",
+          "explanation": "两种方案都有效但适用场景不同。Keyspace notifications（选项 A）是事件驱动的：配置 notify-keyspace-events \"Kgx\" 后，每次 key 被删除或过期 Redis 会往对应 channel 发布事件，监控服务订阅后可以主动查询该 key 的内存占用，实现「发现即告警」。缺点是有额外 CPU 开销，且 key 删除后无法再查 MEMORY USAGE，需要在删除前异步查询。Redis latency monitoring（选项 C）是 Redis 4.0+ 内置的延迟诊断工具，配置 latency-monitor-threshold 后 Redis 自动记录超过阈值的内部事件（包括命令执行、fork、AOF 等），通过 LATENCY HISTORY 可以看到历史慢事件时间线。两者互补：keyspace notifications 帮你找到大 Key 是谁，latency monitoring 帮你分析系统级延迟的全貌。B 的 MONITOR 会把所有命令都打印出来，在高 QPS 实例上本身就会造成 50% 以上的性能下降，生产环境慎用。"
+        }
+      ],
+      "references": [
+        "https://redis.io/docs/manual/memory-optimization/#memory-allocation",
+        "https://redis.io/commands/unlink/",
+        "https://redis.io/docs/manual/keyspace-notifications/",
+        "https://redis.io/commands/memory-usage/",
+        "https://redis.io/docs/manual/latency-monitor/"
+      ]
+    }
+  ]
+}
