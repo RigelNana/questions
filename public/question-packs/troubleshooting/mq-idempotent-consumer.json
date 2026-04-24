@@ -1,0 +1,156 @@
+{
+  "id": "mq-idempotent-consumer",
+  "name": "消息队列幂等消费设计",
+  "domain": "troubleshooting",
+  "description": "消息重复消费的根因分析与多种幂等消费方案的设计实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "mq-idempotent-consumer-1",
+      "domain": "troubleshooting",
+      "type": "practice",
+      "difficulty": 2,
+      "tags": ["kafka", "rabbitmq", "idempotence", "redis", "state-machine"],
+      "title": "MQ 消息被重复消费导致重复扣款，如何设计幂等消费保证业务安全？",
+      "content": "## 场景：重复扣款事故复盘\n\n凌晨两点，支付系统的告警响了。监控显示过去十分钟内有 237 笔订单被重复扣款，用户客诉像雪片一样涌进来。On-call 工程师拉起日志，发现两个消费者实例都处理了同一批扣款消息——而这一切，只是因为一次普通的网络抖动。\n\n故障的还原过程很典型：消费者节点 A 从 Kafka 拉取到一批包含扣款指令的消息，调用支付核心系统完成了扣款，但在提交 offset 回 Kafka 之前，节点 A 与 Broker 的心跳超时了。Kafka 认为该分区的消费者已经死亡，把这批消息重新分配给了新启动的消费者节点 B。节点 B 并不知道这批消息已经被处理过，于是老老实实地再执行了一遍扣款逻辑，237 个用户被多扣了一次钱。\n\n这个事故暴露了一个根本性的设计缺陷：整个消费链路没有幂等保护。当时的代码大概长这样：\n\n```java\n@KafkaListener(topics = \"payment.deduct\")\npublic void handleDeductMessage(DeductMessage msg) {\n    // 直接调用扣款，没有任何幂等检查\n    paymentService.deduct(msg.getUserId(), msg.getAmount());\n    // 扣款成功后才提交 offset，但 offset 提交可能失败\n}\n```\n\n问题在于，这段代码假设了消息只会被消费一次。但 Kafka 的语义是 at-least-once（至少一次），网络问题、消费者重启、Rebalance 都可能导致消息被重复投递。任何依赖「消息恰好只来一次」的设计，在分布式系统里都是纸牌屋。\n\n现在问题摆在你面前：**如何重新设计这套消费逻辑，确保即使同一条扣款消息被投递 N 次，扣款操作也只执行一次？** 请从原理出发，给出适合金融级别业务的幂等消费方案，并说明在高吞吐场景下如何取舍。",
+      "answer": "## 第一步：理解幂等性和消息队列的语义边界\n\n幂等性（Idempotence）这个词来自数学，指的是一个操作执行一次和执行多次，产生的结果完全相同。HTTP 协议里 GET 和 PUT 被设计成幂等的，POST 不是。在消息消费的语境里，幂等消费意味着：无论同一条消息被投递几次，业务状态的最终结果都和被投递一次完全一致。\n\n很多工程师会问：「Kafka 能不能保证消息只投递一次？」答案是——Kafka 0.11 开始确实支持 exactly-once 语义，但那是针对 Producer 到 Broker 的投递阶段，以及 Kafka Streams 的内部处理。对于外部消费者来说，Kafka 的默认语义是 at-least-once，即消息至少会被投递一次，但可能多次。RabbitMQ 的情况类似，消费者在 ACK 之前崩溃，消息就会被重新投递。这不是 MQ 的 bug，而是在「不丢消息」和「只投一次」两个目标之间，分布式系统必然存在的取舍——你很难同时拥有两者。\n\n这个现实决定了一件事：**幂等消费是消费者自己的责任，不能依赖 MQ 来保证**。MQ 只管把消息送到，至于你处理了几遍，那是你的事。理解了这一点，就不会再去寄希望于调整 MQ 配置来解决重复消费的问题。\n\n幂等消费的基石是消息唯一 ID。每条消息必须携带一个全局唯一的标识符，消费者用这个 ID 来判断「这条消息我处理过了吗」。没有唯一 ID，任何幂等方案都是空中楼阁。生产者在构造消息时必须保证 ID 的唯一性，通常用「业务 ID + 场景标识」的方式生成，比如 `pay_deduct_{orderId}_{timestamp}`，而不是随机 UUID——UUID 虽然唯一，但排查问题时完全看不出这条消息是哪个订单的，出了线上故障会让你抓狂。\n\n## 第二步：四种幂等消费方案，金融场景该怎么选\n\n### 方案一：数据库唯一约束 + INSERT IGNORE\n\n最简单直接的方案。在数据库里建一张消息消费记录表，以消息 ID 为唯一键。每次消费消息时，先尝试插入一条记录：\n\n```sql\n-- 建表，message_id 设唯一约束\nCREATE TABLE message_consumed (\n    id         BIGINT AUTO_INCREMENT PRIMARY KEY,\n    message_id VARCHAR(128) NOT NULL,\n    consumed_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n    UNIQUE KEY uk_message_id (message_id)\n);\n\n-- 消费时先尝试插入，INSERT IGNORE 在主键/唯一键冲突时静默忽略\nINSERT IGNORE INTO message_consumed (message_id) VALUES (?);\n-- 如果影响行数为 0，说明这条消息已经处理过，直接返回成功\n-- 如果影响行数为 1，继续执行业务逻辑\n```\n\n这个方案胜在简单可靠，把幂等性的保证交给了数据库的唯一约束，只要 DB 不出问题，就不会有并发竞争。它特别适合「消费一条消息就往数据库写一条记录」的场景，比如入账记录、流水记录。但它有一个局限：需要额外的数据库写操作，对高吞吐场景的性能有影响；而且历史消费记录会无限增长，需要定期清理。\n\n### 方案二：Redis SETNX 去重\n\n用 Redis 的原子命令来做幂等检查，性能远高于数据库方案：\n\n```python\nimport redis\n\nr = redis.Redis(host='localhost', port=6379)\n\ndef consume_message_idempotent(message_id: str, handler_func):\n    \"\"\"\n    使用 Redis SET NX EX 实现幂等消费\n    SET key value NX EX seconds\n    NX: 只在 key 不存在时设置\n    EX: 设置过期时间（秒），防止 key 永久占用内存\n    \"\"\"\n    redis_key = f\"msg:consumed:{message_id}\"\n    # 尝试设置 key，NX 保证原子性，EX 86400 = 24 小时后自动过期\n    result = r.set(redis_key, \"1\", nx=True, ex=86400)\n    \n    if result is None:\n        # set 返回 None 表示 key 已存在，消息已处理过\n        print(f\"[幂等跳过] 消息 {message_id} 已被处理，跳过\")\n        return True  # 返回成功，防止 MQ 重复投递\n    \n    # result 为 True 表示 set 成功，是第一次处理这条消息\n    try:\n        handler_func()  # 执行业务逻辑（如扣款）\n        return True\n    except Exception as e:\n        # 业务执行失败，需要删除 Redis key，让消息可以被重新处理\n        r.delete(redis_key)\n        raise e\n```\n\nRedis 方案的吞吐能力非常强，SET 命令的延迟通常在 1ms 以内，适合高并发场景。但有一个必须重视的问题：TTL 设置。如果把过期时间设得太短，过期后相同消息再次投递就会被当成新消息处理；如果设得太长，Redis 内存占用会很大。通常根据业务的最大重试窗口来设定——如果消息最多会在 24 小时内重投，TTL 就设 25 小时留一点余量。另外还要注意异常处理：业务逻辑执行失败时，必须删掉 Redis key，否则这条消息就被「永久跳过」了，业务数据会不一致。\n\n### 方案三：业务状态机检查（金融场景首选）\n\n这是金融级别系统最推荐的方案，思路是检查业务对象自身的状态，而不是维护一张消费记录表。以支付订单为例，订单有明确的状态流转：`待支付 → 支付中 → 已支付 → 已退款`。扣款操作只对「待支付」状态的订单有意义：\n\n```java\n// 状态机检查伪代码\npublic void handleDeductMessage(DeductMessage msg) {\n    String orderId = msg.getOrderId();\n    \n    // 加分布式锁，防止并发的两个消费者同时通过状态检查\n    try (DistributedLock lock = lockService.lock(\"order:\" + orderId, 5000)) {\n        // 查询订单当前状态\n        Order order = orderRepo.findById(orderId);\n        \n        if (order == null) {\n            log.warn(\"订单不存在，消息可能是脏数据: {}\", orderId);\n            return; // 直接 ACK，不重试\n        }\n        \n        // 关键：只有「待支付」状态才执行扣款\n        if (order.getStatus() != OrderStatus.PENDING_PAYMENT) {\n            // 订单已经是「支付中」或「已支付」，说明之前处理过了\n            log.info(\"订单 {} 当前状态为 {}，幂等跳过扣款\",\n                     orderId, order.getStatus());\n            return; // 直接 ACK\n        }\n        \n        // 状态满足前置条件，执行扣款\n        // 先把订单状态改为「支付中」，防止并发问题\n        orderRepo.updateStatus(orderId, OrderStatus.PAYING, OrderStatus.PENDING_PAYMENT);\n        \n        // 调用支付核心\n        paymentService.deduct(msg.getUserId(), msg.getAmount(), orderId);\n        \n        // 扣款成功，更新为「已支付」\n        orderRepo.updateStatus(orderId, OrderStatus.PAID, OrderStatus.PAYING);\n    }\n}\n```\n\n状态机方案的优雅之处在于，它不需要维护额外的幂等记录表，业务数据本身就是幂等的证明——「订单已支付」这个状态天然说明扣款已经执行过了。这个方案对业务语义的理解最深，也最不容易出现遗漏。缺点是逻辑相对复杂，需要结合分布式锁来防止并发场景下的竞态条件（Race Condition，指两个执行流在没有同步机制保护时，结果取决于谁先执行，不可预测）。\n\n### 方案四：乐观锁（Optimistic Lock）\n\n乐观锁不加显式锁，而是在更新时带上版本号条件，让数据库自己来做并发控制：\n\n```sql\n-- 带版本号的更新，WHERE 条件同时检查状态和版本号\n-- 如果 status 已经不是 'pending' 或 version 不匹配，影响行数为 0\nUPDATE orders \nSET    status = 'paid', \n       version = version + 1,\n       paid_at = NOW()\nWHERE  id = #{orderId}\n  AND  status = 'pending'\n  AND  version = #{expectedVersion};\n\n-- 在 Java 代码里检查 affectedRows\nint rows = orderMapper.updateToPaid(orderId, currentVersion);\nif (rows == 0) {\n    // 更新失败：要么状态已经变了（已支付），要么并发冲突（版本号不对）\n    // 重新查询订单状态，判断是幂等跳过还是需要重试\n    Order latest = orderMapper.findById(orderId);\n    if (latest.getStatus() == OrderStatus.PAID) {\n        return; // 幂等成功，已支付\n    }\n    throw new ConcurrentModificationException(\"并发冲突，请重试\");\n}\n```\n\n乐观锁方案性能较好，不需要显式加锁，冲突率低的场景下开销很小。它与状态机方案实际上是互补的——状态机检查是「读再写」的逻辑，乐观锁是把这个检查合并到一个原子的 SQL UPDATE 里，减少了一次数据库往返。\n\n### 选型建议：金融场景双重保障\n\n对于支付这类金融场景，不要只用单一方案。推荐的组合是：**Redis SETNX 做第一道快速拦截 + 业务状态机做第二道兜底保障**。Redis 把绝大多数重复消息在内存层就挡掉，性能高；状态机在 Redis 出现故障（比如缓存被清空）或者 TTL 过期时提供最终保障。两道防线同时失效的概率极低。对于高吞吐但业务复杂度低的场景（如日志收集、埋点上报），单用 Redis SETNX 就足够了。\n\n## 第三步：更深的水——幂等消费的边界问题\n\n### 本地消息表：把发送和消费都做成幂等的\n\n如果你不仅要保证消费幂等，还要保证消息一定会被发出去（不丢消息），那就需要本地消息表（Transactional Outbox Pattern）。核心思路是：在同一个数据库事务里，既更新业务数据，又往本地消息表写一条待发送的消息记录。有一个独立的 Relay 进程扫描这张表，把消息实际发到 MQ，发送成功后标记消息为已发送。消费端再配合幂等消费，整个链路就同时具备了发送幂等和消费幂等。这个方案比分布式事务简单得多，是工程实践中最常用的「可靠消息」方案。\n\n### TTL 过期后的重复消费问题\n\nRedis 方案里，如果把 TTL 设为 24 小时，而某条消息因为极端情况（比如消费者长时间宕机）在 25 小时后才重新投递，这时 Redis key 已经过期，消费者会把它当成新消息处理。这种情况很少发生，但金融场景必须考虑。解决方案是：在 Redis 快速拦截失效后，第二道状态机检查会把这条「假新消息」正确识别为已处理，不会造成实际的重复执行。这也是为什么金融场景一定要用双重保障的原因。\n\n### 消息 ID 的生成规范：不要用纯 UUID\n\n纯随机的 UUID 作为消息 ID 是一个常见的偷懒做法。UUID 没有业务语义，排查问题时完全无法判断这条消息属于哪个业务对象。推荐的做法是：`{业务前缀}_{业务ID}_{操作类型}_{时间戳}`，例如 `pay_deduct_order12345_1704067200`。这样的 ID 既能全局唯一，又能在日志里一眼看出业务背景，出问题时能大幅缩短排查时间。\n\n### Saga 补偿也需要幂等\n\n在分布式事务的 Saga 模式中，每个本地事务都需要有对应的补偿操作（Compensation）。补偿操作本身也可能被重复调用，所以补偿操作也必须是幂等的。「退款」是典型的补偿操作——退款被执行两次，用户就多收了一次退款，这和重复扣款一样严重。任何业务状态的变更操作（无论是正向还是逆向），都应该用相同的幂等设计原则来保护。",
+      "keyPoints": [
+        "Kafka、RabbitMQ 等主流消息队列默认提供 at-least-once 语义，网络抖动、消费者重启、Rebalance 都会导致消息重复投递，幂等消费是消费者自身必须具备的能力，不能依赖 MQ 配置来解决。",
+        "消息唯一 ID 是幂等消费的基础，生产者必须保证消息 ID 全局唯一且具有业务语义（如 pay_deduct_{orderId}_{ts}），使用纯随机 UUID 虽然唯一但无法在排查时关联业务上下文。",
+        "Redis SET NX EX 方案用原子操作实现幂等检查，吞吐能力强，适合高并发场景；但必须注意 TTL 设置要覆盖消息最大重投窗口，且业务失败时需删除 Redis key 防止消息被永久跳过。",
+        "业务状态机方案不依赖额外的幂等记录，而是利用业务对象的状态流转来判断消息是否处理过（如订单状态「待支付→已支付」），是金融级业务最推荐的方案，需配合分布式锁防止并发竞态。",
+        "乐观锁通过在 UPDATE SQL 中加 WHERE version=? AND status='pending' 条件，把状态检查和更新合并为一个原子操作，影响行数为 0 时说明已处理，比「先查再写」减少一次数据库往返。",
+        "金融场景推荐双重保障：Redis SETNX 作为第一道快速拦截，业务状态机作为第二道兜底，两道防线同时失效的概率极低，且 TTL 过期导致的边界问题也能被状态机兜底。",
+        "本地消息表（Transactional Outbox Pattern）将业务数据更新和消息记录写入同一个数据库事务，再由 Relay 进程异步发送到 MQ，是在不引入分布式事务的前提下同时保证消息可靠发送和消费幂等的工程首选方案。",
+        "Saga 模式中的补偿操作（如退款）同样可能被重复调用，必须用相同的幂等设计原则保护，否则「补偿了两次」和「正向操作了两次」在危害上是等价的。"
+      ],
+      "quiz": [
+        {
+          "id": "mq-idempotent-consumer-1-q1",
+          "question": "为什么消费者不能依靠 Kafka 的 exactly-once 语义来解决重复消费问题？",
+          "choices": [
+            { "id": "A", "text": "Kafka 的 exactly-once 只对 Producer→Broker 投递和 Kafka Streams 内部处理有效，外部消费者仍面临 at-least-once 的投递语义" },
+            { "id": "B", "text": "Kafka 根本不支持 exactly-once，这个特性只存在于 RabbitMQ" },
+            { "id": "C", "text": "exactly-once 只在单分区场景有效，多分区时会退化为 at-least-once" },
+            { "id": "D", "text": "启用 exactly-once 会大幅降低吞吐量，所以实践中无法使用" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Kafka 0.11 版本引入了幂等 Producer 和事务 API，确实支持 exactly-once 语义，但这个保证的边界是：Producer 到 Broker 的写入阶段，以及 Kafka Streams 的端到端处理（consume-transform-produce 链路）。对于普通的外部消费者来说，当消费者在提交 offset 之前崩溃或发生 Rebalance，Broker 会把该分区的消息重新投递给新的消费者，外部消费者面对的仍然是 at-least-once 语义。B 选项错误，Kafka 确实支持 exactly-once。C 选项是干扰项，exactly-once 与分区数无关。D 选项虽然性能影响是真实的，但这不是「不能用」的原因，且 D 也没有回答核心问题。"
+        },
+        {
+          "id": "mq-idempotent-consumer-1-q2",
+          "question": "下列关于幂等性定义的表述，哪个最准确？",
+          "choices": [
+            { "id": "A", "text": "幂等操作执行一次和执行多次，产生的业务状态结果完全相同" },
+            { "id": "B", "text": "幂等操作每次执行都返回相同的响应码，不会抛出异常" },
+            { "id": "C", "text": "幂等操作是指同一请求在网络中只会被发送一次，不存在重传" },
+            { "id": "D", "text": "幂等操作是线程安全的，多线程并发执行不会产生数据竞争" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "幂等性的核心定义是：对同一操作执行一次和执行多次，系统的最终状态（业务结果）完全相同。注意「结果相同」指的是业务状态，而不是每次调用都返回同样的 HTTP 响应码或不抛异常——第二次处理重复消息可以返回「已处理，跳过」的提示，这没问题，重要的是账户余额没有被扣两次。B 选项混淆了幂等性和「返回值稳定性」。C 选项描述的是 exactly-once 投递语义，和幂等性是两个不同的概念。D 选项描述的是线程安全，虽然幂等实现往往需要配合锁来保证线程安全，但两者定义不同。"
+        },
+        {
+          "id": "mq-idempotent-consumer-1-q3",
+          "question": "使用 Redis SET NX EX 实现幂等消费时，如果业务逻辑执行抛出异常，正确的处理方式是？",
+          "choices": [
+            { "id": "A", "text": "删除 Redis key，让这条消息可以被重新正常处理" },
+            { "id": "B", "text": "保留 Redis key，等 TTL 过期后消息自然会被重新处理" },
+            { "id": "C", "text": "记录日志后直接 ACK，避免消息无限重试造成积压" },
+            { "id": "D", "text": "把 Redis key 的值改为 'failed'，标记处理失败状态" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "当业务逻辑执行失败时，必须删除 Redis key，原因是：Redis key 的存在表示「这条消息已经成功处理」，但实际上业务操作失败了，状态不一致。如果不删 key，这条消息后续所有的重投都会被 SETNX 拦截，业务逻辑永远不会被重新执行，扣款就「永久跳过」了，账户状态会出现不一致。B 选项等 TTL 过期虽然最终能被处理，但这意味着这笔扣款可能延迟 24 小时才执行，对支付业务完全不可接受。C 选项直接 ACK 丢失了这条消息，业务数据永久不一致。D 选项在 Redis 里存 failed 状态没有实际意义，下次 SETNX 仍会失败。"
+        },
+        {
+          "id": "mq-idempotent-consumer-1-q4",
+          "question": "业务状态机方案中，为什么在检查订单状态后还需要加分布式锁？",
+          "choices": [
+            { "id": "A", "text": "防止两个消费者并发通过状态检查，都认为订单是「待支付」，导致扣款被执行两次" },
+            { "id": "B", "text": "分布式锁用于保护 Redis 的 SETNX 操作，防止缓存击穿" },
+            { "id": "C", "text": "防止消费者处理消息时数据库发生死锁" },
+            { "id": "D", "text": "消费者处理消息是单线程的，不需要分布式锁，加锁是多余的" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "状态机检查是一个「先读再写」的操作：先查询订单当前状态，再根据状态决定是否执行扣款，最后更新状态。如果两个消费者实例几乎同时处理同一条重复消息，都在第一步查到订单是「待支付」，都判断应该执行扣款，然后两个都去执行扣款——这就是经典的竞态条件（Race Condition）。分布式锁保证了「检查状态」和「执行扣款」两个步骤的原子性，同一时间只有一个消费者能持有订单的锁。D 选项的错误在于：即使单个消费者是单线程的，在分布式系统里有多个消费者实例同时运行，进程级别的并发问题依然存在。"
+        },
+        {
+          "id": "mq-idempotent-consumer-1-q5",
+          "question": "以下乐观锁 SQL 执行后返回 affectedRows=0，可能的原因有哪些？",
+          "choices": [
+            { "id": "A", "text": "订单状态已经不是 pending（已被处理），或者并发更新导致 version 号不匹配，两种情况都可能" },
+            { "id": "B", "text": "只可能是 version 号不匹配，status 变更不会影响 affectedRows" },
+            { "id": "C", "text": "只可能是订单不存在于数据库，status 和 version 条件不会导致 affectedRows=0" },
+            { "id": "D", "text": "affectedRows=0 说明数据库事务被回滚，需要检查事务隔离级别" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "乐观锁 SQL 的 WHERE 子句通常包含两个条件：`status = 'pending'` 和 `version = #{expectedVersion}`。任何一个条件不满足，UPDATE 都不会匹配到行，affectedRows 就为 0。在幂等消费场景里，`status != 'pending'` 意味着这条消息已经被之前的消费处理了，是幂等跳过；`version` 不匹配意味着有并发的另一个消费者抢先更新了，是并发冲突，需要重新查询状态再判断。代码里需要区分这两种情况：幂等跳过直接返回成功，并发冲突需要重试或报错。B 和 C 都只考虑了一种情况，是片面的。D 选项混淆了乐观锁和事务回滚的概念。"
+        },
+        {
+          "id": "mq-idempotent-consumer-1-q6",
+          "question": "为什么金融场景下不推荐用纯随机 UUID 作为消息 ID？",
+          "choices": [
+            { "id": "A", "text": "UUID 无业务语义，排查线上问题时无法通过消息 ID 关联到具体业务对象，显著增加排障成本" },
+            { "id": "B", "text": "UUID 的生成依赖操作系统随机数，高并发下可能出现 ID 碰撞" },
+            { "id": "C", "text": "UUID 字符串较长，存储到 Redis 时内存开销远大于数字型 ID" },
+            { "id": "D", "text": "UUID 不能保证全局唯一，在分布式系统中会产生 ID 重复问题" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "UUID（通用唯一标识符）确实能保证全局唯一，B 和 D 选项的说法是错误的，UUID4 基于密码学安全随机数，碰撞概率低到可以忽略不计。C 选项的存储开销差异在实际场景里微不足道。A 才是核心痛点：UUID 是完全随机的字符串（如 `3f6b5e2a-1d4c-4a7b-9f8e-2c1d0e9f7a3b`），完全没有业务含义，当线上出现异常扣款时，你看着日志里一堆 UUID，根本不知道它们对应哪些订单，需要额外的关联查询才能追踪。而像 `pay_deduct_order12345_1704067200` 这样的 ID，一眼就知道是 order12345 在某个时间点的扣款消息，排查效率天差地别。"
+        },
+        {
+          "id": "mq-idempotent-consumer-1-q7",
+          "question": "数据库唯一约束方案（INSERT IGNORE）和 Redis SETNX 方案相比，主要的性能差异和适用场景有何不同？",
+          "choices": [
+            { "id": "A", "text": "INSERT IGNORE 需要磁盘 I/O，延迟约 1-10ms；Redis SETNX 基于内存，延迟约 0.1-1ms；INSERT IGNORE 适合低频场景，Redis 适合高吞吐场景" },
+            { "id": "B", "text": "两者性能相同，区别只在于 INSERT IGNORE 会永久保存记录而 Redis 有 TTL" },
+            { "id": "C", "text": "Redis SETNX 需要网络往返，延迟更高；INSERT IGNORE 在本地执行更快" },
+            { "id": "D", "text": "INSERT IGNORE 在分布式环境下不可用，只有 Redis 才能做分布式幂等" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "数据库的 INSERT 操作需要经过 SQL 解析、锁获取、B+ 树索引更新、WAL 日志写入（redo log、binlog），整个链路涉及磁盘 I/O，延迟通常在 1-10ms 量级，且会占用数据库连接池资源，并发高时可能造成连接排队。Redis SETNX 是纯内存操作，单命令延迟通常在 0.1-1ms 以内，并发能力强得多。INSERT IGNORE 方案的优点是数据持久化，消费记录永远有据可查，适合对审计有要求且 QPS 不高（< 1000）的场景。C 选项误解了本地执行的含义——INSERT IGNORE 也需要通过网络连接到数据库服务器。D 选项错误，分布式环境下数据库同样可以提供全局唯一约束。"
+        },
+        {
+          "id": "mq-idempotent-consumer-1-q8",
+          "question": "在支付系统中，使用双重保障（Redis SETNX + 业务状态机）的主要原因是什么？",
+          "choices": [
+            { "id": "A", "text": "单用 Redis 时，若 Redis key 因 TTL 过期或 Redis 故障导致 key 丢失，相同消息再次投递会绕过 Redis 直接到达状态机兜底，确保不会漏掉任何一道防护" },
+            { "id": "B", "text": "Redis 不支持事务，必须用数据库状态机作为备用方案" },
+            { "id": "C", "text": "双重保障是为了解决消息顺序性问题，确保消息按序消费" },
+            { "id": "D", "text": "状态机检查性能太差，需要 Redis 先过滤掉大部分重复消息来降低 DB 压力" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "D 选项虽然也是双重保障的一个副作用（减少 DB 压力），但它不是主要原因。主要原因是可靠性：Redis 是内存系统，存在 TTL 过期和服务故障两种场景会导致 key 丢失。设想一个极端情况：某条扣款消息第一次处理成功，Redis key 写入，但 24 小时后 TTL 过期，此时 MQ 因某种极端故障将这条消息再次投递（虽然概率极低，但金融场景要考虑）——如果只有 Redis 一道防线，这条消息会被当成新消息处理，导致重复扣款。有了状态机兜底，订单状态「已支付」会正确拦截这次重复处理。A 完整描述了这个场景。B 选项错误，Redis 支持 MULTI/EXEC 事务和 Lua 脚本原子操作。C 选项的消息顺序性和幂等性是两个不同的问题。"
+        },
+        {
+          "id": "mq-idempotent-consumer-1-q9",
+          "question": "本地消息表（Transactional Outbox Pattern）解决的核心问题是什么？",
+          "choices": [
+            { "id": "A", "text": "在一个本地数据库事务里同时完成业务数据更新和消息记录写入，避免「业务成功但消息没发出去」或「消息发出去但业务失败」的数据不一致" },
+            { "id": "B", "text": "本地消息表用于存储消费者已处理的消息 ID，是数据库唯一约束幂等方案的别称" },
+            { "id": "C", "text": "本地消息表通过在本机内存缓存消息，减少网络往返提升消费吞吐量" },
+            { "id": "D", "text": "本地消息表是 Kafka 的内部机制，用于保证 exactly-once 投递" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "本地消息表解决的是「消息可靠发送」问题，也叫 Transactional Outbox Pattern。场景是：你希望「扣款成功」和「发出扣款通知消息」是原子的——要么两件事都发生，要么都不发生。如果先扣款再发消息，服务在发消息前崩溃，钱扣了但下游系统不知道；如果先发消息再扣款，服务在扣款前崩溃，消息发了但钱没扣。本地消息表的做法是：在同一个数据库事务里更新扣款记录并插入本地消息表，再由独立的 Relay 进程扫表把消息投递到 MQ。Relay 投递成功则标记消息已发送，投递失败则重试——结合消费端的幂等消费，整条链路的可靠性就有了保证。B 选项混淆了两种不同的模式。C 和 D 完全错误。"
+        },
+        {
+          "id": "mq-idempotent-consumer-1-q10",
+          "question": "如果线上出现消费者处理消息时异常退出，Redis 中该消息 ID 的 key 没有被删除，导致这条消息被永久跳过，应如何补救？",
+          "choices": [
+            { "id": "A", "text": "手动删除 Redis 中对应的 key，让消息在下一次投递时可以被正常处理；同时检查业务状态，确认数据是否需要补偿" },
+            { "id": "B", "text": "重启消费者服务，Redis 会在服务重启时自动清除该 key" },
+            { "id": "C", "text": "修改消息 ID 后重新发布这条消息，绕过 Redis 的幂等检查" },
+            { "id": "D", "text": "只需等待 TTL 过期，期间无需任何干预操作" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "当消费者异常退出且 Redis key 没有被清理时，说明业务逻辑没有成功执行，但 Redis 认为「已处理」。这是一个数据不一致的状态，需要人工介入。正确的处理步骤是：第一步，查询 Redis 确认对应 key 存在且 TTL 还没过期；第二步，查询业务数据库确认这笔扣款是否实际执行了（订单状态是否变为已支付）；第三步，如果扣款没有执行，手动删除 Redis key，让消息重新投递时可以被处理；如果扣款已执行但 Redis key 记录丢失，则不需要操作，保持现状即可。B 选项错误，服务重启不会影响 Redis 里的 key。C 选项虽然能绕过幂等检查，但如果原始消息的业务逻辑是否执行还未确认，贸然重发可能导致重复执行。D 选项等待 TTL 在金融场景不可接受，24 小时的数据不一致窗口太长。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#semantics",
+        "https://www.rabbitmq.com/reliability.html",
+        "https://microservices.io/patterns/data/transactional-outbox.html"
+      ]
+    }
+  ]
+}
