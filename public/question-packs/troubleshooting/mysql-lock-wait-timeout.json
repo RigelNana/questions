@@ -1,0 +1,156 @@
+{
+  "id": "mysql-lock-wait-timeout",
+  "name": "MySQL 锁等待超时排查",
+  "domain": "troubleshooting",
+  "description": "排查 MySQL InnoDB 锁等待超时的方法，深入理解行锁、间隙锁与长事务问题",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "mysql-lock-wait-timeout-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["mysql", "innodb", "lock", "transaction", "deadlock", "performance"],
+      "title": "MySQL 大量报 Lock wait timeout exceeded，如何排查锁等待问题？",
+      "content": "某电商平台在大促活动期间，后端服务日志开始出现大量如下报错：\n\n```\n[ERROR] com.mysql.jdbc.exceptions.jdbc4.MySQLTransactionRollbackException:\n  Lock wait timeout exceeded; try restarting transaction\n```\n\n与此同时，监控大盘显示 MySQL 的活跃连接数从平时的 80 飙升到 600+，慢查询数量每分钟超过 200 条，部分订单创建和库存扣减接口 P99 延迟从 50ms 暴涨到 8s 以上，且有明显的超时失败。DBA 紧急查看 `SHOW PROCESSLIST`，发现大量线程处于 `Waiting for lock` 状态，最长的已经等待了 120 秒。\n\n应用使用的是 MySQL 5.7，InnoDB 存储引擎，事务隔离级别为默认的 `REPEATABLE READ`。当时后台有一个批量更新商品库存的定时任务正在运行，前台同时有大量用户在下单，二者都会写 `orders` 表和 `inventory` 表。\n\n面对这种情况，你会如何系统地排查锁等待的根本原因？是什么导致了锁等待的级联放大？如何在不重启数据库的情况下快速恢复服务，同时找到根本原因并给出长期修复方案？\n\n**已知信息：**\n- MySQL 版本：5.7.36\n- 事务隔离级别：`REPEATABLE READ`\n- `innodb_lock_wait_timeout` = 50（默认值）\n- 发生时间段：大促活动期间，并发写入量是平时的 5 倍\n- 涉及的核心表：`orders`（主键 id，索引 user_id, status）、`inventory`（主键 sku_id，索引 warehouse_id）\n- 定时任务逻辑：`UPDATE inventory SET stock = stock - ? WHERE sku_id = ? AND warehouse_id = ?`，一个事务内批量更新数百条记录\n- 下单逻辑：先 `SELECT ... FOR UPDATE` 锁定库存行，再扣减，再插入 `orders`，整个事务包含若干次 HTTP 调用（调用风控服务、优惠券服务）",
+      "answer": "## 一、先建立认知地基：InnoDB 的锁体系\n\n在动手排查之前，必须先搞清楚 InnoDB 的锁类型，否则看 `SHOW ENGINE INNODB STATUS` 的输出就像看天书。\n\nInnoDB 的锁分为两个层次。第一层是**意向锁（Intention Lock）**，分为意向共享锁 IS 和意向排他锁 IX。意向锁是表级别的，它的存在是为了让表锁和行锁能高效共存——当你要给某行加排他锁时，InnoDB 会先在表上加 IX，这样另一个想加表级读锁的事务就能快速判断「有人在表里某行持有排他锁」，而不用逐行扫描。意向锁之间互不冲突，它只跟表级的 LOCK TABLES 发生冲突。\n\n第二层是**行级锁**，这才是引发锁等待超时的主角。行级锁有三种形态：**记录锁（Record Lock）** 锁的是索引上的一条具体记录；**间隙锁（Gap Lock）** 锁的是两条索引记录之间的空隙，阻止其他事务在这个区间内插入新记录；**临键锁（Next-Key Lock）** 是前两者的组合，锁住一条记录及其前方的间隙。在 `REPEATABLE READ` 隔离级别下，InnoDB 默认使用临键锁来防止幻读。这个设计意味着：即便你只更新一条记录，如果走了范围扫描，可能会锁住一大片区间。\n\n理解 MVCC 与锁的关系同样关键。**快照读**（普通的 SELECT）不加任何锁，读的是事务开始时的数据快照，走 undo log 重建，所以完全不会引发锁冲突。**当前读**（`SELECT ... FOR UPDATE`、`SELECT ... LOCK IN SHARE MODE`、`UPDATE`、`DELETE`、`INSERT`）则必须读最新数据，因此会加锁。题目中下单逻辑用了 `SELECT ... FOR UPDATE`，这是一个当前读，会真实加排他锁。这个区别非常重要，很多人以为「我没用 FOR UPDATE 就不会有锁」，但所有的写操作本身就是当前读。\n\n## 二、应急排查：快速找到持锁元凶\n\n服务已经在超时了，要分两个阶段操作：第一步快速止血，第二步慢慢找原因。\n\n**立刻执行的第一个命令**是 `SHOW ENGINE INNODB STATUS\\G`，重点看 `TRANSACTIONS` 段。这个命令的输出会告诉你当前最新的死锁记录以及所有活跃事务的状态。一个典型的锁等待输出长这样：\n\n```\n------------\nTRANSACTIONS\n------------\nTrx id counter 421837602\nPurge done for trx's n:o < 421837480 undo n:o < 0 state: running but idle\nHistory list length 1842\nLIST OF TRANSACTIONS FOR EACH SESSION:\n---TRANSACTION 421837598, ACTIVE 187 sec starting index read\nMySQL thread id 1042, OS thread handle 140234567890, query id 98723 10.0.1.55 app_user\nUPDATE inventory SET stock = stock - 1 WHERE sku_id = 10086 AND warehouse_id = 3\n------- TRX HAS BEEN WAITING 47 sec FOR THIS LOCK TO BE GRANTED:\nRECORD LOCKS space id 231 page no 5 n bits 72 index PRIMARY of table `shop`.`inventory`\n trx id 421837598 lock_mode X locks rec but gap waiting\nRecord lock, heap no 3 PHYSICAL RECORD: n_fields 5; compact format; info bits 0\n 0: len 8; hex 0000000000002766; asc     'f;;\n\n------------------\n---TRANSACTION 421837401, ACTIVE 312 sec\n2 lock struct(s), heap size 1136, 1 row lock(s), undo log entries 87\nMySQL thread id 889, OS thread handle 140234512345, query id 96105 10.0.1.20 batch_user\n---TRANSACTION IS HOLDING:\nRECORD LOCKS space id 231 page no 5 n bits 72 index PRIMARY of table `shop`.`inventory`\n trx id 421837401 lock_mode X locks rec but gap\nRecord lock, heap no 3 PHYSICAL RECORD: n_fields 5; compact format; info bits 0\n```\n\n从这段输出中，可以读出关键信息：thread id 889 的事务已经活跃了 **312 秒**，持有 `inventory` 表主键上的排他锁（`lock_mode X`），而 thread id 1042 已经等待了 47 秒。312 秒的活跃时间说明这个事务迟迟没有提交，这就是持锁元凶。\n\n**第二个排查入口**是三张系统表（MySQL 5.7）：\n\n```sql\n-- 查看所有活跃事务，重点看 trx_started 最老的\nSELECT trx_id, trx_started, trx_state, trx_mysql_thread_id,\n       trx_rows_locked, trx_rows_modified, trx_query\nFROM information_schema.INNODB_TRX\nORDER BY trx_started ASC\nLIMIT 10;\n\n-- 查看锁等待关系：谁在等谁\nSELECT r.trx_id AS waiting_trx,\n       r.trx_mysql_thread_id AS waiting_thread,\n       r.trx_query AS waiting_query,\n       b.trx_id AS blocking_trx,\n       b.trx_mysql_thread_id AS blocking_thread,\n       b.trx_query AS blocking_query\nFROM information_schema.INNODB_LOCK_WAITS w\nJOIN information_schema.INNODB_TRX r ON w.requesting_trx_id = r.trx_id\nJOIN information_schema.INNODB_TRX b ON w.blocking_trx_id = b.trx_id;\n```\n\n这两个查询组合起来，能快速告诉你：谁持锁时间最长（`trx_started` 最老），它锁了多少行（`trx_rows_locked`），以及它目前在执行什么 SQL。\n\n找到问题事务的 thread id 之后，如果确认它是失控的批量任务或者卡住的应用连接，执行 `KILL 889` 强制回滚这个事务。InnoDB 会自动回滚该事务持有的所有锁，等待队列里的事务就能陆续拿到锁继续执行。这是最快的止血手段。\n\n在 MySQL 8.0 中，`INNODB_LOCK_WAITS` 和 `INNODB_LOCKS` 被移到了 `performance_schema` 下，对应的表是 `data_locks` 和 `data_lock_waits`，查询逻辑类似但列名有变化。\n\n## 三、根本原因分析：为什么这次问题这么严重\n\n找到元凶只是第一步，更重要的是搞清楚为什么会发生，否则下次大促还会重现。结合题目场景，这里至少有三个叠加的问题。\n\n**第一个问题：事务范围过大，HTTP 调用在事务内部。** 下单逻辑在一个数据库事务里调用了风控服务和优惠券服务。HTTP 调用的延迟通常在几十毫秒到几百毫秒，如果风控服务在大促期间响应变慢，整个数据库事务就会被撑大。事务存在的时间越长，持有的锁就越久，后续等待的事务就越多。这是一个典型的**长事务陷阱**。正确的做法是把 HTTP 调用移到事务外面：先调外部服务获取结果，然后开启数据库事务，在事务内做尽量短的数据库操作，立刻提交。\n\n**第二个问题：批量更新的行顺序不一致，制造死锁。** 定时任务一个事务内批量更新数百条 `inventory` 记录，而下单逻辑也在同时锁定库存行。如果定时任务按 sku_id 升序锁行（1, 2, 3, 4……），而某个下单请求的锁顺序是（3, 1）——先锁 sku 3 再锁 sku 1——那么二者之间就会形成经典的**循环等待死锁**：任务持有锁1等待锁3，下单持有锁3等待锁1。InnoDB 的死锁检测（`innodb_deadlock_detect=ON` 默认开启）会在几毫秒内发现这种循环等待并强制回滚代价较小的那个事务，但在高并发下死锁频率过高会本身消耗大量 CPU。\n\n**第三个问题：索引失效导致行锁升级为表锁。** 如果 `UPDATE inventory SET stock = stock - ? WHERE sku_id = ? AND warehouse_id = ?` 这条 SQL 没有命中联合索引，MySQL 就会做全表扫描，而扫描过程中被扫到的每一行都会被加临键锁，最终效果近似于表锁。用 `EXPLAIN` 检查一下执行计划，如果看到 `type: ALL` 或者 `Extra: Using where` 而不是 `Using index`，就说明索引没走，需要立刻建索引。\n\n## 四、扩展：工具与长期防御机制\n\n事故处理完之后，需要建立长效机制防止复发。\n\n`innodb_deadlock_detect` 默认开启，这是 InnoDB 在后台用有向图检测循环等待的机制。它的代价是：每次加锁都要遍历等待图，在高并发锁竞争场景下，这个检测本身会消耗大量 CPU。如果你的系统死锁很少但并发锁获取量极大，可以关闭死锁检测并依赖 `innodb_lock_wait_timeout` 兜底，但这不是一般场景下的建议。\n\nPercona Toolkit 的 `pt-deadlock-logger` 工具可以持续监控 `SHOW ENGINE INNODB STATUS` 的输出并把死锁信息存入表中，这样事后复盘就有完整的历史记录，不用等下次死锁发生时正好有人在场。\n\n在业务层，有几个减少锁竞争的手段值得认真考虑。**乐观锁**是最常用的替代悲观锁的方案：在 `inventory` 表上加一个 `version` 字段，更新时用 `UPDATE inventory SET stock = stock - 1, version = version + 1 WHERE sku_id = ? AND version = ?`，如果 affected rows 为 0 说明被别人先改了，应用层重试。乐观锁完全不持有数据库锁，并发冲突低时性能远优于 `SELECT FOR UPDATE`。\n\nMySQL 8.0 还引入了 `SELECT ... FOR UPDATE SKIP LOCKED`，这个语法对于抢购、任务队列场景非常有用：多个消费者并发抢任务时，`SKIP LOCKED` 让每个消费者自动跳过已被锁定的行，直接拿到下一个未锁定的行，避免了大量锁等待的堆积。\n\n最后，养成定期巡检长事务的习惯。可以在监控系统里加一条告警：当 `INNODB_TRX` 中存在活跃时间超过 10 秒的事务时立即报警，这样可以在问题还没放大之前就发现失控的事务。",
+      "keyPoints": [
+        "InnoDB 在 REPEATABLE READ 隔离级别下默认使用临键锁（Next-Key Lock = 记录锁 + 间隙锁），范围扫描时会锁住一段区间而不只是单行，这是导致锁冲突面积远超预期的根本原因。",
+        "锁等待超时排查的第一个命令是 SHOW ENGINE INNODB STATUS，重点看 TRANSACTIONS 段中 trx_started 最老的事务以及「TRX HAS BEEN WAITING ... FOR THIS LOCK TO BE GRANTED」信息。",
+        "information_schema.INNODB_TRX 和 INNODB_LOCK_WAITS（MySQL 5.7）能直接查出「谁在等谁」的阻塞链，找到持锁最久的线程后 KILL 掉可以立即释放所有等待。",
+        "事务内包含外部 HTTP 调用是长事务最常见的根因，HTTP 抖动会直接撑大事务持锁时间，应当先完成所有外部调用再开启数据库事务，在事务内只做最短的数据库操作。",
+        "批量更新时如果多个事务对同一批行的加锁顺序不一致，会形成循环等待死锁；解决方法是强制所有事务按相同的主键顺序（如升序）加锁。",
+        "UPDATE 语句的 WHERE 条件如果没有命中索引，InnoDB 会对全表扫描到的每一行加临键锁，实际效果等同于表锁，用 EXPLAIN 确认执行计划是排查锁升级问题的必要步骤。",
+        "乐观锁（version 字段 CAS 更新）在并发冲突率低的场景下性能优于 SELECT FOR UPDATE，因为它完全不持有数据库行锁；MySQL 8.0 的 SELECT FOR UPDATE SKIP LOCKED 则适合多消费者抢任务的队列场景。"
+      ],
+      "quiz": [
+        {
+          "id": "mysql-lock-wait-timeout-q1",
+          "question": "innodb_lock_wait_timeout 参数的默认值是多少秒？",
+          "choices": [
+            { "id": "A", "text": "10 秒" },
+            { "id": "B", "text": "30 秒" },
+            { "id": "C", "text": "50 秒" },
+            { "id": "D", "text": "120 秒" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "innodb_lock_wait_timeout 的默认值是 50 秒。这个参数控制一个事务等待行锁的最大时间，超时后事务会收到「Lock wait timeout exceeded; try restarting transaction」错误并回滚。需要注意的是，这个参数回滚的只是等待超时的那条 SQL（或整个事务，取决于 innodb_rollback_on_timeout），而不是持锁方的事务。A 选项 10 秒是部分业务方手动调小后的常见值。B 选项 30 秒是容易记混的数字。D 选项 120 秒超出默认值，是部分批处理场景下调大的值。"
+        },
+        {
+          "id": "mysql-lock-wait-timeout-q2",
+          "question": "以下哪种操作属于「当前读」，会真实加锁？",
+          "choices": [
+            { "id": "A", "text": "普通 SELECT（不带 FOR UPDATE）" },
+            { "id": "B", "text": "SELECT ... FOR UPDATE" },
+            { "id": "C", "text": "在 READ COMMITTED 隔离级别下的 SELECT" },
+            { "id": "D", "text": "以上均不加锁" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SELECT ... FOR UPDATE 是当前读，会读取最新版本的数据并加排他锁。普通 SELECT 在 InnoDB 下是快照读，通过 MVCC 读取事务开始时的数据快照，完全不加任何行锁，因此多个普通 SELECT 之间绝不会发生锁等待。这个区别极其重要：很多开发者认为 SELECT 也会加锁，从而对并发问题产生误判。此外，UPDATE、DELETE、INSERT 以及 SELECT ... LOCK IN SHARE MODE 也都属于当前读，都会加锁。"
+        },
+        {
+          "id": "mysql-lock-wait-timeout-q3",
+          "question": "在 REPEATABLE READ 隔离级别下，InnoDB 默认使用哪种行锁来防止幻读？",
+          "choices": [
+            { "id": "A", "text": "记录锁（Record Lock），只锁具体的行" },
+            { "id": "B", "text": "间隙锁（Gap Lock），只锁行与行之间的间隙" },
+            { "id": "C", "text": "临键锁（Next-Key Lock），同时锁住记录和记录前方的间隙" },
+            { "id": "D", "text": "意向锁（Intention Lock），表级别加锁" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "临键锁（Next-Key Lock）是记录锁和间隙锁的组合，它锁住一条索引记录以及该记录之前的间隙。InnoDB 在 REPEATABLE READ 隔离级别下默认用临键锁来阻止其他事务在已扫描的区间内插入新记录，从而防止幻读。这也是为什么一个范围查询（如 WHERE id BETWEEN 100 AND 200）会锁住整段区间，而不只是现有的几行。READ COMMITTED 隔离级别下，InnoDB 不使用间隙锁，只用记录锁，并发性更高但有幻读风险。"
+        },
+        {
+          "id": "mysql-lock-wait-timeout-q4",
+          "question": "SHOW ENGINE INNODB STATUS 输出中，「ACTIVE 312 sec」表示什么？",
+          "choices": [
+            { "id": "A", "text": "该事务已经等待锁 312 秒" },
+            { "id": "B", "text": "该事务从开始到现在已经活跃了 312 秒，仍未提交" },
+            { "id": "C", "text": "该事务在 312 秒前已经提交" },
+            { "id": "D", "text": "该事务的 innodb_lock_wait_timeout 被设置为 312 秒" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ACTIVE N sec 表示该事务从开始（BEGIN 或第一条 DML）到当前时刻已经持续了 N 秒，事务尚未提交或回滚。一个事务活跃时间越长，说明它持有的锁也越久。这是判断「长事务」最直接的指标。如果看到一个事务 ACTIVE 几百秒，同时 trx_rows_locked 很多，基本可以断定它是锁等待的元凶。真正的等待锁时间用「TRX HAS BEEN WAITING N sec」来表示，两者含义不同。"
+        },
+        {
+          "id": "mysql-lock-wait-timeout-q5",
+          "question": "以下哪条 SQL 在 information_schema 中能最直观地看出「哪个事务在阻塞哪个事务」（MySQL 5.7）？",
+          "choices": [
+            { "id": "A", "text": "SELECT * FROM information_schema.INNODB_TRX" },
+            { "id": "B", "text": "SELECT * FROM information_schema.INNODB_LOCK_WAITS JOIN information_schema.INNODB_TRX" },
+            { "id": "C", "text": "SELECT * FROM information_schema.PROCESSLIST WHERE State = 'Waiting for lock'" },
+            { "id": "D", "text": "SHOW ENGINE INNODB STATUS" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "INNODB_LOCK_WAITS 记录了正在等待的锁请求（requesting_trx_id）和持有该锁的事务（blocking_trx_id），将其与 INNODB_TRX JOIN 之后就能直接得到「等待方正在执行什么 SQL」和「阻塞方正在执行什么 SQL」，是最高效的阻塞链查询方式。INNODB_TRX 单独只能看到所有活跃事务，看不出谁在等谁。PROCESSLIST 只能看到线程状态，缺少锁的关联信息。SHOW ENGINE INNODB STATUS 信息最全，但需要人工解析文本，不适合脚本化查询。在 MySQL 8.0 中，对应的是 performance_schema.data_lock_waits。"
+        },
+        {
+          "id": "mysql-lock-wait-timeout-q6",
+          "question": "一个 UPDATE 语句的 WHERE 条件没有命中任何索引，在 REPEATABLE READ 下会发生什么？",
+          "choices": [
+            { "id": "A", "text": "只锁符合条件的行，因为 InnoDB 只锁必要的行" },
+            { "id": "B", "text": "直接报错，MySQL 要求 UPDATE 必须走索引" },
+            { "id": "C", "text": "全表扫描，对扫描到的每一行加临键锁，锁范围接近整张表" },
+            { "id": "D", "text": "只加表级意向锁，不会有行锁" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是一个非常高频的生产坑。当 UPDATE 的 WHERE 条件无法使用索引时，InnoDB 必须做全表扫描（type: ALL），在扫描过程中对每一行都会加临键锁（Next-Key Lock）。虽然最终只修改符合条件的少数几行，但被锁住的是整张表几乎所有的行区间，并发写入都会被阻塞，效果接近于表锁。用 EXPLAIN 检查执行计划，如果看到 type 为 ALL 或 index，就应该立刻检查是否需要建索引。这就是为什么「索引失效」会导致本来只是行锁的 UPDATE 演变为全局锁等待。"
+        },
+        {
+          "id": "mysql-lock-wait-timeout-q7",
+          "question": "以下关于乐观锁和悲观锁的描述，哪个最准确？",
+          "choices": [
+            { "id": "A", "text": "乐观锁（version 字段）在任何场景下都优于 SELECT FOR UPDATE，应该全面替换" },
+            { "id": "B", "text": "悲观锁（SELECT FOR UPDATE）会持有数据库行锁直到事务提交，并发冲突高时锁等待严重；乐观锁无数据库锁，冲突时应用层重试，冲突低时性能更好" },
+            { "id": "C", "text": "乐观锁需要数据库支持，InnoDB 原生不支持乐观锁" },
+            { "id": "D", "text": "SELECT FOR UPDATE 不会阻塞普通 SELECT，两者可以并发执行没有冲突" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "乐观锁的本质是在应用层做 CAS（Compare-And-Swap）：更新时带上 version = old_version 条件，如果 affected rows = 0 说明被别人先改了，应用层重试。它完全不持有数据库行锁，在冲突率低（大多数情况下成功）的场景下吞吐量远高于 SELECT FOR UPDATE。但在冲突率高的场景下（如秒杀同一个 sku），乐观锁会导致大量重试，反而不如悲观锁直接排队。D 选项错误：SELECT FOR UPDATE 加的是排他锁，会阻塞其他 SELECT FOR UPDATE 和 LOCK IN SHARE MODE，但不会阻塞不加锁的普通 SELECT（因为普通 SELECT 是快照读）。"
+        },
+        {
+          "id": "mysql-lock-wait-timeout-q8",
+          "question": "两个事务 A 和 B 同时操作同一张表的两行（row1 和 row2），事务 A 先锁 row1 再锁 row2，事务 B 先锁 row2 再锁 row1。最终会发生什么？",
+          "choices": [
+            { "id": "A", "text": "两个事务都会正常完成，InnoDB 会自动排队处理" },
+            { "id": "B", "text": "先提交的事务成功，后提交的事务等待超时" },
+            { "id": "C", "text": "形成死锁，InnoDB 的死锁检测会回滚代价较小的事务" },
+            { "id": "D", "text": "两个事务都会立即失败并回滚" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是经典的死锁场景：事务 A 持有 row1 等待 row2，事务 B 持有 row2 等待 row1，形成循环等待。InnoDB 的 innodb_deadlock_detect 默认开启，内部维护一个等待图（wait-for graph），当检测到循环依赖时会立即介入，选择「undo log 条目最少」（代价最小）的事务强制回滚，另一个事务得以继续执行。整个死锁检测通常在几毫秒内完成。避免死锁的根本方法是让所有事务按相同的顺序（如主键升序）访问资源，彻底破坏循环等待的条件。"
+        },
+        {
+          "id": "mysql-lock-wait-timeout-q9",
+          "question": "SELECT ... FOR UPDATE SKIP LOCKED 语法（MySQL 8.0）的主要应用场景是什么？",
+          "choices": [
+            { "id": "A", "text": "用于跳过死锁检测，提高高并发下的写入性能" },
+            { "id": "B", "text": "用于多消费者并发抢任务场景，让每个消费者跳过已被锁定的行直接拿到空闲任务，避免锁等待堆积" },
+            { "id": "C", "text": "用于替代 MVCC 快照读，读取最新数据同时不加锁" },
+            { "id": "D", "text": "用于绕过 innodb_lock_wait_timeout 限制，无限等待锁" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SKIP LOCKED 的典型场景是「数据库实现任务队列」：tasks 表中有大量待处理任务，多个 worker 并发执行 SELECT * FROM tasks WHERE status = 'pending' LIMIT 1 FOR UPDATE SKIP LOCKED。没有 SKIP LOCKED 时，多个 worker 会争抢同一行，大量 worker 阻塞等待锁释放。有了 SKIP LOCKED，每个 worker 会自动跳过已被其他 worker 锁定的行，直接锁定下一个空闲任务，完全消除锁等待，吞吐量接近线性扩展。这个语法在 MySQL 8.0.1 引入，是处理并发任务分发的利器。"
+        },
+        {
+          "id": "mysql-lock-wait-timeout-q10",
+          "question": "排查锁等待问题时，发现一个事务已 ACTIVE 450 秒，trx_rows_locked = 1，trx_query 为 NULL，这最可能是什么情况？",
+          "choices": [
+            { "id": "A", "text": "该事务正在执行一个超大的批量 UPDATE，锁了大量行" },
+            { "id": "B", "text": "该事务是一个空闲事务（idle transaction）：开启事务后执行了 SQL，但应用程序没有及时提交，连接一直挂着持锁" },
+            { "id": "C", "text": "该事务正在等待其他事务释放锁" },
+            { "id": "D", "text": "该事务已经提交，INNODB_TRX 中的记录是历史数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "trx_query 为 NULL 且 ACTIVE 时间很长，是空闲事务（idle transaction）的典型特征：事务已经执行完了它的 SQL（当前没有正在执行的查询，所以 trx_query 为 NULL），但应用程序没有调用 COMMIT 或 ROLLBACK，连接就这样挂着。这通常是连接池管理不当（比如从池中取出连接后忘记关闭事务）、应用代码异常退出但连接未回收、或者在事务内做了耗时的业务逻辑（如等待用户输入）导致的。空闲事务持有的锁会阻塞后续所有写操作，危害极大。监控 trx_query IS NULL AND trx_state = 'SLEEP' 是发现这类问题的有效手段。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-deadlocks.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-locking.html",
+        "https://dev.mysql.com/doc/refman/5.7/en/innodb-information-schema-transactions.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/select.html#idm45828638932848"
+      ]
+    }
+  ]
+}
