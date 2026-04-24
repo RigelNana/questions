@@ -1,0 +1,158 @@
+{
+  "id": "container-cpu-throttling",
+  "name": "容器 CPU Throttling 的原理与优化",
+  "domain": "troubleshooting",
+  "description": "cgroup CFS CPU 限速机制导致容器 throttling 的原理、诊断指标与优化方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "container-cpu-throttling-1",
+      "domain": "troubleshooting",
+      "type": "concept",
+      "difficulty": 3,
+      "tags": ["container", "cpu", "cgroup", "kubernetes", "throttling", "cfs", "prometheus"],
+      "title": "容器 CPU 使用率只有 30% 但延迟很高，Prometheus 发现大量 CPU throttling，是什么原因？",
+      "content": "你负责一个部署在 Kubernetes 上的 Java 微服务，负责处理用户下单请求。服务配置了 `resources.limits.cpu: \"1\"` 和 `resources.requests.cpu: \"500m\"`，Pod 运行在一台 32 核的宿主机上，理论上 CPU 资源非常充裕。\n\n然而上周五下午，值班同学在 Grafana 上看到 P99 延迟从正常的 50ms 飙升到了 800ms，报警疯狂触发。第一直觉是 CPU 压力大，但打开 CPU 使用率面板一看，`container_cpu_usage_seconds_total` 显示该容器 CPU 使用率只有 30%，离 limit 的 100% 还差得很远。节点整体 CPU 也才 40%，根本不像是资源争抢的样子。\n\n同学百思不得其解，准备去查数据库慢查询。但这时另一位同学打开了 Prometheus，执行了一条查询：\n\n```promql\nrate(container_cpu_cfs_throttled_periods_total{pod=~\"order-service-.*\"}[5m])\n/\nrate(container_cpu_cfs_periods_total{pod=~\"order-service-.*\"}[5m])\n```\n\n结果令人惊讶——throttling 比例高达 **78%**。也就是说，这个容器有将近八成的调度周期都被内核强制「踩了刹车」。\n\n但明明 CPU 使用率才 30%，为什么会被限速这么严重？这两个数字之间真的不矛盾吗？如果你是这个系统的 SRE，你会如何解释这个现象，又会如何彻底解决它？",
+      "answer": "## 第一步：理解 Linux cgroup CFS 的 CPU 限制机制\n\n要解释这个「30% 使用率却有 78% throttling」的悖论，必须先从 Linux 内核的 CFS（Completely Fair Scheduler，完全公平调度器）说起。CFS 是 Linux 2.6.23 引入的主流进程调度算法，它的核心目标是让每个进程都「公平地」分享 CPU 时间。为了实现对容器的 CPU 资源限制，Linux 在 CFS 基础上提供了一套带宽控制机制，通过 cgroup 文件系统中的两个关键参数来实现：\n\n`cpu.cfs_period_us` 定义了一个「统计周期」的长度，单位是微秒，默认值是 **100000**，即 100ms。`cpu.cfs_quota_us` 定义了在每个周期内，这个 cgroup 最多能使用多少 CPU 时间，同样是微秒。当你在 Kubernetes 里写 `limits.cpu: \"1\"` 时，K8s 实际上是把这两个值配置成了 `period=100ms, quota=100ms`，意思是「每 100ms 内，这个容器最多用 100ms 的 CPU 时间」，折算下来就是占用一个核。如果你写的是 `limits.cpu: \"500m\"`，那么 quota 就会被设成 50ms。\n\n你可以进入一个容器对应的 cgroup 目录，亲眼确认这两个数字：\n\n```bash\n# 在宿主机上找到对应容器的 cgroup 路径\nCONTAINER_ID=$(docker inspect order-service-xxx --format '{{.Id}}')\ncat /sys/fs/cgroup/cpu/docker/${CONTAINER_ID}/cpu.cfs_period_us\n# 输出：100000\ncat /sys/fs/cgroup/cpu/docker/${CONTAINER_ID}/cpu.cfs_quota_us\n# 输出：100000  （对应 limits.cpu=1）\n```\n\n这个机制听起来很合理，但有一个致命的隐含假设：它以 period 为单位来「计账」。内核不关心你在 5 秒内平均用了多少 CPU，它只关心**当前这 100ms 内**你用了多少。一旦你在某个 100ms 内把 quota 用完了，不管这台机器上其他核有多空闲，你的容器就会被强制挂起，直到下一个 period 开始。这就是 CPU throttling。\n\n## 第二步：为什么 30% 使用率和 78% throttling 同时成立\n\n现在回到那个看似矛盾的监控数据。「CPU 使用率 30%」这个数字是 Prometheus 在一段时间窗口（比如 5 分钟）内的**平均值**。它告诉你，在过去 5 分钟里，这个容器平均每秒只消耗了 0.3 核的 CPU。\n\n但 Java 服务的 CPU 消耗从来不是均匀分布的。当一个下单请求进来时，JVM 需要在极短的时间内处理大量逻辑：GC、序列化、JSON 解析、业务计算……这些 CPU 消耗可能集中在某个 100ms 的 period 里「一次性爆发」。假设你的服务同时有 20 个线程在跑，每个线程需要 8ms 来完成一次请求，那么在最坏的情况下，这 20 个线程会在同一个 100ms period 内消耗 160ms 的 CPU 时间——超过了 quota 限制的 100ms，剩下的 60ms 就需要被推迟到下一个 period。\n\n这就是 throttling 的本质：**它衡量的是瞬时峰值，而不是平均值**。一个服务可以在 5 分钟尺度上平均只用 30% 的 CPU，但在某些 100ms 的小窗口里消耗了 110% 的 quota，依然会被限速。\n\n用 Prometheus 精确量化 throttling 比例的方式如下：\n\n```promql\n# throttling 比例：被限速的 period 占总 period 的百分比\nrate(container_cpu_cfs_throttled_periods_total{namespace=\"prod\", pod=~\"order-service-.*\"}[5m])\n/\nrate(container_cpu_cfs_periods_total{namespace=\"prod\", pod=~\"order-service-.*\"}[5m])\n* 100\n```\n\n`container_cpu_cfs_periods_total` 是容器经历的总 period 数量，`container_cpu_cfs_throttled_periods_total` 是其中被 throttled 的 period 数量。两者相除得到的百分比就是 throttling 率。一般认为，throttling 率超过 25% 就需要关注，超过 50% 就会对延迟产生显著影响，超过 75% 则是严重问题。\n\n## 第三步：优化方案——从治标到治本\n\n理解了原理，优化方案其实有三个层次，按照侵入性从低到高排列。\n\n**方案一：直接增大 CPU limit**。这是最简单的治标方案。如果你把 `limits.cpu` 从 `1` 改成 `2`，那么 quota 就从 100ms 变成 200ms，容器在每个 period 内的「预算」翻倍，burst 发生时被 throttle 的概率大幅降低。生产中通常建议把 limit 设为 request 的 **2 到 4 倍**，给服务留出应对瞬时流量峰值的空间。纯粹把 request 和 limit 设成一样的值（即 Guaranteed QoS）在 CPU 场景下往往适得其反，容易造成 throttling。\n\n**方案二：缩短 cfs_period 为 10ms**。这是一个更精妙的优化，很多人不知道。现在 100ms 的 period 导致 burst 容易「一次性耗尽 quota」，如果把 period 缩短为 10ms，同时把 quota 等比例缩短为 10ms（对应 1 核的限制），那么服务每 10ms 就有一次「重置预算」的机会，瞬时 burst 的影响窗口缩短了 10 倍。对于 Java 这种延迟敏感型服务，这个调整往往能在不修改 CPU limit 的情况下把 throttling 率降低 60% 以上。\n\n在 Kubernetes 中通过 Node 级别的 kubelet 配置来修改这个参数：\n\n```yaml\n# kubelet 配置文件 /etc/kubernetes/kubelet-config.yaml\napiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncpuCFSQuota: true\ncpuCFSQuotaPeriod: 10ms  # 默认是 100ms，改成 10ms\n```\n\n注意这是节点级别的变更，修改后需要重启 kubelet，并且会影响该节点上所有容器。需要在测试环境验证后再逐步推到生产节点。\n\n**方案三：使用 cpuset 绑核（CPUManager）**。K8s 1.10 引入了 CPUManager 特性，K8s 1.18 将其稳定（GA）。当 `CPUManagerPolicy` 设置为 `static` 时，对于 Guaranteed QoS 的 Pod（即 request == limit），K8s 会把容器绑定到专属的物理 CPU 核上，彻底绕开 CFS 带宽控制，从根本上消除 throttling。代价是 CPU 利用率可能降低（专属核无法被其他 Pod 复用），适合对延迟极度敏感的核心服务。\n\n```yaml\n# 使用 cpuset 的前提：Pod 必须是 Guaranteed QoS\n# 即 requests == limits，且都是整数核\nresources:\n  requests:\n    cpu: \"2\"      # 必须是整数\n    memory: \"4Gi\"\n  limits:\n    cpu: \"2\"      # 必须与 requests 相等\n    memory: \"4Gi\"\n```\n\n## 扩展：K8s QoS 类型对 CPU 调度的影响\n\nK8s 根据容器的 resource 配置把 Pod 分为三种 QoS 类型，这直接影响 CPU 调度行为。**Guaranteed** Pod（request == limit）优先级最高，在资源紧张时最后被驱逐，但 CPU limit 的存在意味着仍然受 CFS 带宽控制的约束（除非开启了 CPUManager static 策略）。**Burstable** Pod（request < limit）是最常见的配置，request 用于调度决策和资源保障，limit 是 CFS 的 quota 上限，瞬时峰值能 burst 到 limit，但受 throttling 风险。**BestEffort** Pod（没有 request 和 limit）完全靠抢，不受 CFS 带宽限制，但最先被驱逐。\n\n对于延迟敏感服务，建议将 limit 设为 request 的 2-4 倍（Burstable），同时配合 10ms 的 cfs_period，在资源利用率和 throttling 风险之间取得平衡。对于真正的核心服务（比如支付、核心交易），考虑 CPUManager static 策略，用资源利用率换确定性延迟。\n\n最后一个值得关注的细节：Java 17+ 引入了对容器 CPU 感知的改进（JDK-8230305），JVM 会根据 `cpu.cfs_quota_us / cpu.cfs_period_us` 来推断可用核数并设置 GC 线程数。如果你的 GC 线程数远超 limit 对应的核数，GC 本身就会引发严重 throttling。可以用 `-XX:ActiveProcessorCount=N` 显式告诉 JVM 可用核数来解决这个问题。",
+      "keyPoints": [
+        "Linux CFS 带宽控制通过 cpu.cfs_period_us（默认 100ms）和 cpu.cfs_quota_us 两个 cgroup 参数实现 CPU 限速，K8s 的 limits.cpu 本质是设置这两个参数。",
+        "CPU Throttling 的触发逻辑是：容器在一个 period（100ms）内累计使用的 CPU 时间超过 quota，剩余时间就被强制挂起，直到下一个 period 重置，与此时宿主机 CPU 是否空闲无关。",
+        "「30% CPU 使用率 + 78% throttling」同时成立并不矛盾：使用率是时间窗口内的均值，throttling 反映的是瞬时 burst 超过 quota 的频率，Java 等多线程服务的 CPU 消耗天然具有突发性。",
+        "用 Prometheus 量化 throttling 的标准公式是 rate(container_cpu_cfs_throttled_periods_total[5m]) / rate(container_cpu_cfs_periods_total[5m])，结果超过 25% 需要关注，超过 50% 会显著影响延迟。",
+        "将 kubelet 的 cpuCFSQuotaPeriod 从默认 100ms 调整为 10ms，可以在不改变 CPU limit 的前提下，将 burst 造成的 throttling 影响窗口缩短 10 倍，对延迟敏感服务效果显著。",
+        "生产中建议将 CPU limit 设为 request 的 2-4 倍（Burstable QoS），将 request 和 limit 设成完全相同的值（Guaranteed QoS）在 CPU 场景下反而容易因 burst 触发 throttling。",
+        "K8s 1.18 GA 的 CPUManager policy=static 可以为 Guaranteed QoS 的 Pod 分配专属物理核，彻底绕开 CFS 带宽控制消除 throttling，代价是降低节点整体 CPU 利用率。",
+        "Java 17 以前的 JVM 不感知 cgroup CPU 限制，会按宿主机核数设置 GC 线程数，导致 GC 本身消耗远超 quota 引发严重 throttling，需用 -XX:ActiveProcessorCount 或升级到 Java 17+ 解决。"
+      ],
+      "quiz": [
+        {
+          "id": "container-cpu-throttling-q1",
+          "question": "Kubernetes 中配置 `resources.limits.cpu: \"500m\"` 时，内核 cgroup 实际是如何实现这个限制的？",
+          "choices": [
+            { "id": "A", "text": "设置 cpu.cfs_quota_us=50000，cpu.cfs_period_us=100000，即每 100ms 内最多用 50ms 的 CPU" },
+            { "id": "B", "text": "直接降低该进程的调度优先级（nice 值），使其获得更少的 CPU 时间" },
+            { "id": "C", "text": "设置 cpu.shares=512，通过权重比例分配 CPU 时间" },
+            { "id": "D", "text": "在宿主机上创建一个虚拟 CPU，频率限制为宿主机的 50%" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "K8s 的 limits.cpu 是通过 cgroup 的 CFS 带宽控制实现的，本质是设置 cpu.cfs_quota_us 和 cpu.cfs_period_us 两个参数。500m 对应 0.5 核，在默认 period=100ms 的情况下，quota=50ms。B 选项描述的是 cpu.shares 的工作方式，但 shares 是 requests 对应的机制，只在 CPU 争抢时生效，不是硬限制。C 选项的 cpu.shares 对应的是 requests 而非 limits。D 选项的「虚拟 CPU 降频」是完全错误的概念，cgroup 不涉及 CPU 频率调整。"
+        },
+        {
+          "id": "container-cpu-throttling-q2",
+          "question": "以下哪个 Prometheus 查询能正确计算容器的 CPU throttling 比例？",
+          "choices": [
+            { "id": "A", "text": "rate(container_cpu_cfs_throttled_periods_total[5m]) / rate(container_cpu_cfs_periods_total[5m])" },
+            { "id": "B", "text": "container_cpu_usage_seconds_total / container_spec_cpu_quota" },
+            { "id": "C", "text": "rate(container_cpu_throttled_seconds_total[5m]) / rate(container_cpu_usage_seconds_total[5m])" },
+            { "id": "D", "text": "1 - rate(container_cpu_usage_seconds_total[5m]) / container_spec_cpu_limit" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "正确的 throttling 比例计算方式是用被 throttle 的 period 数除以总 period 数。container_cpu_cfs_throttled_periods_total 记录了被限速的调度周期次数，container_cpu_cfs_periods_total 记录了总调度周期次数，两者之比才是真正的 throttling 率。B 选项混淆了时间维度。C 选项中的 container_cpu_throttled_seconds_total 虽然存在，但除以使用时间得到的不是 period 级别的 throttling 比例，语义不准确。D 选项计算的是「CPU 余量」而非 throttling 率，即使 CPU 使用率很低，throttling 也可能很高。"
+        },
+        {
+          "id": "container-cpu-throttling-q3",
+          "question": "一个容器 CPU 使用率只有 30%，但 throttling 率达到 70%，最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Prometheus 数据采集有误差，两个指标不能直接比较" },
+            { "id": "B", "text": "容器 CPU 使用在时间上分布不均，存在瞬时 burst 超过 quota，而使用率是长时间窗口的均值" },
+            { "id": "C", "text": "CPU 使用率指标只统计用户态，throttling 是内核态 CPU 超限导致的" },
+            { "id": "D", "text": "宿主机 CPU 被其他容器过度占用，导致调度延迟被误计为 throttling" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 CPU throttling 最核心也最反直觉的地方：throttling 是在 period（100ms）级别计算的，而 CPU 使用率通常是 1 分钟或 5 分钟的均值。一个 Java 服务可能在某些 100ms 内集中使用 120ms 的 CPU（多线程 burst），被 throttle 后剩余 period 挂起；而从 5 分钟的角度来看，大部分时间是空闲的，平均使用率很低。A 选项错误，两个指标都来自内核 cgroup，数据是准确的，只是度量维度不同。C 选项错误，throttling 统计的是整个 cgroup 的 CPU 时间，不区分用户态和内核态。D 选项描述的是调度延迟（run queue latency），不是 CFS throttling。"
+        },
+        {
+          "id": "container-cpu-throttling-q4",
+          "question": "将 kubelet 的 cpuCFSQuotaPeriod 从 100ms 改为 10ms 后（CPU limit 不变），对 throttling 的影响是什么？",
+          "choices": [
+            { "id": "A", "text": "throttling 会加剧，因为 period 更短，quota 更容易被耗尽" },
+            { "id": "B", "text": "没有影响，因为总的 CPU 配额没有变" },
+            { "id": "C", "text": "throttling 会减少，因为 burst 被分散到更多更短的 period 中，每个 period 的 quota 按比例缩小但重置更频繁" },
+            { "id": "D", "text": "throttling 会消失，因为 10ms 的 period 粒度太细，内核无法准确计量" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "将 period 缩短为 10ms 时，quota 也等比例缩短为 10ms（对应 1 核），但关键是「重置频率」从每 100ms 一次变成每 10ms 一次。对于有瞬时 burst 的服务，原来在一个 100ms period 内可能需要 150ms CPU（burst 超限 50%），但如果把同样的工作分散到 10 个 10ms period 里，每个 period 内的峰值可能只需要 12ms，不超过 10ms quota 太多，整体 throttling 率会大幅降低。A 选项的逻辑相反，更短的 period 意味着更快恢复，不是更容易耗尽。D 选项不正确，10ms 对内核来说是完全可测量的精度。"
+        },
+        {
+          "id": "container-cpu-throttling-q5",
+          "question": "以下是某容器在高峰期的 Prometheus 指标数据（5 分钟采样）：\n\n```\ncontainer_cpu_usage_seconds_total 增量：90s\ncontainer_cpu_cfs_periods_total 增量：3000\ncontainer_cpu_cfs_throttled_periods_total 增量：2100\n```\n\n该容器配置了 limits.cpu=0.5，period 为默认 100ms，请计算 throttling 率和实际 CPU 使用率。",
+          "choices": [
+            { "id": "A", "text": "throttling 率 70%，CPU 使用率 30%（0.3 核）" },
+            { "id": "B", "text": "throttling 率 70%，CPU 使用率 60%（0.6 核）" },
+            { "id": "C", "text": "throttling 率 30%，CPU 使用率 60%（0.6 核）" },
+            { "id": "D", "text": "throttling 率 70%，CPU 使用率 50%（0.5 核，达到 limit）" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "throttling 率 = 2100 / 3000 = 70%，这部分比较直接。CPU 使用率的计算：5 分钟 = 300 秒，container_cpu_usage_seconds_total 增量 90s 表示这 300 秒内总共消耗了 90 个 CPU 秒，折算成核数 = 90 / 300 = 0.3 核。limits.cpu=0.5 核，所以使用率相对于 limit 是 60%，但相对于实际核数是 0.3 核（30%）。面试中问的通常是「占用了多少核」，答案是 0.3 核。B 选项混淆了「相对 limit 的使用率」和「实际消耗的核数」。这个数据组合完美还原了「30% 使用率 + 70% throttling」的真实场景。"
+        },
+        {
+          "id": "container-cpu-throttling-q6",
+          "question": "以下关于 K8s CPU resources 配置的说法，哪个是错误的？",
+          "choices": [
+            { "id": "A", "text": "requests.cpu 影响 Pod 的调度决策，scheduler 用它来判断节点是否有足够资源" },
+            { "id": "B", "text": "limits.cpu 通过 cgroup cpu.shares 实现，保证容器在所有情况下都能得到至少这么多 CPU" },
+            { "id": "C", "text": "requests.cpu 对应 cgroup 的 cpu.shares，只在 CPU 争抢时生效，不做硬性限制" },
+            { "id": "D", "text": "将 requests 和 limits 设置为相同值时，Pod 的 QoS 级别为 Guaranteed" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 选项完全错误。limits.cpu 是通过 cgroup 的 CFS 带宽控制（cpu.cfs_quota_us）实现的，它是一个「上限」，不是「保障」——即使节点 CPU 完全空闲，容器在 period 内用超 quota 依然会被 throttle。cpu.shares 对应的是 requests.cpu，是一种比例权重机制，只在多个容器争抢 CPU 时才有意义，空闲时没有任何限制效果。A 选项正确，requests 确实用于 scheduler 的 bin packing 算法。C 选项正确，cpu.shares 是软性权重。D 选项正确，request == limit（且同时设置了 CPU 和内存）时 QoS 为 Guaranteed。"
+        },
+        {
+          "id": "container-cpu-throttling-q7",
+          "question": "对于延迟敏感型服务，以下哪种 CPU resource 配置策略最合理？",
+          "choices": [
+            { "id": "A", "text": "requests = limits（Guaranteed QoS），确保资源独占，避免被驱逐" },
+            { "id": "B", "text": "只设置 requests，不设置 limits，让容器自由使用 CPU，彻底消除 throttling" },
+            { "id": "C", "text": "limits 设为 requests 的 2-4 倍（Burstable QoS），配合 10ms cfs_period，平衡资源利用率和 throttling 风险" },
+            { "id": "D", "text": "requests 和 limits 都设置得非常大（比如 8 核），确保永远不会 throttling" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "对于延迟敏感但 CPU 消耗有突发性的服务，Burstable + 较大 limit 倍数是最平衡的方案。A 选项的 Guaranteed QoS 设 request=limit 虽然防驱逐，但 CPU limit 的存在依然会导致 burst 时的 throttling，除非同时开启 CPUManager static 策略。B 选项不设 limits 在生产中非常危险：一旦服务出现 CPU 泄漏（比如死循环、全量数据扫描），会影响同节点所有容器；另外 LimitRange 策略通常会拒绝没有 limits 的 Pod。D 选项虽然能消除 throttling，但会造成节点资源虚报（requests 不准确），影响调度质量，并且 scheduler 会以为节点「已满」而实际 CPU 空闲，是浪费也是反模式。"
+        },
+        {
+          "id": "container-cpu-throttling-q8",
+          "question": "一个 Java 服务升级到 Kubernetes 后，发现即使 CPU 使用率不高也会频繁出现 GC pause 导致的 throttling。你怀疑是 JVM GC 线程数配置不当，应该如何诊断和解决？",
+          "choices": [
+            { "id": "A", "text": "增大 JVM 堆内存（-Xmx），减少 GC 频率，间接降低 GC 导致的 CPU burst" },
+            { "id": "B", "text": "检查 JVM 感知的 CPU 核数，如果远超 limits.cpu 限制的核数，用 -XX:ActiveProcessorCount 或升级到 Java 17+ 解决" },
+            { "id": "C", "text": "切换 GC 算法从 G1 到 Serial GC，用单线程 GC 避免 CPU burst" },
+            { "id": "D", "text": "关闭容器的 CPU limits，让 JVM 使用宿主机所有核进行 GC" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Java 8u121 之前的 JVM（包括很多 Java 11 早期版本）无法正确感知 cgroup 的 CPU 限制，会读取宿主机的物理核数来决定 GC 线程数。比如宿主机 32 核，JVM 可能启动 8 个 ParallelGC 线程，但容器只有 1 核的 limit，8 个 GC 线程同时运行在一个 100ms period 内很容易耗尽 quota。解决方案是用 -XX:ActiveProcessorCount=N 告诉 JVM 实际可用核数，或升级到 Java 17（JEP 387 正确支持 cgroup v2）。A 选项可以减少 GC 频率，但不解决根本问题，GC 发生时依然是多线程 burst。C 选项 Serial GC 会严重影响吞吐量，是极端方案。D 选项放开 limits 带来的风险远大于收益。"
+        },
+        {
+          "id": "container-cpu-throttling-q9",
+          "question": "K8s CPUManager 的 static 策略相比默认的 none 策略，主要优势和限制分别是什么？",
+          "choices": [
+            { "id": "A", "text": "优势：完全消除 throttling；限制：只适用于 Guaranteed QoS 的 Pod，且 CPU request 必须是整数核" },
+            { "id": "B", "text": "优势：提高节点整体 CPU 利用率；限制：需要手动指定绑定的 CPU 核编号" },
+            { "id": "C", "text": "优势：所有 Pod 都能绑定专属核；限制：需要 kubelet 1.20+ 才支持" },
+            { "id": "D", "text": "优势：自动根据负载动态调整绑核；限制：只适用于 DaemonSet 类型的 Pod" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "CPUManager static 策略的核心机制是为满足条件的 Pod 分配专属物理 CPU 核，这些核不会被其他 Pod 使用，从而完全绕开 CFS 带宽控制，彻底消除 throttling。但使用条件很严格：Pod 必须是 Guaranteed QoS（requests == limits），且 CPU request 必须是整数（如 2、4，不能是 1.5）。代价是这些核被「锁定」，即使 Pod 空闲也不能给其他 Pod 用，节点整体 CPU 利用率会降低。B 选项的「提高利用率」恰好相反，static 策略会降低利用率。C 选项错误，static 只对 Guaranteed Pod 生效，BestEffort 和 Burstable Pod 仍然走 CFS。D 选项错误，static 策略是静态分配，不动态调整。CPUManager 在 K8s 1.10 alpha，1.26 GA，不需要 1.20+。"
+        },
+        {
+          "id": "container-cpu-throttling-q10",
+          "question": "上线后你发现修改 cpuCFSQuotaPeriod=10ms 后某些 Batch 类型的 Pod 性能反而下降了，原因最可能是什么？",
+          "choices": [
+            { "id": "A", "text": "10ms 的 period 导致内核调度器负担加重，context switch 增加影响了所有进程" },
+            { "id": "B", "text": "Batch 任务通常是持续高 CPU 的负载，更短的 period 意味着更频繁地「耗尽 quota 后被 throttle」，单次 throttle 虽短但累积暂停次数增多" },
+            { "id": "C", "text": "10ms 的 period 与 Linux 默认 10ms 的时钟中断频率（HZ=100）冲突，导致计时不准" },
+            { "id": "D", "text": "修改 cpuCFSQuotaPeriod 需要重启所有 Pod 才能生效，性能下降是因为 Pod 没有完全重启" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是使用 10ms period 时经常忽略的副作用。对于有瞬时 burst 的延迟敏感型服务，10ms period 减少了单次 burst 超出 quota 的幅度，效果很好。但对于 Batch 任务（数据处理、机器学习训练、日志分析），CPU 使用是持续满载的，任何 period 长度都会在每个周期内耗尽 quota。10ms period 意味着每秒会发生 100 次 throttle（每次最多暂停 10ms），而 100ms period 只会发生 10 次（每次最多暂停 100ms）。虽然总暂停时间相似，但更高频的 throttle 会打断任务的 CPU cache warm-up，对需要持续计算的 Batch 任务性能影响更大。A 选项的 context switch 增加是真实的但影响很小。C 选项关于 HZ=100 的说法不准确，现代 Linux 默认 HZ=250 或 1000，且 cgroup 计时使用 hrtimer，不依赖 HZ。D 选项错误，cpuCFSQuotaPeriod 是 kubelet 配置，对新建 Pod 生效，不需要手动重启。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/",
+        "https://www.kernel.org/doc/html/latest/scheduler/sched-bwc.html",
+        "https://github.com/kubernetes/kubernetes/issues/51135",
+        "https://engineering.indeedblog.com/blog/2019/12/unthrottled-fixing-cpu-limits-in-the-cloud/"
+      ]
+    }
+  ]
+}
