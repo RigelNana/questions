@@ -1,0 +1,158 @@
+{
+  "id": "monitoring-q86",
+  "name": "OpenTelemetry SDK 接入与 Traces 导出",
+  "domain": "monitoring",
+  "description": "为已有 Go/Java 服务集成 OpenTelemetry SDK，配置 TracerProvider、OTLP exporter、context propagation 与优雅关闭",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q86",
+      "domain": "monitoring",
+      "type": "modification",
+      "difficulty": 2,
+      "tags": ["opentelemetry", "tracing", "go", "java", "otlp", "distributed-tracing", "observability"],
+      "title": "如何为已有项目添加 OpenTelemetry SDK 并导出 Traces？",
+      "content": "你们公司有一套运行了两年的 Go HTTP 微服务，目前没有任何分布式追踪能力，排查跨服务调用的慢请求只能靠逐台机器捞日志。现有代码结构大致如下：\n\n```go\n// main.go — 现有代码片段\nfunc main() {\n    mux := http.NewServeMux()\n    mux.HandleFunc(\"/orders\", handleOrders)\n    mux.HandleFunc(\"/payments\", handlePayments)\n    log.Println(\"Starting server on :8080\")\n    http.ListenAndServe(\":8080\", mux)\n}\n\nfunc handleOrders(w http.ResponseWriter, r *http.Request) {\n    orderID := r.URL.Query().Get(\"id\")\n    order, err := db.QueryOrder(orderID)          // 数据库查询\n    if err != nil {\n        http.Error(w, err.Error(), 500)\n        return\n    }\n    inv := inventoryClient.Get(orderID)           // 调用下游库存服务\n    json.NewEncoder(w).Encode(buildResponse(order, inv))\n}\n```\n\nSRE 团队要求在下个迭代给所有服务接入分布式追踪，使用 OpenTelemetry 标准，Traces 通过 OTLP 协议导出到 K8s 里的 OpenTelemetry Collector，再转发到 Jaeger。你是这个服务的负责工程师。\n\n**请描述如何为这个已有的 Go 服务完整接入 OpenTelemetry SDK，具体包括：**\n\n- 依赖安装与 `TracerProvider` 初始化（OTLP gRPC exporter 配置、Resource 属性设置）\n- 全局 Provider 与显式 Provider 的初始化模式选择\n- 在 HTTP 中间件层实现 context propagation（入口提取父 Span，出口注入追踪头）\n- 在业务逻辑中创建 Span 并添加 Attribute 和 Event\n- 优雅关闭时如何确保内存缓冲的 Span 不丢失\n- 本地如何用 OTel Collector 快速验证接入效果\n\n同时对比一下 Java 服务接入 OTel 的方式，以及两者在工程量上的本质差异。",
+      "answer": "## OpenTelemetry 是什么，为什么不直接用 Jaeger SDK\n\nOpenTelemetry（简称 OTel）是 CNCF 于 2019 年将 OpenCensus 和 OpenTracing 两个项目合并后产生的可观测性标准。在它出现之前，分布式追踪领域是碎片化的：用 Jaeger 就得写 Jaeger SDK 的代码，换成 Zipkin 就要改代码，换成 Datadog 又要改一遍。OTel 的目标是提供一套与后端无关的 API 和 SDK，业务代码只依赖 OTel API，底层换 Jaeger 还是 Tempo 或者 Datadog，只需要改 exporter 配置，一行业务代码都不用动。\n\n架构上 OTel 分三层：**API 层**定义接口（`Tracer`、`Span`、`Context` 等），业务代码只依赖这层，编译时可以没有实现；**SDK 层**是具体实现，包含采样器、`SpanProcessor`、`Exporter` 等组件；**Collector** 是独立部署的进程，负责接收、处理（过滤、采样、丰富属性）并转发 Spans 到各种后端。生产环境推荐所有服务都打到 Collector 而非直接打 Jaeger，因为 Collector 提供了缓冲、重试和格式转换能力，后端切换不影响 SDK 配置。\n\n## Go SDK 接入全流程\n\n### 安装依赖\n\n以当前稳定版 v1.24.0 为例，需要以下几个模块：\n\n```bash\ngo get go.opentelemetry.io/otel@v1.24.0\ngo get go.opentelemetry.io/otel/sdk@v1.24.0\ngo get go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.24.0\ngo get go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp@v0.49.0\n```\n\n`otel` 是 API 层，`otel/sdk` 是实现层，`otlptracegrpc` 是 OTLP gRPC exporter，`otelhttp` 是 HTTP 框架的自动埋点库。拆开安装的好处是：如果你写的是一个被别人引用的库，只需依赖 `otel`（API 层），不需要依赖 SDK 和 exporter，避免污染上游的依赖树。\n\n### TracerProvider 初始化\n\n`TracerProvider` 是 OTel Go SDK 的核心对象，所有 `Tracer` 都从它这里创建。初始化逻辑建议单独放在 `internal/telemetry/tracing.go` 中：\n\n```go\npackage telemetry\n\nimport (\n    \"context\"\n    \"fmt\"\n    \"time\"\n\n    \"go.opentelemetry.io/otel\"\n    \"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc\"\n    \"go.opentelemetry.io/otel/propagation\"\n    \"go.opentelemetry.io/otel/sdk/resource\"\n    sdktrace \"go.opentelemetry.io/otel/sdk/trace\"\n    semconv \"go.opentelemetry.io/otel/semconv/v1.21.0\"\n    \"google.golang.org/grpc\"\n    \"google.golang.org/grpc/credentials/insecure\"\n)\n\nfunc InitTracerProvider(ctx context.Context, collectorAddr string) (*sdktrace.TracerProvider, error) {\n    // 建立到 OTel Collector 的 gRPC 连接，WithBlock 确保启动时就能感知连接失败\n    conn, err := grpc.DialContext(ctx, collectorAddr,\n        grpc.WithTransportCredentials(insecure.NewCredentials()),\n        grpc.WithBlock(),\n        grpc.WithTimeout(5*time.Second),\n    )\n    if err != nil {\n        return nil, fmt.Errorf(\"连接 OTel Collector 失败: %w\", err)\n    }\n\n    exp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))\n    if err != nil {\n        return nil, fmt.Errorf(\"创建 OTLP exporter 失败: %w\", err)\n    }\n\n    // Resource 定义了这个服务实例的身份，这些属性会附加到该服务产生的所有 Span 上\n    // service.name 是在 Jaeger UI 里按服务过滤的关键字段，必须设置\n    res, _ := resource.New(ctx,\n        resource.WithAttributes(\n            semconv.ServiceName(\"order-service\"),\n            semconv.ServiceVersion(\"1.4.2\"),\n            semconv.DeploymentEnvironment(\"production\"),\n        ),\n        resource.WithHost(),    // 自动采集主机名\n        resource.WithProcess(), // 自动采集进程 ID 和命令行\n    )\n\n    tp := sdktrace.NewTracerProvider(\n        sdktrace.WithBatcher(exp),     // BatchSpanProcessor：异步批量发送，生产必选\n        sdktrace.WithResource(res),\n        sdktrace.WithSampler(sdktrace.AlwaysSample()), // 测试期间全采，上线改为按比例采样\n    )\n\n    // 注册为全局 TracerProvider，后续代码通过 otel.Tracer() 获取 Tracer\n    otel.SetTracerProvider(tp)\n    // 注册 W3C TraceContext 传播器，负责跨服务传播 traceparent / tracestate 头\n    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(\n        propagation.TraceContext{},\n        propagation.Baggage{},\n    ))\n\n    return tp, nil\n}\n```\n\n这里有一个关于初始化模式的选择值得单独说明：OTel 提供了「全局 Provider」和「显式 Provider」两种用法。全局模式（`otel.SetTracerProvider(tp)` + `otel.Tracer(\"name\")`）的优点是代码侵入性低，任何包都能通过全局函数拿到 Tracer，缺点是存在隐式的全局状态。显式模式是把 `tp` 直接作为依赖注入到各个组件中，更符合 Go 的依赖显式化风格，也更容易在单元测试中替换成 `NoopTracerProvider`。实践中，服务本身用全局模式无妨，如果你在写一个通用库则必须用显式模式，不应该在库代码里修改全局 Provider。\n\n### HTTP 中间件与 Context Propagation\n\nContext propagation（上下文传播）是分布式追踪的灵魂。它解决的问题是：当 A 服务调用 B 服务时，B 服务怎么知道自己产生的 Span 应该挂在 A 的哪个 Span 下面？答案是通过 HTTP 请求头传递 Trace ID 和 Span ID，W3C 标准规定的头叫做 `traceparent`，格式为 `00-{traceID}-{parentSpanID}-{flags}`。\n\n`otelhttp` 库帮你处理了所有这些细节：\n\n```go\nfunc main() {\n    ctx := context.Background()\n    tp, err := telemetry.InitTracerProvider(ctx, \"otel-collector:4317\")\n    if err != nil {\n        log.Fatalf(\"初始化追踪失败: %v\", err)\n    }\n\n    // 优雅关闭：程序退出前给 BatchSpanProcessor 10 秒时间 flush 缓冲中的 Span\n    defer func() {\n        shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\n        defer cancel()\n        if err := tp.Shutdown(shutdownCtx); err != nil {\n            log.Printf(\"关闭 TracerProvider 失败: %v\", err)\n        }\n    }()\n\n    mux := http.NewServeMux()\n    mux.HandleFunc(\"/orders\", handleOrders)\n    mux.HandleFunc(\"/payments\", handlePayments)\n\n    // otelhttp.NewHandler 自动完成：\n    // 1. 从请求头提取父 Span（traceparent）并注入 ctx\n    // 2. 创建当前服务的入口 Span（SpanKind=SERVER）\n    // 3. 请求结束后自动记录 HTTP 状态码和延迟\n    handler := otelhttp.NewHandler(mux, \"order-service\")\n    log.Println(\"Starting server on :8080\")\n    http.ListenAndServe(\":8080\", handler)\n}\n```\n\n### 业务层创建 Span\n\n有了中间件打底，业务函数里的 `r.Context()` 已经携带了父 Span 信息，直接从这个 ctx 创建子 Span 即可形成完整的调用树：\n\n```go\nfunc handleOrders(w http.ResponseWriter, r *http.Request) {\n    ctx := r.Context() // 由 otelhttp 中间件注入了父 Span\n    tracer := otel.Tracer(\"order-service\")\n\n    ctx, dbSpan := tracer.Start(ctx, \"db.QueryOrder\",\n        trace.WithSpanKind(trace.SpanKindClient),\n        trace.WithAttributes(\n            attribute.String(\"db.system\", \"postgresql\"),\n            attribute.String(\"db.statement\", \"SELECT * FROM orders WHERE id=?\"),\n        ),\n    )\n    defer dbSpan.End() // 这行不能漏！忘记 End 的 Span 永远不会被上报\n\n    orderID := r.URL.Query().Get(\"id\")\n    order, err := db.QueryOrder(ctx, orderID) // 把 ctx 传下去，db 层可以继续创建子 Span\n    if err != nil {\n        dbSpan.RecordError(err)                    // 自动记录 stack trace\n        dbSpan.SetStatus(codes.Error, err.Error()) // 设置 Span 状态为 ERROR\n        http.Error(w, err.Error(), 500)\n        return\n    }\n\n    // 调用下游 HTTP 服务时，必须用 otelhttp.NewTransport 包装 http.Client\n    // 它会自动把 traceparent 头注入出站请求，下游服务才能把自己的 Span 挂到正确的父节点上\n    httpClient := &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)}\n    req, _ := http.NewRequestWithContext(ctx, \"GET\",\n        fmt.Sprintf(\"http://inventory-service/items/%s\", orderID), nil)\n    resp, _ := httpClient.Do(req)\n\n    // AddEvent 在 Span timeline 上打一个时间点标记，适合记录业务里程碑\n    dbSpan.AddEvent(\"inventory.response.received\", trace.WithAttributes(\n        attribute.Int(\"http.status_code\", resp.StatusCode),\n    ))\n\n    json.NewEncoder(w).Encode(buildResponse(order, resp))\n}\n```\n\n### 优雅关闭不能省\n\n`BatchSpanProcessor` 为了性能会把 Span 攒成批次异步发送，默认批次大小 512 个或每 5 秒发一次。如果进程收到 SIGTERM 后直接退出，内存里还没来得及发出去的 Span 就会全部丢失。正确的做法是捕获系统信号，调用 `tp.Shutdown(ctx)` 让 processor 做最后一次 flush：\n\n```go\nquit := make(chan os.Signal, 1)\nsignal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)\n<-quit\n\nshutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\ndefer cancel()\nif err := tp.Shutdown(shutdownCtx); err != nil {\n    log.Printf(\"flush spans 失败: %v\", err)\n}\n```\n\n## Java 服务的对比：Agent 省去了所有手动工作\n\nJava 服务接入 OTel 有两种路径，工程量差异巨大。最省力的方式是 Java Agent：\n\n```bash\njava -javaagent:opentelemetry-javaagent-2.1.0.jar \\\n     -Dotel.service.name=order-service \\\n     -Dotel.exporter.otlp.endpoint=http://otel-collector:4317 \\\n     -Dotel.resource.attributes=deployment.environment=production \\\n     -jar your-app.jar\n```\n\nAgent 通过字节码注入（bytecode instrumentation）在运行时自动给 Spring MVC、JDBC、gRPC、Kafka、Redis 客户端等数百个主流框架打 Span，不需要改任何业务代码。这是 Go 做不到的事情，因为 Go 是静态编译语言，没有字节码注入的入口。\n\n如果 Java 项目也需要在业务逻辑里打自定义 Span（比如标记一段复杂的业务计算），手动埋点方式和 Go 非常相似，同样要注意 `span.end()` 不能漏：\n\n```java\nTracer tracer = GlobalOpenTelemetry.getTracer(\"order-service\");\nSpan span = tracer.spanBuilder(\"processOrderDiscount\")\n    .setAttribute(\"order.id\", orderId)\n    .startSpan();\ntry (Scope scope = span.makeCurrent()) {\n    // 业务逻辑\n} catch (Exception e) {\n    span.recordException(e);\n    span.setStatus(StatusCode.ERROR);\n    throw e;\n} finally {\n    span.end(); // Java 同样必须 end，忘了一样不上报\n}\n```\n\n## 本地验证：用 OTel Collector logging exporter\n\n不需要搭完整的 Jaeger，用一个最简单的 docker-compose 就能验证数据是否正确发出。`otel-collector-config.yaml` 内容如下：\n\n```yaml\nreceivers:\n  otlp:\n    protocols:\n      grpc:\n        endpoint: 0.0.0.0:4317\n      http:\n        endpoint: 0.0.0.0:4318\n\nexporters:\n  debug:\n    verbosity: detailed  # 把收到的完整 Span 结构打印到 Collector 的 stdout\n\nservice:\n  pipelines:\n    traces:\n      receivers: [otlp]\n      exporters: [debug]\n```\n\n启动后跑几个请求，在 Collector 的日志里就能看到完整的 Span 结构，包括 `traceId`、`parentSpanId`、`attributes`、`events`。看到这些输出说明 SDK 配置正确，下一步再接 Jaeger 或 Tempo 都是 Collector 的配置变更，不需要动服务代码。\n\n## 最容易犯的四个错误\n\n在做过不下十个服务的 OTel 接入之后，最高频的坑集中在这几个地方。第一，**忘记 `span.End()`**，这是新手 100% 会踩的坑，Span 如果没有调用 `End()`，`BatchSpanProcessor` 永远不知道这个 Span 结束了，也就永远不会把它加入发送队列。养成一个习惯：`ctx, span := tracer.Start(...)` 的下一行必须是 `defer span.End()`。第二，**没把新的 ctx 传给下游调用**，在 Go 里 context 是显式传递的，如果你 `ctx, span := tracer.Start(ctx, ...)` 但后续调用还用旧的 `r.Context()`，那这个子 Span 的信息就断了，下游 HTTP 请求也不会带上 `traceparent` 头。第三，**进程直接 `os.Exit(1)` 而不经过 Shutdown**，这在某些错误处理路径上很常见，会导致最后一批 Span 丢失。第四，**生产环境用 `AlwaysSample` 不设采样率**，一个 QPS 5000 的服务如果全量采样，Jaeger 的存储压力会非常大，上线前务必换成 `TraceIDRatioBased(0.1)` 或者头部采样（Parent-based sampler）。",
+      "keyPoints": [
+        "`TracerProvider` 是 OTel Go SDK 的核心对象，必须在程序启动时初始化并通过 `otel.SetTracerProvider(tp)` 注册为全局，后续代码通过 `otel.Tracer(\"name\")` 获取 Tracer，而不直接持有 provider 引用",
+        "Resource 属性（`service.name`、`service.version`、`deployment.environment`）在 TracerProvider 初始化时一次性设置，它们会自动附加到该服务产生的所有 Span 上，是在 Jaeger/Tempo 里按服务过滤 Trace 的基础",
+        "`context.Context` 是 OTel 的传播载体，HTTP 入口需要用 `otelhttp.NewHandler` 从请求头提取父 Span 并注入 ctx，向下游发出 HTTP 请求时必须用 `otelhttp.NewTransport` 注入 `traceparent` 头，缺任何一头链路都会断裂",
+        "每个 Span 必须配对调用 `defer span.End()`，忘记 `End()` 的 Span 永远不会被加入发送队列也不会上报到后端，这是新手接入 OTel 最常踩的坑",
+        "优雅关闭时必须调用 `tp.Shutdown(ctx)` 而不是直接退出进程，`Shutdown` 会触发 `BatchSpanProcessor` 把内存中缓冲的 Span 全部 flush 到 exporter，进程直接退出会丢失最后一批 Span",
+        "Java 服务可以通过 `-javaagent` 挂载 OpenTelemetry Java Agent 实现零代码侵入的自动埋点，利用字节码注入覆盖 Spring MVC、JDBC 等主流框架；Go 因静态编译没有字节码注入入口，只能手动埋点，这是两者工程量的本质差异",
+        "生产环境应使用 `ParentBased(TraceIDRatioBased(0.1))` 等采样策略而非 `AlwaysSample`，全量采样在高 QPS 服务上会对存储系统造成巨大压力，采样率通常从 1%~10% 开始调整",
+        "本地调试时用 OTel Collector 的 `debug` exporter（`verbosity: detailed`）可以直接在终端打印完整 Span 结构，无需搭建 Jaeger 即可验证数据是否正确发出、属性是否完整"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q86-quiz-1",
+          "question": "在 Go 服务中，`otel.SetTracerProvider(tp)` 这行代码的核心作用是什么？",
+          "choices": [
+            {"id": "A", "text": "将 TracerProvider 注册为进程级别的全局实例，后续代码无需传递 tp 引用即可通过 otel.Tracer() 获取 Tracer"},
+            {"id": "B", "text": "启动一个后台 goroutine，定期将内存中的 Span 批量发送到 exporter"},
+            {"id": "C", "text": "向 OTel Collector 注册当前服务，Collector 会主动轮询服务拉取 Span 数据"},
+            {"id": "D", "text": "初始化 W3C TraceContext 传播器，使 HTTP 请求能自动携带 traceparent 头"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "B 选项描述的是 `BatchSpanProcessor` 的职责，它确实有后台 goroutine 做批量发送，但 `SetTracerProvider` 本身只是设置全局状态。C 选项是错误的，OTel 是 push 模型而非 pull 模型，服务主动推数据到 Collector，Collector 不会主动来拉。D 选项描述的是 `otel.SetTextMapPropagator()` 的职责，传播器需要单独注册，这是接入时另一个常见的遗漏点。`SetTracerProvider` 的作用就是让全局 `otel.Tracer()` 函数有一个真实的 SDK 实现来创建 Span，如果不调用这行，所有 `otel.Tracer()` 返回的都是 Noop Tracer，Span 不会被记录。"
+        },
+        {
+          "id": "monitoring-q86-quiz-2",
+          "question": "在初始化 `TracerProvider` 时配置 `resource.WithAttributes(semconv.ServiceName(\"order-service\"))` 的主要目的是什么？",
+          "choices": [
+            {"id": "A", "text": "设置服务名称让 Jaeger/Tempo 能够按服务名过滤 Trace，该属性会自动附加到该服务产生的所有 Span 上"},
+            {"id": "B", "text": "在每个 Span 上手动设置一个名称属性，等同于在 tracer.Start() 时传入 span name"},
+            {"id": "C", "text": "向 OTel Collector 声明当前服务的身份，只有注册过的服务才能发送数据"},
+            {"id": "D", "text": "配置 TracerProvider 使用的采样器，服务名不同采样策略也会不同"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Resource 是 OTel 中「描述产生遥测数据的实体」的标准概念，它不是某个 Span 的属性，而是与这个 Provider 绑定的服务级元数据，会自动附加到该 Provider 创建的所有 Span 上。B 选项混淆了 Resource 属性和 Span name 的概念，Span name 是在 `tracer.Start(ctx, \"span-name\")` 时设置的，两者完全不同。C 选项是错的，OTel Collector 不做身份验证，任何能连到 Collector 的服务都可以发送数据。D 选项是错的，采样器通过 `sdktrace.WithSampler()` 单独配置，与服务名无关。`service.name` 是在 Jaeger 侧区分不同微服务 Trace 数据的关键字段，必须正确设置。"
+        },
+        {
+          "id": "monitoring-q86-quiz-3",
+          "question": "为什么向下游服务发出 HTTP 请求时必须使用 `otelhttp.NewTransport(http.DefaultTransport)` 包装 http.Client？",
+          "choices": [
+            {"id": "A", "text": "为了在出站 HTTP 请求头中自动注入 traceparent 等传播头，让下游服务能识别父 Span 并将自己的 Span 挂到正确的位置"},
+            {"id": "B", "text": "为了给出站请求创建一个新的独立 Trace，与当前服务的 Trace 完全隔离"},
+            {"id": "C", "text": "为了在发送请求前自动检查 OTel Collector 的连接状态，连接断开时缓存请求"},
+            {"id": "D", "text": "为了压缩 HTTP 请求体，减少网络传输的开销"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "分布式追踪的「分布式」体现在跨服务传递 Trace 上下文。W3C TraceContext 标准规定通过 `traceparent` 请求头传递 `traceId` 和 `spanId`，下游服务的 otelhttp 中间件会从这个头里解析出父 Span 信息，从而把下游的 Span 挂在正确的父节点下。如果不包装 Transport，出站请求没有 traceparent 头，下游服务就会为这个请求创建一个全新的根 Trace，两个服务的 Span 无法关联，Jaeger 里显示的是两条断开的 Trace 而不是一条完整链路。B 选项描述的正是不包装时会发生的错误行为。"
+        },
+        {
+          "id": "monitoring-q86-quiz-4",
+          "question": "在 Go 代码中创建了一个 Span 但忘记调用 `span.End()`，会发生什么？",
+          "choices": [
+            {"id": "A", "text": "该 Span 永远不会被 BatchSpanProcessor 加入发送队列，也不会出现在 Jaeger 等后端中"},
+            {"id": "B", "text": "该 Span 会在 30 秒超时后自动结束并发送"},
+            {"id": "C", "text": "Go runtime 的 GC 回收 Span 对象时会自动触发 End() 并发送"},
+            {"id": "D", "text": "该 Span 会出现在 Jaeger 中，但持续时间显示为 0ms"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "OTel SDK 的设计是：只有调用 `span.End()` 才会触发 SpanProcessor 的 `OnEnd` 回调，`BatchSpanProcessor` 在 `OnEnd` 里把 Span 加入内部队列等待批量发送。如果没有调用 `End()`，Span 对象会一直留在内存里，既不被发送也不会自动超时结束，同时还会造成轻微的内存泄漏。B 选项的「30 秒自动超时」不存在于标准 OTel SDK 中。C 选项是错的，`span.End()` 不是 finalizer，Go GC 不会触发它。D 选项也是错的，连队列都进不了，自然不会出现在 Jaeger 里。这就是为什么标准写法是 `ctx, span := tracer.Start(...); defer span.End()` 紧跟两行。"
+        },
+        {
+          "id": "monitoring-q86-quiz-5",
+          "question": "以下是一段 OTel Collector 的 `debug` exporter 输出片段：\n\n```\nInstrumentationScope order-service\nSpan #0\n    Trace ID       : 4bf92f3577b34da6a3ce929d0e0e4736\n    Parent ID      :\n    ID             : 00f067aa0ba902b7\n    Name           : /orders\n    Kind           : Server\n    ...\nSpan #1\n    Trace ID       : 4bf92f3577b34da6a3ce929d0e0e4736\n    Parent ID      :\n    ID             : b7ad6b7169203331\n    Name           : db.QueryOrder\n    Kind           : Client\n```\n\nSpan #1 的 `Parent ID` 字段为空，这说明什么问题？",
+          "choices": [
+            {"id": "A", "text": "创建 db.QueryOrder Span 时传入的 ctx 不是从 r.Context() 获取的，导致父子关系丢失"},
+            {"id": "B", "text": "Span #0 还没有调用 End()，所以 Span #1 无法确定父节点"},
+            {"id": "C", "text": "db.QueryOrder 是 Client 类型的 Span，Client Span 不设置 Parent ID 是正常行为"},
+            {"id": "D", "text": "OTel Collector 版本过低，不支持显示嵌套 Span 的父子关系"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在 OTel Go SDK 中，父子 Span 关系是通过 `context.Context` 传递的。`tracer.Start(ctx, \"db.QueryOrder\")` 会从 ctx 中提取当前活跃的父 Span 并记录为 Parent ID。如果此处的 ctx 是全新的 `context.Background()` 或者是不含 Span 信息的旧 ctx，创建出来的 Span 就没有父节点，成了一个根 Span。常见的触发场景是：在 `handleOrders` 里用 `context.Background()` 创建子 Span，或者把 `ctx` 变量写成 `_` 丢弃了。B 选项是错的，父 Span 的 End 状态不影响子 Span 的 Parent ID 记录。C 选项是错的，SpanKind 不影响父子关系。"
+        },
+        {
+          "id": "monitoring-q86-quiz-6",
+          "question": "Go 服务在收到 SIGTERM 后直接 `os.Exit(0)` 退出而不调用 `tp.Shutdown()`，最可能出现的现象是什么？",
+          "choices": [
+            {"id": "A", "text": "最后一批（最多 512 个）Span 会丢失，Jaeger 里这段时间的调用链不完整"},
+            {"id": "B", "text": "所有已发送的 Span 会从 Jaeger 中删除，因为服务异常退出被认为是无效数据"},
+            {"id": "C", "text": "没有任何影响，BatchSpanProcessor 会在发送每个 Span 后立即清空缓冲区"},
+            {"id": "D", "text": "OTel Collector 会检测到连接断开，自动从服务的进程内存转储中恢复未发送的 Span"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`BatchSpanProcessor` 的设计是攒够一批（默认 512 个）或者到达时间间隔（默认 5 秒）才会发送。进程直接退出时，内存中已创建但还在队列里等待下一批发送的 Span 会全部消失。这在 K8s 滚动更新时特别常见：新版本 Pod 启动后，旧 Pod 收到 SIGTERM，如果 graceful shutdown 没有正确处理 OTel 的 Shutdown，最近几秒的 Trace 数据就会有空洞。`tp.Shutdown(ctx)` 的作用是调用 `BatchSpanProcessor.ForceFlush()`，把队列里所有未发送的 Span 强制发出去再退出。B 选项是错的，Jaeger 不会主动删除数据。D 选项是不存在的功能。"
+        },
+        {
+          "id": "monitoring-q86-quiz-7",
+          "question": "Java 服务接入 OTel 使用 `-javaagent` 方式与 Go 服务手动接入 SDK 的最本质区别是什么？",
+          "choices": [
+            {"id": "A", "text": "Java Agent 通过字节码注入在运行时自动给主流框架打 Span，无需修改业务代码；Go 因静态编译无字节码注入入口，只能手动埋点"},
+            {"id": "B", "text": "Java Agent 使用 UDP 协议发送 Span 性能更高；Go SDK 只支持 TCP 协议"},
+            {"id": "C", "text": "Java Agent 只能与 Zipkin 后端配合使用；Go SDK 支持任意 OTel 后端"},
+            {"id": "D", "text": "Java Agent 采样率固定为 100%；Go SDK 可以自定义采样率"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是理解两种语言运行时差异的核心考点。Java 的 JVM 提供了 Java Agent（`-javaagent`）机制，允许在类加载时修改字节码（通过 `Instrumentation` API），OTel Java Agent 利用这个机制在运行时无侵入地给 Spring MVC、JDBC、Netty、gRPC、Kafka 等数百个框架打 Span，应用代码完全不感知。Go 是 AOT 静态编译，没有运行时字节码的概念，也没有等效的 Agent 机制，因此所有埋点必须在源码层面手动完成，或者依赖对框架的包装库（如 `otelhttp`、`otelsql`）。B 选项是错的，OTel Agent 同样支持 OTLP over gRPC 和 HTTP。C 选项是错的，Java Agent 完全支持 OTel Collector 和任意后端。D 选项是错的，Java Agent 同样支持配置采样率。"
+        },
+        {
+          "id": "monitoring-q86-quiz-8",
+          "question": "`BatchSpanProcessor` 和 `SimpleSpanProcessor` 有什么区别？生产环境应该用哪个？",
+          "choices": [
+            {"id": "A", "text": "BatchSpanProcessor 异步批量发送、有缓冲队列，适合生产环境；SimpleSpanProcessor 同步阻塞发送，每个 Span 结束立即发送，只用于本地调试"},
+            {"id": "B", "text": "BatchSpanProcessor 只发送采样到的 Span；SimpleSpanProcessor 发送所有 Span 包括未采样的"},
+            {"id": "C", "text": "BatchSpanProcessor 适合低流量服务；SimpleSpanProcessor 适合高流量服务，因为批处理会增加延迟"},
+            {"id": "D", "text": "两者功能完全相同，BatchSpanProcessor 只是 SimpleSpanProcessor 的别名，为了 API 兼容性保留"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "`SimpleSpanProcessor` 在每次 `span.End()` 时同步调用 exporter 发送数据，这意味着如果 Collector 响应慢，会直接阻塞当前 goroutine，对服务延迟有明显影响。只在本地调试时用它，方便立即看到输出。`BatchSpanProcessor` 有一个内部通道和后台 goroutine，`span.End()` 只是把 Span 放入通道就返回，由后台 goroutine 攒够批次或到达时间间隔后异步发送，不影响请求处理延迟，这才是生产环境的正确选择。在 `sdktrace.NewTracerProvider` 中用 `WithBatcher(exp)` 等同于添加一个 `BatchSpanProcessor`。B 选项描述的不是两者的区别，采样决策在 Sampler 层做，与 Processor 类型无关。"
+        },
+        {
+          "id": "monitoring-q86-quiz-9",
+          "question": "OTLP exporter 支持 gRPC 和 HTTP 两种协议，在以下哪种场景下应该优先选择 HTTP 协议（`otlptracegrpc` → `otlptracehttp`）？",
+          "choices": [
+            {"id": "A", "text": "服务部署在只开放了 80/443 端口的受限网络环境中，或者中间有不支持 HTTP/2 的代理（如某些 ALB）"},
+            {"id": "B", "text": "需要传输大量 Span 数据时，HTTP 的吞吐量比 gRPC 高"},
+            {"id": "C", "text": "服务是用 Go 编写的，Go 的 gRPC 库存在已知的性能问题"},
+            {"id": "D", "text": "OTel Collector 部署在 Docker 中时，只能接受 HTTP 协议"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "gRPC 基于 HTTP/2，某些网络环境（比如只开放 443 端口的企业内网、不支持 HTTP/2 的四层代理）会导致 gRPC 连接建立失败或被拦截。HTTP 协议（默认端口 4318）对网络基础设施的要求更低，兼容性更好。性能方面，gRPC 通常比 HTTP 的吞吐量更好，因为 HTTP/2 多路复用和 Protobuf 序列化的开销更小，B 选项说反了。C 选项是错的，Go 的 gRPC 实现（`google.golang.org/grpc`）是业界成熟的库，没有已知的性能问题。D 选项是错的，`otel/opentelemetry-collector-contrib` 镜像同时支持 gRPC（4317）和 HTTP（4318）。"
+        },
+        {
+          "id": "monitoring-q86-quiz-10",
+          "question": "接入 OTel SDK 后服务运行正常，但在 Jaeger 里完全看不到这个服务的任何 Trace，OTel Collector 日志也没有任何收到数据的记录。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "初始化代码中遗漏了 otel.SetTextMapPropagator() 调用，导致所有 Span 无法跨服务传播"},
+            {"id": "B", "text": "TracerProvider 初始化后没有注册为全局（未调用 otel.SetTracerProvider(tp)），所有 otel.Tracer() 调用返回的是 Noop Tracer，Span 被静默丢弃"},
+            {"id": "C", "text": "Resource 中 service.name 包含中划线（如 order-service），Jaeger 不支持这种格式"},
+            {"id": "D", "text": "BatchSpanProcessor 的默认队列大小（2048）太小，所有 Span 都被丢弃了"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是接入 OTel 时最隐蔽的一类问题：代码编译运行都正常，服务也能提供业务功能，但追踪数据完全为空。根本原因是 `otel.SetTracerProvider(tp)` 这行没调用，或者调用发生在 `otel.Tracer()` 之后。在没有注册全局 Provider 的情况下，`otel.GetTracerProvider()` 返回的是 SDK 内置的 `noopTracerProvider`，它的所有方法都是空操作，`tracer.Start()` 返回的 Span 也是 Noop Span，调用 `End()` 不会触发任何 processor。排查方法：在初始化函数末尾加一行 `log.Printf(\"TracerProvider type: %T\", otel.GetTracerProvider())`，如果输出 `*trace.noopTracerProvider` 就确认了这个问题。A 选项的传播器缺失只影响跨服务的上下文传递，本服务自己的 Span 仍然会出现在 Jaeger。C 和 D 选项都是错误的干扰项。"
+        }
+      ],
+      "references": [
+        "https://opentelemetry.io/docs/languages/go/getting-started/",
+        "https://opentelemetry.io/docs/languages/go/instrumentation/",
+        "https://opentelemetry.io/docs/languages/java/automatic/",
+        "https://opentelemetry.io/docs/collector/quick-start/",
+        "https://pkg.go.dev/go.opentelemetry.io/otel/sdk/trace"
+      ]
+    }
+  ]
+}
