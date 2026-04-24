@@ -1,0 +1,169 @@
+{
+  "id": "monitoring-q109",
+  "name": "如何监控 Pod 的 OOMKilled 事件？",
+  "domain": "monitoring",
+  "description": "覆盖 OOMKilled 检测方法、三种监控信号辨析、内存指标区分、告警规则配置、VPA 推荐与内存泄漏排查完整工作流",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q109",
+      "domain": "monitoring",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["kubernetes", "oom", "memory", "prometheus", "cadvisor", "kube-state-metrics", "vpa", "debugging", "profiling"],
+      "title": "如何监控 Pod 的 OOMKilled 事件？",
+      "content": "你的团队在生产环境运行着一批 Java 微服务，最近运维同学发现某个订单处理服务的 Pod 总是在凌晨 2 点左右悄无声息地重启，业务侧监控到短暂的 HTTP 5xx 飙升。你打开 Grafana，CPU 指标正常，磁盘 IO 正常，唯独内存曲线在重启前有一段陡峭的上升，然后突然归零。\n\n`kubectl get pods -n production` 的输出让你确认了问题：\n\n```\nNAME                          READY   STATUS    RESTARTS   AGE\norder-svc-7d8b9f-xkp2m        1/1     Running   7          3d\n```\n\nRESTARTS 已经到 7 次了。你进一步执行 `kubectl describe pod order-svc-7d8b9f-xkp2m -n production`，在容器状态段看到：\n\n```\n    Last State:     Terminated\n      Reason:       OOMKilled\n      Exit Code:    137\n      Started:      Mon, 15 Apr 2024 02:13:47 +0800\n      Finished:     Mon, 15 Apr 2024 02:13:48 +0800\n    Limits:\n      memory:       512Mi\n    Requests:\n      memory:       256Mi\n```\n\nExit Code 137，Reason OOMKilled——问题明确了，但领导接着追问：「能不能在 OOM 真正发生之前就收到告警？OOM 之后怎么快速判断是内存泄漏还是 limit 设得太小？」\n\n你的 Prometheus 栈里已经有 kube-state-metrics、cAdvisor 和 node-exporter，你知道有 `kube_pod_container_status_last_terminated_reason`、`container_oom_events_total` 这些指标，也听说过通过 K8s Events 来感知 OOM，但不确定该用哪个组合写告警规则。另外你的同事说「cgroup 是按 working set 判断 OOM 的，不是 RSS」，你半信半疑——这三个内存指标到底有什么区别？告警阈值写错了会有什么后果？",
+      "answer": "## 先搞清楚 OOMKilled 是怎么触发的\n\n在讨论监控方案之前，理解触发机制本身非常重要，因为机制直接决定了你该看哪个指标。Kubernetes 给每个容器设置 `resources.limits.memory` 的底层实现，是在该容器对应的 Linux cgroup v1/v2 控制组上写入 `memory.limit_in_bytes`。当容器内所有进程的内存使用量累计触碰这条线，内核的 **cgroup OOM killer** 就会介入，选择杀死该 cgroup 里占用内存最多的进程，发送 SIGKILL 信号（信号编号为 9）。进程的退出码遵循 Unix 惯例：`128 + 信号编号 = 128 + 9 = 137`。这就是为什么 OOMKilled 的容器退出码永远是 137 而不是其他数字。\n\n这里有一个细节经常被忽略：**cgroup OOM killer 和系统级 OOM killer 是两套完全独立的机制**。系统级 OOM killer 在整个节点物理内存耗尽时才触发，而 cgroup OOM killer 只要单个容器超出自己的 limit 就触发，跟节点剩余内存没有任何关系。你完全可以在节点上还有 20GB 空闲内存的情况下，看到某个 512Mi limit 的容器被 OOMKilled——这是正常的，不是 Bug。\n\n## 三种信号，三个层次，各有用途\n\n生产环境中检测 OOM 事件主要有三种信号来源，它们的时效性和适用场景都不同，不能混用。\n\n**`kube_pod_container_status_last_terminated_reason`** 来自 kube-state-metrics，记录的是容器上一次终止的原因。当容器因 OOM 重启后，这个指标会携带 `reason=\"OOMKilled\"` 标签并且值变为 1。这是一个「事后」指标——容器已经挂掉并成功重启之后才会更新。它最适合用来做「已发生 OOM 的报警」，写告警规则时通常与重启次数联合使用：\n\n```yaml\n# 过去 15 分钟内容器因 OOMKilled 发生了重启\n- alert: PodOOMKilled\n  expr: |\n    increase(\n      kube_pod_container_status_restarts_total{\n        job=\"kube-state-metrics\"\n      }[15m]\n    ) > 0\n    and on(namespace, pod, container)\n    kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} == 1\n  for: 0m\n  labels:\n    severity: warning\n  annotations:\n    summary: \"Pod {{ $labels.namespace }}/{{ $labels.pod }} 容器 {{ $labels.container }} 发生 OOMKilled\"\n```\n\n这里用 `and on(...)` 做指标连接（metric join）是有意为之。单纯用重启次数会误报（应用崩溃也会重启）；单纯用 `last_terminated_reason` 也不够（历史上 OOMKilled 过但当前正常运行的 Pod 也命中）。两个条件组合才能精准捕获「最近发生了 OOM 重启」的场景，`for: 0m` 表示不需要持续一段时间，立即触发。\n\n**`container_oom_events_total`** 来自 cAdvisor（Kubernetes 节点上随 kubelet 内置的容器监控组件），这个计数器在 OOM 事件发生时立即递增，时效性比 kube-state-metrics 好，通常在几秒内反映。它更适合用来统计 OOM 发生的频率，检测「某个容器反复 OOM」的模式：\n\n```promql\n# 过去 5 分钟 OOM 事件的频率，单位：次/分钟\nrate(container_oom_events_total{namespace=\"production\"}[5m]) * 60\n```\n\n如果你需要一个「OOM 正在高频发生」的告警（比如某个容器每分钟 OOM 超过 2 次，说明 limit 完全不够用），这个指标比 kube-state-metrics 响应更及时。\n\n**Kubernetes Events** 是第三种信号。通过 `kubectl get events -n production --field-selector reason=OOMKilling` 可以看到包含 OOM 上下文的事件记录，包括当时是哪个进程触发了 OOM、使用的内存量等信息。但 K8s Events 默认只在 etcd 中保留约 1 小时（由 `--event-ttl` 参数控制，默认值 1h），超时后就消失了，完全不适合做长期趋势分析。如果你想持久化 K8s Events，需要额外部署 event-exporter（如 Bitnami 的 kubernetes-event-exporter）将事件推送到 Prometheus 或 Elasticsearch 中存储。\n\n## 内存指标的关键区分：working set、RSS 与 cache\n\n这是最容易搞错的地方，也是告警阈值写错之后无法预测 OOM 的根本原因。\n\n**RSS（Resident Set Size，常驻内存集）** 是进程实际占用的物理内存页数量，包括进程的堆内存、栈、代码段和共享库，但不包括内核为该进程维护的文件系统 page cache。RSS 是进程视角的内存使用量，可以通过 `/proc/<pid>/status` 的 `VmRSS` 字段读取，在 Prometheus 里对应 `container_memory_rss`。\n\n**Page Cache（页缓存）** 是 Linux 内核为了加速文件 IO 而在内存中缓存的文件数据。当你的容器频繁读写文件（比如写日志、读取本地配置文件、Java JVM 加载 JAR 包），内核会把这些文件内容缓存在 page cache 里以加速下次访问。这部分内存在内存压力大时内核可以随时回收（使用 MADV_FREE 标记或直接丢弃 clean page），所以它不代表「真实的内存压力」。\n\n**Working Set（工作集）** 的计算方式是：`working_set = memory.usage_in_bytes - total_inactive_file`，其中 `total_inactive_file` 是 cgroup 内存统计里「不活跃的文件 page cache」，这部分内核可以在内存压力时直接回收。Working set 代表的是「当前必须驻留在内存、内核无法轻易回收的那部分内存」。在 Prometheus 里对应 `container_memory_working_set_bytes`。\n\n**关键结论：Kubernetes 的 cgroup OOM killer 使用 `memory.usage_in_bytes` 来判断是否超限，而 working set 指标正是对这个值的近似反映**（严格说是 `usage_in_bytes - inactive_file`，对应 cAdvisor 的计算逻辑）。如果你在 Grafana 里用 `container_memory_rss` 来监控内存是否接近 limit，你看到的值会比真实的内存使用量低——因为你漏掉了 page cache 的部分，误以为还有充裕的余量，但实际上容器可能已经快撞上 limit 了。\n\n因此，**预测性 OOM 告警必须使用 `container_memory_working_set_bytes`**，规则如下：\n\n```yaml\n# 容器 working set 超过 memory limit 的 85%，持续 5 分钟，提前预警\n- alert: PodMemoryNearLimit\n  expr: |\n    (\n      container_memory_working_set_bytes{container!=\"\", container!=\"POD\"}\n      /\n      container_spec_memory_limit_bytes{container!=\"\", container!=\"POD\"}\n    ) > 0.85\n    and\n    container_spec_memory_limit_bytes{container!=\"\", container!=\"POD\"} > 0\n  for: 5m\n  labels:\n    severity: warning\n  annotations:\n    summary: \"容器内存使用率 {{ $value | humanizePercentage }}，接近 OOM\"\n    description: \"{{ $labels.namespace }}/{{ $labels.pod }}/{{ $labels.container }}\"\n```\n\n两个注意事项：过滤 `container!=\"POD\"` 是因为 cAdvisor 会为 Pod 的 pause 容器产生名为 `POD` 的指标，它不是真实的应用容器；`container_spec_memory_limit_bytes > 0` 是为了排除没有设置 memory limit 的容器，避免除以零导致 Prometheus 报错。\n\n## 用 VPA 找到合适的 limit 值\n\n很多 OOM 的根本原因不是泄漏，而是 limit 本来就设得太低。手工调整 limit 费时费力，而且经验性很强——设多少才算「合适」没有人真正清楚。Kubernetes 的 **Vertical Pod Autoscaler（VPA）** 可以自动分析过去一段时间的历史资源用量，给出统计意义上的推荐值。以 `updateMode: \"Off\"` 运行，它只推荐不自动修改：\n\n```yaml\napiVersion: autoscaling.k8s.io/v1\nkind: VerticalPodAutoscaler\nmetadata:\n  name: order-svc-vpa\n  namespace: production\nspec:\n  targetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: order-svc\n  updatePolicy:\n    updateMode: \"Off\"   # 只收集数据并给出建议，不自动修改 Pod\n```\n\n部署几天后执行 `kubectl describe vpa order-svc-vpa -n production`，可以看到类似这样的推荐：\n\n```\nRecommendation:\n  Container Recommendations:\n    Container Name:  order-svc\n      Lower Bound:\n        Memory:  256Mi\n      Target:\n        Memory:  480Mi\n      Upper Bound:\n        Memory:  1Gi\n      Uncapped Target:\n        Memory:  480Mi\n```\n\nVPA 建议的 Target 是 480Mi，而你现在设的 limit 是 512Mi——勉强够用，但没有任何余量。建议的实践策略是：将 limit 设为 Upper Bound 的 1.2 倍（这里约 1.2Gi），将 request 设为 Target 的 80%（约 384Mi），给 JVM GC 的堆外内存、Metaspace 和突发流量留出缓冲空间。\n\n## 内存泄漏的排查工作流\n\n如果 OOM 是真正的内存泄漏（而不只是 limit 太小），单看 Prometheus 指标只能确认「内存在线性增长」，定位不到根因。真正的排查需要两个工具结合使用：**heap dump** 和**持续性能剖析（Continuous Profiling）**。\n\nHeap dump 是某个时间点的内存快照，记录了 JVM 堆里所有存活对象的类型、数量和引用关系。最简单的获取方式是在 JVM 启动参数里加上 `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/heap-dumps/`，这样容器在 OOM 前一刻会自动写出 `.hprof` 文件。然后用 `kubectl cp` 把文件从容器复制出来，用 Eclipse MAT（Memory Analyzer Tool）打开。MAT 的 Dominator Tree 视图会展示按 Retained Heap 排序的对象树——Retained Heap 是指该对象被 GC 之后能释放的内存量，找 Retained Heap 最大的对象链路，通常能直接定位到泄漏的类。\n\n持续性能剖析更适合生产环境的长期监控。**Pyroscope**（Grafana 生态中的开源持续剖析平台）以 agent 或 sidecar 形式运行在 Pod 旁边，以极低的开销（通常 < 1% CPU）持续采样内存分配情况，并将数据推送到 Pyroscope Server 存储。你可以在 Grafana 里查看任意时间段的内存分配火焰图（Flame Graph），纵轴是调用栈，横轴宽度代表在该函数上分配的内存量。如果某个函数在 OOM 前 1 小时内的分配占比持续超过 60% 且没有下降趋势，基本可以确认泄漏源。\n\n两种方法结合使用的工作流是：用 Pyroscope 确认「哪个函数在持续分配内存且不被释放」，用 heap dump 在 OOM 时刻确认「哪类对象在堆里大量堆积、Retained Heap 最大」。两者交叉印证，通常可以在 30 分钟内定位到具体的代码位置，而不需要反复重现问题。",
+      "keyPoints": [
+        "OOMKilled 的本质是容器触碰 cgroup memory.limit_in_bytes，内核 cgroup OOM killer 发送 SIGKILL（信号 9），退出码固定为 137（= 128 + 9），与节点剩余内存无关",
+        "kube-state-metrics 的 `kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"}` 是事后指标，需配合 `kube_pod_container_status_restarts_total` 的 increase 联合告警才能精准捕获 OOM 重启事件",
+        "cAdvisor 的 `container_oom_events_total` 在 OOM 事件发生后秒级响应，时效性优于 kube-state-metrics，适合做高频 OOM 的实时频率告警",
+        "K8s Events 包含 OOM 上下文细节（哪个进程、当时内存量），但默认只保留约 1 小时，不适合长期趋势分析，需额外部署 event-exporter 才能持久化",
+        "Kubernetes cgroup OOM 判断基准是 `container_memory_working_set_bytes`（usage_in_bytes 减去不可回收 inactive file cache），而非 RSS；监控内存是否接近 limit 必须使用 working set 指标，否则会低估实际压力导致漏报",
+        "预测性 OOM 告警应监控 working set 与 memory limit 的比值超过 85% 持续 5 分钟，并注意过滤 pause 容器和未设 limit 的容器，避免除零错误",
+        "VPA 以 updateMode=\"Off\" 运行可自动分析历史用量给出推荐值，建议按 Upper Bound × 1.2 设置 limit、Target × 0.8 设置 request，为 GC 和突发流量预留缓冲",
+        "内存泄漏排查需结合 heap dump（`-XX:+HeapDumpOnOutOfMemoryError` 自动捕获，Eclipse MAT 分析 Retained Heap 最大对象链路）与 Pyroscope 持续剖析（确认高频分配函数），两者交叉印证可快速定位泄漏代码位置"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q109-q1",
+          "question": "一个因 OOMKilled 终止的容器，其退出码（Exit Code）是多少？",
+          "choices": [
+            {"id": "A", "text": "137"},
+            {"id": "B", "text": "1"},
+            {"id": "C", "text": "139"},
+            {"id": "D", "text": "255"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Linux 进程因信号终止时，退出码为 128 加上信号编号。OOM killer 发送的是 SIGKILL，信号编号为 9，因此退出码 = 128 + 9 = 137。选项 B（退出码 1）是通用错误码，通常是应用程序主动 exit(1)。选项 C（139）是 SIGSEGV（段错误，信号 11）的退出码 128 + 11 = 139，属于空指针或非法内存访问，与 OOM 无关。选项 D（255）没有标准对应信号，不是 OOMKilled 的特征。记住 137 = OOMKilled、139 = Segfault 是排查容器崩溃时的基本知识。",
+          "relatedConcepts": ["Linux 信号", "cgroup OOM killer", "exit code"]
+        },
+        {
+          "id": "monitoring-q109-q2",
+          "question": "在 kube-state-metrics 提供的指标中，哪个指标记录了容器上一次终止的原因（如 OOMKilled）？",
+          "choices": [
+            {"id": "A", "text": "container_oom_events_total"},
+            {"id": "B", "text": "kube_pod_container_status_last_terminated_reason"},
+            {"id": "C", "text": "container_memory_working_set_bytes"},
+            {"id": "D", "text": "kube_pod_status_phase"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`kube_pod_container_status_last_terminated_reason` 是 kube-state-metrics 暴露的指标，带有 `reason` 标签，取值包括 `OOMKilled`、`Error`、`Completed` 等，值为 1 时表示该容器上次以此原因终止。选项 A 的 `container_oom_events_total` 来自 cAdvisor 而非 kube-state-metrics，是 OOM 事件的计数器。选项 C 是内存使用量指标与终止原因无关。选项 D 的 `kube_pod_status_phase` 只反映 Pod 当前的运行阶段（Running/Pending/Failed 等），不记录历史终止原因。",
+          "relatedConcepts": ["kube-state-metrics", "Pod 状态"]
+        },
+        {
+          "id": "monitoring-q109-q3",
+          "question": "Kubernetes 判断容器是否超过 memory limit、从而触发 OOM 的内存指标是哪个？",
+          "choices": [
+            {"id": "A", "text": "container_memory_rss（进程常驻内存集）"},
+            {"id": "B", "text": "container_memory_usage_bytes（包含所有 page cache）"},
+            {"id": "C", "text": "container_memory_working_set_bytes（usage 减去不可回收 inactive file cache）"},
+            {"id": "D", "text": "container_memory_cache（纯 page cache 大小）"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "cgroup OOM killer 触发条件是 `memory.usage_in_bytes` 超过 `memory.limit_in_bytes`，而 `container_memory_working_set_bytes` 的计算方式是 `usage_in_bytes - total_inactive_file`，是对 cgroup 实际内存压力的最准确反映。选项 A 的 RSS 不包含 page cache，会低估实际内存占用，导致看到的值比 limit 低很多，实际上容器可能已经接近 OOM。选项 B 的 usage_bytes 包含所有 page cache（含可回收部分），会略高估压力。选项 D 是纯 page cache 指标，与判断 OOM 无直接关系。因此生产环境监控内存压力必须使用 working set。",
+          "relatedConcepts": ["working set", "RSS", "page cache", "cgroup"]
+        },
+        {
+          "id": "monitoring-q109-q4",
+          "question": "`container_oom_events_total` 这个指标由哪个组件提供？",
+          "choices": [
+            {"id": "A", "text": "kube-state-metrics"},
+            {"id": "B", "text": "node-exporter"},
+            {"id": "C", "text": "cAdvisor（内置于 kubelet）"},
+            {"id": "D", "text": "Kubernetes API Server"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "cAdvisor（Container Advisor）是 Google 开发的容器资源监控组件，从 Kubernetes 1.7 起内置在 kubelet 中，默认在 `/metrics/cadvisor` 路径暴露 Prometheus 格式的指标，包括 `container_oom_events_total`、`container_memory_working_set_bytes`、`container_cpu_usage_seconds_total` 等。选项 A 的 kube-state-metrics 关注的是 Kubernetes 对象的状态（Pod phase、Deployment replica 数、Node 条件等），不直接暴露容器级别的 OOM 事件计数。选项 B 的 node-exporter 关注节点级别的系统指标（CPU、磁盘、网络）。选项 D 的 API Server 不暴露 cAdvisor 格式的容器指标。",
+          "relatedConcepts": ["cAdvisor", "kubelet", "Prometheus exporter"]
+        },
+        {
+          "id": "monitoring-q109-q5",
+          "question": "执行 `kubectl describe pod` 看到容器 Last State 的 Exit Code 为 137，这说明什么？",
+          "choices": [
+            {"id": "A", "text": "容器应用程序主动调用了 exit(137) 正常退出"},
+            {"id": "B", "text": "容器收到 SIGTERM 信号后优雅退出，退出码由应用决定"},
+            {"id": "C", "text": "容器进程收到 SIGKILL 信号被强制终止，通常由 cgroup OOM killer 触发"},
+            {"id": "D", "text": "容器因 SIGSEGV 内存段错误崩溃"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "退出码 137 = 128 + 9（SIGKILL），表示进程被 SIGKILL 强制终止。在容器的上下文中，SIGKILL 最常见的来源是 cgroup OOM killer（内存超限）或 kubelet 强制删除 Pod（超过 terminationGracePeriodSeconds 后从 SIGTERM 升级为 SIGKILL）。结合 `Reason: OOMKilled` 字段可以确认是前者。选项 A 不正确，应用程序主动 exit 的退出码通常是 0（正常）或 1-127（错误），不会是 137。选项 B 的 SIGTERM（信号 15）对应退出码是 143（= 128 + 15），不是 137。选项 D 的 SIGSEGV（信号 11）对应退出码 139（= 128 + 11）。",
+          "relatedConcepts": ["SIGKILL", "exit code", "OOM killer"]
+        },
+        {
+          "id": "monitoring-q109-q6",
+          "question": "用 `container_memory_rss` 监控容器内存是否接近 memory limit 的主要问题是什么？",
+          "choices": [
+            {"id": "A", "text": "RSS 值总是比 working set 大，会导致告警频繁误报"},
+            {"id": "B", "text": "RSS 不包含 page cache，会低估实际内存压力，可能导致漏报——容器快 OOM 时 working set 已接近 limit，但 RSS 看起来还很低"},
+            {"id": "C", "text": "cAdvisor 中 container_memory_rss 指标已被废弃，不应该使用"},
+            {"id": "D", "text": "RSS 包含了虚拟内存（VSZ），数值远大于物理内存实际用量"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是用 RSS 代替 working set 的典型危险。一个 Java 容器的 working set 可能是 480Mi（接近 512Mi 的 limit），但由于大量 JAR 文件被 page cache 缓存，RSS 可能只有 320Mi——你看到的监控图显示「内存使用率 62%」，以为安全，但实际上容器随时可能 OOM。选项 A 说反了，RSS 通常比 working set 小（working set 包含更多内存类型），不会导致误报而是漏报。选项 C 不正确，container_memory_rss 在 cAdvisor 中仍然有效，只是用途不同。选项 D 混淆了 RSS 和 VSZ（Virtual Size），RSS 只计算物理内存页，不包含未分配的虚拟地址空间。",
+          "relatedConcepts": ["RSS", "working set", "page cache", "告警漏报"]
+        },
+        {
+          "id": "monitoring-q109-q7",
+          "question": "与 `container_oom_events_total` 相比，Kubernetes Events 作为 OOM 监控信号的主要劣势是什么？",
+          "choices": [
+            {"id": "A", "text": "K8s Events 中不包含 OOMKilled 相关的事件记录"},
+            {"id": "B", "text": "K8s Events 默认只在 etcd 中保留约 1 小时，不适合长期趋势分析和历史回溯"},
+            {"id": "C", "text": "K8s Events 的延迟比 cAdvisor 高 10 倍以上，会严重影响告警时效"},
+            {"id": "D", "text": "K8s Events 需要额外购买商业授权才能查看 OOM 相关事件"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kubernetes Events 存储在 etcd 中，默认保留时间由 kube-apiserver 的 `--event-ttl` 参数控制，默认值是 1 小时。超过保留时间后事件就消失了，无法回溯历史 OOM 记录。如果你想知道「过去 7 天这个服务总共 OOMKilled 了多少次」，Events 无法回答这个问题。要持久化 K8s Events，需要部署 event-exporter（如 kubernetes-event-exporter）将事件推送到长期存储。相比之下，`container_oom_events_total` 是 Prometheus 指标，由 Prometheus 按配置的 retention（通常 15-90 天）保留，适合长期分析。选项 A 不正确，K8s Events 确实包含 OOMKilling 原因的事件。选项 C 夸大了延迟差异。选项 D 完全错误，K8s Events 是开源免费功能。",
+          "relatedConcepts": ["K8s Events", "event-ttl", "etcd", "监控持久化"]
+        },
+        {
+          "id": "monitoring-q109-q8",
+          "question": "配置 VPA 时将 `updatePolicy.updateMode` 设置为 `\"Off\"` 的目的是什么？",
+          "choices": [
+            {"id": "A", "text": "完全禁用 VPA 功能，该配置仅作为占位使用"},
+            {"id": "B", "text": "VPA 只收集 Pod 资源使用数据，不生成任何推荐值"},
+            {"id": "C", "text": "VPA 只分析历史数据并生成推荐值，不会自动修改 Pod 的 request/limit 配置"},
+            {"id": "D", "text": "VPA 只自动调整 request，不修改 limit"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "VPA 支持四种 updateMode：`Off`（只推荐不修改）、`Initial`（只在 Pod 创建时应用推荐值）、`Recreate`（重建 Pod 时应用并可能驱逐现有 Pod）、`Auto`（同 Recreate，未来可能支持原地调整）。生产环境初次使用 VPA 时，强烈建议先用 `Off` 模式运行 1-2 周，通过 `kubectl describe vpa` 查看推荐值后人工评估再应用，避免 VPA 自动驱逐 Pod 影响线上服务稳定性。选项 A 完全错误，`Off` 模式 VPA 是完全工作的，只是不执行修改动作。选项 B 错误，`Off` 模式也会生成推荐值（Recommendation 字段）。选项 D 描述的是 VPA 的局限性（目前不支持只调整其中一个），不是 `Off` 模式的行为。",
+          "relatedConcepts": ["VPA", "updateMode", "资源推荐", "生产稳定性"]
+        },
+        {
+          "id": "monitoring-q109-q9",
+          "question": "一个 Pod 所在节点仍有 15GB 空闲内存，但容器被 OOMKilled 了。这是为什么？",
+          "choices": [
+            {"id": "A", "text": "这种情况在正常的 Kubernetes 集群中不可能发生"},
+            {"id": "B", "text": "该容器的内存使用量超过了其自身 cgroup 的 memory limit，触发了 cgroup OOM killer，与节点剩余内存无关"},
+            {"id": "C", "text": "Kubernetes 调度器发现节点内存使用率过高，主动驱逐了该 Pod"},
+            {"id": "D", "text": "该 Pod 的 memory request 超过了节点可分配内存，被 kubelet 强制终止"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 Kubernetes 内存管理最容易让人困惑的一点。cgroup OOM killer 是容器级别的内存限制机制，它的触发条件只有一个：该容器所属 cgroup 的 memory.usage_in_bytes 超过 memory.limit_in_bytes。这个判断完全在 cgroup 的范围内进行，内核不关心节点上其他进程或其他容器还有多少内存可用。换句话说，memory limit 是对单个容器的硬性约束，而不是「节点内存不够时才生效」的软性约束。选项 A 错误，这是 Kubernetes 的正常行为。选项 C 描述的是基于内存压力的 Pod 驱逐（Eviction）机制，触发条件是节点整体内存不足，且驱逐是优雅的（发送 SIGTERM），不会产生 OOMKilled reason。选项 D 错误，memory request 是调度时的参考值，不是运行时强制终止的依据。",
+          "relatedConcepts": ["cgroup OOM killer", "memory limit", "Pod 驱逐", "节点内存压力"]
+        },
+        {
+          "id": "monitoring-q109-q10",
+          "question": "排查 Java 服务内存泄漏时，heap dump 分析和 Pyroscope 持续性能剖析各自的核心作用是什么？",
+          "choices": [
+            {"id": "A", "text": "两者功能基本相同，分析同类问题，选其中一个使用即可"},
+            {"id": "B", "text": "heap dump 用于定位持续高频分配内存的函数，Pyroscope 用于展示某时刻存活对象的分布"},
+            {"id": "C", "text": "heap dump 展示某时刻 JVM 堆中存活对象的分布和 Retained Heap，Pyroscope 定位在一段时间内持续分配内存的热点函数，两者交叉印证定位泄漏"},
+            {"id": "D", "text": "heap dump 只能分析 Java 进程，Pyroscope 只支持 Go 进程，两者面向不同语言，不能用于同一服务"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "两者的视角不同，因此互补。Heap dump 是「瞬间快照」——在 OOM 发生前一刻（通过 -XX:+HeapDumpOnOutOfMemoryError 自动触发），记录 JVM 堆里所有存活对象。Eclipse MAT 的 Dominator Tree 可以找到 Retained Heap 最大的对象链，回答「堆里堆积了哪类对象」。Pyroscope 是「持续录像」——以低开销持续采样内存分配，可以回答「过去 1 小时哪个函数在不停分配内存且不释放」。泄漏的典型模式是：某类对象（heap dump 发现）被某个函数持续创建（Pyroscope 发现）但从不被 GC 回收。选项 B 把两者的功能描述反了。选项 D 错误，Pyroscope 支持 Java、Go、Python、Ruby、.NET 等多种语言，并非只支持 Go。",
+          "relatedConcepts": ["heap dump", "Pyroscope", "内存泄漏", "持续性能剖析", "Eclipse MAT"]
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/assign-memory-resource/",
+        "https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler",
+        "https://github.com/google/cadvisor/blob/master/docs/storage/prometheus.md",
+        "https://grafana.com/oss/pyroscope/",
+        "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html"
+      ]
+    }
+  ]
+}
