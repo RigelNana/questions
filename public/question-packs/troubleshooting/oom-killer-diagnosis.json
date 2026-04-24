@@ -1,0 +1,156 @@
+{
+  "id": "oom-killer-diagnosis",
+  "name": "OOM Killer 触发机制与排查",
+  "domain": "troubleshooting",
+  "description": "Linux OOM Killer 的触发条件、进程选择算法与被杀进程的排查和保护方法",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "oom-killer-diagnosis-1",
+      "domain": "troubleshooting",
+      "type": "principle",
+      "difficulty": 2,
+      "tags": ["oom", "memory", "linux", "kernel", "container", "cgroup", "kubernetes"],
+      "title": "服务进程莫名消失，dmesg 发现 OOM Killer 杀了它，这是怎么回事？如何排查和预防？",
+      "content": "## 场景：进程无故消失，日志里没有任何异常\n\n某个深夜，你的 on-call 告警响了。监控显示一个 Java 服务实例在凌晨 3:17 突然下线，但应用日志里没有任何异常堆栈，进程就这样静默消失了。重启之后一切恢复正常，但半小时后又挂了。\n\n值班同学第一反应是「是不是进程崩溃了？」，但崩溃通常会有 core dump 或者 JVM 打印 fatal error。登上机器一看，`/var/log/messages` 里什么都没有，`journalctl -xe` 也很干净。直到有人想到去看 `dmesg`：\n\n```\n$ dmesg -T | grep -i 'oom\\|kill'\n[Tue Mar 12 03:17:42 2024] java invoked oom-killer: gfp_mask=0x100cca(GFP_HIGHUSER_MOVABLE), order=0, oom_score_adj=0\n[Tue Mar 12 03:17:42 2024] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/system.slice/java.service,task=java,pid=18423,uid=1000\n[Tue Mar 12 03:17:42 2024] Out of memory: Killed process 18423 (java) total-vm:8523776kB, anon-rss:7981632kB, file-rss:24576kB, shmem-rss:0kB, UID:1000 pgtables:16384kB oom_score_adj:0\n```\n\n案情大白：是 Linux 内核的 OOM Killer 杀死了这个进程。\n\n但问题随之而来：为什么内核要杀进程？它是怎么选中这个 Java 服务的？机器明明还有 2GB 的空闲内存（`free -h` 显示 `free` 列是 2.1G），为什么还会 OOM？怎么才能防止重要服务被杀？如果是跑在容器里的服务，OOM 的机制又有什么不同？\n\n这道题要求你把 Linux 内存子系统从虚拟内存分配到 OOM Killer 选择牺牲者的完整链路讲清楚，并给出生产环境可以直接落地的保护方案。",
+      "answer": "## 先从根本说起：Linux 为什么会允许「超额分配」内存\n\n要理解 OOM Killer，必须先搞清楚 Linux 内存分配的哲学。当你的程序调用 `malloc(1GB)` 时，内核实际上并不会立刻给你 1GB 的物理内存，它只是给了你 1GB 的**虚拟地址空间**。物理内存的分配推迟到你真正访问这些地址时才发生，这个机制叫做**需求分页（demand paging）**：CPU 访问某个虚拟地址时触发缺页异常（page fault），内核此时才分配一个物理页帧并建立映射。\n\n这种设计带来了「过量提交（overcommit）」的可能性：系统上所有进程 `malloc` 分配的虚拟内存总量，可以远超物理内存 + swap 的实际容量。内核默认允许这种行为（`/proc/sys/vm/overcommit_memory = 0`，启发式允许超额），甚至可以设置为 `1`（无条件允许一切分配）。这个设计的合理性在于：fork 出来的子进程通过 COW（Copy-on-Write，写时复制）机制共享父进程的物理页，实际上并不会立刻用掉那么多内存；许多应用申请了内存但从不全部使用。\n\n然而，这个美好的假设有时会被打破。当系统真正需要分配物理页面，却发现物理内存和 swap 都已经耗尽，又找不到可以回收的 page cache 时，内核就会陷入一种绝境：总得有人让出内存。这时 OOM Killer 登场了。\n\n## OOM Killer 的触发条件：不是「内存不足」，而是「无法分配」\n\n这是很多人搞错的一个关键点。触发 OOM 的条件不是「剩余内存低于某个阈值」，而是内核在尝试分配内存时**无论如何都分配不到**。具体来说，内核会在以下情况下才考虑 OOM：物理内存已满，swap 也已满（或者没有 swap），而且 page cache 里也没有可以直接丢弃或写回的干净页。`free -h` 里显示的 `free` 那一列只是完全空闲的内存，实际上 `available` 那一列才是真正可用的估算值——它包括了可以立刻回收的 page cache。所以「free 是 2GB 但还是 OOM」这种现象，意味着当时 available 已经趋近于零，page cache 也无法满足本次分配需求。\n\n你可以通过 `/proc/meminfo` 看到更精确的状态：\n\n```bash\n$ cat /proc/meminfo\nMemTotal:       32768000 kB\nMemFree:          102400 kB   # 完全空闲，通常很少\nMemAvailable:    409600 kB   # 真正可用，OOM 前这个值会趋近于 0\nBuffers:          51200 kB\nCached:          204800 kB   # 文件缓存，大部分可回收\nSwapTotal:            0 kB   # 没有 swap！\nSwapFree:             0 kB\nAnonPages:      31948800 kB  # 匿名页，进程实际用掉的物理内存\n```\n\n## OOM Killer 如何选择「牺牲谁」：oom_score 算法\n\n内核决定杀哪个进程，靠的是 `oom_score`。你可以直接看任意进程的分数：\n\n```bash\n$ cat /proc/18423/oom_score\n847\n\n$ cat /proc/1/oom_score       # systemd init 进程\n0\n\n$ cat /proc/$$/oom_score      # 当前 shell\n12\n```\n\n`oom_score` 的计算核心是该进程的**内存占用比例**：进程使用的物理内存（包括 RSS + swap）除以系统总内存，再乘以 1000，得到一个 0～1000 的基础分。这意味着占用内存越多，越容易被选中——这其实是合理的，杀一个大进程能释放更多内存。\n\n但 `oom_score` 还受到 `oom_score_adj` 的调整，范围是 -1000 到 1000，存在 `/proc/pid/oom_score_adj`。最终 `oom_score = 基础分 + oom_score_adj`，如果结果超过 1000 则截断为 1000，如果低于 0 则截断为 0。当 `oom_score_adj = -1000` 时，最终 `oom_score` 恒为 0，这个进程就永远不会被 OOM Killer 选中——这是保护关键进程的核心手段。\n\n内核选择 `oom_score` 最高的进程杀掉，如果分数相同，选 RSS 更大的那个。\n\n## 读懂 dmesg 里的 OOM 日志\n\n回到场景中的 dmesg 输出，我们来逐行解读：\n\n```\njava invoked oom-killer: gfp_mask=0x100cca(GFP_HIGHUSER_MOVABLE), order=0, oom_score_adj=0\n```\n\n这行说明是 java 进程自己触发了 OOM Killer——它在尝试分配普通用户内存（GFP_HIGHUSER_MOVABLE）时失败了，`order=0` 表示申请的是单个 4KB 页面（最小单位），连一个 4KB 页都分配不到，说明系统已经极度内存紧张。\n\n```\noom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,\nglobal_oom,task_memcg=/system.slice/java.service,task=java,pid=18423,uid=1000\n```\n\n`constraint=CONSTRAINT_NONE` 表示这是全系统级别的 OOM，不是 cgroup 限制触发的。`task_memcg` 告诉你这个进程属于哪个 cgroup 层级。`global_oom` 确认是全局 OOM。\n\n```\nOut of memory: Killed process 18423 (java) total-vm:8523776kB, anon-rss:7981632kB, file-rss:24576kB, shmem-rss:0kB, UID:1000 pgtables:16384kB oom_score_adj:0\n```\n\n这是最有价值的一行：`total-vm:8523776kB`（约 8.1GB）是该进程的虚拟地址空间总量，`anon-rss:7981632kB`（约 7.6GB）是实际占用的匿名物理内存（堆、栈），`file-rss` 是文件映射占用的物理内存（mmap 的 .so 库等）。这个 Java 进程的 `oom_score_adj=0`，说明没有做任何保护配置，所以内核自然会在它的高 `oom_score` 面前选中它。\n\n紧接着 dmesg 里通常还有一段 OOM 时刻的内存快照，显示系统各种内存区域的状态，以及当时 `oom_score` 最高的若干进程列表——这对你判断「到底是谁把内存吃完的」至关重要。\n\n## 如何保护重要进程不被 OOM Killer 杀掉\n\n最直接的方式是把关键进程的 `oom_score_adj` 设为 `-1000`：\n\n```bash\n# 方法一：直接写 /proc/pid/oom_score_adj（重启失效）\necho -1000 > /proc/$(pgrep java)/oom_score_adj\n\n# 方法二：在 systemd service 文件里配置（推荐，永久有效）\n# /etc/systemd/system/java.service\n[Service]\nOOMScoreAdjust=-1000\n\n# 方法三：在启动脚本里用 choom 命令（util-linux 2.31+）\nchoom -n -1000 -- java -jar myapp.jar\n```\n\n设置完后用 `systemctl daemon-reload && systemctl restart java` 重启服务，确认生效：\n\n```bash\n$ cat /proc/$(pgrep java)/oom_score_adj\n-1000\n$ cat /proc/$(pgrep java)/oom_score\n0\n```\n\n需要注意的是，把关键进程的 `oom_score_adj` 设为 `-1000` 并不能解决内存不足的根本问题，只是在 OOM 发生时保护它不被选中。内核还是会选择 `oom_score` 最高的其他进程来杀。如果你的系统上只有一个进程（或者其他进程也都设了 `-1000`），内核在实在找不到牺牲者的情况下，可能会触发 kernel panic，比被杀进程更惨。真正的解决方案是搞清楚内存去哪儿了——是内存泄漏、业务量增长超过预期，还是 JVM 堆配置不合理。\n\n## 容器里的 OOM：cgroup 触发 vs 系统触发，两回事\n\n在容器化环境里，OOM 有两种完全不同的触发路径，很多人把它们混为一谈。\n\n**系统级 OOM**（上文所述）是当整台宿主机内存耗尽时，内核 OOM Killer 在全局范围内选择牺牲者。容器里的进程会参与这个全局选拔，`oom_score_adj` 的设置照样有效。\n\n**cgroup 级 OOM** 是当容器的内存使用量触碰了 cgroup 的 `memory.limit_in_bytes`（cgroup v1）或 `memory.max`（cgroup v2）限制时触发的。这种情况下宿主机内存可能还很充裕，但内核会把这个 cgroup 内存超限视为一次「局部 OOM」，在该 cgroup 内部选择 `oom_score` 最高的进程杀掉。dmesg 里的标志是 `constraint=CONSTRAINT_MEMCG`，而不是 `CONSTRAINT_NONE`：\n\n```\noom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/kubepods/...,\nmems_allowed=0,oom_memcg=/kubepods/burstable/pod.../container,task=java,pid=18423\n```\n\n在 Kubernetes 里，Pod 的 OOM 优先级由 QoS 类决定：`Guaranteed`（requests == limits）的 Pod `oom_score_adj` 被设为 `-997`；`Burstable`（requests < limits）的 Pod 按 requests/limits 的比例计算，`oom_score_adj` 在 2~999 之间；`BestEffort`（没有设置 requests/limits）的 Pod `oom_score_adj` 固定为 1000，最先被杀。这意味着在生产环境里，**一定要给所有 Pod 设置资源 requests 和 limits**，否则 BestEffort 的 Pod 就是 OOM 时的炮灰。\n\n## 如何提前预警而不是事后排查\n\n等 OOM 发生了再排查永远是被动的。主动预警有几个层面：在监控层面，持续采集 `/proc/meminfo` 的 `MemAvailable` 字段，当它低于总内存的 10% 时告警；在进程层面，监控各个关键进程的 RSS 和虚拟内存增长趋势；在 cgroup 层面，如果用容器，监控 `container_memory_working_set_bytes` 与 limit 的比值，超过 80% 就该预警了。\n\n关于 swap 的争议值得单独说一句：开 swap 确实可以推迟 OOM 的发生时间，但 swap 只是把内存压力转移到了磁盘 I/O，对于延迟敏感的服务（比如 MySQL、Redis）来说，进程被换出到磁盘意味着访问延迟从微秒级变成毫秒级，反而造成更严重的服务抖动。业界对数据库服务的普遍共识是**禁用 swap**（`/proc/sys/vm/swappiness = 0` 或直接不配置 swap 分区），宁可让 OOM Killer 来清场，也不要让 MySQL 因为 swap 导致的 I/O 延迟把整个系统拖垮。",
+      "keyPoints": [
+        "Linux 的过量提交（overcommit）机制允许所有进程虚拟内存总量超过物理内存+swap 的实际容量，因为 fork 的 COW 机制和「申请但不用」的常见模式使得这种超额在大多数时候不会成为问题。",
+        "OOM Killer 的触发条件是「内核尝试分配物理页时真正分配不到」，而不是「剩余内存低于阈值」，/proc/meminfo 的 MemAvailable 字段比 MemFree 更能反映系统真实可用内存。",
+        "内核通过 oom_score 选择牺牲进程，其核心是进程占用物理内存的比例（RSS/总内存 × 1000），占用越多分数越高越容易被杀；oom_score_adj 可在 -1000 到 +1000 范围内调整这个分数。",
+        "将关键进程的 oom_score_adj 设为 -1000 可使其 oom_score 永远为 0，从而完全豁免于 OOM Killer 的选择，生产环境推荐通过 systemd 的 OOMScoreAdjust=-1000 字段永久配置。",
+        "容器内的 cgroup 级 OOM（constraint=CONSTRAINT_MEMCG）与系统级 OOM（constraint=CONSTRAINT_NONE）是完全不同的触发路径：前者是容器内存超出 limit 限制，宿主机内存可能仍然充裕；后者是整台机器内存耗尽。",
+        "Kubernetes 通过 QoS 类控制 OOM 优先级：BestEffort Pod 的 oom_score_adj 固定为 1000 最先被杀，Guaranteed Pod 为 -997 最后被杀，生产环境的核心服务必须配置 resources.requests 和 resources.limits 以获得 Guaranteed 或 Burstable 保护。",
+        "MySQL、Redis 等延迟敏感的数据库服务应当禁用 swap（swappiness=0），因为进程被 swap 换出到磁盘后访问延迟从微秒级骤增到毫秒级，造成的服务抖动比 OOM Killer 直接杀进程更难恢复。"
+      ],
+      "quiz": [
+        {
+          "id": "oom-killer-diagnosis-1-q1",
+          "question": "Linux 的 overcommit 机制的核心含义是什么？",
+          "choices": [
+            { "id": "A", "text": "内核允许所有进程虚拟内存分配总量超过物理内存+swap 的实际容量，依赖需求分页延迟物理内存分配" },
+            { "id": "B", "text": "内核会为每个 malloc 调用立刻分配对应大小的物理内存，但会在后台异步压缩" },
+            { "id": "C", "text": "overcommit 只针对 mmap 匿名映射，普通 malloc 调用仍然立刻分配物理内存" },
+            { "id": "D", "text": "overcommit 是通过 swap 实现的，物理内存不足时自动将旧数据换出到磁盘" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "overcommit 的本质是「虚拟地址空间的分配」与「物理页的分配」相分离。当进程调用 malloc 时，内核只分配虚拟地址范围，真正的物理页在进程首次访问该地址触发缺页异常时才分配。这使得系统上所有进程的虚拟内存总量可以远超物理内存容量。B 选项描述的是没有 overcommit 的行为，C 选项是错的因为 malloc 本质上就是匿名映射，D 选项混淆了 overcommit 与 swap 的概念——swap 是物理页换出机制，跟虚拟内存分配策略是两个不同的层面。"
+        },
+        {
+          "id": "oom-killer-diagnosis-1-q2",
+          "question": "执行 `free -h` 显示 free 列为 2GB，但系统依然触发了 OOM，最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "free 命令的数据存在延迟，实际上在 OOM 触发时 free 已经是 0" },
+            { "id": "B", "text": "free 列只是完全空闲内存，MemAvailable 才是真正可用估算值；OOM 时 MemAvailable 趋近于 0，page cache 也无法满足分配需求" },
+            { "id": "C", "text": "2GB free 内存被内核保留用于内核自身，用户空间进程无法使用这部分内存" },
+            { "id": "D", "text": "没有开启 swap 导致 OOM 阈值变高，free 内存必须超过总内存 10% 才能避免 OOM" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`free -h` 的 free 列（对应 /proc/meminfo 的 MemFree）是完全没有被任何用途占用的内存，它通常非常少，因为内核会尽可能把空闲内存用作文件系统的 page cache。真正能「随时拿来用」的内存是 MemAvailable，它包含了 MemFree 加上可以立刻回收的 page cache 等。当 MemAvailable 趋近于 0 时，即使 page cache 存在，内核也可能在某次分配时找不到足够的连续可回收页面，从而触发 OOM。A 选项是错的因为 /proc/meminfo 是实时的。C 选项不对，内核内存由 Slab 等另外管理。D 选项是完全虚构的概念。"
+        },
+        {
+          "id": "oom-killer-diagnosis-1-q3",
+          "question": "一个进程的 oom_score 是如何计算的？",
+          "choices": [
+            { "id": "A", "text": "oom_score = 进程运行时间（秒）× 10，运行越久的进程越容易被杀" },
+            { "id": "B", "text": "oom_score 基于进程占用物理内存比例（RSS/总内存 × 1000），再叠加 oom_score_adj 调整值，分数越高越先被杀" },
+            { "id": "C", "text": "oom_score = CPU 使用率 × 10 + 内存使用率 × 10，综合资源占用高的进程优先被杀" },
+            { "id": "D", "text": "oom_score 由进程的 nice 值决定，nice 值越高（优先级越低）的进程 oom_score 越高" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Linux 内核计算 oom_score 的核心逻辑是：将进程的 RSS（常驻物理内存）加上 swap 使用量，除以系统总内存，乘以 1000，得到 0～1000 的基础分，再叠加 oom_score_adj（范围 -1000~+1000）。基础逻辑是「谁占内存多谁先被杀」，因为杀大进程能释放更多内存，让系统从 OOM 状态恢复。oom_score_adj 允许管理员手动干预这个优先级。A 选项（时间）、C 选项（CPU）在 oom_score 的计算中根本不占权重，D 选项混淆了调度优先级（nice 值）与 OOM 优先级。"
+        },
+        {
+          "id": "oom-killer-diagnosis-1-q4",
+          "question": "要永久保护一个关键 systemd 服务不被 OOM Killer 选中，最佳实践是什么？",
+          "choices": [
+            { "id": "A", "text": "在 /etc/sysctl.conf 中设置 vm.oom_kill_disable=1，禁用整个系统的 OOM Killer" },
+            { "id": "B", "text": "在 systemd service 文件的 [Service] 段添加 OOMScoreAdjust=-1000" },
+            { "id": "C", "text": "在启动脚本中用 renice -20 调整进程优先级，高优先级进程不会被 OOM Killer 选中" },
+            { "id": "D", "text": "在 /etc/security/limits.conf 中设置该用户的 memlock 为 unlimited" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "systemd 的 OOMScoreAdjust=-1000 会在服务启动时写入 /proc/pid/oom_score_adj，使该进程的最终 oom_score 永远为 0，从而在全局 OOM 选举中豁免。这个配置随服务文件持久化，重启后自动生效。A 选项（vm.oom_kill_disable=1）会禁用整个系统的 OOM Killer，一旦真正内存耗尽系统会直接 hang 住或 kernel panic，生产环境中极度危险，只在极特殊场景的极短窗口内使用。C 选项混淆了 CPU 调度优先级（nice）与内存管理，两者完全独立。D 选项（memlock）控制的是可以被锁定在内存中（不被 swap 出去）的内存量，与 OOM 选择无关。"
+        },
+        {
+          "id": "oom-killer-diagnosis-1-q5",
+          "question": "以下是一段 dmesg 输出，`constraint=CONSTRAINT_MEMCG` 说明什么？\n\n```\noom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/kubepods/burstable/pod-abc,oom_memcg=/kubepods/burstable/pod-abc/container-xyz,task=myapp,pid=31337\n```",
+          "choices": [
+            { "id": "A", "text": "这是全系统内存耗尽触发的 OOM，myapp 进程的内存占用超过了全局 oom_score 阈值" },
+            { "id": "B", "text": "这是 cgroup 内存限制触发的 OOM，myapp 所在容器的内存使用超过了 cgroup limit，宿主机整体内存可能仍然充裕" },
+            { "id": "C", "text": "这是内核检测到内存碎片化，无法分配连续内存页时触发的特殊 OOM" },
+            { "id": "D", "text": "这表示 myapp 进程设置了 oom_score_adj=-1000 但依然被 OOM Killer 选中，属于内核 bug" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "dmesg 的 OOM 日志中，constraint 字段标明了触发路径：CONSTRAINT_NONE 表示全系统内存耗尽，CONSTRAINT_MEMCG 表示是 cgroup 的内存限制（memory.limit_in_bytes 或 memory.max）被触碰。在 Kubernetes 场景中，每个容器都有对应的 cgroup，当容器内存超过 Pod spec 里定义的 limits 时，内核就会在该 cgroup 范围内执行 OOM Killer，此时宿主机剩余内存可能非常充裕。oom_memcg 字段指向了触发限制的具体 cgroup 路径，通过这个路径可以定位到具体是哪个 Pod 的哪个容器。A 选项描述的是 CONSTRAINT_NONE，B 是正确的，C 描述的是内存碎片问题（会是不同的 gfp_mask），D 完全不符合内核行为。"
+        },
+        {
+          "id": "oom-killer-diagnosis-1-q6",
+          "question": "以下哪种说法关于 Kubernetes Pod QoS 与 OOM 优先级的描述是正确的？",
+          "choices": [
+            { "id": "A", "text": "Guaranteed Pod 的 oom_score_adj 为 0，与未做任何配置的普通进程相同" },
+            { "id": "B", "text": "BestEffort Pod 的 oom_score_adj 固定为 1000，内存紧张时最先被 OOM Killer 选中" },
+            { "id": "C", "text": "只要给 Pod 设置了 requests，oom_score_adj 就会被设为 -1000，完全豁免于 OOM" },
+            { "id": "D", "text": "K8s 的 QoS 机制只影响 CPU 调度，与 OOM Killer 的选择顺序无关" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kubernetes kubelet 在启动容器时会根据 Pod 的 QoS 类自动设置 oom_score_adj：Guaranteed Pod（requests == limits）设为 -997，几乎不会被系统级 OOM 杀掉；Burstable Pod 按 requests 与 limits 的比值计算，oom_score_adj 在 2~999 之间；BestEffort Pod（没有 requests/limits）设为 1000，是最优先的 OOM 牺牲者。A 选项错在 Guaranteed Pod 是 -997 而非 0；C 选项夸大了，只有 Guaranteed（requests==limits）才会得到 -997，且 -997 不等于 -1000，仍可能在极端情况下被系统级 OOM 选中（尽管概率极低）；D 选项完全错误，QoS 正是通过 oom_score_adj 直接影响 OOM 选择顺序的。"
+        },
+        {
+          "id": "oom-killer-diagnosis-1-q7",
+          "question": "为什么 MySQL 等数据库的部署文档通常建议将 vm.swappiness 设为 0 或禁用 swap？",
+          "choices": [
+            { "id": "A", "text": "禁用 swap 可以降低 OOM 触发的阈值，让内核更早触发 OOM Killer 清理其他进程，从而为 MySQL 保留更多内存" },
+            { "id": "B", "text": "MySQL 数据一旦被 swap 换出到磁盘，访问延迟从微秒级骤增到毫秒级，造成的查询超时和连接堆积比 OOM 直接崩溃更难恢复" },
+            { "id": "C", "text": "swap 会导致 MySQL 的 redo log 写入路径发生冲突，损坏数据文件" },
+            { "id": "D", "text": "Linux 内核要求数据库进程必须使用 mlock 锁定内存，而 mlock 与 swap 互斥，所以必须禁用 swap" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "数据库最核心的性能要求是低延迟、可预期的响应时间。MySQL 的 InnoDB buffer pool、连接线程栈、排序缓冲区等如果被 swap 换出到磁盘，一次普通的 SQL 执行可能因为缺页异常触发磁盘 I/O，延迟从原来的微秒/毫秒级变成几十上百毫秒。更糟糕的是 swap 的影响是渐进的——不是立刻崩溃，而是逐渐变慢，连接堆积，导致雪崩。相比之下，OOM Killer 直接杀掉进程虽然粗暴，但重启之后系统恢复干净。A 选项逻辑方向基本对但表述不准确；C 选项是虚构的，swap 不会影响 redo log 的 fsync 路径；D 选项混淆了 mlock 的使用（mlock 是应用程序主动调用的，且 swappiness=0 并不等于不能使用 mlock）。"
+        },
+        {
+          "id": "oom-killer-diagnosis-1-q8",
+          "question": "生产服务在没有监控覆盖的情况下，哪个 /proc/meminfo 指标最适合作为 OOM 预警的观测对象？",
+          "choices": [
+            { "id": "A", "text": "MemFree，当它低于总内存的 5% 时发出告警" },
+            { "id": "B", "text": "MemAvailable，它估算了包括可回收 page cache 在内的真正可用内存，趋近于 0 时预示 OOM 即将发生" },
+            { "id": "C", "text": "SwapFree，当 SwapFree 为 0 时说明 swap 已满，OOM 即将触发" },
+            { "id": "D", "text": "AnonPages，当匿名页超过物理内存的 80% 时发出告警" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "MemAvailable 是 Linux 3.14 内核引入的字段，专门为「这台机器还能不能启动新进程」这个问题设计。它的计算包含 MemFree、可回收的 page cache 减去低水位保留、可回收的 Slab，是一个对真实可用内存的合理估算。当 MemAvailable 低于某个绝对值（如 500MB）或者低于总内存的某个比例（如 5%）时，距离 OOM 就已经很近了。A 选项（MemFree）是个陷阱：MemFree 通常很小，内核会尽量把空闲内存用作 page cache，MemFree=100MB 完全正常。C 选项（SwapFree=0）不是充分条件，它只说明 swap 用完了，但如果 page cache 还可回收，不一定会立刻 OOM；而且很多系统没有 swap，这个指标永远是 0。D 选项（AnonPages）有一定参考价值但没有 MemAvailable 直接。"
+        },
+        {
+          "id": "oom-killer-diagnosis-1-q9",
+          "question": "以下哪种场景会导致系统频繁 OOM，但每次 OOM 后服务自动重启又很快再次 OOM？",
+          "choices": [
+            { "id": "A", "text": "进程存在内存泄漏，每次启动后内存持续增长，增长到耗尽系统可用内存时触发 OOM，如此循环" },
+            { "id": "B", "text": "系统 swap 分区损坏，内核无法正常换出内存页，导致频繁 OOM" },
+            { "id": "C", "text": "oom_score_adj 设置为 1000 会强制进程在任何时候立刻被杀，导致反复重启" },
+            { "id": "D", "text": "cgroup memory limit 设置过低，每次进程启动后正常运行都会超出 limit，触发 cgroup OOM" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "A 和 D 都能导致反复 OOM 的现象，但题目问的是「频繁 OOM 后自动重启又很快再次 OOM」，A 更典型。内存泄漏的特征是：进程重启后内存从一个较低的基线开始，随着时间推移持续增长，数小时或数天后再次触发 OOM。这个规律在监控上表现为内存使用的锯齿波形——周期性陡升后被杀，重启后从低点再次爬升。D 选项（cgroup limit 过低）会导致进程启动后立刻被杀（可能几分钟内），而不是「运行一段时间后」被杀，模式有所不同。排查时关注进程重启后到被杀的时间间隔和内存增长曲线，能区分这两种情况。B 选项（swap 损坏）在实践中极少见，且 swap 损坏通常会有磁盘错误日志。C 选项完全错误，oom_score_adj=1000 只是让进程在 OOM 时最优先被选中，不会主动触发 OOM。"
+        },
+        {
+          "id": "oom-killer-diagnosis-1-q10",
+          "question": "排查一个「进程无故消失」的故障，以下排查步骤的正确顺序是什么？",
+          "choices": [
+            { "id": "A", "text": "先看应用日志 → 再看 dmesg | grep oom → 再看 /proc/meminfo 历史数据 → 最后看 oom_score_adj 配置" },
+            { "id": "B", "text": "先重启进程 → 等它再次崩溃 → 用 strace 跟踪进程 → 分析 strace 输出" },
+            { "id": "C", "text": "先检查 core dump 文件 → 用 gdb 分析 core dump → 查找崩溃原因" },
+            { "id": "D", "text": "直接检查 /var/log/syslog 里的 segfault 记录，进程无故消失必然是段错误导致的" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "进程无故消失、日志里没有异常的排查路径应该是：首先看应用日志排除应用层异常（panic、fatal error）；如果日志干净则上升到内核层，`dmesg -T | grep -iE 'oom|kill|memory'` 能快速确认是否有 OOM Killer 的记录；如果确认是 OOM，再看监控或 /proc/meminfo 的历史趋势，搞清楚是什么把内存吃完的；最后检查被杀进程和其他进程的 oom_score_adj 配置，决定是保护关键进程还是限制内存大户。B 选项（strace）在确认是 OOM 之前就用 strace 是浪费时间，而且 strace 本身会有很大的性能开销。C 选项（core dump）是段错误的排查路径，OOM 被杀的进程不会留下 core dump（除非专门配置了 core_pattern）。D 选项（segfault）是完全不同的故障类型。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/admin-guide/mm/concepts.html",
+        "https://www.kernel.org/doc/html/latest/admin-guide/mm/oom_kill.html",
+        "https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/",
+        "https://man7.org/linux/man-pages/man5/proc.5.html"
+      ]
+    }
+  ]
+}

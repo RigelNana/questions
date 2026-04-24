@@ -1,0 +1,155 @@
+{
+  "id": "memory-leak-diagnosis",
+  "name": "应用内存泄漏的诊断",
+  "domain": "troubleshooting",
+  "description": "Java/Go 应用内存持续增长时，系统性诊断内存泄漏的工具与方法论",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "memory-leak-diagnosis-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["memory", "leak", "java", "jvm", "profiling", "jmap", "heap-dump", "native-memory"],
+      "title": "Java 服务 RSS 每天增长 200MB，两周后 OOM，如何确认是内存泄漏并找到根因？",
+      "content": "你负责维护一个 Java 微服务，线上监控显示它的 RSS（Resident Set Size，进程实际占用的物理内存）呈现出令人不安的线性增长趋势：每天稳定增长约 200MB。服务启动时 RSS 约为 800MB，一周后涨到 2.2GB，两周后逼近 4GB，最终触发宿主机 OOM Killer，进程被强制 kill。重启之后一切恢复正常，但两周后历史重演。\n\n服务的技术栈是 Java 17 + Spring Boot 3.1，运行在 Kubernetes Pod 中，资源限制为 4 核 8GB 内存。JVM 启动参数如下：\n\n```\n-Xmx4g -Xms1g -XX:+UseG1GC -XX:MaxGCPauseMillis=200\n```\n\nGrafana 监控面板上你观察到以下现象：JVM Heap Used 始终维持在 1.2GB 以内，GC 频率和 Full GC 停顿时间完全正常；但 `container_memory_working_set_bytes`（容器工作集内存，对应 RSS）从第一天起就在线性爬升。到第 10 天，Pod 的 RSS 已经达到 5.8GB，比 JVM 的 `-Xmx4g` 上限还多出将近 2GB。\n\n你已经尝试过以下操作，但都没找到线索：\n\n```bash\n# 查看堆对象分布，没有发现异常增长的类\njmap -histo <pid> | head -30\n\n# 每 5 秒观察一次 GC 统计，GC 工作正常\njstat -gcutil <pid> 5000\n```\n\n`jmap -histo` 的输出显示堆内存对象总量没有明显变化，Full GC 后堆也能正常回收。换句话说，操作系统看到这个进程用了将近 6GB 内存，JVM 却声称自己只用了 1.2GB 堆。多出来的将近 4.8GB 究竟在哪里？\n\n这个现象已经持续了 3 个版本迭代，你的团队怀疑是最近引入的某个第三方库导致的堆外内存泄漏（off-heap memory leak），但完全没有头绪。请给出系统性的诊断思路：如何判断泄漏位置（堆内 vs 堆外 vs native），如何用工具定位根因，以及针对不同泄漏类型应该怎么修复？",
+      "answer": "## 先搞清楚内存的组成：RSS 不等于 Heap\n\n遇到这种「JVM 堆正常、但 RSS 不断增长」的问题，很多人的第一反应是「GC 有问题」或者「有内存泄漏但 jmap 没查出来」。在动手排查之前，必须先理解一个 Java 进程的内存由哪几部分构成。\n\n操作系统视角下，一个 Java 进程的内存由以下几层组成：Heap（由 JVM 管理，-Xmx 控制上限）、Metaspace（类元数据，Java 8 之后从永久代移出到本地内存）、Code Cache（JIT 编译后的机器码）、Direct Memory（DirectByteBuffer 分配的堆外内存，-XX:MaxDirectMemorySize 控制）、JVM 内部结构（线程栈、GC 数据结构等），以及通过 JNI 或第三方 native 库分配的 native heap。RSS 是这些所有组成部分的总和，而不仅仅是 Heap。\n\n所以当你看到 `-Xmx4g` 但 RSS 达到 6GB，差出来的这 2GB 极有可能藏在 Metaspace、Direct Memory 或者 native heap 里。理解了这一点，排查思路就清晰多了。\n\n## 第一步：用 NMT 定位泄漏在 JVM 哪个内存区域\n\n在 Java 8u40 以后，JVM 提供了一个官方工具叫 Native Memory Tracking（NMT），可以精确追踪 JVM 自身各个内存区域的用量。生产环境中启用它的代价很小（overhead 约 5-10%），强烈建议默认开启：\n\n```bash\n# 在 JVM 启动参数中加入（summary 模式开销更低）\n-XX:NativeMemoryTracking=summary\n\n# 服务运行一段时间后，查看当前内存快照\njcmd <pid> VM.native_memory summary\n```\n\n一个典型的 `jcmd` 输出如下，各区域用量一目了然：\n\n```\nNative Memory Tracking:\n\nTotal: reserved=7.2GB, committed=5.6GB\n-                 Java Heap (reserved=4096MB, committed=4096MB)\n                            (mmap: reserved=4096MB, committed=4096MB)\n-                     Class (reserved=1056MB, committed=112MB)\n                            (classes #18432)\n-                    Thread (reserved=342MB, committed=342MB)\n                            (thread #334)\n-                      Code (reserved=248MB, committed=195MB)\n-                        GC (reserved=386MB, committed=386MB)\n-               Native Heap (reserved=1024MB, committed=981MB)  ← 异常！\n-              Direct Memory (reserved=512MB, committed=488MB)\n```\n\n如果你发现 `Native Heap` 或 `Direct Memory` 的 committed 值在随时间持续增长，那泄漏就在这两块。结合这道题的现象——堆正常但 RSS 持续涨——99% 的概率是 Direct Memory 或 native heap 泄漏。\n\n## 第二步：堆内泄漏的确认——jmap + MAT\n\n虽然本题的堆使用量正常，但作为完整排查流程，还是要说清楚堆内泄漏的诊断方法，因为这是面试必考点。\n\n`jmap -histo <pid>` 能快速看到堆中对象的分布，按实例数和总大小排序。如果某个类的实例数在几次采样之间持续增长，那它就是嫌疑人：\n\n```bash\n# 每隔 60 秒采样一次，对比增量\njmap -histo <pid> | sort -k3 -rn | head -20\n```\n\n```\n num     #instances         #bytes  class name\n----------------------------------------------\n   1:       3547821      567651360  byte[]\n   2:       1234567      197530720  com.example.cache.CacheEntry   ← 持续增长的嫌疑类\n   3:        876543       84147328  java.util.HashMap$Node\n   4:        234567       56296080  java.lang.String\n```\n\n发现嫌疑类之后，要导出完整的 heap dump 进行引用链分析：\n\n```bash\n# 导出 heap dump（live=true 只导出 GC 后存活对象，排除垃圾）\njmap -dump:format=b,live=true,file=/tmp/heap-$(date +%Y%m%d%H%M).hprof <pid>\n```\n\n拿到 `.hprof` 文件后，用 Eclipse MAT（Memory Analyzer Tool）打开。MAT 会自动运行「Leak Suspects」报告，它的核心逻辑是找「支配树」（dominator tree）——即哪个对象持有了最多不能被 GC 回收的内存。你会看到类似这样的报告：\n\n```\n1 instance of \"com.example.service.EventListenerRegistry\" \n  retains 1.8 GB (43.2%) \n  → holds reference to ArrayList with 1,234,567 entries\n     → each entry holds strong reference to UserSession object\n```\n\n这就是典型的「监听器注册了但从未注销」导致的泄漏：`EventListenerRegistry` 持有对 `UserSession` 的强引用，而 `UserSession` 本应在用户退出后被回收。\n\n## 第三步：堆外内存泄漏——Direct Memory 和 native heap\n\n回到本题的场景。NMT 告诉你 native heap 在持续增长，接下来怎么排查？\n\n对于 Direct Memory 泄漏，最常见的原因是使用了 `ByteBuffer.allocateDirect()` 但没有显式释放，或者使用 Netty 的 `PooledByteBufAllocator` 时 `release()` 调用时机不对。DirectByteBuffer 的释放依赖 JVM 的 `Cleaner` 机制，只有当 DirectByteBuffer 对象被 GC 回收时，对应的堆外内存才会被释放。但如果这些对象还被某个缓存或队列持有引用，堆外内存就永远不会还给操作系统。\n\n可以通过以下方式监控 Direct Memory 用量：\n\n```bash\n# 通过 JMX/MBean 查看 DirectByteBuffer 用量\njcmd <pid> VM.native_memory summary.diff  # 对比基线差量\n\n# 或者用 jconsole 连接进程，查看 java.nio:type=BufferPool,name=direct 的 MemoryUsed\n```\n\n如果泄漏在更底层的 native heap（比如 JNI 调用了某个 C 库，或者 RocksDB、TensorFlow 这类 JNI 封装库），`/proc/<pid>/smaps` 是你的下一个工具。它可以列出进程所有内存映射段的详细信息：\n\n```bash\n# 找出所有匿名内存映射（native heap 分配通常是匿名的）并统计大小\ngrep -A 10 'Anonymous' /proc/<pid>/smaps | awk '/Size:/{sum+=$2} END{print sum/1024 \" MB\"}'\n\n# 用 smem 工具更直观地看各段分布\nsmem -p | grep java\n```\n\n如果确认是 JNI native 库泄漏，在 Linux 上可以用 `jemalloc` 的 heap profiling 来定位：\n\n```bash\n# 用 jemalloc 替换 malloc，启用泄漏追踪\nLD_PRELOAD=/path/to/libjemalloc.so MALLOC_CONF=prof:true,prof_leak:true java -jar app.jar\n```\n\n## 常见 Java 内存泄漏场景与修复\n\n排查工具之外，还要知道 Java 里最容易出现内存泄漏的几个模式。**静态集合持有引用**是最常见的一类：某个 `static Map` 作为缓存使用，但只增不删，随着时间推移积累几十万条记录。修复方式是换成 `WeakHashMap` 或带 TTL 的 Caffeine 缓存。\n\n**ThreadLocal 未清理**是另一个高频陷阱，尤其在使用线程池的场景下。线程池里的线程是复用的，如果你在请求处理完后没有调用 `threadLocal.remove()`，这个线程上的 ThreadLocal 值会永远留在线程对象里，随着请求积累越来越多的对象。\n\n**监听器和回调未注销**也是本题答案里提到的那类问题。在 Spring 中注册了 `ApplicationListener` 或通过 `addObserver()` 注册了观察者，但对象生命周期结束时忘记调用注销方法，导致被观察对象持有大量应该已经死亡的对象引用。\n\n**连接池和资源泄漏**则会表现为 native memory 增长：数据库连接、文件描述符、Socket 连接没有在 finally 块或 try-with-resources 中关闭，不断消耗系统资源直到耗尽。\n\n## 扩展：自动化内存泄漏监控\n\n生产环境中靠人工排查内存泄漏的时机往往已经太晚。更好的做法是建立自动化监控：通过 Prometheus JMX Exporter 持续采集 `jvm_memory_bytes_used{area=\"nonheap\"}`、Direct Memory 用量和 NMT 各区域大小，设置「连续 6 小时线性增长且无 GC 回收」的告警规则，在泄漏早期就介入。同时定期（比如每天凌晨）自动执行 `jmap -histo` 并对比差量，如果某个类的实例数增长超过阈值就触发告警，不需要等到 OOM 才发现问题。",
+      "keyPoints": [
+        "RSS（Resident Set Size）包含 Java Heap、Metaspace、Direct Memory、Code Cache、线程栈以及 JNI native heap 等所有部分，RSS 持续增长而 JVM Heap 正常通常意味着堆外内存泄漏，不能只盯着 -Xmx。",
+        "GC 语言同样会发生内存泄漏，根本原因是「对象仍被引用但业务上已不再需要」——静态集合、ThreadLocal 未清理、监听器未注销都会让 GC 无法回收本应死亡的对象。",
+        "启用 JVM 的 Native Memory Tracking（-XX:NativeMemoryTracking=summary）并定期执行 `jcmd <pid> VM.native_memory summary.diff`，是定位堆外内存泄漏区域（Metaspace/Direct Memory/native heap）最直接的方式。",
+        "堆内泄漏的标准排查路径是：`jmap -histo` 间隔采样找到持续增长的类，再用 `jmap -dump:live=true` 导出 heap dump，通过 MAT 的 dominator tree 和 Leak Suspects 报告追踪强引用链直到根对象。",
+        "DirectByteBuffer 的堆外内存依赖 JVM Cleaner 在 GC 时触发释放，如果 DirectByteBuffer 对象被缓存持有引用，对应的堆外内存将永远无法释放，这是 Netty 和 NIO 框架中最常见的堆外泄漏模式。",
+        "JNI native 库引发的 native heap 泄漏可以通过 `/proc/<pid>/smaps` 观察匿名内存段增长，再结合 jemalloc heap profiling 或 Valgrind 的 --leak-check=full 定位到具体的 C/C++ 分配调用栈。",
+        "生产环境内存泄漏监控应该做到事前预警而非事后救火：通过 Prometheus JMX Exporter 持续采集堆外内存指标，定期对比 jmap -histo 差量，在泄漏早期就能发现问题，而不是等到 OOM Killer 介入。"
+      ],
+      "quiz": [
+        {
+          "id": "memory-leak-diagnosis-1-q1",
+          "question": "一个 Java 进程的 RSS 为 5GB，但 JVM 的 `-Xmx` 设置为 2g，GC 日志显示 Heap Used 只有 1.5GB。对这个现象最准确的描述是？",
+          "choices": [
+            {"id": "A", "text": "RSS 包含 Heap、Metaspace、Direct Memory、Code Cache、线程栈等多个区域，RSS > Xmx 完全可能是正常现象或堆外内存增长导致的"},
+            {"id": "B", "text": "JVM 在撒谎，实际 Heap 占用远超 1.5GB，jstat 数据不可信"},
+            {"id": "C", "text": "这说明操作系统为进程分配了 5GB 虚拟内存，但实际物理内存只用了 1.5GB"},
+            {"id": "D", "text": "RSS 超过 Xmx 说明 JVM 参数配置有误，-Xmx 应该设置为物理内存的 80%"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "RSS（Resident Set Size）是操作系统视角下进程实际占用的物理内存总量，包含多个组成部分：Java Heap（受 -Xmx 限制）、Metaspace（类元数据，Java 8 后在 native memory 中）、Direct Memory（NIO/Netty 的堆外内存）、Code Cache（JIT 编译产物）、每个线程的栈内存，以及 JNI native 库分配的内存。所以 RSS 超过 Xmx 非常正常，差值才是排查的重点。B 选项混淆了 Heap 和 RSS。C 选项描述的是 VSZ（Virtual Memory Size），不是 RSS。D 选项是毫无依据的规则，RSS 超过 Xmx 并不说明参数配置有误。"
+        },
+        {
+          "id": "memory-leak-diagnosis-1-q2",
+          "question": "为什么 Java 这种有 GC 的语言也会发生内存泄漏？",
+          "choices": [
+            {"id": "A", "text": "Java GC 不完善，无法回收循环引用的对象"},
+            {"id": "B", "text": "对象仍被某个存活的引用链持有，GC 认为它们还「活着」不能回收，即使业务逻辑上这些对象已经不再需要"},
+            {"id": "C", "text": "Java GC 只在 Full GC 时才回收内存，Young GC 会导致大量内存积累"},
+            {"id": "D", "text": "堆内存够大时 GC 不会主动触发，所以对象会一直堆积"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Java 的 GC 基于可达性分析（reachability analysis）：从 GC Roots（静态变量、栈帧、JNI 引用等）出发，能被引用链访问到的对象就是「活的」，不能访问的才会被回收。内存泄漏的本质是：对象仍然在引用链上（所以 GC 不回收它），但业务逻辑上已经不再需要它了。最典型的例子：一个永远不清理的 static Map，它持有对大量业务对象的强引用，这些对象永远可达，永远不会被 GC 回收。A 选项是错的，Java GC 完全能处理循环引用（正是因为它用的是可达性分析而不是引用计数）。"
+        },
+        {
+          "id": "memory-leak-diagnosis-1-q3",
+          "question": "`jmap -histo <pid>` 命令的主要作用是什么？它有什么使用局限？",
+          "choices": [
+            {"id": "A", "text": "导出完整的 heap dump 文件，可以用 MAT 分析对象引用链"},
+            {"id": "B", "text": "列出堆中各类的实例数量和总内存占用，可以快速找到数量异常的类，但无法告诉你对象为什么无法被回收"},
+            {"id": "C", "text": "强制触发一次 Full GC，用于统计 GC 后的存活对象分布"},
+            {"id": "D", "text": "分析 JVM 的 native memory 使用情况，包括 Metaspace 和 Direct Memory"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`jmap -histo <pid>` 输出的是堆内所有类的统计快照：每个类有多少实例、占用多少字节。通过对比多次采样的差量，可以快速定位实例数持续增长的嫌疑类。局限在于它只告诉你「谁多」，不告诉你「为什么不能被回收」——要回答后者，必须导出 heap dump（`jmap -dump`）并用 MAT/JProfiler 分析对象的引用链，找到持有这些对象的根引用。另外，`jmap` 在某些 JVM 实现上执行时会短暂暂停应用，生产环境要注意。A 是 `jmap -dump` 的功能。D 描述的是 NMT（`jcmd VM.native_memory`）的功能。"
+        },
+        {
+          "id": "memory-leak-diagnosis-1-q4",
+          "question": "用 Eclipse MAT 分析 heap dump 时，「Dominator Tree」视图的核心含义是什么？",
+          "choices": [
+            {"id": "A", "text": "展示 GC Roots 到所有对象的最短引用路径"},
+            {"id": "B", "text": "展示按持有内存大小排序的对象树：如果删除某个节点，它所「支配」的所有子节点都将变得不可达，从而可以被 GC 回收"},
+            {"id": "C", "text": "展示 JVM 各个线程的栈帧及局部变量占用的内存"},
+            {"id": "D", "text": "展示内存中所有对象的循环引用关系图"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Dominator Tree（支配树）是 MAT 最核心的分析视图。在图论中，节点 A「支配」节点 B 的意思是：所有从 GC Root 到 B 的路径都必须经过 A。在内存分析中，这意味着：如果 A 被回收，那么 A 直接支配的所有对象（子树）都会跟着变为不可达，全部可以被 GC 回收。所以 Dominator Tree 按「retained size」（删除该节点后能释放的总内存）排序，能直接告诉你：回收哪一个对象能释放最多内存。找到排名靠前的大节点，顺着引用链往上追，就能找到持有泄漏对象的根。"
+        },
+        {
+          "id": "memory-leak-diagnosis-1-q5",
+          "question": "执行 `jcmd <pid> VM.native_memory summary` 后，看到以下输出片段。最可能是什么原因导致了内存泄漏？\n\n```\n- Direct Memory (reserved=2048MB, committed=1987MB)\n  (malloc=1987MB #45231)\n```\n\n而两天前同样的输出是 `committed=312MB #6842`。",
+          "choices": [
+            {"id": "A", "text": "Java Heap 碎片化严重，GC 无法有效整理内存"},
+            {"id": "B", "text": "Direct Memory（堆外内存）在持续增长，可能是 DirectByteBuffer 或 Netty ByteBuf 未被释放，对应的 native 内存无法还给操作系统"},
+            {"id": "C", "text": "JIT 编译产生了大量 Code Cache，应该增加 -XX:ReservedCodeCacheSize"},
+            {"id": "D", "text": "线程数不断增加导致线程栈内存累积，应该检查线程池配置"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "NMT 输出中的 `Direct Memory` 区域对应通过 `ByteBuffer.allocateDirect()` 或 `sun.misc.Unsafe.allocateMemory()` 分配的堆外内存。从 312MB 增长到 1987MB，并且分配次数从 6842 次增加到 45231 次，说明有大量 DirectByteBuffer 对象正在被创建，但它们的堆外内存没有被释放。DirectByteBuffer 的释放依赖 JVM GC 回收 DirectByteBuffer Java 对象时触发 Cleaner 回调，但如果这些对象被缓存或队列持有强引用，JVM Heap 上的对象不会被回收，堆外内存自然也不会释放。这是 Netty 和 NIO 框架中最经典的堆外泄漏模式。"
+        },
+        {
+          "id": "memory-leak-diagnosis-1-q6",
+          "question": "以下哪段 Java 代码最可能导致内存泄漏？",
+          "choices": [
+            {"id": "A", "text": "使用 try-with-resources 打开并操作 FileInputStream"},
+            {"id": "B", "text": "在方法内创建局部变量 `Map<String, Object> map = new HashMap<>()`，方法返回后 map 不再被引用"},
+            {"id": "C", "text": "在 Spring Bean 中声明 `private static final Map<String, UserSession> SESSION_CACHE = new HashMap<>()`，每次请求 put 新 session 但从不 remove"},
+            {"id": "D", "text": "使用 `new WeakHashMap<>()` 作为缓存，key 是业务对象"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "C 选项是教科书级别的 Java 内存泄漏：static final 变量是 GC Root，它持有一个 HashMap，而这个 HashMap 每次请求都在增长却从不清理。即使 UserSession 对应的用户早已退出，这些对象依然被 SESSION_CACHE 持有强引用，GC 无法回收，内存会随请求量线性增长直到 OOM。A 选项的 try-with-resources 会自动调用 close()，安全。B 选项的局部变量在方法返回后就脱离作用域，GC 可以回收，没有泄漏。D 选项的 WeakHashMap 恰恰是防泄漏的：当 key 没有其他强引用时，该条目会被 GC 自动清除。"
+        },
+        {
+          "id": "memory-leak-diagnosis-1-q7",
+          "question": "jmap -dump 和 jmap -histo 在使用场景上有什么区别？应该在什么时候选择哪个？",
+          "choices": [
+            {"id": "A", "text": "两者功能完全相同，只是输出格式不同，随意选择即可"},
+            {"id": "B", "text": "-histo 适合快速采样确认嫌疑类（轻量，秒级），-dump 用于深度分析引用链和根因（重量，需要离线工具，dump 文件可能几个 GB）"},
+            {"id": "C", "text": "-histo 只能在开发环境使用，生产环境必须用 -dump"},
+            {"id": "D", "text": "-dump 是 -histo 的子集，-dump 包含 -histo 的所有信息且额外包含引用关系"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`jmap -histo` 只输出一个统计表格（各类的实例数和字节数），执行很快，对进程影响小，适合在生产环境频繁采样，通过对比差量快速定位嫌疑类。`jmap -dump:format=b,file=...` 则会把整个 Java Heap 序列化成 .hprof 文件，文件大小通常等于 -Xmx 设置的大小（比如 -Xmx4g 就可能生成 4GB 的 dump），这个过程会导致进程暂停数秒到数十秒不等。所以正确的工作流是：先用 -histo 做快速筛查，锁定嫌疑类之后，再在合适的时间点导出 -dump 进行深度分析。A 和 C 描述都不准确。D 说「-dump 是 -histo 的超集」方向对，但描述不够精确。"
+        },
+        {
+          "id": "memory-leak-diagnosis-1-q8",
+          "question": "一个使用线程池的 Java Web 服务，在每次 HTTP 请求中都往 ThreadLocal 里 set 了一个用户上下文对象，但没有在请求结束时调用 remove()。这会导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "不会有问题，ThreadLocal 的值在 set() 时会自动覆盖旧值，不会积累"},
+            {"id": "B", "text": "线程池中的线程生命周期很长，ThreadLocal 值不会随请求结束而清除。下一个请求复用同一线程时，会读到上一个请求的残留用户上下文，导致数据错乱；同时旧的上下文对象被线程持有无法 GC，导致内存泄漏"},
+            {"id": "C", "text": "只会导致内存泄漏，不会影响业务正确性，因为每次 set() 会创建新值"},
+            {"id": "D", "text": "ThreadLocal 内部使用弱引用存储 value，GC 会自动回收，不会内存泄漏"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "线程池里的核心线程是复用的，它们不会随请求结束而终止。ThreadLocal 的值存储在线程对象内部的 ThreadLocalMap 中，线程活着，ThreadLocalMap 里的值就活着。如果每次请求 set() 但不 remove()，两个问题同时发生：一是内存泄漏，大量旧的用户上下文对象被线程持有无法 GC；二是数据污染，下一个复用该线程的请求如果不先 set() 而直接 get()，会拿到上一个请求的用户数据，引发严重的安全和业务问题。D 选项存在误解：ThreadLocal 的 key（ThreadLocal 实例本身）是弱引用，但 value（你存的用户对象）是强引用，不会被自动回收。"
+        },
+        {
+          "id": "memory-leak-diagnosis-1-q9",
+          "question": "如果 Java 服务通过 JNI 调用了一个 C++ native 库，怀疑是 C++ 层发生了内存泄漏，应该如何定位？",
+          "choices": [
+            {"id": "A", "text": "用 jmap -dump 导出 heap dump，MAT 可以追踪到 JNI 层的内存分配"},
+            {"id": "B", "text": "只能通过重启服务并观察 RSS 是否恢复来间接判断"},
+            {"id": "C", "text": "用 Valgrind（--leak-check=full）或 jemalloc heap profiling 启动服务，在 native 层追踪 malloc/free 的配对情况，直接输出泄漏点的 C++ 调用栈"},
+            {"id": "D", "text": "JNI 层的内存由 JVM GC 统一管理，不存在 JNI 内存泄漏的可能"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "JNI native 库分配的内存（通过 malloc/new 等 C/C++ 分配器）完全在 JVM GC 管理范围之外，JVM 不知道也不负责回收这部分内存。MAT 只能看 Java Heap，对 native heap 完全无感知，所以 A 是错的。正确的做法是在 native 层使用专用工具：Valgrind 的 Memcheck 工具可以追踪所有 malloc/free 调用，最终报告哪些内存分配了但从未释放，并输出分配时的 C++ 调用栈；jemalloc 的 heap profiling 功能（MALLOC_CONF=prof:true）可以在进程运行期间定期采样，对比快照找出增量分配。AddressSanitizer（ASan）编译时插桩的方式也能检测内存泄漏，但需要重新编译 native 库。"
+        },
+        {
+          "id": "memory-leak-diagnosis-1-q10",
+          "question": "回到题目场景：Java 17 服务 RSS 每天增长 200MB，JVM Heap 和 GC 均正常，`jmap -histo` 无异常。作为 SRE，你的下一步最优先的操作是什么？",
+          "choices": [
+            {"id": "A", "text": "立即导出 heap dump 进行 MAT 分析"},
+            {"id": "B", "text": "在 JVM 启动参数中加入 `-XX:NativeMemoryTracking=summary`，重启后等待一天，用 `jcmd <pid> VM.native_memory summary.diff` 对比基线，精确定位是 Metaspace、Direct Memory 还是 native heap 在增长"},
+            {"id": "C", "text": "直接增加 Pod 的内存限制到 16GB，观察是否还会 OOM"},
+            {"id": "D", "text": "用 /proc/<pid>/smaps 逐行分析所有内存段"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "题目已经明确告知 jmap -histo 无异常，说明泄漏不在 Java Heap，首先要做的是确定「泄漏在 JVM 内存的哪个非堆区域」，而不是深挖已经排除嫌疑的 Heap。启用 NMT 是性价比最高的下一步：它能精确区分 Metaspace、Direct Memory、Code Cache、native heap 各自的用量变化，一次诊断就能把排查范围缩小 80%。A 选项（heap dump + MAT）在 Heap 已经排除嫌疑后优先级很低，而且 dump 4GB 文件会暂停服务。C 选项是在逃避问题，扩容只能推迟 OOM，无法找到根因。D 选项（smaps 分析）是更底层的手段，适合 NMT 之后确认 native heap 增长时再使用，直接从 smaps 开始效率太低。"
+        }
+      ],
+      "references": [
+        "https://docs.oracle.com/en/java/javase/17/docs/specs/man/jmap.html",
+        "https://docs.oracle.com/en/java/javase/17/vm/native-memory-tracking.html",
+        "https://help.eclipse.org/latest/index.jsp?topic=/org.eclipse.mat.ui.help/welcome.html"
+      ]
+    }
+  ]
+}

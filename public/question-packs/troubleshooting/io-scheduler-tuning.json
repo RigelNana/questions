@@ -1,0 +1,157 @@
+{
+  "id": "io-scheduler-tuning",
+  "name": "Linux I/O 调度器的选择与调优",
+  "domain": "troubleshooting",
+  "description": "Linux 块设备 I/O 调度器的工作原理、不同场景下的选择策略与调优参数",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "io-scheduler-tuning-1",
+      "domain": "troubleshooting",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["io-scheduler", "linux", "storage", "database", "performance", "blk-mq", "nvme"],
+      "title": "数据库服务器的 I/O 延迟高，I/O 调度器应该选哪个？如何调优？",
+      "content": "## 场景背景\n\n你们团队维护一套金融交易系统的核心数据库，部署在一台 8 核 64GB 的物理机上，操作系统是 CentOS 7.9，存储是一块企业级 SAS HDD RAID 阵列（`/dev/sda`）。MySQL 8.0 跑在上面，InnoDB buffer pool 配置了 48GB，大部分热数据都在内存里。\n\n最近两周业务高峰期（每天 10:00–12:00 和 14:00–17:00）数据库出现间歇性卡顿，DBA 拿到的 `SHOW ENGINE INNODB STATUS` 显示 I/O 等待时间异常：\n\n```\n---\nFILE I/O\n--------\nI/O thread 0 state: waiting for completed aio requests (insert buffer thread)\nI/O thread 1 state: waiting for completed aio requests (log thread)\nPending normal aio reads: [64, 0, 0, 0] , aio writes: [0, 0, 0, 4] ,\n ibuf aio reads: 0, log i/o's: 0, sync i/o's: 0\nPending flushes (fsync) log: 0; buffer pool: 0\n1523 OS file reads, 28741 OS file writes, 11892 OS fsyncs\nPending reads: 64\n0.25 reads/s, 16384 avg bytes/read\n12.5 writes/s, 0 syncs/s\n```\n\n你用 `iostat -x 1` 观察磁盘，发现 `await` 稳定在 80–120ms，而 `%util` 只有 55% 左右，说明磁盘并没有跑满，但 I/O 请求在某个地方被「堵住」了。\n\n```\nDevice:         rrqm/s   wrqm/s     r/s     w/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util\nsda               0.00   124.50    0.25   12.50     4.00   892.00   143.10    10.23   92.14    4.50   93.50   3.20  55.1\n```\n\n`avgqu-sz` 达到 10.23，队列里积压了大量请求。你的同事说可能是 I/O 调度器配置不当导致的。你应该怎么判断？该换成什么调度器？换了之后还需要调哪些参数？",
+      "answer": "## 第一步：理解 I/O 调度器是什么，为什么它对数据库延迟影响这么大\n\nI/O 调度器（I/O Scheduler）是 Linux 内核块层（block layer）中的一个子系统，它坐在文件系统和块设备驱动之间，负责对上层提交的块设备读写请求进行**排序和合并**，然后再按照一定策略下发给底层驱动。如果没有调度器，各个进程的 I/O 请求会乱序到达磁盘，对于机械磁盘来说，磁头会反复在盘面上大幅度移动（这叫做磁头抖动），导致每次寻道时间都很长。调度器的核心价值就在于把「空间上接近」的 I/O 请求合并或排序，让磁头尽量单向移动，降低整体寻道时间——这个优化思路和电梯的工作原理一样，所以早期调度器也叫做 elevator。\n\n但调度器不只是为了优化吞吐量，它同样需要控制延迟。一个只追求吞吐量的调度器会把「大块顺序 I/O」放在前面，反复插队，导致某些请求等很久才被处理。对于数据库来说，这种「高吞吐但高延迟」的调度策略是不可接受的——用户的每一笔交易都需要 redo log 落盘，任何一个 fsync 等 100ms 都会直接影响事务提交延迟。\n\n在 Linux 4.0 之前，内核使用的是**单队列块层架构**（single-queue block layer），所有 CPU 的 I/O 请求都被汇聚进一个全局请求队列，由调度器统一处理后串行下发。这套架构在 HDD 时代很合理，因为机械磁盘本身就是串行的。但随着 SSD 和 NVMe 出现，单队列成了瓶颈：NVMe 理论上可以并行处理数万个 I/O 请求，而单队列架构在 32 核服务器上单队列的锁竞争本身就能把吞吐量砍掉一半。\n\nLinux 3.13 开始引入、4.0 之后默认启用的 **blk-mq（多队列块层）** 架构彻底解决了这个问题：每个 CPU 有自己独立的软件队列（software staging queue），减少了锁竞争；硬件队列数量可以匹配设备实际支持的硬件队列深度，NVMe 可以有 64 个硬件队列同时处理请求。blk-mq 下运行的调度器和传统单队列调度器是两套不同的代码，名字也不同。\n\n所以在看调度器之前，你需要先弄清楚你的系统运行的是哪套架构：\n\n```bash\n# 查看当前使用的调度器（方括号内是当前激活的）\ncat /sys/block/sda/queue/scheduler\n# 传统单队列架构输出示例（CentOS 7 内核 3.10）：\n# noop deadline [cfq]\n\n# blk-mq 架构输出示例（内核 5.x）：\n# [mq-deadline] kyber bfq none\n\n# 查看队列深度（nr_requests）\ncat /sys/block/sda/queue/nr_requests\n# 默认 128\n\n# 查看预读大小（read_ahead_kb）\ncat /sys/block/sda/queue/read_ahead_kb\n# 默认 128，单位 KB\n```\n\n## 第二步：几种主要调度器的对比与数据库场景选型\n\n**CFQ（Completely Fair Queuing）** 是 Linux 内核 2.6 时代到 5.0 之前的默认调度器，设计目标是「公平地在所有进程之间分配 I/O 带宽」。CFQ 会为每个进程维护一个独立的 I/O 队列，通过时间片轮转保证没有进程被饿死。这套思路对桌面场景很合理——你不希望一个 rsync 占满磁盘导致你的编辑器卡顿。但对数据库来说，CFQ 是反模式的：数据库的 I/O 都来自 MySQL 进程的少数几个线程，CFQ 的公平调度并不能帮到什么，反而它默认开启的「预期 I/O（anticipatory I/O）」——等待进程发出更多请求的空窗期——会让 redo log 的 fsync 凭空多等几毫秒。CFQ 在 Linux 5.0 中被移除，如果你的系统还在用 CFQ 且跑的是数据库负载，这是第一个需要改的地方。\n\n**Deadline（deadline / mq-deadline）** 是专门为「保证每个 I/O 请求在 deadline 内被处理」而设计的。它维护两个队列：一个按扇区地址排序（SCAN 方向，类似电梯算法），一个按到达时间排序（FIFO）。每个读请求的默认 deadline 是 500ms，写请求是 5000ms（可调）。正常情况下按地址队列处理以优化吞吐，一旦某个请求快到 deadline 了，就优先处理它。这对数据库来说是非常好的特性：读请求（比如用户查询回表读 InnoDB 页）的延迟有了上界保证，不会因为大量写入被无限拖延。**对于跑在机械磁盘或 SAS 阵列上的 MySQL，mq-deadline 是首选。**\n\n**Noop / None** 是最简单的调度器：noop 只做基本的请求合并，不做任何排序；none（blk-mq 架构下的版本）完全不做调度，请求按到达顺序直接下发。这两者适合 SSD 和 NVMe，原因很直接：SSD 没有磁头，任意地址的访问时间都差不多，排序没有意义，反而徒增调度层的 CPU 开销和延迟。对于 NVMe SSD 上的 MySQL，使用 none 调度器可以把 I/O 延迟再降低 10%–20%。\n\n**Kyber** 是 Linux 4.12 引入的专为高速块设备（NVMe、高端 SSD）设计的调度器，它基于令牌桶机制（token bucket）分别控制读和同步写的延迟目标，可以在高吞吐的同时保持低延迟。Kyber 的调优参数更复杂，适合对 I/O 延迟有精确 SLA 要求的场景，比如存储密集型 NVMe 集群。\n\n**BFQ（Budget Fair Queuing）** 是 blk-mq 下的 CFQ 替代品，保留了公平调度的思路但使用了更精细的预算（budget）机制。适合桌面和混合负载，数据库场景通常不用。\n\n回到本题的场景：CentOS 7.9 内核是 3.10，使用的是传统单队列块层，调度器是 CFQ。问题非常明确：\n\n```bash\n# 验证当前调度器\ncat /sys/block/sda/queue/scheduler\n# 输出：noop deadline [cfq]    ← CFQ 正在使用\n\n# 临时切换到 deadline（立即生效，不需要重启）\necho deadline > /sys/block/sda/queue/scheduler\n\n# 验证切换成功\ncat /sys/block/sda/queue/scheduler\n# 输出：noop [deadline] cfq\n```\n\n这个命令不需要重启 MySQL，对正在运行的业务立即生效。切换后用 `iostat -x 1` 观察，通常 `await` 会在几分钟内明显下降。\n\n要让这个配置持久化（重启后保留），有两种方式。第一种是通过 udev 规则，推荐这种方式，因为它可以针对不同设备类型设置不同调度器：\n\n```bash\n# 创建 udev 规则（适用于 SAS/HDD）\ncat > /etc/udev/rules.d/60-io-scheduler.rules << 'EOF'\n# SAS/SATA HDD — 使用 deadline 调度器\nACTION==\"add|change\", KERNEL==\"sd[a-z]\", ATTR{queue/rotational}==\"1\", ATTR{queue/scheduler}=\"deadline\"\n# SATA SSD — 使用 noop 调度器\nACTION==\"add|change\", KERNEL==\"sd[a-z]\", ATTR{queue/rotational}==\"0\", ATTR{queue/scheduler}=\"noop\"\n# NVMe — 使用 none 调度器（blk-mq 下）\nACTION==\"add|change\", KERNEL==\"nvme[0-9]*\", ATTR{queue/scheduler}=\"none\"\nEOF\n\n# 让规则立即生效（不需要重启）\nudevadm trigger --type=devices --action=change\n```\n\n第二种是在 kernel cmdline 里设置默认调度器，适合简单场景：在 `/etc/default/grub` 的 `GRUB_CMDLINE_LINUX` 里加 `elevator=deadline`，然后重建 grub。\n\n调度器切换完成后，还有几个参数值得一起调优。\n\n**nr_requests（队列深度）** 默认是 128，表示每个队列最多容纳 128 个请求（读写各半，所以实际上读写各 64）。对于高并发写入的数据库，128 有时候不够，请求会被迫在内核外等待（这就是为什么 `avgqu-sz` 达到 10 了 `%util` 还只有 55%——很多请求还没进队列）。可以适当调大：\n\n```bash\n# 调大队列深度（根据磁盘 IOPS 能力评估，不要无限调大）\necho 256 > /sys/block/sda/queue/nr_requests\n```\n\n**read_ahead_kb（预读大小）** 控制内核预读多少数据进 page cache。对于顺序读场景（全表扫描、备份），大预读值（比如 4096KB）可以显著提升吞吐；但对于 MySQL 的随机读（InnoDB 按主键或索引读单行），大预读是浪费——你读了一页 16KB，内核却预读了 128KB 进 page cache，把有用的热数据挤出去了。数据库服务器通常建议把这个值调小：\n\n```bash\n# 对于以随机 I/O 为主的数据库磁盘\necho 0 > /sys/block/sda/queue/read_ahead_kb\n# 或者设置成 16（一个 InnoDB 页的大小）\necho 16 > /sys/block/sda/queue/read_ahead_kb\n```\n\n**deadline 调度器的 read_expire 和 write_expire** 控制读写请求的 deadline 时间（单位毫秒）：\n\n```bash\n# 读请求 deadline，默认 500ms\ncat /sys/block/sda/queue/iosched/read_expire\n\n# 写请求 deadline，默认 5000ms\ncat /sys/block/sda/queue/iosched/write_expire\n\n# 对于对写延迟敏感的场景（如 redo log 写入）可以调小写 deadline\necho 1000 > /sys/block/sda/queue/iosched/write_expire\n\n# fifo_batch：每次从 FIFO（deadline）队列取多少请求，默认 16\n# 调小可以让 deadline 优先级更高，减少单次批量造成的延迟波动\necho 8 > /sys/block/sda/queue/iosched/fifo_batch\n```\n\n## 第三步：blk-mq、NVMe 多队列与多租户 I/O 隔离的进阶话题\n\n如果你的团队正在做存储升级，把 SAS HDD 换成 NVMe SSD（比如 Intel Optane P5800X 或 Samsung PM9A3），那上面那套 deadline 调优就全部作废了，思路要完全切换。\n\nNVMe 设备天然支持多队列（多硬件提交队列，每个队列最多 65535 个命令），内核通过 blk-mq 架构让每个 CPU 核心都有对应的软件队列直接映射到 NVMe 的硬件队列，这样 32 核服务器上 32 个 CPU 可以同时提交 I/O，没有任何队列锁竞争。这时候调度器本身几乎没有存在价值，因为 NVMe 的随机读延迟只有 20–100μs，根本不需要「排序以减少寻道」。\n\n```bash\n# 查看 NVMe 设备的队列信息\nls /sys/block/nvme0n1/queue/\ncat /sys/block/nvme0n1/queue/scheduler\n# 输出：[none] mq-deadline kyber\n# none 是 NVMe 的正确选择\n\n# 查看 NVMe 的硬件队列数量\ncat /sys/block/nvme0n1/queue/nr_hw_queues\n# 典型 NVMe SSD 会显示 8–64\n```\n\n在多租户场景下，如果同一台数据库服务器上跑了多个 MySQL 实例（比如通过 Docker 或 KVM 隔离的多个业务库），你可能需要对 I/O 进行隔离，防止某个业务的大量备份或全表扫描把磁盘带宽吃光。Linux 的 cgroup blkio 子系统提供了两种控制方式：\n\n第一种是 `blkio.weight`，按权重比例分配 I/O 带宽，属于「相对保证」——正常情况下高权重进程获得更多 I/O，但如果低权重进程没有 I/O，高权重进程可以用满带宽：\n\n```bash\n# 查看主设备号（用于 cgroup 配置）\nls -la /dev/sda\n# brw-rw---- 1 root disk 8, 0 ...  ← 主设备号 8, 次设备号 0\n\n# 给某个进程组设置 blkio 权重（默认 500，范围 100–1000）\nmkdir /sys/fs/cgroup/blkio/mysql-primary\necho 800 > /sys/fs/cgroup/blkio/mysql-primary/blkio.weight\necho $MYSQL_PID > /sys/fs/cgroup/blkio/mysql-primary/tasks\n\n# 给备份进程组设置较低权重\nmkdir /sys/fs/cgroup/blkio/backup\necho 200 > /sys/fs/cgroup/blkio/backup/blkio.weight\n```\n\n第二种是 `blkio.throttle`，设置硬性的 IOPS 或带宽上限（单位：bytes/s 或 iops），适合需要绝对隔离的场景：\n\n```bash\n# 限制备份进程的读带宽不超过 50MB/s（设备号 8:0 对应 /dev/sda）\necho \"8:0 52428800\" > /sys/fs/cgroup/blkio/backup/blkio.throttle.read_bps_device\n\n# 限制写 IOPS 不超过 1000\necho \"8:0 1000\" > /sys/fs/cgroup/blkio/backup/blkio.throttle.write_iops_device\n```\n\n需要注意的是，blkio.weight 的 CFQ 权重功能只在 CFQ 调度器下工作，换成 deadline 之后 weight 对排序没有影响（但 throttle 还是有效的）。在 cgroup v2 中，blkio 子系统统一为 `io` 控制器，使用 `io.weight` 和 `io.max`，与 blk-mq 配合更好。\n\n最后一个常被忽视的调优点：`/sys/block/sda/queue/rotational`。这个文件表示内核认为该设备是否是旋转磁盘（1=旋转，0=SSD）。有些虚拟化环境或 RAID 控制器会把 SSD 上的逻辑卷标记为旋转磁盘，导致内核选错调度策略。如果你发现 NVMe SSD 上的调度器是 mq-deadline 而不是 none，先检查一下这个值：\n\n```bash\ncat /sys/block/nvme0n1/queue/rotational\n# 正常 NVMe 应该输出 0\n# 如果输出 1，手动修正：\necho 0 > /sys/block/nvme0n1/queue/rotational\n```\n\n综合来看，回到本题的场景，你需要做的是：切换 `/dev/sda` 的调度器从 CFQ 到 deadline，把 `nr_requests` 从 128 调到 256，把 `read_ahead_kb` 从 128 调到 16，把 `write_expire` 从 5000ms 调到 1500ms，把 `fifo_batch` 从 16 调到 8。做完这一套调整，`await` 降到 20–40ms 是正常预期——如果还高，那问题可能在 RAID 控制器的写缓存策略（是否开启了 write-back），那就是另一个话题了。",
+      "keyPoints": [
+        "I/O 调度器位于 Linux 内核块层（block layer），通过对块设备请求进行排序和合并来减少机械磁盘的寻道次数，但对 SSD/NVMe 几乎没有排序意义，反而引入额外延迟。",
+        "CFQ 调度器的「公平调度」和「预期 I/O 等待」机制对数据库负载是反模式，会人为增加 redo log fsync 的延迟，CFQ 已在 Linux 5.0 中被移除。",
+        "Deadline 调度器通过双队列（地址排序 + FIFO）保证每个请求在 deadline 内被处理，是机械磁盘和 SAS 阵列上运行 MySQL/PostgreSQL 的推荐选择，`read_expire` 默认 500ms，`write_expire` 默认 5000ms 可根据业务需求调小。",
+        "NVMe 和高速 SSD 应使用 none 调度器（blk-mq 架构下）或 noop（单队列架构下），配合 blk-mq 多队列让每个 CPU 直接向硬件队列提交 I/O，避免任何调度层开销。",
+        "调度器切换可通过 `echo deadline > /sys/block/sda/queue/scheduler` 立即生效且不需要重启服务，持久化应通过 udev 规则按设备类型（rotational=1/0）自动应用不同调度器。",
+        "`nr_requests` 控制内核请求队列深度，`avgqu-sz` 远小于 `nr_requests` 说明请求在队列外等待，适当调大 `nr_requests` 可减少等待；`read_ahead_kb` 对随机 I/O 为主的数据库应调小甚至设为 0。",
+        "cgroup blkio throttle（`blkio.throttle.read_bps_device` / `write_iops_device`）可硬性限制备份等低优先级任务的 I/O 带宽，防止影响在线业务，且在 deadline 调度器下依然有效（不同于 blkio.weight 依赖 CFQ）。"
+      ],
+      "quiz": [
+        {
+          "id": "io-scheduler-tuning-1-q1",
+          "question": "以下哪条命令可以查看 `/dev/sda` 当前激活的 I/O 调度器？",
+          "choices": [
+            { "id": "A", "text": "cat /sys/block/sda/queue/scheduler" },
+            { "id": "B", "text": "cat /proc/sys/kernel/io_scheduler" },
+            { "id": "C", "text": "lsblk --scheduler sda" },
+            { "id": "D", "text": "hdparm -q /dev/sda" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "Linux 内核通过 sysfs 暴露块设备的调度器信息，路径是 `/sys/block/<设备名>/queue/scheduler`，输出中方括号括起来的就是当前激活的调度器，例如 `noop [deadline] cfq`。`/proc/sys/kernel/` 下没有 `io_scheduler` 文件，那个路径不存在。`lsblk` 命令没有 `--scheduler` 参数。`hdparm` 是用于查看和设置硬盘 ATA 参数的工具，不涉及 I/O 调度器。记住这个路径很重要，面试时能直接写出来会加分不少。"
+        },
+        {
+          "id": "io-scheduler-tuning-1-q2",
+          "question": "在 CentOS 7（内核 3.10）的机械磁盘上跑 MySQL，默认的 CFQ 调度器对数据库负载最主要的问题是什么？",
+          "choices": [
+            { "id": "A", "text": "CFQ 不支持并发 I/O，所有请求都被序列化" },
+            { "id": "B", "text": "CFQ 的预期 I/O 等待（anticipatory I/O）机制会人为增加 redo log 等关键写操作的延迟" },
+            { "id": "C", "text": "CFQ 会把所有写请求排在读请求后面，导致写延迟高" },
+            { "id": "D", "text": "CFQ 不支持 SAS 设备，只能用于 SATA" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "CFQ 的核心问题在于它的「公平调度」设计目标与数据库需求不匹配。CFQ 会在处理完一个进程的 I/O 后短暂等待（anticipatory wait），期望这个进程会继续提交更多相邻请求，这对桌面场景合理但对数据库毫无意义。更关键的是 CFQ 的时间片轮转策略可能延误数据库的 redo log 写入，而 redo log 的延迟直接影响事务提交的延迟。CFQ 并非不支持并发，也不区分 SAS/SATA，更没有把写排在读后面的策略。CFQ 在 Linux 5.0 中已被移除，生产环境应尽早切换。"
+        },
+        {
+          "id": "io-scheduler-tuning-1-q3",
+          "question": "Deadline 调度器维护了哪两种队列来同时优化吞吐量和延迟上界？",
+          "choices": [
+            { "id": "A", "text": "一个读队列和一个写队列，读优先处理" },
+            { "id": "B", "text": "一个按扇区地址排序的 SCAN 队列和一个按到达时间排序的 FIFO 队列，优先 SCAN 但超时时切换 FIFO" },
+            { "id": "C", "text": "一个高优先级队列和一个低优先级队列，高优先级由进程 nice 值决定" },
+            { "id": "D", "text": "一个内存队列（RAM 缓冲）和一个磁盘队列，先写内存再合并下盘" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Deadline 调度器的精妙之处在于双队列并存：SCAN 队列按扇区地址排序，确保磁头单向移动，优化整体吞吐量；FIFO 队列按请求到达时间排序，并为每个请求设置截止时间（读请求默认 500ms，写请求默认 5000ms）。正常情况下从 SCAN 队列取请求，但一旦 FIFO 队首的请求快到 deadline 了，就优先处理它，保证没有请求被无限拖延。选项 A 描述的是优先级调度不是 deadline。选项 C 的 nice 值是 CPU 调度概念，不适用于 I/O。选项 D 描述的是写缓冲机制，与调度器无关。"
+        },
+        {
+          "id": "io-scheduler-tuning-1-q4",
+          "question": "以下哪个 sysfs 路径用于查看 deadline 调度器的读请求超时时间（read_expire）？",
+          "choices": [
+            { "id": "A", "text": "/sys/block/sda/queue/read_expire" },
+            { "id": "B", "text": "/sys/block/sda/queue/iosched/read_expire" },
+            { "id": "C", "text": "/proc/sys/block/deadline/read_expire" },
+            { "id": "D", "text": "/sys/kernel/block/scheduler/read_expire" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "调度器的专属参数存放在 `/sys/block/<设备>/queue/iosched/` 目录下，这个目录的内容会随当前使用的调度器变化——切换到 deadline 后才会出现 `read_expire`、`write_expire`、`fifo_batch` 等文件；切换到 CFQ 后会出现 CFQ 的参数。`/sys/block/sda/queue/` 目录下的是通用参数（如 `nr_requests`、`scheduler`、`read_ahead_kb`），不包含调度器专属参数。`/proc/sys/block/` 这个路径在 Linux 里不存在。掌握这个目录结构是调优的基础。"
+        },
+        {
+          "id": "io-scheduler-tuning-1-q5",
+          "question": "观察以下 `iostat -x 1` 输出，最可能的问题根因是什么？\n\n```\nDevice: await avgqu-sz %util\nsda     95ms  11.2     58%\n```",
+          "choices": [
+            { "id": "A", "text": "磁盘已经跑满，%util 100% 说明需要换更快的磁盘" },
+            { "id": "B", "text": "磁盘带宽不够，rkB/s + wkB/s 超过了磁盘额定带宽" },
+            { "id": "C", "text": "I/O 请求在调度器或设备队列中积压，磁盘实际利用率低但 await 高，说明请求排队等待时间长" },
+            { "id": "D", "text": "CPU 处理 I/O 中断的能力不足，导致请求完成后无法及时通知进程" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这个数据的关键矛盾在于：`await`（平均 I/O 等待时间）高达 95ms，但 `%util`（磁盘使用率）只有 58%。如果是磁盘真的跑满，`%util` 应该接近 100%。`avgqu-sz` 为 11.2 说明平均有 11 个请求在队列中等待。这种「低利用率但高延迟」的组合，通常就是调度器层面的问题：要么调度策略把某些请求推后处理（CFQ 的时间片问题），要么 `nr_requests` 太小导致请求在进入调度队列之前就被挡在外面等待。选项 A 和 B 都要求 `%util` 接近 100% 才成立。选项 D 的 CPU 中断问题通常表现为 `%sys` 升高，不是 `await` 升高。"
+        },
+        {
+          "id": "io-scheduler-tuning-1-q6",
+          "question": "以下对 `read_ahead_kb` 的描述，哪个是错误的？",
+          "choices": [
+            { "id": "A", "text": "对以顺序读为主的场景（如日志分析、数据备份），调大 read_ahead_kb 可以减少系统调用次数，提升吞吐" },
+            { "id": "B", "text": "对以随机读为主的 MySQL InnoDB 场景，应该把 read_ahead_kb 调小或设为 0，避免预读无效数据污染 page cache" },
+            { "id": "C", "text": "read_ahead_kb 的调整对 NVMe SSD 同样重要，因为 SSD 也需要预读来减少 I/O 次数" },
+            { "id": "D", "text": "read_ahead_kb 可以通过 /sys/block/<dev>/queue/read_ahead_kb 在运行时动态调整，不需要重启" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "选项 C 是错误的。预读（read-ahead）的价值在于通过一次 I/O 读取比请求更多的数据，用未来可能用到的数据换取减少 I/O 次数。对机械磁盘而言，顺序预读可以大幅减少寻道，价值显著。但 NVMe SSD 的随机读延迟只有 20–100μs，和顺序读几乎没有差别，预读的收益非常有限，而预读占用了 page cache 空间，可能反而把热数据挤出去降低命中率。生产中 NVMe SSD 上的 MySQL 通常把 `read_ahead_kb` 设为 0。选项 A、B、D 均正确：A 是预读的正确使用场景；B 是数据库场景的正确实践；D 是 sysfs 参数的通用特性。"
+        },
+        {
+          "id": "io-scheduler-tuning-1-q7",
+          "question": "blk-mq（多队列块层）相比传统单队列块层，最主要的架构改进是什么？",
+          "choices": [
+            { "id": "A", "text": "blk-mq 把调度器从内核态移到了用户态，减少上下文切换" },
+            { "id": "B", "text": "blk-mq 为每个 CPU 核心分配独立的软件队列，消除了全局请求队列上的锁竞争" },
+            { "id": "C", "text": "blk-mq 把所有 I/O 请求改为异步处理，消除了同步 I/O 阻塞" },
+            { "id": "D", "text": "blk-mq 在调度层增加了自动预测算法，预先将可能需要的数据读入 cache" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "单队列块层的根本瓶颈在于全局请求队列上的自旋锁：当 32 个 CPU 核心同时提交 I/O 时，它们都要争同一把锁来往队列里放请求，锁竞争本身就成了性能瓶颈，这在 NVMe 能达到百万级 IOPS 的时代尤为突出。blk-mq 的解法是给每个 CPU 分配独立的软件暂存队列（per-CPU staging queue），CPU 在本地队列操作完全无锁，然后由 blk-mq 把这些请求映射到设备的硬件队列。选项 A 是错的，调度器始终在内核态。选项 C 是错的，blk-mq 不改变同步/异步 I/O 的语义。选项 D 描述的是预读机制，与 blk-mq 的架构改进无关。"
+        },
+        {
+          "id": "io-scheduler-tuning-1-q8",
+          "question": "生产环境中同一台服务器同时跑了两个 MySQL 实例，一个是在线交易库（高优先级），一个是夜间跑 ETL 全表扫描的报表库（低优先级）。在使用 deadline 调度器的场景下，最合适的 I/O 隔离方案是什么？",
+          "choices": [
+            { "id": "A", "text": "用 cgroup blkio.weight 为在线库设置高权重，利用 deadline 的权重感知功能保证优先级" },
+            { "id": "B", "text": "用 cgroup blkio.throttle 为报表库设置读写带宽或 IOPS 上限，防止 ETL 占满磁盘" },
+            { "id": "C", "text": "把两个 MySQL 实例绑定到不同的 CPU，通过 CPU 隔离间接减少 I/O 竞争" },
+            { "id": "D", "text": "调大在线库 MySQL 进程的 ionice 优先级到 class 1（实时），让内核优先调度它的 I/O" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这个问题的陷阱在于选项 A 看起来很合理，但 `blkio.weight` 的优先级权重功能依赖 CFQ 调度器——切换到 deadline 后，weight 对 I/O 排序顺序没有影响（因为 deadline 有自己的排序逻辑）。`blkio.throttle` 则是独立于调度器的硬性速率限制，在 deadline 下也完全有效，给报表库设置读带宽上限（比如 50MB/s）是最直接有效的隔离方案。选项 C 的 CPU 隔离不能解决 I/O 竞争问题，I/O 请求最终都要经过同一个块设备。选项 D 的 ionice 在 deadline 调度器下效果有限，而且 class 1（实时）过于激进，容易导致其他进程 I/O 饿死。"
+        },
+        {
+          "id": "io-scheduler-tuning-1-q9",
+          "question": "在 Linux 5.x 系统上，以下命令 `cat /sys/block/nvme0n1/queue/scheduler` 返回 `[mq-deadline] kyber none`。这说明了什么，应该怎么做？",
+          "choices": [
+            { "id": "A", "text": "这是 NVMe 的默认配置，mq-deadline 是最优选择，不需要修改" },
+            { "id": "B", "text": "NVMe 设备可能被内核误识别为旋转磁盘，应检查 rotational 文件并将调度器切换为 none" },
+            { "id": "C", "text": "这说明该 NVMe 设备需要 deadline 保证，可能是品质较差的消费级 SSD" },
+            { "id": "D", "text": "mq-deadline 和 none 性能一样，选哪个都无所谓" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Linux 内核在某些情况下（尤其是虚拟化环境、某些存储控制器，或者内核版本较旧）可能把 NVMe 设备的 `rotational` 属性设为 1（旋转磁盘），导致内核自动选择了面向旋转磁盘优化的 mq-deadline。对于真实的 NVMe SSD，排序没有意义，mq-deadline 的调度逻辑纯粹是开销。应该先检查 `cat /sys/block/nvme0n1/queue/rotational`，如果是 1，手动改成 0；然后把调度器改成 `none`。在 blk-mq + none 模式下，NVMe 请求直接绕过所有调度逻辑，每个 CPU 的请求直接进入对应硬件队列，延迟可以降低 10–20μs，在高 IOPS 场景下差异非常明显。"
+        },
+        {
+          "id": "io-scheduler-tuning-1-q10",
+          "question": "数据库 DBA 反映在高峰期 `SHOW ENGINE INNODB STATUS` 显示 `Pending reads: 64`，同时 `iostat` 显示 `avgqu-sz` 只有 2–3。这最可能说明什么问题？",
+          "choices": [
+            { "id": "A", "text": "磁盘队列已满，说明需要升级到更高 IOPS 的磁盘" },
+            { "id": "B", "text": "InnoDB 的 64 个 pending reads 被 I/O 调度器合并成了 2–3 个请求，调度器工作正常" },
+            { "id": "C", "text": "nr_requests 设置太小，InnoDB 的 I/O 请求在进入内核调度队列之前就被限流了，内核队列看起来不满但应用层在等待" },
+            { "id": "D", "text": "InnoDB 的 innodb_io_capacity 设置过高，提交了超过磁盘能力的 I/O 请求" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这个场景描述的是一个经典的「层次不对齐」问题：InnoDB 层面有 64 个 pending reads（InnoDB 自己维护的 AIO 队列），但内核 `iostat` 看到的 `avgqu-sz` 只有 2–3（内核调度队列几乎空着）。这说明 InnoDB 的请求在从用户态提交到内核的过程中被限速了，很可能是 `nr_requests` 太小（比如只有 32），导致内核拒绝接收更多请求，InnoDB 的 AIO 线程在用户态自旋等待。解决方案是调大 `nr_requests`，通常调到 128–256 对数据库比较合适。选项 B 说的「合并」是指把物理上相邻的请求合并为一个更大的请求，不会把 64 个请求变成 2–3 个。选项 D 的 `innodb_io_capacity` 影响的是后台刷脏的速率，不直接导致这个现象。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/block/index.html",
+        "https://www.kernel.org/doc/html/latest/block/deadline-iosched.rst",
+        "https://www.kernel.org/doc/html/latest/block/blk-mq.rst",
+        "https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_io_capacity",
+        "https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/performance_tuning_guide/chap-red_hat_enterprise_linux-performance_tuning_guide-storage_and_file_systems"
+      ]
+    }
+  ]
+}
