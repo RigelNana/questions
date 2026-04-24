@@ -1,0 +1,156 @@
+{
+  "id": "mysql-replication-lag",
+  "name": "MySQL 主从复制延迟排查",
+  "domain": "troubleshooting",
+  "description": "诊断 MySQL 从库延迟增大的根因，深入理解复制架构与多线程并行回放",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "mysql-replication-lag-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["mysql", "replication", "binlog", "slave", "mts"],
+      "title": "MySQL 从库 Seconds_Behind_Master 持续增长，如何排查复制延迟？",
+      "content": "凌晨两点，告警群里一条消息炸开了：「MySQL 从库延迟告警，Seconds_Behind_Master = 312，持续增长中」。你打开 Grafana，看到延迟曲线从昨晚 11 点就开始爬坡，到现在已经涨到 5 分钟以上，而且没有任何收敛的迹象。\n\n业务侧随即反馈：读写分离架构下，用户查询走从库，开始出现「刚下单却查不到订单」「余额刚充了还是旧数据」这类数据不一致投诉。负责人让你 15 分钟内给出根因。\n\n这套业务的 MySQL 版本是 5.7.38，主从一主一从，binlog 格式是 ROW，从库没有专门调优过复制相关参数。昨天傍晚运营做了一次大促活动，期间有批量更新用户积分的脚本在跑。\n\n你 SSH 上从库，首先想到的是执行 `SHOW SLAVE STATUS\\G`，但面对输出里几十个字段，你知道哪些字段才是此刻最关键的线索吗？",
+      "answer": "## MySQL 主从复制的基本架构\n\n要排查延迟，必须先清楚数据是怎么从主库流向从库的。MySQL 的主从复制本质上是一个「异步日志传输 + 串行重放」的管道，分三个环节。\n\n第一个环节是主库写 binlog。主库每执行一条事务，在提交时会把变更以 event 的形式追加写入 binary log 文件。binlog 格式有三种：STATEMENT 格式记录 SQL 语句本身（体积小但有不确定性风险）；ROW 格式记录每一行的前后镜像（体积大但精确，生产推荐）；MIXED 格式是两者的混合。现代生产环境几乎清一色用 ROW 格式，因为涉及 `NOW()`、`UUID()` 等不确定性函数时 STATEMENT 格式会导致主从数据不一致。\n\n第二个环节是从库的 IO thread 拉取。从库启动后会建一个专用线程——IO thread，它连接到主库，从指定的 binlog 文件和位点开始拉取 event，写到本地的 relay log（中继日志）文件中。IO thread 的工作是纯 I/O，正常情况下几乎不会成为瓶颈，除非主从之间的网络带宽不够。\n\n第三个环节是 SQL thread 回放。从库另有一个 SQL thread，它读取 relay log，把里面的 event 一条一条地在从库本地执行，最终让从库的数据追上主库。这是整个复制管道里最容易出问题的环节，因为默认配置下 SQL thread 是**单线程串行执行**的，而主库上的事务可能是几十个并发连接同时提交的。一旦遇到一个大事务或者一条复杂 DDL，SQL thread 就会卡住，后续所有 relay log event 全部堆积，Seconds_Behind_Master 就开始爬坡。\n\n理解了这个管道，你才能看懂 `SHOW SLAVE STATUS\\G` 的输出。\n\n## 先执行 SHOW SLAVE STATUS\\G，锁定问题层\n\n```sql\nmysql> SHOW SLAVE STATUS\\G\n*************************** 1. row ***************************\n               Slave_IO_State: Waiting for master to send event\n                  Master_Host: 10.0.1.100\n                  Master_Port: 3306\n             Slave_IO_Running: Yes\n            Slave_SQL_Running: Yes\n          Seconds_Behind_Master: 312\n              Master_Log_File: mysql-bin.002345\n          Read_Master_Log_Pos: 897412087\n               Relay_Log_File: relay-bin.000178\n                Relay_Log_Pos: 1024\n        Relay_Master_Log_File: mysql-bin.002340\n      Exec_Master_Log_Pos: 412308992\n          Relay_Log_Space: 2147483648\n     Seconds_Behind_Master: 312\n     Last_SQL_Error: \n     Last_IO_Error: \n```\n\n关键字段逐一解读。`Slave_IO_Running: Yes` 和 `Slave_SQL_Running: Yes` 说明两个线程都在跑，复制链路本身没断，这排除了网络中断或账号权限问题。`Slave_IO_State: Waiting for master to send event` 说明 IO thread 处于空闲等待，意味着它已经把主库当前的 binlog 全部拉回来了，IO thread 不是瓶颈。\n\n然后看两个位点的差距：`Read_Master_Log_Pos: 897412087` 是 IO thread 从主库读到的位置，`Exec_Master_Log_Pos: 412308992` 是 SQL thread 已经在从库执行到的位置，两者相差约 4.8 亿字节，加上 `Relay_Log_Space: 2147483648`（约 2GB），说明本地已经有大量 relay log 堆积等待回放，**SQL thread 明显在拖后腿**。\n\n`Seconds_Behind_Master` 的计算方式值得特别说明：它并不是拿当前时间减去最后一条执行的事务的提交时间那么简单，而是用「从库当前正在执行的 event 的时间戳」减去「主库当前时间」。这意味着如果从库 SQL thread 卡在一个大事务里几十秒不动，`Seconds_Behind_Master` 这段时间内不会增长，给你一种「延迟稳定了」的假象；一旦大事务执行完，它会突然跳增。所以这个指标有时不准，真正反映进度的是 `Exec_Master_Log_Pos` 是否在稳定推进。\n\n## 定位 SQL thread 卡在哪里\n\n在从库执行 `SHOW PROCESSLIST`，找 system user（即 SQL thread）正在干什么：\n\n```sql\nmysql> SHOW PROCESSLIST\\G\n...省略其他...\n| 5 | system user | | db_prod | Query | 42 | Waiting for table metadata lock | UPDATE user_points SET points = points + 10 WHERE user_id IN (SELECT user_id FROM activity_log WHERE activity_date = '2024-01-15') |\n```\n\n这里出现了两个重要信号。第一，这条 UPDATE 已经跑了 42 秒，还没完成；第二，状态是 `Waiting for table metadata lock`，说明从库上有别的连接持有了 `user_points` 表的元数据锁（通常是有人在从库上直接查询或做了一个未提交的长事务）。这种情况下 SQL thread 会被活生生卡住。\n\n如果没有元数据锁问题，SQL thread 的 State 应该是 `Reading event from the relay log` 或者具体的 SQL 语句，而且每隔几秒位点数字应该在推进。如果位点长时间不动，你还可以用以下命令精确监控：\n\n```bash\n# 每隔2秒采样一次，观察 Exec_Master_Log_Pos 是否推进\nwhile true; do \n  mysql -e \"SHOW SLAVE STATUS\\G\" | grep -E \"Exec_Master_Log_Pos|Seconds_Behind\"\n  sleep 2\ndone\n```\n\n## 常见根因与解决方案\n\n根据现场证据，这次的直接原因是**大事务**：昨晚的积分更新脚本用一条 `UPDATE ... WHERE user_id IN (SELECT ... FROM activity_log)` 一次性更新了几百万行。主库有几十个 CPU 和充足的 buffer pool，这条 SQL 可能 3 秒内跑完；但 SQL thread 是单线程，只能在从库串行执行，实际耗时可能超过 1 分钟。在这 1 分钟里，所有其他正常的业务写入全部堆在 relay log 里等待，Seconds_Behind_Master 就线性增长。\n\n除大事务外，还有几种高频原因。**从库多线程复制未开启**是最常见的系统性根因，MySQL 5.7 默认 `slave_parallel_workers=0` 即单线程，改成 8 或 16 可以大幅提升回放吞吐量。**从库上的大量读请求**也会竞争磁盘 I/O，让 SQL thread 的写操作变慢，生产上从库最好不要直接承载全量读业务，或者为 SQL thread 提高 I/O 优先级。**DDL 操作**（如 ALTER TABLE）在从库上同样是串行执行，一张大表的 DDL 可以让从库延迟数十分钟。针对 DDL，有 `pt-online-schema-change` 或 `gh-ost` 这两个工具可以做无锁变更，主从库都适用。\n\n解决眼前的延迟追上问题，没有捷径：只能等 SQL thread 把堆积的 relay log 消化完。但可以做的是立刻开启多线程复制加速追赶，并临时把从库从读写分离中摘除，避免业务继续读到脏数据：\n\n```sql\n-- 停止复制，修改并行参数，然后重启\nSTOP SLAVE;\nSET GLOBAL slave_parallel_workers = 8;\nSET GLOBAL slave_parallel_type = 'LOGICAL_CLOCK';\nSET GLOBAL binlog_format = 'ROW';  -- 确认主库已是 ROW 格式\nSTART SLAVE;\n```\n\n`LOGICAL_CLOCK` 模式基于主库提交时的逻辑时钟，能让在主库同一时间窗口内提交的事务在从库并行回放，比旧的 `DATABASE` 模式（按库并行）效率高得多，对单库多表的业务尤其明显。\n\n## 扩展：彻底消灭延迟的体系化方案\n\nMySQL 8.0 引入了 `WRITESET` 并行复制（`slave_parallel_type=WRITESET`），它在主库提交时就计算每个事务的写集合哈希，只要两个事务的写集合没有交集（没有修改同一行），就可以在从库并行回放，不再依赖时间窗口重叠，并行度更高，是 8.0 环境的首选。\n\n半同步复制（`rpl_semi_sync_master_enabled`）可以让主库在至少一个从库确认收到 binlog 后才返回提交成功，将「异步」变成「半同步」，大幅减少数据丢失的风险，但会增加主库的写延迟，适合对数据一致性要求极高的场景。\n\nGTID（全局事务标识符）模式下，每个事务有全局唯一 ID，主从切换时不需要人工计算位点，Orchestrator 等高可用工具可以全自动完成主从切换，是现代 MySQL 高可用部署的标配。\n\nProxySQL 作为 MySQL 代理层做读写分离时，有一个 `max_replication_lag` 参数，当监测到某个从库延迟超过阈值（如 10s）时，ProxySQL 会自动把该从库从读池里剔除，把读请求路由到延迟更低的其他从库甚至主库，这是在应用层对复制延迟做兜底保护最优雅的方式。",
+      "keyPoints": [
+        "MySQL 主从复制由三个环节组成：主库写 binlog → 从库 IO thread 拉取到本地 relay log → SQL thread 串行回放，大多数延迟问题出在 SQL thread 的单线程串行回放阶段。",
+        "SHOW SLAVE STATUS\\G 中 Exec_Master_Log_Pos 是判断 SQL thread 是否在正常推进的最可靠指标，Seconds_Behind_Master 在 SQL thread 卡住大事务时会有滞后性，可能造成「延迟没变化」的假象。",
+        "单个大事务（如一次性 UPDATE 影响百万行）是最常见的延迟根因：主库并发执行耗时数秒，从库 SQL thread 单线程串行回放却可能需要数分钟，期间后续所有 event 全部堆积。",
+        "开启多线程复制（slave_parallel_workers=8，slave_parallel_type=LOGICAL_CLOCK）可以让同一时间窗口提交的事务在从库并行回放，是解决复制延迟最有效的系统级优化。",
+        "MySQL 8.0 的 WRITESET 并行复制在主库提交时即计算事务写集合哈希，无写集合交集的事务可无条件并行，比 LOGICAL_CLOCK 更激进，是 8.0 环境的推荐并行模式。",
+        "从库上运行的未提交长事务或 MDL 锁可能阻塞 SQL thread，表现为 SHOW PROCESSLIST 中 system user 长期处于 Waiting for table metadata lock 状态，这是容易被忽视的延迟来源。",
+        "ProxySQL 的 max_replication_lag 参数可以在应用代理层自动剔除延迟超标的从库，是读写分离架构中对复制延迟做兜底保护的推荐实践，比在业务代码里手动判断延迟更可靠。"
+      ],
+      "quiz": [
+        {
+          "id": "mysql-replication-lag-1-q1",
+          "question": "MySQL 主从复制的默认模式下，从库回放 relay log 的线程架构是什么？",
+          "choices": [
+            { "id": "A", "text": "单个 SQL thread 串行执行，一次只处理一个 event" },
+            { "id": "B", "text": "多个 SQL worker thread 并行执行，数量等于主库的并发连接数" },
+            { "id": "C", "text": "IO thread 和 SQL thread 各一个，各自并行处理不同的 binlog 文件" },
+            { "id": "D", "text": "每个数据库（schema）各有一个 SQL thread，天然按库并行" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "MySQL 5.7 及以下版本默认配置（slave_parallel_workers=0）下，复制回放只有一个 SQL thread，它从 relay log 中逐条取出 event 并在本地串行执行。这是复制延迟最主要的架构性原因，因为主库可以并发提交数十个事务，但 SQL thread 只能一个接一个地重放。IO thread 是另一个线程，但它的职责是拉取 binlog 到 relay log，不负责回放，两者分工不同。B 选项是混淆了并发执行的概念；C 选项把 IO thread 的作用理解错了；D 选项是按库并行（DATABASE 模式）需要显式配置才会启用，并非默认行为。"
+        },
+        {
+          "id": "mysql-replication-lag-1-q2",
+          "question": "SHOW SLAVE STATUS\\G 输出中，哪个字段最能准确反映 SQL thread 的回放进度是否在正常推进？",
+          "choices": [
+            { "id": "A", "text": "Seconds_Behind_Master，它实时反映从库落后主库的秒数" },
+            { "id": "B", "text": "Relay_Log_Space，它显示本地堆积的 relay log 总大小" },
+            { "id": "C", "text": "Exec_Master_Log_Pos，它记录 SQL thread 在主库 binlog 中已回放到的字节位置" },
+            { "id": "D", "text": "Read_Master_Log_Pos，它记录 IO thread 从主库读取到的最新位置" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "Exec_Master_Log_Pos 是 SQL thread 在主库对应 binlog 中已经执行到的字节偏移量，通过多次采样观察这个值是否在递增，可以准确判断 SQL thread 是否在正常推进。Seconds_Behind_Master 在 SQL thread 卡在一个大事务内部时会「假性稳定」，不会随时间增长，容易产生「延迟不再扩大」的误判。Relay_Log_Space 只反映本地堆积量，不直接说明回放是否在进行。Read_Master_Log_Pos 反映的是 IO thread 的拉取进度，与回放无关，即使 IO thread 工作正常，SQL thread 也可能已经卡住很久了。"
+        },
+        {
+          "id": "mysql-replication-lag-1-q3",
+          "question": "SHOW SLAVE STATUS\\G 显示 Slave_IO_Running: Yes、Slave_SQL_Running: Yes，但 Seconds_Behind_Master 持续增长。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "主从之间网络带宽不足，IO thread 来不及拉取 binlog" },
+            { "id": "B", "text": "SQL thread 回放速度跟不上主库产生 binlog 的速度" },
+            { "id": "C", "text": "binlog 格式配置错误，ROW 格式和 STATEMENT 格式不兼容" },
+            { "id": "D", "text": "从库磁盘空间不足，relay log 写入失败" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "两个线程都在运行说明复制链路本身正常，IO thread 能正常连接主库并拉取 binlog，所以网络不是问题（A 错误）。延迟持续增长意味着从库「消化」binlog 的速度慢于主库「产生」binlog 的速度，这是 SQL thread 单线程回放的性能瓶颈，是延迟的直接原因。binlog 格式不兼容（C）会导致 SQL thread 报错停止，而不是持续运行但延迟增长。磁盘空间不足（D）会导致 SQL thread 无法写入而报错停止，同样不会表现为两个线程都正常运行但延迟增长的现象。"
+        },
+        {
+          "id": "mysql-replication-lag-1-q4",
+          "question": "生产环境中，一条 UPDATE 语句在主库花了 2 秒影响了 500 万行，这条事务在从库的 SQL thread 上需要多少时间完成回放？",
+          "choices": [
+            { "id": "A", "text": "约 2 秒，因为从库硬件通常和主库相同" },
+            { "id": "B", "text": "约 1 秒，因为 ROW 格式直接应用行变更，比执行 SQL 更快" },
+            { "id": "C", "text": "远超 2 秒，从库 SQL thread 串行单线程执行，而主库可能有并发加速，且 500 万行的 ROW event 体积巨大" },
+            { "id": "D", "text": "0 秒，从库使用增量同步，只需把 binlog event 追加到数据页，无需实际执行" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "主库执行 UPDATE 时，其优势在于可以利用多个 CPU 核心、充足的 buffer pool 以及并发 I/O；而从库的 SQL thread 是单线程，需要逐行应用 ROW format 的行变更 event。500 万行在 ROW 格式下意味着 relay log 中有 500 万条行变更记录，SQL thread 需要逐条应用到从库数据页。实际观测中，主库 2 秒完成的大事务在单线程 SQL thread 上回放耗时超过 10 秒甚至数分钟是非常常见的情况。D 选项完全错误，MySQL 复制不是简单的文件追加，SQL thread 需要真实修改数据页并维护索引。"
+        },
+        {
+          "id": "mysql-replication-lag-1-q5",
+          "question": "以下 SHOW SLAVE STATUS\\G 片段中，哪个现象说明当前是 IO thread 出现了问题而非 SQL thread？",
+          "choices": [
+            { "id": "A", "text": "Read_Master_Log_Pos 和 Exec_Master_Log_Pos 相差 500MB" },
+            { "id": "B", "text": "Slave_IO_State: Waiting for master to send event，Relay_Log_Space 很小且不增长" },
+            { "id": "C", "text": "Slave_IO_Running: Yes，但 Master_Log_File 和 Relay_Master_Log_File 的文件编号相差 5" },
+            { "id": "D", "text": "Slave_IO_Running: No，Last_IO_Error: error reconnecting to master ... - retry-time: 60" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "Slave_IO_Running: No 直接说明 IO thread 已经停止，Last_IO_Error 显示连接主库失败并在重试，这是 IO thread 层面的故障，通常原因是网络中断、主库重启、复制账号权限变更或防火墙规则变化。A 选项（位点差距大）是 SQL thread 堆积的现象；B 选项（IO thread 空闲等待、relay log 不增长）说明 IO thread 正常工作且已追上主库，是健康状态；C 选项（binlog 文件编号差距大）说明历史上有过大量 binlog 产生，但当前状态需要结合 Slave_IO_Running 才能判断，单独看文件编号差距不能说明问题在 IO thread。"
+        },
+        {
+          "id": "mysql-replication-lag-1-q6",
+          "question": "开启多线程复制时设置了 slave_parallel_workers=8 但 slave_parallel_type 保持默认（DATABASE），在单库业务下效果如何？",
+          "choices": [
+            { "id": "A", "text": "8 个 worker 会均匀分配所有表的事务并行回放，效果显著" },
+            { "id": "B", "text": "DATABASE 模式按库分配事务，单库下实际只有 1 个 worker 工作，并行形同虚设" },
+            { "id": "C", "text": "slave_parallel_type 对单库无影响，8 个 worker 会自动按事务行数分配工作" },
+            { "id": "D", "text": "单库下会随机选择 8 个 worker 竞争处理事务，吞吐量提升 8 倍" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "DATABASE 模式（也叫 schema 级别并行）的工作原理是：不同数据库（schema）的事务可以并行，同一个数据库的事务必须串行。因此如果所有业务都在同一个 schema（比如 db_prod）里，无论配置多少个 worker，实际上只有一个 worker 在处理这个 schema 的事务，其余 worker 处于空闲状态，多线程配置完全没有起到并行效果。正确的做法是把 slave_parallel_type 改为 LOGICAL_CLOCK（基于主库提交时间窗口并行）或 MySQL 8.0 的 WRITESET 模式。这是一个非常常见的「以为开了多线程但实际没有效果」的生产踩坑。"
+        },
+        {
+          "id": "mysql-replication-lag-1-q7",
+          "question": "MySQL 8.0 的 WRITESET 并行复制相比 5.7 的 LOGICAL_CLOCK 有何本质区别？",
+          "choices": [
+            { "id": "A", "text": "WRITESET 只能在 SSD 服务器上使用，LOGICAL_CLOCK 没有硬件限制" },
+            { "id": "B", "text": "WRITESET 在主库提交时计算写集合哈希，无交集事务可无条件并行；LOGICAL_CLOCK 依赖提交时间窗口重叠，并行度受制于主库并发量" },
+            { "id": "C", "text": "WRITESET 只支持 InnoDB 表，LOGICAL_CLOCK 支持所有存储引擎" },
+            { "id": "D", "text": "两者并行度相同，WRITESET 仅仅是实现代码更简洁" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "LOGICAL_CLOCK 的并行条件是：在主库上，两个事务的提交时间窗口存在重叠（即 last_committed 相同），才能在从库并行回放。如果主库并发度低（比如深夜流量低谷只有几个并发），大部分事务是串行提交的，LOGICAL_CLOCK 的并行度就会很低。而 WRITESET 在主库的 binlog 写入时为每个事务计算「修改了哪些行」的哈希集合，只要两个事务的写集合没有交集（没有修改同一行），就一定可以并行，不依赖时间窗口，所以在主库低并发场景下也能获得更高的从库并行回放度，是 MySQL 8.0 的推荐配置。"
+        },
+        {
+          "id": "mysql-replication-lag-1-q8",
+          "question": "线上从库延迟突然从 0 跳到 600 秒，随后 Seconds_Behind_Master 不再增长，一直维持在 600 秒附近。最可能是什么原因？",
+          "choices": [
+            { "id": "A", "text": "SQL thread 已经停止运行，延迟停止增长是因为复制完全暂停了" },
+            { "id": "B", "text": "SQL thread 正在执行一个大事务（如大批量 DELETE），执行期间时间戳不变，延迟数字暂时冻结" },
+            { "id": "C", "text": "主库产生 binlog 的速度恰好等于从库回放速度，两者达到平衡" },
+            { "id": "D", "text": "网络带宽恰好饱和，IO thread 拉取速度等于 SQL thread 回放速度" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Seconds_Behind_Master 的计算是用从库「当前正在执行的 event 的时间戳」减去「主库当前时间」。当 SQL thread 卡在一个大事务的执行过程中时，它一直在处理同一个 event（即这个大事务的开始 event），这个 event 的时间戳固定不变，所以 Seconds_Behind_Master 的值在这段时间里近似静止，给人「延迟稳定了」的错觉。一旦大事务执行完，SQL thread 推进到下一个 event，延迟可能再次跳变。通过 SHOW PROCESSLIST 看 system user 的状态，以及观察 Exec_Master_Log_Pos 是否在推进，可以辨别这种情况。A 选项可以通过 Slave_SQL_Running 字段排除。"
+        },
+        {
+          "id": "mysql-replication-lag-1-q9",
+          "question": "为什么在从库上做 ALTER TABLE 大表操作会导致严重的复制延迟？",
+          "choices": [
+            { "id": "A", "text": "ALTER TABLE 会触发主从之间额外的全表数据同步" },
+            { "id": "B", "text": "DDL 操作在 ROW 格式下不记录 binlog，从库需要重新做一次表扫描" },
+            { "id": "C", "text": "DDL 在从库的 SQL thread 中串行执行，执行期间所有后续 DML 事务全部堆积等待，表越大耗时越长" },
+            { "id": "D", "text": "ALTER TABLE 会临时停止 IO thread，导致 relay log 中断" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "ALTER TABLE 是 DDL，在主库上可能借助 Online DDL（如 ALGORITHM=INPLACE）减少锁定时间，但 DDL 的 binlog event 到达从库后，SQL thread 仍需要完整执行这个 DDL，而 DDL 无法通过多线程并行——它本身就是一个需要顺序完成的操作。一张 1 亿行的表在从库做 ALTER TABLE 可能需要 30 分钟到数小时，在这整个过程中，后续所有 DML 的 relay log event 全部堆积，Seconds_Behind_Master 线性爬升。解决方案是使用 pt-online-schema-change 或 gh-ost，将 DDL 拆解为增量拷贝的方式，避免长时间持锁和串行阻塞。"
+        },
+        {
+          "id": "mysql-replication-lag-1-q10",
+          "question": "ProxySQL 作为读写分离代理时，如何利用 max_replication_lag 参数保护业务不读到过期数据？",
+          "choices": [
+            { "id": "A", "text": "ProxySQL 会定时执行 FLUSH BINARY LOGS 强制从库追上主库" },
+            { "id": "B", "text": "当从库的 Seconds_Behind_Master 超过 max_replication_lag 阈值时，ProxySQL 自动将该从库从读连接池中下线，把读请求路由到其他延迟低的从库或主库" },
+            { "id": "C", "text": "ProxySQL 会在每次读请求前检查 binlog 位点，如果主从位点差距超过阈值就拦截查询" },
+            { "id": "D", "text": "max_replication_lag 控制的是 ProxySQL 允许的最大连接队列等待时间，与复制延迟无关" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ProxySQL 内置了对 MySQL 复制健康状态的监控，它会定期对读池中的每个从库执行 SHOW SLAVE STATUS，获取 Seconds_Behind_Master 值。当某个从库的复制延迟超过 mysql-monitor_replication_lag_interval（即 max_replication_lag 的判断阈值）时，ProxySQL 会将该从库在内部标记为不健康，暂时从读流量的目标列表中移除，直到延迟恢复正常。这样业务侧完全感知不到从库延迟，也不需要在应用代码里自己判断延迟，是读写分离架构中处理复制延迟的推荐方式，比手动告警和人工切换快得多。"
+        }
+      ],
+      "references": [
+        "https://dev.mysql.com/doc/refman/8.0/en/replication-administration-status.html",
+        "https://dev.mysql.com/doc/refman/8.0/en/replication-options-replica.html#sysvar_slave_parallel_workers",
+        "https://dev.mysql.com/doc/refman/8.0/en/replication-mode-change-online-enable-gtids.html",
+        "https://proxysql.com/documentation/replication-monitoring/"
+      ]
+    }
+  ]
+}

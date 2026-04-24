@@ -1,0 +1,279 @@
+{
+  "id": "k8s-scheduler-debug",
+  "name": "K8s 调度器异常排查",
+  "domain": "troubleshooting",
+  "description": "排查 Kubernetes 调度不均衡、Pod 调度失败的原因与调度器工作原理",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-scheduler-debug-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["kubernetes", "scheduler", "affinity", "taint", "topology-spread", "kube-scheduler"],
+      "title": "K8s Pod 总是调度到同一批节点导致负载不均，如何排查调度器问题？",
+      "content": "你负责维护一个生产 Kubernetes 集群，版本 1.28，共 20 个工作节点，分布在 3 个可用区（AZ-A：8 节点，AZ-B：6 节点，AZ-C：6 节点）。近期运维同学反馈了两个交叉出现的问题，让人头疼。\n\n**现象一：负载严重不均**\n\n`kubectl top nodes` 显示 AZ-A 的 8 台节点 CPU 使用率普遍在 70-85%，内存也快打满；而 AZ-B 和 AZ-C 的 12 台节点资源利用率不到 30%，大量资源空置。你部署了一个 50 副本的无状态服务 `payment-service`，按道理应该均匀分散，但 `kubectl get pods -o wide` 一看，40 个 Pod 全挤在 AZ-A 的节点上。\n\n**现象二：Pod 间歇性 Pending**\n\n另一个服务 `risk-engine` 偶发 Pod 长时间 Pending，有时卡 10 分钟以上。但你看了 `kubectl get nodes`，每台节点显示 Ready，`kubectl describe node` 也确认节点上有空闲 CPU 和内存。偏偏这个 Pod 就是调度不出去。\n\n下面是 `risk-engine` 中一个卡住的 Pod 的 Events 片段：\n\n```\nEvents:\n  Type     Reason            Age    From               Message\n  ----     ------            ----   ----               -------\n  Warning  FailedScheduling  8m12s  default-scheduler  0/20 nodes are available:\n                                                        3 node(s) had untolerated taint {gpu-only: \"true\"},\n                                                        5 node(s) didn't match Pod's node affinity/selector,\n                                                        12 node(s) didn't match pod anti-affinity rules.\n```\n\n12 个节点因为「pod anti-affinity rules」不匹配被排除，但你的 `risk-engine` 副本数才 6 个，集群里明明还有很多空节点。这条报错让你看得一头雾水。\n\n请结合以上两个现象，系统梳理 kube-scheduler 的工作原理，分析可能的根因，并给出完整的排查思路和修复方案。",
+      "answer": "## 一、理解 kube-scheduler：它是如何决定把 Pod 放哪里的\n\nkube-scheduler 是 Kubernetes 控制平面的核心组件之一，它的唯一职责就是：对每一个新创建的、还没有绑定节点的 Pod，从集群现有节点中挑出「最合适」的那一个，然后把这个绑定关系写入 API Server。调度器本身不做任何资源拉起，它只是做决策并写记录，实际的容器启动由 kubelet 完成。\n\n调度流程分为两个阶段：**Filtering（过滤）** 和 **Scoring（打分）**。在 Filtering 阶段，调度器会并发地对所有节点跑一组「过滤插件」，把任何一个不满足条件的节点直接排除掉——资源不够、节点有不能容忍的 taint、不匹配 nodeSelector 或 nodeAffinity，都会在这里被踢出候选集。经过 Filtering 之后剩下的节点才是「可行节点」（feasible nodes）。\n\n接下来是 Scoring 阶段。对每一个可行节点，调度器会并发运行一组「打分插件」，每个插件给节点打 0-100 分，最终加权求和得到一个综合分，分最高的节点胜出。**关键在于默认的打分策略是什么**：Kubernetes 1.22 起默认使用 `LeastAllocated` 插件——分数越高代表节点剩余资源越多，调度器倾向于把 Pod 分散到资源最空闲的节点。这听起来很合理，但问题就藏在这里，后面会细讲。\n\n还有一个不起眼但影响巨大的参数：`percentageOfNodesToScore`。在大集群（100 节点以上）中，为了降低调度延迟，kube-scheduler 默认只对前 50% 的可行节点做 Scoring，找到分数足够高的节点就直接拍板，不再继续评估剩余节点。这个优化在调度吞吐量上收益很大，但在节点分布不均匀的场景下会带来显著的调度偏斜。\n\n---\n\n## 二、现象一排查：为什么 Pod 全堆到 AZ-A\n\n### 第一步：用 kubectl describe 和调度器日志还原调度决策\n\n先确认 `payment-service` 的 Pod Spec 里有没有 affinity 配置：\n\n```bash\nkubectl get deployment payment-service -o yaml | grep -A 40 affinity\n```\n\n如果看到类似下面这样的 `podAffinity` 配置，那根因基本锁定了：\n\n```yaml\naffinity:\n  podAffinity:\n    preferredDuringSchedulingIgnoredDuringExecution:\n    - weight: 100\n      podAffinityTerm:\n        labelSelector:\n          matchExpressions:\n          - key: app\n            operator: In\n            values:\n            - payment-gateway   # 与网关 Pod 放在一起\n        topologyKey: kubernetes.io/hostname\n```\n\n这段配置的意思是「优先和 `payment-gateway` 的 Pod 放在同一个节点上」，权重 100。如果 `payment-gateway` 恰好只部署在 AZ-A 的节点上，那么所有 `payment-service` 的 Pod 经过 Scoring 后都会倾向于 AZ-A，即使 AZ-B 和 AZ-C 有更多空闲资源，这个强力的 affinity 权重会把分数反转过来。\n\n但即使没有 affinity，还有另一个常见原因：**`topologySpreadConstraints` 缺失或 `maxSkew` 设置不合理**。检查一下：\n\n```bash\nkubectl get deployment payment-service -o yaml | grep -A 20 topologySpreadConstraints\n```\n\n如果这个字段压根不存在，那 `payment-service` 完全依赖 `LeastAllocated` 插件来分散 Pod。问题在于，`LeastAllocated` 是节点维度的，它看的是单个节点的剩余资源，而不是跨可用区的分布。假设 AZ-A 的节点在这批 Pod 下去之前本来就比 AZ-B/C 节点资源略多（比如机型更大），那么头几十个 Pod 会持续被调度到 AZ-A，直到 AZ-A 的节点分数都被拉低才会轮到 AZ-B/C。这就是「滚雪球效应」——越早下去的 Pod 越让节点的已分配资源统计看起来「已经很多了」，后续的 Pod 就不会再来，但前期已经严重倾斜。\n\n### 第二步：开启调度器详细日志，看到底发生了什么\n\n对 kube-scheduler 加 `--v=4` 可以看到每个 Pod 的调度决策日志：\n\n```bash\n# 如果是 static pod，编辑 /etc/kubernetes/manifests/kube-scheduler.yaml\n# 加上 --v=4 参数，kubelet 会自动重启\n\n# 查看日志\nkubectl logs -n kube-system kube-scheduler-<node> --tail=200 | grep \"payment-service\"\n```\n\n典型的 v=4 日志输出类似：\n\n```\nI1025 14:32:11.123456       1 scheduler.go:462] \"Successfully bound pod to node\"\n    pod=\"default/payment-service-7d9f8b-xkp2q\"\n    node=\"node-az-a-04\"\n    evaluatedNodes=10\n    feasibleNodes=10\n\nI1025 14:32:11.234567       1 score.go:68]  \"Scoring plugin result\"\n    plugin=\"NodeResourcesBalancedAllocation\"\n    pod=\"default/payment-service-7d9f8b-xkp2q\"\n    scores=[{node-az-a-04 82} {node-az-a-07 79} {node-az-b-01 61} {node-az-b-03 58}]\n```\n\n注意 `evaluatedNodes=10`，而集群有 20 个节点，这就是 `percentageOfNodesToScore=50%` 在起作用——调度器只评估了前 10 个节点就做了决定，而这 10 个节点恰好都在 AZ-A，导致 AZ-B/C 的节点根本没有参与竞争。\n\n### 第三步：修复调度不均\n\n正确的修复方式是给 `payment-service` 加上 `topologySpreadConstraints`：\n\n```yaml\nspec:\n  topologySpreadConstraints:\n  - maxSkew: 1                          # 任意两个可用区之间 Pod 数量差不超过 1\n    topologyKey: topology.kubernetes.io/zone\n    whenUnsatisfiable: DoNotSchedule    # 严格模式，无法满足时 Pending\n    labelSelector:\n      matchLabels:\n        app: payment-service\n  - maxSkew: 2                          # 节点维度允许更大的偏差\n    topologyKey: kubernetes.io/hostname\n    whenUnsatisfiable: ScheduleAnyway   # 宽松模式，实在不行就放弃均衡\n    labelSelector:\n      matchLabels:\n        app: payment-service\n```\n\n这两条规则叠加的效果是：优先保证可用区间的均衡（最多差 1 个 Pod），在此基础上尽量做节点级别的均衡。\n\n如果你不想用 `DoNotSchedule` 的严格模式（担心扩容时 Pod Pending），可以把第一条改成 `ScheduleAnyway`，但加上 `minDomains: 3` 确保调度器知道有 3 个可用区：\n\n```yaml\n  - maxSkew: 1\n    topologyKey: topology.kubernetes.io/zone\n    whenUnsatisfiable: ScheduleAnyway\n    minDomains: 3   # 告诉调度器至少有 3 个 domain，不要因为某区没 Pod 就放弃均衡计算\n    labelSelector:\n      matchLabels:\n        app: payment-service\n```\n\n同时，如果集群节点数超过 100，建议把 `percentageOfNodesToScore` 从默认 50 调高到 80 或 100，确保调度器不会因为「见好就收」而忽略大量候选节点：\n\n```yaml\n# kube-scheduler 配置文件（KubeSchedulerConfiguration）\napiVersion: kubescheduler.config.k8s.io/v1\nkind: KubeSchedulerConfiguration\npercentageOfNodesToScore: 80\n```\n\n---\n\n## 三、现象二排查：Pod Pending 但节点有资源\n\n回到 `risk-engine` 那条令人困惑的报错：\n\n```\n0/20 nodes are available:\n  3 node(s) had untolerated taint {gpu-only: \"true\"},\n  5 node(s) didn't match Pod's node affinity/selector,\n  12 node(s) didn't match pod anti-affinity rules.\n```\n\n三组原因加起来正好 20 个节点，一个不剩。逐一排查：\n\n**3 个 GPU 节点有 taint**：`risk-engine` 没有对应的 toleration，这 3 个节点被 Filtering 直接排除。解法是确认 `risk-engine` 不需要 GPU，则无需处理，这是正常的隔离行为。\n\n**5 个节点不满足 nodeAffinity**：检查 `risk-engine` 的 nodeAffinity 配置。很可能是某人加了一条 `requiredDuringSchedulingIgnoredDuringExecution` 规则，要求必须调度到有某个 label 的节点，但打了这个 label 的节点只有部分。\n\n```bash\nkubectl get deployment risk-engine -o yaml | grep -A 20 nodeAffinity\n```\n\n如果确认 `risk-engine` 不需要特定节点特性，把 required 改成 preferred 或者直接删掉这条规则。\n\n**重点是第三条：12 个节点不满足 pod anti-affinity**。只有 6 个副本，为什么 12 个节点都被反亲和性排除了？大概率是反亲和性的 `topologyKey` 配置成了 `kubernetes.io/hostname` 并且是 `requiredDuringScheduling`，这没问题。但问题在于 label selector 写宽了：\n\n```bash\nkubectl get deployment risk-engine -o yaml | grep -A 30 podAntiAffinity\n```\n\n常见的错误配置：\n\n```yaml\n# 错误：selector 匹配了所有带 tier=backend 的 Pod，不仅仅是 risk-engine 自己\naffinity:\n  podAntiAffinity:\n    requiredDuringSchedulingIgnoredDuringExecution:\n    - labelSelector:\n        matchLabels:\n          tier: backend   # ← 太宽泛！集群里所有 backend 服务的 Pod 都会触发排斥\n      topologyKey: kubernetes.io/hostname\n```\n\n如果集群里有 12 个节点已经跑了其他 `tier=backend` 的服务（比如 `payment-service` 就是 backend），那这 12 个节点对于新的 `risk-engine` Pod 来说都是「被占用」的，Filtering 直接排除。结合 GPU taint 的 3 个和 nodeAffinity 的 5 个，正好 20 个全被排掉，Pod 无处可去。\n\n修复方式是把反亲和性的 selector 收紧，只针对 `risk-engine` 自己：\n\n```yaml\naffinity:\n  podAntiAffinity:\n    requiredDuringSchedulingIgnoredDuringExecution:\n    - labelSelector:\n        matchLabels:\n          app: risk-engine   # ← 只排斥自己的同类 Pod\n      topologyKey: kubernetes.io/hostname\n```\n\n同时，如果 `risk-engine` 的副本数可能会超过可用节点数，建议把 `required` 改成 `preferred`，避免副本数扩容时触发全局 Pending。\n\n### 快速批量看所有 FailedScheduling 事件\n\n```bash\n# 按时间排序看最近的调度失败事件\nkubectl get events --field-selector reason=FailedScheduling \\\n  --all-namespaces \\\n  --sort-by='.lastTimestamp' | tail -20\n\n# 看某个具体 Pod 的完整调度历史\nkubectl describe pod <pod-name> | grep -A 30 Events\n```\n\n---\n\n## 四、扩展：调度器的深水区\n\n理解了基础的 Filtering/Scoring 两阶段之后，Kubernetes 1.19 引入的 **Scheduler Framework** 把这个流程拆得更细。完整的插件扩展点依次是：`PreFilter → Filter → PostFilter → PreScore → Score → Reserve → Permit → PreBind → Bind → PostBind`。`PostFilter` 是一个特别有意思的扩展点——当 Filtering 之后没有任何可行节点时，`PostFilter` 会尝试「抢占」（Preemption），把优先级较低的 Pod 驱逐掉，为高优先级 Pod 腾出空间。这就是为什么有时候你看到一个高优先级 Pod 突然 Pending 一小段时间后，另一个低优先级 Pod 被驱逐，高优先级 Pod 随即调度成功。\n\n对于已经调度但分布不均的存量 Pod，**Descheduler** 是个很实用的工具。它作为 CronJob 或 Deployment 运行，定期分析集群中 Pod 的分布情况，把不均衡的 Pod 主动驱逐，让 kube-scheduler 重新调度它们。Descheduler 有多个内置策略，`RemovePodsViolatingTopologySpreadConstraint` 专门处理违反 `topologySpreadConstraints` 的 Pod，`LowNodeUtilization` 专门把高负载节点上的 Pod 往空闲节点迁移。\n\n如果你的集群跑 AI 训练任务（比如 PyTorch DDP），还需要关注 **Gang Scheduling**：一个训练 Job 需要同时启动 N 个 Worker Pod，如果资源只够 N-1 个，普通调度器会让 N-1 个 Pod 跑起来占着资源，剩下 1 个 Pending，整个 Job 卡死。Gang Scheduling（如 Volcano、Koordinator）的解法是：要么全部 Pod 同时调度成功，要么全部等待，避免局部调度导致的死锁。\n\n最后，如果你想在不真正下发 Pod 的情况下验证调度决策，可以用 [scheduler-simulator](https://github.com/kubernetes-sigs/kube-scheduler-simulator) 在本地模拟集群环境，反复测试调度配置，比直接在生产环境试要安全得多。",
+      "keyPoints": [
+        "kube-scheduler 调度分两阶段：Filtering 阶段并发排除不满足条件的节点（资源、taint、affinity），Scoring 阶段对剩余可行节点打分，默认 LeastAllocated 插件倾向于把 Pod 分散到资源最空闲的节点。",
+        "大集群中 percentageOfNodesToScore 默认只评估 50% 的可行节点就做调度决策，这会导致调度偏向先进入评估队列的节点，产生系统性的调度不均衡。",
+        "topologySpreadConstraints 的 maxSkew 控制的是任意两个 topology domain（如可用区）之间 Pod 数量的最大差值，设置 whenUnsatisfiable: DoNotSchedule 是硬约束会导致 Pending，设置 ScheduleAnyway 是软约束会尽力而为。",
+        "Pod 反亲和性的 labelSelector 如果匹配范围过宽（比如 tier=backend 而非 app=specific-service），会将大量已有其他服务的节点全部排除，导致新 Pod 无节点可用而长时间 Pending。",
+        "排查调度失败的首选工具是 kubectl describe pod 看 Events 中的 FailedScheduling 消息，其中明确列出了每种原因排除的节点数量，结合 kubectl get events --field-selector reason=FailedScheduling 可以批量查看集群级别的调度失败历史。",
+        "kube-scheduler 开启 --v=4 日志后，每次调度决策都会记录 evaluatedNodes 和 feasibleNodes，以及各打分插件对每个节点的具体得分，是定位调度偏斜根因的最直接手段。",
+        "Descheduler 通过主动驱逐分布不均的存量 Pod 让调度器重新调度，弥补了 kube-scheduler 只在 Pod 创建时调度、不感知后续集群变化的缺陷，是生产环境持续保持调度均衡的重要补充。",
+        "Scheduler Framework 的 PostFilter 扩展点实现了抢占机制，当高优先级 Pod 找不到可行节点时，调度器会尝试驱逐低优先级 Pod 为其腾出空间，这是生产环境中 Pod 出现短暂 Pending 后又突然调度成功的常见原因。"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-scheduler-debug-1-q1",
+          "question": "kube-scheduler 的 Filtering 阶段和 Scoring 阶段分别做什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "Filtering 排除不满足约束的节点，Scoring 对剩余节点打分选出最优节点"
+            },
+            {
+              "id": "B",
+              "text": "Filtering 对所有节点打分排序，Scoring 从排序结果中过滤掉资源不足的节点"
+            },
+            {
+              "id": "C",
+              "text": "Filtering 检查 Pod 的配置合法性，Scoring 检查节点的健康状态"
+            },
+            {
+              "id": "D",
+              "text": "Filtering 和 Scoring 是并行执行的，分别负责资源调度和网络调度"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "kube-scheduler 的调度流程严格分为先后两阶段。Filtering 阶段（也叫预选）对所有节点并发运行一组过滤插件，把任何一个不满足条件的节点直接排除，得到一组「可行节点」——资源不够、有未容忍的 taint、不匹配 nodeAffinity 等都在这里被踢出。只有通过 Filtering 的节点才会进入 Scoring 阶段（也叫优选），每个插件给节点打 0-100 分，最终加权求和，分最高的节点胜出。B 选项把两个阶段的顺序和作用完全搞反了；C 选项描述的是校验而非调度逻辑；D 选项「并行执行」是错误的，两个阶段有严格的先后依赖关系。"
+        },
+        {
+          "id": "k8s-scheduler-debug-1-q2",
+          "question": "Kubernetes 默认的调度打分插件 LeastAllocated 的选择策略是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "选择当前运行 Pod 数量最少的节点，避免单节点运行过多容器"
+            },
+            {
+              "id": "B",
+              "text": "选择已分配资源最少（剩余资源最多）的节点，让 Pod 尽量分散到空闲节点"
+            },
+            {
+              "id": "C",
+              "text": "选择已分配资源最多的节点，把 Pod 尽量堆积在同一批节点以便空出其他节点给大任务"
+            },
+            {
+              "id": "D",
+              "text": "随机选择通过 Filtering 的节点，每次调度结果不固定"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "LeastAllocated 插件的逻辑是「资源越空闲，分数越高」，目的是把 Pod 分散到已分配资源最少的节点上，从而实现资源利用率的均衡分布。与之对应的 MostAllocated 插件策略相反——倾向于把 Pod 往已经用了较多资源的节点上放，目的是尽量装满一批节点，空出另一批节点供大规格工作负载使用或节点缩容。A 选项描述的是 Pod 数量而非资源量，这是两个不同维度；C 选项描述的是 MostAllocated 的行为；D 选项是错误的，调度结果有明确的打分规则，并非随机。"
+        },
+        {
+          "id": "k8s-scheduler-debug-1-q3",
+          "question": "kube-scheduler 的 percentageOfNodesToScore 参数默认值是多少，设置这个参数的目的是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "默认 100%，评估所有节点以获得最优调度结果"
+            },
+            {
+              "id": "B",
+              "text": "默认 50%，在大集群中只评估部分可行节点以降低调度延迟，提升调度吞吐量"
+            },
+            {
+              "id": "C",
+              "text": "默认 50%，只调度到前 50% 资源利用率的节点，避免高负载节点被调度"
+            },
+            {
+              "id": "D",
+              "text": "默认 80%，保留 20% 的节点作为备用，应对突发流量"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "percentageOfNodesToScore 控制的是在 Scoring 阶段评估的可行节点比例。在拥有数百上千节点的大集群中，对每个 Pod 评估所有节点的开销是巨大的，会导致调度延迟显著增加。默认 50% 是个经验性的权衡——牺牲一定的调度最优性换取更低的延迟和更高的吞吐量。这个参数的副作用是会导致调度偏向队列靠前的节点，在节点分布不均时（比如不同可用区、不同机型）容易产生系统性偏斜。C 选项把「节点评估比例」和「节点资源利用率」混淆了，这是完全不同的概念。D 选项描述的是一个不存在的「备用节点保留」语义。"
+        },
+        {
+          "id": "k8s-scheduler-debug-1-q4",
+          "question": "topologySpreadConstraints 中 whenUnsatisfiable 设置为 DoNotSchedule 和 ScheduleAnyway 的区别是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "DoNotSchedule 让调度器跳过当前 Pod 直接处理下一个，ScheduleAnyway 让调度器随机选一个节点"
+            },
+            {
+              "id": "B",
+              "text": "DoNotSchedule 是硬约束，无法满足 maxSkew 时 Pod 保持 Pending；ScheduleAnyway 是软约束，无法满足时仍会调度但会在打分中降低违反约束节点的分数"
+            },
+            {
+              "id": "C",
+              "text": "DoNotSchedule 只在 Pod 首次调度时生效，ScheduleAnyway 对重新调度也生效"
+            },
+            {
+              "id": "D",
+              "text": "DoNotSchedule 需要手动干预才能解除 Pending 状态，ScheduleAnyway 会自动重试直到满足条件"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "whenUnsatisfiable 定义了调度器在无法满足 maxSkew 约束时的行为策略。DoNotSchedule 是硬约束（hard constraint）：如果当前没有任何节点能让 Pod 调度后保持 maxSkew 不被违反，Pod 就会进入 Pending 状态等待，直到集群条件变化（其他 Pod 被删除、新节点加入）为止。ScheduleAnyway 是软约束（soft constraint）：调度器会把违反约束的程度作为负向打分因素，尽量选最不违反约束的节点，但不会因此让 Pod Pending。生产中对关键服务建议可用区级别用 ScheduleAnyway，节点级别用 DoNotSchedule，在分散性和可用性之间取得平衡。"
+        },
+        {
+          "id": "k8s-scheduler-debug-1-q5",
+          "question": "以下是一个 Pod 的调度失败 Event，最可能的原因是什么？\n\n```\n0/15 nodes are available:\n  2 node(s) had untolerated taint {dedicated: gpu},\n  3 node(s) didn't match node affinity,\n  10 node(s) didn't match pod anti-affinity rules.\n```",
+          "choices": [
+            {
+              "id": "A",
+              "text": "集群资源已经全部耗尽，需要扩容节点"
+            },
+            {
+              "id": "B",
+              "text": "Pod 的反亲和性 labelSelector 可能过于宽泛，匹配到了远超自身副本数的其他 Pod，导致大量节点被排除"
+            },
+            {
+              "id": "C",
+              "text": "kube-scheduler 组件故障，需要重启调度器"
+            },
+            {
+              "id": "D",
+              "text": "Pod 的 CPU/Memory request 超过了节点容量，需要降低资源申请"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这条 Event 中 15 个节点的排除原因加起来正好等于集群节点总数，说明 Filtering 阶段将全部节点排除。关键线索是「10 node(s) didn't match pod anti-affinity rules」——anti-affinity 的目的是让 Pod 不和某类 Pod 同节点，如果这个 Pod 只有少数几个副本，理论上不应该排除这么多节点。最可能的根因是反亲和性的 labelSelector 匹配了过宽的范围（比如 tier=backend 匹配到了集群里大量其他服务的 Pod），导致凡是跑了任何 backend 服务的节点都被排除掉。A 选项不对，Event 里没有出现 Insufficient cpu/memory；C 选项不对，调度器若故障 Event 类型会不同；D 选项也不对，资源不足会有明确的 Insufficient 字样。"
+        },
+        {
+          "id": "k8s-scheduler-debug-1-q6",
+          "question": "以下哪种 Pod 反亲和性配置最容易导致副本数扩容时 Pod 卡在 Pending 状态？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "preferredDuringSchedulingIgnoredDuringExecution + topologyKey: kubernetes.io/hostname + 只匹配自身 app label"
+            },
+            {
+              "id": "B",
+              "text": "requiredDuringSchedulingIgnoredDuringExecution + topologyKey: kubernetes.io/hostname + 只匹配自身 app label"
+            },
+            {
+              "id": "C",
+              "text": "preferredDuringSchedulingIgnoredDuringExecution + topologyKey: topology.kubernetes.io/zone + 只匹配自身 app label"
+            },
+            {
+              "id": "D",
+              "text": "requiredDuringSchedulingIgnoredDuringExecution + topologyKey: topology.kubernetes.io/zone + 只匹配自身 app label"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 选项使用了 requiredDuringScheduling（硬约束）加上 hostname 为 topologyKey，含义是「在每个节点上最多只能有一个本服务的 Pod」。这等价于 Pod 数量上限 = 集群节点总数。当你的 Deployment 副本数超过可用节点数时，多余的 Pod 就会永远 Pending。这是生产中一个非常常见的坑：服务在节点数多的时候一切正常，某次扩容（节点缩容或副本增加）之后突然有一批 Pod 无论如何都无法调度。A 和 C 使用 preferred 是软约束，不会强制 Pending；D 使用 zone 为 topologyKey，限制的是每个可用区最多一个副本，扩容空间相对更大，但仍受可用区数量限制。"
+        },
+        {
+          "id": "k8s-scheduler-debug-1-q7",
+          "question": "kube-scheduler 的 LeastAllocated 和 MostAllocated 插件各适合什么场景？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "LeastAllocated 适合在线服务（追求高可用分散）；MostAllocated 适合离线批处理（追求节点高密度利用率，方便空出节点给大任务或触发缩容）"
+            },
+            {
+              "id": "B",
+              "text": "LeastAllocated 适合 GPU 任务；MostAllocated 适合 CPU 任务，因为 GPU 节点资源贵需要充分利用"
+            },
+            {
+              "id": "C",
+              "text": "两者性能完全相同，只是命名习惯不同，实际调度结果无差异"
+            },
+            {
+              "id": "D",
+              "text": "LeastAllocated 是 Kubernetes 1.24+ 的新特性，MostAllocated 是旧版本默认策略"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "LeastAllocated 的「分散」策略对在线服务非常友好：Pod 分布在更多节点上，单节点故障影响面小，同时避免热点节点。MostAllocated 的「装箱」策略则更适合批处理或机器学习训练任务：把 Pod 尽量堆在同一批节点上，让另一批节点维持低负载，一旦业务低峰期这批节点就可以被 Cluster Autoscaler 缩容，节省云资源费用。在 Kubernetes 1.23+ 中，可以通过 KubeSchedulerConfiguration 的 `pluginConfig` 字段配置每个插件的权重，甚至同时启用两个插件并调整权重，实现介于两者之间的混合策略。B 选项混淆了资源类型和调度策略；C 选项完全错误，两者调度结果有本质差异；D 选项是错误的版本历史描述。"
+        },
+        {
+          "id": "k8s-scheduler-debug-1-q8",
+          "question": "生产集群中发现某命名空间的 Pod 在高峰期总是被调度到同一批节点，但 topologySpreadConstraints 已经配置了 maxSkew: 1，怎么进一步排查？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "直接重启 kube-scheduler，重置调度状态"
+            },
+            {
+              "id": "B",
+              "text": "检查 topologySpreadConstraints 的 labelSelector 是否与 Pod 的实际 labels 匹配，同时查看调度器 --v=4 日志确认约束是否真的生效"
+            },
+            {
+              "id": "C",
+              "text": "把 maxSkew 改成 0 彻底消除倾斜"
+            },
+            {
+              "id": "D",
+              "text": "topologySpreadConstraints 只对 StatefulSet 有效，Deployment 需要改用 podAntiAffinity"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "topologySpreadConstraints 配置了但没有生效，最常见的原因是 labelSelector 写错了。topologySpreadConstraints 的 labelSelector 必须与 Pod 模板里的 labels 完全匹配，如果 Pod 实际上没有 labelSelector 指定的 label，约束就会被静默忽略——调度器不会报错，Pod 照样调度，但均衡约束没有起作用。排查步骤是：先用 `kubectl get pods -l <your-selector>` 验证 selector 能匹配到 Pod，再开启 --v=4 日志确认调度决策时 topologySpreadConstraints 分数插件是否在起作用。maxSkew 不能设为 0，最小值是 1；topologySpreadConstraints 对 Deployment 完全有效，D 选项是错误的。"
+        },
+        {
+          "id": "k8s-scheduler-debug-1-q9",
+          "question": "Scheduler Framework 的 PostFilter 扩展点的主要用途是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "在调度成功后做后置清理，释放调度过程中占用的临时资源"
+            },
+            {
+              "id": "B",
+              "text": "当 Filtering 后没有可行节点时，尝试抢占低优先级 Pod，为当前 Pod 腾出调度空间"
+            },
+            {
+              "id": "C",
+              "text": "对调度结果做二次验证，如果验证失败则回滚调度决策"
+            },
+            {
+              "id": "D",
+              "text": "汇总所有 Filter 插件的结果，生成最终的节点过滤报告写入 Events"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "PostFilter 扩展点在 Scheduling Framework 中是一个「兜底」机制，只在 Filtering 阶段没有找到任何可行节点时才被触发。它最重要的内置实现是 DefaultPreemption 插件，负责实现 Pod 抢占（Preemption）逻辑：找到一批低优先级的 Pod，如果把它们驱逐掉，当前高优先级 Pod 就能获得调度空间，调度器就会标记这些 Pod 为「被抢占候选」，触发驱逐流程。这就是为什么 PriorityClass 高的 Pod 在资源紧张时能优先获得调度：它不是和低优先级 Pod 抢打分，而是在 PostFilter 阶段直接把对方踢掉。A 选项描述的更像 PostBind；C 描述的是一个不存在的回滚机制；D 的「生成报告」不是 PostFilter 的用途。"
+        },
+        {
+          "id": "k8s-scheduler-debug-1-q10",
+          "question": "kube-scheduler 开启 --v=4 日志后，以下哪条日志最能帮助定位「调度偏向特定节点」的根因？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "\"Successfully bound pod to node\" 日志，观察 node 字段的分布规律"
+            },
+            {
+              "id": "B",
+              "text": "\"Scoring plugin result\" 日志，对比不同节点在各插件下的具体得分，找出是哪个插件导致特定节点持续高分"
+            },
+            {
+              "id": "C",
+              "text": "\"Pod does not fit on node\" 日志，统计哪些节点被 Filtering 排除最多次"
+            },
+            {
+              "id": "D",
+              "text": "\"Preempting pods\" 日志，观察是否有抢占行为影响了正常调度"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「调度偏向」的根因在 Scoring 阶段——某些节点持续得到高分，调度器才会反复选中它们。--v=4 的 Scoring plugin result 日志会把每个评分插件对每个节点的得分逐一列出，格式类似 `scores=[{node-a 92} {node-b 45} {node-c 38}]`。通过对比多次调度记录，你能清楚看到是 LeastAllocated 给某节点打了高分（说明那个节点资源异常空闲），还是 PodAffinity 插件因为亲和性配置给特定节点加分。A 选项只是结果统计，能发现偏斜现象但无法解释原因；C 选项分析 Filtering 排除，跟「调度偏向」无关，偏向问题发生在 Scoring；D 选项抢占日志和调度偏向也是两回事。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/",
+        "https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/",
+        "https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/",
+        "https://kubernetes.io/docs/reference/scheduling/config/",
+        "https://github.com/kubernetes-sigs/descheduler",
+        "https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/"
+      ]
+    }
+  ]
+}

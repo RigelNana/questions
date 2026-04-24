@@ -1,0 +1,157 @@
+{
+  "id": "k8s-etcd-troubleshoot",
+  "name": "K8s etcd 故障排查与优化",
+  "domain": "troubleshooting",
+  "description": "etcd 磁盘延迟高、DB 膨胀等常见故障的诊断方法与 K8s 集群稳定性保障",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-etcd-troubleshoot-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["kubernetes", "etcd", "raft", "fsync", "compaction", "defrag", "ssd", "performance"],
+      "title": "K8s 集群 API Server 响应变慢、kubectl 超时，监控发现 etcd fsync 延迟飙到 200ms+，怎么排查和优化？",
+      "content": "## 故障背景\n\n你所在的团队维护一套生产 K8s 集群，节点规模约 120 台，运行了 400+ 个微服务 Pod。某天早上收到告警：`kubectl get pods` 开始出现超时，部分 Deployment 的滚动更新卡在中间不动了。API Server 的 P99 响应时间从正常的 30ms 飙到了 4 秒以上，Grafana 监控面板上 etcd 的面板红成一片。\n\n你查看 etcd 的 Prometheus 指标，发现以下两个关键指标异常：\n\n```\n# etcd WAL 日志 fsync 延迟（P99）\netcd_disk_wal_fsync_duration_seconds{quantile=\"0.99\"} 0.218\n\n# etcd boltdb 后端 commit 延迟（P99）\netcd_disk_backend_commit_duration_seconds{quantile=\"0.99\"} 0.156\n```\n\netcd 官方文档明确指出：WAL fsync 延迟应当保持在 10ms 以下，超过 25ms 就会开始影响 Raft 心跳，超过 100ms 集群将频繁触发 leader 选举。现在你面对的是 218ms，已经严重超标。\n\n与此同时，你在 etcd 的 Pod 日志里看到了大量如下警告：\n\n```\nWARN etcdserver/server.go:2406 failed to send out heartbeat on time\n  {\"to\": \"d2c0c1dc9e54c4c7\", \"heartbeat-interval\": \"100ms\",\n   \"election-timeout\": \"1000ms\", \"exceeded-duration\": \"198ms\"}\n```\n\n这说明 etcd leader 已经无法按时发出心跳，follower 们正在准备发起选举投票。每一次 leader 重选期间，整个 K8s 控制面都会短暂不可用。\n\n你需要回答以下问题：\n\n**第一**，etcd 为什么对磁盘延迟这么敏感？它的写入路径是什么，fsync 在哪个环节产生？\n\n**第二**，给出完整的诊断步骤：用哪些命令判断根因，要检查哪些维度（磁盘、DB size、leader 状态、watch 连接数）？\n\n**第三**，针对不同的根因，分别给出对应的解决方案和预防措施。",
+      "answer": "## 第一步：理解 etcd 是什么，以及它为什么是 K8s 的命门\n\netcd 是一个分布式键值存储，基于 Raft 共识算法实现强一致性。在 K8s 架构里，它是**唯一的数据持久化层**——所有 Node 信息、Pod 定义、Service 配置、RBAC 规则，无一例外都存在 etcd 里。API Server 本身是无状态的，它每次处理请求都要读写 etcd。所以 etcd 一旦变慢，整个控制面就等比例变慢；etcd 一旦不可用，API Server 就完全罢工。这就是为什么运维 K8s 集群的第一优先级永远是保证 etcd 健康。\n\n要真正理解 fsync 延迟为什么致命，必须先搞清楚 etcd 的写入路径。etcd 的每一笔写操作（比如你 `kubectl apply` 一个 Deployment）都要经过以下流程：客户端请求先到达 etcd leader，leader 把这条操作记录到本地 WAL（Write-Ahead Log）日志，并对 WAL 文件调用 `fsync` 强制刷盘——注意，这里的 `fsync` 是同步阻塞的，必须等内核确认数据写到磁盘才能继续；完成本地 WAL fsync 之后，leader 才通过 Raft 协议把这条日志广播给所有 follower；等到多数节点（通常是 3 个节点中的 2 个）都完成 WAL fsync 并回复确认之后，leader 才把这条操作应用到 boltdb 状态机，并最终向客户端返回成功。\n\n把这个流程想清楚，就明白了：WAL fsync 的延迟直接出现在写操作的关键路径上，而且是**串行等待**，不可跳过。如果磁盘的 fsync 要 200ms，那每一笔写操作至少要等 200ms，leader 还必须在完成这个 200ms 的等待后才能发出心跳。Raft 默认心跳间隔是 100ms，选举超时是 1000ms，当 fsync 稳定在 200ms 时，心跳就再也发不出去了，集群就开始不停地选举，控制面就彻底瘫痪。\n\n## 第二步：系统化诊断，从表到里逐层排查\n\n收到告警的第一件事不是乱改配置，而是先确认集群的实际状态。最快的方式是 `etcdctl endpoint status`：\n\n```bash\n# 设置认证环境变量（生产环境 etcd 通常开了 mTLS）\nexport ETCDCTL_API=3\nexport ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt\nexport ETCDCTL_CERT=/etc/kubernetes/pki/etcd/server.crt\nexport ETCDCTL_KEY=/etc/kubernetes/pki/etcd/server.key\n\n# 查看所有节点状态\netcdctl endpoint status \\\n  --endpoints=https://10.0.0.1:2379,https://10.0.0.2:2379,https://10.0.0.3:2379 \\\n  --write-out=table\n```\n\n输出类似这样：\n\n```\n+------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n|        ENDPOINT        |        ID        | VERSION | DB SIZE | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS |\n+------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n| https://10.0.0.1:2379  | 8e9e05c52164694d |   3.5.9 |   6.8 GB|      true |      false |        42 |   18372951 |           18372891 |        |\n| https://10.0.0.2:2379  | d2c0c1dc9e54c4c7 |   3.5.9 |   6.8 GB|     false |      false |        42 |   18372951 |           18372831 |        |\n| https://10.0.0.3:2379  | c9fffed65b6b2903 |   3.5.9 |   6.8 GB|     false |      false |        42 |   18372951 |           18372801 |        |\n+------------------------+------------------+---------+---------+-----------+------------+-----------+------------+--------------------+--------+\n```\n\n这个输出里有几个关键信息：第一，**DB SIZE 是 6.8 GB**，接近 etcd 默认的 8GB quota 上限，这是一个重大危险信号；第二，`RAFT APPLIED INDEX` 三个节点有明显差距（18372891 vs 18372801），说明 follower 同步已经落后，这正是磁盘延迟导致日志同步卡顿的体现。再用 `etcdctl endpoint health` 确认集群整体是否还能提供服务，然后检查是否有 `alarm` 状态：\n\n```bash\netcdctl endpoint health --endpoints=... --write-out=table\netcdctl alarm list\n```\n\n如果 `alarm list` 返回了 `NOSPACE`，说明 etcd DB 已经达到 quota 上限，所有写操作都被拒绝，集群进入只读模式——这是比延迟高更严重的故障。\n\n确认了 DB 偏大之后，接下来要判断磁盘本身的性能。etcd 对磁盘的要求很苛刻，官方建议使用 NVMe SSD，并且 etcd 数据目录必须是**独享的磁盘**，不能和操作系统或其他服务共用。用 `fio` 做一个快速基准测试：\n\n```bash\n# 模拟 etcd WAL 的写入模式：顺序写、同步刷盘、小 IO\nfio --rw=write --ioengine=sync --fdatasync=1 \\\n    --directory=/var/lib/etcd \\\n    --size=22m --bs=2300 \\\n    --name=etcd-perf-test 2>&1 | grep -E 'fsync|IOPS|BW'\n```\n\n对于一块健康的 NVMe SSD，`99th percentile` 的 fsync 延迟应该在 1ms 以内。如果你用的是 HDD 或者 NFS 挂载，这个数字轻松超过 20ms。如果 etcd 数据目录挂在了 NFS 上——这是一个你在云上用 PVC 很容易踩的坑——那 fsync 性能会极其不稳定，偶发 200ms 甚至 500ms 完全是正常现象。\n\n磁盘性能确认没问题之后，还要检查 DB 膨胀的原因。etcd 的存储引擎是 boltdb，boltdb 使用 B+ 树存储数据，并且**只追加不回收页面**，已删除的键值会留下空洞，只有执行 defrag（碎片整理）才能释放空间。K8s 集群中最常见的 DB 膨胀来源有两个：一是大量 Event 对象（kubectl get events 可能有几十万条）；二是 Deployment/ReplicaSet 的历史版本没有及时清理（历史 revision 堆积）。\n\n## 第三步：对症下药，给出完整的恢复和预防方案\n\n**针对 DB 过大的紧急处理**，需要先执行 compact（压缩历史版本）再执行 defrag（整理碎片）：\n\n```bash\n# 第一步：获取当前最新的 revision 号\nREV=$(etcdctl endpoint status --write-out=json | \\\n      python3 -c \"import sys,json; \\\n      print(max(s['Status']['header']['revision'] \\\n      for s in json.load(sys.stdin)))\")\n\n# 第二步：compact 掉 REV 之前所有的历史版本\netcdctl compact $REV\n\n# 第三步：对所有节点执行 defrag（一次一个节点，先 follower 后 leader）\n# 注意：defrag 期间该节点会短暂不可用，生产环境要在低峰期操作\netcdctl defrag --endpoints=https://10.0.0.2:2379  # follower 先做\netcdctl defrag --endpoints=https://10.0.0.3:2379\netcdctl defrag --endpoints=https://10.0.0.1:2379  # leader 最后做\n\n# 第四步：如果已经触发了 NOSPACE alarm，解除它\netcdctl alarm disarm\n```\n\ndefrag 之后，DB SIZE 通常能从 6.8GB 降到 1-2GB，boltdb 的写入性能也会随之恢复，因为空洞减少了，每次 commit 需要 fsync 的数据量也变小了。\n\n**针对磁盘性能不足的根治方案**，没有捷径，必须迁移到 SSD，而且要是专用的 SSD，不能和操作系统分区共享。在云环境里，AWS 的 io2 Block Express、GCP 的 pd-extreme、阿里云的 ESSD PL3 都是合适的选择，关键参数是 IOPS 要高、延迟要稳定。etcd 官方推荐的磁盘指标是：顺序写 IOPS > 50，fsync P99 < 10ms。如果你在物理机上，NVMe SSD 是首选，SATA SSD 勉强可用，HDD 和 NFS 绝对不行。\n\n**关于预防措施**，在 K8s 侧要做好几件事：第一，为 etcd 配置自动 compact，`--auto-compaction-mode=revision --auto-compaction-retention=1000` 表示保留最近 1000 个 revision，超过就自动回收，这样 DB 就不会无限膨胀；第二，强烈建议把 K8s Event 对象存到一个**独立的 etcd 集群**——Event 是 K8s 里增长最快的对象类型，一个中等规模集群每天产生几十万个 Event 完全正常，这些 Event 把主 etcd 撑大之后，defrag 也救不了你，因为 Event 始终在写入，空间始终在被占用；第三，给 etcd 配置 Prometheus 告警规则，核心告警包括：`etcd_disk_wal_fsync_duration_seconds{quantile=\"0.99\"} > 0.01`（WAL fsync P99 超 10ms 就告警，不要等到 200ms）、`etcd_mvcc_db_total_size_in_bytes > 4294967296`（DB size 超过 4GB 就告警，给运维留出操作窗口）。\n\n## 扩展：etcd v3 的高阶机制与生产实践\n\nwatch 机制是另一个容易被忽视的性能杀手。K8s 中每个 controller（Deployment Controller、ReplicaSet Controller、Node Controller 等）都会对各自关心的资源建立 watch 长连接，一个中等规模集群同时存在几千个 watch 连接完全正常。每个 watch 连接在 etcd server 端都要维护一个 watcher 状态，消耗内存和 CPU。当 etcd 事件产生速度过快（比如大量 Pod 频繁变更状态），所有 watcher 都要被通知，这个「扇出」开销会把 etcd 的 CPU 打满。通过 `etcdctl watch` 配合 `--prefix` 可以观察事件风暴，`etcd_debugging_mvcc_watcher_total` 指标可以监控 watcher 总数。\n\netcd 的 snapshot 备份是灾备的核心。生产环境应当每小时执行一次：\n\n```bash\n# 创建快照，必须指定一个具体的 endpoint（通常是 leader）\netcdctl snapshot save /backup/etcd-$(date +%Y%m%d%H%M%S).db \\\n  --endpoints=https://10.0.0.1:2379\n\n# 验证快照完整性\netcdctl snapshot status /backup/etcd-20240115103000.db --write-out=table\n```\n\n恢复的时候，每个 etcd 节点都要用相同的 snapshot 执行 `etcdctl snapshot restore`，并指定不同的 `--name` 和 `--initial-advertise-peer-urls`，然后以新集群模式（`--force-new-cluster` 或 `--initial-cluster-state=new`）启动。这个操作要在所有控制面节点上同步进行，时序很重要，建议先看 kubeadm 的官方恢复文档再动手。\n\netcd 3.4 引入的 learner 节点（非投票成员）是扩展只读副本的正确姿势。learner 会同步所有日志但不参与投票，非常适合用来做备份节点或者跨 AZ 的异步副本，不会因为网络分区影响主集群的 quorum。在需要从三节点集群扩展到五节点集群时，先把新节点加为 learner，等它追上进度再 promote 为 voting member，这样整个扩容过程对集群可用性的影响是最小的。",
+      "keyPoints": [
+        "etcd 是 K8s 控制面的唯一数据持久化层，API Server 无状态，所有 Node/Pod/Service 等对象都存在 etcd 中，etcd 的性能直接决定整个控制面的响应速度。",
+        "etcd 的写入路径是强同步的：leader 必须先完成本地 WAL fsync，再广播给 follower，等多数派确认后才返回成功，fsync 延迟直接串行叠加在每笔写操作的关键路径上，无法绕过。",
+        "etcd 官方建议 WAL fsync P99 延迟低于 10ms，超过 25ms 影响 Raft 心跳，超过 100ms 触发频繁 leader 选举，etcd 数据目录必须使用专用 SSD，HDD 和 NFS 绝对不可用于生产。",
+        "etcd DB 膨胀到接近 quota（默认 8GB）会导致写操作被拒绝进入只读模式，需要先执行 `etcdctl compact` 回收历史 revision，再执行 `etcdctl defrag` 整理 boltdb 碎片，操作顺序必须是先 compact 再 defrag，先 follower 后 leader。",
+        "应为 etcd 配置 `--auto-compaction-mode=revision` 自动压缩，避免 DB 无限增长；同时应将 K8s Event 对象与主数据分离，存储在独立的 etcd 集群，因为 Event 是增长最快的对象类型。",
+        "通过 `etcdctl endpoint status` 的 DB SIZE 和 RAFT APPLIED INDEX 差距可以快速判断 DB 膨胀和同步滞后问题，`etcd_disk_wal_fsync_duration_seconds` 和 `etcd_disk_backend_commit_duration_seconds` 这两个 Prometheus 指标是 etcd 磁盘健康的核心监控点。",
+        "etcd 的生产备份应每小时执行 `etcdctl snapshot save`，并验证 snapshot 完整性；etcd 3.4+ 的 learner 节点机制可实现集群在线扩容，新节点先以 learner 身份追日志，追上后再 promote 为 voting member，降低扩容对集群稳定性的影响。"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-etcd-troubleshoot-1-q1",
+          "question": "在 K8s 集群中，etcd 扮演的核心角色是什么？",
+          "choices": [
+            { "id": "A", "text": "K8s 唯一的数据持久化层，API Server 本身是无状态的，所有集群对象都存储在 etcd 中" },
+            { "id": "B", "text": "etcd 是 API Server 的缓存层，真实数据存储在 API Server 的本地磁盘上" },
+            { "id": "C", "text": "etcd 仅存储 Node 和 Pod 信息，其他对象（Service、ConfigMap）存储在 API Server 内存中" },
+            { "id": "D", "text": "etcd 是 K8s 的消息总线，Controller Manager 和 Scheduler 通过 etcd 传递调度指令" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd 是 K8s 控制面的唯一数据持久化组件，API Server 是完全无状态的，它每次处理请求都直接读写 etcd。所有 K8s 对象——Node、Pod、Deployment、Service、ConfigMap、RBAC 规则等——无一例外全部持久化在 etcd 中。B 选项颠倒了 etcd 和 API Server 的关系。C 选项是错的，所有类型的 K8s 对象都在 etcd 里。D 选项混淆了 etcd 和消息队列的概念，etcd 是键值存储而非消息总线，Controller 是通过 API Server 的 watch 机制监听变化，而不是直接读写 etcd。"
+        },
+        {
+          "id": "k8s-etcd-troubleshoot-1-q2",
+          "question": "etcd 官方推荐的 WAL fsync P99 延迟上限是多少？",
+          "choices": [
+            { "id": "A", "text": "10ms，超过 25ms 开始影响 Raft 心跳，超过 100ms 集群频繁选举" },
+            { "id": "B", "text": "50ms，这是生产环境可接受的最大 fsync 延迟" },
+            { "id": "C", "text": "100ms，等于 Raft 默认心跳间隔，保持在心跳间隔内即可" },
+            { "id": "D", "text": "1ms，etcd 只能在 NVMe SSD 上运行，否则不保证可用性" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "etcd 官方文档明确推荐 WAL fsync 延迟应低于 10ms。超过 25ms 后，leader 开始无法按时发出 Raft 心跳（默认 100ms 间隔）。超过 100ms 之后，follower 等不到心跳就开始发起选举投票，频繁的 leader 重选会导致控制面间歇性不可用。B 选项的 50ms 远超安全线。C 选项的理解有误，fsync 延迟等于心跳间隔意味着每次写操作结束时心跳窗口已经到期，完全无法正常运作。D 选项说法过于绝对，SATA SSD 满足条件的情况下也可以使用，关键是延迟指标而非介质类型。"
+        },
+        {
+          "id": "k8s-etcd-troubleshoot-1-q3",
+          "question": "以下关于 etcd Raft 写入路径的描述，哪一项是正确的？",
+          "choices": [
+            { "id": "A", "text": "leader 先将请求广播给 follower，等多数派确认后，自己才写 WAL 并 fsync" },
+            { "id": "B", "text": "leader 先写本地 WAL 并 fsync，再广播给 follower，等多数派完成 WAL fsync 后才应用到状态机" },
+            { "id": "C", "text": "leader 直接将请求应用到 boltdb，同时异步写 WAL，boltdb commit 成功即返回客户端" },
+            { "id": "D", "text": "写请求先发到任意 follower，follower 转发给 leader，leader 广播后立即返回客户端不等 fsync" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "etcd 的 Raft 写入是严格有序的：leader 收到写请求后，第一步是将这条日志条目写入本地 WAL 文件并调用 fsync 同步刷盘（这是不可跳过的同步操作）；第二步才是通过 AppendEntries RPC 将日志广播给所有 follower，follower 同样需要完成本地 WAL fsync 并回复 ACK；第三步是 leader 收到多数派（含自己）的确认后，将这条日志应用到 boltdb 状态机并返回客户端成功。A 选项颠倒了 leader 本地写和广播的顺序。C 选项的「异步写 WAL」是危险的错误认知，WAL 的目的正是在崩溃时恢复数据，必须在应用前持久化。D 选项错误，虽然客户端请求可以先到 follower 再被转发，但最终仍需等待 fsync 完成才返回。"
+        },
+        {
+          "id": "k8s-etcd-troubleshoot-1-q4",
+          "question": "查看 `etcdctl endpoint status` 的输出时，哪个字段能帮助你判断某个 follower 是否出现了严重的日志同步滞后？",
+          "choices": [
+            { "id": "A", "text": "RAFT TERM（Raft 任期号），数字越大说明选举越频繁，同步越滞后" },
+            { "id": "B", "text": "RAFT INDEX 与 RAFT APPLIED INDEX 的差值，差值越大说明该节点已提交但未应用的日志越多" },
+            { "id": "C", "text": "IS LEADER 字段，false 的节点就是滞后的 follower" },
+            { "id": "D", "text": "VERSION 字段，版本号不一致说明节点间存在同步问题" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "RAFT INDEX 是已提交（committed）的最大日志索引，RAFT APPLIED INDEX 是已应用到状态机（boltdb）的最大日志索引。正常情况下两者应非常接近（差值在个位数）。当磁盘延迟高时，节点写 WAL 和 apply 的速度都会变慢，APPLIED INDEX 追不上 COMMITTED INDEX，差值就会拉大。若不同节点之间的 RAFT INDEX 本身也有差距，则说明日志同步本身也出现了问题。A 选项的 RAFT TERM 频繁增大确实说明选举频繁，但它是结果而非诊断滞后的直接依据。C 选项只区分 leader 和 follower，跟滞后无关。D 选项的 VERSION 是 etcd 软件版本，与数据同步完全无关。"
+        },
+        {
+          "id": "k8s-etcd-troubleshoot-1-q5",
+          "question": "以下是一条 etcd 日志输出，请判断它反映了什么问题？\n\n```\nWARN etcdserver/server.go:2406 failed to send out heartbeat on time\n  {\"to\": \"d2c0c1dc9e54c4c7\", \"heartbeat-interval\": \"100ms\",\n   \"election-timeout\": \"1000ms\", \"exceeded-duration\": \"198ms\"}\n```",
+          "choices": [
+            { "id": "A", "text": "follower d2c0c1dc9e54c4c7 网络故障，无法接收 leader 的心跳" },
+            { "id": "B", "text": "leader 自身耗时 198ms 才处理完上一个操作，导致心跳发送延迟超过 100ms 间隔，说明 leader 节点存在性能瓶颈（通常是磁盘 fsync 太慢）" },
+            { "id": "C", "text": "etcd 集群发生了 leader 选举，选举耗时 198ms，目前正在等待选举完成" },
+            { "id": "D", "text": "etcd 集群的 election-timeout 配置不合理，应该调大到 2000ms 以上" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这条日志是 leader 自己打印的，含义是：leader 想要向 follower d2c0c1dc9e54c4c7 发送心跳，但心跳被延迟了 198ms（超过了 100ms 的心跳间隔）。「heartbeat on time」的「time」指的是心跳该发出的时刻，leader 因为自身阻塞（最常见的是在等磁盘 fsync）没有在时间窗口内发出心跳。当 `exceeded-duration` 接近或超过 `election-timeout`（1000ms）时，follower 就会发起选举。A 选项是错的，网络故障的话 leader 能发出心跳，只是 follower 收不到，日志形式不同。C 选项混淆了心跳延迟和选举日志。D 选项治标不治本，调大 election-timeout 只是推迟选举触发，根本原因仍是磁盘太慢。"
+        },
+        {
+          "id": "k8s-etcd-troubleshoot-1-q6",
+          "question": "对 etcd 执行 defrag（碎片整理）操作时，以下哪个说法是错误的？",
+          "choices": [
+            { "id": "A", "text": "defrag 之前应先执行 compact，否则 defrag 的效果很有限，回收不了多少空间" },
+            { "id": "B", "text": "defrag 期间该节点会短暂不可用，应当先对 follower 执行，最后对 leader 执行" },
+            { "id": "C", "text": "defrag 会自动触发新一轮 compact，可以省略手动 compact 步骤直接执行 defrag" },
+            { "id": "D", "text": "如果触发了 NOSPACE alarm，defrag 完成后还需要执行 etcdctl alarm disarm 才能恢复写操作" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "defrag 不会自动执行 compact，两者是独立的操作，缺一不可。compact（压缩）负责回收被删除键值的历史 revision，告知 etcd 哪些版本可以丢弃；defrag（碎片整理）负责将 boltdb 文件中这些被标记为可回收的「空洞」真正写回磁盘。如果不先 compact 就直接 defrag，大量历史 revision 还被 etcd 视为有效数据，boltdb 文件中的空洞很少，defrag 几乎回收不到空间。正确顺序是：`etcdctl compact <rev>` → `etcdctl defrag`。A 说法正确。B 说法正确，先操作 follower 是为了在 leader 不受影响的情况下完成大多数节点的整理，降低对集群可用性的影响。D 说法正确，NOSPACE alarm 是显式设置的，需要手动解除。"
+        },
+        {
+          "id": "k8s-etcd-troubleshoot-1-q7",
+          "question": "以下哪种存储方案不适合作为 etcd 数据目录的底层磁盘？",
+          "choices": [
+            { "id": "A", "text": "NVMe SSD（本地直连，专用给 etcd）" },
+            { "id": "B", "text": "NFS 网络文件系统（通过 K8s PVC 挂载）" },
+            { "id": "C", "text": "AWS io2 Block Express（高 IOPS 云块存储，专用 EBS 卷）" },
+            { "id": "D", "text": "SATA SSD（本地直连，专用给 etcd，fsync P99 < 5ms）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "NFS 绝对不能用于 etcd 数据目录，这是 etcd 官方文档的明确禁止项。NFS 的 fsync 实现依赖网络，其延迟具有高度不确定性：平时可能只有几毫秒，网络抖动时轻松飙到几百毫秒，而且 NFS 的 fsync 语义与本地磁盘不同，不能保证数据真正落盘。这类问题在云上用 ReadWriteMany 类型的 PVC 时非常容易踩到。A 的 NVMe 是最佳选择。C 的 AWS io2 Block Express 是云上的正确选项，它提供可预期的低延迟 IOPS。D 的 SATA SSD 性能不如 NVMe 但满足 fsync P99 < 5ms 的要求是完全可用的，关键是要专用，不与其他服务共享 IO 带宽。"
+        },
+        {
+          "id": "k8s-etcd-troubleshoot-1-q8",
+          "question": "为什么 K8s 官方和多个大型云厂商都建议把 Event 对象存储在独立的 etcd 集群，而不是和其他 K8s 对象放在同一个 etcd 里？",
+          "choices": [
+            { "id": "A", "text": "Event 对象的数据结构特殊，boltdb 无法高效存储 Event，需要专门的存储引擎" },
+            { "id": "B", "text": "Event 是 K8s 中增长最快的对象类型，数量可达几十万级别，会快速撑大 etcd DB，引发 DB 膨胀和性能劣化；分离后即使 Event etcd 故障也不影响控制面" },
+            { "id": "C", "text": "Event 对象的 watch 连接数量特别多，会独占 etcd 的网络带宽，影响其他对象的读写" },
+            { "id": "D", "text": "etcd 对单个 namespace 下的对象数量有 10000 个的上限，Event 容易触发这个限制" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "K8s Event 是集群中写入频率最高的对象——每次 Pod 启动、调度、拉镜像、容器状态变更都会产生 Event，一个有几百个节点和几千个 Pod 的集群每天轻松产生几十万个 Event。这些 Event 会快速占满 etcd 的 DB quota，触发 NOSPACE 告警，而且大量 Event 写入会和正常的控制面操作争抢 etcd 的写带宽，加剧 fsync 压力。分离存储的好处有两个：一是 Event etcd 即使因为 DB 满了进入只读模式，也不影响主 etcd 里的 Pod、Service 等核心数据的读写；二是主 etcd 的 DB 增长速度大幅降低，compact 和 defrag 的维护频率也随之降低。A、C、D 的说法都不是主要原因。"
+        },
+        {
+          "id": "k8s-etcd-troubleshoot-1-q9",
+          "question": "etcd 3.4 引入了 learner 节点，以下关于 learner 的描述哪项是正确的？",
+          "choices": [
+            { "id": "A", "text": "learner 节点参与 Raft 投票，但不能成为 leader，只能作为 follower 存在" },
+            { "id": "B", "text": "learner 节点同步所有 Raft 日志但不参与投票，可用于集群扩容时新节点追日志，追上后再 promote 为 voting member" },
+            { "id": "C", "text": "learner 节点只接受读请求，所有写请求会被拒绝并转发给 leader，用于分摊读负载" },
+            { "id": "D", "text": "learner 节点是 etcd 3.5 引入的功能，3.4 版本不支持" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "learner（也叫 non-voting member）是 etcd 3.4 正式引入的功能，其核心特性是：同步所有 Raft 日志条目（保持数据一致），但不参与 Raft 选举投票，也不计入 quorum（法定人数）。这个设计的价值在于：向一个已有 3 个节点的集群添加新节点时，如果新节点一加入就作为 voting member，在它追上日志之前 quorum 可能无法满足（例如 3 节点变 4 节点时需要 3 个确认，但新节点日志差距大，响应慢），影响集群可用性。learner 可以在不影响 quorum 的情况下慢慢追日志，等追上之后再通过 `etcdctl member promote` 晋升为 voting member，这是在线扩容的最安全方式。A 说法错误，learner 不参与投票。C 混淆了 learner 和只读副本的概念。D 的版本信息错误，learner 从 3.4 就已稳定可用。"
+        },
+        {
+          "id": "k8s-etcd-troubleshoot-1-q10",
+          "question": "生产环境的 etcd 集群应配置哪些 Prometheus 告警规则来实现早期预警，避免等到故障爆发才发现问题？",
+          "choices": [
+            { "id": "A", "text": "只监控 etcd 进程是否存活（up == 1）即可，进程活着说明 etcd 运行正常" },
+            { "id": "B", "text": "监控 etcd_disk_wal_fsync_duration_seconds P99 > 10ms 和 etcd_mvcc_db_total_size_in_bytes > 4GB，前者预警磁盘性能劣化，后者在 DB 接近 quota 上限前留出操作时间窗口" },
+            { "id": "C", "text": "监控 etcd_server_proposals_failed_total > 0 即可，有写操作失败时才触发告警" },
+            { "id": "D", "text": "etcd 自带健康检查 API，只需定期调用 /health 接口，返回 200 就说明一切正常" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "有效的 etcd 监控必须覆盖「趋势预警」而非「故障告警」。仅监控进程存活（A 选项）是最低限度的保障，进程活着完全不代表 etcd 性能健康，可能已经慢到 API Server 超时了。`etcd_disk_wal_fsync_duration_seconds` P99 超 10ms 往往是磁盘开始老化或 IO 竞争的早期信号，在它到 200ms 之前你有足够时间做磁盘迁移。`etcd_mvcc_db_total_size_in_bytes` 超 4GB 告警（quota 默认 8GB）能给运维团队留出充裕的时间做 compact 和 defrag，而不是等到 NOSPACE 之后才去紧急操作。C 选项的 proposals_failed 是结果指标，等到写失败才告警时故障已经发生了。D 选项的 /health 接口只检测基本可用性，不反映性能状态，而且 etcd 在极端磁盘压力下 /health 仍然可能返回 200，给出虚假的健康状态。"
+        }
+      ],
+      "references": [
+        "https://etcd.io/docs/v3.5/op-guide/performance/",
+        "https://etcd.io/docs/v3.5/op-guide/maintenance/",
+        "https://etcd.io/docs/v3.5/faq/",
+        "https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/",
+        "https://etcd.io/docs/v3.5/learning/design-learner/"
+      ]
+    }
+  ]
+}

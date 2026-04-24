@@ -1,0 +1,158 @@
+{
+  "id": "k8s-apiserver-slow",
+  "name": "K8s API Server 响应慢排查",
+  "domain": "troubleshooting",
+  "description": "诊断 Kubernetes API Server 延迟高、kubectl 超时的根因与优化策略",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "k8s-apiserver-slow-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["kubernetes", "apiserver", "etcd", "webhook", "informer", "performance", "apf"],
+      "title": "K8s kubectl 命令响应越来越慢甚至超时，如何排查 API Server 性能问题？",
+      "content": "## 故障背景\n\n运维团队在过去两周持续反馈：`kubectl` 命令的响应时间越来越长。起初只是偶发的几秒延迟，逐渐演变成 `kubectl get pods --all-namespaces` 动辄需要 30～60 秒才能返回结果，CI/CD 流水线中的 `kubectl apply` 频繁触发客户端超时（默认 30 秒），导致部署任务失败后重试，反而进一步加重了集群压力，形成恶性循环。\n\n集群规模：生产环境单集群，约 200 个节点、1500 个 Pod、50 个 Namespace，API Server 以 3 副本 HA 模式部署在独立的控制平面节点上。\n\n你登上跳板机，执行一条最基本的诊断命令：\n\n```bash\n$ time kubectl get nodes\nNAME       STATUS   ROLES           AGE   VERSION\nnode-001   Ready    control-plane   90d   v1.28.4\n...\n\nreal    0m28.341s\nuser    0m0.089s\nsys     0m0.021s\n```\n\n28 秒才返回 node 列表。与此同时，你查看 API Server 的监控面板，发现 `apiserver_request_duration_seconds` 的 P99 已经飙到 25 秒，而一周前这个值稳定在 200ms 以内。\n\n监控还显示了另一个异常指标：\n\n```\napiserver_current_inflight_requests{request_kind=\"readOnly\"} = 892\napiserver_current_inflight_requests{request_kind=\"mutating\"} = 147\n```\n\nAPI Server 的 `--max-requests-inflight` 默认值是 400，现在只读请求已经是这个值的两倍多。\n\n你注意到两周前恰好有一批变更上线：新增了一个用于安全合规检查的 `ValidatingAdmissionWebhook`，同时有一个新的监控 Agent 被部署到了所有节点，每个节点上的 Agent 都会定期调用 `kubectl` 查询资源状态。\n\n**问题：请描述你的排查思路，找出导致 API Server 响应变慢的根本原因，并给出解决方案。**",
+      "answer": "## 第一步：理解 API Server 是什么，以及它为什么会成为瓶颈\n\nKubernetes 的 API Server（`kube-apiserver`）是整个控制平面的唯一入口和核心枢纽。理解这一点非常关键：集群中所有组件——`kubelet`、`controller-manager`、`scheduler`、`kube-proxy`，以及你的 `kubectl`——全部通过 API Server 交互，没有任何组件能绕过它直接访问 etcd。这意味着 API Server 一旦变慢，整个集群的控制面都会感受到影响。\n\nAPI Server 的请求处理链是这样的：一个请求进来之后，首先经过**认证（Authentication）**确认「你是谁」，然后**鉴权（Authorization）**确认「你能做什么」，再经过**准入控制（Admission Control）**决定「这个请求是否被允许、是否需要修改」，最后才真正去读写 **etcd**。准入控制阶段是一个串联的插件链，其中 MutatingAdmissionWebhook 和 ValidatingAdmissionWebhook 是外部 Webhook，API Server 需要同步等待它们的 HTTP 响应。如果 Webhook 服务响应慢，整条请求链就会卡在这里。\n\n另一个核心机制是 **Watch/Informer**。所有 Kubernetes 组件（包括你自己写的 Controller）并不是每次需要数据时都去调用 List API，而是通过 Watch 建立一个长连接，API Server 会主动将资源变更事件推送过来。client-go 的 Informer 在本地维护一份缓存，绝大多数读操作直接查缓存，只有缓存未命中才真正发起 API 请求。这个机制大幅减轻了 etcd 的压力。但如果有客户端绕过 Informer 直接发 List 请求，每次都会触发 etcd 全量扫描，代价非常高。\n\nAPI Server 最关键的两个监控指标是 `apiserver_request_duration_seconds`（请求延迟分布）和 `apiserver_current_inflight_requests`（当前在途请求数）。前者告诉你请求慢不慢，后者告诉你堵不堵。\n\n## 第二步：系统性排查——从指标到根因\n\n### 第一招：看 metrics，确认延迟分布\n\n最快速的入手点是直接查 API Server 的 metrics 端点：\n\n```bash\n# 通过 kubectl 代理访问 metrics（避免直接暴露 API Server 端口）\nkubectl get --raw /metrics | grep apiserver_request_duration_seconds | \\\n  grep -v '^#' | sort -t= -k2 -rn | head -30\n```\n\n典型的慢请求输出长这样：\n\n```\napiserver_request_duration_seconds_bucket{component=\"apiserver\",dry_run=\"\",group=\"\",resource=\"pods\",scope=\"cluster\",subresource=\"\",verb=\"LIST\",version=\"v1\",le=\"25\"} 12\napiserver_request_duration_seconds_bucket{component=\"apiserver\",dry_run=\"\",resource=\"pods\",scope=\"cluster\",verb=\"LIST\",version=\"v1\",le=\"30\"} 891\napiserver_request_duration_seconds_count{component=\"apiserver\",resource=\"pods\",verb=\"LIST\",version=\"v1\"} 1203\n```\n\n这里能看到两个关键信息：问题集中在 `LIST pods` 这个操作上，而且 le=30 的桶和 le=25 的桶之间有巨大跳跃，说明大量请求耗时在 25～30 秒之间，正好在客户端默认超时阈值附近。\n\n进一步按 verb 和 resource 汇总，找到最慢的操作：\n\n```bash\nkubectl get --raw /metrics | grep 'apiserver_request_duration_seconds_sum' | \\\n  grep -v '^#' | awk -F'[{}]' '{print $2, $3}' | sort -k2 -rn | head -20\n```\n\n### 第二招：Audit Log 抓现行\n\nmetrics 告诉你慢在哪类请求，但不告诉你是谁在发这些请求。这时候要看 **Audit Log**。在 `kube-apiserver` 启动参数里加上 `--audit-policy-file` 和 `--audit-log-path` 即可开启（生产环境建议默认开启）。\n\n一条典型的慢 List 请求审计日志看起来是这样：\n\n```json\n{\n  \"kind\": \"Event\",\n  \"apiVersion\": \"audit.k8s.io/v1\",\n  \"level\": \"Metadata\",\n  \"auditID\": \"a1b2c3d4-...\",\n  \"stage\": \"ResponseComplete\",\n  \"requestURI\": \"/api/v1/pods\",\n  \"verb\": \"list\",\n  \"user\": {\"username\": \"system:serviceaccount:monitoring:node-agent\"},\n  \"sourceIPs\": [\"10.0.1.45\"],\n  \"requestReceivedTimestamp\": \"2024-01-15T03:22:01.123456Z\",\n  \"stageTimestamp\": \"2024-01-15T03:22:29.887654Z\",\n  \"annotations\": {\n    \"authorization.k8s.io/decision\": \"allow\",\n    \"authorization.k8s.io/reason\": \"\"\n  }\n}\n```\n\n注意 `requestURI` 是 `/api/v1/pods`，没有任何查询参数——这是一个无 selector 的全量 List，会把集群里所有 1500 个 Pod 的完整对象序列化后一次性返回。再看 `user.username`：`system:serviceaccount:monitoring:node-agent`，正是新部署的监控 Agent。\n\n用 `jq` 统计慢请求来源：\n\n```bash\ncat /var/log/kubernetes/audit.log | \\\n  jq -r 'select(.stage==\"ResponseComplete\") | \n  [(.stageTimestamp | fromdateiso8601) - (.requestReceivedTimestamp | fromdateiso8601), \n   .user.username, .requestURI] | @tsv' | \\\n  awk '$1 > 5' | sort -rn | head -20\n```\n\n输出清楚地显示：每隔 60 秒，来自 200 个节点上 node-agent 的 `list pods` 请求会集中涌入，每个请求耗时 25～30 秒，而且没有设置任何 `fieldSelector` 或 `labelSelector`。200 个并发全量 List 请求，直接把 API Server 打满。\n\n### 第三招：确认 Webhook 影响\n\nWebhook 问题排查要看 `apiserver_admission_webhook_request_total` 和 `apiserver_admission_webhook_admission_duration_seconds`：\n\n```bash\nkubectl get --raw /metrics | grep admission_webhook | grep -v '^#'\n```\n\n```\napiserver_admission_webhook_admission_duration_seconds_bucket{name=\"security-compliance.example.com\",operation=\"CREATE\",rejected=\"false\",type=\"validate\",le=\"10\"} 0\napiserver_admission_webhook_admission_duration_seconds_bucket{name=\"security-compliance.example.com\",operation=\"CREATE\",rejected=\"false\",type=\"validate\",le=\"25\"} 3421\napiserver_admission_webhook_admission_duration_seconds_count{name=\"security-compliance.example.com\",operation=\"CREATE\"} 3421\n```\n\n这组数据说明 `security-compliance.example.com` 这个 ValidatingWebhook 的响应时间普遍在 10～25 秒之间。每一个 Pod CREATE 请求都要等这个 Webhook 响应，相当于给所有 mutating 操作都套上了一个 25 秒的枷锁。\n\n查看这个 Webhook 的配置：\n\n```bash\nkubectl get validatingwebhookconfigurations security-compliance -o yaml\n```\n\n发现它的 `timeoutSeconds` 设置为 30（默认值），`failurePolicy` 设置为 `Fail`——也就是说，Webhook 超时了请求也会失败，而不是降级放行。\n\n### 根因总结\n\n至此，两个根因都水落石出了。**第一个根因**是监控 Agent 的 `kubectl` 调用方式有严重问题：200 个节点的 Agent 每分钟同时发起全量 `list pods`，每次传输的数据量巨大，直接耗尽了 API Server 的并发处理能力（`apiserver_current_inflight_requests` 的只读请求量达到 892，远超默认限额 400）。**第二个根因**是新增的 ValidatingWebhook 性能不达标，响应时间高达 25 秒，拖慢了所有写操作。两个问题叠加，形成了今天的雪崩。\n\n## 第三步：修复方案与生产级最佳实践\n\n### 修复 Agent 的 List 问题\n\n让监控 Agent 在 List 调用时加上合适的 selector，把全量扫描变成精准查询：\n\n```bash\n# 错误做法：全量 list，无任何过滤\nkubectl get pods --all-namespaces\n\n# 正确做法：用 fieldSelector 过滤当前节点，labelSelector 过滤目标应用\nkubectl get pods --all-namespaces \\\n  --field-selector spec.nodeName=node-001 \\\n  --label-selector app=my-app\n```\n\n如果 Agent 需要持续监控 Pod 状态，正确的做法是用 Watch 而不是轮询 List。在 client-go 里，应该用 SharedInformer 来监听变更，而不是每隔 60 秒发一次 List：\n\n```go\n// 推荐：使用 SharedInformer，本地缓存 + Watch 增量更新\nfactory := informers.NewSharedInformerFactory(clientset, 0)\npodInformer := factory.Core().V1().Pods()\npodInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{\n    AddFunc:    func(obj interface{}) { /* 处理新增 */ },\n    UpdateFunc: func(old, new interface{}) { /* 处理变更 */ },\n    DeleteFunc: func(obj interface{}) { /* 处理删除 */ },\n})\nfactory.Start(stopCh)\nfactory.WaitForCacheSync(stopCh)\n\n// 此后的查询直接从本地缓存读，不走网络\npods, _ := podInformer.Lister().List(labels.Everything())\n```\n\nSharedInformer 初始化时只发一次 List，之后通过 Watch 接收增量事件，本地缓存始终保持最新。所有的读操作都查本地缓存，几乎不给 API Server 增加任何负担。\n\n如果确实需要分页 List（比如一次性导出数据），要用 `limit` 和 `continue` 参数分页，避免单次传输过大：\n\n```bash\n# 每次只取 500 条，通过 continue token 翻页\nkubectl get pods --all-namespaces --limit=500\n```\n\n### 修复 Webhook 性能问题\n\nWebhook 的修复有两个方向。短期来说，先把 `failurePolicy` 改成 `Ignore`，让超时的 Webhook 降级放行而不是阻塞请求——这是一个紧急止血措施，不能长期这样配置。同时把 `timeoutSeconds` 从 30 改到 5，给 Webhook 一个合理的 SLA 约束：\n\n```yaml\napiVersion: admissionregistration.k8s.io/v1\nkind: ValidatingWebhookConfiguration\nmetadata:\n  name: security-compliance\nwebhooks:\n- name: security-compliance.example.com\n  timeoutSeconds: 5       # 从 30 改到 5\n  failurePolicy: Ignore   # 临时：超时降级放行\n  namespaceSelector:      # 缩小生效范围，避免影响系统命名空间\n    matchExpressions:\n    - key: kubernetes.io/metadata.name\n      operator: NotIn\n      values: [kube-system, kube-public]\n```\n\n中长期则是优化 Webhook 服务本身：使用本地缓存减少外部调用、增加副本提升吞吐、或者用 sidecar 模式把 Webhook 服务和被校验的工作负载部署在同一个 Namespace 以减少网络跳数。\n\n### API Priority and Fairness（APF）流量整形\n\nKubernetes 1.20 正式引入、1.29 稳定的 APF 机制是应对这类流量突发问题的长效手段。APF 通过 `FlowSchema` 和 `PriorityLevelConfiguration` 对不同来源的请求进行分类和限流，防止某类请求（比如监控 Agent 的大量 List）耗尽所有并发配额，保证 CI/CD 等高优先级流量始终有配额可用：\n\n```yaml\napiVersion: flowcontrol.apiserver.k8s.io/v1\nkind: PriorityLevelConfiguration\nmetadata:\n  name: monitoring-limited\nspec:\n  type: Limited\n  limited:\n    nominalConcurrencyShares: 10   # 只分配 10 份并发额度\n    limitResponse:\n      type: Queue\n      queuing:\n        queues: 4\n        handSize: 2\n        queueLengthLimit: 50\n```\n\n把监控 Agent 的 ServiceAccount 绑定到这个 PriorityLevel，它的 List 请求最多只能占用 10 份并发额度，再也无法把整个 API Server 打满。\n\n### 扩展视角：API Server 的水平扩展与缓存\n\nAPI Server 是无状态的，水平扩展相对简单——加 LB 加副本即可。但要注意 Watch 连接的粘滞性：客户端 Watch 时携带的 `resourceVersion` 只在连接到的那个 API Server 副本上有效，LB 切换后需要重新建立 Watch。在 K8s 1.27 之后，etcd 支持了 Watch Cache 的一致性保证，多副本 API Server 的 Watch 行为更加可靠。\n\n`kube-apiserver` 有两个关键限流参数：`--max-requests-inflight`（默认 400，控制只读请求并发上限）和 `--max-mutating-requests-inflight`（默认 200，控制写请求并发上限）。在 APF 启用后（默认启用），这两个参数的语义变成了 APF 的总并发预算，单独调大它们并不能解决流量不均的问题，必须配合 APF 的 FlowSchema 一起使用。\n\n`kubectl` 自身也有缓存机制：`~/.kube/cache` 目录缓存了 API Server 的 discovery 信息（支持的 API Group 和资源类型），默认缓存 10 分钟。每次执行 `kubectl` 命令时它会先查这个本地缓存，避免每次都调用 `/api` 和 `/apis` 端点。集群版本升级或者新增 CRD 后，如果发现 `kubectl` 找不到新资源类型，可以用 `kubectl api-resources` 强制刷新这个缓存。",
+      "keyPoints": [
+        "API Server 是 K8s 控制平面的唯一入口，所有组件（kubelet、controller-manager、scheduler、kubectl）都通过它交互，没有组件能绕过 API Server 直接访问 etcd，因此 API Server 变慢会影响整个集群控制面。",
+        "API Server 的请求处理链是串联的：认证 → 鉴权 → 准入控制（Webhook 在此阶段同步调用）→ etcd 读写，任何一个环节变慢都会拖慢整条链路。",
+        "Watch/Informer 机制让 Controller 通过本地缓存提供读服务，大幅减轻 etcd 和 API Server 压力；而绕过 Informer 直接发 List 请求的客户端（尤其是无 selector 的全量 List）是 API Server 性能杀手。",
+        "排查 API Server 性能问题的第一手段是读 metrics：`apiserver_request_duration_seconds` 看延迟分布，`apiserver_current_inflight_requests` 看并发消耗，两者结合能快速定位是「哪类请求」在拖慢整体。",
+        "Audit Log 是定位「谁在发慢请求」的关键工具，通过分析 `user.username` 和 `requestURI` 字段可以精确找到问题来源，是 metrics 的必要补充。",
+        "ValidatingAdmissionWebhook 和 MutatingAdmissionWebhook 的 `timeoutSeconds` 应设置为 5 秒以内，`failurePolicy` 在非强制安全场景下建议设为 `Ignore`，防止 Webhook 服务抖动拖垮所有写操作。",
+        "API Priority and Fairness（APF）是 K8s 1.20+ 的官方流量整形机制，通过 FlowSchema 和 PriorityLevelConfiguration 将不同来源的请求分类限流，防止某类请求（如监控 Agent 的批量 List）耗尽 API Server 的并发配额，是生产环境防雪崩的必备配置。",
+        "生产环境中需要频繁查询 K8s 资源的客户端，应优先使用 client-go 的 SharedInformer 模式（本地缓存 + Watch 增量更新），而不是定时 List；必须 List 时要加 fieldSelector/labelSelector 缩小范围，并用 limit/continue 分页，避免单次传输过大。"
+      ],
+      "quiz": [
+        {
+          "id": "k8s-apiserver-slow-q1",
+          "question": "Kubernetes 中，以下哪个组件不需要通过 API Server 就能直接访问 etcd？",
+          "choices": [
+            {"id": "A", "text": "kube-scheduler"},
+            {"id": "B", "text": "kube-controller-manager"},
+            {"id": "C", "text": "etcd 本身存储数据，所有 K8s 组件都必须通过 API Server 访问，没有例外"},
+            {"id": "D", "text": "kubelet 在某些紧急情况下会直接读取 etcd"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 Kubernetes 架构最基础的设计原则：etcd 是 K8s 的「数据库」，API Server 是访问这个数据库的唯一合法入口。kube-scheduler、kube-controller-manager、kubelet、kube-proxy，以及所有第三方 Controller，全部只能通过 API Server 的 HTTP/gRPC 接口与集群状态交互，没有任何组件被允许直连 etcd。这个设计带来了统一的认证、鉴权和准入控制，也是 API Server 成为单点瓶颈的根本原因。选项 A、B 的干扰性在于这两个组件名气大，容易被误以为有特殊权限；选项 D 是常见误解，kubelet 没有直连 etcd 的能力。"
+        },
+        {
+          "id": "k8s-apiserver-slow-q2",
+          "question": "API Server 的请求处理链中，AdmissionWebhook 处于哪个阶段？",
+          "choices": [
+            {"id": "A", "text": "认证（Authentication）之前，用于 IP 白名单过滤"},
+            {"id": "B", "text": "认证之后、鉴权之前，用于快速拒绝未知身份的请求"},
+            {"id": "C", "text": "鉴权之后、etcd 读写之前，是准入控制阶段的外部扩展点"},
+            {"id": "D", "text": "etcd 写入之后、响应返回之前，用于审计记录"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "API Server 的处理顺序固定为：认证 → 鉴权 → 准入控制 → etcd 读写。Webhook 属于准入控制阶段，在请求被确认为合法用户且有权限执行操作之后，才会调用外部 Webhook 进行进一步的修改（Mutating）或校验（Validating）。这个顺序决定了 Webhook 的延迟会直接累加到整个请求的端到端延迟上——如果 Webhook 响应需要 25 秒，那对应请求就至少要等 25 秒。选项 D 是干扰项，审计日志的写入是在整个处理链的多个阶段（RequestReceived、ResponseStarted、ResponseComplete）异步进行的，不是在 etcd 写入之后才触发。"
+        },
+        {
+          "id": "k8s-apiserver-slow-q3",
+          "question": "client-go 的 SharedInformer 机制能减轻 API Server 压力，其核心原因是什么？",
+          "choices": [
+            {"id": "A", "text": "Informer 使用了 HTTP/2 多路复用，单连接传输效率更高"},
+            {"id": "B", "text": "Informer 初始化时 List 一次，之后通过 Watch 接收增量事件维护本地缓存，后续读操作直接查缓存不走网络"},
+            {"id": "C", "text": "Informer 会自动压缩请求的 body，减少网络传输量"},
+            {"id": "D", "text": "Informer 使用了独立的 etcd 只读副本，绕过了 API Server"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "SharedInformer 的本质是「一次 List，一直 Watch，本地缓存」。启动时发一次全量 List 把当前状态拉到本地，然后通过 Watch 长连接持续接收后续的增量变更事件（ADD/UPDATE/DELETE），始终保持本地缓存与 API Server 的状态同步。业务逻辑通过 Lister 从本地缓存读数据，完全不发网络请求。这样一个 Controller 对 API Server 的读压力几乎为零，只有初始化时的一次 List 和一条持久的 Watch 连接。选项 A 虽然 client-go 也用 HTTP/2，但这不是 Informer 减压的核心原因；选项 D 是错误的，Informer 依然通过 API Server，没有独立的 etcd 副本。"
+        },
+        {
+          "id": "k8s-apiserver-slow-q4",
+          "question": "执行 `kubectl get --raw /metrics | grep apiserver_current_inflight_requests` 后得到如下输出，你的判断是什么？\n\n```\napiserver_current_inflight_requests{request_kind=\"readOnly\"} 892\napiserver_current_inflight_requests{request_kind=\"mutating\"} 23\n```",
+          "choices": [
+            {"id": "A", "text": "集群非常健康，892 个只读请求说明集群活跃度高"},
+            {"id": "B", "text": "只读请求严重过载，已远超 --max-requests-inflight 默认值 400，新来的读请求会被 429 拒绝或排队"},
+            {"id": "C", "text": "mutating 请求只有 23 个，说明写入压力不大，可以忽略只读侧的数字"},
+            {"id": "D", "text": "只读请求多是正常现象，因为 K8s 的读写比天然就是 10:1"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`kube-apiserver` 的 `--max-requests-inflight` 参数控制只读请求的最大并发数，默认值是 400；`--max-mutating-requests-inflight` 控制写请求，默认值是 200。当 `readOnly` 达到 892 时，已经是默认限额的两倍多，API Server 会对超出限额的请求返回 HTTP 429 Too Many Requests，客户端会看到「请求被拒绝」或者等待队列耗尽后超时。这种状态下 API Server 的 CPU 和内存也会显著升高。选项 C 是典型的「幸存者偏差」思维，写请求少不代表读请求多没问题——两者有独立的限额控制。"
+        },
+        {
+          "id": "k8s-apiserver-slow-q5",
+          "question": "在 Audit Log 中发现大量如下记录，应优先怎么处理？\n\n```json\n{\"verb\":\"list\",\"requestURI\":\"/api/v1/pods\",\"user\":{\"username\":\"system:serviceaccount:monitoring:node-agent\"}}\n```",
+          "choices": [
+            {"id": "A", "text": "增加 API Server 副本数量，用水平扩展来吸收更多的 list 请求"},
+            {"id": "B", "text": "检查并修改 node-agent 的代码，为 list 调用添加 fieldSelector 或 labelSelector，或改用 Watch/Informer 模式"},
+            {"id": "C", "text": "给 node-agent 的 ServiceAccount 赋予更高的 RBAC 权限，让它的请求优先被处理"},
+            {"id": "D", "text": "调大 --max-requests-inflight 参数到 2000，给 list 请求更多并发空间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这条 Audit Log 揭示了根本问题：node-agent 在发不带任何 selector 的全量 Pod list，每次都让 API Server 从 etcd 拉取全量数据然后序列化，这是 O(n) 的操作且数据量巨大。正确的修复方式是在调用侧加 fieldSelector（比如 `spec.nodeName=当前节点名`）将全量 1500 个 Pod 的 list 缩小到只属于本节点的几十个 Pod，或者改用 Informer 完全消除定时 List。选项 A 和 D 是治标不治本，水平扩展和调大限额都只是给糟糕的调用方式更多资源，问题迟早还会出现。选项 C 反而会让问题更严重，更高的优先级意味着它的低效请求能更快地消耗完所有并发配额。"
+        },
+        {
+          "id": "k8s-apiserver-slow-q6",
+          "question": "一个 ValidatingAdmissionWebhook 的 `failurePolicy` 设置为 `Fail`，`timeoutSeconds` 设置为 30。如果 Webhook 服务因内存不足开始响应变慢（响应时间 20～28 秒），会对集群产生什么影响？",
+          "choices": [
+            {"id": "A", "text": "只影响经过这个 Webhook 校验的资源类型的 CREATE/UPDATE 操作，其他操作不受影响"},
+            {"id": "B", "text": "由于 failurePolicy 是 Fail，超时的请求会立即被拒绝，不会长时间占用 API Server 连接"},
+            {"id": "C", "text": "每个经过该 Webhook 的写请求都要等待 20～28 秒，导致 mutating 并发配额被大量占用，间接拖慢所有写操作"},
+            {"id": "D", "text": "Webhook 超时只影响当前请求，不会占用 API Server 的并发槽"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 Webhook 配置中最容易踩的坑。`failurePolicy: Fail` 的含义是「如果 Webhook 调用失败或超时则请求失败」，但在超时之前，API Server 会同步等待 Webhook 响应，这段等待时间是实实在在地占用着 API Server 的 inflight 并发槽的。如果 Webhook 响应时间是 25 秒，那每个写请求要占用一个 mutating inflight 槽位 25 秒。`--max-mutating-requests-inflight` 默认是 200，200 ÷ 25秒 = 每秒只能处理 8 个写请求，任何 QPS 稍高的写操作都会开始排队。选项 B 是最常见的误解：`Fail` 指的是最终结果失败，不是立刻返回——在超时发生之前，连接是阻塞着的。"
+        },
+        {
+          "id": "k8s-apiserver-slow-q7",
+          "question": "API Priority and Fairness（APF）和直接调大 `--max-requests-inflight` 参数，这两种方式处理 API Server 过载问题有什么本质区别？",
+          "choices": [
+            {"id": "A", "text": "APF 是 Kubernetes 1.29 才引入的新功能，老版本只能用 --max-requests-inflight"},
+            {"id": "B", "text": "两者等价，APF 只是 --max-requests-inflight 的图形化配置界面"},
+            {"id": "C", "text": "APF 能对不同来源的请求分类限流，保障高优先级流量始终有配额；单纯调大参数只是扩大总容量，一旦某类请求暴增仍然会打满"},
+            {"id": "D", "text": "APF 主要用于限制 etcd 的写入速率，与 API Server 的请求并发没有直接关系"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这两种方式的哲学完全不同。`--max-requests-inflight` 设置的是一个总量上限，所有请求共享这个池子，先到先得——监控 Agent 的 200 个 List 请求如果先到，就会把 400 个槽位占满，CI/CD 的关键 apply 请求反而排不上队。APF 通过 FlowSchema 把请求分成不同的流（Flow），每个流有独立的并发配额和队列。可以给 CI/CD ServiceAccount 配一个高优先级 PriorityLevel，给监控 Agent 配一个低优先级 PriorityLevel，这样即使监控 Agent 的请求把它自己的配额占满，CI/CD 的请求依然有独立的配额可用。APF 在 K8s 1.20 Alpha、1.23 Beta、1.29 正式 GA，1.20+ 集群默认已启用。"
+        },
+        {
+          "id": "k8s-apiserver-slow-q8",
+          "question": "新增了一个 CRD 之后，发现 `kubectl get mycrd` 报错「the server doesn't have a resource type 'mycrd'」，但 `kubectl api-resources` 却能看到这个 CRD。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "CRD 的 RBAC 配置有问题，需要给当前用户授权"},
+            {"id": "B", "text": "kubectl 的本地 discovery 缓存（~/.kube/cache）还是旧的，未包含新 CRD 信息，需要等缓存失效或手动清除"},
+            {"id": "C", "text": "CRD 的 versions[].served 字段设置为 false，导致该版本不可用"},
+            {"id": "D", "text": "API Server 需要重启才能识别新添加的 CRD"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "kubectl 在执行 `get` 命令前会先通过 discovery API（`/api` 和 `/apis`）查询 API Server 支持的资源类型，为了减少这个开销，kubectl 把 discovery 结果缓存到 `~/.kube/cache/discovery/` 目录，默认缓存有效期为 10 分钟。如果刚创建了 CRD 但缓存还是旧的，kubectl 就「不知道」这个新资源类型。而 `kubectl api-resources` 会强制查询 API Server 不走缓存，所以能看到新 CRD。解决方法是删除 `~/.kube/cache` 目录或等缓存过期。选项 D 是错误的，K8s 的 CRD 机制无需重启 API Server，新 CRD 的 API 端点会动态注册。"
+        },
+        {
+          "id": "k8s-apiserver-slow-q9",
+          "question": "在 K8s 集群中，API Aggregation Layer（AA）和 CustomResourceDefinition（CRD）都能扩展 API，它们的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "CRD 只能定义只读资源，AA 可以定义读写资源"},
+            {"id": "B", "text": "两者完全等价，只是实现方式不同，最终效果相同"},
+            {"id": "C", "text": "CRD 由 API Server 内置存储（etcd），适合简单的自定义资源；AA 将请求代理到独立的 Extension APIServer，可以自定义存储后端、实现复杂逻辑，但引入了额外的网络跳数"},
+            {"id": "D", "text": "AA 是 CRD 的旧版 API，K8s 1.22 已废弃 AA 推荐使用 CRD"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "CRD 和 AA 是 K8s 扩展 API 的两种截然不同的机制。CRD 是「声明式」扩展：你只需要提交一个 CRD 对象，API Server 就会自动为你注册对应的 REST 端点，数据存在 etcd 里，全程不需要你写任何服务。代价是功能受限——只能做 CRUD，没有自定义业务逻辑，没有自定义验证（超出 OpenAPI Schema 范围的）。AA 是「代理式」扩展：你需要部署一个独立的 Extension APIServer 进程，kube-apiserver 将对应 Group 的请求代理转发给它。你可以用自己的数据库、实现复杂的 webhook、自定义 subresource 逻辑。Metrics Server 和 custom.metrics.k8s.io 就是典型的 AA 应用。AA 每次请求多一跳网络延迟，需要额外的部署运维成本。"
+        },
+        {
+          "id": "k8s-apiserver-slow-q10",
+          "question": "执行 `kubectl get pods -n production` 时响应很慢，但 `kubectl get pods -n production --field-selector=spec.nodeName=node-001` 却很快。这说明性能瓶颈最可能在哪里？",
+          "choices": [
+            {"id": "A", "text": "node-001 上的 kubelet 性能特别好，对该节点的查询走了快速路径"},
+            {"id": "B", "text": "production namespace 中 Pod 数量巨大，无 selector 的全量 list 需要从 etcd 拉取大量数据并序列化，而加了 fieldSelector 后只返回少量 Pod"},
+            {"id": "C", "text": "fieldSelector 会绕过 API Server 直接查 etcd 索引，所以更快"},
+            {"id": "D", "text": "这两个命令性能应该完全相同，fieldSelector 只是客户端过滤，服务端行为没有区别"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考查 K8s 服务端过滤和客户端过滤的区别。`spec.nodeName` 是 K8s 支持的服务端 fieldSelector——API Server 在构造 etcd 查询时会携带这个过滤条件，只从 etcd 读取并序列化符合条件的对象，网络传输量和序列化开销都大幅减少。而没有 selector 的全量 list 需要把 namespace 内所有 Pod（可能数百个）全部从 etcd 读出、反序列化、过滤（如果有 labelSelector 的话在 API Server 侧做），然后序列化成 JSON 传回客户端。production namespace 里如果有几百个 Pod，单个 Pod 对象序列化后可能有几十 KB，几百个就是几十 MB 的 JSON。选项 D 是错误的，K8s 的 fieldSelector 在 API Server 侧生效，不是客户端过滤。"
+        }
+      ],
+      "references": [
+        "https://kubernetes.io/docs/concepts/cluster-administration/flow-control/",
+        "https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/",
+        "https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes",
+        "https://kubernetes.io/docs/tasks/extend-kubernetes/configure-aggregation-layer/",
+        "https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/"
+      ]
+    }
+  ]
+}
