@@ -1,0 +1,168 @@
+{
+  "id": "monitoring-q127",
+  "name": "PostgreSQL 锁等待与死锁监控",
+  "domain": "monitoring",
+  "description": "PostgreSQL 锁等待检测、死锁排查、pg_stat_activity 分析与 Prometheus 告警配置",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q127",
+      "domain": "monitoring",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["postgresql", "locks", "deadlock", "pg_stat_activity", "postgres_exporter", "prometheus", "vacuum"],
+      "title": "如何监控 PostgreSQL 的锁等待和死锁情况？",
+      "content": "## 场景背景\n\n你负责一个电商平台的后端基础设施，核心订单数据库是 PostgreSQL 14，日均写入量约 200 万行，高峰期并发事务数在 300 左右。最近每天促销时段都会出现一批订单创建请求超时，应用日志里开始出现以下错误：\n\n```\nERROR: deadlock detected\nDETAIL: Process 18423 waits for ShareLock on transaction 7849301; blocked by process 18501.\n        Process 18501 waits for ShareLock on transaction 7849298; blocked by process 18423.\nHINT: See server log for query details.\n```\n\n同时 Grafana 监控大盘上，订单服务的 P99 延迟从平时的 60ms 飙升到了 8 秒，部分请求直接 504 超时。DBA 登上数据库服务器用 `psql` 临时查了一下，发现有十几个会话处于 `waiting` 状态，但当时没来得及保留现场就已经恢复了。\n\n现在领导要求你搭建一套完整的 PostgreSQL 锁监控体系，不仅要能在死锁发生后快速定位根因，还要能在锁等待积累到影响业务之前提前告警。你的监控栈是 Prometheus + Grafana，数据库节点上已经部署了 `postgres_exporter` v0.15。\n\n面对这个场景，你需要回答：\n\n1. `postgres_exporter` 默认暴露了哪些与锁相关的指标？如何通过这些指标判断当前锁竞争情况？\n2. 如何用 SQL 实时查询正在等待锁的会话和它们的阻塞链？\n3. 死锁发生后，如何从 PostgreSQL 日志和系统视图中还原死锁的完整现场？\n4. 如何配置 Prometheus 告警规则，在死锁率突增或长时间锁等待时提前通知？\n5. 高写入表上的 VACUUM 操作会带来什么额外的锁竞争，如何识别和缓解？",
+      "answer": "## 第一步：理解 PostgreSQL 锁机制的基础\n\nPostgreSQL 的锁机制比大多数工程师印象中复杂得多。很多人以为「锁」就是「行锁」，但 PostgreSQL 实际上有两层完全不同的锁系统在同时工作：**表级锁（relation-level locks）**和**行级锁（row-level locks）**，前者存储在共享内存的锁表中，后者以标记位的形式存储在堆页面上（tuple 的 t_infomask 字段）。\n\nPostgreSQL 定义了 8 种表级锁模式，按冲突强度从弱到强依次是：`AccessShareLock`（SELECT 获取）、`RowShareLock`（SELECT FOR UPDATE/SHARE 获取）、`RowExclusiveLock`（INSERT/UPDATE/DELETE 获取）、`ShareUpdateExclusiveLock`（VACUUM、CREATE INDEX CONCURRENTLY 获取）、`ShareLock`（CREATE INDEX 非并发模式获取）、`ShareRowExclusiveLock`、`ExclusiveLock`，以及最强的 `AccessExclusiveLock`（ALTER TABLE、DROP TABLE 获取，会阻塞一切其他访问）。两个事务能否同时持有某张表上的锁，取决于它们各自的锁模式是否互相冲突。\n\n`pg_locks` 是观察运行时锁状态的核心视图。它记录了所有当前持有或等待中的锁，每行代表一个锁请求，`granted = true` 表示已获得，`granted = false` 表示正在等待。配合 `pg_stat_activity`，你可以把锁的 `pid` 关联到具体的查询、用户名、客户端地址和等待时长。这两个视图是 PostgreSQL 锁排查的基础工具，任何监控方案都绕不开它们。\n\n死锁（deadlock）是锁等待的极端情况：进程 A 持有资源 X 并等待资源 Y，进程 B 持有资源 Y 并等待资源 X，两者互相等待形成环路，谁也无法前进。PostgreSQL 有一个专门的死锁检测进程，每隔 `deadlock_timeout`（默认 1 秒）扫描一次等待图，发现环路后会选择代价最小的事务回滚并抛出 `ERROR: deadlock detected`。\n\n## 第二步：用 SQL 实时查询锁等待现场\n\n死锁报错出现之后，第一件事不是去看监控大盘，而是马上用下面这条 SQL 把当前的阻塞链快照下来。`pg_blocking_pids()` 是 PostgreSQL 9.6 引入的函数，给定一个 PID，它直接返回阻塞这个进程的所有上游 PID 数组，省去了手动关联 `pg_locks` 的麻烦：\n\n```sql\n-- 查询当前所有正在等待锁的会话及其阻塞者\nSELECT\n  waiting.pid                                    AS waiting_pid,\n  waiting.usename                                AS waiting_user,\n  waiting.query_start                            AS waiting_since,\n  now() - waiting.query_start                    AS waiting_duration,\n  waiting.query                                  AS waiting_query,\n  blocking.pid                                   AS blocking_pid,\n  blocking.usename                               AS blocking_user,\n  blocking.query_start                           AS blocking_since,\n  now() - blocking.xact_start                    AS blocking_txn_age,\n  blocking.query                                 AS blocking_query,\n  blocking.state                                 AS blocking_state\nFROM pg_stat_activity AS waiting\nJOIN pg_stat_activity AS blocking\n  ON blocking.pid = ANY(pg_blocking_pids(waiting.pid))\nWHERE waiting.wait_event_type = 'Lock'\nORDER BY waiting_duration DESC;\n```\n\n这条查询最重要的字段是 `blocking_txn_age`——它告诉你阻塞者的事务已经跑了多久。如果一个事务已经持续了 30 分钟，`blocking_state` 还是 `idle in transaction`，那大概率是应用代码里事务没有正确关闭，这种「僵尸事务」是锁等待积压最常见的根因之一。\n\n要检测长时间运行的事务，可以单独查询：\n\n```sql\n-- 查找运行超过 5 分钟的事务（可能是锁的持有者）\nSELECT\n  pid,\n  usename,\n  application_name,\n  state,\n  now() - xact_start         AS txn_duration,\n  now() - query_start        AS query_duration,\n  wait_event_type,\n  wait_event,\n  left(query, 120)           AS query_preview\nFROM pg_stat_activity\nWHERE xact_start IS NOT NULL\n  AND now() - xact_start > interval '5 minutes'\nORDER BY txn_duration DESC;\n```\n\n`xact_start IS NOT NULL` 这个条件很关键，它过滤掉了没有活跃事务的连接。`state = 'idle in transaction'` 的会话特别危险，它们持有锁但什么都不做，直到连接超时或应用主动提交/回滚。\n\n## 第三步：postgres_exporter 指标与 Prometheus 告警\n\n`postgres_exporter` 默认通过内置的 `pg_locks` collector 暴露锁相关指标。最核心的是 `pg_locks_count`，它按锁模式（`mode` 标签）汇总当前锁的数量：\n\n```\n# 示例指标输出\npg_locks_count{datname=\"orders\",mode=\"RowExclusiveLock\"}   847\npg_locks_count{datname=\"orders\",mode=\"ShareLock\"}          12\npg_locks_count{datname=\"orders\",mode=\"AccessExclusiveLock\"} 2\n```\n\n`ShareLock` 的数量突增通常是死锁或行锁争用的先兆——它对应的是事务等待另一个事务提交时获取的锁类型。`AccessExclusiveLock` 的出现则意味着有 DDL 操作（ALTER TABLE、DROP TABLE）在运行，这种锁会阻塞所有 SELECT 查询，在业务高峰期出现绝对是重大风险。\n\n死锁计数来自 `pg_stat_database`，`postgres_exporter` 将其暴露为 `pg_stat_database_deadlocks`（counter 类型）。在 Prometheus 里用 `rate()` 就能得到死锁速率：\n\n```yaml\n# prometheus/alerts/postgresql.yml\ngroups:\n  - name: postgresql_locks\n    rules:\n      # 死锁率告警：1 分钟内死锁速率超过 0.1 次/秒（即 6 次/分钟）\n      - alert: PostgreSQLDeadlockRateHigh\n        expr: |\n          rate(pg_stat_database_deadlocks{datname!~\"template.*|postgres\"}[1m]) > 0.1\n        for: 2m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"PostgreSQL 死锁率过高 ({{ $labels.datname }})\"\n          description: \"数据库 {{ $labels.datname }} 过去 1 分钟死锁速率为 {{ $value | humanizePercentage }}/s，请检查应用层事务顺序。\"\n\n      # 锁等待积压告警：等待 ShareLock 的数量超过 20（通常表示行锁争用严重）\n      - alert: PostgreSQLLockWaitAccumulating\n        expr: |\n          pg_locks_count{mode=\"ShareLock\"} > 20\n        for: 1m\n        labels:\n          severity: critical\n        annotations:\n          summary: \"PostgreSQL 锁等待积压 ({{ $labels.datname }})\"\n          description: \"{{ $labels.datname }} 上等待锁的事务数已达 {{ $value }}，可能即将出现级联阻塞。\"\n```\n\n告警触发后，SRE 的第一个动作应该是执行上面的阻塞链查询，然后判断是否需要手动 `SELECT pg_terminate_backend(<blocking_pid>)` 杀掉阻塞源头。\n\n## 第四步：配置 PostgreSQL 日志让死锁可追溯\n\n仅靠实时查询是不够的，很多死锁转瞬即逝——PostgreSQL 检测到之后会立即回滚其中一个事务，等你登上去查时现场已经消失。因此必须在 `postgresql.conf` 里配置好日志记录，让每次死锁都留下完整的案发记录：\n\n```ini\n# postgresql.conf\n\n# 死锁超时：默认 1s，这是 PostgreSQL 检测死锁环路的间隔\n# 不建议调得太低（增加死锁检测的 CPU 开销），也不建议太高（用户等待时间过长）\ndeadlock_timeout = 1s\n\n# 锁等待超时：单个语句等待锁超过此时长时主动报错放弃，防止级联阻塞\n# 业务层应捕获 ERROR: canceling statement due to lock timeout 并重试\nlock_timeout = 10s\n\n# 记录锁等待事件：等待时间超过 deadlock_timeout 时写入日志\n# 这是追溯锁竞争历史的关键配置，生产环境必须开启\nlog_lock_waits = on\n\n# 记录详细的死锁图（进程 A 等待什么、进程 B 持有什么）\nlog_min_messages = warning\n```\n\n开启 `log_lock_waits = on` 后，当一个事务等待锁的时间超过 `deadlock_timeout` 时，PostgreSQL 会在日志里写入类似下面的记录：\n\n```\n2024-03-15 14:23:07 CST [18423]: LOG:  process 18423 still waiting for ShareLock on transaction 7849301 after 1000.234 ms\n2024-03-15 14:23:07 CST [18423]: DETAIL:  Process holding the lock: 18501. Wait queue: 18423.\n2024-03-15 14:23:07 CST [18423]: CONTEXT:  while updating tuple (0,42) in relation \"orders\"\n2024-03-15 14:23:07 CST [18423]: STATEMENT:  UPDATE orders SET status = 'paid' WHERE id = 10086;\n```\n\n这条日志告诉你：PID 18423 在执行 `UPDATE orders` 时等待 PID 18501 持有的锁，已经等了 1 秒。结合应用的 tracing，你就能找到是哪个业务接口触发了这条 SQL。\n\n## 第五步：VACUUM 锁竞争——容易被忽视的根因\n\n在高写入量的订单表上，有一类锁竞争很容易被忽略：**autovacuum 和业务事务之间的 ShareUpdateExclusiveLock 竞争**。\n\nPostgreSQL 的 MVCC 机制会在每次 UPDATE/DELETE 时保留旧版本的 dead tuples，autovacuum 负责定期清理这些废弃行。autovacuum 持有的是 `ShareUpdateExclusiveLock`，它与自身冲突（两个 autovacuum 不能同时处理同一张表），也与 `ShareLock` 以上的锁冲突——这意味着如果你要对高写入表执行 `CREATE INDEX`（非并发模式），它需要等待 autovacuum 完成。\n\n更危险的场景是长事务阻止 autovacuum 推进。PostgreSQL 的 dead tuple 清理有个约束：只能清理所有当前事务都已经看不到的行版本。如果一个事务持续了 1 小时，这 1 小时内所有的 UPDATE/DELETE 产生的旧版本都无法被清理，表膨胀（table bloat）会越来越严重，最终影响查询性能和锁等待时间。\n\n识别 autovacuum 锁竞争的查询：\n\n```sql\n-- 查找被 autovacuum 阻塞的会话，或正在阻塞 autovacuum 的长事务\nSELECT\n  pid,\n  usename,\n  application_name,\n  state,\n  wait_event,\n  now() - xact_start AS txn_age,\n  left(query, 100)   AS query\nFROM pg_stat_activity\nWHERE backend_type IN ('autovacuum worker', 'client backend')\n  AND (wait_event LIKE '%Lock%' OR now() - xact_start > interval '10 minutes')\nORDER BY txn_age DESC NULLS LAST;\n```\n\n缓解 vacuum 锁竞争的实践方向有两个：一是通过调整 `autovacuum_vacuum_cost_delay`（降低 vacuum 的 IO 速率，减少它持锁的连续时间）；二是设置 `idle_in_transaction_session_timeout`，强制关闭那些长时间 `idle in transaction` 的连接，让 autovacuum 能顺利推进。\n\n## 建立完整的监控闭环\n\n综合以上所有手段，一套完整的 PostgreSQL 锁监控体系应该包含三层：**实时感知**（`pg_locks_count` 指标 + `ShareLock` 数量告警）、**深度诊断**（`pg_stat_activity` + `pg_blocking_pids()` 的阻塞链查询）、**历史追溯**（`log_lock_waits = on` + `pg_stat_database_deadlocks` 的趋势图）。三者缺一不可——指标告诉你「现在有问题」，SQL 查询告诉你「问题在哪里」，日志告诉你「问题是怎么发生的」。",
+      "keyPoints": [
+        "pg_locks 视图记录所有当前持有或等待中的锁请求，granted = false 表示正在等待；结合 pg_stat_activity 可以关联到具体的查询、用户和等待时长",
+        "pg_blocking_pids(pid) 函数直接返回阻塞某个进程的所有上游 PID 数组，是排查锁阻塞链最高效的工具，避免手动关联 pg_locks",
+        "pg_stat_database_deadlocks 是 counter 类型指标，通过 Prometheus 的 rate() 函数可以得到死锁速率，超过阈值时应立即触发告警",
+        "log_lock_waits = on 配置让等待时间超过 deadlock_timeout 的锁等待事件写入 PostgreSQL 日志，是死锁事后追溯的关键配置，生产环境必须开启",
+        "idle in transaction 状态的会话持有锁但不做任何操作，是锁等待积压最常见的根因；应设置 idle_in_transaction_session_timeout 强制超时关闭",
+        "autovacuum 持有 ShareUpdateExclusiveLock，长事务会阻止 autovacuum 推进 dead tuple 清理，导致表膨胀并间接加剧锁竞争",
+        "lock_timeout 参数让单个语句等待锁超过指定时长时主动报错放弃，可防止一个阻塞事件级联蔓延到所有并发请求",
+        "AccessExclusiveLock（DDL 操作获取）会阻塞一切读写，在业务高峰期通过 pg_locks_count 指标监控其出现是避免重大故障的必要手段"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q127-q1",
+          "question": "在 pg_locks 视图中，granted 字段为 false 的记录表示什么？",
+          "choices": [
+            {"id": "A", "text": "该锁请求正在等待获取，对应的会话被阻塞"},
+            {"id": "B", "text": "该锁已经被释放，记录等待被清理"},
+            {"id": "C", "text": "该锁被拒绝，对应的事务已回滚"},
+            {"id": "D", "text": "该锁是共享锁，与其他事务的锁兼容但尚未激活"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "pg_locks 视图中 granted = false 的行表示该进程（pid）正在申请这把锁，但目前被其他已持有冲突锁的事务阻塞，进入了等待队列。granted = true 才表示锁已成功获得并正在被持有。PostgreSQL 不会在锁被拒绝时保留记录（死锁回滚的事务会直接从视图中消失），也没有「共享锁未激活」这一状态概念。监控 granted = false 的行数量，尤其是按 mode 分类统计，是判断当前锁竞争严重程度的直接手段。",
+          "relatedConcepts": ["pg_locks", "lock_granted", "lock_waiting"]
+        },
+        {
+          "id": "monitoring-q127-q2",
+          "question": "postgres_exporter 暴露的 pg_stat_database_deadlocks 是什么类型的 Prometheus 指标？要计算死锁发生速率，应该使用哪个函数？",
+          "choices": [
+            {"id": "A", "text": "Gauge 类型，使用 delta() 函数计算速率"},
+            {"id": "B", "text": "Counter 类型，使用 rate() 函数计算速率"},
+            {"id": "C", "text": "Histogram 类型，使用 histogram_quantile() 分析分布"},
+            {"id": "D", "text": "Counter 类型，使用 increase() 函数计算总增量后再除以时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "pg_stat_database_deadlocks 是单调递增的计数器，对应 Prometheus 的 Counter 类型。计算速率的标准做法是 rate(pg_stat_database_deadlocks[1m])，它会自动处理 counter reset（如数据库重启后计数归零的情况）。delta() 不适合 Counter 类型（它适合 Gauge）。increase() 虽然也能用于 Counter，但它返回的是时间窗口内的总增量，要得到每秒速率还需要额外除以秒数，不如 rate() 直接。Gauge 类型是可以任意增减的值（如当前连接数），不适合描述单调递增的事件计数。",
+          "relatedConcepts": ["prometheus_counter", "rate()", "pg_stat_database"]
+        },
+        {
+          "id": "monitoring-q127-q3",
+          "question": "以下哪条 SQL 能最高效地找到「正在阻塞其他会话的事务」以及「被阻塞的会话」？",
+          "choices": [
+            {"id": "A", "text": "SELECT * FROM pg_locks WHERE granted = false"},
+            {"id": "B", "text": "SELECT pid, query FROM pg_stat_activity WHERE state = 'active' AND wait_event_type = 'Lock'"},
+            {"id": "C", "text": "SELECT waiting.pid, blocking.pid FROM pg_stat_activity waiting JOIN pg_stat_activity blocking ON blocking.pid = ANY(pg_blocking_pids(waiting.pid)) WHERE waiting.wait_event_type = 'Lock'"},
+            {"id": "D", "text": "SELECT * FROM pg_stat_activity WHERE wait_event = 'relation'"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "选项 C 利用了 pg_blocking_pids() 函数直接建立等待者和阻塞者之间的关联，是 PostgreSQL 9.6+ 的推荐方式。选项 A 只列出了等待中的锁记录，但无法直接告诉你阻塞者是谁（需要再关联 pg_locks 找出持有冲突锁的 pid）。选项 B 找出了所有在等待锁的会话，但也没有阻塞者信息。选项 D 的 wait_event = 'relation' 仅匹配等待关系锁（表级锁）的特定子类型，会漏掉行锁、事务锁等其他类型的等待，并且也没有阻塞者信息。",
+          "relatedConcepts": ["pg_blocking_pids", "pg_stat_activity", "lock_chain"]
+        },
+        {
+          "id": "monitoring-q127-q4",
+          "question": "postgresql.conf 中 log_lock_waits = on 的作用是什么？它与 lock_timeout 有什么区别？",
+          "choices": [
+            {"id": "A", "text": "log_lock_waits 记录所有锁申请操作到日志；lock_timeout 设置锁等待的记录频率"},
+            {"id": "B", "text": "log_lock_waits 在等待时间超过 deadlock_timeout 时写入日志；lock_timeout 让等待超时的语句主动报错放弃"},
+            {"id": "C", "text": "两者功能相同，都是防止锁等待超时，log_lock_waits 是 lock_timeout 的别名"},
+            {"id": "D", "text": "log_lock_waits 仅对死锁事件记录日志；lock_timeout 仅对行锁等待生效"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "log_lock_waits = on 是一个可观测性配置：当某个事务等待锁的时间超过 deadlock_timeout（默认 1s）时，PostgreSQL 将一条包含等待详情（等待什么锁、被哪个进程阻塞、阻塞了多久）的日志写入服务器日志。它不影响事务的实际行为，只是记录。lock_timeout 则是一个主动干预配置：当某条语句等待锁超过指定时长时，PostgreSQL 会直接取消这条语句并向客户端返回 ERROR: canceling statement due to lock timeout。两者应该配合使用：log_lock_waits 保留历史现场，lock_timeout 防止级联阻塞。",
+          "relatedConcepts": ["log_lock_waits", "lock_timeout", "deadlock_timeout"]
+        },
+        {
+          "id": "monitoring-q127-q5",
+          "question": "观察以下 pg_stat_activity 查询结果，哪个会话最可能是当前锁竞争的根源？\n\n```\npid   | state              | wait_event_type | xact_start              | query\n------+--------------------+-----------------+-------------------------+------------------\n18501 | idle in transaction| null            | 2024-03-15 13:55:00     | UPDATE orders...\n18423 | active             | Lock            | 2024-03-15 14:23:06     | UPDATE orders...\n18890 | active             | null            | 2024-03-15 14:23:07     | SELECT * FROM...\n```",
+          "choices": [
+            {"id": "A", "text": "PID 18423，因为它正在等待锁（wait_event_type = Lock）"},
+            {"id": "B", "text": "PID 18890，因为它是 SELECT 查询，持有 AccessShareLock 阻塞了写操作"},
+            {"id": "C", "text": "PID 18501，因为它处于 idle in transaction 状态且事务已运行约 28 分钟"},
+            {"id": "D", "text": "无法判断，需要查询 pg_locks 才能确认"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "PID 18501 的 state 是 idle in transaction，意味着这个会话开启了事务后没有主动提交或回滚，但也没有在执行任何 SQL——它只是持有着已获得的锁「挂在那里」。从 xact_start 可以算出它已经这样运行了约 28 分钟。这是锁等待积压最典型的根因，常见于连接池配置错误、应用异常退出后连接未释放、或者长时间的手动 psql 会话。PID 18423 是受害者（在等待锁），不是根源。PID 18890 执行的是 SELECT，持有的是最弱的 AccessShareLock，几乎不会阻塞正常的 DML 操作。",
+          "relatedConcepts": ["idle_in_transaction", "xact_start", "lock_holder"]
+        },
+        {
+          "id": "monitoring-q127-q6",
+          "question": "PostgreSQL 死锁检测的工作机制是什么？哪个参数控制检测间隔？",
+          "choices": [
+            {"id": "A", "text": "每次有新的锁等待请求时立即触发检测，由后台进程实时扫描等待图"},
+            {"id": "B", "text": "每隔 deadlock_timeout 时间触发一次扫描，检测等待图中是否存在环路"},
+            {"id": "C", "text": "每隔 lock_timeout 时间触发一次扫描，超时未获取锁则判定死锁"},
+            {"id": "D", "text": "由 autovacuum 进程兼职检测，每次 autovacuum 运行时扫描死锁"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PostgreSQL 的死锁检测是延迟触发的：当一个事务进入锁等待状态后，并不立即检测死锁（实时检测开销太大），而是等待 deadlock_timeout 时间（默认 1 秒）之后才触发一次等待图扫描。扫描算法会构建有向图，每个节点是一个等待中的事务，每条边表示「A 在等待 B 持有的锁」，如果图中存在环路则判定死锁，选择代价最小的事务（通常是最近开始的那个）回滚。这种延迟设计的代价是：在并发高的场景下，死锁从发生到被检测到最长需要等待 deadlock_timeout 时间。lock_timeout 和 autovacuum 均与死锁检测无关。",
+          "relatedConcepts": ["deadlock_timeout", "deadlock_detection", "wait_graph"]
+        },
+        {
+          "id": "monitoring-q127-q7",
+          "question": "在高写入表上运行 CREATE INDEX（非 CONCURRENTLY 模式）时，它会获取什么级别的锁？对业务有什么影响？",
+          "choices": [
+            {"id": "A", "text": "RowExclusiveLock，只阻塞其他写操作，不影响 SELECT 查询"},
+            {"id": "B", "text": "ShareLock，阻塞所有写操作（INSERT/UPDATE/DELETE），允许 SELECT 查询"},
+            {"id": "C", "text": "AccessExclusiveLock，阻塞包括 SELECT 在内的所有操作"},
+            {"id": "D", "text": "ShareUpdateExclusiveLock，只阻塞同时运行的其他 DDL 操作"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "CREATE INDEX 在非 CONCURRENTLY 模式下会获取 AccessExclusiveLock，这是 PostgreSQL 中最强的锁，与所有其他锁模式都冲突，包括最弱的 AccessShareLock（SELECT 查询获取）。这意味着在索引构建期间，所有对该表的 SELECT、INSERT、UPDATE、DELETE 全部被阻塞。在一张千万级别的高写入表上，这可能持续数分钟，直接导致业务不可用。正确做法是使用 CREATE INDEX CONCURRENTLY，它只需要 ShareUpdateExclusiveLock，允许读写操作并发进行，代价是构建时间更长、构建失败后需要手动清理无效索引。",
+          "relatedConcepts": ["AccessExclusiveLock", "CREATE INDEX CONCURRENTLY", "ShareUpdateExclusiveLock"]
+        },
+        {
+          "id": "monitoring-q127-q8",
+          "question": "生产数据库出现死锁告警后，你执行阻塞链查询发现一个已运行 45 分钟的 idle in transaction 会话正在阻塞 30 个业务请求。这种情况下最直接的处置手段是什么？",
+          "choices": [
+            {"id": "A", "text": "重启 PostgreSQL 服务清除所有锁"},
+            {"id": "B", "text": "执行 SELECT pg_terminate_backend(<blocking_pid>) 终止阻塞源头的连接"},
+            {"id": "C", "text": "等待 lock_timeout 自动超时释放阻塞"},
+            {"id": "D", "text": "执行 SELECT pg_cancel_backend(<blocking_pid>) 取消阻塞源头的当前查询"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "pg_terminate_backend() 会向目标进程发送 SIGTERM 信号，强制关闭连接并回滚其持有的所有事务，立即释放锁，30 个等待中的会话可以继续执行。这是处置僵尸事务（idle in transaction）的正确方法。重启整个 PostgreSQL 服务是过度操作，会导致所有业务连接断开。lock_timeout 只影响「等待锁的语句」主动放弃，对已经持有锁的 idle in transaction 会话没有任何约束（需要设置 idle_in_transaction_session_timeout 才能自动超时）。pg_cancel_backend() 发送的是 SIGINT，只能取消当前正在执行的查询，对于 idle in transaction 状态的会话（没有正在执行的查询）无效。",
+          "relatedConcepts": ["pg_terminate_backend", "pg_cancel_backend", "idle_in_transaction_session_timeout"]
+        },
+        {
+          "id": "monitoring-q127-q9",
+          "question": "以下哪个 postgresql.conf 参数能在数据库层面自动处置长时间 idle in transaction 的连接，避免人工干预？",
+          "choices": [
+            {"id": "A", "text": "lock_timeout，设置为等待锁的最长时间"},
+            {"id": "B", "text": "statement_timeout，设置单条语句的最长执行时间"},
+            {"id": "C", "text": "idle_in_transaction_session_timeout，超时后自动断开 idle in transaction 的连接"},
+            {"id": "D", "text": "tcp_keepalives_idle，通过 TCP 层面检测断开的连接"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "idle_in_transaction_session_timeout 是 PostgreSQL 9.6 引入的参数，专门针对 idle in transaction 状态的会话：当一个会话开启事务后在指定时间内没有任何活动，PostgreSQL 会自动回滚事务并断开连接，释放持有的所有锁。这是预防僵尸事务的最佳配置，推荐在生产环境设置为 5min 到 30min 之间。lock_timeout 只影响等待锁超时的语句，不处理持锁空闲的会话。statement_timeout 限制单条语句执行时间，idle in transaction 没有正在执行的语句，所以不受影响。tcp_keepalives_idle 是网络层面的保活机制，只能检测 TCP 连接是否已经物理断开，不能处理 TCP 连接存活但应用逻辑挂起的情况。",
+          "relatedConcepts": ["idle_in_transaction_session_timeout", "lock_timeout", "statement_timeout"]
+        },
+        {
+          "id": "monitoring-q127-q10",
+          "question": "一张高写入的订单表 autovacuum 任务长期无法完成，你在 pg_stat_activity 中看到 autovacuum worker 处于 wait_event_type = Lock 状态。以下哪个场景最可能导致这个问题？",
+          "choices": [
+            {"id": "A", "text": "表上有太多索引，autovacuum 在清理索引时遇到 I/O 瓶颈"},
+            {"id": "B", "text": "一个长时间运行的事务持有的 RowExclusiveLock 与 autovacuum 的 ShareUpdateExclusiveLock 冲突"},
+            {"id": "C", "text": "有其他 DDL 操作（如 ALTER TABLE）持有 AccessExclusiveLock，阻塞了 autovacuum"},
+            {"id": "D", "text": "autovacuum_vacuum_cost_delay 设置太大，导致 autovacuum 速度过慢而看起来被阻塞"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "autovacuum 持有的是 ShareUpdateExclusiveLock，这种锁与 AccessExclusiveLock 冲突。当有 ALTER TABLE、VACUUM FULL、DROP INDEX 等持有 AccessExclusiveLock 的 DDL 操作正在运行时，autovacuum 无法获取 ShareUpdateExclusiveLock，进入等待状态。反过来，autovacuum 运行时也会阻塞后续申请 AccessExclusiveLock 的 DDL。选项 B 描述的情况是错误的：RowExclusiveLock（DML 操作持有）与 ShareUpdateExclusiveLock 并不冲突，正常的 INSERT/UPDATE/DELETE 不会阻塞 autovacuum。选项 A 描述的是 I/O 问题，不会体现为 Lock 等待状态。选项 D 描述的是速度慢，也不会出现 Lock 等待。长事务确实会阻止 dead tuple 被清理（因为旧版本不能被回收），但那体现为 autovacuum 跑完了却没有效果，而不是 autovacuum 本身被锁阻塞。",
+          "relatedConcepts": ["autovacuum", "ShareUpdateExclusiveLock", "AccessExclusiveLock", "vacuum_bloat"]
+        }
+      ],
+      "references": [
+        "https://www.postgresql.org/docs/current/view-pg-locks.html",
+        "https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW",
+        "https://www.postgresql.org/docs/current/runtime-config-locks.html",
+        "https://github.com/prometheus-community/postgres_exporter",
+        "https://www.postgresql.org/docs/current/explicit-locking.html"
+      ]
+    }
+  ]
+}

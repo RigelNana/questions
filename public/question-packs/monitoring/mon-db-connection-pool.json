@@ -1,0 +1,173 @@
+{
+  "id": "monitoring-q126",
+  "name": "数据库连接池监控关键指标",
+  "domain": "monitoring",
+  "description": "需求分析：数据库连接池（Connection Pool）监控的关键指标体系，涵盖 HikariCP、GORM 指标、连接泄漏检测与 K8s 扩容影响",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "monitoring-q126",
+      "domain": "monitoring",
+      "type": "requirement",
+      "difficulty": 2,
+      "tags": ["connection-pool", "hikaricp", "gorm", "prometheus", "database", "kubernetes", "monitoring"],
+      "title": "数据库连接池（Connection Pool）监控的关键指标有哪些？",
+      "content": "你的团队维护着一套 Java（Spring Boot + HikariCP）和 Go（GORM + database/sql）混合技术栈的后端服务，部署在 Kubernetes 集群上，共 20 个 Pod，后端连接同一个 MySQL 实例（max_connections = 500）。最近运维反馈偶发请求超时，错误日志中出现：\n\n```\n# Java 侧（HikariCP）\nHikariPool-1 - Connection is not available, request timed out after 30000ms\n\n# Go 侧（GORM/database/sql）\ndriver: bad connection\ncontext deadline exceeded (Client.Timeout exceeded while awaiting headers)\n```\n\n监控同学说「数据库 CPU 才 30%，不像是数据库本身的问题」。你怀疑是连接池耗尽了，但现有监控只有数据库层面的 QPS 和慢查询，**连接池维度的指标完全空白**。\n\n现在你需要给 SRE 团队提一份需求：**从零建立完整的连接池监控体系**，让下次出现类似问题时，能在 5 分钟内定位根因。\n\n请分析：\n1. 连接池监控需要采集哪些核心指标？每个指标的业务含义是什么？\n2. HikariCP（Java）和 GORM/database/sql（Go）分别如何暴露这些指标？\n3. 如何通过指标判断连接池是否「即将耗尽」，以及如何合理设置池大小？\n4. K8s 水平扩容（HPA 触发）会对数据库连接总数产生什么影响，如何纳入监控？",
+      "answer": "## 第一步：理解连接池是什么，以及它为什么值得被认真监控\n\n数据库连接池（Connection Pool）是应用程序和数据库之间的「连接中介层」。建立一条 TCP 连接并完成 MySQL 握手认证大约需要 5~20ms，如果每次 SQL 都新建连接，高并发场景下光建连的开销就足以把服务拖垮。连接池的核心价值是**连接复用**：预先建立一批连接放在池子里，请求来了直接从池子里借一条，用完归还，避免反复建连的开销。\n\n池子里的连接在任意时刻处于以下几种状态之一：**active（活跃）**表示已被某个业务线程借走、正在执行 SQL；**idle（空闲）**表示在池中等待被借用；**pending（等待）**表示有请求想借连接但池子里没有空闲连接、只能排队等待。这三种状态就是连接池监控最核心的观测维度，其他所有指标都围绕这三个状态展开。\n\n理解了状态机，再看上面的故障现象就清晰了：HikariCP 报「request timed out after 30000ms」，意思是某个请求在 pending 队列里等了 30 秒都没借到连接，最终超时；Go 侧的「driver: bad connection」则可能是长时间 idle 的连接被 MySQL 的 `wait_timeout`（默认 8 小时）关掉，但连接池没有及时感知，把一条死连接借给了业务线程。两种报错看起来不同，根因却可能都指向连接池配置或泄漏问题。\n\n## 第二步：连接池监控的核心指标体系\n\n**连接数三件套**是基础：`active connections`（活跃连接数）、`idle connections`（空闲连接数）、`pending connections`（等待连接数）。这三个指标加起来的含义是：active 反映当前数据库负载，idle 反映池的余量，pending 是最直接的告警信号——只要 pending > 0，就意味着已经有请求开始等连接了，此时任何一个慢查询拖长 active 连接的占用时间，都会让 pending 队列雪崩。\n\n**连接池利用率**（pool utilization）是 active / (active + idle) 的比值，正常生产环境建议保持在 70%~80% 以下。持续超过 90% 意味着池子已经没有缓冲空间，任何突发流量都会直接触发 pending。\n\n**连接等待时间**（connection acquisition wait time）衡量从「请求连接」到「获得连接」的耗时，P99 超过 100ms 就值得关注，超过 1 秒就需要立刻介入。这个指标是端到端 SQL 延迟中容易被忽视的隐性成本：你以为 SQL 只跑了 10ms，但获取连接等了 500ms，整个请求就慢了。\n\n**连接创建速率**（connection creation rate）和**连接销毁速率**（connection destroy rate）是进阶指标，用于判断连接池是否处于「频繁扩缩容」的不稳定状态。稳定运行的服务，连接应该在启动后就基本固定，如果你看到连接持续被创建和销毁，要么是 `minimumIdle` 配太小、连接不断被回收，要么是发生了连接泄漏——业务代码拿走连接后没有归还，池子里的连接越来越少，只能不断新建来补充。\n\n**连接超时计数**（connection timeout total）是一个累计计数器，每次发生「等待超时、拿不到连接」就 +1。这个指标直接对应用户感知到的报错，用 rate() 计算每分钟超时次数，任何非零值都应该触发告警。\n\n## 第三步：HikariCP 和 GORM 分别如何暴露指标\n\n**HikariCP（Java）** 从 3.x 版本开始原生支持 Micrometer 指标集成。在 Spring Boot 项目中，只需要在 `application.yml` 里加一行配置：\n\n```yaml\nspring:\n  datasource:\n    hikari:\n      # 开启 Micrometer 指标注册\n      register-mbeans: true\n      pool-name: HikariPool-main  # 建议命名，方便多数据源区分\n      # 连接池核心参数\n      maximum-pool-size: 20        # 最大连接数\n      minimum-idle: 5              # 最小空闲连接\n      connection-timeout: 30000    # 等待连接超时时间（ms）\n      idle-timeout: 600000         # 空闲连接被回收的时间（ms）\n      max-lifetime: 1800000        # 连接最大生命周期（ms），建议小于 MySQL wait_timeout\n      keepalive-time: 60000        # 保活探测间隔（ms）\n```\n\n引入 `spring-boot-actuator` + `micrometer-registry-prometheus` 依赖后，HikariCP 会自动向 Prometheus 暴露以下指标：\n\n```\n# 活跃连接数（正在执行 SQL 的连接）\nhikaricp_connections_active{pool=\"HikariPool-main\"}\n\n# 空闲连接数（在池中等待被借用）\nhikaricp_connections_idle{pool=\"HikariPool-main\"}\n\n# 等待连接的请求数（pending 队列长度）\nhikaricp_connections_pending{pool=\"HikariPool-main\"}\n\n# 连接总数（= active + idle）\nhikaricp_connections{pool=\"HikariPool-main\"}\n\n# 连接超时总次数（累计计数器）\nhikaricp_connection_timeout_total{pool=\"HikariPool-main\"}\n\n# 连接获取耗时（histogram，单位秒）\nhikaricp_connection_acquisition_seconds_bucket{pool=\"HikariPool-main\", le=\"0.1\"}\n\n# 连接使用耗时（histogram）\nhikaricp_connection_usage_seconds_bucket{pool=\"HikariPool-main\"}\n```\n\n**GORM / Go 的 database/sql** 的指标通过标准库的 `db.Stats()` 方法获取，返回一个 `sql.DBStats` 结构体，包含了所有连接池状态信息：\n\n```go\npackage main\n\nimport (\n    \"database/sql\"\n    \"github.com/prometheus/client_golang/prometheus\"\n    \"github.com/prometheus/client_golang/prometheus/promauto\"\n    \"time\"\n)\n\n// 定义 Prometheus Gauge 指标\nvar (\n    dbOpenConnections = promauto.NewGauge(prometheus.GaugeOpts{\n        Name: \"db_open_connections\",\n        Help: \"当前数据库连接池中打开的连接总数（active + idle）\",\n    })\n    dbInUseConnections = promauto.NewGauge(prometheus.GaugeOpts{\n        Name: \"db_in_use_connections\",\n        Help: \"当前正在使用的连接数（active）\",\n    })\n    dbIdleConnections = promauto.NewGauge(prometheus.GaugeOpts{\n        Name: \"db_idle_connections\",\n        Help: \"当前空闲连接数\",\n    })\n    dbWaitCount = promauto.NewGauge(prometheus.GaugeOpts{\n        Name: \"db_wait_count_total\",\n        Help: \"等待连接的累计次数\",\n    })\n    dbWaitDuration = promauto.NewGauge(prometheus.GaugeOpts{\n        Name: \"db_wait_duration_seconds_total\",\n        Help: \"等待连接的累计耗时（秒）\",\n    })\n)\n\n// 启动一个 goroutine 定期采集并推送指标\nfunc StartDBMetricsCollector(db *sql.DB) {\n    go func() {\n        ticker := time.NewTicker(15 * time.Second) // 每 15 秒采集一次，与 Prometheus scrape 间隔对齐\n        for range ticker.C {\n            stats := db.Stats()\n            dbOpenConnections.Set(float64(stats.OpenConnections))\n            dbInUseConnections.Set(float64(stats.InUse))\n            dbIdleConnections.Set(float64(stats.Idle))\n            dbWaitCount.Set(float64(stats.WaitCount))\n            dbWaitDuration.Set(stats.WaitDuration.Seconds())\n        }\n    }()\n}\n```\n\n注意 Go 的 `database/sql` 本身没有「pending 连接数」这个直接指标，但 `WaitCount` 是累计等待次数，用 rate() 处理后得到每秒新增等待次数，效果等同于 HikariCP 的 `hikaricp_connections_pending` 趋势。对于 GORM，底层用的就是 `database/sql`，通过 `db.DB()` 拿到原始 `*sql.DB` 对象即可：\n\n```go\nsqlDB, err := gormDB.DB()\nif err == nil {\n    StartDBMetricsCollector(sqlDB)\n}\n```\n\n## 第四步：如何判断连接池「即将耗尽」—— Little's Law 定池大小\n\n连接池大小不是「越大越好」。很多人以为把 `maximum-pool-size` 调大就能解决超时问题，实际上可能适得其反：连接数越多，MySQL 端的线程调度开销越大，反而导致每条 SQL 的执行时间变长，整体吞吐量下降。\n\n合理的池大小应该用 **Little's Law** 来推算：`pool_size = concurrency × latency`。这里 `concurrency` 是单个 Pod 同时执行数据库操作的并发数，`latency` 是单次数据库操作的平均耗时（秒）。比如一个 Pod 的数据库并发为 10，平均 SQL 耗时 50ms（0.05s），那么池大小只需要 10 × 0.05 = 0.5，也就是 1 个连接就够了（极端例子）；如果 SQL 耗时 500ms，就需要 5 个连接。\n\n实际生产中，建议的告警规则如下，直接写成 Prometheus AlertingRules：\n\n```yaml\ngroups:\n  - name: database_connection_pool\n    rules:\n      # 告警1：有请求开始等待连接，预警级别\n      - alert: DBConnectionPoolPending\n        expr: hikaricp_connections_pending{pool=~\"HikariPool-.*\"} > 0\n        for: 1m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"连接池出现等待队列，pool={{ $labels.pool }}\"\n          description: \"pending 连接数 {{ $value }}，说明池已耗尽，请求开始排队。检查是否有慢查询或连接泄漏。\"\n\n      # 告警2：连接获取超时发生，紧急级别\n      - alert: DBConnectionTimeoutOccurred\n        expr: rate(hikaricp_connection_timeout_total[5m]) > 0\n        for: 1m\n        labels:\n          severity: critical\n        annotations:\n          summary: \"连接池超时告警，pool={{ $labels.pool }}\"\n          description: \"过去 5 分钟发生 {{ $value | humanizePercentage }} 次连接超时，用户请求已失败。\"\n\n      # 告警3：连接池利用率过高\n      - alert: DBConnectionPoolHighUtilization\n        expr: |\n          hikaricp_connections_active / (hikaricp_connections_active + hikaricp_connections_idle) > 0.85\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"连接池利用率超过 85%\"\n          description: \"利用率 {{ $value | humanizePercentage }}，建议检查是否需要扩大池大小或优化慢查询。\"\n\n      # Go 服务侧的等待告警\n      - alert: GoDBConnectionWaiting\n        expr: rate(db_wait_count_total[5m]) > 1\n        for: 2m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"Go 服务数据库连接等待频繁\"\n          description: \"每秒有 {{ $value }} 次连接等待发生，建议检查 database/sql 的 SetMaxOpenConns 配置。\"\n```\n\n## 第五步：连接泄漏检测\n\n连接泄漏（Connection Leak）是「active 连接数只升不降，但 SQL 早就执行完了」。典型场景是业务代码里用 `conn := db.Conn(ctx)` 手动获取连接后，没有在 defer 里调用 `conn.Close()`，或者事务开启后异常分支没有 Rollback。\n\nHikariCP 有内置的泄漏检测机制，通过 `leak-detection-threshold` 参数启用：\n\n```yaml\nspring:\n  datasource:\n    hikari:\n      leak-detection-threshold: 5000  # 单位 ms，连接被借出超过 5 秒还没归还，打印告警日志\n```\n\n日志中会出现：\n```\nWARN  HikariPool-main - Connection leak detection triggered for\ncom.zaxxer.hikari.pool.ProxyConnection@6e3c1e69, stack trace follows\n  at com.example.UserService.getUserById(UserService.java:42)\n  ...\n```\n\n直接定位到泄漏的调用栈。Go 侧可以通过监控 `db_open_connections` 是否持续增长（而 `db_idle_connections` 为 0）来间接判断泄漏，但没有像 HikariCP 这样精确的栈信息。建议在 Go 侧对所有 `db.Conn()` 的使用加上超时 Context，让空转连接自动 cancel。\n\n## 第六步：K8s 扩容对数据库连接总数的冲击\n\n这是一个经常被忽视的生产坑。假设你的每个 Pod 配置 `maximum-pool-size=20`，平时跑 10 个 Pod，数据库最多承受 200 条连接，完全没问题。但是当流量突增，HPA 把 Pod 从 10 个扩到 20 个，数据库需要承受的最大连接数就变成了 400 条。如果 MySQL 的 `max_connections=300`，新 Pod 的连接请求会直接被 MySQL 拒绝，报 `Too many connections`，而这时监控上只看到「Pod 数量增加」，完全感知不到数据库已经被撑爆。\n\n正确的计算方式是：**全局最大连接数 = max_pod_count × maximum_pool_size**，这个值必须小于 MySQL `max_connections` 并留出至少 20% 的余量（给 DBA 的管理工具、慢查询杀手等）。\n\n对应的 Prometheus 监控策略是在集群层面引入一条聚合告警：\n\n```yaml\n# 统计所有 Pod 的活跃连接总数，超过阈值告警\n- alert: TotalDBConnectionsNearLimit\n  expr: |\n    sum(hikaricp_connections_active) > 350  # MySQL max_connections=500 的 70%\n  for: 3m\n  labels:\n    severity: critical\n  annotations:\n    summary: \"集群总数据库连接数接近上限\"\n    description: \"当前所有 Pod 活跃连接总计 {{ $value }} 条，MySQL max_connections=500，扩容时存在打满风险。建议降低单 Pod 池大小或提升 MySQL max_connections。\"\n```\n\n更健壮的方案是引入 **PgBouncer 或 ProxySQL** 这类连接代理：所有 Pod 连接到代理，代理维护一个固定大小的真实连接池连接数据库。这样 K8s 扩容对数据库的连接压力就变成了「代理节点数 × 代理池大小」，而不是「Pod 数 × 应用池大小」，彻底解耦了应用弹性伸缩和数据库连接管理。\n\n## 小结：一张指标全景图\n\n建立完整的连接池监控，关键在于理解三个层次：**连接状态**（active/idle/pending）告诉你现在怎么样；**时间维度指标**（等待耗时、超时计数）告诉你用户感受到了什么；**全局视角指标**（集群总连接数、Pod 数 × 池大小）告诉你系统的安全边界在哪里。三个层次结合起来，才能在连接池问题从「偶发超时」演变成「全站不可用」之前，提前 10 分钟发出告警。",
+      "keyPoints": [
+        "连接池的三个核心状态是 active（执行中）、idle（空闲）和 pending（等待中），pending > 0 是最直接的耗尽预警信号，任何非零值都应触发告警",
+        "HikariCP 通过 Micrometer 原生暴露 hikaricp_connections_active、hikaricp_connections_pending、hikaricp_connection_timeout_total 等指标，需在 application.yml 中配置 pool-name 和引入 prometheus registry 依赖",
+        "Go 的 database/sql 通过 db.Stats() 返回 DBStats 结构体，包含 InUse、Idle、WaitCount、WaitDuration，需要业务侧起 goroutine 定期采集并注册为 Prometheus Gauge",
+        "用 Little's Law 推算合理池大小：pool_size = 并发数 × 平均 SQL 耗时（秒），而不是凭感觉往大调，池过大会加剧 MySQL 线程调度压力反而降低吞吐",
+        "HikariCP 的 leak-detection-threshold 配置（如 5000ms）可以在连接被借出超时未归还时打印调用栈，精准定位代码中未 close 的连接泄漏位置",
+        "连接获取等待时间（connection acquisition wait time）P99 是被忽视的延迟来源——用户感知的请求慢，可能大部分时间都在等连接，而不是 SQL 本身慢",
+        "K8s HPA 扩容会使集群总连接数 = max_pod_count × pool_size，必须建立集群级聚合告警确保不超过 MySQL max_connections 的 70~80%，否则扩容瞬间会触发 Too many connections",
+        "max-lifetime 必须小于 MySQL 的 wait_timeout（默认 28800 秒），否则长时间 idle 的连接会被 MySQL 单方面关闭，应用拿到死连接后报 driver: bad connection"
+      ],
+      "quiz": [
+        {
+          "id": "monitoring-q126-q1",
+          "question": "在连接池的状态模型中，「pending connections」代表什么含义？",
+          "choices": [
+            {"id": "A", "text": "已建立但尚未被任何请求使用的空闲连接"},
+            {"id": "B", "text": "正在执行 SQL 语句的活跃连接"},
+            {"id": "C", "text": "请求想要获取连接但池中已无空闲连接、正在排队等待的请求数"},
+            {"id": "D", "text": "正在被连接池回收销毁的连接"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "pending connections 代表「想借连接但借不到、正在排队等待」的请求数量，是连接池耗尽最直接的信号。A 选项描述的是 idle connections（空闲连接）。B 选项描述的是 active connections（活跃连接）。D 选项描述的是连接销毁过程，并不是一个标准的监控状态。pending > 0 意味着池子已经没有余量，此时任何一个持有连接的慢查询都会延长等待时间，容易引发级联超时。"
+        },
+        {
+          "id": "monitoring-q126-q2",
+          "question": "HikariCP 在 Spring Boot 项目中暴露 Prometheus 指标，需要哪个核心配置或依赖？",
+          "choices": [
+            {"id": "A", "text": "在 hikari 配置中设置 enable-prometheus: true 即可"},
+            {"id": "B", "text": "引入 micrometer-registry-prometheus 依赖，HikariCP 会自动通过 Micrometer 注册指标"},
+            {"id": "C", "text": "需要在代码中手动调用 HikariPool.exportMetrics() 方法"},
+            {"id": "D", "text": "HikariCP 不支持 Prometheus，只能通过 JMX 暴露指标"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "HikariCP 3.x 起原生集成 Micrometer，只需在项目中引入 micrometer-registry-prometheus 和 spring-boot-actuator 依赖，HikariCP 就会自动注册 hikaricp_connections_active、hikaricp_connections_pending 等指标到 Micrometer 的 MeterRegistry，并通过 /actuator/prometheus 端点暴露。A 选项中的 enable-prometheus 不是有效的 HikariCP 配置项。C 选项中并不存在 exportMetrics() 这样的方法，是虚构的 API。D 选项不正确，HikariCP 支持 Prometheus，尽管也支持 JMX。"
+        },
+        {
+          "id": "monitoring-q126-q3",
+          "question": "Go 的 database/sql 标准库中，db.Stats() 返回的 DBStats 里哪个字段可以反映「连接等待」情况？",
+          "choices": [
+            {"id": "A", "text": "DBStats.Pending，直接返回当前等待连接的 goroutine 数量"},
+            {"id": "B", "text": "DBStats.WaitCount，累计等待连接的总次数，结合 rate() 可得每秒等待频率"},
+            {"id": "C", "text": "DBStats.BlockCount，被阻塞的连接获取次数"},
+            {"id": "D", "text": "database/sql 没有等待相关的字段，需要用 OpenTelemetry 才能获取"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go 标准库 database/sql 的 DBStats 结构体中，WaitCount 是一个累计计数器，记录自连接池创建以来所有「等待空闲连接」的总次数；与之配套的 WaitDuration 记录累计等待总时长。通过 Prometheus 的 rate(db_wait_count_total[5m]) 可以计算出每秒新增等待次数，效果类似 HikariCP 的 pending 趋势。A 选项的 Pending 字段不存在于 DBStats 中。C 选项的 BlockCount 同样是虚构字段。D 选项不正确，标准库自带等待统计，不需要额外引入 OpenTelemetry。"
+        },
+        {
+          "id": "monitoring-q126-q4",
+          "question": "根据 Little's Law 推算连接池大小，公式 pool_size = concurrency × latency 中，latency 的单位是什么？",
+          "choices": [
+            {"id": "A", "text": "毫秒（ms）"},
+            {"id": "B", "text": "微秒（μs）"},
+            {"id": "C", "text": "秒（s）"},
+            {"id": "D", "text": "Little's Law 不适用于连接池，应该直接设置为 CPU 核数 × 2"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Little's Law 的标准形式是 L = λW，其中 L 是系统中的平均请求数（对应 pool_size），λ 是请求到达率（对应 concurrency，即每秒并发数），W 是请求在系统中的平均停留时间（对应 SQL 平均耗时，单位必须与 λ 匹配，即秒）。如果 concurrency=10（每秒），latency=0.05s（50ms），则 pool_size=0.5，向上取整为 1。如果 latency 用 ms（50ms），得到 pool_size=500，完全错误。D 选项「CPU 核数 × 2」是某些通用连接池经验值，并非 Little's Law 的推导，HikariCP 作者 Brett Wooldridge 明确反对这种做法并推荐用 Little's Law。"
+        },
+        {
+          "id": "monitoring-q126-q5",
+          "question": "以下是某服务的 HikariCP 指标快照：hikaricp_connections_active=18，hikaricp_connections_idle=0，hikaricp_connections_pending=5，maximum-pool-size=20。最可能的根因是什么？",
+          "choices": [
+            {"id": "A", "text": "数据库 CPU 使用率过高导致 SQL 执行变慢，连接被长时间占用"},
+            {"id": "B", "text": "连接池配置了过大的 minimum-idle，空闲连接消耗了过多资源"},
+            {"id": "C", "text": "Spring Boot 版本过低，HikariCP 指标采集存在 bug"},
+            {"id": "D", "text": "maximum-pool-size 设置过大，超过了 MySQL 的 max_connections 限制"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "从指标看：池子满了（active=18，idle=0，已接近 max=20），还有 5 个请求在排队等连接（pending=5）。这是典型的连接耗尽场景，最常见的原因是某些 SQL 执行时间变长（可能因为数据库负载高、出现慢查询或锁等待），导致连接被长时间占用无法归还，后续请求只能排队。B 选项描述的是 minimum-idle 过大的问题，但 idle=0 说明不是这个问题。C 选项是无关的 bug 猜测。D 选项描述方向相反——maximum-pool-size 过大才会超 MySQL 连接数上限，而题目场景是连接不够用，不是过大。"
+        },
+        {
+          "id": "monitoring-q126-q6",
+          "question": "HikariCP 的 max-lifetime 参数应该如何设置，以避免「driver: bad connection」报错？",
+          "choices": [
+            {"id": "A", "text": "设置为比 MySQL 的 wait_timeout 更大的值，确保连接可以长期保活"},
+            {"id": "B", "text": "设置为比 MySQL 的 wait_timeout 更小的值（如 wait_timeout=28800s，则 max-lifetime 设 1800s），让连接池主动淘汰旧连接"},
+            {"id": "C", "text": "将 max-lifetime 设置为 0（无限制），同时依靠 keepalive-time 来保持连接存活"},
+            {"id": "D", "text": "max-lifetime 只影响性能，与 bad connection 报错无关"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "MySQL 的 wait_timeout（默认 28800 秒，即 8 小时）会在连接长时间无活动后单方面关闭该连接，但应用侧的连接池并不知道这件事。下次借到这条被 MySQL 关闭的「死连接」时，执行 SQL 就会报 driver: bad connection 或 invalid connection。正确做法是让 max-lifetime 小于 MySQL 的 wait_timeout（留出一定余量），这样连接池会主动在 MySQL 关闭前就回收并重建连接。A 选项正好相反，会导致死连接问题。C 选项中 max-lifetime=0 虽然配合 keepalive 可以工作，但需要数据库允许长连接且 keepalive 配置正确，风险更高。D 选项不正确，max-lifetime 配置不当是 bad connection 的主要来源之一。"
+        },
+        {
+          "id": "monitoring-q126-q7",
+          "question": "为什么「把 maximum-pool-size 调大」不一定能解决连接池超时问题，有时反而会更糟？",
+          "choices": [
+            {"id": "A", "text": "HikariCP 有 bug，池大小超过 50 后指标采集会失效"},
+            {"id": "B", "text": "池越大，建立连接的 TCP 握手开销越高，导致总体延迟上升"},
+            {"id": "C", "text": "连接数越多，MySQL 端的线程调度和锁竞争开销越大，每条 SQL 执行时间反而变长，进一步加剧连接占用时间"},
+            {"id": "D", "text": "maximum-pool-size 是软限制，实际连接数不会超过 minimum-idle 的两倍"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是连接池调优最反直觉的点。MySQL 内部每个连接对应一个线程，线程数越多，操作系统的上下文切换开销和 MySQL 内部的锁竞争就越大。HikariCP 作者 Brett Wooldridge 的压测数据显示，一个 16 核服务器上，100 个连接的 TPS 有时低于 10 个连接的 TPS，因为大量线程在争抢同一个资源（如 InnoDB buffer pool latch）。正确做法是先排查慢查询、连接泄漏或热点锁，优化根因，而不是简单扩大池。A 选项是虚构的 bug。B 选项中建立连接的开销在连接池场景下是一次性的，不是持续开销。D 选项对 maximum-pool-size 的描述完全错误。"
+        },
+        {
+          "id": "monitoring-q126-q8",
+          "question": "某 K8s 集群的 Java 服务，每个 Pod 配置 maximum-pool-size=25，MySQL max_connections=300。当 HPA 把 Pod 从 8 个扩到 15 个时，可能出现什么问题？",
+          "choices": [
+            {"id": "A", "text": "新 Pod 启动的连接会把旧 Pod 的连接挤掉，导致旧 Pod 报 bad connection"},
+            {"id": "B", "text": "15 × 25 = 375 条连接超过了 MySQL 的 max_connections=300，新 Pod 的连接请求会被 MySQL 拒绝，报 Too many connections"},
+            {"id": "C", "text": "HPA 扩容时会自动降低每个 Pod 的 maximum-pool-size，确保总连接数不超限"},
+            {"id": "D", "text": "不会出现问题，MySQL 的 max_connections 是建议值，不是硬限制"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是生产中非常真实的 K8s 扩容陷阱。8 Pod 时最大连接 8×25=200，远小于 300，一切正常。HPA 扩容到 15 Pod 时，理论最大连接 15×25=375，超过 MySQL 的硬限制 300。新 Pod 在初始化连接池时会向 MySQL 申请 minimum-idle 数量的连接，当全局连接数超过 max_connections，MySQL 直接返回「ERROR 1040 (HY000): Too many connections」，新 Pod 的连接池初始化失败，服务健康检查不通过，导致扩容反而让服务更不稳定。A 选项中 MySQL 不存在「挤掉」机制。C 选项中 HPA 完全不感知数据库连接数，不会做这种自动调整。D 选项中 max_connections 是 MySQL 的硬限制，超过后严格拒绝新连接。"
+        },
+        {
+          "id": "monitoring-q126-q9",
+          "question": "HikariCP 的 leak-detection-threshold 参数设置为 5000（ms），它的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "当连接池利用率超过 5000ms 的滑动窗口平均值时，触发连接扩容"},
+            {"id": "B", "text": "当一条连接被借出超过 5000ms 还未归还时，打印包含调用栈的 WARN 日志，帮助定位连接泄漏代码"},
+            {"id": "C", "text": "当等待连接时间超过 5000ms 时，抛出异常并关闭整个连接池"},
+            {"id": "D", "text": "设置连接泄漏检测的采样率，5000 表示每 5000 次连接借用检查一次"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "leak-detection-threshold 是 HikariCP 内置的连接泄漏检测机制。它的原理是：每次连接被借出时，HikariCP 会同时启动一个延迟任务；如果这条连接在 threshold 时间内没有归还，延迟任务就触发，打印一条包含完整 Java 调用栈的 WARN 日志，栈信息指向借出这条连接的代码位置。这样工程师可以直接定位到哪个方法忘了 close 连接，而不需要盲目翻代码。建议生产环境设置为 2000~5000ms（略大于最慢的正常 SQL 执行时间）。A 和 D 选项对这个参数的描述是完全虚构的。C 选项描述的是 connection-timeout 参数的行为，不是 leak-detection-threshold。"
+        },
+        {
+          "id": "monitoring-q126-q10",
+          "question": "监控显示某 Go 服务的 db_open_connections 从 10 慢慢涨到了 80（max=100），而 db_idle_connections 始终接近 0，db_in_use_connections 与 db_open_connections 基本相等，但业务 QPS 没有明显增长。最可能的原因是什么，应该如何排查？",
+          "choices": [
+            {"id": "A", "text": "数据库连接数正常增长反映真实业务并发，db_idle 接近 0 是连接池配置合理的表现"},
+            {"id": "B", "text": "可能发生了连接泄漏：业务代码获取连接后没有正确 close，连接数持续增长但没有对应的业务流量"},
+            {"id": "C", "text": "SetMaxOpenConns 配置过小导致连接不足，应该提高上限"},
+            {"id": "D", "text": "database/sql 的 SetConnMaxLifetime 未配置，导致连接无法被回收"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "关键异常信号是「连接数持续增长 + 几乎全部 in-use + QPS 未增长」，这三者同时出现是连接泄漏的经典特征。正常情况下，业务流量没增长，活跃连接数不该持续上涨；而 idle≈0 说明连接回到池中后立刻又被借走，但 QPS 不高说明不是真实并发导致的。排查步骤：首先用 `go tool pprof` 抓 goroutine profile，查找是否有大量 goroutine 阻塞在 db 相关调用；其次全局搜索代码中 db.Conn()、db.Begin() 的调用，确认所有路径都有对应的 Close() 或 Rollback()；最后增加泄漏检测：设置 db.SetConnMaxLifetime 强制回收老连接，观察是否能压制增长。A 选项忽略了 QPS 未增长这个关键矛盾点。C 选项逻辑相反，是连接不够时的解法。D 选项的 SetConnMaxLifetime 未配置会导致连接不被回收，但主要表现是连接数卡在上限不减，而不是持续增长超过 max。"
+        }
+      ],
+      "references": [
+        {
+          "title": "HikariCP GitHub - About Pool Sizing",
+          "url": "https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing"
+        },
+        {
+          "title": "Go database/sql — DBStats documentation",
+          "url": "https://pkg.go.dev/database/sql#DBStats"
+        },
+        {
+          "title": "HikariCP Configuration — leak-detection-threshold",
+          "url": "https://github.com/brettwooldridge/HikariCP#gear-configuration-knobs-baby"
+        },
+        {
+          "title": "Little's Law — Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Little%27s_law"
+        },
+        {
+          "title": "Prometheus Alerting Rules Best Practices",
+          "url": "https://prometheus.io/docs/practices/alerting/"
+        }
+      ]
+    }
+  ]
+}
