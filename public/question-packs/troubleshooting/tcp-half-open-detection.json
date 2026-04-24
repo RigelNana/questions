@@ -1,0 +1,158 @@
+{
+  "id": "tcp-half-open-detection",
+  "name": "TCP 半开连接的检测与处理",
+  "domain": "troubleshooting",
+  "description": "TCP 半开连接的产生原因、检测机制与连接池有效性验证的最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "tcp-half-open-detection-1",
+      "domain": "troubleshooting",
+      "type": "concept",
+      "difficulty": 3,
+      "tags": ["tcp", "keepalive", "connection-pool", "network", "linux", "sockets"],
+      "title": "什么是 TCP 半开连接？连接池为什么会拿到一个「死」连接？如何防范？",
+      "content": "你的服务用了数据库连接池，配置了最大连接数 50，最小空闲连接 10。某个周一早晨，夜间维护窗口刚结束，数据库服务器做了一次重启。前几分钟一切正常，但随后监控开始报警：大量请求的 P99 延迟从 5ms 飙升到 30s，最终触发超时错误。日志里出现两种截然不同的错误信息——\n\n```\n# 部分请求立即失败\n[ERROR] dial tcp 10.0.1.20:5432: read: connection reset by peer\n\n# 另一部分请求挂起后超时\n[ERROR] context deadline exceeded (30s)\n```\n\n第一种错误好理解，但第二种更让人困惑：连接明明「存在」，为什么发出去的查询永远等不到响应？\n\n排查了 10 分钟之后你发现了关键线索：连接池里那 10 条空闲连接，是在数据库重启**之前**建立的。数据库重启时操作系统内核清理了所有 TCP 状态，但你的应用进程完全不知道这件事——它仍然认为这些连接是活的，可以随时拿来用。\n\n这就是 TCP 半开连接（Half-Open Connection）最典型的触发场景。面试中，当面试官问「连接池为什么会拿到死连接」时，他其实在考你：**TCP 是全双工的，但连接状态是双方独立维护的，当一方悄悄「消失」时，另一方无法自动感知。**\n\n现在，请你回答：\n\n1. TCP 半开连接的准确定义是什么？它与 TCP 半关闭连接（Half-Closed）有什么本质区别？\n2. 操作系统层面的 TCP keepalive 机制是如何检测半开连接的？`tcp_keepalive_time`、`tcp_keepalive_intvl`、`tcp_keepalive_probes` 三个内核参数分别控制什么？\n3. 仅靠 TCP keepalive 够用吗？连接池应该如何做有效性检测？\n4. 收到 RST 和永久无响应，背后的原因有什么不同？",
+      "answer": "## 从一个连接的「消失」开始\n\nTCP 连接的状态是由通信双方各自独立维护的。当你的应用服务器与数据库服务器之间建立一条 TCP 连接时，双方各自的内核都保存了一个 `tcp_sock` 结构体，记录了序号、窗口大小、连接状态（`ESTABLISHED`）等信息。正常情况下，断开连接要走四次挥手——双方各发一个 FIN，各回一个 ACK，最终两边的状态机都切换到 `CLOSED`，内核释放资源。\n\n问题在于，四次挥手是理想情况。当数据库服务器突然断电、进程被 kill -9 杀死、或者系统管理员执行了 `systemctl restart postgresql` 时，内核来不及发送 FIN。服务器端的 TCP 连接在操作系统重启后直接消失了，什么通知都没给对端发出去。此时你的应用服务器端，那个连接依然处于 `ESTABLISHED` 状态，等待着一个永远不会来的对端。这就是 **TCP 半开连接（Half-Open Connection）**：连接的一端认为连接仍然存在，而另一端已经完全忘记了这条连接。\n\n要注意与半开连接容易混淆的一个概念：**TCP 半关闭（Half-Closed Connection）**。半关闭是正常的协议行为——一方发送了 FIN 表示「我不再发送数据了」，进入 `FIN_WAIT_1` 状态，但此时它仍然可以接收数据；对端收到 FIN 后进入 `CLOSE_WAIT`，可以继续向前者发数据，直到自己也准备好关闭。HTTP/1.1 的 `Connection: close` 场景、curl 下载大文件时的状态，都可能观察到半关闭。半关闭是**有计划的、双方都知情的**状态；而半开连接是**意外发生的、只有一端不知情的**状态，这是两者的本质区别。\n\n## 半开连接的三大产生场景\n\n半开连接在生产环境中有三种最常见的触发路径，了解这三种场景对排查问题至关重要。\n\n第一种是**对端进程/主机崩溃**，也就是本题开头的场景。服务端进程崩溃或机器重启，没有发送 FIN，客户端连接池里的连接变成半开连接。下次从连接池取出这条连接发送数据时，如果服务端已经重启并且监听了同一个端口，内核会收到一个序号不在任何已知连接窗口内的数据包，于是**立即回复 RST**，客户端会收到 `connection reset by peer` 错误——这就是日志里第一种错误的来源，它反而是「好」的情况，因为至少快速失败了。\n\n第二种是**网络中断后恢复**。比如客户端和服务端之间的交换机故障了 10 分钟又恢复了。这段时间内双方的连接状态机没有变化（没有收到 RST 或 FIN），连接看起来还「活着」。网络恢复后，如果这条连接静默已久，也许服务端的某个负载均衡器或防火墙早已把这条连接的 NAT 映射给删除了，此时客户端发数据，包根本到不了服务端，客户端会一直等，直到超时——这就是第二种错误（挂起后 deadline exceeded）的来源。\n\n第三种是 **NAT 超时**，这是云环境中最常见、也最难被意识到的场景。云厂商的 NAT 网关（AWS NAT Gateway、GCP Cloud NAT）以及几乎所有硬件防火墙，都有空闲连接超时机制。AWS NAT Gateway 的 TCP 空闲超时默认是 **350 秒**，阿里云 SLB 是 **900 秒**。如果你的连接在空闲超时后既没有数据流量，也没有 keepalive 探针，NAT 网关会直接把这条连接的映射条目删掉，但不会通知任何一方。之后客户端再往这个连接发数据，包会在 NAT 网关处被静默丢弃，客户端依然认为连接是好的。\n\n## TCP Keepalive：内核级别的心跳\n\n解决半开连接的第一道防线是 TCP keepalive 机制，它工作在操作系统内核层面，应用程序本身不需要修改任何逻辑。当一个 socket 的 `SO_KEEPALIVE` 选项被开启后，内核会在连接空闲超过 `tcp_keepalive_time` 秒后，开始周期性地发送 TCP keepalive 探针——这是一个没有数据载荷的 ACK 包，对端必须回复。\n\nLinux 的三个关键内核参数控制 keepalive 的行为：\n\n```bash\n# 查看当前值\nsysctl net.ipv4.tcp_keepalive_time    # 默认 7200（秒），即 2 小时\nsysctl net.ipv4.tcp_keepalive_intvl   # 默认 75（秒），探针间隔\nsysctl net.ipv4.tcp_keepalive_probes  # 默认 9，失败次数上限\n\n# 生产环境推荐配置（写入 /etc/sysctl.conf 持久化）\nnet.ipv4.tcp_keepalive_time = 60      # 空闲 60 秒后开始探测\nnet.ipv4.tcp_keepalive_intvl = 10     # 每 10 秒发一次探针\nnet.ipv4.tcp_keepalive_probes = 3     # 连续 3 次失败则判定连接死亡\n\n# 立即生效\nsysctl -p\n```\n\n`tcp_keepalive_time` 的含义是：连接**连续空闲**多少秒后，内核才开始发送第一个 keepalive 探针。默认值 7200 秒（2 小时）在生产环境几乎等于没用——AWS NAT Gateway 350 秒就超时了，2 小时后才开始探测根本来不及。所以必须把这个值改成远小于 NAT 超时的数值，60 秒是比较合理的选择。\n\n`tcp_keepalive_intvl` 是探针发送间隔，`tcp_keepalive_probes` 是连续失败多少次才宣判连接死亡。所以完整的判定时间是 `tcp_keepalive_time + tcp_keepalive_intvl × tcp_keepalive_probes`，按推荐配置计算就是 `60 + 10 × 3 = 90` 秒，服务端挂掉后最多 90 秒内客户端就能感知到。\n\n应用程序开启 `SO_KEEPALIVE` 的方式：\n\n```python\nimport socket\n\nsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\nsock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)\n# 以下三个选项覆盖系统默认值，只对这个 socket 生效（Linux 专有）\nsock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)    # 等同于 tcp_keepalive_time\nsock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)   # 等同于 tcp_keepalive_intvl\nsock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)      # 等同于 tcp_keepalive_probes\n```\n\n## 仅靠 TCP Keepalive 还不够\n\n掌握了 TCP keepalive 之后，很多工程师会误以为只要开了 keepalive 就万事大吉。但有两个重要的局限性必须了解。\n\n第一，**TCP keepalive 探针不经过应用层**。keepalive 是纯内核行为，它只能验证「底层 TCP 通路是否畅通」，无法验证「应用程序是否正常工作」。服务端 Java 进程发生了死锁，TCP 连接还是 ESTABLISHED，keepalive 探针也能正常往返，但你发过去的真实请求会永远阻塞在服务端的请求队列里。\n\n第二，**keepalive 有感知延迟**。按上面的配置，最坏情况要 90 秒才能检测到死连接。在这 90 秒内，如果你的连接池把一条半开连接分配给了请求，这个请求只能等到 `context deadline exceeded`。\n\n所以正确的防御策略是**两层并行**：TCP keepalive 负责后台持续探测，连接池负责借出时主动验证。\n\n## 连接池的有效性检测\n\n主流连接池框架都提供了两种验证策略，通常需要同时配置：\n\n**test-on-borrow（借出前验证）**：每次从连接池取出连接时，先执行一个轻量查询（数据库常用 `SELECT 1`，Redis 用 `PING`）验证连接是否有效。有效则返回给调用方，无效则丢弃并重建。这是最可靠的方式，但每次借出都有额外 RTT 开销。对低延迟敏感的场景，可以改用 `testWhileIdle`（空闲时后台验证）降低借出时的开销。\n\n**validate-on-return（归还时验证）**：连接归还连接池时检查是否有效，无效直接丢弃不放回池中。这可以防止坏连接被下一个请求取到，但不能应对连接在空闲期间变坏的情况。\n\n以 HikariCP（Java 生态最流行的连接池）为例：\n\n```yaml\n# application.yaml\nspring:\n  datasource:\n    hikari:\n      # 连接的最大存活时间，比 NAT 超时短，强制定期重建连接\n      max-lifetime: 1800000        # 30 分钟（毫秒）\n      # 连接在池中空闲超过此时间，发送 keepalive 查询\n      keepalive-time: 30000        # 30 秒\n      # 借出前验证（轻量）\n      connection-test-query: SELECT 1\n      # 连接验证超时\n      validation-timeout: 3000     # 3 秒\n      # 空闲连接超时后释放（避免堆积半开连接）\n      idle-timeout: 600000         # 10 分钟\n```\n\n`max-lifetime` 是关键配置，它强制所有连接在固定时间后主动重建，彻底消灭因 NAT 超时产生的半开连接风险，而不是依赖检测去发现。**主动防御永远比被动检测更可靠。**\n\nGo 的 `database/sql` 标准库也提供了等效配置：\n\n```go\ndb, err := sql.Open(\"postgres\", dsn)\nif err != nil {\n    log.Fatal(err)\n}\n// 连接最大存活时间，务必小于 NAT 超时\ndb.SetConnMaxLifetime(25 * time.Minute)\n// 连接最大空闲时间（Go 1.15+），空闲太久的连接主动释放\ndb.SetConnMaxIdleTime(5 * time.Minute)\n// 最大空闲连接数\ndb.SetMaxIdleConns(10)\n// 最大连接数\ndb.SetMaxOpenConns(50)\n```\n\n## 扩展：gRPC 的 Keepalive 与云环境实践\n\ngRPC 服务在云环境里是半开连接的重灾区，因为 gRPC 默认使用 HTTP/2 长连接，一条连接可能存活数小时。gRPC 提供了应用层的 keepalive 配置，独立于 TCP keepalive：\n\n```go\nimport \"google.golang.org/grpc/keepalive\"\n\nconn, err := grpc.Dial(\n    addr,\n    grpc.WithKeepaliveParams(keepalive.ClientParameters{\n        // 连接空闲 20 秒后发送 HTTP/2 PING 帧\n        Time:                20 * time.Second,\n        // PING 超时时间\n        Timeout:             5 * time.Second,\n        // 即使没有活跃 RPC 也发送 PING（穿透 NAT）\n        PermitWithoutStream: true,\n    }),\n)\n```\n\n`PermitWithoutStream: true` 这个配置非常重要。默认情况下 gRPC 只在有活跃 RPC 调用时才发 PING，但此时连接早已被 NAT 遗忘了。开启这个选项后，即使连接空闲，也会定期发送 HTTP/2 PING 帧，既检测了连接有效性，也给 NAT 网关「续命」。\n\n不同云厂商的负载均衡器空闲超时各不相同，这个差异直接影响你的 keepalive 参数选择：AWS NLB 默认 350 秒，AWS ALB 默认 60 秒，GCP HTTPS LB 默认 600 秒，阿里云 SLB 默认 900 秒。keepalive 的间隔必须**小于**这些值，否则等于没开。\n\n最后一个生产经验值得特别强调：在排查半开连接问题时，`ss -tn state ESTABLISHED` 加上 `netstat -an` 是你的第一步，查看本地处于 ESTABLISHED 状态但长时间没有流量的连接。如果你看到大量这样的连接，且对端已经不可达，基本可以确认是半开连接堆积。此时临时的解决方案是重启应用（清空连接池），长期方案是按本文的配置修正 keepalive 和连接池参数。",
+      "keyPoints": [
+        "TCP 半开连接是指连接的一端（通常是客户端/连接池）仍处于 ESTABLISHED 状态，而另一端（服务端）因崩溃、重启或 NAT 超时已经不再知道这条连接的存在，双方状态不一致。",
+        "半开连接与半关闭连接（Half-Closed）有本质区别：半关闭是正常的 TCP 单向关闭流程，双方都知情且可以继续接收数据；半开连接是意外产生的，只有一端不知情。",
+        "服务端重启后，若客户端从连接池取出旧连接发送数据，如果服务端端口已恢复监听，内核会因序号不匹配而回复 RST，客户端立即报错；若服务端未恢复或 NAT 映射已删除，数据包被静默丢弃，客户端只能等到超时。",
+        "NAT 网关空闲超时是云环境中半开连接最常见的成因，AWS NAT Gateway 默认 350 秒、AWS ALB 默认 60 秒，连接池的 max-lifetime 和 keepalive 间隔必须均小于这些值才能有效防护。",
+        "Linux 内核的 tcp_keepalive_time 默认值为 7200 秒（2 小时），在云环境中几乎无效，生产环境应将其调整为 60 秒左右，并相应配置 tcp_keepalive_intvl=10 和 tcp_keepalive_probes=3，使检测延迟缩短到 90 秒以内。",
+        "TCP keepalive 仅验证底层 TCP 通路是否畅通，无法验证应用层是否正常响应，因此连接池的 test-on-borrow（借出前执行 SELECT 1 / PING）是必要的应用层补充。",
+        "主动防御优于被动检测：连接池的 max-lifetime 参数强制所有连接定期重建，彻底避免长寿命连接因 NAT 超时变成半开连接，比依赖 keepalive 检测更可靠。",
+        "gRPC 长连接场景必须开启应用层 keepalive 并设置 PermitWithoutStream: true，确保在没有活跃 RPC 调用时也能定期发送 HTTP/2 PING 帧穿透 NAT 网关。"
+      ],
+      "quiz": [
+        {
+          "id": "tcp-half-open-detection-q1",
+          "question": "以下哪种描述最准确地定义了 TCP 半开连接（Half-Open Connection）？",
+          "choices": [
+            { "id": "A", "text": "连接的一端已发送 FIN 但尚未收到对端的 FIN，处于单向关闭状态" },
+            { "id": "B", "text": "连接的一端认为连接仍处于 ESTABLISHED 状态，而另一端已因崩溃或重启完全丢失了该连接的状态" },
+            { "id": "C", "text": "连接处于 SYN_SENT 状态，三次握手尚未完成" },
+            { "id": "D", "text": "连接的双方都处于 TIME_WAIT 状态，等待最终关闭" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "TCP 半开连接的核心特征是「一端有，另一端无」的状态不一致。A 选项描述的是半关闭（Half-Closed）连接，是正常的协议状态，双方都知情；C 描述的是握手未完成的半连接（SYN 泛洪攻击也会制造大量这种状态）；D 描述的是正常四次挥手的最终等待阶段，两端都知道连接在关闭。只有 B 精确描述了「意外产生、单边不知情」的半开连接特征。"
+        },
+        {
+          "id": "tcp-half-open-detection-q2",
+          "question": "客户端从连接池取出一条旧连接向已重启的服务端发送查询，最可能出现哪种情况？",
+          "choices": [
+            { "id": "A", "text": "服务端重启后内核会向所有旧连接发送 FIN，客户端会提前感知到连接已断开" },
+            { "id": "B", "text": "如果服务端重启后端口已重新监听，内核会因序号不匹配回复 RST，客户端立即收到 connection reset 错误" },
+            { "id": "C", "text": "服务端会将数据放入缓冲区等待旧连接的重传，最终数据会被处理" },
+            { "id": "D", "text": "客户端操作系统会检测到对端不可达，自动重建连接并重发数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "服务端重启时操作系统来不及发送 FIN，所以 A 错误。重启后如果同一端口重新开始监听，新的内核对旧连接一无所知。当客户端发来的数据包到达时，内核发现其序号不属于任何已知连接，会立即回复 RST 数据包。客户端收到 RST 后触发 `connection reset by peer` 错误，这是快速失败的场景。C 和 D 描述的都是不存在的行为——TCP 没有自动重连机制，这是应用层的责任。"
+        },
+        {
+          "id": "tcp-half-open-detection-q3",
+          "question": "Linux 内核参数 tcp_keepalive_time 的默认值是多少？为什么在云环境中这个默认值是危险的？",
+          "choices": [
+            { "id": "A", "text": "默认 300 秒（5 分钟），可能导致断开检测过于频繁，增加网络开销" },
+            { "id": "B", "text": "默认 7200 秒（2 小时），远超 AWS NAT Gateway 350 秒等云环境 NAT 超时，导致 keepalive 探针在 NAT 条目已消失后才开始发送" },
+            { "id": "C", "text": "默认 3600 秒（1 小时），在大多数云环境中已经足够，不需要调整" },
+            { "id": "D", "text": "默认 60 秒，在云环境中可能过于激进，增加不必要的探针流量" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "tcp_keepalive_time 的真实默认值是 7200 秒即 2 小时，这是很多工程师不知道的事实。AWS NAT Gateway 的 TCP 空闲超时是 350 秒，AWS ALB 更是只有 60 秒，阿里云 SLB 是 900 秒。2 小时后才开始发第一个 keepalive 探针，意味着在探针发出前 NAT 映射早已被删除。生产环境应将其改为 60 秒甚至更短，使 keepalive 间隔小于所有中间设备的空闲超时，这样探针才能真正起到「保活」和「检测」的双重作用。"
+        },
+        {
+          "id": "tcp-half-open-detection-q4",
+          "question": "以下关于 tcp_keepalive_time、tcp_keepalive_intvl、tcp_keepalive_probes 三个参数的描述，哪一项是正确的？",
+          "choices": [
+            { "id": "A", "text": "tcp_keepalive_time 是两次探针之间的间隔，tcp_keepalive_intvl 是开始探测前的空闲等待时间" },
+            { "id": "B", "text": "连接被判定为死亡的最长时间是 tcp_keepalive_time + tcp_keepalive_intvl × tcp_keepalive_probes" },
+            { "id": "C", "text": "tcp_keepalive_probes 是探针总发送次数，而不是连续失败次数，只要有一次成功则从头开始计数" },
+            { "id": "D", "text": "这三个参数是全局生效的，无法针对单个 socket 单独配置" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "三个参数的关系是：首先等待 tcp_keepalive_time 秒的空闲时间再发第一个探针，之后每隔 tcp_keepalive_intvl 秒发一次，连续 tcp_keepalive_probes 次收不到响应则认为连接死亡。所以总检测时间是 time + intvl × probes，选 B 正确。A 把两个参数的定义搞反了。C 的描述不准确，probes 确实是连续失败次数。D 是错的，Linux 上可以通过 TCP_KEEPIDLE、TCP_KEEPINTVL、TCP_KEEPCNT socket 选项针对单个连接覆盖系统默认值。"
+        },
+        {
+          "id": "tcp-half-open-detection-q5",
+          "question": "观察以下两条错误日志，哪种推断最符合实际情况？\n```\n# 错误 1（立即出现）\nread: connection reset by peer\n\n# 错误 2（约 30 秒后出现）\ncontext deadline exceeded\n```",
+          "choices": [
+            { "id": "A", "text": "错误 1 说明服务端主动关闭了连接；错误 2 说明客户端网络有问题" },
+            { "id": "B", "text": "错误 1 说明服务端已重启且端口重新监听，内核因序号不匹配回复了 RST；错误 2 说明数据包被中途（如 NAT）静默丢弃，客户端无法得知对端状态" },
+            { "id": "C", "text": "两种错误都是由客户端的 TCP keepalive 探针超时引起的" },
+            { "id": "D", "text": "错误 1 是正常的四次挥手触发的；错误 2 是服务端响应慢导致的业务超时" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这两种错误模式在排查半开连接时极具诊断价值。RST 是内核级别的拒绝信号，出现在对端已重启且端口重新监听的情况，内核对不认识的连接直接 reset。而静默丢弃（silent drop）发生在 NAT 映射已消失、防火墙规则拦截、或服务端进程挂死但 TCP 连接还活着等场景——数据包发出去没有任何响应，只能等到应用层超时。判断这两种错误是定位半开连接根因的第一步，RST 和 timeout 的排查方向截然不同。"
+        },
+        {
+          "id": "tcp-half-open-detection-q6",
+          "question": "一个工程师声称：「只要开了 TCP keepalive，连接池就不需要再做 test-on-borrow 了。」这个说法有什么问题？",
+          "choices": [
+            { "id": "A", "text": "这个说法完全正确，TCP keepalive 能检测所有类型的连接失效" },
+            { "id": "B", "text": "TCP keepalive 只检测底层 TCP 通路是否畅通，无法检测应用层故障（如数据库进程死锁、服务端线程池耗尽），且 keepalive 有检测延迟，在延迟期内死连接仍可能被分配给请求" },
+            { "id": "C", "text": "TCP keepalive 比 test-on-borrow 更可靠，因为它在内核层运行，不依赖应用层" },
+            { "id": "D", "text": "test-on-borrow 本来就是多余的，连接池自身会维护连接健康状态" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "TCP keepalive 是内核级别的探测，它只能验证「TCP 连接的字节流通路是否畅通」，本质上等价于发了一个空 ACK 并等待对端响应。但应用层的健康完全不在其检测范围内：数据库进程因死锁无法处理新请求，但 TCP 连接的 keepalive 探针会被内核正常回复；服务端线程池耗尽时同样如此。更重要的是，即使 keepalive 最终能检测到死连接，按推荐配置也需要最多 90 秒，这段时间内死连接可能已经被分配出去并造成请求失败。test-on-borrow 是应用层的补充防线，两者各司其职，不可相互替代。"
+        },
+        {
+          "id": "tcp-half-open-detection-q7",
+          "question": "以下哪种连接池配置策略对防范 NAT 超时导致的半开连接最有效？",
+          "choices": [
+            { "id": "A", "text": "增大最大连接数，使每个请求都能分配到新连接而不需要复用" },
+            { "id": "B", "text": "将 max-lifetime 设置为小于 NAT 超时的值（如 25 分钟），强制所有连接定期重建，从源头消灭长寿命连接" },
+            { "id": "C", "text": "只配置 test-on-borrow，每次借出时执行 SELECT 1 验证即可" },
+            { "id": "D", "text": "禁用连接复用，改为每次请求都创建新连接、用完即关" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "主动防御优于被动检测——这是连接池配置的核心原则。max-lifetime 设置连接的最大存活时间，到期后连接池主动关闭并重建连接，彻底避免连接寿命超过 NAT 超时的可能性。这是从根源上消除问题，而不是等问题出现再检测。A 选项增大连接数治标不治本。C 选项 test-on-borrow 虽然有效但有每次借出的 RTT 开销，且对长时间空闲后才被使用的连接有效，不如 max-lifetime 来得彻底。D 选项放弃连接复用在高并发场景下会导致频繁的 TCP 握手，性能极差。"
+        },
+        {
+          "id": "tcp-half-open-detection-q8",
+          "question": "一个 gRPC 服务部署在 AWS，经过 ALB（Application Load Balancer）暴露给客户端。客户端使用长连接，夜间流量低谷时频繁出现 `transport: Error while dialing` 错误。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "gRPC 不支持经过 ALB 转发，需要改用 NLB" },
+            { "id": "B", "text": "AWS ALB 的 TCP 空闲超时默认为 60 秒，夜间低流量时连接空闲超过此值后 ALB 强制关闭连接，但客户端不知情，下次使用时触发半开连接错误" },
+            { "id": "C", "text": "gRPC 使用 HTTP/2，ALB 不支持 HTTP/2 协议" },
+            { "id": "D", "text": "夜间服务端资源不足，主动拒绝了新连接" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是生产环境中 gRPC 经过 ALB 时的经典问题。AWS ALB 的空闲超时默认只有 60 秒，而 NLB 是 350 秒。夜间流量低谷时，长连接可能超过 60 秒没有数据流量，ALB 会单方面发送 FIN/RST 关闭连接，但如果客户端没有及时感知，下次使用时就会遇到半开连接。解决方案是在 gRPC 客户端配置 keepalive，将 Time 设为 30-50 秒（小于 60 秒），并开启 PermitWithoutStream: true。ALB 确实支持 HTTP/2（gRPC 正是基于此），所以 A 和 C 是错误的。"
+        },
+        {
+          "id": "tcp-half-open-detection-q9",
+          "question": "在 Linux 上，可以针对单个 socket 覆盖系统级 tcp_keepalive_time 默认值的 socket 选项是？",
+          "choices": [
+            { "id": "A", "text": "SO_KEEPALIVE（设置为探测间隔秒数）" },
+            { "id": "B", "text": "TCP_KEEPIDLE（在 IPPROTO_TCP 层设置，只影响该 socket）" },
+            { "id": "C", "text": "TCP_NODELAY（禁用 Nagle 算法同时控制 keepalive 间隔）" },
+            { "id": "D", "text": "SO_TIMEOUT（设置 socket 的全局超时包含 keepalive）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "在 Linux 上，SO_KEEPALIVE 是一个布尔选项，只控制是否开启 keepalive，设置为 1 表示开启，不接受时间参数。要针对单个 socket 覆盖系统级参数，需要在 IPPROTO_TCP 协议层分别设置三个选项：TCP_KEEPIDLE（对应 tcp_keepalive_time）、TCP_KEEPINTVL（对应 tcp_keepalive_intvl）、TCP_KEEPCNT（对应 tcp_keepalive_probes）。TCP_NODELAY 用于禁用 Nagle 算法，与 keepalive 无关。SO_TIMEOUT 是 Java 的抽象概念，Linux socket API 没有这个选项（对应的是 SO_RCVTIMEO 和 SO_SNDTIMEO）。"
+        },
+        {
+          "id": "tcp-half-open-detection-q10",
+          "question": "线上服务凌晨 3 点开始大量报错 `connection reset by peer`，早晨 8 点恢复正常。监控显示数据库在凌晨 2:50 做了一次例行重启（耗时约 30 秒）。以下排查步骤中，哪个最有助于确认问题根因并制定长期方案？",
+          "choices": [
+            { "id": "A", "text": "重启应用服务，清空连接池，等待问题自行恢复" },
+            { "id": "B", "text": "检查连接池的 max-lifetime 配置，对比其与数据库重启前连接存活时长；同时检查 tcp_keepalive_time 是否大于数据库重启窗口；最终将 max-lifetime 调短并开启连接池 keepalive 查询" },
+            { "id": "C", "text": "增加数据库只读副本，把读流量分散到多个节点，降低单点故障影响" },
+            { "id": "D", "text": "修改应用代码，捕获 connection reset 错误后自动重试一次" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "问题的根因是连接池在数据库重启前建立的连接变成了半开连接，重启后第一批使用这些连接的请求都收到 RST。仅重启应用（A）是临时解决方案，治标不治本。增加只读副本（C）是横向扩展，与半开连接问题无关。自动重试（D）可以掩盖错误但不解决根因，且在非幂等操作上重试有数据安全风险。正确的排查路径是：确认连接池 max-lifetime 是否远大于实际维护窗口，再检查内核 keepalive 配置，然后制定「max-lifetime 短于维护窗口 + 应用层 keepalive 查询」的组合方案，从根本上消除问题。"
+        }
+      ],
+      "references": [
+        "https://www.rfc-editor.org/rfc/rfc9293",
+        "https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html",
+        "https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html#connection-idle-timeout",
+        "https://grpc.io/docs/guides/keepalive/",
+        "https://github.com/brettwooldridge/HikariCP#gear-configuration-knobs-baby"
+      ]
+    }
+  ]
+}

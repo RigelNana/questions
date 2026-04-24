@@ -1,0 +1,159 @@
+{
+  "id": "disk-space-cleanup",
+  "name": "磁盘空间告警的快速定位与清理",
+  "domain": "troubleshooting",
+  "description": "磁盘使用率告警时，快速找出空间占用元凶并安全清理的方法论",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "disk-space-cleanup-1",
+      "domain": "troubleshooting",
+      "type": "env-config",
+      "difficulty": 1,
+      "tags": ["disk", "du", "df", "lsof", "linux", "logrotate", "filesystem"],
+      "title": "收到磁盘空间告警，df -h 显示某分区使用率 90%，如何快速找到占用空间的文件并清理？",
+      "content": "凌晨两点，手机震动，PagerDuty 告警进来了：生产服务器 `/var` 分区磁盘使用率达到 90%。你翻身坐起，SSH 登上机器，`df -h` 一跑，输出是这样的：\n\n```\nFilesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        50G   45G  5.0G  90% /\n/dev/sdb1       200G   80G  120G  40% /data\ntmpfs           7.8G     0  7.8G   0% /dev/shm\n```\n\n`/` 根分区 50GB 已经用了 45GB。服务还在跑，写日志的进程没有报错，但你知道如果磁盘满了，进程一旦写文件失败就会开始抛异常，情况只会更糟。\n\n你的第一反应可能是 `ls -lh /var/log` 看看日志有多大，但这个方法太慢了。你需要一套系统的排查手段，能在五分钟内找到「元凶」，十分钟内释放足够的空间让服务继续运行，事后再做根本治理。\n\n这台机器运行着一个 Java Web 应用、Nginx、MySQL，以及一个 Docker 化的后台任务服务。你不确定到底是哪一层在吃磁盘，有可能是应用日志滚动失败、有可能是 MySQL 的 binlog 没有清理、也有可能是某个 Docker 镜像层或 core dump 文件悄悄堆积。\n\n请描述你的完整排查思路：从哪个命令入手，如何逐层下钻定位到具体的目录和文件，遇到「明明文件删了但磁盘还是满的」这种情况怎么处理，以及清理完之后如何防止同样的事情再次发生。",
+      "answer": "## 一、先搞清楚你手里的两把尺子：df 与 du 的本质区别\n\n很多工程师上来就 `du -sh /var/log`，找到最大的目录，`rm -rf` 一顿清，然后发现 `df -h` 显示可用空间没变——这是磁盘排查最经典的坑，而它的根源在于没搞清楚 `df` 和 `du` 到底在量什么。\n\n`df`（disk free）读取的是文件系统级别的元数据，它直接询问内核：这个挂载点上块设备总共有多少块，用掉了多少。它的数字是绝对准确的，因为这是内核维护的账本。`du`（disk usage）做的事完全不同：它递归遍历目录树，把每个文件的大小加起来。问题在于，`du` 只能看到「文件系统中有目录项（directory entry）的文件」。如果一个文件已经被 `unlink`（也就是 `rm` 掉了），但还有进程持有它的文件描述符没有关闭，那么这个文件的数据块依然被占用，`df` 能看到，`du` 看不到。这个特性在 Linux 文件系统中叫做「deleted but open file」，是凌晨磁盘告警中最容易让人迷惑的陷阱。\n\n理解了这一点，你的排查就有了清晰的框架：先用 `df` 确认哪个分区满了，再用 `du` 找目录树中的大户，最后用 `lsof` 找那些被删除但仍被持有的幽灵文件。\n\n## 二、第一步：用 df 确认战场\n\n`df -h` 已经告诉你 `/` 分区是问题所在。但在开始 `du` 下钻之前，有个细节值得注意：Linux ext4/xfs 文件系统在格式化时会预留一部分空间（默认 5%）给 root 用户，这部分空间在 `df -h` 的「Use%」中不计入可用，但 `df` 的 `Use%` 列反映的是非 root 用户视角。所以有时候你会看到 Use% 95% 但服务却还在正常写入——那是因为进程以 root 运行，在用预留空间。不过这不是今晚的重点，你看到 90% 就该动手了。\n\n```bash\n# 查看所有挂载点的使用情况，-h 是人类可读格式\ndf -h\n\n# 如果想看 inode 使用情况（有时磁盘空间剩余但 inode 耗尽也会写入失败）\ndf -i\n```\n\n`df -i` 这一步经常被跳过，但很重要。有些场景下磁盘块空间还有很多，但 inode 耗尽了，`touch` 一个新文件会报「No space left on device」，让人非常困惑。inode 耗尽的典型元凶是大量小文件，比如 PHP session 文件、邮件队列，或者某个程序在循环创建临时文件但没有清理。\n\n## 三、第二步：du 逐层下钻，找到大目录\n\n确认是 `/` 分区满了之后，用 `du` 从根目录开始逐层定位。但直接 `du -sh /` 会扫遍整个文件系统，耗时很长，还会扫进 `/proc` 这种虚拟文件系统，可能挂起。正确的姿势是：\n\n```bash\n# 查看根目录下各一级目录的大小，排除 /proc 避免挂起\n# --max-depth=1 只看一层，-h 人类可读，--exclude 排除虚拟文件系统\ndu -sh /* --exclude=/proc --exclude=/sys --exclude=/dev 2>/dev/null | sort -rh | head -20\n```\n\n实际输出可能是这样的：\n\n```\n38G     /var\n4.2G    /usr\n1.1G    /home\n512M    /opt\n280M    /boot\n...\n```\n\n`/var` 占了 38GB，这是重灾区。继续下钻：\n\n```bash\ndu -sh /var/* 2>/dev/null | sort -rh | head -10\n```\n\n```\n22G     /var/log\n12G     /var/lib\n3.1G    /var/cache\n...\n```\n\n`/var/log` 有 22GB，继续：\n\n```bash\ndu -sh /var/log/* 2>/dev/null | sort -rh | head -10\n```\n\n```\n18G     /var/log/app\n2.3G    /var/log/nginx\n1.1G    /var/log/mysql\n```\n\n`/var/log/app` 有 18GB，这就是元凶了。可能是应用的日志没有配置 logrotate，或者日志级别被误改成了 DEBUG 导致产出速度暴增。\n\n同时也不要放过 `find` 命令，它可以直接找到超过指定大小的文件，绕过目录结构逐层下钻的麻烦：\n\n```bash\n# 找到根目录下所有大于 1GB 的文件，2>/dev/null 屏蔽权限报错\nfind / -xdev -size +1G -type f 2>/dev/null\n```\n\n`-xdev` 参数非常关键：它告诉 `find` 不要跨越文件系统边界，也就是不去扫 `/proc`、`/sys`、其他挂载点，只扫当前文件系统。实际输出示例：\n\n```\n/var/log/app/application.log\n/var/log/app/application.log.1\n/var/log/mysql/mysql-bin.000123\n/var/log/mysql/mysql-bin.000124\n/core.12345\n/var/lib/docker/overlay2/abc123.../merged/tmp/dump.rdb\n```\n\n一眼就能看到几个嫌疑人：未轮转的应用日志、MySQL binlog、一个 core dump 文件。\n\n## 四、第三步：lsof 找幽灵——deleted but open 的陷阱\n\n假设你删掉了 `/var/log/app/application.log`（18GB），但 `df -h` 显示可用空间根本没变。这就是前文说的幽灵文件现象。\n\n```bash\n# 列出所有被删除但仍被进程持有的文件\nlsof | grep deleted\n```\n\n输出可能是：\n\n```\njava    1234  root  12u  REG  8,1  19327352832  /var/log/app/application.log (deleted)\nnginx   5678  root  5u   REG  8,1   2415919104  /var/log/nginx/access.log (deleted)\n```\n\n第一列是进程名，第二列是 PID，第五列是文件描述符编号（这里是 `12u`），最后是文件路径加上 `(deleted)` 标记。这意味着文件已经从目录树中移除（`unlink`），但 Java 进程的文件描述符 12 还指向它，数据块没有被释放。\n\n这时候有两个选择。激进做法是直接重启应用进程，文件描述符关闭，内核引用计数归零，数据块立即释放。但凌晨两点重启生产 Java 服务风险不小。更优雅的做法是直接清空文件描述符指向的内容，而不需要重启进程：\n\n```bash\n# 通过 /proc 文件系统直接截断被持有的文件，PID=1234，fd=12\n> /proc/1234/fd/12\n# 或者用 truncate\ntruncate -s 0 /proc/1234/fd/12\n```\n\n这个操作把文件内容清空，空间立刻释放，进程还在继续运行（只是日志文件现在是空的了），服务完全不中断。`df -h` 此时再跑，你会看到那 18GB 已经回来了。\n\n## 五、常见磁盘杀手全景图\n\n理解了工具之后，再来看生产环境中最常见的几类磁盘杀手，以便第一眼看到输出就能快速定位。\n\n**日志文件未轮转**是最常见的元凶，尤其是应用程序自己管理日志文件而没有配置 logrotate 的情况。一个 DEBUG 级别的 Java 应用，一天可以产出数十 GB 日志。正确的配置方式是在 `/etc/logrotate.d/` 下为每个应用创建轮转规则，设置 `daily`、`rotate 7`、`compress`、`missingok`、`notifempty`，以及最关键的 `postrotate` 脚本向进程发送 `SIGUSR1` 信号让它重新打开日志文件句柄。\n\n**core dump 文件**是另一个常见大户。进程崩溃时系统会把内存转储写到磁盘，一个 4GB 内存的 Java 进程崩溃一次就写出一个 4GB 的 core 文件。可以用 `ulimit -c 0` 禁用，或者在 `/etc/sysctl.conf` 中配置 `kernel.core_pattern` 把 core dump 输出到专用目录并定期清理。\n\n**Docker 镜像和容器层**是很多人没想到的大户。`docker images` 和 `docker ps -a` 看到的只是当前活跃的层，真正占用空间的还有构建缓存、已停止的容器、悬空镜像（dangling images）。`docker system df` 能给你一个全景：\n\n```\nTYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\nImages          23        8         18.2GB    14.1GB (77%)\nContainers      15        3         2.1GB     1.9GB (90%)\nLocal Volumes   8         5         4.3GB     1.2GB (28%)\nBuild Cache     -         -         6.8GB     6.8GB\n```\n\n`docker system prune -a --volumes` 能一次性清理所有未使用的资源，但要在确认不影响服务的前提下执行。\n\n**MySQL binlog** 在主从复制场景下如果 slave 很久没同步，binlog 就不会被自动清理，几十个 1GB 的 binlog 文件堆在那里毫无察觉。`SHOW BINARY LOGS;` 查看，`PURGE BINARY LOGS BEFORE DATE_SUB(NOW(), INTERVAL 3 DAY)` 清理三天前的。\n\n**npm/pip 缓存**在 CI 机器上容易积累到十几 GB。`npm cache clean --force` 和 `pip cache purge` 是安全的清理手段。\n\n## 六、预防：自动化清理与监控告警\n\n治标之后一定要治本。一个成熟的 SRE 不应该让磁盘告警成为日常。logrotate 是 Linux 上日志管理的标准工具，以下是一个应用日志的典型配置：\n\n```\n# /etc/logrotate.d/myapp\n/var/log/app/*.log {\n    daily              # 每天轮转\n    rotate 7           # 保留 7 份历史\n    compress           # 轮转后压缩（gzip）\n    delaycompress      # 压缩延迟一天，让应用关闭上一份文件\n    missingok          # 文件不存在时不报错\n    notifempty         # 空文件不轮转\n    create 0644 app app # 轮转后创建新文件\n    postrotate\n        # 向应用发送 SIGUSR1 让它重新打开日志文件句柄\n        kill -USR1 $(cat /var/run/myapp.pid)\n    endscript\n}\n```\n\n在监控层面，Prometheus 的 `node_exporter` 提供 `node_filesystem_avail_bytes` 指标，可以设置两级告警：`Use% > 80%` 发 Warning 让 oncall 注意，`Use% > 90%` 发 Critical 立即处理。更进一步，可以基于磁盘使用增速来预测「距离磁盘满还有多少小时」，在真正告急前提前预警。",
+      "keyPoints": [
+        "df 读取的是文件系统元数据（内核账本），反映真实的磁盘块占用；du 遍历目录树累加文件大小，两者的差值正是「已删除但仍被进程持有的文件」所占的空间。",
+        "使用 du 下钻时必须加 --exclude=/proc 或 -xdev 参数，避免进入 /proc、/sys 等虚拟文件系统导致命令挂起或结果失真。",
+        "文件被 rm 删除后，只要还有进程持有其文件描述符，内核引用计数不为零，数据块就不会释放；用 lsof | grep deleted 能找到这类幽灵文件，通过 truncate -s 0 /proc/<pid>/fd/<fd> 可在不重启进程的情况下立即释放空间。",
+        "find / -xdev -size +1G -type f 2>/dev/null 能快速列出所有超过 1GB 的文件，绕过逐层目录下钻，是凌晨紧急处理时最高效的定位手段之一。",
+        "Docker 的磁盘占用远不止 docker images 看到的，构建缓存、已停止容器、悬空镜像加在一起可以轻易超过 20GB；docker system df 是全景检查命令，docker system prune 是安全清理入口。",
+        "MySQL binlog 在主从复制场景下不会自动清理，需要定期执行 PURGE BINARY LOGS 或配置 expire_logs_days（MySQL 5.x）/ binlog_expire_logs_seconds（MySQL 8.x）参数来自动过期。",
+        "logrotate 的 postrotate 脚本向应用发送 SIGUSR1 是让进程重新打开日志文件句柄的标准做法；若跳过这一步，即使日志文件已轮转，进程仍然持有旧文件的描述符继续写入，新文件始终为空。",
+        "Prometheus node_exporter 提供 node_filesystem_avail_bytes 指标，结合使用增速可以预测磁盘耗尽时间，实现「距离满还有 N 小时」的预测性告警，比阈值告警更早发现问题。"
+      ],
+      "quiz": [
+        {
+          "id": "disk-space-cleanup-q1",
+          "question": "执行 rm 删除了一个 10GB 的日志文件后，df -h 显示可用空间没有增加，最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "ext4 文件系统有 5% 的预留空间，被预留空间抵消了" },
+            { "id": "B", "text": "还有其他进程持有该文件的文件描述符，内核引用计数不为零，数据块尚未释放" },
+            { "id": "C", "text": "rm 只是把文件移入了回收站，需要清空回收站才能释放" },
+            { "id": "D", "text": "df 有缓存，需要等待几分钟才能刷新" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Linux 文件系统采用引用计数机制管理数据块的生命周期。`rm` 实际上是 `unlink` 系统调用，它只是把文件的目录项（directory entry）移除，并将硬链接计数减一。如果同时还有进程通过 `open()` 打开了这个文件，文件描述符会让引用计数保持非零，内核就不会释放数据块。这种「deleted but open」状态可以通过 `lsof | grep deleted` 看到。A 选项的预留空间最多 5%，无法解释 10GB 的差距。C 选项是 Windows 的行为，Linux `rm` 不使用回收站。D 选项错误，`df` 直接读取内核维护的文件系统元数据，没有缓存延迟。"
+        },
+        {
+          "id": "disk-space-cleanup-q2",
+          "question": "du -sh /* 命令在某些机器上运行时会卡住很久甚至挂起，最常见的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "根目录文件太多，du 递归层数超出限制" },
+            { "id": "B", "text": "du 进入了 /proc 或 /sys 等虚拟文件系统，读取内核结构体时可能阻塞" },
+            { "id": "C", "text": "磁盘 I/O 压力太大，du 的读取速度受限" },
+            { "id": "D", "text": "/* 通配符展开了太多文件描述符，超出系统限制" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`/proc` 是 Linux 的进程信息虚拟文件系统，`/sys` 是内核对象文件系统，它们看起来像普通目录，但实际上每次读取都是从内核动态生成数据。`du` 扫描时如果进入这些目录，可能触发某些内核路径的阻塞，甚至读到「永远增长」的虚拟文件。正确做法是加 `--exclude=/proc --exclude=/sys --exclude=/dev`，或者用 `find -xdev`（不跨越文件系统边界）来代替。C 选项虽然也会影响速度但不是「挂起」的原因。A 和 D 选项在正常系统上不构成实际限制。"
+        },
+        {
+          "id": "disk-space-cleanup-q3",
+          "question": "以下哪条命令能在不重启进程的情况下，释放一个「deleted but open」文件占用的磁盘空间？",
+          "choices": [
+            { "id": "A", "text": "kill -9 <pid>（强制终止持有文件的进程）" },
+            { "id": "B", "text": "sync && echo 3 > /proc/sys/vm/drop_caches（清除页面缓存）" },
+            { "id": "C", "text": "truncate -s 0 /proc/<pid>/fd/<fd>（通过 /proc 文件系统截断文件内容）" },
+            { "id": "D", "text": "fsck /dev/sda1（文件系统检查并修复）" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "`/proc/<pid>/fd/` 目录下的每个条目都是进程打开的文件描述符的符号链接，即使原始路径已经被 `unlink`，这个链接依然有效并指向实际的数据块。`truncate -s 0` 通过这个路径把文件内容截断为零字节，数据块立即被释放，进程的文件描述符仍然有效并继续持有（现在是空文件的）句柄，服务完全不中断。A 选项 `kill -9` 能释放空间但会终止进程，不符合「不重启」的要求。B 选项 `drop_caches` 只清除页面缓存，和数据块释放无关。D 选项 `fsck` 必须在文件系统未挂载的情况下运行，完全不适用。"
+        },
+        {
+          "id": "disk-space-cleanup-q4",
+          "question": "df -h 显示磁盘空间充足，但执行 touch newfile 却报「No space left on device」，最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "文件系统只读挂载（read-only），需要重新挂载为读写" },
+            { "id": "B", "text": "inode 耗尽，即使有剩余磁盘块也无法创建新文件" },
+            { "id": "C", "text": "当前用户的磁盘配额（quota）已满" },
+            { "id": "D", "text": "文件系统碎片化严重，需要 defrag 整理" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Linux 文件系统有两套「账本」：一套记录数据块（block）的使用情况，一套记录 inode 的使用情况。inode 是文件的元数据节点，每个文件（包括目录、符号链接）都需要消耗一个 inode。`df -h` 只显示块使用情况，用 `df -i` 才能看 inode 使用率。inode 耗尽的典型场景是大量小文件积累：PHP session 文件、Postfix 邮件队列、某个程序疯狂创建临时文件。清理方案是找到小文件最多的目录（`find /var -xdev -type f | cut -d/ -f-4 | sort | uniq -c | sort -rn | head`）并批量删除。A 选项只读挂载会报「Read-only file system」不同的错误信息，C 选项可能但不是「最可能」，D 选项是 Windows 的概念，Linux ext4/xfs 不需要手动碎片整理。"
+        },
+        {
+          "id": "disk-space-cleanup-q5",
+          "question": "执行 lsof | grep deleted 后看到如下输出，以下解读正确的是哪个？\n\n```\njava  1234  root  12u  REG  8,1  19327352832  /var/log/app/application.log (deleted)\n```",
+          "choices": [
+            { "id": "A", "text": "Java 进程（PID 1234）的文件描述符 12 持有该文件，文件大小约 18GB，删除目录项后数据块尚未释放" },
+            { "id": "B", "text": "Java 进程尝试写入一个已删除的文件，下次写入会报 IOException" },
+            { "id": "C", "text": "文件已经完全释放，这条记录只是 lsof 的历史缓存" },
+            { "id": "D", "text": "文件被 Java 进程锁定，需要 fuser -k 强制解锁才能释放磁盘空间" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "lsof 输出各字段含义：第一列是进程名（java），第二列是 PID（1234），第四列是文件描述符（12u，u 表示读写模式），第七列是文件大小（19327352832 字节，约 18GB），最后是文件路径加 `(deleted)` 标记。`(deleted)` 意味着文件已经被 `unlink`（从目录树移除），但进程仍持有 fd 12，数据块未释放，正是 `df` 和 `du` 数字对不上的元凶。进程本身感知不到文件已被删除，它的 `write()` 调用依然成功，日志还在继续写入这个「幽灵」文件。要释放空间可以执行 `truncate -s 0 /proc/1234/fd/12` 或重启进程。B 和 C 选项描述与 Linux 文件系统行为不符，D 选项的 `fuser -k` 会杀死进程，不是「解锁」。"
+        },
+        {
+          "id": "disk-space-cleanup-q6",
+          "question": "配置 logrotate 对 Nginx 日志进行轮转后，发现轮转后新日志文件始终为空，而旧文件仍在被写入，原因最可能是什么？",
+          "choices": [
+            { "id": "A", "text": "logrotate 的 compress 选项压缩了新文件导致看起来是空的" },
+            { "id": "B", "text": "logrotate 配置了 delaycompress 导致延迟写入" },
+            { "id": "C", "text": "没有在 postrotate 中向 Nginx 发送 USR1 信号，Nginx 的文件描述符仍指向旧文件" },
+            { "id": "D", "text": "Nginx 日志文件需要手动 chmod 777 才能被 logrotate 写入" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是 logrotate 最经典的配置陷阱。logrotate 的工作方式是：把 `access.log` 重命名为 `access.log.1`，然后创建一个空的新 `access.log`。但 Nginx 进程的文件描述符是在启动时通过 `open()` 系统调用获得的，它持有的是旧文件的 inode，不是路径字符串。重命名之后，Nginx 依然在向旧文件（现在叫 `access.log.1`）写入，新的空文件没有任何进程写入。解决方法是在 postrotate 块中执行 `nginx -s reopen` 或 `kill -USR1 $(cat /var/run/nginx.pid)`，让 Nginx 关闭旧文件描述符并重新 `open()` 路径，此时打开的就是新创建的空文件了。A 和 B 选项与「旧文件仍在被写入」的现象无关，D 选项的权限说法错误，logrotate 可以用 `create` 指令控制新文件权限。"
+        },
+        {
+          "id": "disk-space-cleanup-q7",
+          "question": "docker system df 输出显示 Build Cache 占用 6.8GB，Images 中有 77% 可回收，下列哪条命令能只清理构建缓存而不影响正在运行的容器和它们使用的镜像？",
+          "choices": [
+            { "id": "A", "text": "docker system prune -a --volumes（清理所有未使用资源）" },
+            { "id": "B", "text": "docker builder prune（只清理构建缓存）" },
+            { "id": "C", "text": "docker image prune -a（清理所有未被容器引用的镜像）" },
+            { "id": "D", "text": "docker container prune（清理已停止的容器）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`docker builder prune` 专门清理 BuildKit 的构建缓存层，对运行中的容器和镜像完全没有影响。这是最安全的释放空间方式，尤其适合 CI 机器。`docker system prune -a --volumes` 威力太大，`-a` 参数会清理所有未被运行中容器引用的镜像，`--volumes` 会删除未挂载的 volume，有误删数据的风险，在生产环境要谨慎。`docker image prune -a` 会清理没有被任何容器（包括已停止的）引用的镜像，如果你有「留着备用」的镜像但没有容器在跑，它会被删掉。`docker container prune` 只清理已停止的容器，不涉及构建缓存。面试时能说出各命令的边界差异，说明你真的用过 Docker 的磁盘管理。"
+        },
+        {
+          "id": "disk-space-cleanup-q8",
+          "question": "生产环境 MySQL 主库的 /var/lib/mysql 目录快满了，你发现有大量 mysql-bin.00xxxx 文件，在清理前必须先确认什么？",
+          "choices": [
+            { "id": "A", "text": "确认 MySQL 版本，因为不同版本 binlog 格式不同，不能混删" },
+            { "id": "B", "text": "确认所有 slave 已经消费了要删除的 binlog，避免主从复制中断" },
+            { "id": "C", "text": "确认 binlog 没有被备份工具锁定（如 xtrabackup 正在运行）" },
+            { "id": "D", "text": "确认 innodb_flush_log_at_trx_commit 的值，以免影响事务安全" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "MySQL binlog 不仅用于主从复制，还是基于时间点恢复（PITR）的数据来源。直接 `rm` binlog 文件是极其危险的操作，可能导致：1）slave 还没有应用这些 binlog，删了之后主从复制会报「Got fatal error 1236」立即断开；2）binlog 是恢复窗口的一部分，删了就无法做基于时间点的数据恢复。正确做法是 `SHOW SLAVE STATUS\\G` 查看所有 slave 的 `Relay_Master_Log_File` 和 `Exec_Master_Log_Pos`，确认所有 slave 都已消费了指定 binlog 之前的内容，再执行 `PURGE BINARY LOGS TO 'mysql-bin.000120'` 或 `PURGE BINARY LOGS BEFORE DATE_SUB(NOW(), INTERVAL 3 DAY)`。绝对不要手动 `rm`，让 MySQL 自己管理 binlog 文件的删除。A、C、D 选项不是主要风险点。"
+        },
+        {
+          "id": "disk-space-cleanup-q9",
+          "question": "find / -xdev -size +1G -type f 2>/dev/null 中，-xdev 参数的作用是什么？",
+          "choices": [
+            { "id": "A", "text": "以扩展模式（extended mode）运行，支持更多文件属性过滤" },
+            { "id": "B", "text": "不跨越文件系统挂载边界，只扫描与起始路径相同的文件系统" },
+            { "id": "C", "text": "排除隐藏文件（以 . 开头的文件）" },
+            { "id": "D", "text": "限制扫描深度为 1 层，等同于 --max-depth=1" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`-xdev`（也写作 `-mount`）告诉 `find` 命令「不要越过当前文件系统的边界」。在 Linux 中，根目录 `/` 下面可能挂载了很多独立的文件系统：`/proc`（虚拟文件系统）、`/sys`（sysfs）、`/dev`（devtmpfs），以及其他磁盘分区如 `/data`、`/home`。如果你在排查 `/` 分区满了的问题，加 `-xdev` 就能保证 `find` 只扫描 `/` 分区本身，不会跑去扫描 `/data`（另一块磁盘），也不会进入 `/proc` 触发内核虚拟路径。这既提高了效率，又避免了在 `/proc` 中读到无意义或导致挂起的伪文件。如果要扫描多个分区，分开对各挂载点执行 `find` 更加精确。"
+        },
+        {
+          "id": "disk-space-cleanup-q10",
+          "question": "服务器上 /var 分区快满，你用 du -sh /var/* 找到 /var/lib/docker/overlay2 占用了 40GB，但 docker ps 显示只有 2 个容器在运行，docker images 显示只有 3 个镜像共 3GB，这 40GB 从何而来，应该怎么处理？",
+          "choices": [
+            { "id": "A", "text": "overlay2 目录记录了 Docker 网络流量日志，可以直接 rm -rf /var/lib/docker/overlay2 清理" },
+            { "id": "B", "text": "可能包含已停止容器的可写层、构建缓存层、悬空镜像层；应用 docker system prune 清理未使用的资源，不要直接 rm" },
+            { "id": "C", "text": "这是 Docker 的内部索引文件，正常大小就是镜像大小的 10-15 倍，不需要处理" },
+            { "id": "D", "text": "overlay2 损坏了，需要 docker system reset 重建文件系统" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "overlay2 目录存放的是 Docker 所有镜像层和容器的联合文件系统层（Union FS）。`docker images` 只显示有标签的镜像，但 overlay2 中还可能包含：1）构建过程中产生的中间层（即使最终镜像已删除，构建缓存仍在）；2）已停止但未 `docker rm` 的容器的可写层；3）悬空镜像（dangling images，没有标签的孤立层）。先用 `docker system df` 看全貌，再分步清理：`docker container prune`（已停止容器）→ `docker image prune`（悬空镜像）→ `docker builder prune`（构建缓存）。绝对不要直接 `rm -rf /var/lib/docker/overlay2`，这会破坏 Docker 的元数据和正在运行容器的文件系统，导致所有容器立即崩溃且无法恢复，只能重启 Docker daemon 并重新拉取所有镜像。"
+        }
+      ],
+      "references": [
+        "https://man7.org/linux/man-pages/man1/du.1.html",
+        "https://man7.org/linux/man-pages/man8/lsof.8.html",
+        "https://man7.org/linux/man-pages/man1/df.1.html",
+        "https://man7.org/linux/man-pages/man1/find.1.html",
+        "https://linux.die.net/man/8/logrotate",
+        "https://docs.docker.com/engine/reference/commandline/system_df/"
+      ]
+    }
+  ]
+}
