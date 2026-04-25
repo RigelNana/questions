@@ -16,10 +16,9 @@ export function QuestionDetail() {
   const { domain, questionId } = useParams<{ domain: string; questionId: string }>();
   const navigate = useNavigate();
   const {
-    registry,
-    fetchRegistry,
-    fetchPacksForDomain,
-    getQuestionsForDomain,
+    fetchIndexForDomain,
+    fetchPackForQuestion,
+    getQuestionSummariesForDomain,
     getQuestionById,
   } = useQuestionStore();
   const {
@@ -45,16 +44,25 @@ export function QuestionDetail() {
 
   const [showAnswer, setShowAnswer] = useState(false);
   const [activeTab, setActiveTab] = useState<DetailTab>('content');
+  const [loadFailed, setLoadFailed] = useState(false);
 
   useEffect(() => {
-    fetchRegistry();
-  }, [fetchRegistry]);
-
-  useEffect(() => {
-    if (registry && domain) {
-      fetchPacksForDomain(domain as Domain);
+    let cancelled = false;
+    if (domain && questionId) {
+      setLoadFailed(false);
+      fetchIndexForDomain(domain as Domain)
+        .then(() => fetchPackForQuestion(domain as Domain, questionId))
+        .then((loaded) => {
+          if (!cancelled && !loaded) setLoadFailed(true);
+        })
+        .catch(() => {
+          if (!cancelled) setLoadFailed(true);
+        });
     }
-  }, [registry, domain, fetchPacksForDomain]);
+    return () => {
+      cancelled = true;
+    };
+  }, [domain, questionId, fetchIndexForDomain, fetchPackForQuestion]);
 
   useEffect(() => {
     if (domain && questionId) {
@@ -64,7 +72,7 @@ export function QuestionDetail() {
 
   const domainKey = domain as Domain;
   const question = questionId ? getQuestionById(questionId) : undefined;
-  const allQuestions = getQuestionsForDomain(domainKey);
+  const allQuestions = domain ? getQuestionSummariesForDomain(domainKey) : [];
   const currentIndex = allQuestions.findIndex((q) => q.id === questionId);
   const progress = questionId ? getQuestionProgress(questionId) : undefined;
   const bookmarked = questionId ? isBookmarked(questionId) : false;
@@ -113,6 +121,14 @@ export function QuestionDetail() {
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   });
+
+  if (!question && loadFailed) {
+    return (
+      <div className="py-16 text-center text-[var(--color-notion-text-secondary)]">
+        题目不存在或加载失败
+      </div>
+    );
+  }
 
   if (!question) {
     return (

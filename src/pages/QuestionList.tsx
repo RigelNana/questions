@@ -20,10 +20,9 @@ const PAGE_SIZE = 15;
 export function QuestionList() {
   const { domain } = useParams<{ domain: string }>();
   const {
-    registry,
-    fetchRegistry,
-    fetchPacksForDomain,
-    getQuestionsForDomain,
+    fetchIndexForDomain,
+    getQuestionSummariesForDomain,
+    isLoadingIndex,
   } = useQuestionStore();
   const { questions: progress, bookmarks } = useProgressStore();
 
@@ -32,6 +31,7 @@ export function QuestionList() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
+  const domainKey = domain as Domain;
 
   const handleTypeFilterChange = (value: QuestionType | 'all') => {
     setTypeFilter(value);
@@ -54,16 +54,13 @@ export function QuestionList() {
   };
 
   useEffect(() => {
-    fetchRegistry();
-  }, [fetchRegistry]);
-
-  useEffect(() => {
-    if (registry && domain) {
-      fetchPacksForDomain(domain as Domain);
+    if (domain) {
+      fetchIndexForDomain(domainKey);
     }
-  }, [registry, domain, fetchPacksForDomain]);
+  }, [domain, domainKey, fetchIndexForDomain]);
 
-  const allQuestions = getQuestionsForDomain(domain as Domain);
+  const allQuestions = domain ? getQuestionSummariesForDomain(domainKey) : [];
+  const isLoading = domain ? !!isLoadingIndex[domainKey] : false;
 
   const filteredQuestions = useMemo(() => {
     let result = allQuestions;
@@ -102,7 +99,6 @@ export function QuestionList() {
   );
 
   if (!domain) return null;
-  const domainKey = domain as Domain;
   const DomainIcon = DOMAIN_ICONS[domainKey];
 
   // Group question types
@@ -193,7 +189,14 @@ export function QuestionList() {
       </div>
 
       {/* Question list */}
-      {filteredQuestions.length === 0 ? (
+      {isLoading ? (
+        <div className="py-16 text-center animate-fade-in">
+          <div className="flex flex-col items-center gap-3 text-[var(--color-notion-text-secondary)]">
+            <div className="w-5 h-5 border-2 border-[var(--color-notion-accent)] border-t-transparent rounded-full animate-spin" />
+            <span className="text-sm">题目加载中...</span>
+          </div>
+        </div>
+      ) : filteredQuestions.length === 0 ? (
         <div className="py-16 text-center text-[var(--color-notion-text-secondary)]">
           {allQuestions.length === 0
             ? '该域暂无题目，请添加题库 JSON 文件'
