@@ -1,0 +1,159 @@
+{
+  "id": "os-memory-leak-detection",
+  "name": "内存泄漏的检测与定位方法",
+  "domain": "operating-system",
+  "description": "内存泄漏的识别症状、检测工具链与生产环境排查实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-memory-leak-detection-1",
+      "domain": "operating-system",
+      "type": "debugging",
+      "difficulty": 2,
+      "tags": ["memory-leak", "valgrind", "heaptrack", "AddressSanitizer", "pmap", "debugging", "eBPF", "bpftrace"],
+      "title": "如何检测和定位程序中的内存泄漏",
+      "content": "你负责维护一个 C++ 后端服务，该服务处理用户上传的图片，调用第三方图像识别库进行分析，并把结果写入 PostgreSQL。服务刚上线时一切正常，RSS 内存稳定在 280MB 左右。但运行三天后，监控系统触发告警：进程 RSS 已经涨到 1.9GB，OOM killer 随时可能介入。你重启服务，内存恢复正常，但过几天又会涨上去。\n\n同事帮你看了代码说「没看出明显问题」，另一个同事说「valgrind 跑一下」，但你对 valgrind 的输出格式不熟悉，也不确定生产环境该不该直接挂 valgrind。\n\n下面是你在某个时间点观察到的 `/proc/<PID>/status` 片段：\n\n```\nName:   image-worker\nVmPeak:  2107488 kB\nVmRSS:   1943216 kB\nVmData:   981344 kB\nVmStk:       136 kB\nVmExe:      2048 kB\nVmLib:    124672 kB\n```\n\n同时，用 `pmap -x <PID> | sort -k3 -rn | head -20` 可以看到大量匿名内存映射区域（`[ anon ]`），每个约 64MB，累计超过 1.5GB，而 `[heap]` 段本身只有 220MB。\n\n面对这种情况，你会如何系统性地确认这是内存泄漏而非正常内存增长？针对开发环境和生产环境分别该用哪些工具？遇到第三方库导致的泄漏，但没有源码，应该怎么处理？",
+      "answer": "## 第一步：先搞清楚内存泄漏到底是什么，以及它的典型症状\n\n内存泄漏（memory leak）指的是程序申请了堆内存却没有释放，这块内存既不能被程序再次使用，也不会被操作系统回收，直到进程退出。理解这个定义很重要：「不能被程序使用」是关键——如果你申请了内存并且一直持有指针，这不是泄漏，只是占用大；只有当指向这块内存的最后一个指针丢失之后，内存才真正泄漏了。\n\n在操作系统层面，内存泄漏最直接的症状是进程的 RSS（Resident Set Size，常驻内存集）随时间单调递增，并且不会因为业务低峰期而下降。RSS 代表进程当前实际占用的物理内存页数，对应 `/proc/<PID>/status` 里的 `VmRSS` 字段。正常的服务可能在高峰期内存升高，低谷期随 GC 或缓存淘汰而回落；但泄漏的服务内存曲线是一根缓慢上升的斜线，低谷期也不会明显回落。\n\n要快速确认是否存在泄漏，最简单的办法是用 `watch` 周期采样：\n\n```bash\n# 每 30 秒采样一次进程内存，持续观察趋势\nwatch -n30 'cat /proc/$(pgrep image-worker)/status | grep -E \"VmRSS|VmData|VmPeak\"'\n```\n\n如果 `VmRSS` 每次刷新都在增长，而业务量保持恒定，基本可以断定存在泄漏。更精确的方式是写个脚本每分钟采集一次 `/proc/<PID>/smaps_rollup` 中的 `Private_Dirty` 字段，这个值代表进程独占的脏页内存，剔除了共享库的影响，是衡量「真实内存占用增长」最准确的指标。\n\n回到题目中的场景：`pmap` 输出显示大量匿名 mmap 区域（`[ anon ]`）而非 `[heap]` 增长，这个细节非常关键。`[heap]` 是通过 `sbrk`/`brk` 系统调用扩展的传统堆区，而 `[ anon ]` 是通过 `mmap(MAP_ANONYMOUS)` 分配的内存。现代 glibc 的 `malloc` 实现（ptmalloc2）有一个策略：当单次分配超过 `MMAP_THRESHOLD`（默认 128KB）时，不走 brk 堆，而是直接 mmap 一块匿名内存；释放时调用 `munmap` 归还给系统。如果这些大块 mmap 内存没有被 `free`，就会以独立的 `[ anon ]` 区域的形式出现在 `pmap` 输出里。这强烈暗示是大对象泄漏，比如图像缓冲区（一张 4K 图片解码后轻松超过 128KB）。\n\n## 第二步：工具链详解——从开发环境到生产环境\n\n### Valgrind Memcheck：最全面的开发期工具\n\nValgrind 的 Memcheck 工具是检测 C/C++ 内存泄漏的「黄金标准」，它通过在软件层面模拟 CPU 执行，拦截所有内存分配和释放操作，在程序退出时报告未释放的内存。使用方式如下：\n\n```bash\n# --leak-check=full：显示每一块泄漏内存的完整调用栈\n# --show-leak-kinds=all：包括 directly lost / indirectly lost / possibly lost\n# --track-origins=yes：追踪未初始化内存的来源（会更慢）\n# --log-file：把输出写到文件，方便后续分析\nvalgrind --leak-check=full \\\n         --show-leak-kinds=all \\\n         --track-origins=yes \\\n         --log-file=valgrind.log \\\n         ./image-worker --test-mode\n```\n\nValgrind 的输出会告诉你每块泄漏内存是在哪里分配的：\n\n```\n==12345== LEAK SUMMARY:\n==12345==    definitely lost: 67,108,864 bytes in 1 blocks\n==12345==    indirectly lost: 0 bytes in 0 blocks\n==12345==      possibly lost: 2,048 bytes in 16 blocks\n==12345==    still reachable: 8,192 bytes in 4 blocks\n\n==12345== 67,108,864 bytes in 1 blocks are definitely lost in loss record 42 of 58\n==12345==    at 0x4C2FB0F: malloc (in /usr/lib/valgrind/vgpreload_memcheck-amd64-linux.so)\n==12345==    by 0x10B4A2: ImageDecoder::decode(std::string const&) (image_decoder.cpp:87)\n==12345==    by 0x10C318: WorkerThread::process(Task const&) (worker.cpp:234)\n```\n\n「definitely lost」是最严重的——指向这块内存的指针已经全部丢失，100% 泄漏。「possibly lost」是指针指向内存内部而非起始地址，可能是泄漏也可能是刻意的指针运算。「still reachable」是程序退出时还持有指针的内存，通常是全局单例或静态容器，不一定是泄漏。\n\nValgrind 的代价是性能：它会让程序慢 10 到 50 倍，内存使用也会膨胀 2-3 倍。所以 Valgrind 只适合开发和测试环境，绝对不能在生产环境直接使用。\n\n### AddressSanitizer：开销更小的编译期工具\n\nAddressSanitizer（ASan）是 Google 开发的内存错误检测工具，集成在 GCC 和 Clang 编译器里，只需在编译时加一个 flag：\n\n```bash\n# 编译时开启 ASan，同时保留调试符号\ng++ -fsanitize=address -fsanitize=leak -g -O1 \\\n    -fno-omit-frame-pointer \\\n    -o image-worker-asan \\\n    $(find src -name '*.cpp')\n\n# 运行时 ASan 会自动检测，程序退出时输出泄漏报告\n./image-worker-asan --test-mode\n```\n\nASan 的运行时开销大约是 2 倍，远低于 Valgrind。除了泄漏检测，它还能发现 use-after-free（释放后使用）、heap buffer overflow（堆缓冲区溢出）等更危险的错误——这些问题用 Valgrind 也能检测，但 ASan 在对性能要求更高的集成测试中更实用。\n\n### heaptrack：低开销的堆分配追踪\n\nheaptrack 是 KDE 开发的堆内存分析工具，它通过 `LD_PRELOAD` 注入 hook 来拦截 malloc/free，记录每次分配的调用栈，然后离线分析。相比 Valgrind，它的运行开销更低，适合在压力测试环境中长时间运行：\n\n```bash\n# 运行程序并记录所有堆分配\nheaptrack ./image-worker --test-mode\n# 运行完成后会生成 heaptrack.image-worker.XXXXXX.zst 文件\n\n# 分析报告：显示峰值内存、泄漏分配、调用栈\nheaptrack_print heaptrack.image-worker.*.zst | head -100\n```\n\nheaptrack 的输出会按泄漏大小排序，直接告诉你哪个调用栈分配了最多没有释放的内存，找起来非常直观。\n\n### jemalloc 内置 profiling：生产可用的轻量方案\n\n如果你能重新编译服务并使用 jemalloc 替换系统 malloc，jemalloc 内置的堆分析功能可以在生产环境轻量运行（开销约 5-10%）：\n\n```bash\n# 编译时链接 jemalloc\ng++ -o image-worker $(find src -name '*.cpp') -ljemalloc\n\n# 启动时开启 profiling\nMALLOC_CONF=\"prof:true,prof_leak:true,lg_prof_interval:25\" ./image-worker\n# lg_prof_interval:25 表示每分配 2^25=32MB 就 dump 一次堆快照\n\n# 用 jeprof 分析堆快照（类似 pprof）\njeprof --show_bytes --pdf ./image-worker jeprof.*.heap > heap.pdf\n```\n\n### bpftrace/eBPF：生产环境零侵入追踪\n\n当你既没办法重新编译（第三方库），又不能给进程带来明显性能损耗时，bpftrace 是最后的武器。eBPF 允许你在内核层面插入探针，追踪 libc 的 malloc 调用，完全不需要修改或重启目标进程：\n\n```bash\n# 追踪目标进程的 malloc 调用，按调用栈聚合分配总量\n# 运行 30 秒后 Ctrl+C 查看结果\nbpftrace -e '\n  uprobe:/lib/x86_64-linux-gnu/libc.so.6:malloc\n  /pid == 12345/ {\n    @bytes[ustack()] = sum(arg0);\n  }\n' --pid 12345\n```\n\n这个命令会实时统计哪些代码路径分配了最多内存，输出按分配字节数排序的调用栈。结合 `free` 的追踪，你甚至可以在生产环境计算出哪些 malloc 没有对应的 free。这需要 Linux kernel 4.9+ 和足够的权限（CAP_BPF 或 root），但在支持的环境里是无与伦比的利器。\n\n## 第三步：生产环境的完整排查流程\n\n### 第一阶段：确认并量化泄漏\n\n首先用脚本建立内存增长趋势的基线。每分钟采集一次，连续观察 2 小时：\n\n```bash\n#!/bin/bash\nPID=$(pgrep image-worker)\nwhile true; do\n  TIMESTAMP=$(date +%s)\n  RSS=$(awk '/VmRSS/ {print $2}' /proc/$PID/status)\n  PRIVATE_DIRTY=$(awk '/Private_Dirty/ {sum+=$2} END {print sum}' /proc/$PID/smaps)\n  echo \"$TIMESTAMP $RSS $PRIVATE_DIRTY\"\n  sleep 60\ndone\n```\n\n如果 `Private_Dirty` 每小时增长超过业务量变化无法解释的量（比如处于空闲期还在增长），泄漏基本坐实。\n\n### 第二阶段：定位泄漏是 heap 还是 mmap\n\n用 `pmap -x <PID> | awk '$3 > 10000 {print}'` 过滤出超过 10MB 的内存段。如果大量 `[ anon ]` 段在增加，说明是 mmap 分配的大对象泄漏（典型的图像缓冲区场景）。如果 `[heap]` 段在膨胀，是小对象碎片堆积。两种情况的工具选择略有不同，但核心都是追踪 malloc 调用栈。\n\n### 第三阶段：用工具定位根因\n\n在开发/测试环境，优先用 ASan + LeakSanitizer 编译一版，跑模拟真实业务的压测 30 分钟，程序退出时 LeakSanitizer 会输出完整的泄漏报告。如果有条件，再跑一遍 heaptrack，把 heaptrack 的报告和 ASan 的报告对照，确认是同一个调用栈在泄漏。\n\n对于第三方库没有源码的情况，ASan 仍然有用——它会显示到你代码调用第三方库的那一层，你能知道是哪个 API 调用导致了泄漏。同时用 bpftrace 在生产进程上跑一段，确认开发环境发现的泄漏路径在生产环境也存在。\n\n### 常见根因清单\n\n在 C/C++ 服务中，内存泄漏最常见的几种根因值得重点排查：一是提前 `return` 或异常路径导致 `free`/`delete` 没有执行，这种情况在有异常处理但没用 RAII 的代码里极为常见；二是容器（`std::map`、`std::vector`）持有指针，容器被清空时只释放了指针本身而没有 `delete` 指向的对象；三是全局或静态容器无限增长，比如一个全局 `std::map` 用于缓存但没有淘汰策略；四是多线程场景下，某个线程的局部缓存在线程退出时没有清理。第三方图像识别库泄漏往往是因为调用了 `lib_init()` 但在所有错误路径上没有调用对应的 `lib_destroy()`。",
+      "keyPoints": [
+        "内存泄漏的本质是指向已分配内存的最后一个指针丢失，导致该内存既无法被程序使用也无法被 OS 回收，进程 RSS 随时间单调递增是最直接的外部症状",
+        "pmap 输出中大量 [ anon ] 匿名段增长，而非 [heap] 段增长，说明是大对象（>MMAP_THRESHOLD=128KB）泄漏，glibc ptmalloc2 对大对象走 mmap 分配而非 brk",
+        "Valgrind Memcheck 是开发期最全面的工具，能精确报告 definitely lost 调用栈，但有 10-50x 性能损耗，绝对不能在生产环境使用",
+        "AddressSanitizer（-fsanitize=address,leak）只有约 2x 开销，适合集成测试环境，同时能发现 use-after-free 和 buffer overflow 等比泄漏更危险的内存错误",
+        "jemalloc 内置 heap profiling 是生产环境相对轻量的选择（约 5-10% 开销），通过 MALLOC_CONF=prof:true 启用，结合 jeprof 分析快照",
+        "bpftrace/eBPF 通过 uprobe 追踪 libc malloc 调用，可在生产环境对运行中的进程零侵入分析内存分配热点，不需要重编译或重启进程",
+        "C++ 中内存泄漏最高频的根因是异常路径/提前 return 跳过了 free/delete，使用 RAII（std::unique_ptr、std::shared_ptr）可以从根本上消灭这类泄漏",
+        "/proc/PID/smaps_rollup 中的 Private_Dirty 字段是衡量进程真实内存增长最精确的指标，排除了共享库的干扰"
+      ],
+      "quiz": [
+        {
+          "id": "os-memory-leak-detection-q1",
+          "question": "以下哪种情况属于真正的内存泄漏？",
+          "choices": [
+            { "id": "A", "text": "程序申请了 1GB 内存，用一个全局变量持有指针，程序退出前始终不释放" },
+            { "id": "B", "text": "程序申请内存后，持有指针的局部变量超出作用域，该内存再也无法被访问或释放" },
+            { "id": "C", "text": "程序使用 mmap 映射了一个大文件，读取后没有 munmap，但文件描述符还开着" },
+            { "id": "D", "text": "Go 程序的 heap 在 GC 后没有立即归还给操作系统，RSS 仍然偏高" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "内存泄漏的核心定义是「指向已分配内存的最后一个指针丢失」，导致该内存既无法被程序使用也无法被释放。选项 A 虽然内存没有释放，但指针仍然存在（全局变量），程序随时可以访问，不是泄漏，只是长期占用。选项 B 中局部变量超出作用域后指针消失，这块内存永远无法释放，是经典的泄漏场景。选项 C 是资源泄漏（文件描述符和映射未释放），但问题描述中文件描述符还在，情况略有不同，且 mmap 文件映射不完全等同于堆内存泄漏。选项 D 是 Go runtime 的正常行为，Go GC 会先标记内存为可复用但不立即归还 OS，这是设计决策不是泄漏。"
+        },
+        {
+          "id": "os-memory-leak-detection-q2",
+          "question": "/proc/<PID>/status 中的 VmRSS 和 VmData 分别代表什么？",
+          "choices": [
+            { "id": "A", "text": "VmRSS 是进程虚拟地址空间总大小；VmData 是已提交到物理内存的大小" },
+            { "id": "B", "text": "VmRSS 是进程当前占用的物理内存（常驻集）；VmData 是数据段+堆+栈的大小" },
+            { "id": "C", "text": "VmRSS 是进程独占的物理内存，不含共享库；VmData 是堆的当前大小" },
+            { "id": "D", "text": "VmRSS 等于 VmData 加上代码段和共享库的物理内存之和" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "VmRSS（Resident Set Size）是进程当前实际驻留在物理内存中的页数之和，包括代码段、数据段、堆、栈以及共享库在内存中的部分，是监控内存泄漏最常用的指标。VmData 是进程的数据段（BSS + data segment）加上堆区的总大小，反映程序的「数据+堆」占用。选项 A 描述的是 VmPeak（虚拟地址峰值）和 VmRSS 的混淆。选项 C 描述的更接近 RssAnon（匿名私有页），而非 VmRSS。选项 D 的等式关系并不成立，VmRSS 是物理内存视角，而不是各段的简单加法。"
+        },
+        {
+          "id": "os-memory-leak-detection-q3",
+          "question": "为什么 pmap 输出中出现大量 [ anon ] 匿名段，而 [heap] 没有明显增长，这意味着什么？",
+          "choices": [
+            { "id": "A", "text": "说明是栈内存溢出，函数递归太深导致大量栈帧分配" },
+            { "id": "B", "text": "说明是共享内存泄漏，进程通过 shmget 分配了大量未释放的共享内存" },
+            { "id": "C", "text": "说明泄漏的是大对象（通常 >128KB），glibc malloc 对大对象走 mmap 而非 brk 扩展 heap" },
+            { "id": "D", "text": "说明内存碎片严重，malloc 分配失败后回退到 mmap 兜底分配" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "glibc 的 ptmalloc2 实现有一个关键策略：当单次 malloc 请求超过 MMAP_THRESHOLD（默认 128KB，可通过 mallopt 调整）时，不走传统的 sbrk/brk 扩展堆，而是直接调用 mmap(MAP_ANONYMOUS) 分配独立的内存区域；对应的 free 会调用 munmap 归还给系统。如果这些大对象分配后忘记 free，它们就以独立的 [ anon ] 段出现在 pmap 输出里，而 [heap] 段几乎不变。图像缓冲区（一张 4K 图解码后约 33MB）是典型的大对象泄漏场景。选项 A 的栈帧在 pmap 中会显示为 [stack] 而非 anon。选项 B 的共享内存在 pmap 中会显示为带 key 的命名段。"
+        },
+        {
+          "id": "os-memory-leak-detection-q4",
+          "question": "用 Valgrind --leak-check=full 运行程序后，输出中 「definitely lost」和 「still reachable」分别代表什么？",
+          "choices": [
+            { "id": "A", "text": "definitely lost 是可能泄漏；still reachable 是确定泄漏" },
+            { "id": "B", "text": "definitely lost 是指向内存的指针已全部丢失，100% 泄漏；still reachable 是退出时仍有指针指向，不一定是泄漏" },
+            { "id": "C", "text": "definitely lost 是堆泄漏；still reachable 是栈上的局部变量未释放" },
+            { "id": "D", "text": "两者都是泄漏，区别只是 definitely lost 是直接泄漏，still reachable 是通过其他泄漏块间接泄漏" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Valgrind 把泄漏分为四类。「definitely lost」最严重：指向该内存起始地址的所有指针都已丢失，程序绝对无法再释放它，这才是真正的内存泄漏，需要立即修复。「still reachable」则相反：程序退出时仍然有指针指向这块内存，只是没有显式 free，常见于全局单例、静态容器、或某些库在 main 返回后才清理的设计，通常不是 bug。「indirectly lost」是被 definitely lost 的块所引用的内存，属于连带损失。「possibly lost」是指针指向内存内部而非起始地址，可能是自定义的指针运算也可能是泄漏。选项 D 描述的是 directly lost 和 indirectly lost 的关系，不是 definitely/still reachable 的区别。"
+        },
+        {
+          "id": "os-memory-leak-detection-q5",
+          "question": "以下是某次 Valgrind 输出片段，请判断最可能的泄漏根因：\n\n```\n==9981== 33,177,600 bytes in 1 blocks are definitely lost\n==9981==    at 0x4C2FB0F: malloc\n==9981==    by 0x10B4A2: ImageDecoder::decode(string const&) (image_decoder.cpp:87)\n==9981==    by 0x10C318: WorkerThread::process(Task const&) (worker.cpp:234)\n==9981==    by 0x10D044: WorkerThread::run() (worker.cpp:189)\n```\n\n33,177,600 bytes 约等于多少？最可能是什么数据？",
+          "choices": [
+            { "id": "A", "text": "约 32MB，可能是一张未压缩的 4K 图像（3840×2160×4 字节 RGBA = 33,177,600 字节）的像素缓冲区" },
+            { "id": "B", "text": "约 32MB，可能是 PostgreSQL 连接池申请的连接缓冲区" },
+            { "id": "C", "text": "约 4MB，可能是线程栈空间泄漏" },
+            { "id": "D", "text": "约 32MB，可能是 TCP socket 的接收缓冲区" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "33,177,600 = 3840 × 2160 × 4 = 33,177,600 字节，正好是一张 4K 分辨率（3840×2160）图像在 RGBA 格式下的原始像素缓冲区大小（每像素 4 字节）。调用栈显示分配发生在 ImageDecoder::decode 函数内（image_decoder.cpp 第 87 行），这是一个图像解码器，解码时需要分配原始像素缓冲区，而这块缓冲区在某个代码路径下没有被释放就返回了。结合题目背景（图像处理服务），这是最自然的解释。选项 B 的数据库连接缓冲区通常不在 ImageDecoder 里分配。选项 C 的线程栈通常由操作系统管理，不通过 malloc 分配。选项 D 的 TCP 缓冲区由内核管理，也不会通过 ImageDecoder 的 malloc 泄漏。"
+        },
+        {
+          "id": "os-memory-leak-detection-q6",
+          "question": "下面这段 C++ 代码有没有内存泄漏？\n\n```cpp\nvoid processImage(const std::string& path) {\n    uint8_t* buf = (uint8_t*)malloc(MAX_IMAGE_SIZE);\n    if (!loadImage(path, buf)) {\n        LOG_ERROR(\"Failed to load image: \" + path);\n        return;  // 提前返回\n    }\n    analyzeImage(buf);\n    free(buf);\n}\n```",
+          "choices": [
+            { "id": "A", "text": "没有泄漏，因为 free(buf) 在函数末尾已经调用" },
+            { "id": "B", "text": "有泄漏，loadImage 失败时提前 return，跳过了 free(buf)" },
+            { "id": "C", "text": "有泄漏，analyzeImage 内部可能抛出异常导致 free 不执行" },
+            { "id": "D", "text": "B 和 C 都是泄漏路径，但 C 的问题更严重" }
+          ],
+          "correctAnswer": "D",
+          "explanation": "这段代码存在两条泄漏路径。第一条是选项 B 描述的：loadImage 返回 false 时提前 return，free(buf) 没有执行，buf 指向的内存泄漏。这是 C 代码中最经典的泄漏模式——异常处理路径（早返回、错误码判断）忘记释放资源。第二条是选项 C 描述的：如果 analyzeImage 抛出 C++ 异常，控制流会直接跳出函数，同样跳过 free(buf)。在没有异常处理的 C 代码中问题 B 更常见；在 C++ 代码中问题 C 更隐蔽，因为异常可能来自你意想不到的地方（标准库操作、间接调用）。正确的修法是用 RAII：把 buf 包在 std::unique_ptr<uint8_t[], decltype(&free)> 里，或者换用 std::vector<uint8_t>，让析构函数自动释放。"
+        },
+        {
+          "id": "os-memory-leak-detection-q7",
+          "question": "在生产环境检测 C++ 服务的内存泄漏，以下哪种方案最合适？",
+          "choices": [
+            { "id": "A", "text": "直接在生产进程上运行 Valgrind，因为它检测最全面" },
+            { "id": "B", "text": "用 jemalloc heap profiling（MALLOC_CONF=prof:true）或 bpftrace uprobe 追踪 malloc，对生产影响最小" },
+            { "id": "C", "text": "用 AddressSanitizer 重新编译并部署到生产，2x 开销可以接受" },
+            { "id": "D", "text": "生产环境无法检测泄漏，只能在开发环境用 Valgrind 复现" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "生产环境的核心约束是不能显著影响服务性能和稳定性。Valgrind（选项 A）有 10-50x 性能损耗，在生产环境使用完全不可接受，会直接导致服务超时和雪崩。ASan（选项 C）虽然只有 2x 开销，但需要重新编译部署，且某些生产环境问题在 ASan 编译版本下无法完全复现；2x 开销对于高 QPS 服务也可能超出容忍范围。选项 D 是错误的，生产环境完全可以检测泄漏。jemalloc profiling 开销约 5-10%，对多数服务可以接受；bpftrace 的开销更低，只在 malloc 调用时触发，且完全不需要修改或重启进程，是生产环境诊断的首选。两者结合可以在不影响服务的情况下精确定位泄漏来源。"
+        },
+        {
+          "id": "os-memory-leak-detection-q8",
+          "question": "你在生产环境用 bpftrace 追踪了目标进程的 malloc 调用 30 秒，发现调用栈 A 累计分配了 4.2GB，调用栈 B 累计分配了 3.1GB。但进程的 RSS 只增长了约 200MB。这说明什么？",
+          "choices": [
+            { "id": "A", "text": "bpftrace 数据不准确，因为 eBPF 有采样丢失" },
+            { "id": "B", "text": "大部分 malloc 有对应的 free，内存被正常回收，累计分配量大不等于泄漏" },
+            { "id": "C", "text": "说明存在大量内存碎片，malloc 的内存虽然被 free 了但没有归还给 OS" },
+            { "id": "D", "text": "说明调用栈 A 和 B 都是安全的，泄漏来自其他地方" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "bpftrace 统计的是累计分配总量，不是未释放内存量。一个每秒处理 1000 个请求、每个请求分配释放 4MB 的服务，30 秒会累计分配 120GB，但任意时刻的实际内存占用可能只有几十 MB。累计分配量大是正常的高频分配，不代表泄漏。要判断是否泄漏，需要同时追踪 malloc 和 free，计算「分配了但没有 free 的内存」，或者对比不同时间点的堆快照。选项 C 描述的内存碎片是另一个问题（碎片会导致 RSS 偏高但 malloc 能复用），与本题场景不完全对应。选项 D 的结论跳跃了——调用栈 A/B 是否泄漏需要结合 free 的统计才能判断，不能仅凭「RSS 增长少」就排除它们。"
+        },
+        {
+          "id": "os-memory-leak-detection-q9",
+          "question": "C++ 服务使用了一个第三方图像识别库（只有 .so 文件，没有源码），Valgrind 报告显示泄漏来自该库内部。你能怎么做？",
+          "choices": [
+            { "id": "A", "text": "没有源码就无法定位，只能联系库的供应商" },
+            { "id": "B", "text": "用 Valgrind 的 --suppressions 屏蔽这些报告，假装没问题" },
+            { "id": "C", "text": "用 bpftrace 追踪 .so 中的函数调用，结合 pmap 分析泄漏模式；同时检查你的代码是否在所有路径上都调用了库的 init/destroy API" },
+            { "id": "D", "text": "换一个有源码的开源替代库，第三方闭源库泄漏无解" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "没有源码不等于束手无策。首先要检查你自己对库的使用方式：大多数库有初始化（如 lib_init()）和销毁（lib_destroy()）函数，泄漏往往是因为错误路径上没有调用 destroy。用 Valgrind 的调用栈可以看到你调用的最后一层 API，从而判断是哪个 API 泄漏。其次，bpftrace 的 uprobe 可以对 .so 的导出函数插桩，即使没有源码也能追踪函数调用频率和参数。第三，可以写一个最小复现（只调用该库的代码），隔离泄漏是否必现，然后向供应商提 bug report 并附上 Valgrind 报告。选项 B 的 suppression 只是掩盖问题，内存还是在泄漏。选项 D 换库的成本过大，应该在其他方案都失败后才考虑。"
+        },
+        {
+          "id": "os-memory-leak-detection-q10",
+          "question": "下面哪种「内存增长」不是内存泄漏，而是正常或可预期的行为？",
+          "choices": [
+            { "id": "A", "text": "LRU 缓存容量配置为 10GB，服务运行 1 小时后内存从 200MB 涨到 9.8GB" },
+            { "id": "B", "text": "C++ 服务运行 72 小时后 RSS 从 300MB 涨到 2.1GB，重启后恢复正常，业务量没有变化" },
+            { "id": "C", "text": "std::map 存储了所有用户的会话数据，没有过期淘汰机制，随用户增加持续增长" },
+            { "id": "D", "text": "C 代码中 malloc 后的指针在 if-else 的某个分支里没有 free，该分支每分钟触发一次" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "选项 A 是正常行为：LRU 缓存被配置为最大 10GB，服务会持续填充缓存直到接近上限，这是预期的设计，缓存有明确的驱逐策略，内存不会无限增长。这不是泄漏，是有界的内存占用。选项 B 的特征符合经典内存泄漏：RSS 持续增长、重启后恢复、业务量不变，完全符合泄漏的行为模式，需要用 Valgrind/ASan 排查。选项 C 虽然不是「指针丢失」意义上的技术性内存泄漏，但在工程实践中被称为「逻辑内存泄漏」——有明确指针指向容器，但容器本身无限增长最终导致 OOM，同样需要修复（加过期时间或最大容量限制）。选项 D 是经典的 C 内存泄漏，每分钟泄漏一次，几天内就会耗尽内存。"
+        }
+      ],
+      "references": [
+        "https://valgrind.org/docs/manual/mc-manual.html",
+        "https://github.com/google/sanitizers/wiki/AddressSanitizerLeakSanitizer",
+        "https://heaptrack.readthedocs.io/",
+        "https://github.com/jemalloc/jemalloc/wiki/Use-Case%3A-Heap-Profiling",
+        "https://www.brendangregg.com/blog/2019-01-01/learn-ebpf-tracing.html",
+        "https://man7.org/linux/man-pages/man5/proc.5.html"
+      ]
+    }
+  ]
+}
