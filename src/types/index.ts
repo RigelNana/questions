@@ -16,7 +16,7 @@ import {
   Wrench,
 } from 'lucide-react';
 
-export type { Domain, QuestionType, QuestionCategory, Difficulty, QuizChoice, QuizQuestion, QuestionEntry, QuestionSummary, QuestionPack, PackRegistryEntry, PackRegistry, QuestionIndex } from './question';
+export type { Domain, QuestionType, QuestionCategory, Difficulty, QuizChoice, QuizQuestion, QuestionEntry, QuestionPack, PackRegistryEntry, PackRegistry } from './question';
 export { DOMAIN_LABELS, QUESTION_TYPE_LABELS, QUESTION_TYPE_CATEGORY, DIFFICULTY_LABELS, ALL_DOMAINS } from './question';
 export type { QuizAttempt, QuestionProgress, UserSettings, UserProgress } from './progress';
 export { DEFAULT_SETTINGS, DEFAULT_PROGRESS } from './progress';

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Search, ArrowRight, CornerDownLeft } from 'lucide-react';
 import { useQuestionStore } from '../../stores/questionStore';
-import { ALL_DOMAINS, DOMAIN_LABELS, DOMAIN_ICONS, type Domain } from '../../types';
+import { DOMAIN_LABELS, DOMAIN_ICONS, type Domain } from '../../types';
 
 interface SearchModalProps {
   isOpen: boolean;
@@ -14,9 +14,9 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
-  const { fetchIndexForDomain, getAllQuestionSummaries } = useQuestionStore();
+  const { getAllLoadedQuestions } = useQuestionStore();
 
-  const allQuestions = getAllQuestionSummaries();
+  const allQuestions = getAllLoadedQuestions();
 
   const results = useMemo(() => {
     if (!query.trim()) return [];
@@ -33,10 +33,9 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
     if (isOpen) {
       setQuery('');
       setSelectedIndex(0);
-      Promise.all(ALL_DOMAINS.map((domain) => fetchIndexForDomain(domain))).catch(() => undefined);
       setTimeout(() => inputRef.current?.focus(), 50);
     }
-  }, [isOpen, fetchIndexForDomain]);
+  }, [isOpen]);
 
   useEffect(() => {
     setSelectedIndex(0);

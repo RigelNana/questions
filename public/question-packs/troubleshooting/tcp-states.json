@@ -1,0 +1,156 @@
+{
+  "id": "tcp-states",
+  "name": "TCP 连接状态分析",
+  "domain": "troubleshooting",
+  "description": "分析 TIME_WAIT 大量堆积耗尽端口和 CLOSE_WAIT 连接泄漏的根因与解决方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "tcp-states-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["tcp", "time-wait", "close-wait", "network", "linux", "ss", "kernel"],
+      "title": "服务器出现大量 TIME_WAIT 和 CLOSE_WAIT 连接，如何分析和解决？",
+      "content": "你是一家电商公司的 SRE，负责维护一批 Nginx + Java 后端服务的线上集群。某天下午高峰期，值班同学收到告警：一台 API 网关机器上的新连接建立开始失败，应用日志里出现大量报错：\n\n```\njava.net.BindException: Cannot assign requested address\n  at java.net.PlainSocketImpl.socketBind(Native Method)\n  at java.net.AbstractPlainSocketImpl.bind(AbstractPlainSocketImpl.java:387)\n```\n\n登上机器后，你运行 `ss -s` 查看套接字汇总信息，输出如下：\n\n```\nTotal: 52847 (kernel 53201)\nTCP:   51983 (estab 312, closed 51204, orphaned 24, synrecv 0, timewait 51189/0), ports 0\n\nTransport Total     IP        IPv6\n*         53201     -         -\nRAW       0         0         0\nUDP       12        8         4\nTCP       779       611       168\nINET      791       619       172\nFRAG      0         0         0\n```\n\n51189 个 TIME_WAIT，端口彻底耗尽了。与此同时，另一台 Java 微服务机器的情况完全不同——那台机器上 TIME_WAIT 不多，但是 CLOSE_WAIT 连接达到了 8000+，并且这个数字在持续缓慢上涨，重启服务后一段时间又会回到这个量级。技术负责人判断这台机器存在连接泄漏。\n\n这两台机器呈现出的症状截然不同，但都和 TCP 连接状态异常有关。如何系统性地分析这两种异常状态的根因？分别应该如何解决？",
+      "answer": "## TCP 状态机：先把基础打牢\n\n要搞清楚 TIME_WAIT 和 CLOSE_WAIT，必须先把 TCP 的四次挥手流程说清楚，因为这两个状态都发生在连接关闭的过程中，而很多人对这个流程其实是一知半解的。\n\nTCP 建立连接用三次握手，关闭连接用四次挥手。四次挥手之所以比握手多一次，是因为 TCP 是全双工协议——两个方向的数据流需要独立关闭。主动关闭的一方（我们叫它 A）先发一个 FIN 报文，告诉对方「我这边没有数据要发了」，对方（B）收到后回一个 ACK 确认，这时 A 进入 `FIN_WAIT_2` 状态，等待 B 也关闭自己那一侧。B 在处理完剩余数据之后，再发出自己的 FIN，A 收到后回 ACK，这时 A 进入 `TIME_WAIT` 状态，而 B 在等待最后那个 ACK 到达期间处于 `LAST_ACK` 状态。\n\n完整的状态迁移路径如下：\n\n```\n主动关闭方 A                          被动关闭方 B\n\nESTABLISHED                          ESTABLISHED\n    │  ──── FIN ────────────────────>  │\nFIN_WAIT_1                             │\n    │  <─── ACK ────────────────────  │  CLOSE_WAIT\nFIN_WAIT_2                             │\n    │                                  │  (应用层调用 close())\n    │  <─── FIN ────────────────────  │\nTIME_WAIT   ──── ACK ────────────────> LAST_ACK ──> CLOSED\n    │\n (等待 2*MSL 后)\n    ▼\n  CLOSED\n```\n\n这里有两个关键时刻需要记住。第一，`CLOSE_WAIT` 是 B 在收到 A 的 FIN 之后、B 自己调用 `close()` 之前的状态。这个状态完全由应用层控制，内核只是在等应用程序发出关闭信号。第二，`TIME_WAIT` 是 A 在发出最后一个 ACK 之后的等待状态，持续时间是 `2 * MSL`（Maximum Segment Lifetime，报文最大存活时间），Linux 内核中 MSL 固定为 30 秒，所以 TIME_WAIT 默认持续 60 秒。这段时间内，这个四元组（源IP、源端口、目标IP、目标端口）不能被复用。\n\n---\n\n## TIME_WAIT 大量堆积：端口耗尽的根因分析\n\n回到第一台机器。51189 个 TIME_WAIT 直接导致端口耗尽，这是一个非常典型的问题，背后的原因一旦理解就会觉得「这必然会发生」。\n\n问题的根源在于 HTTP 短连接加上服务端主动关闭。在很多老旧的架构里，每次 HTTP 请求结束之后，服务端会主动 `close()` 这条 TCP 连接。因为是服务端主动关闭，服务端就进入了 TIME_WAIT 状态，而且 60 秒内端口无法复用。高峰期 QPS 假设是 2000，那么每秒会产生 2000 个 TIME_WAIT，60 秒内累积就是 12 万个。Linux 默认的本地端口范围是 `net.ipv4.ip_local_port_range = 32768 60999`，只有大约 28000 个可用端口。数字一对上，端口耗尽就不奇怪了。\n\n用下面这条命令可以精确地查看 TIME_WAIT 的数量，比 `ss -s` 更直接：\n\n```bash\n# 使用 ss 的状态过滤，比 grep 更高效\nss -tan state time-wait | wc -l\n\n# 查看端口范围配置\ncat /proc/sys/net/ipv4/ip_local_port_range\n# 32768   60999\n\n# 查看当前各状态的连接分布\nss -tan | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn\n# 51189 TIME-WAIT\n#   312 ESTAB\n#   ...\n```\n\n**解决方案一：开启 `tcp_tw_reuse`**\n\n最立竿见影的内核参数是 `net.ipv4.tcp_tw_reuse`。这个参数允许新的出站连接复用处于 TIME_WAIT 状态的端口，前提是新连接的时间戳比 TIME_WAIT 连接的最后时间戳更新（这就是为什么必须同时开启 `tcp_timestamps`）。\n\n```bash\n# 永久生效，写入 /etc/sysctl.conf\nnet.ipv4.tcp_tw_reuse = 1\nnet.ipv4.tcp_timestamps = 1\n\n# 立即生效\nsysctl -p\n```\n\n这里有一个非常重要的限制必须说清楚：`tcp_tw_reuse` **只对出站连接（客户端发起的连接）有效**。对于服务端 `accept()` 进来的连接没有任何作用。所以如果这台机器是在用 HTTP 短连接访问下游服务，开启这个参数有效；如果 TIME_WAIT 是上游客户端访问这台机器产生的，这个参数解决不了问题。\n\n**解决方案二：使用长连接（根本解法）**\n\n`tcp_tw_reuse` 只是治标，真正的治本方案是开启 HTTP Keep-Alive，让连接在处理完一个请求后不立即关闭，而是复用来处理下一个请求。在 Nginx 上开启 upstream keepalive 非常简单：\n\n```nginx\nupstream backend {\n    server 10.0.0.1:8080;\n    keepalive 32;  # 每个 worker 进程维持的空闲长连接数\n}\n\nserver {\n    location / {\n        proxy_pass http://backend;\n        proxy_http_version 1.1;          # 必须是 HTTP/1.1\n        proxy_set_header Connection \"\";  # 清除 Connection: close 头\n    }\n}\n```\n\n开启长连接后，TIME_WAIT 的产生速率会大幅降低，因为一条 TCP 连接现在可以承载数百个 HTTP 请求，只在最终关闭时才产生一个 TIME_WAIT。\n\n**关于 `tcp_tw_recycle` 的重要警告**\n\n你可能在老文章里见过 `net.ipv4.tcp_tw_recycle = 1` 这个参数，声称可以更激进地回收 TIME_WAIT 连接。千万不要在生产环境开启这个参数，原因有两个：第一，**Linux 4.12 内核已经彻底移除了这个参数**，在新内核上设置它毫无效果；第二，即使在老内核上，这个参数在 NAT 环境（几乎所有云环境、K8s 集群都是）下会导致大量连接被错误丢弃，因为 NAT 后面多个客户端的时间戳可能不单调递增，内核会把它们的包当作重放攻击丢掉。\n\n---\n\n## CLOSE_WAIT 大量堆积：连接泄漏的根因分析\n\n第二台机器的情况和 TIME_WAIT 有本质的不同。TIME_WAIT 是正常的协议行为，数量多只是性能问题；而 **CLOSE_WAIT 如果持续堆积，一定是 bug**，没有例外。\n\n回顾状态机：进入 CLOSE_WAIT 意味着对方已经发送了 FIN（对方已经关闭了自己那一侧），内核已经收到了，但应用程序还没有调用 `close()` 关闭这个连接。连接就这样卡在 CLOSE_WAIT，直到应用程序最终关闭它（或者进程重启）。\n\n第一步，定位是哪个进程在泄漏：\n\n```bash\n# 查看处于 CLOSE_WAIT 状态的连接及对应进程\nss -tnp state close-wait\n# State    Recv-Q  Send-Q  Local Address:Port  Peer Address:Port  Process\n# CLOSE-WAIT  0     0       10.0.0.5:45821     10.0.0.1:8080      users:((\"java\",pid=12345,fd=89))\n# CLOSE-WAIT  0     0       10.0.0.5:45822     10.0.0.1:8080      users:((\"java\",pid=12345,fd=90))\n# ...\n\n# 查看该进程打开的连接总数（包含所有状态）\nls /proc/12345/fd | wc -l\n```\n\n通过输出可以确认泄漏来自 PID 12345 这个 Java 进程，而且都是连向 `10.0.0.1:8080` 这个下游服务的连接。\n\n第二步，分析代码层面的原因。CLOSE_WAIT 堆积最常见的三种场景：\n\n**场景一：try-with-resources 漏写。** Java 里使用 `HttpURLConnection`、`Socket` 或各种连接池时，如果没有在 `finally` 块或 try-with-resources 里正确 `close()`，连接就会泄漏。下面是一个经典的错误写法：\n\n```java\n// 错误：抛出异常时 connection 永远不会被关闭\nHttpURLConnection conn = (HttpURLConnection) url.openConnection();\nInputStream is = conn.getInputStream();\n// 如果这里抛异常...\nString result = readAll(is);\nis.close();  // 这行永远不会执行\nconn.disconnect();\n```\n\n**场景二：线程池打满，积压的连接无法被处理。** 假设 Java 服务的业务线程池满了，有大量连接在 accept 队列里等待被处理，但与此同时下游服务开始关闭这些连接，就会导致大量 CLOSE_WAIT 积压在等待应用处理的状态。\n\n**场景三：连接池配置错误，连接超出池容量后被遗弃。** 比如 HikariCP 连接池 `maximumPoolSize` 设置得太小，超出容量后新的连接请求被拒绝，而已获取到连接的线程在报错后没有正确归还连接。\n\n第三步，用 jstack 确认线程状态：\n\n```bash\n# 抓取 Java 线程堆栈\njstack 12345 > thread_dump.txt\n\n# 看是否有大量线程阻塞在同一个位置\ngrep -A 5 'BLOCKED\\|WAITING' thread_dump.txt | head -60\n```\n\n如果看到几百个线程都阻塞在同一行代码（比如等待连接池获取连接），那就找到根因了。\n\n---\n\n## 扩展：进阶知识点\n\n理解了 TIME_WAIT 和 CLOSE_WAIT 之后，有几个相关的知识点值得延伸掌握，在面试和生产中都会遇到。\n\n**SO_LINGER 选项强制 RST 关闭。** 正常的 TCP 关闭走四次挥手，发送的是 FIN。如果在 socket 上设置 `SO_LINGER` 并且 `l_onoff=1, l_linger=0`，调用 `close()` 时内核会直接发送 RST 报文，连接立即消失，不会有 TIME_WAIT。这在某些需要快速释放端口的场景下很有用，但 RST 会导致对方收到「连接被强制重置」的错误，使用时需要谨慎。\n\n**SYN 队列和 Accept 队列溢出。** 除了 TIME_WAIT 和 CLOSE_WAIT，TCP 连接建立阶段还有另一类常见问题：半连接队列（SYN queue）和全连接队列（Accept queue）溢出。前者溢出会导致 SYN 报文被丢弃，客户端看到的是连接超时；后者溢出则是服务端内核已完成三次握手，但应用层 `accept()` 太慢，表现为连接建立成功但请求延迟异常高。用 `netstat -s | grep -i overflow` 可以查看历史溢出次数。\n\n**`ss` vs `netstat` 的性能差异。** 当连接数达到数万时，`netstat` 会变得极慢，因为它通过 `/proc/net/tcp` 读取，需要遍历内核中所有 socket 的链表，复杂度是 O(n)。而 `ss` 使用 Netlink socket 直接和内核通信，速度快得多。在连接数超过 1 万的生产环境，永远用 `ss` 不用 `netstat`。\n\n**连接追踪表（conntrack）。** 在使用 iptables 或者 Kubernetes 网络插件的环境里，每一条 TCP 连接都会在 conntrack 表里占一个条目。当 TIME_WAIT 堆积到几万时，conntrack 表可能也会被耗尽（默认大小约 65536），导致新连接被 iptables 静默丢弃，表现非常诡异——连接建立看起来正常，但数据包在内核层面被丢了。用 `conntrack -L | wc -l` 和 `sysctl net.netfilter.nf_conntrack_max` 可以检查是否已接近上限。\n\n**TCP Fast Open（TFO）。** 标准 TCP 三次握手完成之后才能发送数据，这意味着即使是最简单的请求也要经历 1.5 个 RTT 的延迟。TFO 允许客户端在 SYN 包里携带数据，服务端在握手完成前就可以开始处理，将延迟降低到 0.5 RTT。在高延迟链路（跨地域请求）上效果显著，Linux 3.7+ 内核已支持，通过 `net.ipv4.tcp_fastopen = 3` 开启。",
+      "keyPoints": [
+        "TIME_WAIT 是主动关闭方在完成四次挥手后必须等待 2*MSL（Linux 上为 60 秒）的状态，目的是防止迷路报文干扰新连接，以及确保对端收到最后一个 ACK；这是完全正常的协议行为，数量多才是问题。",
+        "CLOSE_WAIT 是被动关闭方收到对端 FIN 后、应用层调用 close() 之前的中间状态；CLOSE_WAIT 长期堆积意味着应用程序没有正确关闭连接，一定是代码 bug，常见原因是 try-with-resources 漏写、线程池打满或连接对象未正确释放。",
+        "TIME_WAIT 大量堆积的直接危害是耗尽本地端口（`net.ipv4.ip_local_port_range` 默认只有约 28000 个可用端口），导致新出站连接报 'Cannot assign requested address' 错误。",
+        "开启 `net.ipv4.tcp_tw_reuse=1` 可以复用 TIME_WAIT 端口用于新的出站连接，但该参数只对客户端（主动发起连接的一方）有效，必须同时开启 `tcp_timestamps`；`tcp_tw_recycle` 在 Linux 4.12 后已废弃，在 NAT 环境下会导致连接被错误丢弃，不得使用。",
+        "根治 TIME_WAIT 堆积的正确方案是从 HTTP 短连接改为长连接（Keep-Alive），Nginx 通过 `keepalive` 指令控制对 upstream 的复用连接数；长连接让一条 TCP 连接承载多个 HTTP 请求，大幅减少 TIME_WAIT 产生速率。",
+        "排查 CLOSE_WAIT 连接泄漏的标准步骤：先用 `ss -tnp state close-wait` 定位是哪个进程的哪些 fd 在泄漏，再用 `jstack` 查线程堆栈是否有线程阻塞，最后逐一检查连接的创建路径是否有遗漏 close() 的代码分支。",
+        "在 Kubernetes 或使用 iptables 的环境中，TIME_WAIT 大量堆积还可能耗尽 conntrack 连接追踪表（`nf_conntrack_max` 默认约 65536），导致新连接被内核静默丢弃；可用 `conntrack -L | wc -l` 检查当前用量是否接近上限。",
+        "生产环境排查连接状态问题应始终使用 `ss` 而非 `netstat`，在连接数万级时 `netstat` 遍历 /proc/net/tcp 会产生严重的性能开销，而 `ss` 使用 Netlink 直接与内核通信速度快得多。"
+      ],
+      "quiz": [
+        {
+          "id": "tcp-states-q1",
+          "question": "在 TCP 四次挥手中，哪一方会进入 TIME_WAIT 状态？",
+          "choices": [
+            { "id": "A", "text": "主动发起关闭的一方（先发 FIN 的那方）" },
+            { "id": "B", "text": "被动接受关闭的一方（先收到 FIN 的那方）" },
+            { "id": "C", "text": "数据传输量更大的一方" },
+            { "id": "D", "text": "服务端（accept 连接的那方）永远不会进入 TIME_WAIT" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "TIME_WAIT 由主动关闭方持有，也就是四次挥手中先发 FIN 的那一方。主动关闭方在发出最后一个 ACK（确认对端的 FIN）之后进入 TIME_WAIT，持续 2*MSL。被动关闭方在等待最后一个 ACK 期间处于 LAST_ACK 状态，收到 ACK 后直接进入 CLOSED。D 选项是常见误解：服务端同样可以主动关闭连接（比如 Nginx 处理完请求后主动 close），此时服务端会产生 TIME_WAIT，这正是本题生产故障的根因。"
+        },
+        {
+          "id": "tcp-states-q2",
+          "question": "CLOSE_WAIT 状态出现在 TCP 四次挥手的哪个阶段？",
+          "choices": [
+            { "id": "A", "text": "主动关闭方发出 FIN 之后，等待对方 ACK 期间" },
+            { "id": "B", "text": "被动关闭方收到 FIN 并回复 ACK 之后，等待应用层调用 close() 期间" },
+            { "id": "C", "text": "双方完成四次挥手之后，等待端口回收期间" },
+            { "id": "D", "text": "被动关闭方发出自己的 FIN 之后，等待对方 ACK 期间" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "CLOSE_WAIT 是被动关闭方（先收到 FIN 的那方）的中间状态。当被动关闭方收到对端的 FIN 时，内核自动回复 ACK，然后连接进入 CLOSE_WAIT，等待应用层调用 close()。这个状态完全由应用程序控制：应用层一旦调用 close()，内核就会发出自己的 FIN，连接进入 LAST_ACK 状态。如果应用层永远不调用 close()，连接就一直卡在 CLOSE_WAIT，这就是连接泄漏的本质。D 选项描述的是 LAST_ACK 状态。"
+        },
+        {
+          "id": "tcp-states-q3",
+          "question": "Linux 上 TIME_WAIT 状态默认持续多久？这个时长是由什么决定的？",
+          "choices": [
+            { "id": "A", "text": "30 秒，等于 1 个 MSL，由 tcp_fin_timeout 控制" },
+            { "id": "B", "text": "60 秒，等于 2 个 MSL，MSL 在 Linux 内核硬编码为 30 秒" },
+            { "id": "C", "text": "120 秒，等于 4 个 MSL，可以通过 tcp_tw_timeout 修改" },
+            { "id": "D", "text": "由应用层 SO_KEEPALIVE 参数决定，默认 75 秒" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "TIME_WAIT 持续时间是 2*MSL。MSL（Maximum Segment Lifetime，报文最大存活时间）在 Linux 内核中硬编码为 30 秒（定义在 `include/net/tcp.h` 的 `TCP_TIMEWAIT_LEN`），因此 TIME_WAIT 持续 60 秒。这个值不能通过 sysctl 修改。`tcp_fin_timeout` 控制的是 FIN_WAIT_2 状态的超时时间，不是 TIME_WAIT。等待 2*MSL 的原因有两个：一是确保对端收到最后一个 ACK（如果 ACK 丢失，对端会重发 FIN，主动方重新计时）；二是让网络中残留的旧报文有足够时间消亡，防止干扰新连接。"
+        },
+        {
+          "id": "tcp-states-q4",
+          "question": "`net.ipv4.tcp_tw_reuse=1` 的作用是什么，它有什么限制条件？",
+          "choices": [
+            { "id": "A", "text": "允许服务端复用 TIME_WAIT 端口接受新连接，无需额外条件" },
+            { "id": "B", "text": "允许客户端复用 TIME_WAIT 端口发起新的出站连接，需同时开启 tcp_timestamps" },
+            { "id": "C", "text": "立即终止所有 TIME_WAIT 连接，释放端口供复用" },
+            { "id": "D", "text": "将 TIME_WAIT 时长从 60 秒缩短到 10 秒" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`tcp_tw_reuse` 允许新的出站连接（客户端发起的连接）复用处于 TIME_WAIT 状态的本地端口，前提是新连接的时间戳比 TIME_WAIT 连接的最后时间戳更新——这就是为什么必须同时开启 `tcp_timestamps`。关键限制：该参数**只对出站连接有效**，对服务端 accept 进来的连接无效。如果 TIME_WAIT 是由服务端主动关闭入站连接产生的，开启 tcp_tw_reuse 没有任何帮助，必须从根本上改用长连接。A 选项描述的是 `tcp_tw_recycle` 的设计初衷（但该参数在 Linux 4.12 后已废弃）。"
+        },
+        {
+          "id": "tcp-states-q5",
+          "question": "以下 `ss -s` 输出中，哪个数字代表真正「建立完成、正在通信」的连接数？\n\n```\nTCP: 51983 (estab 312, closed 51204, orphaned 24, synrecv 0, timewait 51189/0)\n```",
+          "choices": [
+            { "id": "A", "text": "51983，这是所有 TCP socket 的总数" },
+            { "id": "B", "text": "312，这是 estab（ESTABLISHED）状态的连接数" },
+            { "id": "C", "text": "51204，这是 closed 状态，代表最近关闭的连接" },
+            { "id": "D", "text": "51189，这是 timewait 连接数，它们仍然占用端口资源" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`estab 312` 表示当前有 312 个处于 ESTABLISHED 状态的连接，这些才是真正在双向通信的活跃连接。`closed 51204` 指的是已进入 CLOSED 状态但 socket 对象还没被释放的数量，它们不占用端口。`timewait 51189` 是处于 TIME_WAIT 状态的连接，它们确实仍占用端口四元组，不能被复用，这正是导致端口耗尽的原因。从这个输出可以看出：机器实际承载的活跃业务连接只有 312 个，但 51189 个 TIME_WAIT 把端口池塞满了，问题的严重程度一目了然。"
+        },
+        {
+          "id": "tcp-states-q6",
+          "question": "为什么在 Kubernetes（或任何 NAT 环境）中，绝对不能开启 `net.ipv4.tcp_tw_recycle`？",
+          "choices": [
+            { "id": "A", "text": "因为 Kubernetes 使用 IPv6，而该参数只对 IPv4 有效" },
+            { "id": "B", "text": "因为该参数在 Linux 4.12 后已被移除，且在旧内核上会将 NAT 后的多个客户端的包错误丢弃" },
+            { "id": "C", "text": "因为该参数会与 kube-proxy 的 iptables 规则冲突，导致服务无法发现" },
+            { "id": "D", "text": "因为该参数会缩短 TIME_WAIT 到 1 秒，导致端口复用时发生数据污染" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`tcp_tw_recycle` 在 Linux 4.12 已被彻底移除（commit: 95a22caee396）。在老内核上，它开启了基于时间戳的快速 TIME_WAIT 回收，要求同一个「源 IP」过来的包时间戳必须单调递增。但在 NAT 后面，多个真实客户端（拥有不同本地时钟）被映射成同一个 NAT 出口 IP，它们的时间戳相对于内核来说是混乱的——内核会把时间戳不单调的包当作旧报文丢弃，表现为随机连接超时，且难以排查，因为 tcpdump 在服务端根本抓不到这些被丢弃的包。"
+        },
+        {
+          "id": "tcp-states-q7",
+          "question": "TIME_WAIT 大量堆积和 CLOSE_WAIT 大量堆积，哪种情况「一定是 bug」？",
+          "choices": [
+            { "id": "A", "text": "两种都不是 bug，都是正常的 TCP 协议行为" },
+            { "id": "B", "text": "TIME_WAIT 一定是 bug；CLOSE_WAIT 是正常现象，只有数量过多时才是问题" },
+            { "id": "C", "text": "CLOSE_WAIT 持续堆积一定是应用层 bug；TIME_WAIT 是正常协议行为，数量多是性能问题而非功能问题" },
+            { "id": "D", "text": "两种都是 bug，前者是内核 bug，后者是应用 bug" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "这是两种状态最本质的区别，面试中必须说清楚。TIME_WAIT 是 TCP 协议规定的必要等待状态，RFC 793 明确要求主动关闭方必须等待 2*MSL，它的存在本身是正确的，只是数量多了会有性能影响（耗端口），可以通过 tcp_tw_reuse 或长连接优化。CLOSE_WAIT 则不同：被动关闭方收到 FIN 之后只要应用层正常调用 close()，这个状态就会迅速消失，只会在瞬间存在；如果 CLOSE_WAIT 在持续堆积且数量不下降，意味着应用程序收到了对端的关闭信号却没有关闭自己这端，这必然是代码缺陷。"
+        },
+        {
+          "id": "tcp-states-q8",
+          "question": "一个 Java 微服务出现大量 CLOSE_WAIT，你用 `ss -tnp state close-wait` 确认是某个 Java 进程（PID 5678）。下一步最优先的排查操作是什么？",
+          "choices": [
+            { "id": "A", "text": "直接重启该 Java 进程，然后观察 CLOSE_WAIT 数量是否在重启后重新增长" },
+            { "id": "B", "text": "用 `jstack 5678` 抓取线程堆栈，同时检查连接相关代码是否正确使用 try-with-resources 关闭连接" },
+            { "id": "C", "text": "修改 `net.ipv4.tcp_fin_timeout` 缩短 FIN 超时时间，强制回收 CLOSE_WAIT 连接" },
+            { "id": "D", "text": "开启 SO_KEEPALIVE，让内核自动检测并关闭失活的 CLOSE_WAIT 连接" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "重启（A 选项）只是临时缓解，题目说明重启后问题会复现，根本没有解决 bug。`tcp_fin_timeout`（C 选项）控制的是 FIN_WAIT_2 超时，对 CLOSE_WAIT 无效——内核无法强制关闭一个应用层还持有的 socket。SO_KEEPALIVE（D 选项）探测的是连接是否还活着，但 CLOSE_WAIT 的对端已经关闭了，不存在 keepalive 探测失败的场景。正确路径是：`jstack` 看线程是否有阻塞在等待连接的地方（说明线程池问题），同时 code review 所有涉及 HTTP 客户端、数据库连接的代码路径，确认是否在所有分支（包括异常分支）都正确调用了 close()。"
+        },
+        {
+          "id": "tcp-states-q9",
+          "question": "在 Kubernetes 集群中，除了端口耗尽，TIME_WAIT 大量堆积还可能引发什么连锁故障？",
+          "choices": [
+            { "id": "A", "text": "导致 etcd 写入延迟升高，因为 TIME_WAIT 占用 etcd 的连接资源" },
+            { "id": "B", "text": "耗尽 conntrack 连接追踪表，导致新连接被 iptables/netfilter 静默丢弃" },
+            { "id": "C", "text": "导致 Pod 的 CPU 使用率飙升，因为内核需要维护 TIME_WAIT 状态" },
+            { "id": "D", "text": "导致 kube-proxy 无法同步 iptables 规则，出现服务发现故障" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Kubernetes 网络（无论是 kube-proxy iptables 模式还是 Calico、Flannel 等 CNI 插件）都依赖内核的 netfilter/conntrack 模块追踪连接状态。conntrack 表的默认容量约 65536 条目（`nf_conntrack_max`），每一个 TCP 连接（包括 TIME_WAIT 状态的连接）都会占一条记录。当 TIME_WAIT 堆积到数万、conntrack 表打满时，新的连接请求会被内核静默丢弃（不回 RST，也不回 ICMP），从应用层看就是请求超时、无响应，极难排查。用 `dmesg | grep 'nf_conntrack: table full'` 或 `conntrack -L | wc -l` 对比 `nf_conntrack_max` 可以验证这个问题。"
+        },
+        {
+          "id": "tcp-states-q10",
+          "question": "为什么生产环境排查大量 TCP 连接时，应优先使用 `ss` 而不是 `netstat`？",
+          "choices": [
+            { "id": "A", "text": "`ss` 支持 IPv6 而 `netstat` 只支持 IPv4" },
+            { "id": "B", "text": "`ss` 使用 Netlink socket 直接与内核通信，`netstat` 通过遍历 /proc/net/tcp 实现，后者在连接数大时性能极差" },
+            { "id": "C", "text": "`netstat` 在 Linux 5.0 后被彻底移除，系统中已没有该命令" },
+            { "id": "D", "text": "`ss` 能显示 TIME_WAIT 连接而 `netstat` 不能" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是个很实际的生产知识点。`netstat` 来自 net-tools 套件，通过读取和解析 `/proc/net/tcp`、`/proc/net/tcp6` 等文件获取连接信息，每次调用都要遍历内核维护的所有 socket 链表，时间复杂度 O(n)。在连接数达到 5 万时，一次 `netstat -an` 可能需要十几秒甚至更长，而且会占用大量 CPU，在故障现场执行可能让情况更糟。`ss`（Socket Statistics）使用 Netlink socket 直接请求内核以结构化方式返回数据，速度快数个数量级。`netstat` 并未被移除（C 选项错误），只是在现代 Linux 发行版中 net-tools 已不默认安装，`ss` 是其推荐替代品（来自 iproute2 套件）。"
+        }
+      ],
+      "references": [
+        "https://vincent.bernat.ch/en/blog/2014-tcp-time-wait-state-linux",
+        "https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html",
+        "https://man7.org/linux/man-pages/man8/ss.8.html"
+      ]
+    }
+  ]
+}

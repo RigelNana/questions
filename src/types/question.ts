@@ -71,18 +71,6 @@ export interface QuestionEntry {
   relatedQuestions?: string[];
 }
 
-export interface QuestionSummary {
-  id: string;
-  domain: Domain;
-  type: QuestionType;
-  difficulty: Difficulty;
-  tags: string[];
-  title: string;
-  keyPoints: string[];
-  packId: string;
-  packFile: string;
-}
-
 /** 题库包 — 可插拔的单元 */
 export interface QuestionPack {
   id: string;
@@ -108,12 +96,6 @@ export interface PackRegistryEntry {
 export interface PackRegistry {
   version: string;
   packs: PackRegistryEntry[];
-}
-
-export interface QuestionIndex {
-  version: string;
-  domain: Domain;
-  questions: QuestionSummary[];
 }
 
 // ── 辅助映射 ──

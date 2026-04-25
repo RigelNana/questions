@@ -1,12 +1,12 @@
 import { Link } from 'react-router-dom';
-import type { QuestionSummary } from '../../types';
+import type { QuestionEntry } from '../../types';
 import { DOMAIN_LABELS } from '../../types';
 import { DifficultyBadge } from '../filter/DifficultyBadge';
 import { TypeBadge } from '../filter/TypeBadge';
 import { Check, Circle, Star } from 'lucide-react';
 
 interface QuestionCardProps {
-  question: QuestionSummary;
+  question: QuestionEntry;
   isCompleted?: boolean;
   isBookmarked?: boolean;
 }

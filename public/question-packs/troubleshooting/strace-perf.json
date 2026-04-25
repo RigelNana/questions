@@ -1,0 +1,159 @@
+{
+  "id": "strace-perf",
+  "name": "Linux 系统调用性能分析",
+  "domain": "troubleshooting",
+  "description": "使用 strace 和 perf 分析系统调用性能瓶颈，解决频繁小 write 导致的延迟问题",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "strace-perf-1",
+      "domain": "troubleshooting",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": ["linux", "strace", "perf", "syscall", "performance", "go", "ebpf"],
+      "title": "服务延迟高但 CPU 正常，火焰图显示大量 syscall 开销，如何用 strace/perf 定位？",
+      "content": "你维护的一个 Go 日志上报服务在线上稳定运行了半年，最近在做容量规划时，SRE 同事发现了一个奇怪的现象：服务的 CPU 使用率只有 15%，内存也完全正常，但 P99 延迟却高达 500ms，远超 SLO 要求的 100ms。\n\n第一直觉是 GC 压力，但 `GODEBUG=gctrace=1` 的输出显示 STW 时间不超过 2ms，完全不是问题所在。随后用 `go tool pprof` 抓了一份 CPU 火焰图，发现大量时间堆积在 `syscall.Syscall` 和 `runtime/internal/syscall.Syscall6` 上，占 CPU 时间的 40% 以上。换句话说，这个服务把大量时间花在了内核态，而不是在做实际的计算。\n\n进一步用 `strace -c -p <pid>` 挂上去统计了 30 秒，输出如下：\n\n```\n% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n 78.32    4.231800           2   1847392           write\n  8.14    0.439900          12     36660           futex\n  6.22    0.336100           1    336100           epoll_wait\n  4.51    0.243800           3     81267           read\n  2.81    0.151800          10     15180           nanosleep\n```\n\n在 30 秒内，`write()` 系统调用被触发了将近 185 万次，折算下来每秒约 6 万次。但这个服务的日志吞吐量并不大，只有大约 3000 条/秒。\n\n通过 `strace -T -e trace=write -p <pid> 2>&1 | head -20` 进一步抓了几条 write 调用的详情：\n\n```\nwrite(5, \"2024/01/15 14:23:01.123456 INFO \", 100) = 100 <0.000018>\nwrite(5, \"[order-svc] request received re\", 100) = 100 <0.000021>\nwrite(5, \"quest_id=abc123 user_id=456789 \", 100) = 100 <0.000019>\nwrite(5, \"status=ok latency=12ms\\n\", 100) = 100 <0.000017>\n```\n\n问题暴露出来了：每条日志被拆成了多个 100 字节左右的小 `write()` 调用分多次写入。每次 `write()` 单次耗时虽然只有 18~21 微秒，但数量乘上来就产生了巨大的累积开销。\n\n**问题：**\n\n1. 请解释为什么频繁的小 `write()` 系统调用会导致高延迟，其背后的内核机制是什么？\n2. 如何正确使用 `strace` 和 `perf` 来定位系统调用性能问题？它们各自的适用场景和局限性是什么？\n3. 针对「每次写入 100 字节」这个根因，应该如何修复？在 Go 中具体怎么实现？\n4. 有没有比 `strace` 更适合生产环境使用的追踪工具？",
+      "answer": "## 第一步：理解系统调用的代价——为什么小 write 会拖垮延迟\n\n要彻底搞清楚这个问题，得先建立一个清晰的认知：系统调用（syscall）不是「调用一个函数」那么简单，它是一次从用户态到内核态的完整上下文切换，代价远比普通函数调用高。\n\n一次系统调用的完整流程是这样的：应用程序执行 `syscall` 指令（x86-64 上是 `syscall` 指令，老系统用 `int 0x80`），CPU 检测到这条特权指令后，自动将当前寄存器状态（rip、rsp、rbp 等通用寄存器，以及 RFLAGS）保存到内核栈，然后切换到内核态特权级（ring 0），跳转到内核的系统调用入口点（`entry_SYSCALL_64`）。内核根据系统调用号（保存在 rax 中）查找 `sys_call_table`，找到对应的处理函数执行，执行完毕后恢复寄存器、切回用户态、返回结果。这一来一回，在现代 CPU 上大约需要 100~300 纳秒。\n\n听起来很快对吧？问题在于 CPU 的 TLB（Translation Lookaside Buffer，即页表缓存，它记录了虚拟地址到物理地址的映射，是 CPU 访问内存的快速通道）在用户态和内核态切换时可能需要刷新，L1/L2 缓存也会因为切换而被污染。真实场景下，一次系统调用的「感知代价」往往是 500ns 到 2μs，尤其在开了 Spectre/Meltdown 内核补丁之后，由于 KPTI（Kernel Page Table Isolation，内核页表隔离，每次进入内核都要切换页表）的存在，切换代价在 2018 年之后普遍上升了 30%~100%。\n\n现在回到案例：185 万次 `write()` 每次平均耗时约 2.3μs，累计消耗 4.2 秒。而 30 秒内实际传输的数据量只有约 185MB，用一次 `writev()` 或者 buffer 聚合后的大 `write()` 本可以用几千次调用就完成。这 180 多万次额外的内核切换，就是 P99 飙到 500ms 的直接原因。\n\n## 第二步：strace 的正确使用方式\n\nstrace 是 Linux 上最经典的系统调用追踪工具，它的底层机制是 `ptrace`——父进程可以通过 ptrace 机制暂停子进程、读取其寄存器和内存。strace 利用 `PTRACE_SYSCALL` 选项，在每个系统调用的入口和出口都让内核暂停被追踪进程，然后 strace 读取调用参数和返回值后才让进程继续。这个机制有一个非常严重的副作用：被追踪的进程**每次系统调用都要被暂停两次**（进入时一次、返回时一次），在调用频繁的服务上，这会让程序性能下降 10 倍甚至更多。所以 strace 在生产环境要慎用，建议在问题复现后挂载 30 秒以内，挂载前告知业务方会有短暂性能抖动。\n\n`strace` 最有用的模式是统计模式 `-c`，它不打印每一次调用的详情，而是在结束时输出汇总表，这是定位「哪个系统调用是热点」的最快方式：\n\n```bash\n# 挂到运行中的进程，统计 30 秒后 Ctrl+C 查看汇总\nstrace -c -p <pid>\n\n# 输出示例（Ctrl+C 后）：\n# % time     seconds  usecs/call     calls    errors syscall\n# ------ ----------- ----------- --------- --------- ----------------\n#  78.32    4.231800           2   1847392           write\n#   8.14    0.439900          12     36660           futex\n```\n\n一旦确认是 `write()` 的问题，用 `-T`（显示每次调用耗时）配合 `-e trace=write` 过滤器，抓几条样本看调用的实际参数和耗时：\n\n```bash\n# 只追踪 write 调用，显示每次耗时，抓 20 条后退出\nstrace -T -e trace=write -p <pid> 2>&1 | head -20\n```\n\n输出里第三个参数是写入字节数，`<0.000018>` 是本次调用耗时（秒）。如果看到每次写入量都很小（几十到几百字节），就可以确认是 unbuffered write 的问题。还有一个常见用法是 `-tt` 打印微秒级时间戳，结合 `-f` 追踪 fork 出来的子进程：\n\n```bash\n# 追踪进程及其所有子进程的 write 和 read，带微秒时间戳\nstrace -tt -f -e trace=read,write -p <pid>\n```\n\n## 第三步：perf 的正确使用方式\n\nperf 的工作原理和 strace 完全不同，它依赖 CPU 内置的 PMU（Performance Monitoring Unit，性能监控单元，是 CPU 硬件中专门用于统计各类事件的计数器组件）硬件计数器。perf 让 PMU 在每隔一定数量的目标事件（比如每 1000 次系统调用）时触发一次中断，内核在中断处理程序里记录当前的调用栈，然后程序继续运行。这种采样机制的性能开销极低，通常在 1% 以内，完全可以在生产环境使用。\n\n`perf stat` 是最基础的用法，它会统计进程运行期间的各类硬件和软件事件：\n\n```bash\n# 统计进程 30 秒内的系统调用总数和上下文切换次数\nperf stat -p <pid> sleep 30\n\n# 关注输出里的这两行：\n#      1,847,392      syscalls:sys_enter_write      # 系统调用次数\n#        183,420      context-switches              # 上下文切换次数\n```\n\n如果要精确追踪 `write()` 系统调用，用 tracepoint 事件：\n\n```bash\n# 采样追踪 write 系统调用，记录调用栈\nperf record -e syscalls:sys_enter_write -ag -p <pid> sleep 10\n\n# 查看报告，-g 显示调用栈\nperf report -g\n```\n\n`perf top` 是实时版本，像 `top` 一样滚动刷新，显示当前 CPU 时间最多的函数：\n\n```bash\n# 实时查看热点函数\nperf top -p <pid>\n```\n\n生成火焰图时，用 `perf script` 把 `perf record` 的采样数据转成文本，再结合 Brendan Gregg 的 `FlameGraph` 工具：\n\n```bash\nperf record -F 99 -ag -p <pid> sleep 30\nperf script | stackcollapse-perf.pl | flamegraph.pl > flamegraph.svg\n```\n\nstrace 和 perf 的本质区别在于：strace 是「同步拦截」，每次系统调用都要停下来等 strace 读完数据，所以开销巨大但数据完整；perf 是「异步采样」，靠统计分析，开销极低但可能错过低频调用。生产环境排查首选 perf，strace 留给本地或预发环境做深度诊断。\n\n## 第四步：根因修复——在 Go 中添加 Buffer\n\n找到了根因，修复其实很简单，但很多工程师忽略了它。问题的本质是：代码直接往底层文件描述符写数据，每次写入都触发一次 `write()` 系统调用，不管写多少字节。\n\n问题代码大概长这样：\n\n```go\n// ❌ 反面示例：每次调用 fmt.Fprintf 都会触发 write() 系统调用\nf, _ := os.OpenFile(\"app.log\", os.O_APPEND|os.O_WRONLY, 0644)\nlogger := log.New(f, \"\", log.LstdFlags)\nfor {\n    logger.Printf(\"request received request_id=%s ...\", reqID) // 每条日志 N 次 write()\n}\n```\n\n`log.Logger` 内部每次调用 `Output()` 会格式化完整的日志行后直接调用 `l.out.Write()`，如果 `l.out` 是一个原始的 `*os.File`，就会直接到 syscall 层面。\n\n正确的修复是在文件和 logger 之间加一层 `bufio.Writer`：\n\n```go\n// ✅ 正确做法：用 bufio.Writer 聚合小写入\nf, _ := os.OpenFile(\"app.log\", os.O_APPEND|os.O_WRONLY, 0644)\n\n// 4KB buffer 是文件系统块大小，32KB 更适合日志场景\n// buffer 满了或调用 Flush() 时才触发真正的 write() 系统调用\nbuf := bufio.NewWriterSize(f, 32*1024) // 32KB buffer\n\nlogger := log.New(buf, \"\", log.LstdFlags)\n\n// 定期 Flush，避免日志停止时 buffer 里的数据永远不落盘\ngo func() {\n    ticker := time.NewTicker(1 * time.Second)\n    for range ticker.C {\n        buf.Flush() // 把 buffer 里积攒的数据一次性写入内核\n    }\n}()\n```\n\n加了 32KB buffer 之后，原来每条日志触发 4 次 `write()`，现在大约每 300 条日志才触发 1 次 `write()`，系统调用次数从 185 万次降到约 6000 次，降幅 99.7%。在我们实际修复后的数据里，P99 延迟从 500ms 降到了 8ms，远超 SLO 目标。\n\n如果用的是第三方日志库，比如 `zap`，可以直接配置 `zapcore.AddSync(bufio.NewWriterSize(f, 32*1024))`。\n\n## 第五步：更好的工具——bpftrace 和 eBPF\n\nstrace 的 ptrace 机制性能开销大，perf 的 tracepoint 功能强但学习曲线陡，2020 年之后更推荐使用 `bpftrace` 做生产环境的系统调用追踪。bpftrace 基于 eBPF（Extended Berkeley Packet Filter，一种在 Linux 内核中安全运行沙箱程序的机制，无需修改内核源码或加载内核模块），可以在内核态直接过滤和聚合数据，避免大量数据传输到用户态，性能开销通常在 5% 以内。\n\n用 bpftrace 追踪 write 调用及其写入字节分布，一条命令就够：\n\n```bash\n# 统计指定 PID 的 write() 调用字节数分布（直方图），运行 10 秒\nbpftrace -e '\n  tracepoint:syscalls:sys_enter_write\n  /pid == 12345/\n  {\n    @bytes = hist(args->count);\n  }\n' -c sleep 10\n\n# 输出示例：\n# @bytes:\n# [64, 128)              1847201 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|\n# [128, 256)                 191 |                                        |\n# [4K, 8K)                     8 |                                        |\n```\n\n这张直方图直接告诉你：绝大多数 write 调用写入的是 64~128 字节，小 write 问题一目了然，都不需要看 strace 的原始输出。\n\n另一个值得了解的是 vDSO（Virtual Dynamic Shared Object）机制：对于某些高频但读取的是用户态就能拿到的数据的系统调用，比如 `gettimeofday()`、`clock_gettime()`，Linux 内核会通过 vDSO 把对应的实现映射到每个进程的地址空间，让这些调用在用户态直接返回，完全不需要陷入内核。Go runtime 在 Linux 上的 `time.Now()` 就走的是 vDSO 路径，所以 `time.Now()` 在火焰图里看起来几乎没有开销。\n\n更进一步，如果场景对 I/O 延迟极其敏感，可以考虑 `io_uring`（Linux 5.1+ 引入的异步 I/O 框架），它通过共享内存的 ring buffer 让应用和内核交换 I/O 请求，批量提交和收割 I/O 操作，把一批 write 请求的系统调用次数降到接近 1 次。Go 目前（1.22）还没有原生 io_uring 支持，但 `github.com/iceber/iouring-go` 这样的第三方库可以使用。\n\n整个排查思路总结：火焰图发现 syscall 热点 → `perf stat` 确认系统调用量级 → `strace -c` 找出高频调用 → `strace -T -e trace=write` 确认参数 → bpftrace 看字节分布 → 加 buffer 修复 → 线上验证。",
+      "keyPoints": [
+        "系统调用（syscall）本质上是一次用户态到内核态的完整上下文切换，涉及寄存器保存、特权级切换、TLB 部分失效，开启 KPTI 后单次代价约 500ns~2μs，远高于普通函数调用。",
+        "strace 基于 ptrace 机制实现，每次系统调用都会暂停被追踪进程两次（进入和返回），会导致程序性能下降约 10 倍，生产环境使用须谨慎，建议挂载不超过 30 秒并提前告知业务方。",
+        "perf 基于 PMU 硬件计数器通过采样实现追踪，性能开销通常低于 1%，是生产环境性能分析的首选工具；`perf stat` 看整体统计，`perf record + perf report` 看调用栈，`perf script` 生成火焰图数据。",
+        "频繁的小 write 问题的根因是缺少应用层缓冲区，每次调用 write() 无论写多少字节都会触发一次内核切换，100 字节和 64KB 的系统调用开销几乎相同，正确做法是用 bufio.Writer（Go）或 BufferedWriter（Java）在用户态聚合数据后批量写入。",
+        "bufio.NewWriterSize(f, 32*1024) 在 Go 中是修复小 write 问题的标准方案，buffer 大小推荐 4KB~64KB，并需要配合定时 Flush 协程保证日志不在 buffer 里长时间驻留。",
+        "bpftrace 基于 eBPF 机制，可以在内核态直接过滤聚合数据，性能开销约 5%，是比 strace 更适合生产环境的现代追踪工具，一条命令即可输出 write 字节分布直方图。",
+        "vDSO 机制将 gettimeofday、clock_gettime 等高频只读系统调用的实现映射到进程地址空间，使其在用户态直接执行，Go 的 time.Now() 在 Linux 上利用了这一机制，调用开销极低。",
+        "io_uring（Linux 5.1+）通过共享内存 ring buffer 实现批量异步 I/O，可将一批 write 操作的系统调用次数降至近 1 次，是对 I/O 延迟极其敏感场景下的终极优化手段。"
+      ],
+      "quiz": [
+        {
+          "id": "strace-perf-q1",
+          "question": "系统调用（syscall）的核心代价来自于什么机制？",
+          "choices": [
+            { "id": "A", "text": "用户态与内核态之间的上下文切换，涉及寄存器保存、特权级切换，开启 KPTI 后还有页表切换开销" },
+            { "id": "B", "text": "内核需要在磁盘上查找系统调用表（sys_call_table），所以有 I/O 等待" },
+            { "id": "C", "text": "系统调用会触发 GC，Go runtime 需要 STW 后才能进入内核" },
+            { "id": "D", "text": "系统调用需要通过网络发送请求到内核进程，等待内核进程回包" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "系统调用的代价主要来自用户态（ring 3）切换到内核态（ring 0）的过程：CPU 需要保存当前寄存器状态（rip、rsp 等）、切换特权级、查找 sys_call_table 执行处理函数、恢复寄存器再切回用户态。在 2018 年 Meltdown 漏洞修复后，内核引入了 KPTI（Kernel Page Table Isolation），每次进入内核都需要切换页表，TLB 随之失效，代价进一步上升至 500ns~2μs。B 选项错误，sys_call_table 在内存中，不涉及磁盘 I/O；C 选项错误，系统调用与 GC 无关；D 选项完全错误，内核不是独立进程。"
+        },
+        {
+          "id": "strace-perf-q2",
+          "question": "strace 的工作原理是什么？它为什么会导致被追踪程序性能大幅下降？",
+          "choices": [
+            { "id": "A", "text": "strace 通过 eBPF 在内核态注入探针，性能开销很低，不会导致程序变慢" },
+            { "id": "B", "text": "strace 利用 ptrace 机制，每次系统调用都让内核暂停被追踪进程两次（进入和返回），等 strace 读完数据才恢复，导致 ~10x 性能下降" },
+            { "id": "C", "text": "strace 在程序源码中插入钩子函数，需要重新编译程序才能使用" },
+            { "id": "D", "text": "strace 通过读取 /proc/<pid>/syscall 文件来获取系统调用信息，是只读操作不影响性能" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "strace 利用 Linux 的 ptrace 系统调用，通过 PTRACE_SYSCALL 选项让内核在被追踪进程每次系统调用的「进入时」和「返回时」都发送 SIGTRAP 信号并暂停进程。strace 收到信号后读取进程的寄存器（获取调用参数和返回值），然后让进程继续。由于每次系统调用都要被暂停两次，对于系统调用密集型程序，性能下降可达 10 倍以上。A 选项描述的是 bpftrace/perf 的工作方式；C 选项描述的是编译时插桩，需要修改源码；D 选项错误，/proc/<pid>/syscall 只记录当前正在执行的系统调用，无法追踪历史。"
+        },
+        {
+          "id": "strace-perf-q3",
+          "question": "在生产环境中需要统计一个进程各系统调用的调用次数和总耗时，应该首选哪个命令？",
+          "choices": [
+            { "id": "A", "text": "strace -p <pid>（默认模式，打印每次调用详情）" },
+            { "id": "B", "text": "strace -c -p <pid>（统计模式，汇总各系统调用次数和时间，Ctrl+C 后输出表格）" },
+            { "id": "C", "text": "ltrace -p <pid>（追踪库函数调用）" },
+            { "id": "D", "text": "strace -v -p <pid>（详细模式，打印完整结构体内容）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "strace -c 是「统计模式」（count mode），它不打印每次调用的详情，而是在结束时输出一张汇总表，包含每个系统调用的占比、总耗时、单次平均耗时和调用次数。这是定位「哪个系统调用是热点」最直接的方式，而且比默认模式的输出量少很多，对系统的压力相对较小。A 选项的默认模式会打印每次调用详情，在高频场景下会产生海量日志且性能影响最大；C 选项 ltrace 追踪的是动态链接库函数（如 libc 函数），不是系统调用；D 选项 -v 只是让输出更详细，适合分析结构体参数内容而非性能分析。"
+        },
+        {
+          "id": "strace-perf-q4",
+          "question": "perf stat -p <pid> 和 strace -c -p <pid> 都能统计系统调用次数，它们最本质的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "perf stat 只能统计 CPU 时间，无法统计系统调用次数；strace -c 才能统计系统调用" },
+            { "id": "B", "text": "perf 基于 PMU 硬件采样，开销约 1%，适合生产环境；strace 基于 ptrace 同步拦截，开销约 10x，生产环境慎用" },
+            { "id": "C", "text": "strace 只能追踪单进程；perf 可以追踪系统全局所有进程" },
+            { "id": "D", "text": "perf 需要 root 权限，普通用户只能用 strace；两者功能等价" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是这道题最核心的知识点。perf 通过 CPU 内置的 PMU（性能监控单元）硬件计数器工作：PMU 在每隔 N 个目标事件时触发中断，内核记录此时的调用栈，程序本身几乎不受影响，开销通常低于 1%。strace 则通过 ptrace 机制在每次系统调用入口和出口「同步」暂停进程，等待 strace 读完数据才恢复，是一种侵入性极强的追踪方式。A 选项错误，perf stat 配合 -e syscalls:sys_enter_write 等 tracepoint 可以统计具体系统调用次数；C 选项不准确，strace -f 可以追踪子进程，perf 也可以通过 -p 限定单进程；D 选项中权限需求的描述也不完全准确。"
+        },
+        {
+          "id": "strace-perf-q5",
+          "question": "以下是 strace -c -p 1234 运行 30 秒后的输出片段，你能从中得出什么结论？\n\n```\n% time     seconds  usecs/call     calls  syscall\n------ ----------- ----------- ---------  ----------------\n 78.32    4.231800           2   1847392  write\n  8.14    0.439900          12     36660  futex\n```",
+          "choices": [
+            { "id": "A", "text": "write 调用耗时 4.2 秒，说明磁盘 I/O 极慢，每次写入需要等待磁盘响应" },
+            { "id": "B", "text": "write 被调用了 184 万次，单次耗时约 2μs，是典型的小 write 问题，累积系统调用开销占总时间的 78%，需要加 buffer 聚合写入" },
+            { "id": "C", "text": "futex 调用平均耗时 12μs，比 write 慢，应该优先优化 futex 调用" },
+            { "id": "D", "text": "write 调用次数多说明业务逻辑处理了 184 万个请求，QPS 约 6 万，服务运行正常" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确解读这份 strace -c 输出：write 调用次数 184.7 万次，单次平均耗时 2μs（usecs/call=2），累积耗时 4.23 秒，占总系统调用时间的 78%。这是典型的「频繁小写入」问题——每次 write 写入少量数据（本题是 100 字节），但每次都要触发一次内核态切换。A 选项错误，write() 的 2μs 是系统调用切换时间，不是磁盘 I/O 等待时间（磁盘 I/O 通常在毫秒级）；C 选项混淆了次数和优化优先级，184 万次 write 的总开销（4.23s）远大于 3.6 万次 futex 的开销（0.44s）；D 选项混淆了系统调用次数和业务请求次数，一个请求可以触发多次 write。"
+        },
+        {
+          "id": "strace-perf-q6",
+          "question": "在 Go 服务中，以下哪种方式会导致频繁的小 write 系统调用？",
+          "choices": [
+            { "id": "A", "text": "使用 bufio.NewWriterSize(f, 65536) 包装文件后写入" },
+            { "id": "B", "text": "使用 log.New(f, \"\", log.LstdFlags) 直接以 *os.File 作为 Writer，每次 Printf 都触发 write()" },
+            { "id": "C", "text": "使用 os.WriteFile() 一次性写入整个文件" },
+            { "id": "D", "text": "使用 zap.NewProduction() 的默认配置（内部有 buffer）" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "log.New(f, ...) 中，f 是 *os.File，它实现了 io.Writer 接口，每次调用 Write() 方法都直接调用底层的 write() 系统调用，无论写入多少字节。log.Logger 内部调用 Output() 方法时，会把格式化好的日志行直接传给 l.out.Write()，没有任何缓冲层，每条日志触发一次或多次 write()。A 选项的 bufio.Writer 在内部维护一个 65KB 的 buffer，只有 buffer 满或调用 Flush() 时才触发真正的 write()，是正确的做法；C 选项 os.WriteFile() 是一次性写入，只有一次系统调用；D 选项 zap 的生产配置默认使用 zapcore 的缓冲写入，也不会频繁触发小 write。"
+        },
+        {
+          "id": "strace-perf-q7",
+          "question": "vDSO（Virtual Dynamic Shared Object）机制解决了什么问题？Go 的 time.Now() 和 vDSO 有什么关系？",
+          "choices": [
+            { "id": "A", "text": "vDSO 把内核的 .so 动态库映射到用户空间，让程序可以直接调用内核函数，与 time.Now() 无关" },
+            { "id": "B", "text": "vDSO 将高频只读系统调用（如 clock_gettime）的实现映射到进程地址空间，在用户态直接返回，避免陷入内核；Go 在 Linux 上的 time.Now() 通过 vDSO 调用 clock_gettime，因此开销极低" },
+            { "id": "C", "text": "vDSO 是虚拟化技术，让容器内的程序能访问宿主机的系统调用，跟 time.Now() 没关系" },
+            { "id": "D", "text": "vDSO 只在 32 位 Linux 上有用，64 位系统已经不需要了" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "vDSO（Virtual Dynamic Shared Object）是 Linux 内核的一个优化机制：对于 gettimeofday、clock_gettime、getcpu 这类调用频繁但只需读取内核维护的数据（如 HPET 时钟值、vvar 页面）的系统调用，内核将其实现映射到每个进程的虚拟地址空间，程序调用时直接在用户态执行，完全不需要陷入内核（no syscall instruction）。在 64 位 Linux 上，`clock_gettime(CLOCK_MONOTONIC)` 通过 vDSO 的耗时约 20~30ns，而普通系统调用需要 500ns+。Go runtime 在 linux/amd64 上的时间相关函数（time.Now、runtime.nanotime）通过 `runtime·vdso_clock_gettime` 调用 vDSO，这就是为什么 time.Now() 在 Go 服务的火焰图中几乎没有开销。A 选项描述不准确；C 选项完全错误；D 选项相反，vDSO 在 64 位系统上更广泛使用（32 位系统靠 vsyscall）。"
+        },
+        {
+          "id": "strace-perf-q8",
+          "question": "生产环境的 Go 服务出现系统调用相关的性能问题，以下排查顺序哪个最合理？",
+          "choices": [
+            { "id": "A", "text": "直接用 strace -p <pid> 追踪几分钟，看原始输出找问题" },
+            { "id": "B", "text": "先用 perf stat 确认系统调用量级，再用 strace -c 统计 30 秒确认热点调用，最后用 strace -T -e trace=<call> 抓少量样本确认参数，避免长时间挂载 strace" },
+            { "id": "C", "text": "直接重启服务，问题可能自然消失" },
+            { "id": "D", "text": "先查看 /proc/<pid>/status 里的 VmRSS，再看 dmesg 有没有 OOM 报错" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "生产环境排查系统调用性能问题的黄金路径是：先用开销低的工具确认方向，再用开销高的工具做精准定位。perf stat 开销 <1%，可以先确认系统调用总量是否异常（比如每秒几十万次）；strace -c 虽然有 ~10x 开销，但统计模式输出量小、挂载时间短（30 秒），是可以接受的；最后 strace -T -e trace=write 追踪参数时，用 head -20 或 head -50 限制输出量，拿到足够的样本就立刻退出。A 选项的默认 strace 模式会打印所有系统调用详情，在高频场景下日志量极大，对程序性能影响最严重，生产环境绝对不能这样用；C 选项是鸵鸟策略；D 选项是内存排查路径，与系统调用性能问题无关。"
+        },
+        {
+          "id": "strace-perf-q9",
+          "question": "bpftrace 相比 strace 在生产环境追踪系统调用时的核心优势是什么？",
+          "choices": [
+            { "id": "A", "text": "bpftrace 可以追踪更多系统调用，而 strace 只能追踪 write 和 read" },
+            { "id": "B", "text": "bpftrace 基于 eBPF 在内核态直接过滤和聚合数据，不需要像 strace 那样把每次调用都传到用户态，性能开销约 5%，可安全用于生产环境" },
+            { "id": "C", "text": "bpftrace 是 strace 的图形化界面版本，只是展示方式不同，底层机制相同" },
+            { "id": "D", "text": "bpftrace 需要修改程序源码插入探针，strace 不需要修改源码，所以 bpftrace 更强大" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "bpftrace 和 strace 的本质区别在于「数据在哪里处理」。strace 基于 ptrace，每次系统调用都要把进程暂停、数据传到用户态、strace 处理完后才恢复，数据传输和进程暂停是主要开销。bpftrace 基于 eBPF：用户编写的 bpftrace 脚本被编译成 eBPF 字节码，加载到内核中执行，数据在内核态就被过滤和聚合（比如填充直方图、维护哈希表），只有最终汇总结果才传到用户态。这样即使是百万次/秒的系统调用，bpftrace 的开销也通常在 5% 以内。A 选项错误，strace 可以追踪所有系统调用；C 选项完全错误，两者底层机制截然不同；D 选项相反，bpftrace 不需要修改源码，strace 也不需要。"
+        },
+        {
+          "id": "strace-perf-q10",
+          "question": "修复小 write 问题时，在 Go 中使用 bufio.Writer 后还需要注意什么？否则会出现什么问题？",
+          "choices": [
+            { "id": "A", "text": "需要增大进程的文件描述符限制（ulimit -n），否则 buffer 会导致文件描述符耗尽" },
+            { "id": "B", "text": "需要定期调用 Flush() 或在程序退出时调用 Flush()，否则 buffer 中未满的数据在进程退出时会丢失，导致日志不完整" },
+            { "id": "C", "text": "bufio.Writer 不是线程安全的，但日志场景只有单 goroutine 写入，所以不需要额外处理" },
+            { "id": "D", "text": "buffer 大小设置为 4KB 或 64KB 效果相同，对性能没有影响" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "bufio.Writer 的工作原理是把数据先写入内存 buffer，当 buffer 满或调用 Flush() 时才真正写入底层 Writer（触发 write 系统调用）。这带来了一个重要的陷阱：如果进程崩溃或被 kill，buffer 中未 Flush 的数据会永远消失，导致日志末尾丢失，给故障排查带来困难。正确的做法是：在 main 函数末尾调用 defer buf.Flush()，以及启动一个定时 Flush 协程（比如每秒 Flush 一次）来保证日志及时落盘。此外，对于日志级别 ERROR 及以上的日志，可以考虑写入后立即 Flush，确保关键日志不丢失。A 选项的 buffer 是内存，不涉及文件描述符；C 选项需要补充：bufio.Writer 确实不是并发安全的，多 goroutine 写同一个 bufio.Writer 需要加锁，生产环境日志库通常已经内部处理了并发问题；D 选项不准确，buffer 大小对减少系统调用次数有直接影响。"
+        }
+      ],
+      "references": [
+        "https://www.brendangregg.com/perf.html",
+        "https://www.brendangregg.com/flamegraphs.html",
+        "https://www.brendangregg.com/blog/2019-01-01/learn-ebpf-tracing.html",
+        "https://man7.org/linux/man-pages/man1/strace.1.html",
+        "https://pkg.go.dev/bufio#NewWriterSize",
+        "https://www.kernel.org/doc/html/latest/admin-guide/perf-security.html"
+      ]
+    }
+  ]
+}

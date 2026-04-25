@@ -3,42 +3,31 @@ import type {
   PackRegistry,
   PackRegistryEntry,
   QuestionEntry,
-  QuestionIndex,
   QuestionPack,
-  QuestionSummary,
   Domain,
 } from '../types';
-import { loadRegistry, loadQuestionIndex, loadQuestionPack } from '../utils/questionLoader';
+import { loadRegistry, loadQuestionPack } from '../utils/questionLoader';
 
 interface QuestionState {
   registry: PackRegistry | null;
-  indexes: Partial<Record<Domain, QuestionIndex>>;
   loadedPacks: Record<string, QuestionPack>;
   isLoadingRegistry: boolean;
-  isLoadingIndex: Partial<Record<Domain, boolean>>;
   isLoadingPack: Record<string, boolean>;
   error: string | null;
 
   // Actions
   fetchRegistry: () => Promise<void>;
-  fetchIndexForDomain: (domain: Domain) => Promise<QuestionIndex>;
   fetchPack: (entry: PackRegistryEntry) => Promise<QuestionPack>;
-  fetchPackForQuestion: (domain: Domain, questionId: string) => Promise<QuestionEntry | undefined>;
   fetchPacksForDomain: (domain: Domain) => Promise<void>;
-  getQuestionSummariesForDomain: (domain: Domain) => QuestionSummary[];
-  getQuestionSummaryById: (id: string) => QuestionSummary | undefined;
   getQuestionsForDomain: (domain: Domain) => QuestionEntry[];
   getQuestionById: (id: string) => QuestionEntry | undefined;
-  getAllQuestionSummaries: () => QuestionSummary[];
   getAllLoadedQuestions: () => QuestionEntry[];
 }
 
 export const useQuestionStore = create<QuestionState>((set, get) => ({
   registry: null,
-  indexes: {},
   loadedPacks: {},
   isLoadingRegistry: false,
-  isLoadingIndex: {},
   isLoadingPack: {},
   error: null,
 
@@ -53,40 +42,6 @@ export const useQuestionStore = create<QuestionState>((set, get) => ({
         error: e instanceof Error ? e.message : 'Failed to load registry',
         isLoadingRegistry: false,
       });
-    }
-  },
-
-  fetchIndexForDomain: async (domain: Domain) => {
-    const { indexes, isLoadingIndex } = get();
-    if (indexes[domain]) return indexes[domain];
-    if (isLoadingIndex[domain]) {
-      return new Promise<QuestionIndex>((resolve, reject) => {
-        const unsubscribe = useQuestionStore.subscribe((state) => {
-          if (state.indexes[domain]) {
-            unsubscribe();
-            resolve(state.indexes[domain]!);
-          } else if (!state.isLoadingIndex[domain] && state.error) {
-            unsubscribe();
-            reject(new Error(state.error));
-          }
-        });
-      });
-    }
-
-    set((s) => ({ isLoadingIndex: { ...s.isLoadingIndex, [domain]: true }, error: null }));
-    try {
-      const index = await loadQuestionIndex(domain);
-      set((s) => ({
-        indexes: { ...s.indexes, [domain]: index },
-        isLoadingIndex: { ...s.isLoadingIndex, [domain]: false },
-      }));
-      return index;
-    } catch (e) {
-      set((s) => ({
-        error: e instanceof Error ? e.message : `Failed to load question index: ${domain}`,
-        isLoadingIndex: { ...s.isLoadingIndex, [domain]: false },
-      }));
-      throw e;
     }
   },
 
@@ -122,50 +77,12 @@ export const useQuestionStore = create<QuestionState>((set, get) => ({
     }
   },
 
-  fetchPackForQuestion: async (domain: Domain, questionId: string) => {
-    const loaded = get().getQuestionById(questionId);
-    if (loaded) return loaded;
-
-    const summary =
-      get().getQuestionSummaryById(questionId) ??
-      (await get().fetchIndexForDomain(domain)).questions.find((q) => q.id === questionId);
-
-    if (!summary) return undefined;
-
-    const entry =
-      get().registry?.packs.find((p) => p.id === summary.packId) ??
-      {
-        id: summary.packId,
-        name: summary.title,
-        domain: summary.domain,
-        file: summary.packFile,
-        questionCount: 0,
-        description: '',
-      };
-
-    const pack = await get().fetchPack(entry);
-    return pack.questions.find((q) => q.id === questionId);
-  },
-
   fetchPacksForDomain: async (domain: Domain) => {
     const { registry } = get();
     if (!registry) return;
 
     const domainPacks = registry.packs.filter((p) => p.domain === domain);
     await Promise.all(domainPacks.map((entry) => get().fetchPack(entry)));
-  },
-
-  getQuestionSummariesForDomain: (domain: Domain) => {
-    return get().indexes[domain]?.questions ?? [];
-  },
-
-  getQuestionSummaryById: (id: string) => {
-    const { indexes } = get();
-    for (const index of Object.values(indexes)) {
-      const found = index?.questions.find((q) => q.id === id);
-      if (found) return found;
-    }
-    return undefined;
   },
 
   getQuestionsForDomain: (domain: Domain) => {
@@ -184,11 +101,6 @@ export const useQuestionStore = create<QuestionState>((set, get) => ({
       if (found) return found;
     }
     return undefined;
-  },
-
-  getAllQuestionSummaries: () => {
-    const { indexes } = get();
-    return Object.values(indexes).flatMap((index) => index?.questions ?? []);
   },
 
   getAllLoadedQuestions: () => {

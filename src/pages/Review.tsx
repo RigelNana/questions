@@ -1,13 +1,11 @@
-import { useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { useProgressStore } from '../stores/progressStore';
 import { useQuestionStore } from '../stores/questionStore';
-import { ALL_DOMAINS } from '../types';
 import { XCircle, ExternalLink } from 'lucide-react';
 
 export function Review() {
   const { questions } = useProgressStore();
-  const { fetchIndexForDomain, getQuestionSummaryById } = useQuestionStore();
+  const { getQuestionById } = useQuestionStore();
 
   const wrongAttempts = Object.values(questions).flatMap((q) =>
     q.quizAttempts.filter((a) => !a.isCorrect).map((a) => ({
@@ -22,12 +20,6 @@ export function Review() {
     acc[item.questionId].push(item);
     return acc;
   }, {});
-
-  useEffect(() => {
-    if (wrongAttempts.length > 0) {
-      Promise.all(ALL_DOMAINS.map((domain) => fetchIndexForDomain(domain))).catch(() => undefined);
-    }
-  }, [wrongAttempts.length, fetchIndexForDomain]);
 
   return (
     <div className="animate-fade-in">
@@ -45,7 +37,7 @@ export function Review() {
       ) : (
         <div className="space-y-4">
           {Object.entries(groupedByQuestion).map(([questionId, attempts]) => {
-            const questionData = getQuestionSummaryById(questionId);
+            const questionData = getQuestionById(questionId);
             return (
               <div
                 key={questionId}
