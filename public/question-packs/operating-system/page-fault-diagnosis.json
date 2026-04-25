@@ -1,0 +1,159 @@
+{
+  "id": "os-page-fault-diagnosis",
+  "name": "频繁 Page Fault 的分析与处理",
+  "domain": "operating-system",
+  "description": "生产环境缺页中断频发的排查思路、工具链与优化方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-page-fault-diagnosis-1",
+      "domain": "operating-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["page-fault", "debugging", "perf", "vmstat", "memory", "swap", "mmap", "numa", "thrashing"],
+      "title": "系统频繁发生 Page Fault 时该如何分析和处理",
+      "content": "## 场景描述\n\n你的团队维护一套部署在 Linux 服务器上的 Java 微服务，负责处理用户订单查询请求。日常 P99 响应时间稳定在 30ms 左右，但最近两周开始出现间歇性毛刺——每隔几分钟，P99 会突然飙到 800ms 以上，持续约 20-40 秒后自动恢复。监控面板上 CPU iowait 指标在毛刺期间从不到 2% 涨到 15-20%。\n\n你登上服务器，执行 `vmstat 1` 观察，在毛刺期间看到如下输出：\n\n```\n procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----\n r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st\n 3  2 524288  42156  12800 380000  480  120   960   240 4200 8100 28  8 46 18  0\n 2  1 524288  38000  12800 378000  620  180  1240   360 5100 9200 31  9 42 18  0\n 4  3 524288  35000  12600 376000  580  140  1160   280 4800 8600 29  8 45 18  0\n```\n\n你注意到 `si`（swap in）和 `so`（swap out）字段持续非零，`swpd` 显示有 512MB 的 swap 正在使用。此外，你对该 Java 进程执行 `cat /proc/$(pidof java)/stat | awk '{print \"minor_faults:\", $10, \"major_faults:\", $12}'` 后看到 `major_faults` 的数值在以每秒数百次的速度增长。\n\n**请回答：Page Fault（缺页中断）是什么，minor fault 和 major fault 有什么本质区别？面对上述症状，你的完整排查思路和处理方案是什么？**",
+      "answer": "## 什么是 Page Fault\n\nPage Fault（缺页中断，也叫缺页异常）是操作系统虚拟内存管理机制的核心组成部分。要理解它，先要理解现代操作系统的内存模型：程序运行时拥有的「虚拟地址空间」和实际占用的「物理内存页」是两回事。程序可以拥有 8GB 的虚拟地址空间，但物理内存只有 4GB，操作系统通过页表（Page Table）维护虚拟地址到物理地址的映射关系，并且只把当前真正需要的数据放在物理内存里——这就是「按需分页」（Demand Paging）机制。\n\n当 CPU 执行指令时，内存管理单元（MMU）会查询 TLB（Translation Lookaside Buffer，一种高速缓存，存着最近用到的虚拟→物理地址映射）来翻译虚拟地址。如果 TLB 里没有（TLB miss），就去查多级页表。如果页表里根本没有对应的物理页帧，或者该页的「存在位」（Present bit）为 0，CPU 就会抛出一个缺页异常，交由操作系统内核的缺页处理程序来处理。内核决定把哪块数据加载到内存、更新页表，然后重新执行刚才出错的那条指令。对进程来说，整个过程是透明的——它不知道自己刚刚被打断了。\n\n缺页中断本身不是 bug，是虚拟内存的正常工作方式。每个进程启动时都会有大量 Page Fault，因为代码段、数据段都是按需加载进来的。问题在于 Page Fault 的「代价」差异极大，这就引出了 minor fault 和 major fault 的本质区别。\n\n## Minor Fault 与 Major Fault 的本质差异\n\nMinor Fault（次要缺页）指的是：内核处理这个 Page Fault 时，所需的物理页**已经在内存中**，只是还没有建立从这个进程的虚拟地址到该物理页的映射关系。最典型的场景是写时复制（COW，Copy-On-Write）：`fork()` 之后父子进程共享同一批物理页，只有当某进程试图写入时才触发 COW，复制出一个私有页——这个过程是纯内存操作，不涉及磁盘，通常只需要几微秒。\n\nMajor Fault（主要缺页）则完全不同：内核处理时需要的页**不在内存中**，必须从磁盘（swap 分区、可执行文件、mmap 的文件）把数据读回来，再建立映射。这里有一次真实的磁盘 I/O，机械硬盘的随机读延迟在 5-10ms 量级，即使 SSD 也要 0.1-0.5ms。更糟的是，这段时间进程处于阻塞状态，在等待 I/O 完成。当一个应用每秒发生数百次 major fault，累积下来就是几秒钟的阻塞，P99 飙升也就不奇怪了。\n\n从 `/proc/PID/stat` 的第 10、12 字段就能读取 minor/major fault 的累计值。场景中看到 major_faults 持续快速增长，加上 `vmstat` 里 `si/so` 非零、iowait 升高，这三个信号叠加，基本可以确认：系统正处于内存压力下的 swap thrashing（抖动）状态。\n\n## 第一步：确认问题的严重程度和 Fault 类型\n\n拿到场景后的第一反应不是立刻查原因，而是先搞清楚现在有多严重、fault 是哪种类型。`perf stat` 可以精确地给出数字：\n\n```bash\n# 对目标 PID 采集 30 秒的 fault 统计\nperf stat -e page-faults,major-faults -p $(pidof java) sleep 30\n```\n\n典型输出如下：\n\n```\n Performance counter stats for process id '18423':\n\n    1,842,301      page-faults               #    61,410 /sec\n        8,247      major-faults              #       274 /sec\n\n      30.001234578 seconds time elapsed\n```\n\n这里 major-faults 是 274/sec，直接说明问题。`pidstat -f 1` 可以持续观察各进程的 fault 速率，方便判断是不是只有这一个进程在造成问题：\n\n```bash\npidstat -f 1 5\n# 输出中 minflt/s 是 minor fault 速率，majflt/s 是 major fault 速率\n```\n\n同时检查系统级的内存压力指标，Linux 4.20+ 内核提供了 PSI（Pressure Stall Information）：\n\n```bash\ncat /proc/pressure/memory\n# some avg10=12.45 avg60=8.21 avg300=3.14 total=18234567\n# full avg10=5.82 avg60=3.91 avg300=1.58 total=7891234\n```\n\n`full` 行的 avg10 超过 5% 就需要警觉；超过 20% 说明系统已经严重抖动。\n\n## 第二步：全面评估内存使用状况\n\n确认是 major fault 问题后，下一步是搞清楚内存到底消耗在哪里。`free -h` 给出概览，但更重要的是 `/proc/meminfo`：\n\n```bash\ngrep -E 'MemTotal|MemAvailable|SwapTotal|SwapUsed|Dirty|AnonPages|Mapped' /proc/meminfo\n```\n\n```\nMemTotal:       16384000 kB\nMemAvailable:     168432 kB   # 关键指标！低于 MemTotal 的 10% 就危险\nSwapTotal:       2097152 kB\nSwapFree:        1572864 kB\nDirty:            524288 kB   # 有大量脏页待写回\nAnonPages:      14208000 kB   # 匿名页（堆内存）占用\nMapped:          1843200 kB\n```\n\n`MemAvailable` 只有 168MB，而 JVM 的 `-Xmx` 设置了 12GB，堆里有大量数据在运行时被 OS 换出去了。这是典型的「JVM 堆设置超过物理内存」的配置问题。\n\n## 第三步：定位到具体的代码路径\n\n知道是哪个进程还不够，要修复问题还需要知道哪条代码路径在频繁触发 major fault。`perf record` 加上调用栈采集是最直接的方式：\n\n```bash\n# 采集 30 秒内该进程的 page-fault 事件及其调用栈\nperf record -e page-faults -g -p $(pidof java) sleep 30\nperf report --stdio | head -60\n```\n\n输出会显示触发 Page Fault 最多的调用链。对于 Java 进程，还可以结合 async-profiler 来直接拿到 Java 层的调用栈（perf 看到的往往是 JIT 编译后的 native 代码）：\n\n```bash\n./profiler.sh -e page-faults -d 30 -f flamegraph.html $(pidof java)\n```\n\n生成的火焰图会清楚地显示哪些 Java 方法在触发 fault，通常问题集中在某个对大型数据集做随机访问的业务逻辑，比如全量加载订单列表到内存后逐条遍历。\n\n## 根因分析与对应修复方案\n\n### 根因一：内存泄漏导致工作集被换出\n\n这是最常见的根因。进程的 RSS（Resident Set Size，实际占用的物理内存）随时间持续增长，OS 为了给其他进程腾出空间，把这个进程的「冷」页换到 swap。当应用再次访问这些被换出的数据时，触发 major fault 把它们换回来。\n\n验证方式是观察 RSS 的趋势：`ps -o rss= -p $(pidof java)` 每分钟记录一次，或者看监控平台的内存折线图。如果 RSS 是单调递增的，大概率存在泄漏。\n\n修复路径：对 Java 进程，首先用 `jmap -histo:live $(pidof java)` 看对象分布，再用 `jcmd $(pidof java) GC.heap_info` 检查堆健康。如果是 off-heap 泄漏（NIO 缓冲区、DirectMemory），jmap 看不到，需要用 `-XX:NativeMemoryTracking=detail` 启动，再 `jcmd $(pidof java) VM.native_memory` 查看。\n\n### 根因二：工作集超过可用 RAM，系统持续 Thrashing\n\n场景中的 Java 服务 `-Xmx12g`，但物理内存才 16GB，OS 本身、其他进程、文件系统 page cache 也需要内存，实际留给 JVM 的物理内存远不够 12GB。JVM 会频繁在堆内某块区域和 swap 之间反复置换，形成 thrashing。\n\n解决方案按优先级排列。第一是降低 JVM 堆上限，把 `-Xmx` 从 12g 降到 8g 甚至更低，强迫 JVM 更频繁地 GC 而不是无限扩张堆。第二是增加机器内存。第三是水平拆分，把一台机器上运行的进程数减半。第四是对 JVM 启用大页（HugePages），减少 TLB 压力和 page table 开销：`-XX:+UseHugeTLBFS` 或者系统级 `echo always > /sys/kernel/mm/transparent_hugepage/enabled`。\n\n### 根因三：mmap 文件随机访问模式\n\n有些 Java 框架（比如 Chronicle Map、某些内存映射索引文件）用 `mmap` 把文件映射到虚拟地址空间，然后以随机顺序访问文件中的不同位置。每访问一个从未被加载的页就是一次 major fault。如果文件很大（几十 GB）而内存有限，这种访问模式会持续不断地触发 major fault。\n\n排查方式是看 `perf report` 的调用栈，是否有大量 fault 来自 mmap 相关路径。修复方式是增加预读（readahead）量：`/sys/block/sda/queue/read_ahead_kb` 从默认 128 改到 2048，让内核在你访问一页时顺带预读后面的页。或者在 mmap 后用 `madvise(addr, length, MADV_WILLNEED)` 提前告诉内核「这块区域我马上要用，帮我先加载进来」。\n\n### 根因四：NUMA 拓扑不匹配\n\n在多路（multi-socket）服务器上，内存被分成多个 NUMA（Non-Uniform Memory Access）节点，每个 CPU socket 有自己的本地内存节点，访问远端节点的内存比本地慢 2-3 倍。如果 Java 进程主要在 Socket 0 的 CPU 上运行，但内存分配到了 Socket 1，每次内存访问都跨 NUMA，这既增加延迟也加剧 CPU 的内存带宽竞争。\n\n检查方式：`numastat -p $(pidof java)` 查看进程的内存在哪个 NUMA 节点上分配；`numactl --hardware` 查看拓扑。如果分布严重不均，用 `numactl --cpunodebind=0 --membind=0` 启动进程，强制它只在 NUMA node 0 上分配内存和使用 CPU。\n\n## 预防与长效治理\n\n对于关键数据结构，可以用 `mlock()` 系统调用把它们锁定在物理内存中，阻止 OS 换出。但要谨慎使用，锁定太多内存会让其他进程的内存更加紧张。\n\nSwap 的定位应当是「安全气囊」而非「廉价内存扩展」。配置 1-2 倍 RAM 的 swap 分区保证系统不会因 OOM 被杀，但正常运行时 swap 使用率应接近零。如果 swap 长期非零，说明内存规划本身就有问题，加 swap 只是掩盖症状。\n\n在监控层面，设置基于 PSI 的告警阈值：`/proc/pressure/memory` 的 `some avg60 > 5%` 时告警，在系统进入 thrashing 前就介入处理，比等 P99 飙高再救火要好得多。",
+      "keyPoints": [
+        "Major Fault 与 Minor Fault 的本质区别在于是否需要磁盘 I/O：minor fault 在内存中找得到物理页只是缺少映射，微秒级完成；major fault 需要从 swap 或文件系统把数据读入内存，毫秒级延迟，数百次/秒时会导致 P99 显著飙升",
+        "vmstat 中 si/so（swap in/out）非零且 majflt > 0 是内存压力的早期预警，三者叠加确认系统处于 swap thrashing 状态，此时应立即排查内存消耗来源而非等待自愈",
+        "perf stat -e page-faults,major-faults -p PID 可以精确量化 fault 速率；perf record -e page-faults -g -p PID 加 perf report 可以定位到触发 major fault 最多的调用栈，是定位根因的决定性工具",
+        "JVM 服务最常见的 major fault 根因是 -Xmx 设置超过了机器可用物理内存，导致堆被 OS 部分换出；解决方案是降低 -Xmx 上限而非扩大 swap，因为 swap 扩大只会延迟爆发时间",
+        "mmap 文件的随机访问模式会触发持续的 major fault，通过调大 /sys/block/sda/queue/read_ahead_kb 或对映射区域调用 madvise(MADV_WILLNEED) 预取来缓解",
+        "多路服务器上需要检查 NUMA 拓扑，numastat -p PID 可以查看进程内存的 NUMA 节点分布，跨节点访问不仅增加延迟还可能加剧内存压力，用 numactl --membind 解决",
+        "/proc/pressure/memory 的 PSI 指标（full avg60 > 5% 触发告警）比等待 P99 报警更早感知到内存压力，是生产环境内存健康监控的推荐基准指标",
+        "mlock() 可以将关键数据结构锁定在物理内存中防止被换出，但应谨慎使用，过度 mlock 会压缩其他进程和 page cache 的可用内存，反而加重整体内存压力"
+      ],
+      "quiz": [
+        {
+          "id": "os-page-fault-diagnosis-1-q1",
+          "question": "以下关于 Page Fault（缺页中断）的描述，哪项是正确的？",
+          "choices": [
+            {"id": "A", "text": "Page Fault 是程序 bug 导致的非法内存访问，每次发生都表示程序出错"},
+            {"id": "B", "text": "Page Fault 是虚拟内存按需分页机制的正常组成部分，进程启动时必然发生大量 minor fault"},
+            {"id": "C", "text": "Page Fault 只在物理内存不足时发生，内存充足的系统不会有 Page Fault"},
+            {"id": "D", "text": "Page Fault 由应用程序主动触发，是一种系统调用"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Page Fault 是虚拟内存「按需分页」机制的正常工作方式，不代表程序出错。进程启动时，代码段、数据段都需要从磁盘（可执行文件）加载进物理内存，这个过程会产生大量 major fault；同时写时复制（COW）等机制也会产生 minor fault。A 选项混淆了 Page Fault 和 Segmentation Fault（段错误）的概念，后者才是非法地址访问。C 选项错误，即使物理内存充足，进程第一次访问某页时也会触发 minor fault 来建立页表映射。D 选项错误，Page Fault 是 CPU 的硬件异常，不是应用程序主动发起的系统调用。"
+        },
+        {
+          "id": "os-page-fault-diagnosis-1-q2",
+          "question": "Minor Fault 和 Major Fault 最本质的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "Minor Fault 只发生在用户空间，Major Fault 只发生在内核空间"},
+            {"id": "B", "text": "Minor Fault 是读操作触发的，Major Fault 是写操作触发的"},
+            {"id": "C", "text": "Minor Fault 处理时所需物理页已在内存中，无需磁盘 I/O；Major Fault 需要从磁盘读取数据"},
+            {"id": "D", "text": "Minor Fault 的代价小于 1 微秒，Major Fault 的代价大于 100 毫秒"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "Minor Fault 和 Major Fault 的核心区别在于是否需要磁盘 I/O。Minor Fault 时所需的物理页已经在内存中（比如 fork 后的 COW、共享库的页已被其他进程加载），内核只需建立映射关系，是纯内存操作，代价很小（通常几微秒）。Major Fault 时所需的页不在内存中，必须从 swap 分区或文件系统读取，需要一次真实的磁盘 I/O，机械硬盘延迟 5-10ms，SSD 也要 0.1-0.5ms。D 选项方向正确但数字不准确，Major Fault 通常是毫秒级而非 100 毫秒级。A、B 选项均为错误的区分维度，与实际机制无关。"
+        },
+        {
+          "id": "os-page-fault-diagnosis-1-q3",
+          "question": "执行 `cat /proc/18423/stat | awk '{print $10, $12}'` 得到 `9823412 847`，其中数字 847 代表什么？",
+          "choices": [
+            {"id": "A", "text": "进程总共发生的 Page Fault 次数（minor + major 之和）"},
+            {"id": "B", "text": "进程累计发生的 Major Fault 次数，需要磁盘 I/O 的缺页次数"},
+            {"id": "C", "text": "进程当前打开的文件描述符数量"},
+            {"id": "D", "text": "进程的虚拟内存大小（单位 KB）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "/proc/PID/stat 是一行空格分隔的进程状态信息，其中第 10 个字段（$10）是 minflt，即 Minor Fault 的累计次数；第 12 个字段（$12）是 majflt，即 Major Fault 的累计次数，也就是这道题里的 847。Minor Fault 值 9823412 很大是正常的，因为进程整个生命周期的 minor fault 都在这里累加，包括启动时加载共享库等操作。真正需要关注的是 majflt 的增长速率——如果每隔几秒重新读取这个值，发现 majflt 在持续快速增长，才说明有正在进行的磁盘 I/O 导致的 fault。单次的绝对值意义不大，速率才是关键指标。"
+        },
+        {
+          "id": "os-page-fault-diagnosis-1-q4",
+          "question": "在 `vmstat 1` 的输出中，以下哪组字段的组合最能确认系统正处于 swap thrashing 状态？",
+          "choices": [
+            {"id": "A", "text": "us（用户态 CPU）高 + sy（系统态 CPU）高"},
+            {"id": "B", "text": "si（swap in）> 0 且 so（swap out）> 0，同时 free 内存很低"},
+            {"id": "C", "text": "bi（block in）高 + bo（block out）高"},
+            {"id": "D", "text": "cs（上下文切换）高 + in（中断数）高"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Swap thrashing 是指系统在物理内存严重不足时，频繁地把内存页写出到 swap（swap out，对应 vmstat 的 so 字段）又从 swap 读回（swap in，对应 si 字段），反复来回导致大量磁盘 I/O 和高延迟。si 和 so 同时非零、free 内存持续低位，三者叠加是 thrashing 的直接证据。bi/bo 表示块设备 I/O，可以是文件读写或 swap，不能直接确认是 swap 操作。us/sy 高说明 CPU 繁忙，可能是计算密集或系统调用多，不直接指向内存问题。cs/in 高通常与高并发或中断驱动的 I/O 有关，是结果而非 thrashing 的特征信号。"
+        },
+        {
+          "id": "os-page-fault-diagnosis-1-q5",
+          "question": "执行 `perf stat -e page-faults,major-faults -p 18423 sleep 30` 得到如下输出：\n```\n  1,842,301  page-faults  #  61,410 /sec\n      8,247  major-faults #     274 /sec\n```\n如何正确解读这个结果？",
+          "choices": [
+            {"id": "A", "text": "major-faults 占 page-faults 的 0.44%，比例很低，说明问题不严重，可以忽略"},
+            {"id": "B", "text": "major-faults 速率 274/sec 是严重问题，每秒 274 次磁盘 I/O 叠加延迟；minor-faults 速率 61K/sec 正常"},
+            {"id": "C", "text": "page-faults 总数 180 万次说明进程存在严重内存泄漏，需要立即重启"},
+            {"id": "D", "text": "这是正常的 JVM 行为，因为 JVM 的 GC 会触发大量 Page Fault，不需要处理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "正确的解读方式是看速率而非绝对数字，且要区分 minor 和 major。Minor fault 速率 61,410/sec 对于一个 Java 服务来说属于正常范围，JVM GC、类加载、JIT 编译等都会触发 minor fault。真正的问题是 major-faults 274/sec——每秒 274 次磁盘 I/O，每次 I/O 阻塞进程 0.5-10ms，累计下来 P99 延迟飙升完全合理。A 选项的「比例低所以不严重」逻辑错误，major fault 的危害不是因为它占比高，而是因为每一次都有磁盘 I/O 代价。C 选项混淆了 fault 计数和内存泄漏的关系。D 选项错误，JVM GC 不会产生 major fault，GC 是纯内存操作。"
+        },
+        {
+          "id": "os-page-fault-diagnosis-1-q6",
+          "question": "一个 Java 服务配置了 `-Xmx12g`，运行在 16GB 内存的服务器上，出现频繁 major fault。同事建议「扩大 swap 到 32GB 来解决问题」，这个方案的根本问题是什么？",
+          "choices": [
+            {"id": "A", "text": "Linux 系统的 swap 最大只能等于物理内存大小，所以 32GB swap 在技术上不可行"},
+            {"id": "B", "text": "扩大 swap 只是延迟问题爆发，JVM 堆还是会被 OS 换出换入，磁盘 I/O 开销依然存在，根本原因（JVM 内存超配）没有解决"},
+            {"id": "C", "text": "Swap 扩大会导致 JVM 的 GC 频率降低，反而增加单次 GC 的 STW 时间"},
+            {"id": "D", "text": "Swap 文件系统格式与 Java 堆内存格式不兼容，扩大 swap 不能缓解 JVM 的内存压力"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "扩大 swap 不能解决内存超配问题，只是把「内存不够用」的后果从「OOM 崩溃」变成了「慢速但不崩」。根本问题在于 JVM 的 -Xmx12g 超出了服务器可以安全分配给它的物理内存（16GB 扣除 OS、其他进程、page cache 后剩余可能只有 10-12GB），OS 被迫把部分 JVM 堆页换到 swap。只要 JVM 还在访问这些被换出的数据，major fault 就会持续存在，swap 大小只影响系统在 OOM 前能撑多久，不影响 major fault 速率。正确方案是降低 -Xmx（比如改到 8g）或增加物理内存。A 选项错误，Linux 的 swap 大小没有技术上限制。C、D 均为错误描述。"
+        },
+        {
+          "id": "os-page-fault-diagnosis-1-q7",
+          "question": "以下哪个命令可以定位到触发 Major Page Fault 最多的 Java 代码调用栈？",
+          "choices": [
+            {"id": "A", "text": "jstat -gcutil $(pidof java) 1000 30"},
+            {"id": "B", "text": "perf record -e page-faults -g -p $(pidof java) sleep 30 && perf report"},
+            {"id": "C", "text": "strace -p $(pidof java) -e trace=mmap"},
+            {"id": "D", "text": "lsof -p $(pidof java) | wc -l"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "perf record 配合 -g（开启调用栈采集）和 -e page-faults（指定采集 page-fault 事件）可以对指定进程采样，记录每次 page fault 发生时的完整调用链。perf report 再对采样数据做聚合，以调用栈为维度统计 fault 的分布，找出触发最多 fault 的代码路径。对于 Java 进程，如果需要 Java 层的方法名，可以结合 async-profiler 工具。A 选项 jstat -gcutil 只看 GC 统计，不能定位 fault 来源。C 选项 strace 追踪系统调用，mmap 是内存映射调用，不能直接看 fault 的调用栈，且 strace 本身对 Java 这类高并发进程会造成严重性能影响。D 选项只统计文件描述符数量，完全无关。"
+        },
+        {
+          "id": "os-page-fault-diagnosis-1-q8",
+          "question": "一个服务使用 Chronicle Map（基于 mmap 的堆外存储）存储 50GB 的数据，服务器内存 32GB，perf report 显示大量 major fault 来自 Chronicle Map 的随机读取路径。以下哪种方案最有效？",
+          "choices": [
+            {"id": "A", "text": "把 Chronicle Map 替换成 Redis，把数据放到独立的 Redis 服务上"},
+            {"id": "B", "text": "增大内核的 readahead 窗口并在 mmap 区域使用 madvise(MADV_WILLNEED) 预取即将访问的页"},
+            {"id": "C", "text": "增加 swap 分区到 50GB，让整个 Chronicle Map 文件可以缓存在 swap 中"},
+            {"id": "D", "text": "升级到更快的 CPU，减少每次 page fault 的处理时间"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "mmap 随机访问产生 major fault 的核心问题在于：内核不知道应用接下来要访问哪些页，所以默认只加载当前访问的那一页，下一次随机跳转又是一次 major fault。解决思路是「预测并预取」。madvise(MADV_WILLNEED) 允许应用告诉内核「这段地址空间我很快要用，帮我异步预取」，内核会在后台提前把这些页从磁盘读到内存，应用真正访问时就变成 minor fault 或直接命中。调大 readahead 则让顺序 I/O 的预读范围更大，减少多次小 I/O。A 选项改变了存储架构，可能解决问题但代价巨大且引入网络延迟。C 选项把 50GB 数据放 swap 反而会更慢，swap 比文件映射开销更大。D 选项 CPU 速度对 I/O 等待无效，等磁盘的时候 CPU 在睡觉。"
+        },
+        {
+          "id": "os-page-fault-diagnosis-1-q9",
+          "question": "在一台 2 路（dual-socket）NUMA 服务器上，`numastat -p $(pidof java)` 输出显示进程在 node1 上分配了 8GB 内存，但 Java 进程绑定的 CPU 都在 node0 上。这会带来什么问题，应如何解决？",
+          "choices": [
+            {"id": "A", "text": "不会有问题，NUMA 对 Java 进程透明，JVM 会自动优化跨 NUMA 访问"},
+            {"id": "B", "text": "跨 NUMA 节点访问内存比本地访问慢 2-3 倍，加剧内存带宽竞争；用 numactl --cpunodebind=0 --membind=0 重启进程，强制 CPU 和内存在同一 NUMA 节点"},
+            {"id": "C", "text": "NUMA 不匹配会导致内存泄漏，node1 上的内存将无法被释放"},
+            {"id": "D", "text": "跨 NUMA 访问会产生额外的 Major Fault，需要在每次内存分配时调用 numa_alloc_local()"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "NUMA（Non-Uniform Memory Access）架构中，每个 CPU socket 有自己的本地内存控制器，访问本地内存延迟低（~70ns），访问另一个 socket 的内存需要经过 QPI/UPI 互联总线，延迟增加到 ~140-200ns，约慢 2-3 倍，且会占用跨节点的内存带宽。对于内存密集型的 Java 服务，这种性能损失是实质性的，会增加 GC 暂停时间和整体延迟。解决方案是用 numactl 启动进程时同时绑定 CPU 节点和内存节点（--cpunodebind 和 --membind 指向同一 node），或者用 --localalloc 让内存总是从当前运行 CPU 所在的节点分配。A 选项错误，JVM 没有 NUMA 感知的跨节点优化（除非用 -XX:+UseNUMA 开启 NUMA-aware 内存分配）。C 选项错误，跨 NUMA 不会导致内存泄漏。D 选项描述了正确的方向但混淆了用户态和内核态，numactl 是更实用的工具。"
+        },
+        {
+          "id": "os-page-fault-diagnosis-1-q10",
+          "question": "你刚完成了对 major fault 问题的修复，想为系统配置预防性监控，在问题再次严重化之前就能收到告警。以下哪个监控策略最合适？",
+          "choices": [
+            {"id": "A", "text": "监控 /proc/meminfo 中的 SwapUsed，SwapUsed > 0 立即告警"},
+            {"id": "B", "text": "监控 /proc/pressure/memory 中 full avg60 > 5% 时触发告警，结合 majflt/s 速率超过 50 次/秒的第二层告警"},
+            {"id": "C", "text": "监控进程的 minor fault 速率，超过 10000/sec 时告警"},
+            {"id": "D", "text": "监控应用的 P99 延迟，P99 > 200ms 时告警（延迟是最终指标）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "好的预防性监控要在问题显现之前就感知到压力。/proc/pressure/memory 的 PSI（Pressure Stall Information）指标是 Linux 4.20+ 引入的内存压力量化工具，full avg60 表示「在过去 60 秒内，有 5% 的时间所有可运行进程都在等内存」，这是内存系统开始承压的早期信号，早于 thrashing 的完全爆发。结合 majflt/s > 50 的第二层告警形成梯度告警体系。A 选项「SwapUsed > 0 就告警」过于敏感，正常的系统可能有少量 swap 使用（比如长期不活跃的进程页被换出），这不一定有害。C 选项监控 minor fault 速率意义不大，正常的高并发 Java 服务 minor fault 速率就很高。D 选项的 P99 监控是必要的，但它是结果指标，收到告警时问题已经在影响用户，不算「预防性」。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/admin-guide/mm/concepts.html",
+        "https://man7.org/linux/man-pages/man5/proc.5.html",
+        "https://www.brendangregg.com/perf.html",
+        "https://www.kernel.org/doc/html/latest/accounting/psi.html",
+        "https://man7.org/linux/man-pages/man2/madvise.2.html",
+        "https://man7.org/linux/man-pages/man8/numactl.8.html"
+      ]
+    }
+  ]
+}
