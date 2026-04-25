@@ -1,0 +1,303 @@
+{
+  "id": "os-mmap-pitfalls",
+  "name": "mmap 使用陷阱与注意事项",
+  "domain": "operating-system",
+  "description": "mmap 系统调用在实际使用中的常见错误、陷阱与最佳实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-mmap-pitfalls-1",
+      "domain": "operating-system",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": [
+        "mmap",
+        "SIGBUS",
+        "SIGSEGV",
+        "file-truncation",
+        "msync",
+        "munmap",
+        "memory-leak",
+        "MAP_SHARED",
+        "MAP_PRIVATE",
+        "CoW",
+        "madvise",
+        "VMA"
+      ],
+      "title": "mmap 在使用中有哪些常见的陷阱和注意事项",
+      "content": "## mmap 基础回顾\n\n`mmap`（memory-mapped file，内存映射文件）是 POSIX 标准定义的系统调用，核心功能是将文件或匿名内存区域直接映射到进程的虚拟地址空间。与 `read()`/`write()` 不同，mmap 让用户空间和内核页缓存（page cache）直接共享同一块物理内存，消除了数据在用户态与内核态之间反复拷贝的开销。这是数据库引擎（LMDB、RocksDB）、大文件处理工具和共享内存 IPC 广泛采用 mmap 的核心原因。\n\n基本 API 如下：\n\n```c\n#include <sys/mman.h>\n\nvoid *mmap(\n    void   *addr,    /* 建议映射地址，通常传 NULL 让内核自动选择 */\n    size_t  length,  /* 映射长度（字节） */\n    int     prot,    /* 内存保护: PROT_READ | PROT_WRITE | PROT_EXEC */\n    int     flags,   /* MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS ... */\n    int     fd,      /* 文件描述符，MAP_ANONYMOUS 时传 -1 */\n    off_t   offset   /* 文件偏移，必须是页大小（通常 4096）的整数倍 */\n);\nint munmap(void *addr, size_t length);           /* 解除映射 */\nint msync(void *addr, size_t length, int flags); /* 脏页同步到磁盘 */\n```\n\n一个最简单的只读映射示例：\n\n```c\nint fd = open(\"data.bin\", O_RDONLY);\nstruct stat st;\nfstat(fd, &st);\n\n/* 把整个文件映射到虚拟地址空间 */\nvoid *ptr = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);\nclose(fd);  /* mmap 成功后 fd 可以安全关闭，映射仍然有效 */\n\nif (ptr == MAP_FAILED) { perror(\"mmap\"); exit(1); }\n\n/* 直接以内存方式读取文件，零拷贝 */\nprintf(\"magic: 0x%x\\n\", *(uint32_t *)ptr);\n\nmunmap(ptr, st.st_size);\n```\n\n内核的处理流程分三步：调用 `mmap()` 时，内核仅在进程虚拟内存区域（VMA，Virtual Memory Area）中登记一段映射关系，**不分配物理内存**；第一次访问某个页时触发缺页中断（page fault），内核将文件对应页从磁盘读入 page cache，建立物理页表项；后续访问直接命中物理内存。这套「按需加载」机制赋予了 mmap 极高的灵活性，但也把内核内存管理的许多细节直接暴露给了应用程序。\n\n稍有不慎，你就会遇到令人困惑的 `SIGBUS`、数据在宕机后静默丢失、进程 VMA 泄漏，甚至 32 位系统上莫名其妙的 `ENOMEM`。以下是生产环境中最常见的八个陷阱，请系统性地分析每个陷阱的成因、触发场景和正确的规避方式，并总结 mmap 使用的最佳实践。",
+      "answer": "## 从缺页中断说起：为什么 mmap 比 read() 更危险\n\n很多工程师用 mmap 是因为「听说它比 read() 快」，但从来没有深入理解为什么快，更没想过为什么危险。read() 慢在哪里？它要把内核 page cache 里的数据再拷贝一份到用户缓冲区，多一次内存复制。mmap 消除了这次复制，让用户程序直接访问 page cache 的物理页，所以快。但代价是：内核不再替你检查「文件现在还有多大」「这个页还在不在」，这些边界条件你必须自己处理。不处理，就会踩坑。\n\n---\n\n### 陷阱一：文件被截断后继续访问 → SIGBUS\n\n这是最危险也最难复现的陷阱，因为它往往由另一个进程触发，而不是你自己的代码。假设你 mmap 了一个 1MB 的日志文件，正在逐字节解析，此时另一个进程调用 `truncate()` 将文件缩短到 512KB。内核并不会主动通知你，VMA 的登记长度仍然是 1MB。当你的代码访问 512KB 到 1MB 之间的地址时：\n\n```c\nint fd = open(\"log.bin\", O_RDWR);\nvoid *ptr = mmap(NULL, 1 * 1024 * 1024, PROT_READ, MAP_SHARED, fd, 0);\n\n/* 另一个进程执行了 truncate(\"log.bin\", 512 * 1024) */\n\nchar c = ((char *)ptr)[600 * 1024];  /* SIGBUS! 不是 SIGSEGV */\n```\n\n注意是 **SIGBUS**（总线错误，signal 7），不是 SIGSEGV（段错误，signal 11）。两者都会让进程崩溃，但成因不同：SIGSEGV 是访问了不属于进程的虚拟地址，而 SIGBUS 是虚拟地址合法（在 VMA 范围内），但内核尝试为这个页建立文件映射时发现文件已经没有对应的数据了。Linux 内核的 `do_fault()` 路径在发现文件页不存在时，向进程投递 SIGBUS。\n\n正确的做法有三层：在 mmap 之后立即用 `fstat()` 拿到文件大小，并且**每次访问前都做边界检查**，永远不要相信 mmap 时的文件大小在整个生命周期里不变。如果文件确实可能在运行期被截断（如滚动日志），必须安装 SIGBUS 信号处理器，在处理器里用 `longjmp` 跳出，而不是让进程直接崩溃。如果只是需要动态大小的内存区域，用 `MAP_ANONYMOUS` 代替文件映射，彻底规避这个问题。\n\n---\n\n### 陷阱二：MAP_SHARED 写入后忘记 msync → 宕机丢数据\n\n这是数据库领域踩得最多的坑。代码看起来完全正确：\n\n```c\nint fd = open(\"db.dat\", O_RDWR);\nvoid *ptr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);\n\n((int *)ptr)[0] = 42;  /* 写入数据 */\nmunmap(ptr, len);       /* BUG: 脏页可能还没有写回磁盘！ */\nclose(fd);\n```\n\n**munmap 不保证脏页立刻写回磁盘。** munmap 的语义是解除虚拟地址映射、释放 VMA，同时让内核知道这些页可以被回收。至于脏页何时真正写回文件，由内核的 pdflush/flusher 线程决定，默认延迟可以长达 30 秒（`/proc/sys/vm/dirty_expire_centisecs` 默认值 3000，即 30 秒）。如果这 30 秒内机器断电，数据就丢了，而且你完全不会收到任何错误提示。\n\n正确做法是在 munmap 之前调用 `msync(ptr, len, MS_SYNC)`，它会阻塞直到所有脏页都真正 fsync 到磁盘：\n\n```c\nmsync(ptr, len, MS_SYNC);  /* 阻塞等待脏页落盘 */\nmunmap(ptr, len);            /* 此时解除映射才是安全的 */\n```\n\n这也是 SQLite WAL 模式、LMDB 在事务提交时必做的操作。如果对性能有要求，可以用 `MS_ASYNC` 发起异步刷盘，但要清楚这不提供持久化保证，仅仅是「提前触发」而不是「等待完成」。\n\n---\n\n### 陷阱三：munmap 的 length 管理不当 → VMA 碎片泄漏\n\n内核在创建 VMA 时会把 length 向上取整到页边界（4096 的整数倍），但 munmap 要求你传入和 mmap 时**语义上一致**的 length。常见错误是把 mmap 的 length 存进了某个被意外修改的变量，导致只 unmap 了部分 VMA：\n\n```c\nsize_t len = file_size;\nchar *ptr = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);\n\n/* 中间某处代码修改了 len... */\nlen = another_size;\nmunmap(ptr, len);  /* 若 len 变小，剩余 VMA 碎片永久泄漏 */\n```\n\n残留的 VMA 碎片不会自动清理（直到进程退出）。在长期运行的服务里，频繁 mmap/munmap 配合 length 传错，会导致 `/proc/pid/maps` 中的 VMA 数量不断增加，最终触及内核默认上限 **65536**（由 `vm.max_map_count` 控制），此后所有 mmap 调用都返回 `ENOMEM`，但物理内存可能还很充裕。诊断命令：`cat /proc/<pid>/maps | wc -l`。这是 Elasticsearch 官方要求用户将 `vm.max_map_count` 调整为 262144 的根本原因。\n\n---\n\n### 陷阱四：MAP_PRIVATE 的写时复制不会写回文件\n\n这是最容易被新手误解的行为差异：\n\n```c\n/* 期望：修改 ptr[0] 后文件内容也跟着变 */\nvoid *ptr = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);\n((char *)ptr)[0] = 'X';  /* 只修改了进程的私有副本，文件内容不变！ */\nmunmap(ptr, len);\n/* 重新打开文件，ptr[0] 仍然是原来的值 */\n```\n\nMAP_PRIVATE 使用写时复制（CoW，Copy-on-Write）：首次写入某页时，内核为该进程创建一个私有物理页副本，之后该页的修改只发生在这个副本上，不影响原始文件和其他进程的映射。这是 Linux 加载共享库（.so 文件）的基础机制。要把修改写回文件，必须用 **MAP_SHARED**。\n\n---\n\n### 陷阱五：/proc 虚拟文件不支持 mmap\n\n```c\nint fd = open(\"/proc/meminfo\", O_RDONLY);\nvoid *ptr = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);\n/* ptr == MAP_FAILED，errno == ENODEV */\n```\n\n`/proc`、`/sys` 下的虚拟文件由内核动态生成，背后没有真实的文件页作为 page cache 后备，因此不支持 mmap，返回 `ENODEV`（设备不支持该操作）。同样不支持 mmap 的还有管道（pipe）、网络 socket 及部分设备文件。对这类文件，只能用 `read()` 系统调用。\n\n---\n\n### 陷阱六：32 位地址空间耗尽\n\n32 位进程的用户虚拟地址空间仅约 3GB，每次 mmap 都消耗一段虚拟地址区间。哪怕物理内存还很充裕，多个大文件 mmap 之后虚拟空间就会耗尽，`mmap()` 返回 `ENOMEM`。这是 2010 年代前 32 位 Java 应用的经典故障：JVM 堆 + JNI 库 + 大量 mmap'd 文件一起把 3GB 虚拟空间撑爆。64 位系统用户虚拟空间高达 128TB，这个问题基本消失，但在嵌入式 32 位平台上仍需注意。\n\n---\n\n### 陷阱七：关闭 fd 不影响映射，但 unlink 文件要小心\n\n很多工程师不敢在 mmap 后立刻 `close(fd)`，担心关闭 fd 会使映射失效。实际上这是安全的——mmap 成功后，内核通过 vm_area_struct 持有对文件 inode 的引用，fd 只是用户空间的整数句柄，关闭它不影响映射。「mmap 后立刻 close fd」是推荐写法，可以避免整个映射生命周期内占用宝贵的文件描述符。\n\n但有一个容易忽略的反面：如果你在 mmap 之后 `unlink()` 了该文件，映射仍然有效（inode 未释放），但其他进程再也找不到这个文件，磁盘空间也不会被释放，直到所有映射都 munmap 为止。这在实现「用后即删的共享内存」时是有意为之的技巧，但误操作会导致磁盘空间泄漏。\n\n---\n\n### 陷阱八：大页对齐要求\n\n使用 `MAP_HUGETLB` 请求 2MB 大页映射时，如果配合 `MAP_FIXED` 指定映射地址，该地址必须严格 2MB 对齐，否则内核返回 `EINVAL`。传 `NULL` 让内核自动选择地址是最安全的做法；传地址 hint（不带 `MAP_FIXED`）时，内核会忽略不对齐的 hint 并自动选择合适地址。\n\n---\n\n## 最佳实践总结\n\n将以上八个陷阱归纳为工程实践，所有使用 mmap 的代码在上线前都应该检查以下几点。\n\n对于文件映射，必须在 mmap 之后立刻保存 `fstat()` 得到的文件大小，并在每次访问时做边界检查，同时安装 SIGBUS 信号处理器以防止文件被外部进程截断时进程直接崩溃。对于 MAP_SHARED 可写映射，每次事务结束前必须 `msync(ptr, len, MS_SYNC)` 确保数据落盘，绝不能依赖 munmap 来保证持久化。\n\nmunmap 的 length 要和 mmap 时的 length 严格一致，养成「mmap/munmap 成对、length 用同一变量」的编码习惯，并定期用 `cat /proc/<pid>/maps | wc -l` 监控 VMA 数量。\n\n善用 `madvise()` 向内核提供访问模式提示，顺序扫描用 `MADV_SEQUENTIAL`，随机跳跃用 `MADV_RANDOM`，不再需要的区域用 `MADV_DONTNEED`（内核可回收物理页但 VMA 保留），计划近期访问的数据用 `MADV_WILLNEED`。LMDB 在 mmap 整个数据库文件后会立刻调用 `madvise(MADV_RANDOM)` 禁止无效的顺序预读，因为 B+ 树的访问模式天生是随机的。\n\n最后，对于纯粹的进程内动态内存，优先用 `MAP_ANONYMOUS | MAP_PRIVATE` 而不是临时文件映射：匿名映射没有文件截断风险，不需要 msync，是最简单安全的 mmap 使用方式。",
+      "keyPoints": [
+        "访问文件映射中超出当前文件大小的地址会触发 SIGBUS（而非 SIGSEGV），因为内核在缺页时找不到文件页；文件被外部进程截断后，VMA 仍存在但对应页消失，必须用 fstat() 持续追踪文件大小并安装 SIGBUS 处理器",
+        "munmap 不保证脏页立刻写回磁盘，内核默认可延迟 30 秒落盘；MAP_SHARED 可写映射在关键路径上必须先执行 msync(ptr, len, MS_SYNC) 再 munmap，否则宕机会静默丢失数据",
+        "munmap 传入的 length 必须与 mmap 时一致，传错会留下 VMA 碎片导致内存泄漏，长期运行的服务最终会因 VMA 数量超过 vm.max_map_count（默认 65536）而 mmap 返回 ENOMEM",
+        "MAP_PRIVATE 写入使用写时复制（CoW），修改只发生在进程私有页副本中，不会写回文件；要写回文件必须使用 MAP_SHARED",
+        "mmap 成功后 fd 可以安全 close()，内核通过 inode 引用计数维持映射；但不能 unlink() 文件，否则磁盘空间在映射解除前无法释放",
+        "/proc、/sys 下的虚拟文件不支持 mmap（返回 ENODEV），只能用 read() 读取；管道和 socket 同样不支持",
+        "用 madvise(MADV_SEQUENTIAL/MADV_RANDOM/MADV_WILLNEED/MADV_DONTNEED) 向内核提示访问模式能显著改善大文件映射的 I/O 性能；LMDB 对 B+树文件映射使用 MADV_RANDOM 禁止无效预读",
+        "使用 MAP_HUGETLB 配合 MAP_FIXED 时地址必须严格 2MB 对齐，传入非对齐地址直接返回 EINVAL；传 NULL 让内核自动选址是最安全的做法"
+      ],
+      "quiz": [
+        {
+          "id": "os-mmap-pitfalls-q1",
+          "question": "调用 mmap() 映射一个文件时，内核在系统调用返回时完成了什么操作？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "仅在进程 VMA 中登记映射范围，不分配物理内存，也不立刻读取文件"
+            },
+            {
+              "id": "B",
+              "text": "立刻把整个文件内容读入物理内存，然后建立页表映射"
+            },
+            {
+              "id": "C",
+              "text": "分配与映射长度等量的物理内存，并将文件内容复制进去"
+            },
+            {
+              "id": "D",
+              "text": "创建一个文件的副本到内核缓冲区，供后续访问使用"
+            }
+          ],
+          "correctAnswer": "A",
+          "explanation": "mmap() 采用「懒加载」策略。系统调用返回时，内核只在进程的虚拟地址空间中创建一条 VMA 记录，记录映射范围、权限和对应文件。物理内存的分配和文件数据的读入发生在首次访问触发缺页中断时，由缺页处理程序 do_fault() 完成。这就是为什么 mmap 一个 10GB 文件的系统调用能在微秒级返回。B、C、D 都描述了立刻分配内存或复制数据的行为，与 mmap 的按需加载设计相反。实际上如果 mmap 调用时就把整个文件读入，那它的启动性能会和 read() 一样慢，也就失去了延迟加载的价值。"
+        },
+        {
+          "id": "os-mmap-pitfalls-q2",
+          "question": "访问「VMA 范围内但对应文件页不存在（文件已被截断）」的地址时，进程收到哪个信号？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "SIGSEGV（段错误，signal 11）"
+            },
+            {
+              "id": "B",
+              "text": "SIGBUS（总线错误，signal 7）"
+            },
+            {
+              "id": "C",
+              "text": "SIGFPE（浮点异常，signal 8）"
+            },
+            {
+              "id": "D",
+              "text": "SIGILL（非法指令，signal 4）"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "SIGSEGV 和 SIGBUS 的区别在于：SIGSEGV 是访问了不在任何 VMA 中的虚拟地址（真正的越界访问）；SIGBUS 是虚拟地址合法（在 VMA 内），但内核在建立文件映射时发现文件没有对应的数据。文件被截断后，VMA 还在，但对应的文件页不存在了，内核的 do_fault() 路径会投递 SIGBUS。这就是为什么诊断 mmap 相关崩溃时，看到 SIGBUS 要优先怀疑文件大小变化，而不是指针越界。在某些 RISC 架构（如 SPARC）上，非对齐内存访问也会触发 SIGBUS，但 x86/x86-64 硬件处理非对齐访问，不会产生 SIGBUS。"
+        },
+        {
+          "id": "os-mmap-pitfalls-q3",
+          "question": "对 MAP_SHARED 可写映射执行 ptr[0]=42 后立刻调用 munmap，之后机器断电。数据是否会丢失？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "不会丢失，munmap 会阻塞等待脏页落盘后才返回"
+            },
+            {
+              "id": "B",
+              "text": "会丢失，munmap 不保证脏页立刻写回磁盘，内核可延迟 30 秒落盘"
+            },
+            {
+              "id": "C",
+              "text": "不会丢失，因为写操作发生在 page cache 中，page cache 是持久化的"
+            },
+            {
+              "id": "D",
+              "text": "会丢失，但只有在 close(fd) 之后才会丢失，munmap 之前是安全的"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考的是 MAP_SHARED 写入的持久化保证。ptr[0]=42 修改了 page cache 中的物理页，此时这个页是「脏页」。munmap() 的语义只是解除 VMA 映射，它会通知内核这些脏页「可以」写回，但实际写回时间由内核的 flusher 线程决定，默认最长可延迟 30 秒（vm.dirty_expire_centisecs=3000）。如果在这 30 秒内断电，数据就丢了。正确做法是在 munmap 之前显式调用 msync(ptr, len, MS_SYNC)，阻塞等待所有脏页落盘。page cache（选项 C）是内存中的缓存，断电同样会消失，并非持久化存储。"
+        },
+        {
+          "id": "os-mmap-pitfalls-q4",
+          "question": "用 MAP_PRIVATE 映射一个文件并修改映射内容，之后 munmap 再重新打开文件读取，会看到修改后的内容吗？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "会，MAP_PRIVATE 最终会在 munmap 时将修改写回文件"
+            },
+            {
+              "id": "B",
+              "text": "不会，MAP_PRIVATE 使用写时复制，修改只存在于进程的私有页副本中"
+            },
+            {
+              "id": "C",
+              "text": "会，因为 MAP_PRIVATE 和 MAP_SHARED 的写行为在单进程时是相同的"
+            },
+            {
+              "id": "D",
+              "text": "不会，并且写操作会触发 SIGSEGV，因为 MAP_PRIVATE 不允许写入"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "MAP_PRIVATE 的核心语义是写时复制（CoW）：首次写入某页时，内核为该进程创建一个私有的物理页副本，之后所有修改都只发生在这个副本上，原始文件和其他进程的映射完全不受影响。这是 Linux 加载共享库的基础——多个进程 mmap 同一个 .so 文件，各自可以修改自己进程内存（如 BSS 段初始化），互不干扰。MAP_PRIVATE 与 PROT_WRITE 组合是完全合法的（选项 D 错误），写入不会报错，但结果不会回到文件。要把修改写回文件必须用 MAP_SHARED 并配合 msync。munmap MAP_PRIVATE 映射不会有任何写回行为（选项 A 错误）。"
+        },
+        {
+          "id": "os-mmap-pitfalls-q5",
+          "question": "对 /proc/meminfo 文件调用 mmap()，返回 MAP_FAILED，errno 的值最可能是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "EACCES（权限不足）"
+            },
+            {
+              "id": "B",
+              "text": "ENODEV（设备不支持该操作）"
+            },
+            {
+              "id": "C",
+              "text": "EINVAL（参数无效）"
+            },
+            {
+              "id": "D",
+              "text": "ENOMEM（内存不足）"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ENODEV 是内核告诉你「这个文件对应的文件系统或设备驱动不支持 mmap 操作」。/proc 文件系统（procfs）中的文件由内核动态生成，没有真实的 page cache 后备存储，因此不支持建立内存映射。同样不支持 mmap 的还有 /sys（sysfs）下的虚拟文件、管道（pipe）、网络 socket 等。EACCES 是权限错误，比如对只读文件请求 MAP_SHARED|PROT_WRITE。EINVAL 出现在 offset 不是页大小对齐、length 为 0、或 MAP_FIXED 配合大页但地址未对齐等场景。ENOMEM 出现在虚拟地址空间不足时。对 procfs 文件的操作只能用 read() 系统调用。"
+        },
+        {
+          "id": "os-mmap-pitfalls-q6",
+          "question": "mmap 成功后立刻 close(fd)，然后继续通过返回的指针访问映射内容，结果是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "访问会立刻触发 SIGSEGV，因为关闭 fd 使映射失效"
+            },
+            {
+              "id": "B",
+              "text": "访问完全正常，内核通过 inode 引用计数维持映射，fd 只是应用层句柄"
+            },
+            {
+              "id": "C",
+              "text": "访问可能成功也可能失败，行为未定义，不应依赖这个行为"
+            },
+            {
+              "id": "D",
+              "text": "访问会触发 SIGBUS，因为文件描述符已关闭导致文件页无法加载"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "mmap() 成功后，内核会在 vm_area_struct 中持有对 struct file 的引用，进而持有 inode 引用。此后 fd 只是用户空间的整数句柄，close(fd) 只减少用户空间对该文件的打开计数，不影响内核维护的映射关系。这个行为是 POSIX 明确规定的，可以放心依赖。「mmap 后立刻 close fd」是推荐写法：避免在整个映射生命周期内占用文件描述符资源（系统默认每进程最多 1024 个 fd，可通过 ulimit -n 调整）。唯一需要注意的是：如果 close 后又 unlink 了文件，磁盘空间要等到所有映射都 munmap 后才会释放。"
+        },
+        {
+          "id": "os-mmap-pitfalls-q7",
+          "question": "以下关于 munmap 的描述，哪个最准确？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "munmap 会立刻回收所有对应的物理内存页，释放 RAM"
+            },
+            {
+              "id": "B",
+              "text": "munmap 的 length 传错（比 mmap 时小）可能导致 VMA 碎片泄漏，最终 mmap 返回 ENOMEM"
+            },
+            {
+              "id": "C",
+              "text": "munmap 总是会先执行 msync 再解除映射，保证数据不丢"
+            },
+            {
+              "id": "D",
+              "text": "munmap 失败时返回 -1，此时映射仍然有效且必须重试"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "如果 munmap 传入的 length 比 mmap 时小，内核只解除对应范围的 VMA，剩余部分继续存在（Linux 允许 partial unmap）。如果这是无意为之，剩余的 VMA 碎片就永远不会被清理，形成泄漏。长期运行的服务若持续产生 VMA 碎片，最终会超过 vm.max_map_count 上限（默认 65536），导致后续所有 mmap 调用失败返回 ENOMEM。A 选项错误，munmap 只释放 VMA，物理页的回收取决于 page cache 压力，不会立刻发生。C 选项严重错误，munmap 不会做任何 msync，这是最常见的误解，也是数据丢失的根源。D 选项描述不准确，munmap 失败场景极少（通常是 addr 未对齐或 length 为 0），且失败后映射状态需具体分析。"
+        },
+        {
+          "id": "os-mmap-pitfalls-q8",
+          "question": "一个长期运行的服务突然开始出现 mmap 返回 ENOMEM 错误，但 free -m 显示物理内存还剩 8GB 空闲，最可能的原因是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "系统的 swap 分区已满，内核无法为新 mmap 分配交换空间"
+            },
+            {
+              "id": "B",
+              "text": "进程的 VMA 数量超过了 vm.max_map_count 上限（默认 65536）"
+            },
+            {
+              "id": "C",
+              "text": "该进程的 RSS 超过了 cgroup 的内存限制触发了 OOM"
+            },
+            {
+              "id": "D",
+              "text": "mmap 的 flags 参数中包含了内核版本不支持的标志位"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「mmap 返回 ENOMEM 但物理内存充裕」是 VMA 数量超限的经典症状。Linux 内核用 vm.max_map_count 参数限制每个进程能拥有的 VMA 数量，默认值 65536。每次 mmap/munmap 如果 length 不匹配，或者 mmap 了很多小区域没有合并，都会积累 VMA 碎片。诊断：cat /proc/<pid>/maps | wc -l，若接近 65536 则确认。Elasticsearch 官方文档要求将 vm.max_map_count 调整为 262144 正是因为它会 mmap 大量 Lucene 段文件。A 选项中 swap 不足通常导致 OOM killer 介入而非仅 mmap 失败。C 选项 cgroup OOM 会直接 kill 进程。D 选项是「突然开始」出现的问题，不符合版本不兼容的特征。",
+          "relatedConcepts": [
+            "vm.max_map_count",
+            "VMA",
+            "Elasticsearch"
+          ]
+        },
+        {
+          "id": "os-mmap-pitfalls-q9",
+          "question": "调用 madvise(ptr, len, MADV_DONTNEED) 之后再次访问该区域，会发生什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "触发 SIGSEGV，因为内核已经释放了对应的 VMA，地址不再合法"
+            },
+            {
+              "id": "B",
+              "text": "触发缺页中断，文件映射重新从磁盘加载，匿名映射读到全零页"
+            },
+            {
+              "id": "C",
+              "text": "触发 SIGBUS，因为内核强制释放了物理页导致文件页不存在"
+            },
+            {
+              "id": "D",
+              "text": "MADV_DONTNEED 是 hint，内核会忽略，访问不受任何影响"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "MADV_DONTNEED 告诉内核「我暂时不需要这些页了，可以回收物理内存」。内核会清除对应的页表项（PTE），释放物理页，但 VMA 本身保持不变。下次访问时触发缺页中断：对于文件映射，内核重新从磁盘（或 page cache）加载数据；对于匿名映射，读到的是全零页（Linux 的 zero page 优化）。这不是错误，而是程序主动归还内存、避免 OOM 的合法手段。jemalloc 就利用 MADV_DONTNEED 来向操作系统归还已释放的内存块。A 选项错误，VMA 还在，不会 SIGSEGV。C 选项 SIGBUS 的成因是文件被截断，而非 MADV_DONTNEED。D 选项在 Linux 上 MADV_DONTNEED 是有实际效果的，不会被忽略。"
+        },
+        {
+          "id": "os-mmap-pitfalls-q10",
+          "question": "调试一个使用 mmap 的 C 程序：coredump 信号是 SIGBUS，崩溃地址在合法的 mmap 区域内，只在生产环境偶发，本地从未复现。最可能的根因和排查方向是什么？",
+          "choices": [
+            {
+              "id": "A",
+              "text": "mmap 的 prot 参数有误，尝试写入只读映射，建议检查 PROT_WRITE 标志"
+            },
+            {
+              "id": "B",
+              "text": "另一个进程在崩溃前截断了被映射的文件，访问了超出文件大小的区域，用 strace 追踪 truncate 系统调用"
+            },
+            {
+              "id": "C",
+              "text": "映射地址没有正确对齐，x86-64 硬件触发了总线错误，检查 mmap 返回地址"
+            },
+            {
+              "id": "D",
+              "text": "内核版本差异导致 mmap 行为不一致，需要升级内核到最新稳定版"
+            }
+          ],
+          "correctAnswer": "B",
+          "explanation": "「合法 VMA 内触发 SIGBUS、只在生产偶发、本地不复现」三个特征高度指向文件截断问题。生产环境通常有多个进程协作处理同一批文件（日志轮转、临时文件清理、日志收集器等），其中某个进程在特定时机截断了文件，而 mmap 进程没有感知到文件大小变化就继续访问。本地不复现是因为没有模拟这个并发场景。排查步骤：用 strace -e trace=ftruncate,truncate -p <pid> 追踪所有相关进程，看谁在截断文件；在 mmap 进程中安装 SIGBUS 信号处理器，在处理器里打印 si_addr（崩溃地址）和当时 fstat 得到的文件大小对比。A 选项写只读映射触发的是 SIGSEGV 不是 SIGBUS。C 选项 x86-64 硬件处理非对齐访问，不触发 SIGBUS。D 选项是逃避排查的借口。",
+          "relatedConcepts": [
+            "SIGBUS",
+            "file truncation",
+            "strace",
+            "fstat"
+          ]
+        }
+      ],
+      "references": [
+        "https://man7.org/linux/man-pages/man2/mmap.2.html",
+        "https://man7.org/linux/man-pages/man2/msync.2.html",
+        "https://man7.org/linux/man-pages/man2/madvise.2.html",
+        "https://www.kernel.org/doc/html/latest/admin-guide/mm/hugetlbpage.html",
+        "https://www.symas.com/lmdb",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/vm-max-map-count.html"
+      ]
+    }
+  ]
+}
