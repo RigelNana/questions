@@ -1,0 +1,157 @@
+{
+  "id": "db-sharding",
+  "name": "数据库分库分表迁移",
+  "domain": "troubleshooting",
+  "description": "设计 5 亿订单表不停服迁移到分库分表架构的双写方案，处理历史数据迁移和一致性校验",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "db-sharding-1",
+      "domain": "troubleshooting",
+      "type": "open-ended",
+      "difficulty": 4,
+      "tags": ["mysql", "sharding", "migration", "double-write", "distributed", "canal", "shardingsphere"],
+      "title": "5 亿订单表如何不停服迁移到分库分表架构？",
+      "content": "你所在的电商平台在过去三年里订单量急速增长，orders 表现在已经积累了 5 亿条记录，单表大小约 800GB。DBA 反馈 B+ 树索引的深度已经到了 5 层，几乎所有的慢查询优化空间都已经压榨干净——主键查询还好，但涉及 user_id 的范围查询和统计类 SQL 的 P99 延迟已经突破了 2 秒，业务方强烈投诉。\n\n架构评审之后，团队决定将 orders 表从当前的「单库单表」迁移到「按 user_id 分 16 个库、每库 32 张表（共 512 张分片）」的水平分库分表架构。路由规则定为：`db_index = hash(user_id) % 16`，`table_index = hash(user_id) % 32`，最终写入 `db_{db_index}.orders_{table_index}`。\n\n但有一个硬性约束：迁移过程中服务不能停机，也不能进入维护模式。订单系统每天 GMV 过亿，任何停机窗口都需要提前一个月向公司申请，这次架构升级无法走这个流程。\n\n技术栈情况如下：后端服务是 Java Spring Boot 微服务，数据库是 MySQL 8.0，已有 binlog 基础设施（Canal Server 在跑），连接池用的是 HikariCP，ORM 是 MyBatis-Plus。现有单库的 TPS 峰值约 8000，平均 3000 左右。\n\n请设计完整的不停服迁移方案：包括分库分表的基础架构选型、不停服迁移的阶段划分、历史数据迁移策略、数据一致性校验，以及迁移过程中需要解决的分布式事务、跨库 JOIN、全局 ID 等核心难点。",
+      "answer": "## 一、先搞清楚分库分表的本质：水平拆分 vs 垂直拆分\n\n分库分表这个词在面试里被频繁提到，但很多人对它的理解停留在「数据太多了就分一下」这个层面。真正理解分库分表，要先明白它在解决什么问题，以及水平拆分和垂直拆分的本质区别。\n\n垂直拆分（Vertical Sharding）是按「列」或「功能」切割。把一张宽表里的热字段和冷字段拆成两张表，或者把订单表、商品表、用户表分散到不同的数据库实例，减少单个库的连接压力和存储压力。垂直拆分不改变单表的行数，解决的是「单库存的东西太多、类型太杂」的问题。\n\n水平拆分（Horizontal Sharding）才是本题要讨论的主角。它按「行」切割，把同一张表里的数据根据某个分片键（Sharding Key）的值，分散存到不同的物理表里。5 亿行变成 512 张表各 ~100 万行，每张分片表的 B+ 树只有 2-3 层深，查询代价回到最优状态。\n\n水平拆分最核心的决策是**分片键的选择**。在订单场景里，候选的分片键通常是 user_id 或 order_id。用 order_id 做分片键的好处是新订单写入均匀（雪花 ID 的高位是时间戳，天然递增，按 order_id hash 分片后写入压力均衡），但坏处是查「某个用户的所有订单」时，你不知道数据在哪个分片，需要广播查询所有 512 张分片表再合并——这对用户中心页面来说是灾难性的。用 user_id 做分片键则相反：同一个用户的所有订单必然在同一个分片，「查我的订单」这类高频操作变成单分片直查，但某个爆款活动触发的热门卖家订单会打到同一个分片，存在数据倾斜风险。综合电商业务的查询模式，用 user_id 做分片键更合理，热点卖家问题可以通过二次路由或独立冗余解决。\n\n路由规则 `db_index = hash(user_id) % 16`，`table_index = hash(user_id) % 32` 的含义是：先用 hash 把 user_id 映射成一个整数（避免字符串 ID 分布不均），再取模确定库号和表号。注意这里库和表用的是同一个 hash 值取不同的模，这意味着同一个用户的数据必然在同一个库的某一张特定表里，不存在跨库聚合的问题。\n\n## 二、中间件选型：ShardingSphere 还是 MyCat？\n\n在 Java 生态里，分库分表中间件主要是 Apache ShardingSphere（前身 Sharding-JDBC）和 MyCat。MyCat 是代理模式，应用连接 MyCat，MyCat 转发到真实 MySQL，对应用完全透明，但引入了额外的网络跳数，延迟增加约 1-2ms；ShardingSphere-JDBC 是驱动模式，以 jar 包形式嵌入应用进程，拦截 JDBC 调用在应用内部完成路由，零额外网络开销，但需要应用侧引入依赖。\n\n对于这个场景，推荐 ShardingSphere-JDBC（5.x 版本）。原因是：延迟敏感、TPS 高（峰值 8000），驱动模式少一跳更重要；团队已有 Spring Boot + MyBatis-Plus，ShardingSphere 的 Spring Boot Starter 和 MyBatis 集成非常成熟，配置也相对干净。\n\nShardingSphere 5.x 的核心配置大致如下：\n\n```yaml\n# application-sharding.yml\nspring:\n  shardingsphere:\n    datasource:\n      names: ds0,ds1,...,ds15   # 16 个数据库实例\n      ds0:\n        type: com.zaxxer.hikari.HikariDataSource\n        driver-class-name: com.mysql.cj.jdbc.Driver\n        jdbc-url: jdbc:mysql://db-host-0:3306/orders_db_0\n        username: app_user\n        password: \"${DB_PASSWORD}\"\n    rules:\n      sharding:\n        tables:\n          orders:\n            actual-data-nodes: ds$->{0..15}.orders_$->{0..31}\n            database-strategy:\n              standard:\n                sharding-column: user_id\n                sharding-algorithm-name: db-inline\n            table-strategy:\n              standard:\n                sharding-column: user_id\n                sharding-algorithm-name: tbl-inline\n        sharding-algorithms:\n          db-inline:\n            type: INLINE\n            props:\n              algorithm-expression: ds$->{Math.abs(user_id.hashCode()) % 16}\n          tbl-inline:\n            type: INLINE\n            props:\n              algorithm-expression: orders_$->{Math.abs(user_id.hashCode()) % 32}\n```\n\n这段配置告诉 ShardingSphere：凡是对 orders 表的操作，都根据 user_id 计算路由，实际写入 `ds{0-15}.orders_{0-31}`。\n\n## 三、不停服迁移的「双写」方案：四个阶段\n\n不停服迁移的核心思路是「双写」（Dual Write）：在迁移期间，新数据同时写入旧的单表和新的分片表；历史数据通过后台任务慢慢搬运；校验一致后，再把读流量切到新表；最后停掉旧表。整个过程服务不中断，用户无感知。\n\n### 阶段一：双写准备（约 1 周）\n\n这个阶段的任务是改造代码，让服务具备双写能力，但还不真正切换读写。首先，在应用里新增一个「分片数据源」配置，与原有的「单表数据源」并存。此时服务还是只读写单表，新的分片数据源处于 standby 状态。\n\n然后在写操作（INSERT/UPDATE/DELETE）路径上加一个「双写开关」。开关关闭时，只写单表；开关打开时，先写单表（保证主路径成功），再异步写分片表。**这里有个关键设计：异步写分片表的失败不能回滚单表写操作**，因为单表仍然是「Source of Truth」，分片表写入失败只需记录到重试队列，后续补偿即可。代码层面大致如下：\n\n```java\n@Transactional\npublic void createOrder(Order order) {\n    // 主路径：写旧单表，事务保护\n    legacyOrderMapper.insert(order);\n    \n    // 双写：异步写新分片表，失败进重试队列\n    if (dualWriteEnabled) {\n        dualWriteExecutor.execute(() -> {\n            try {\n                shardingOrderMapper.insert(order);\n            } catch (Exception e) {\n                dualWriteRetryQueue.push(order);\n                log.error(\"dual write failed, order_id={}\", order.getId(), e);\n            }\n        });\n    }\n}\n```\n\n灰度验证几天，观察分片表的写入成功率和重试队列积压量。如果重试队列长期清零，说明双写稳定，可以进入下一阶段。\n\n### 阶段二：历史数据迁移（约 2-4 周）\n\n打开双写开关后，新产生的数据已经实时同步到分片表了，但 5 亿条历史数据还在旧表里。这一步需要用后台任务把它们全部搬过去。\n\n关键约束是**限速**。不限速的迁移任务会把 MySQL 的 IO 和 CPU 打满，直接影响线上查询的 P99 延迟。一般建议每批 1000 条，批次间 sleep 100ms，让出资源。迁移任务按 id 范围分段，可以起多个线程并发跑，但总 TPS 要控制在单表正常 TPS 的 20% 以内。\n\n```java\n// 历史数据迁移任务（伪代码）\nlong minId = 0;\nwhile (true) {\n    List<Order> batch = legacyOrderMapper.selectByIdRange(minId, minId + 10000, BATCH_SIZE);\n    if (batch.isEmpty()) break;\n    \n    for (Order order : batch) {\n        try {\n            shardingOrderMapper.insertIgnore(order); // INSERT IGNORE 避免重复插入\n        } catch (DuplicateKeyException e) {\n            // 双写期间该记录已被写入，跳过\n        }\n    }\n    minId = batch.get(batch.size() - 1).getId();\n    Thread.sleep(100); // 限速\n}\n```\n\n光靠批量迁移任务还不够，因为迁移期间旧表上的 UPDATE 和 DELETE 也需要同步到分片表。这里就要用到 **Canal**。Canal 通过伪装成 MySQL Slave 来消费 binlog，把旧表上的所有变更事件（INSERT/UPDATE/DELETE）实时转发到应用，应用再把这些变更应用到分片表。Canal + 批量迁移的组合保证了「历史数据追平 + 增量数据实时同步」的双重覆盖。\n\n### 阶段三：一致性校验与灰度切读（约 1 周）\n\n历史数据迁移完成后，不要着急切读。先做**全量数据校验**：对比旧表和分片表的总行数（COUNT）是否一致；按 user_id 范围随机采样，对比关键字段的 MD5 或 checksum。如果发现不一致，用 Canal 的重放功能补偿差异。\n\n```sql\n-- 旧表\nSELECT COUNT(*) FROM orders WHERE create_time BETWEEN '2024-01-01' AND '2024-12-31';\n-- 对应的分片表（需要在所有 512 张表上执行并汇总）\nSELECT SUM(cnt) FROM (\n  SELECT COUNT(*) as cnt FROM ds0.orders_0 WHERE create_time BETWEEN ...\n  UNION ALL\n  -- ... 512 张表\n);\n```\n\n校验通过后，开始**灰度切读**。先把 1% 的读请求路由到分片表，同时保留旧表读作为兜底对比。框架层面可以用一个 ThreadLocal 标记「是否走分片读」，结合流量染色实现。观察分片读的结果是否与旧表读一致，以及分片读的 P99 延迟是否符合预期（应该远低于旧表的 2 秒）。逐步把流量从 1% → 10% → 50% → 100% 切换，每个节点观察 1-2 天。\n\n### 阶段四：停止双写，完成迁移\n\n读流量 100% 切到分片表后，观察 1 周无异常，可以关闭双写开关，停止 Canal 同步，下线旧表。旧表不要立刻删除，建议保留 30 天作为回滚保障，期间只读不写，最终确认无回滚需求后再彻底删除。\n\n## 四、三大核心难点\n\n**分布式事务**是分库分表之后最头疼的问题。拆分前，一个下单操作（写订单 + 扣库存 + 扣余额）可以包在一个本地事务里，ACID 全部由 MySQL 保证。拆分后，订单表在分片库里，库存表和余额表可能在其他数据库，跨库的原子性无法用本地事务实现。生产环境通用方案是 **Seata AT 模式**：Seata 的 TC（Transaction Coordinator）协调各个分支事务，AT 模式通过在本地数据库记录 undo log 来实现两阶段提交，对业务代码侵入最小，只需加 `@GlobalTransactional` 注解。更激进的方案是 TCC（Try-Confirm-Cancel），性能更好但业务侵入大。对于这个订单系统，优先推荐 Seata AT 模式，等稳定后再考虑 TCC 改造高频路径。\n\n**跨库 JOIN** 是另一个必须在拆分前解决的问题。分片后，`orders JOIN order_items JOIN products` 这样的 SQL 涉及不同分片的数据，无法下推给 MySQL 执行。解决方案有两个方向：一是**冗余字段**，把 JOIN 需要的字段直接冗余到订单表里（比如商品名称、用户昵称），查询时不需要 JOIN；二是**应用层聚合**，在代码里分别查两张表，再做内存 JOIN。这两种方案都需要在迁移前就把业务代码里的跨表 JOIN 消灭掉，这通常是迁移中工作量最大的一块。\n\n**全局唯一 ID** 在分片后不能继续用 MySQL 的自增 ID，因为每张分片表各自自增会产生重复的 order_id。常见方案是**雪花算法**（Snowflake）：64 位整数 = 41 位毫秒时间戳 + 10 位机器 ID + 12 位序列号，每台机器每毫秒可以生成 4096 个不重复 ID，Twitter 在 2010 年就在生产环境验证过。另一种方案是**号段模式**（Leaf-Segment，美团开源）：用一个专门的 ID 分配服务，每次批量取一段 ID（如 1000 个），用完再取下一段，避免了网络频繁调用。\n\n## 五、扩展：NewSQL 和 Vitess 是否更优？\n\n如果是新项目，TiDB 这类 NewSQL 数据库是分库分表的强力替代方案。TiDB 对外兼容 MySQL 协议，内部自动做水平扩展，业务代码几乎不需要改。但存量系统迁移到 TiDB 本身也是一次大工程，成本不比分库分表低。\n\nVitess 是 YouTube 为 MySQL 设计的开源分片系统（现在是 PlanetScale 的核心），在 Kubernetes 生态里落地非常好，但国内大厂用得少，社区支持和文档相对薄弱。\n\nShardingSphere 5.x 的「弹性伸缩」（Scaling）功能支持在线扩容分片数，可以从 512 张表扩到 1024 张表而不停服，这是它相比手工方案的最大优势，值得在答案里提一下，展示你对工具能力的深度了解。",
+      "keyPoints": [
+        "分库分表的核心是水平拆分（按行切割），分片键选择 user_id 而非 order_id，是因为电商系统的核心查询是「查某用户的订单」，user_id 分片可以保证同一用户的数据在同一分片，避免广播查询。",
+        "不停服迁移的核心是「双写」策略：写操作同时写旧单表（作为主数据源）和新分片表，旧表写入失败事务回滚，分片表写入失败仅进重试队列异步补偿，保证主路径不受影响。",
+        "历史数据迁移必须限速（每批 1000 条 + 批次间 sleep），避免压垮线上 IO；同时用 Canal 消费旧表的 binlog 增量，保证迁移期间旧表的 UPDATE/DELETE 能实时同步到分片表。",
+        "切读必须灰度进行，从 1% 流量开始，每步验证分片读与旧表读的结果一致性和 P99 延迟改善情况，确认无误后再放大流量比例，最终全量切换。",
+        "分片后跨库事务需要引入 Seata AT 模式（两阶段提交 + undo log），对业务代码侵入最小；跨库 JOIN 需要在迁移前消灭，改为字段冗余或应用层内存聚合。",
+        "分片后自增 ID 不可用，必须引入全局唯一 ID 方案：雪花算法（Snowflake）适合对 ID 有时间有序要求的场景，号段模式（Leaf-Segment）适合对 ID 生成高可用有更高要求的场景。",
+        "迁移完成后旧表不要立刻删除，保留 30 天作为回滚保障，期间旧表只读不写；确认无回滚需求后再彻底删除，这是生产级迁移的必要安全网。"
+      ],
+      "quiz": [
+        {
+          "id": "db-sharding-1-q1",
+          "question": "在订单系统的分库分表场景中，为什么通常选择 user_id 而非 order_id 作为分片键？",
+          "choices": [
+            { "id": "A", "text": "user_id 是数字类型，hash 计算更快，而 order_id 通常是字符串" },
+            { "id": "B", "text": "电商系统的核心查询是「某用户的订单列表」，user_id 分片可将同一用户的数据聚在同一分片，避免广播查询所有分片" },
+            { "id": "C", "text": "order_id 是自增 ID，在分库分表后会产生重复，不能作为分片键" },
+            { "id": "D", "text": "user_id 的基数比 order_id 小，分片后数据分布更均匀" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "分片键选择的核心原则是「让最频繁的查询尽量落在单个分片内」。电商系统的高频查询是「查我的订单」，这类查询必须带上 user_id。用 user_id 分片后，同一用户的所有订单在同一个分片，单分片直查即可。如果用 order_id 分片，则查某用户的订单时不知道数据在哪个分片，必须广播查询全部 512 个分片再合并，延迟从毫秒级变成秒级。A 选项说 order_id 是字符串是错误的，order_id 通常也是数字（雪花 ID）；C 选项混淆了分片键和全局 ID 的问题，自增 ID 不能用是全局唯一性问题，不是不能作为分片键的原因；D 选项说法与实际相反，order_id 基数反而更大（每笔订单唯一），分片均匀性并不是问题。"
+        },
+        {
+          "id": "db-sharding-1-q2",
+          "question": "路由规则 `db_index = hash(user_id) % 16`，`table_index = hash(user_id) % 32` 意味着什么？",
+          "choices": [
+            { "id": "A", "text": "同一个用户的数据可能分布在多个库，但必然在同一张表内" },
+            { "id": "B", "text": "同一个用户的数据必然在同一个库的同一张表内，总共 512 个分片" },
+            { "id": "C", "text": "同一个用户的数据分布在 16 个库中，但在每个库里只占 1 张表" },
+            { "id": "D", "text": "库号和表号用不同的 hash 函数计算，同一用户可能在不同库" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这里库索引和表索引使用的是同一个 hash(user_id) 的值，只是取的模数不同（16 和 32）。对同一个 user_id，hash 值是固定的，因此 db_index 和 table_index 都是唯一确定的——同一个用户的所有订单必然写入同一个 db_index 库的同一个 table_index 表。16 个库 × 32 张表 = 512 个分片，每个分片承载约 1/512 的数据量。A 选项错误：同一用户不会跨库分布。C 选项错误：32 张表是每库的表数，不是说一个用户在每个库各占一张。D 选项错误：库和表确实用同一个 hash 值，只是取模不同，同一用户的路由是完全确定的。"
+        },
+        {
+          "id": "db-sharding-1-q3",
+          "question": "双写方案中，分片表的写入失败应该如何处理？",
+          "choices": [
+            { "id": "A", "text": "回滚整个事务，包括旧单表的写入，保证两边数据一致" },
+            { "id": "B", "text": "记录到重试队列异步补偿，旧单表的写入不受影响，因为旧表仍然是数据来源" },
+            { "id": "C", "text": "直接忽略，等历史数据迁移任务统一补偿" },
+            { "id": "D", "text": "立即触发回滚并告警，停止双写，人工介入处理" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "双写阶段的设计原则是「旧表是 Source of Truth，分片表是跟随者」。写旧表失败，整个业务操作应该失败，事务回滚。但写分片表失败，不能回滚旧表的写入——因为业务已经成功完成，回滚旧表会造成数据丢失，比分片表暂时落后更严重。正确做法是把写入失败的记录推入重试队列，后台异步补偿，同时监控队列积压量。A 选项「回滚整个事务」会造成业务失败，用户下单会报错，是最差的处理方式。C 选项「直接忽略」会导致大量数据丢失，迁移完成后数据不一致。D 选项「停止双写」对于偶发失败过度反应，会导致系统频繁停摆。"
+        },
+        {
+          "id": "db-sharding-1-q4",
+          "question": "Canal 在数据迁移方案中承担的核心职责是什么？",
+          "choices": [
+            { "id": "A", "text": "作为分库分表的查询路由器，将 SQL 分发到对应的分片" },
+            { "id": "B", "text": "监听旧单表的 binlog，实时捕获迁移期间的 UPDATE 和 DELETE 变更，同步到分片表" },
+            { "id": "C", "text": "执行历史数据的批量迁移任务，按分片键将数据搬运到各分片表" },
+            { "id": "D", "text": "在双写失败时，自动重放失败的写操作" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Canal 的核心机制是伪装成 MySQL 的 Slave 节点，订阅 binlog 事件流。在分库分表迁移场景里，Canal 的价值在于处理「迁移期间旧表上发生的变更」——历史数据批量迁移任务可以搬运静态存量数据，但迁移期间旧表上产生的 UPDATE 和 DELETE 无法被批量任务捕获（批量任务按 id 范围扫描，已扫描过的行的后续修改会被漏掉）。Canal 监听 binlog 可以实时捕获这些增量变更，确保分片表不会有「值已过期」的记录。A 选项是 ShardingSphere/MyCat 的职责，不是 Canal。C 选项是批量迁移任务的职责。D 选项描述的是重试队列的职责，Canal 不做写入重试。"
+        },
+        {
+          "id": "db-sharding-1-q5",
+          "question": "历史数据迁移使用 INSERT IGNORE 而非普通 INSERT 的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "INSERT IGNORE 比普通 INSERT 性能更高，减少锁竞争" },
+            { "id": "B", "text": "双写期间，该记录可能已被双写路径写入分片表，INSERT IGNORE 可以跳过重复，避免主键冲突异常" },
+            { "id": "C", "text": "INSERT IGNORE 会自动合并字段值，保证数据最新" },
+            { "id": "D", "text": "普通 INSERT 不支持跨库操作，必须用 INSERT IGNORE" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "批量迁移任务和双写路径是并发运行的。假设 user A 在批量迁移任务迁移到他的数据范围之前刚下了一单，这条新订单已经通过双写写入了分片表；然后批量迁移任务扫描到这条记录，再次尝试写入，就会触发主键冲突（Duplicate Key）。使用 INSERT IGNORE 可以让 MySQL 在遇到主键重复时静默跳过，不抛异常，批量任务就能平滑处理这种并发写入的情况。A 选项「减少锁竞争」不是主要原因。C 选项错误，INSERT IGNORE 遇到重复时是跳过整行，不会做字段级别的合并，如果需要合并应该用 INSERT ... ON DUPLICATE KEY UPDATE。D 选项纯属错误，普通 INSERT 完全支持跨库操作。"
+        },
+        {
+          "id": "db-sharding-1-q6",
+          "question": "分片后为什么不能继续使用 MySQL 自增 ID 作为 order_id？",
+          "choices": [
+            { "id": "A", "text": "自增 ID 是 32 位整数，5 亿条数据会溢出" },
+            { "id": "B", "text": "每张分片表各自维护独立的自增序列，不同分片的 order_id 会产生重复值" },
+            { "id": "C", "text": "自增 ID 无法用于 hash 分片路由计算" },
+            { "id": "D", "text": "ShardingSphere 不支持自增 ID，会自动报错" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "MySQL 的 AUTO_INCREMENT 是表级别的，每张表独立维护自己的计数器。在 512 张分片表里，每张表都从 1 开始自增，结果就是 orders_0 有 order_id=1，orders_1 也有 order_id=1，orders_2 也有 order_id=1……全局来看 order_id 重复了 512 份。这在「查某订单详情」时就会出问题：`SELECT * FROM orders WHERE order_id = 12345` 但不带 user_id，系统不知道去哪个分片查。全局唯一 ID（雪花算法或号段模式）保证任意一个 ID 在全局只存在一次，路由时即使不带分片键也能通过 ID 本身的分片信息（如雪花 ID 的机器位）定位分片。A 选项错误，自增 ID 通常是 BIGINT（64 位），5 亿远未溢出。C 选项错误，数字 ID 完全可以 hash 路由。D 选项错误，ShardingSphere 本身就提供了雪花 ID 生成器集成。"
+        },
+        {
+          "id": "db-sharding-1-q7",
+          "question": "Seata AT 模式解决分布式事务的核心机制是什么？",
+          "choices": [
+            { "id": "A", "text": "通过 XA 协议让所有参与库锁定资源，直到所有分支都 prepare 成功再统一 commit" },
+            { "id": "B", "text": "在每个分支事务本地记录 undo log，若全局回滚则根据 undo log 反向补偿" },
+            { "id": "C", "text": "通过消息队列实现最终一致性，事务提交后异步通知各参与方" },
+            { "id": "D", "text": "使用乐观锁，事务提交时检查版本号，冲突则重试" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Seata AT 模式的工作原理分两阶段：第一阶段，每个分支事务在执行 SQL 前后各保存一份快照（before image 和 after image），这就是 undo log，然后直接提交本地事务（不等待全局结果）；第二阶段，如果全局事务 commit，TC 通知各分支删除 undo log，事务完成；如果全局事务 rollback，TC 通知各分支用 undo log 里的 before image 执行反向 SQL，恢复数据。AT 模式的优点是对业务代码几乎无侵入（只需加 @GlobalTransactional），缺点是依赖 undo log 存储和网络通信，比本地事务多 30-50% 的延迟开销。A 选项描述的是 XA/2PC 协议，锁持有时间长，在高并发下性能很差。C 选项描述的是基于消息的最终一致性，不是 Seata AT。D 选项描述的是乐观锁，不是分布式事务协议。"
+        },
+        {
+          "id": "db-sharding-1-q8",
+          "question": "灰度切读时，为什么要从 1% 流量开始而不是直接全量切换？",
+          "choices": [
+            { "id": "A", "text": "分片表的连接池还没有预热，直接全量切换会触发大量连接超时" },
+            { "id": "B", "text": "灰度切换可以在小范围内验证数据一致性和分片查询性能，发现问题时快速回滚影响面小" },
+            { "id": "C", "text": "ShardingSphere 的路由计算有性能瓶颈，只能处理 1% 的流量" },
+            { "id": "D", "text": "监管合规要求数据库变更必须经过灰度流程" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "灰度发布（Canary Release）的本质是用小流量暴露风险。即使做了完整的测试和数据校验，生产环境的查询模式仍然可能有测试覆盖不到的边界情况，例如某些特殊字符的 user_id 导致 hash 分布偏斜，或者某类范围查询在分片后变成了全分片广播导致延迟飙升。从 1% 开始，异常影响的用户比例极小，一旦监控发现 P99 延迟上升或错误率异常，把切读比例回拨到 0% 即可完成回滚，而不需要做代码发布。如果直接全量切换出了问题，影响 100% 用户，回滚成本极高。A 选项「连接池预热」是真实存在的问题，但可以提前预热解决，不是分级灰度的核心原因。C 选项错误，ShardingSphere 的路由计算是微秒级，没有 1% 限制。D 选项是捏造的场景。"
+        },
+        {
+          "id": "db-sharding-1-q9",
+          "question": "以下哪种情况会导致「数据倾斜」（Skew），使得某个分片的数据量远超其他分片？",
+          "choices": [
+            { "id": "A", "text": "某个超级大卖家的 user_id hash 到了固定分片，该卖家一天产生 100 万笔订单" },
+            { "id": "B", "text": "使用了雪花算法生成 order_id，高位时间戳导致写入集中在最新分片" },
+            { "id": "C", "text": "分片数量选择了 512（非 2 的整数幂），hash 取模分布不均" },
+            { "id": "D", "text": "ShardingSphere 的 INLINE 算法有 bug，对某些 user_id 值计算错误" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "数据倾斜（Hot Spot / Skew）是分库分表最常见的生产问题之一。按 user_id 分片时，如果某个用户（如平台大卖家、企业账号）的订单量是普通用户的几千倍，他的所有订单都落在同一个分片上，这个分片就成了热点——存储压力、写入 TPS、查询延迟都会显著高于其他分片。解决方案包括：对大卖家单独路由到独立的「独享分片」，或者在 user_id 后面拼接后缀再 hash（如 user_id + '_' + random(0,3)）把同一用户散列到多个分片，但后者会破坏「同用户聚合查询」的假设。B 选项是「写入热点」问题（时间序 ID 导致最新分片写压力集中），不是数据量倾斜。C 选项错误，512 = 2^9 是 2 的整数幂，取模分布均匀。D 选项是假设性故障，不是系统性的数据倾斜原因。"
+        },
+        {
+          "id": "db-sharding-1-q10",
+          "question": "迁移完成后旧表保留 30 天不立刻删除，主要原因是什么？",
+          "choices": [
+            { "id": "A", "text": "MySQL DROP TABLE 操作很慢，800GB 的表需要 30 天才能删完" },
+            { "id": "B", "text": "监管合规要求订单数据必须有双备份保留 30 天" },
+            { "id": "C", "text": "保留旧表作为回滚保障，一旦发现分片数据有问题可以切回旧表，30 天后确认无误再删除" },
+            { "id": "D", "text": "旧表还在被 Canal 实时消费，停止 Canal 需要 30 天的冷却期" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "任何大规模数据库变更都必须有回滚方案。即使切读 100% 切到分片表后一切正常，也无法排除在某些极端查询或业务场景下潜藏的数据不一致问题——这类问题可能在上线几周后才被发现（例如某个定时报表任务运行时发现数据对不上）。保留旧表意味着一旦发现问题，可以在分钟级别把读流量切回旧表，配合重新打开双写开关来恢复数据同步，损失极小。如果旧表已经删除，回滚就意味着要么接受数据丢失，要么从备份恢复（可能需要数小时，且恢复期间服务不可用）。A 选项错误，MySQL 8.0 的 DROP TABLE 对 InnoDB 是 O(1) 的元数据操作，但 800GB 的 ibd 文件回收确实需要时间，通常是分钟级而非天级。B 选项是编造的合规要求，实际保留 30 天是工程安全边际。D 选项错误，Canal 在切写完成后应该尽快停止，不需要 30 天冷却期。"
+        }
+      ],
+      "references": [
+        "https://shardingsphere.apache.org/document/current/en/overview/",
+        "https://seata.apache.org/docs/user/mode/at/",
+        "https://github.com/alibaba/canal",
+        "https://github.com/Meituan-Dianping/Leaf",
+        "https://vitess.io/docs/overview/architecture/"
+      ]
+    }
+  ]
+}
