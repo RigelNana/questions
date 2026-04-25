@@ -1,0 +1,158 @@
+{
+  "id": "mq-message-loss",
+  "name": "消息队列消息丢失排查",
+  "domain": "troubleshooting",
+  "description": "排查 Kafka 消息丢失的三大根因：生产者 acks 配置、Broker 副本同步、消费者 offset 提交时机",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "mq-message-loss-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["kafka", "message-loss", "consumer", "acks", "offset", "auto-commit", "isr"],
+      "title": "Kafka 消费者处理消息数量对不上，如何系统排查消息丢失？",
+      "content": "## 事故背景\n\n你所在的团队负责一套电商支付链路。每笔订单支付成功后，订单系统会向 Kafka Topic `payment.success` 发送一条消息，下游的积分服务消费这个 Topic，给用户累加积分。这个链路已经平稳运行了大半年，从来没出过问题。\n\n然而本月初的一次月度对账，财务发现了异常：订单系统的日志显示，当天一共发送了 **10000 条**支付成功消息；但积分服务的数据库里，当天只有 **9876 条**积分记录，整整少了 **124 条**。\n\n问题很奇怪。你第一反应是去看积分服务的日志，结果日志里**没有任何 ERROR 或 Exception**，消费看起来非常正常，每条处理完都有打印成功日志。你又去看 Kafka 的监控面板，消费者 lag 显示为 0，看上去已经全部消费完了。\n\n但 124 条积分就是不见了。\n\n---\n\n## 系统基本信息\n\n- Kafka 版本：2.8.1，3 个 Broker，Topic `payment.success` 共 6 个分区，副本因子为 3\n- 生产者：Java，使用 `KafkaProducer`，异步发送\n- 消费者：Java，使用 `KafkaConsumer`，消费者组 `integral-service-group`，实例数 3\n- 消费者配置片段如下：\n\n```properties\n# 消费者关键配置\nenable.auto.commit=true\nauto.commit.interval.ms=5000\nmax.poll.records=500\nsession.timeout.ms=10000\n```\n\n- 生产者配置片段如下：\n\n```properties\n# 生产者关键配置\nacks=1\nretries=3\nbatch.size=16384\nlinger.ms=5\n```\n\n---\n\n## 问题\n\n在消费者日志没有任何错误、Kafka lag 显示为 0 的情况下，124 条消息去哪了？请从**生产者侧、Broker 侧、消费者侧**三个维度，系统性地给出排查思路，并指出最可能的根因。",
+      "answer": "## 先建立一个消息丢失的心智模型\n\nKafka 的消息从生产到消费，要经过三个阶段：生产者把消息写入 Broker、Broker 在分区副本间同步存储、消费者拉取消息并提交 offset。消息丢失可以发生在任何一个阶段，而且每个阶段的丢失方式各不相同，排查手段也完全不一样。\n\n有意思的是，题目中的现象给了我们一个很重要的线索：消费者 lag 为 0，日志里没有任何错误。lag 为 0 意味着消费者的 committed offset 已经追上了 log end offset，也就是说 Kafka 自己认为这些消息「已经被消费了」。但积分数据库里没有对应的记录。这两个事实放在一起，强烈指向一个方向：**消费者提交了 offset，但业务逻辑没有真正完成**。不过我们还是要从头到尾系统排查，不能靠直觉下结论。\n\n## 第一步：排查生产者侧\n\nKafka 的生产者配置中，`acks` 参数决定了生产者在什么条件下认为一条消息「发送成功」。`acks=0` 是最激进的配置：生产者把消息扔出去就不管了，完全不等 Broker 的任何回应，吞吐量最高但可靠性最低，网络抖动或 Broker 崩溃都会导致消息直接消失。`acks=1` 是默认配置：只要 leader 副本写入成功就返回确认，但如果 leader 在同步到 follower 之前崩溃，那些还没来得及同步的消息就永远丢了。`acks=-1`（等价于 `acks=all`）是最安全的配置：必须等到所有 ISR（In-Sync Replicas，同步副本集合）中的副本都写入成功才返回确认，配合 `min.insync.replicas=2` 使用可以保证即使挂掉一个副本也不丢消息。\n\n题目中的生产者用的是 `acks=1`，这本身有丢消息的风险，但这种丢法通常发生在 Broker 发生 leader 切换的时候。排查生产者侧，首先要确认**发送异常有没有被静默地吞掉**。Java 的 `KafkaProducer.send()` 是异步方法，它返回一个 `Future<RecordMetadata>`。如果你只调用 `send()` 但不处理这个 Future，也不传 Callback，那发送失败了你根本不知道。正确的写法是：\n\n```java\n// 错误写法：发送失败了也不知道，消息静默丢失\nproducer.send(record);\n\n// 正确写法 1：传入 Callback，异步感知发送结果\nproducer.send(record, (metadata, exception) -> {\n    if (exception != null) {\n        // 报警、入库、重试...\n        log.error(\"消息发送失败，topic={}, partition={}\", \n                  record.topic(), record.partition(), exception);\n    }\n});\n\n// 正确写法 2：同步等待，get() 会在失败时抛出异常\nRecordMetadata metadata = producer.send(record).get();\n```\n\n去检查生产者代码，看看 `send()` 调用时有没有处理发送结果。另外，检查 `retries=3` 配置：这意味着发送失败时会重试 3 次，但如果 3 次都失败，最终还是会丢消息——前提是你没有 Callback 或者没有记录失败。可以通过 Kafka 的 JMX 指标 `kafka.producer:type=producer-metrics,client-id=<id>` 里的 `record-error-rate` 来确认是否有发送错误。\n\n但是，对于题目中的场景，生产者侧丢消息的可能性相对较低。原因是：订单系统发出了 10000 条，这 10000 条在 Kafka 里确实存在（否则 lag 不会是 0，因为 lag = log end offset - committed offset，如果消息根本没写进 Kafka，log end offset 就不会到 10000），所以生产者侧大概率没问题。\n\n## 第二步：排查 Broker 侧\n\nBroker 侧的消息丢失通常和副本同步机制有关。Kafka 的每个分区有一个 leader 副本负责接收读写请求，其他 follower 副本从 leader 同步数据。ISR 列表记录了「和 leader 保持同步的副本集合」，只有 ISR 里的副本才有资格在 leader 宕机时被选举为新 leader。\n\n当 `unclean.leader.election.enable=true` 时（这是 Kafka 2.x 之前的默认值），如果 ISR 列表里只剩一个副本或者全空了，Kafka 允许不在 ISR 里的「落后」副本当选 leader——这个动作会直接丢失那些已经写入旧 leader 但还没同步到新 leader 的消息。可以用以下命令查看各分区的副本同步状态：\n\n```bash\n# 查看 topic 的分区分配和 ISR 状态\nkafka-topics.sh --bootstrap-server localhost:9092 \\\n  --describe --topic payment.success\n\n# 输出示例（正常情况 ISR 应该包含所有副本）：\n# Topic: payment.success  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3\n# Topic: payment.success  Partition: 1  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1\n# 如果 ISR 缩水，比如 Isr: 1，就要警惕了\n\n# 查看 leader epoch 历史，判断是否发生过 leader 切换\nkafka-leader-election.sh --bootstrap-server localhost:9092 \\\n  --topic payment.success --partition 0\n```\n\n另一个要查的是 `min.insync.replicas`。这个参数配合 `acks=all` 使用，规定了至少要有多少个副本在 ISR 里才允许写入。如果 `min.insync.replicas=1` 而 `acks=all`，那「all」实际上只需要 leader 一个副本就够了，和 `acks=1` 没有本质区别。\n\n但同样，结合「lag 为 0」这个线索，Broker 侧丢消息的可能性也不大。因为如果 Broker 丢了消息，那这些消息的 offset 在 Kafka 里就是空洞，消费者是读不到这些 offset 的，committed offset 会越过这些空洞继续往前走，最终 lag 同样是 0。这条路也走不通。\n\n## 第三步：排查消费者侧（最可能的根因）\n\n回到最开始那个关键线索：lag 为 0，但业务数据少了 124 条。现在来看消费者配置：\n\n```properties\nenable.auto.commit=true       # 自动提交 offset\nauto.commit.interval.ms=5000  # 每 5 秒自动提交一次\nmax.poll.records=500          # 每次 poll 最多拉 500 条\n```\n\n`enable.auto.commit=true` 是 Kafka 消费者的默认配置，也是最容易踩坑的地方。它的工作机制是：消费者调用 `poll()` 拉取消息后，后台有一个定时线程，每隔 `auto.commit.interval.ms`（默认 5 秒）就会自动把「上次 poll 返回的最大 offset」提交到 Broker。注意这里的关键点：**提交 offset 的动作和业务逻辑的执行是完全解耦的**，自动提交线程不知道、也不在乎你的业务有没有处理完。\n\n这条链路下，以下场景会导致消息「看上去被消费了但实际上没有」：\n\n**场景一：进程在自动提交后、业务处理完成前崩溃。** 消费者拉取了一批消息开始处理，5 秒的自动提交窗口到了，后台线程提交了这批消息的 offset。但此时业务逻辑才处理到一半，进程突然崩溃（OOM、部署重启、机器宕机）。下次消费者重启时，会从已提交的 offset 之后开始消费，这批「已提交但没处理完」的消息就永远消失了。\n\n**场景二：多线程异步处理 + 自动提交。** 这是更隐蔽的坑。消费者主线程 `poll()` 出来 500 条消息，扔给线程池异步处理，然后主线程继续下一次 `poll()`。自动提交线程在 5 秒后提交了当前最大 offset，但线程池里可能还有几十条消息没处理完。如果这时候进程崩溃，那些还在队列里的消息就丢了。即使进程没崩，如果处理逻辑有异常被 catch 后没有重试，也会静默丢失。\n\n结合题目的配置，可以构造出一个很可能发生过的场景：积分服务在部署或者重启期间（微服务架构下这非常频繁），恰好有一批消息已经被 `poll()` 出来，5 秒自动提交窗口到了 offset 被提交，但处理还没完成，进程就因为部署重启而被 kill 掉了。这 124 条消息的 offset 已经提交，它们在 Kafka 的视角里已经「被消费」，但积分数据库里没有对应的记录。\n\n用以下命令可以还原案发现场，查看各分区的 committed offset 和实际消费情况：\n\n```bash\n# 查看消费者组各分区的 offset 和 lag\nkafka-consumer-groups.sh --bootstrap-server localhost:9092 \\\n  --group integral-service-group --describe\n\n# 正常输出（lag 全为 0）：\n# TOPIC            PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID\n# payment.success  0          1843            1843            0    consumer-1-...\n# payment.success  1          1672            1672            0    consumer-2-...\n# ...\n\n# 结合 Kafka 自带的时间戳工具，找出事故时间段的 offset 范围\nkafka-run-class.sh kafka.tools.GetOffsetShell \\\n  --broker-list localhost:9092 \\\n  --topic payment.success \\\n  --time 1704038400000  # 事故发生时间的 Unix 毫秒时间戳\n```\n\n如果在订单系统的消息里埋了唯一的 `orderId` 或 `traceId`，还可以通过 ES 日志系统做交叉比对：把生产者日志里记录的所有 `orderId` 和积分服务日志里成功处理的 `orderId` 做 diff，直接找出那 124 条消息的具体内容，确认它们属于哪个时间段、哪几个分区，从而复原丢失的完整场景。\n\n## 修复方案：改为手动提交\n\n找到根因之后，修复方案很直接——关掉自动提交，改为在业务逻辑完成后手动提交 offset：\n\n```java\n// 消费者配置\nprops.put(\"enable.auto.commit\", \"false\");  // 关掉自动提交\n\n// 消费逻辑\nwhile (true) {\n    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));\n    \n    for (ConsumerRecord<String, String> record : records) {\n        try {\n            // 业务逻辑：写积分数据库\n            integralService.addIntegral(record.value());\n        } catch (Exception e) {\n            // 处理异常：可以选择记录到死信队列，然后继续\n            deadLetterQueue.send(record);\n            log.error(\"处理失败，已发送到死信队列: offset={}\", record.offset(), e);\n        }\n    }\n    \n    // 所有记录处理完之后，才提交 offset\n    // commitSync() 会阻塞直到 Broker 确认，更安全\n    consumer.commitSync();\n}\n```\n\n手动提交有两种方式：`commitSync()` 是同步的，会阻塞直到 Broker 确认提交成功，安全但会影响吞吐量；`commitAsync()` 是异步的，不阻塞，但如果网络抖动导致提交失败，默认不重试（因为重试可能覆盖后来的 offset），需要自己实现回调处理失败情况。生产环境的常见做法是：正常情况用 `commitAsync()` 提高吞吐，在消费者关闭前调用一次 `commitSync()` 确保最后一批 offset 被正确提交。\n\n## 扩展：更高可靠性的架构\n\n手动提交解决了消费者侧的丢消息问题，但整个链路还有可以加固的地方。\n\n在生产者侧，如果使用 Kafka 2.5+ 并且开启了幂等生产者（`enable.idempotence=true`），Kafka 会自动给每条消息分配一个序列号，Broker 会拒绝重复的消息，同时生产者会开启自动重试，彻底解决因网络问题导致的消息丢失和重复。开启幂等性会自动把 `acks` 升级为 `all`、`retries` 升级为 `Integer.MAX_VALUE`，但要注意 `max.in.flight.requests.per.connection` 不能超过 5，否则幂等性会失效。\n\n如果业务场景对消息可靠性要求极高（比如金融交易），可以考虑 Kafka 的事务性消息（Exactly Once Semantics）。它通过两阶段提交协议保证「消息写入 + offset 提交」这两个操作是原子的，要么都成功要么都回滚，从而实现端到端的「精确一次」语义。代价是性能会有明显下降，吞吐量通常只有普通模式的 20%~30%，需要根据业务需求权衡。\n\n最后，不管用什么机制，都应该设计死信队列（Dead Letter Queue，DLQ）：对于重试多次仍然失败的消息，不是直接丢弃，而是写入一个专门的 DLQ Topic，由运维人员或专门的告警系统处理。这样即使出现了意外，消息也有迹可查，可以人工补偿。\n\n相比之下，RocketMQ 在可靠性设计上更「开箱即用」：它默认使用同步刷盘（或可配置为异步），默认支持消费确认机制（消费者必须返回 `CONSUME_SUCCESS`，否则会重试），并且内置了死信队列。Kafka 更追求高吞吐和灵活性，把可靠性的控制权完全交给使用者，所以踩坑的机会也更多。",
+      "keyPoints": [
+        "Kafka 消息丢失发生在三个阶段：生产者发送阶段（acks 配置不当或 Callback 未处理）、Broker 存储阶段（unclean leader election 或 ISR 缩水）、消费者消费阶段（offset 提交早于业务完成）。",
+        "enable.auto.commit=true 是消费者侧丢消息最常见的根因：自动提交线程每隔 5 秒提交一次 offset，提交时机与业务逻辑的完成完全解耦，在进程重启或崩溃时窗口期内的消息会永久丢失。",
+        "lag 为 0 但业务数据缺失，强烈指向「offset 已提交但业务未完成」，而非消息没有到达 Kafka，这个组合现象是消费者自动提交问题的经典指纹。",
+        "KafkaProducer.send() 是异步方法，不传 Callback 且不调用 Future.get() 的情况下，发送失败会被静默丢弃，生产者侧的消息丢失往往就发生在这里。",
+        "acks=1 配置下，如果 leader 副本在消息同步到 follower 之前宕机并触发 leader 切换，已写入旧 leader 但未同步的消息会永久丢失，acks=all 配合 min.insync.replicas≥2 才是生产环境的安全配置。",
+        "手动提交 offset 的正确模式是：业务逻辑全部完成后调用 commitSync()，而不是处理每条消息后就提交（性能差）也不是提前提交（会丢消息）；生产环境常见做法是日常用 commitAsync() 提高吞吐，关闭时用 commitSync() 确保最后一批被提交。",
+        "kafka-consumer-groups.sh --describe 命令可以实时查看消费者组各分区的 committed offset 和 lag，是排查消息消费问题的第一个命令；结合消息里的业务 ID 在日志系统做 diff 可以精确定位丢失的具体消息。",
+        "幂等生产者（enable.idempotence=true）和 Kafka 事务性消息（Exactly Once Semantics）分别解决生产者重复/丢失和端到端精确一次的问题，但事务性消息有 20%~30% 的性能代价，需要根据业务对可靠性的要求权衡。"
+      ],
+      "quiz": [
+        {
+          "id": "mq-message-loss-q1",
+          "question": "Kafka 消费者配置 enable.auto.commit=true 时，自动提交 offset 的时机是什么？",
+          "choices": [
+            { "id": "A", "text": "每次 poll() 拉取到消息后立即提交上一批的 offset" },
+            { "id": "B", "text": "后台定时线程按 auto.commit.interval.ms 的间隔提交最近一次 poll 返回的最大 offset" },
+            { "id": "C", "text": "消费者处理完所有消息后，在下一次 poll() 调用时提交" },
+            { "id": "D", "text": "消费者关闭时统一提交所有未提交的 offset" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "自动提交由消费者内部的后台线程（HeartbeatThread 负责协调，实际提交逻辑在 poll() 内部触发）按 auto.commit.interval.ms 间隔执行，提交的是「上一次 poll() 返回的最大 offset」。关键在于这个提交动作和业务逻辑的执行完全解耦——不管业务处理是否完成，只要间隔时间到了就会提交。A 选项描述了「在下次 poll 调用时检查是否需要提交」的触发机制，但不是「立即提交」。C 和 D 都是错误的理解，自动提交不感知业务完成状态，也不等到消费者关闭才提交。"
+        },
+        {
+          "id": "mq-message-loss-q2",
+          "question": "Kafka 生产者 acks=1 和 acks=all 的核心区别是什么？",
+          "choices": [
+            { "id": "A", "text": "acks=1 只有一个副本，acks=all 有多个副本，区别是副本数量" },
+            { "id": "B", "text": "acks=1 等待 leader 副本写入确认即返回；acks=all 等待所有 ISR 副本写入确认才返回" },
+            { "id": "C", "text": "acks=1 是同步发送，acks=all 是异步发送" },
+            { "id": "D", "text": "acks=1 适合低延迟场景，acks=all 会导致消息乱序" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "acks 参数控制的是「Producer 认为一条消息发送成功所需的确认条件」，与副本数量无关（A 选项混淆了两个概念）。acks=1 只要 leader 写入磁盘就返回，如果 leader 在 follower 同步之前宕机，消息就丢了。acks=all（等价于 acks=-1）要求 ISR 中所有副本都写入成功才返回，配合 min.insync.replicas≥2 才有实际意义。C 选项完全错误，acks 和同步/异步无关，KafkaProducer.send() 永远是异步的。D 选项部分正确（acks=all 确实延迟更高），但「导致乱序」的说法错误——消息乱序和 max.in.flight.requests.per.connection 配置有关。"
+        },
+        {
+          "id": "mq-message-loss-q3",
+          "question": "题目场景中，消费者 lag 显示为 0 但积分数据缺失 124 条，这个现象最可能的解释是？",
+          "choices": [
+            { "id": "A", "text": "生产者发送失败，这 124 条消息根本没有写入 Kafka" },
+            { "id": "B", "text": "Broker 发生了 leader 切换，这 124 条消息在切换过程中丢失" },
+            { "id": "C", "text": "消费者提交了 offset 但对应的业务逻辑未完成，进程重启后从新 offset 继续消费" },
+            { "id": "D", "text": "积分服务的数据库写入有幂等逻辑，重复消息被去重导致少了 124 条" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "lag = log_end_offset - committed_offset。lag 为 0 说明 committed_offset 已经追上了 log_end_offset，意味着 Kafka 已经记录这些消息「被消费」了。如果是 A（消息没写入 Kafka），log_end_offset 就不会包含这些消息，但 lag 依然可能为 0。如果是 B（Broker 丢消息），消息的 offset 在 log 里是空洞，消费者跳过这些 offset 后 lag 也为 0，但更可能产生消费异常。C 是最直接的解释：enable.auto.commit=true 导致 offset 在业务未完成时就被提交，进程重启后不会重新消费这些 offset，业务数据自然缺失。D 选项是一种可能，但题目中没有提到幂等逻辑，且缺失的是 124 条而非重复被去重，不符合题意。"
+        },
+        {
+          "id": "mq-message-loss-q4",
+          "question": "以下 Java Kafka 生产者代码，哪种写法最容易导致消息静默丢失？",
+          "choices": [
+            { "id": "A", "text": "producer.send(record, (metadata, e) -> { if (e != null) log.error(\"发送失败\", e); });" },
+            { "id": "B", "text": "RecordMetadata meta = producer.send(record).get();" },
+            { "id": "C", "text": "producer.send(record);" },
+            { "id": "D", "text": "Future<RecordMetadata> f = producer.send(record); try { f.get(3, TimeUnit.SECONDS); } catch (Exception e) { log.error(\"超时或失败\", e); }" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "KafkaProducer.send() 是完全异步的，它把消息放入内部缓冲队列后立即返回，实际的网络发送在后台进行。如果不传 Callback 也不调用 Future.get()（即 C 选项），发送失败时没有任何感知路径，消息静默丢失。A 选项传入了 Callback，发送失败时会触发错误日志，是最常用的异步感知方式。B 选项调用 .get() 会阻塞直到发送完成或抛出异常，失败时会显式地抛异常，不会静默丢失（但会阻塞线程，影响吞吐）。D 选项增加了超时控制，失败时有日志，也不会静默丢失。"
+        },
+        {
+          "id": "mq-message-loss-q5",
+          "question": "执行 kafka-consumer-groups.sh --describe 后，以下输出中哪个分区最值得关注？",
+          "choices": [
+            { "id": "A", "text": "PARTITION: 0, CURRENT-OFFSET: 5000, LOG-END-OFFSET: 5000, LAG: 0" },
+            { "id": "B", "text": "PARTITION: 1, CURRENT-OFFSET: 4800, LOG-END-OFFSET: 5000, LAG: 200" },
+            { "id": "C", "text": "PARTITION: 2, CURRENT-OFFSET: 3100, LOG-END-OFFSET: 3100, LAG: 0, CONSUMER-ID: -" },
+            { "id": "D", "text": "PARTITION: 3, CURRENT-OFFSET: 2500, LOG-END-OFFSET: 2600, LAG: 100" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "CONSUMER-ID 为「-」（连字符）表示这个分区当前没有活跃的消费者实例在消费它，这意味着该分区处于「未被消费」状态。虽然 lag 为 0，但这只是因为 committed_offset 恰好等于 log_end_offset（可能是之前消费完后消费者退出了），后续新写入的消息将不会被消费。这种情况通常发生在消费者实例数少于分区数、或者消费者组发生了再平衡（rebalance）但没能重新分配所有分区时。B 和 D 选项的 lag 虽然不为 0，但说明消费者还在活跃消费，只是有积压，不如 C 选项危险。"
+        },
+        {
+          "id": "mq-message-loss-q6",
+          "question": "以下哪个 Kafka 消费者代码模式会在多线程场景下导致消息丢失？",
+          "choices": [
+            { "id": "A", "text": "单线程 poll → 同步处理 → commitSync，线性执行" },
+            { "id": "B", "text": "poll 出消息后提交给线程池异步处理，主线程继续 poll，依赖 enable.auto.commit=true 提交 offset" },
+            { "id": "C", "text": "poll 出消息后提交给线程池，等待 CountDownLatch 确认所有消息处理完毕后再 commitSync" },
+            { "id": "D", "text": "使用单个消费者线程，每处理一条消息就调用 commitSync(Collections.singletonMap(...))" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "B 选项是多线程 + 自动提交的经典陷阱：主线程把消息扔给线程池后继续 poll() 下一批，自动提交线程按 5 秒间隔提交「当前最大 offset」，而此时线程池里的消息可能还没处理完。如果进程在线程池工作完成之前崩溃，那些在队列里等待处理的消息的 offset 已经被提交，重启后不会重新消费。A 选项是最安全的单线程模式，处理完再提交。C 选项通过 CountDownLatch 等待所有消息处理完再提交，正确地解决了多线程问题。D 选项逐条提交会让 offset 提交 RPC 次数等于消息数量，性能极差，但不会丢消息。"
+        },
+        {
+          "id": "mq-message-loss-q7",
+          "question": "unclean.leader.election.enable=true 可能导致什么问题？Kafka 3.0 对此默认值做了什么改变？",
+          "choices": [
+            { "id": "A", "text": "导致消费者重复消费消息；Kafka 3.0 将其默认值改为 false" },
+            { "id": "B", "text": "导致已写入 leader 但未同步到 follower 的消息丢失；Kafka 3.0 将其默认值改为 false" },
+            { "id": "C", "text": "导致消费者 offset 重置到最早位置；Kafka 3.0 将其默认值改为 true" },
+            { "id": "D", "text": "导致 ISR 列表无限扩大影响性能；Kafka 3.0 将其默认值改为 false" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "unclean.leader.election.enable=true 允许不在 ISR（同步副本集合）里的落后副本被选举为新 leader。这意味着新 leader 可能缺少旧 leader 已经写入但还没同步过来的那批消息，这些消息对消费者来说永远不可见，就此丢失。Kafka 2.0 之前这个配置默认为 true（优先保证可用性），2.0 之后默认改为 false（优先保证数据不丢失），Kafka 3.0 延续了 false 的默认值。A 选项的「重复消费」是另一类问题（offset 回退导致），与 unclean election 无关。D 选项关于 ISR 扩大的说法完全错误，ISR 的扩缩和选举策略是两个独立机制。"
+        },
+        {
+          "id": "mq-message-loss-q8",
+          "question": "积分服务需要保证「支付成功消息」精确处理一次（Exactly Once）。以下方案中最完整且正确的是？",
+          "choices": [
+            { "id": "A", "text": "生产者开启 enable.idempotence=true，消费者使用 enable.auto.commit=true" },
+            { "id": "B", "text": "消费者使用手动提交（commitSync），积分数据库写入和 offset 提交使用同一个本地事务" },
+            { "id": "C", "text": "消费者关闭自动提交，业务写入数据库时以消息的 offset 或业务 ID 做唯一键（幂等写入），处理完后手动 commitSync" },
+            { "id": "D", "text": "生产者开启事务（transactional.id），消费者读取时设置 isolation.level=read_committed，同时消费者手动提交" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "精确一次在消费者侧的实现核心是「幂等消费」：就算因为网络问题消费者重新拉取了同一批消息（at-least-once），由于数据库写入有唯一键保护，重复消费不会产生重复数据，从结果看就是「精确一次」。C 选项的组合（关闭自动提交 + 业务幂等 + 手动提交）是生产环境最常见且最实用的方案。A 选项的 enable.idempotence 解决的是生产者重复发送的问题，与消费者侧的精确一次无关，而且还保留了自动提交。B 选项描述的「offset 提交和数据库写入同一个本地事务」在技术上无法实现，因为 Kafka offset 提交是通过 Kafka 协议完成的，无法和 JDBC 事务合并。D 选项是 Kafka 的 EOS 方案，适用于 Kafka-to-Kafka 的流处理场景，在 Kafka-to-数据库场景下实现更复杂。"
+        },
+        {
+          "id": "mq-message-loss-q9",
+          "question": "开启 Kafka 生产者幂等性（enable.idempotence=true）后，以下哪个配置约束会被强制生效？",
+          "choices": [
+            { "id": "A", "text": "acks 自动设为 1，retries 自动设为 0，max.in.flight.requests.per.connection 不能超过 5" },
+            { "id": "B", "text": "acks 自动设为 all，retries 自动设为 Integer.MAX_VALUE，max.in.flight.requests.per.connection 不能超过 5" },
+            { "id": "C", "text": "acks 自动设为 all，retries 不变，batch.size 强制设为 1（逐条发送）" },
+            { "id": "D", "text": "acks 自动设为 all，retries 自动设为 3，消息必须带 key 才能保证幂等" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "开启幂等性后，Kafka 会强制将 acks 升级为 all（确保消息持久化），将 retries 升级为 Integer.MAX_VALUE（无限重试直到成功或超时），同时要求 max.in.flight.requests.per.connection ≤ 5。最后这个限制是因为幂等性通过 Producer ID + 序列号来去重，如果同一连接上有超过 5 个在途请求，Broker 缓存的序列号状态可能不够用，幂等性保证会失效。A 选项把 acks 写成 1 完全错误。C 选项的「batch.size=1」是错误的，幂等性和批量发送是兼容的。D 选项的「消息必须带 key」是错误的，幂等性靠 PID + 序列号而非 key。"
+        },
+        {
+          "id": "mq-message-loss-q10",
+          "question": "排查消息丢失时，发现 kafka-topics.sh --describe 输出中某个分区的 ISR 只剩一个副本（原本有 3 个），但其余两个副本仍然存活。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "另外两个 Broker 宕机了，副本无法提供服务" },
+            { "id": "B", "text": "两个 follower 副本因为 replica.lag.time.max.ms 配置的时间内没有追上 leader 而被踢出 ISR" },
+            { "id": "C", "text": "Kafka Controller 发生了故障转移，重新选举过程中临时缩减了 ISR" },
+            { "id": "D", "text": "min.insync.replicas 设置为 1，所以 ISR 只保留一个副本以节省资源" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ISR（In-Sync Replicas）是一个动态集合，follower 副本如果在 replica.lag.time.max.ms（默认 30 秒）内没有从 leader 拉取到最新数据（即落后太多），就会被 leader 踢出 ISR。常见触发原因包括：follower 所在 Broker 的 I/O 压力大导致复制跟不上、网络抖动导致复制连接中断、fullGC 导致 follower 暂停。被踢出 ISR 的副本不是不可用，只是「不再被视为同步」，等它追上 leader 后会重新加入 ISR。A 选项如果 Broker 宕机了，副本状态会是 offline 而不是简单地不在 ISR 里。C 选项 Controller 故障转移不会导致 ISR 缩减。D 选项 min.insync.replicas 控制的是「写入时至少需要多少副本确认」，不是 ISR 的大小。"
+        }
+      ],
+      "references": [
+        "https://kafka.apache.org/documentation/#producerconfigs",
+        "https://kafka.apache.org/documentation/#consumerconfigs",
+        "https://kafka.apache.org/documentation/#design_replicatedlog",
+        "https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/",
+        "https://kafka.apache.org/documentation/#semantics"
+      ]
+    }
+  ]
+}

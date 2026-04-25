@@ -1,0 +1,159 @@
+{
+  "id": "es-cluster-health",
+  "name": "Elasticsearch 集群红黄状态排查",
+  "domain": "troubleshooting",
+  "description": "排查 ES 集群变为 RED/YELLOW 的根因，掌握分片分配诊断和集群恢复操作",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "es-cluster-health-1",
+      "domain": "troubleshooting",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["elasticsearch", "cluster", "shards", "red-status", "allocation"],
+      "title": "Elasticsearch 集群变为 RED 状态，部分索引写入失败，如何排查恢复？",
+      "content": "凌晨两点，告警群炸了。监控显示 Elasticsearch 集群状态从 GREEN 变成了 RED，告警内容是「cluster status changed to RED」。与此同时，业务方反馈搜索服务的写入接口开始大量报错，日志里到处是这样的错误：\n\n```\n[2024-03-15T02:17:43,821][WARN ][o.e.a.b.TransportShardBulkAction] [node-3] [orders-2024.03][2] failed to execute bulk item (index) BulkShardRequest\norg.elasticsearch.action.UnavailableShardsException: [orders-2024.03][2] primary shard is not active Timeout: [1m], request: [BulkShardRequest [[orders-2024.03][2]] containing [47] requests]\n\n[2024-03-15T02:18:01,344][ERROR][o.e.c.r.a.AllocationService] [node-1] all shards failed for index [orders-2024.03], applying [CLUSTER_REROUTE (reroute called by ShardStateAction.ShardFailed)]\n```\n\n你的集群规模是 5 个数据节点（node-1 到 node-5），3 个 Master 候选节点（其中 node-1、node-2、node-3 同时承担数据节点角色），ES 版本为 8.11.0。出问题的索引是 `orders-2024.03`，配置了 5 个主分片、1 个副本。写入量平时约 3000 doc/s，高峰期 8000 doc/s。\n\n运维同事说 node-4 昨晚做了磁盘扩容操作，今早又有同学改过一个 ILM 策略。此外，你在 Kibana 的 Stack Monitoring 里看到集群有 12 个 unassigned shards，其中 6 个是 PRIMARY，6 个是 REPLICA。\n\n**这是面试中最高频的 ES 生产故障场景之一**。请你系统地阐述：如何一步步判断 RED 的根因？哪个 API 是最关键的诊断命令？常见的 RED 原因分别对应什么修复手段？如果主分片数据已经丢失，有哪些恢复选项，代价分别是什么？",
+      "answer": "## 一、先建立认知基础：ES 集群的三色健康模型\n\nElasticsearch 的集群健康状态本质上是对分片分配情况的一个汇总快照。要真正理解 RED/YELLOW/GREEN 的含义，必须先理解 ES 的数据模型。ES 把每个索引的数据水平切分成若干个「分片」（shard），分片是 ES 中最小的数据存储和复制单元，本质上就是一个 Lucene 索引实例。每个分片分为两种角色：primary shard（主分片）负责接收写入请求，是数据的权威副本；replica shard（副本分片）是主分片的拷贝，用于高可用和分担读压力。\n\n索引创建时主分片数量就固定了（ES 8.x 默认 1 个，不可在线修改），副本数量则可以随时调整。集群健康状态的三个颜色对应的含义是：GREEN 表示所有主分片和副本分片都已正常分配到节点上，写入和查询都完全正常；YELLOW 表示所有主分片正常，但有部分副本分片无法分配，此时写入不受影响，但失去了对应副本的冗余保护；RED 则意味着至少有一个主分片处于未分配状态，那个主分片对应的数据无法写入，写入请求会直接返回 `UnavailableShardsException`。\n\n这里有一个关键细节经常被忽略：RED 只影响「未分配主分片」所对应的分片槽，不是整个集群不可写，也不是整个索引不可写——如果 `orders-2024.03` 有 5 个主分片，其中 2 个是 RED，那么路由到这 2 个分片的文档写入会失败，但路由到剩余 3 个正常主分片的文档仍然可以写入成功。这就是为什么日志里可以看到「部分写入失败」而不是「全部失败」。\n\n## 二、系统排查：从集群全局到分片级别逐层诊断\n\n**第一步：获取集群健康概览**\n\n第一个要执行的命令永远是 `GET /_cluster/health?pretty`，它给你一个全局快照：\n\n```json\n{\n  \"cluster_name\" : \"prod-es-cluster\",\n  \"status\" : \"red\",\n  \"timed_out\" : false,\n  \"number_of_nodes\" : 4,\n  \"number_of_data_nodes\" : 4,\n  \"active_primary_shards\" : 142,\n  \"active_shards\" : 278,\n  \"relocating_shards\" : 0,\n  \"initializing_shards\" : 0,\n  \"unassigned_shards\" : 12,\n  \"delayed_unassigned_shards\" : 0,\n  \"number_of_pending_tasks\" : 0,\n  \"number_of_in_flight_fetch\" : 0,\n  \"task_max_waiting_in_queue_millis\" : 0,\n  \"active_shards_percent_as_number\" : 95.8\n}\n```\n\n这里有几个关键指标值得细看。`number_of_nodes` 是 4 而不是 5，说明 node-5 已经离线或不可达，这立刻成为最大的嫌疑点。`unassigned_shards` 是 12，`delayed_unassigned_shards` 是 0，说明这些分片并不是在等待延迟分配（即不是节点刚刚掉线的正常 grace period 内），而是已经确认无法分配。`initializing_shards` 是 0，说明没有分片正在恢复中。这几个数字组合起来给你的第一印象是：某个节点已经长时间离线，它上面的主分片无法重新分配。\n\n**第二步：执行最关键的诊断命令**\n\n`GET /_cluster/allocation/explain?pretty` 是整个排查过程中最重要的一个 API，没有之一。它会让 ES 告诉你「为什么有某个分片无法被分配」，直接输出人类可读的诊断原因。不带参数时 ES 会自动选择第一个未分配的分片来解释，你也可以指定具体的分片：\n\n```json\nGET /_cluster/allocation/explain?pretty\n{\n  \"index\": \"orders-2024.03\",\n  \"shard\": 2,\n  \"primary\": true\n}\n```\n\n返回结果可能类似：\n\n```json\n{\n  \"index\" : \"orders-2024.03\",\n  \"shard\" : 2,\n  \"primary\" : true,\n  \"current_state\" : \"unassigned\",\n  \"unassigned_info\" : {\n    \"reason\" : \"NODE_LEFT\",\n    \"at\" : \"2024-03-15T02:10:33.421Z\",\n    \"details\" : \"node_left [node-5][abc123]\",\n    \"last_allocation_status\" : \"no_valid_shard_copy\"\n  },\n  \"can_allocate\" : \"no\",\n  \"allocate_explanation\" : \"cannot allocate because a previous copy of the primary shard existed but can no longer be found on the nodes in the cluster\",\n  \"node_allocation_decisions\" : [\n    {\n      \"node_id\" : \"node1_id\",\n      \"node_name\" : \"node-1\",\n      \"deciders\" : [\n        {\n          \"decider\" : \"same_shard\",\n          \"decision\" : \"NO\",\n          \"explanation\" : \"a copy of this shard is already allocated to this node [[orders-2024.03][2], s[0], [R], a[id=replica_shard_id]]\"\n        }\n      ]\n    }\n  ]\n}\n```\n\n`can_allocate: no` 加上 `no_valid_shard_copy` 这个组合是最危险的信号，意思是「这个主分片之前只有一份数据在 node-5 上，node-5 已经消失，集群里找不到任何有效的副本可以晋升为主分片」。这种情况就是数据丢失风险最高的场景。\n\n**第三步：确认节点状态和磁盘使用情况**\n\n执行 `GET /_cat/nodes?v&h=name,ip,diskUsed,diskAvail,diskTotal,diskPercent,heapPercent,ram.percent,cpu,master,nodeRole` 查看所有节点的状态：\n\n```\nname    ip           diskUsed diskAvail diskTotal diskPercent heapPercent ram.percent cpu master nodeRole\nnode-1  10.0.0.1       120gb     80gb     200gb          60          45          70  12  *      dimr\nnode-2  10.0.0.2       115gb     85gb     200gb          57          42          68  10  -      dimr\nnode-3  10.0.0.3       118gb     82gb     200gb          59          48          72   8  -      dimr\nnode-4  10.0.0.4        10gb    390gb     400gb           2          35          55   5  -      dimr\nnode-5 <missing>\n```\n\nnode-5 根本不在节点列表里，这确认了它已经脱离集群。同时注意 node-4 的磁盘情况：diskPercent 只有 2%，但磁盘容量从 200GB 变成了 400GB，这印证了运维同事说的「昨晚做了磁盘扩容」。扩容本身不是问题，但扩容操作有时候会引起节点重启或服务短暂中断。\n\n再用 `GET /_cat/shards?h=index,shard,prirep,state,unassigned.reason,node&s=state&v` 查看所有分片的分配状态：\n\n```\nindex            shard prirep state      unassigned.reason  node\norders-2024.03       0     p  STARTED                       node-1\norders-2024.03       0     r  STARTED                       node-3\norders-2024.03       1     p  STARTED                       node-2\norders-2024.03       1     r  STARTED                       node-4\norders-2024.03       2     p  UNASSIGNED    NODE_LEFT        \norders-2024.03       2     r  UNASSIGNED    NODE_LEFT        \norders-2024.03       3     p  STARTED                       node-3\norders-2024.03       3     r  STARTED                       node-1\norders-2024.03       4     p  STARTED                       node-4\norders-2024.03       4     r  STARTED                       node-2\n```\n\n现在真相大白了：`orders-2024.03` 的第 2 号主分片和其副本都在 node-5 上，node-5 宕机导致这两个分片同时不可用。其他 4 个主分片都在正常运行，这也解释了为什么是「部分写入失败」。\n\n## 三、不同 RED 根因的修复手段\n\n**场景一：节点宕机，主分片丢失，副本存活**\n\n这是最常见也最好处理的情况。ES 的自动恢复机制会把存活的副本晋升为新的主分片，过程是自动的，不需要手动干预。你只需要等待分配完成即可。整个过程可以通过 `GET /_cat/recovery?v&active_only=true` 实时监控。\n\n**场景二：节点宕机，主分片和副本都丢失（就是我们当前的情况）**\n\n这是最棘手的情况。这意味着这个分片的数据可能真的丢了。你有以下几个选项，按风险从低到高排列。\n\n首先检查是否有快照（snapshot）可以恢复，这是最安全的方式，数据损失只取决于上次快照的时间点：\n\n```json\nPOST /_snapshot/my_backup/snapshot_2024.03.14/_restore\n{\n  \"indices\": \"orders-2024.03\",\n  \"index_settings\": {\n    \"index.number_of_replicas\": 0\n  }\n}\n```\n\n如果 node-5 能够重新上线（比如只是网络抖动或服务崩溃，磁盘数据完好），重启 node-5 上的 ES 进程后，分片会自动恢复，数据完整性有保证。\n\n如果 node-5 已经永久消失（硬盘损坏、节点彻底报废），并且没有快照，最后的手段是使用 `allocate_stale_primary`。这个操作的含义是「我知道数据可能不完整，但我接受这个风险，强制把某个节点上的残留数据提升为主分片」。这个操作**有丢数据风险**，因为副本和主分片可能在节点宕机前没有完成同步：\n\n```json\nPOST /_cluster/reroute\n{\n  \"commands\": [\n    {\n      \"allocate_stale_primary\": {\n        \"index\": \"orders-2024.03\",\n        \"shard\": 2,\n        \"node\": \"node-1\",\n        \"accept_data_loss\": true\n      }\n    }\n  ]\n}\n```\n\n`accept_data_loss: true` 是必须显式传入的，ES 强迫你承认你理解了这个操作的后果。\n\n**场景三：磁盘空间触发 Flood Stage 限制**\n\nES 有三个磁盘水位线：`low`（默认 85%，停止向该节点分配新分片）、`high`（默认 90%，开始将分片从该节点迁走）、`flood_stage`（默认 95%，对该节点上所有索引强制设置 `read_only_allow_delete` 标志，写入全部失败）。磁盘告警触发 flood stage 后，即使你清理了磁盘，索引的 `read_only_allow_delete` 标志也不会自动取消，需要手动解除：\n\n```json\nPUT /orders-2024.03/_settings\n{\n  \"index.blocks.read_only_allow_delete\": null\n}\n```\n\n**场景四：YELLOW 状态的常见原因**\n\nYELLOW 状态比 RED 的处理轻松很多，因为主分片是正常的，写入不受影响。最常见的 YELLOW 原因是「副本数量超过数据节点数」。比如一个 1 节点集群，你建了一个 replica=1 的索引，那个副本永远无法分配（不能和主分片在同一节点上），集群就会一直是 YELLOW。修复方式是把副本数调小：\n\n```json\nPUT /my-index/_settings\n{\n  \"index.number_of_replicas\": 0\n}\n```\n\n另一种 YELLOW 是节点刚加入集群时，分片正在从其他节点迁移过来，这种状态是暂时的，等待分片迁移完成即可。\n\n## 四、进阶：从根本上减少集群故障概率\n\n排查完具体故障之后，更重要的是思考如何避免下次再发生。在生产环境中，分片设计是影响集群稳定性最关键的因素之一。单个分片的理想大小是 10GB 到 50GB，分片太小（几十 MB）会导致集群元数据开销过大，分片太大（几百 GB）会导致节点恢复时间过长、迁移时占用大量带宽。按照 Elastic 官方建议，每个节点的分片数量不应超过 `heap_size_GB × 20`，比如 32GB heap 的节点最多承载 640 个分片。\n\nIndex Lifecycle Management（ILM）是解决时序索引（日志、监控数据）分片膨胀的标准方案。通过定义 Hot-Warm-Cold-Delete 四个阶段，你可以让 ES 自动把旧索引从高性能节点迁移到低成本节点，最终自动删除。这样既控制了总分片数，也降低了单次故障影响的数据范围。\n\n在跨集群高可用场景下，Cross-Cluster Replication（CCR）可以把数据实时复制到另一个集群，在主集群整体故障时快速切换。但 CCR 有一个容易被忽视的限制：它是异步复制，主集群故障时可能有几秒到几十秒的数据延迟，所以它能保证高可用但不能保证零数据丢失。\n\n最后说一点调优层面的经验。ES 的 JVM heap 应该设置为物理内存的 50%，但不超过 31GB（超过 31GB 会导致 JVM 从压缩指针模式退出，内存效率大幅下降）。`indices.fielddata.cache.size` 设置为 heap 的 20-40% 可以防止 fielddata 把 heap 撑爆，触发 field data circuit breaker。这些参数不是越大越好，需要根据实际数据模式和查询类型调整。",
+      "keyPoints": [
+        "ES 集群 RED 状态的本质是「至少一个主分片处于未分配状态」，RED 只影响未分配主分片所服务的那些文档写入，集群其他部分的读写仍可正常工作。",
+        "`GET /_cluster/allocation/explain?pretty` 是排查分片无法分配问题最关键的 API，ES 会用人类可读的语言解释分片无法分配的具体原因，远比肉眼看日志高效。",
+        "当主分片和副本都在同一节点上丢失（`no_valid_shard_copy`）时，必须在「从快照恢复」「等节点重启恢复数据」「`allocate_stale_primary` 强制分配但接受数据丢失」三个选项中做权衡。",
+        "磁盘使用率超过 `flood_stage` 阈值（默认 95%）后，ES 会对受影响节点的所有索引自动加 `read_only_allow_delete` 写保护；清理磁盘后需要手动执行 `PUT /<index>/_settings` 来取消这个标志，否则索引仍然无法写入。",
+        "YELLOW 状态最常见的原因是「副本数大于可用数据节点数」，此时副本分片永远无法找到一个合规的节点落脚，通过调小 `number_of_replicas` 可以立即恢复到 GREEN。",
+        "分片大小应控制在 10-50GB，每个节点的分片数不超过 `heap_size_GB × 20`，过多或过大的分片都会显著延长集群故障后的恢复时间。",
+        "ILM（Index Lifecycle Management）通过 Hot-Warm-Cold-Delete 生命周期策略自动管理时序索引的迁移和删除，是防止日志类集群因分片堆积而崩溃的标准工程手段。",
+        "ES 的 JVM heap 最大设置为 31GB 是关键经验值，超过 31GB 会使 JVM 退出压缩指针（Compressed OOPs）模式，内存效率明显下降，实际能寻址的对象数量反而减少。"
+      ],
+      "quiz": [
+        {
+          "id": "es-cluster-health-q1",
+          "question": "Elasticsearch 集群状态变为 RED，最准确的含义是什么？",
+          "choices": [
+            { "id": "A", "text": "集群中所有节点都无法响应请求，整个集群完全不可用" },
+            { "id": "B", "text": "至少有一个主分片处于未分配状态，对应的写入请求会失败，但其他分片仍然正常" },
+            { "id": "C", "text": "所有主分片正常，但有副本分片未分配，存在数据丢失风险" },
+            { "id": "D", "text": "集群 Master 节点不可用，导致所有集群管理操作失败" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "RED 状态是分片级别的概念，不是集群级别的全停服。它意味着至少有一个主分片没有被分配到任何节点，那个主分片负责的那部分文档无法写入，但集群中其他分片（主分片和副本）仍然可以正常提供服务。A 描述的是极端情况下的全集群不可用，与 RED 含义不符。C 描述的是 YELLOW 状态。D 描述的是 Master 选举相关的问题，Master 不可用时集群状态会变红，但 RED 的本质原因是主分片未分配，而不是 Master 本身不可用。"
+        },
+        {
+          "id": "es-cluster-health-q2",
+          "question": "以下哪个 API 能直接告诉你某个分片为什么无法被分配，输出人类可读的诊断信息？",
+          "choices": [
+            { "id": "A", "text": "GET /_cluster/health?pretty" },
+            { "id": "B", "text": "GET /_cat/shards?v" },
+            { "id": "C", "text": "GET /_cluster/allocation/explain?pretty" },
+            { "id": "D", "text": "GET /_cluster/stats?pretty" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "`GET /_cluster/allocation/explain` 是 ES 专门为诊断分片分配问题设计的 API，它会输出详细的分配决策过程，告诉你每个节点为什么「NO」或「YES」，最终汇总出分片无法分配的根本原因（如 `no_valid_shard_copy`、`disk_watermark`、`filter_not_allowed` 等）。`_cluster/health` 只给全局汇总数字。`_cat/shards` 可以看到分片的 `unassigned.reason`（如 `NODE_LEFT`、`ALLOCATION_FAILED`），但不会给出具体的诊断说明。`_cluster/stats` 是集群维度的统计信息，不包含分片分配诊断。"
+        },
+        {
+          "id": "es-cluster-health-q3",
+          "question": "一个 ES 索引有 5 个主分片，你发现其中 2 号主分片和它的副本都在同一个已宕机的节点上，`_cluster/allocation/explain` 返回 `can_allocate: no` 且 `last_allocation_status: no_valid_shard_copy`。此时最优先应该尝试的恢复手段是什么？",
+          "choices": [
+            { "id": "A", "text": "立即执行 `allocate_stale_primary` 强制将主分片分配到其他节点" },
+            { "id": "B", "text": "先检查是否有快照（snapshot）可以恢复，这是数据损失最小的选项" },
+            { "id": "C", "text": "直接删除 RED 状态的索引并重建" },
+            { "id": "D", "text": "增加一个新的数据节点，ES 会自动从 WAL 恢复丢失的分片" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "`no_valid_shard_copy` 意味着整个集群里找不到这个分片的任何有效数据副本，是数据丢失风险最高的信号。应对策略按风险从低到高排列：第一优先是从快照恢复，数据损失仅限于上次快照后的增量；第二是尝试重启宕机节点（如果是软件故障，磁盘数据完好）；最后才是 `allocate_stale_primary`，这个操作会明确要求传入 `accept_data_loss: true`，因为它可能丢失宕机前未同步的数据。直接删除索引是放弃所有数据的最坏选择。ES 没有 WAL 自动跨节点恢复的机制。"
+        },
+        {
+          "id": "es-cluster-health-q4",
+          "question": "ES 磁盘 `flood_stage` 水位线默认是多少？触发后会产生什么效果？",
+          "choices": [
+            { "id": "A", "text": "80%，触发后停止向该节点分配新的分片" },
+            { "id": "B", "text": "90%，触发后开始将分片从该节点迁移走" },
+            { "id": "C", "text": "95%，触发后对该节点上的所有索引强制加 `read_only_allow_delete` 写保护，索引无法写入" },
+            { "id": "D", "text": "95%，触发后 ES 自动删除最旧的索引来释放空间" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "ES 有三条磁盘水位线：`low`（默认 85%）停止向该节点分配新分片；`high`（默认 90%）触发分片迁移，将该节点上的分片移到其他节点；`flood_stage`（默认 95%）最严厉，会对该节点上所有索引强制设置 `index.blocks.read_only_allow_delete` 为 true，使所有写入立即失败。特别注意：即使之后磁盘使用率降回正常水平，这个 block 标志也不会自动清除，必须手动执行 `PUT /<index>/_settings` 将其设为 null 才能恢复写入能力。D 描述的自动删除行为是错误的，ES 不会擅自删除用户数据。"
+        },
+        {
+          "id": "es-cluster-health-q5",
+          "question": "执行 `GET /_cluster/health?pretty` 返回以下结果，你能得出什么结论？\n```json\n{\n  \"status\": \"yellow\",\n  \"number_of_nodes\": 1,\n  \"number_of_data_nodes\": 1,\n  \"active_primary_shards\": 5,\n  \"active_shards\": 5,\n  \"unassigned_shards\": 5\n}\n```",
+          "choices": [
+            { "id": "A", "text": "有一个节点刚宕机，5 个主分片丢失，需要立即 allocate_stale_primary" },
+            { "id": "B", "text": "集群只有 1 个数据节点，5 个副本分片无法分配（不能和主分片同节点），这是正常的单节点配置限制" },
+            { "id": "C", "text": "索引的分片数配置过多，需要缩减 primary shard 数量" },
+            { "id": "D", "text": "Master 节点和数据节点没有分离，需要增加专用 Master 节点" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "从返回数据可以读出关键信息：`active_primary_shards: 5` 等于 `active_shards: 5`，说明所有主分片都是正常的，`unassigned_shards: 5` 全部是副本；`number_of_nodes: 1` 意味着集群只有一个节点。ES 的设计规则是副本分片不能与对应的主分片在同一个节点上（这样才有冗余意义），所以单节点集群的副本永远无法分配，集群必然是 YELLOW。这不是故障，而是配置不匹配。解决方法是将索引的 `number_of_replicas` 调整为 0，YELLOW 立刻变 GREEN。"
+        },
+        {
+          "id": "es-cluster-health-q6",
+          "question": "执行 `allocate_stale_primary` 强制分配主分片后，该索引的副本分片会发生什么？",
+          "choices": [
+            { "id": "A", "text": "副本分片会自动从新主分片同步数据，等同步完成后集群状态恢复 GREEN" },
+            { "id": "B", "text": "副本分片会被删除，需要手动重新创建" },
+            { "id": "C", "text": "副本分片数量自动从 1 变为 0" },
+            { "id": "D", "text": "副本分片会从宕机节点上尝试 allocate_replica 操作" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "`allocate_stale_primary` 执行后，ES 会把指定节点上的陈旧数据强制提升为主分片，此时这个主分片的 sequence number 会被「重置」，其他节点上如果还有这个分片的旧副本，会被认为数据不一致而触发完整的分片数据同步（peer recovery）。具体过程是：新主分片被激活 → 其他节点检测到 sequence number 不匹配 → 删除本地旧副本数据 → 从主分片全量复制数据 → 副本分片上线，集群状态由 RED 升为 YELLOW 再升为 GREEN。整个过程是自动的，但取决于索引大小，可能需要几分钟到几小时不等。"
+        },
+        {
+          "id": "es-cluster-health-q7",
+          "question": "以下关于 `_cat/shards` 中 `unassigned.reason` 字段的描述，哪项最准确？",
+          "choices": [
+            { "id": "A", "text": "`NODE_LEFT` 表示分片所在节点离开了集群，是最常见的 RED 触发原因之一" },
+            { "id": "B", "text": "`ALLOCATION_FAILED` 表示 ES 内核 bug 导致的随机分配失败" },
+            { "id": "C", "text": "`REINITIALIZED` 表示索引被删除重建，是不可恢复的分片丢失状态" },
+            { "id": "D", "text": "`INDEX_CREATED` 表示索引创建时的错误导致分片从未成功初始化" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "`NODE_LEFT` 是生产环境中最高频的 `unassigned.reason`，表示持有该分片的节点已经离开集群（宕机、网络分区、主动下线等），ES 需要在剩余节点中寻找副本来晋升或重新分配。`ALLOCATION_FAILED` 通常是分片分配规则（如 `require`/`include`/`exclude` 过滤规则）配置错误或节点资源不足时触发，不是 ES bug。`INDEX_CREATED` 是索引新建后副本的初始状态，表示分片刚刚被创建、尚未分配，这是正常状态而不是错误。`REINITIALIZED` 通常出现在快照恢复过程中，是临时状态。要真正理解某个 `unassigned.reason` 的根因，还是要配合 `_cluster/allocation/explain` 深入查看。"
+        },
+        {
+          "id": "es-cluster-health-q8",
+          "question": "生产环境的一个 ES 集群有 3 个数据节点，你需要新建一个每日日志索引，每天产生约 30GB 数据，保留 30 天。以下哪种分片配置最合理？",
+          "choices": [
+            { "id": "A", "text": "1 个主分片，1 个副本，ILM 每天自动 rollover，单索引控制在合理大小" },
+            { "id": "B", "text": "30 个主分片，0 个副本，这样 30 天的数据每天一个分片，方便管理" },
+            { "id": "C", "text": "1 个主分片，0 个副本，节省存储空间" },
+            { "id": "D", "text": "5 个主分片，2 个副本，尽可能高的并行度和副本数保证可靠性" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "对于日志类时序数据，Elastic 官方推荐使用 ILM + Data Stream 的方式，通过 rollover 策略控制单个索引的大小（通常按 `max_size: 50GB` 或 `max_age: 1d` 触发），而不是一开始就创建大量分片。1 主 1 副的配置在 3 节点集群中是合理的，既有冗余又不浪费资源。B 选项的问题是 30 个主分片一次创建，每个分片初始只有约 1GB 数据，分片过小会造成大量元数据开销和合并压力，极大消耗 JVM heap（小分片的元数据开销不比大分片小多少）。C 选项没有副本，任何一个节点故障都会导致 RED。D 选项 5 主 2 副意味着要分配 15 个分片，对于只有 3 个节点的集群，每天 30GB 这个规模来说明显过度分片。"
+        },
+        {
+          "id": "es-cluster-health-q9",
+          "question": "为什么 ES 的 JVM heap 大小建议不超过 31GB，即使服务器有 128GB 物理内存？",
+          "choices": [
+            { "id": "A", "text": "ES 源码中有 31GB 的硬编码上限，超过会直接报错启动失败" },
+            { "id": "B", "text": "超过 31GB 后 JVM 会退出压缩指针（Compressed OOPs）模式，每个对象引用从 4 字节变成 8 字节，实际可用内存效率反而下降" },
+            { "id": "C", "text": "超过 31GB 的 heap 会导致 ES 的 circuit breaker 无法准确计算内存用量" },
+            { "id": "D", "text": "超过 31GB 后 ES 会把多余内存用于 page cache，与操作系统内核产生竞争" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 JVM 底层机制导致的经典内存优化点。在 64 位 JVM 中，当 heap 小于约 32GB 时，JVM 会启用「压缩指针」（Compressed Ordinary Object Pointers，简称 Compressed OOPs），用 32 位整数来存储对象引用，可以寻址约 32GB 内存，节省了大量空间（Java 程序里有海量的对象引用）。一旦 heap 超过这个阈值（具体取决于 JVM 版本，通常在 30-32GB 之间），JVM 就必须切换到完整的 64 位指针，每个对象引用从 4 字节变为 8 字节，等效于堆内存「缩水」了——你设置了 32GB heap，实际能存储的对象数量可能比 30GB heap 还少。所以 Elastic 建议要么设置到 30-31GB 以利用压缩指针，要么把剩余内存留给操作系统的 page cache，用于 Lucene 段文件缓存。"
+        },
+        {
+          "id": "es-cluster-health-q10",
+          "question": "你的同事把一个索引的 `number_of_replicas` 从 1 改成了 2，集群有 3 个数据节点。改完后执行 `GET /_cluster/health` 发现集群变成了 YELLOW，`unassigned_shards` 有 5 个（索引有 5 个主分片）。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "改成 2 副本需要每个主分片有 2 个副本，加上主分片本身共 3 份数据，刚好需要 3 个节点，但 ES 默认不允许同一个节点存 2 个同 shard id 的副本，所以第二组副本无法分配" },
+            { "id": "B", "text": "副本数增加导致 ES 重建了索引，索引重建期间会短暂变为 YELLOW" },
+            { "id": "C", "text": "3 个节点，每个主分片已经在 1 个节点，2 个副本各需要不同节点，共需 1+2=3 个节点，这在 3 节点集群中完全可行，YELLOW 说明有节点下线" },
+            { "id": "D", "text": "修改 replicas 是不可逆操作，需要先删除索引才能正确应用" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "这道题考察对 ES 分片分配约束的理解。ES 有一条核心规则：同一个分片（同 index + 同 shard id）的不同副本（包括主分片）不能在同一个节点上。3 节点集群 + 5 主分片 + 2 副本 = 每个 shard id 需要 3 份（1 primary + 2 replicas），正好需要 3 个不同的节点。理论上这是可以满足的。但是！如果集群中某个节点此前已经存了这个 shard 的第一个副本，那第二个副本就不能再放到那个节点上，需要第 4 个节点才能满足。而集群只有 3 个节点，所以其实 5 个分片的第二组副本（5 个 REPLICA）都无法找到合规的节点，导致 5 个 unassigned_shards。解决方法：增加第 4 个数据节点，或把 `number_of_replicas` 改回 1。B 和 D 都是错误的，改 replica 数不会触发索引重建，也不是不可逆操作。"
+        }
+      ],
+      "references": [
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-health.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-allocation-explain.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/cluster-reroute.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/disk-usage-exceeded.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/size-your-shards.html",
+        "https://www.elastic.co/guide/en/elasticsearch/reference/current/index-lifecycle-management.html"
+      ]
+    }
+  ]
+}
