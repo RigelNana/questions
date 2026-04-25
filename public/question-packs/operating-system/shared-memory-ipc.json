@@ -1,0 +1,176 @@
+{
+  "id": "os-shared-memory-ipc",
+  "name": "共享内存（Shared Memory）为何是最快的 IPC 方式",
+  "domain": "operating-system",
+  "description": "共享内存的实现原理、零拷贝机制与同步配合方案",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-shared-memory-ipc-1",
+      "domain": "operating-system",
+      "type": "purpose",
+      "difficulty": 2,
+      "tags": ["shared-memory", "IPC", "mmap", "shm_open", "zero-copy", "semaphore", "page-table"],
+      "title": "共享内存（Shared Memory）为什么是最快的 IPC 方式",
+      "content": "## 背景场景\n\n你在做一个视频转码平台，采集进程（Capturer）每秒产出 60 帧 4K YUV 原始帧，每帧约 12MB，总带宽约 720MB/s。编码进程（Encoder）需要把这些帧拿走，做 H.265 压缩后推流。最初你们用 Unix Domain Socket 传帧，结果 Encoder 进程的 CPU 里有 40% 都花在 `memcpy` 上，延迟稳定超过 8ms/帧，还没算压缩本身的时间。\n\n同事建议改成共享内存，改完之后帧传输延迟降到了 0.05ms，CPU 占用下降了 35%。但你翻了一遍代码，发现改后多了一堆 `sem_wait`、`sem_post`，以及一个看起来很复杂的 `pthread_mutex_t` 被放进了共享内存里。你一时没看懂这样做的目的是什么。\n\n下面的代码片段是改造后的生产者端（Capturer）核心逻辑，请分析：共享内存为什么能比 Socket/Pipe 快这么多，以及为什么还需要这些同步原语，它们的作用是什么。\n\n```c\n#include <sys/mman.h>\n#include <fcntl.h>\n#include <semaphore.h>\n#include <pthread.h>\n#include <string.h>\n\n/* 共享内存中的控制结构 */\ntypedef struct {\n    pthread_mutex_t mutex;          /* 进程间互斥锁，需 PTHREAD_PROCESS_SHARED */\n    sem_t           slots_avail;    /* 消费者还没读的槽数量（生产者等待） */\n    sem_t           items_ready;    /* 已填充数据的槽数量（消费者等待） */\n    int             write_idx;      /* 生产者下一次写入的槽编号 */\n    int             read_idx;       /* 消费者下一次读取的槽编号 */\n    char            frames[4][12 * 1024 * 1024]; /* 4 个槽，每槽 12MB */\n} SharedRingBuffer;\n\nint    shm_fd;\nSharedRingBuffer *shm;\n\nvoid producer_init() {\n    /* 创建 POSIX 共享内存对象，文件在 /dev/shm/video_frames */\n    shm_fd = shm_open(\"/video_frames\", O_CREAT | O_RDWR, 0600);\n    ftruncate(shm_fd, sizeof(SharedRingBuffer));\n\n    /* 将共享内存映射到本进程的虚拟地址空间 */\n    shm = mmap(NULL, sizeof(SharedRingBuffer),\n               PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);\n\n    /* 初始化进程间共享的 mutex */\n    pthread_mutexattr_t attr;\n    pthread_mutexattr_init(&attr);\n    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED); /* 关键！ */\n    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);    /* 防崩溃死锁 */\n    pthread_mutex_init(&shm->mutex, &attr);\n\n    /* 4 个空槽，0 个就绪帧 */\n    sem_init(&shm->slots_avail, 1, 4); /* pshared=1 表示进程间共享 */\n    sem_init(&shm->items_ready, 1, 0);\n}\n\nvoid producer_write_frame(const char *frame_data, size_t size) {\n    sem_wait(&shm->slots_avail);   /* 等待有空槽可写 */\n    pthread_mutex_lock(&shm->mutex);\n\n    int idx = shm->write_idx % 4;\n    memcpy(shm->frames[idx], frame_data, size); /* 写入共享内存 */\n    shm->write_idx++;\n\n    pthread_mutex_unlock(&shm->mutex);\n    sem_post(&shm->items_ready);   /* 通知消费者有新帧 */\n}\n```\n\n请回答：共享内存为什么比 Pipe、Socket、消息队列快？`mmap` 在这里做了什么？为什么 `pthread_mutexattr_setpshared` 是必须的，`PTHREAD_MUTEX_ROBUST` 又解决了什么问题？",
+      "answer": "## IPC 的「数据搬运」本质\n\n要理解共享内存为什么快，得先想清楚其他 IPC 机制是怎么传数据的。当你往 Pipe 里写一帧 12MB 的图像时，内核要做的事是：把用户空间的 12MB 数据复制到内核的 pipe 缓冲区，另一端进程调用 `read` 时，内核再把 pipe 缓冲区里的数据复制到对端的用户空间缓冲区。这是两次内存拷贝，而且每次拷贝都在内核态执行，无法被用户态代码优化。Socket（包括 Unix Domain Socket）原理相同，甚至比 Pipe 还慢，因为还有协议栈的开销。消息队列（System V msgqueue 或 POSIX mq）本质上也是用内核缓冲区中转，同样是两次拷贝。\n\n720MB/s 的视频流意味着每秒要做 720MB × 2 = 1.44GB 的无意义 `memcpy`，这些 CPU 周期全部白白浪费在把数据从一块内存搬到另一块内存上，对业务毫无贡献。这就是同事观察到的「40% CPU 在 memcpy」的根源。\n\n## 共享内存的本质：让两个进程共享同一批物理页帧\n\n操作系统给每个进程一套独立的虚拟地址空间，但虚拟地址最终要通过页表（Page Table）翻译成物理地址才能访问真实的内存。页表是一个映射关系：「这个进程虚拟地址 0x7f3a00000000 → 物理页帧 0x1234000」。\n\n共享内存的核心操作，就是让两个进程的页表都指向同一批物理页帧。进程 A 写入虚拟地址 0x7f3a00000000，CPU 翻译成物理页帧 0x1234000 并写入；进程 B 读取虚拟地址 0x7fcc00000000，CPU 翻译成同一个物理页帧 0x1234000 并读出。A 写的数据 B 立刻就能看到，中间没有任何复制，0 次 `memcpy`。这就是所谓的「零拷贝（zero-copy）」，不是说系统调用没有开销，而是说数据本身从未被复制过。\n\n这个过程的性能上限就是内存带宽本身。现代服务器的 DDR4 内存带宽在 40-80 GB/s，比 Pipe 的 ~5 GB/s（受内核缓冲区拷贝限制）高了一个数量级。4K 视频场景的 720MB/s 离这个上限还差得远，这就是为什么改完之后帧传输延迟从 8ms 骤降到 0.05ms。\n\n## POSIX API 怎么建立这个映射\n\n代码里用的是 POSIX 共享内存，分三步走，每一步都有明确的职责。\n\n`shm_open(\"/video_frames\", O_CREAT | O_RDWR, 0600)` 在内核里创建一个「具名共享内存对象」，这个对象在 Linux 上表现为 `/dev/shm/video_frames` 这个文件（`/dev/shm` 是 tmpfs，本身就在内存里，不会落磁盘）。它返回一个普通的文件描述符，这个 fd 是后续操作的句柄。另一个进程只要用同样的名字 `shm_open` 一次，就能拿到指向同一内存对象的 fd。\n\n`ftruncate(shm_fd, sizeof(SharedRingBuffer))` 设置这块内存的大小。新创建的共享内存对象初始大小为 0，必须先扩展到你需要的尺寸，否则后面 `mmap` 会失败。这一步只是告诉内核「我要这么大」，物理页帧是按需分配的，不会一次性全部占用。\n\n`mmap(NULL, sizeof(SharedRingBuffer), PROT_READ|PROT_WRITE, MAP_SHARED, shm_fd, 0)` 是真正建立映射的系统调用。它的返回值是一个虚拟地址指针，从这个地址开始的内存区域，在页表层面直接映射到了那个共享内存对象的物理页。`MAP_SHARED` 是关键标志，表示写入会反映到底层对象，其他映射了同一对象的进程能看到修改；如果用 `MAP_PRIVATE` 则会触发写时复制（COW），修改只对本进程可见，那就失去了共享的意义。\n\n消费者进程（Encoder）启动后用同样的名字调用 `shm_open` 和 `mmap`，内核就把同一批物理页帧也映射进了 Encoder 的虚拟地址空间。从这一刻起，Capturer 对 `shm->frames[idx]` 的写入，Encoder 在自己的 `shm->frames[idx]` 指针下就能直接读到。\n\n## 共享内存没有同步，这是最大的坑\n\n共享内存本身只是「能看到同一块内存」，它完全没有任何同步语义。假如你去掉代码里所有的锁和信号量，让两个进程直接读写，会发生什么？\n\n场景一：Capturer 写到一半（只写了 6MB），Encoder 就开始读，拿到的是半帧垃圾数据，压缩出来的视频花屏。场景二：两个进程同时修改 `write_idx`，发生 data race，索引越界，进程崩溃。场景三：Encoder 读取速度跟不上，`write_idx` 超过 `read_idx` 四圈，新帧把旧帧覆盖了，帧丢失。\n\n这三种问题分别对应代码里三个同步机制的作用。`pthread_mutex_t` 保护 `write_idx`/`read_idx` 这两个共享计数器的原子更新，防止并发修改导致 data race。`sem_t slots_avail` 实现「生产者等消费者」的流控：初始值为 4（有 4 个空槽），每次生产者写入前 `sem_wait` 减一，消费者读完后 `sem_post` 加一，槽全满时生产者会阻塞，防止覆盖还没读走的帧。`sem_t items_ready` 实现「消费者等生产者」的唤醒：生产者写完一帧后 `sem_post`，消费者读取前 `sem_wait`，没有新帧时消费者阻塞而不是空转轮询，节省 CPU。\n\n## `PTHREAD_PROCESS_SHARED` 为什么是必须的\n\n这里有个很容易踩的坑。`pthread_mutex_t` 默认只能在同一个进程的多个线程之间使用，因为默认的 mutex 内部实现依赖 futex，而 futex 的等待队列是进程私有的。如果你把一个用默认属性初始化的 mutex 放进共享内存，进程 A 做了 `lock` 之后，进程 B 调用 `lock` 时内核不知道要把进程 B 挂到哪个等待队列上，行为是未定义的——实测通常表现为 mutex 完全不起互斥作用，两个进程同时拿到了锁。\n\n`pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED)` 告诉 pthreads 库：这个 mutex 会被多个进程共享，底层 futex 调用需要使用可以跨进程工作的地址标识方式。有了这个属性，mutex 才能真正在两个进程之间互斥。\n\n## `PTHREAD_MUTEX_ROBUST` 解决了什么问题\n\n想象 Capturer 进程在持有 `shm->mutex` 的情况下崩溃了（segfault、OOM kill、`kill -9`）。这个 mutex 的内部状态显示「已锁定，持有者 PID=xxx」，但那个 PID 已经死了，永远不会调用 `pthread_mutex_unlock`。Encoder 进程调用 `pthread_mutex_lock` 后会永远阻塞，这就是死锁。\n\n`PTHREAD_MUTEX_ROBUST` 让 mutex 具备「健壮性」：如果持有 mutex 的进程崩溃，下一个尝试 lock 的线程/进程不会永久阻塞，`pthread_mutex_lock` 会返回 `EOWNERDEAD`。收到这个错误码后，调用方必须调用 `pthread_mutex_consistent` 宣布「我知道上一个持有者死了，我来修复共享状态」，然后再调用 `unlock` 恢复 mutex 到可用状态。这是生产环境中使用进程间共享 mutex 的必要配置，缺了它，任何一个进程崩溃都会让整个系统卡死。\n\n## System V API 与 POSIX API 的区别\n\nLinux 上还有另一套更老的 System V 共享内存 API：`shmget` 创建或获取一个共享内存段（用 key_t 标识而不是名字），`shmat` 把它附加到当前进程地址空间，`shmdt` 解除附加，`shmctl(IPC_RMID)` 删除。用 `ipcs -m` 可以查看系统中当前所有 SysV 共享内存段，`ipcrm -m <shmid>` 删除指定段。\n\nSysV API 的主要问题是：生命周期绑定到内核而不是文件系统，进程崩溃后共享内存段残留在内核里，必须手动 `shmctl(IPC_RMID)` 清理，否则系统重启前一直占用内存。POSIX API 用 `/dev/shm/` 下的文件表示，`shm_unlink` 删除名字（但映射仍然有效直到所有映射被 `munmap`），行为更符合直觉，也更容易用 shell 脚本查看和清理。新项目推荐用 POSIX API。\n\n## 生产环境的性能数字与实际应用\n\n共享内存的传输速度理论上限是 DRAM 带宽的一半（读+写各占一半），在 DDR4-3200 双通道的机器上大约是 25-40 GB/s。实测中，两进程通过共享内存传递大块数据，能轻松跑到 20 GB/s 以上；而 Pipe 受限于内核缓冲区（默认 64KB，最大 1MB），吞吐量通常在 3-6 GB/s。这个差距不是因为 Pipe「慢」，而是因为额外的两次 memcpy 把 CPU 的 L3 cache 打穿了，导致每次都要从 DRAM 搬数据。\n\n实际生产案例：高频交易系统（HFT）的行情分发模块用共享内存把 tick 数据从网关进程推给十几个策略进程，延迟控制在 500ns 以内；Linux 内核中 X11/Wayland 的 MIT-SHM 扩展用共享内存传递窗口像素数据；PostgreSQL 的 shared_buffers 就是用 SysV 共享内存实现的，所有后端进程共享同一块缓冲池。",
+      "keyPoints": [
+        "Pipe、Socket、消息队列传输数据时至少需要两次 memcpy（用户→内核缓冲区，内核缓冲区→对端用户空间），共享内存通过页表映射让两个进程直接共享物理页帧，数据写入后对端可立即读取，零次内核拷贝",
+        "POSIX 共享内存三步走：shm_open 创建命名对象（存在 /dev/shm/）、ftruncate 设置大小、mmap 以 MAP_SHARED 建立页表映射；消费者进程用相同名字重复这三步后，两进程的虚拟地址就指向同一批物理页帧",
+        "共享内存本身没有任何同步语义，必须配合进程间信号量（sem_init pshared=1）或互斥锁（pthread_mutex + PTHREAD_PROCESS_SHARED）才能正确协调读写顺序，否则会出现数据竞争、脏读或覆盖未消费的数据",
+        "pthread_mutex 默认只在进程内有效，放入共享内存前必须用 pthread_mutexattr_setpshared(PTHREAD_PROCESS_SHARED) 初始化，否则跨进程 lock 行为未定义，实测表现为互斥完全失效",
+        "生产环境必须启用 PTHREAD_MUTEX_ROBUST：持有 mutex 的进程崩溃后，下一个 lock 调用会返回 EOWNERDEAD 而非永久阻塞，调用方通过 pthread_mutex_consistent + unlock 恢复 mutex 可用状态",
+        "System V API（shmget/shmat/shmdt/shmctl）生命周期绑定内核，进程崩溃后段残留需手动 ipcrm 清理；POSIX API（shm_open/mmap/shm_unlink）用文件系统语义，行为更直观，新项目推荐使用",
+        "共享内存的传输带宽上限约等于 DRAM 带宽，在 DDR4 双通道机器上可达 20+ GB/s，远超 Pipe 的 3-6 GB/s，适用于视频帧传输、HFT 行情分发、数据库缓冲池等高带宽低延迟场景"
+      ],
+      "quiz": [
+        {
+          "id": "os-shared-memory-ipc-1-q1",
+          "question": "以下哪项最准确描述了共享内存实现零拷贝的底层原理？",
+          "choices": [
+            { "id": "A", "text": "内核使用了高速 DMA 通道直接在两个进程之间传输数据，绕过 CPU" },
+            { "id": "B", "text": "内核将同一批物理页帧同时映射进两个进程的页表，使双方的虚拟地址都指向相同的物理内存" },
+            { "id": "C", "text": "内核使用了 sendfile 系统调用将数据从一个进程的文件描述符直接传给另一个" },
+            { "id": "D", "text": "内核为共享内存分配了专用的 L3 Cache 分区，两个进程都从这个缓存读取" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "共享内存的本质是页表操作：内核让两个进程的虚拟地址通过各自的页表项（PTE）映射到同一批物理页帧（physical page frames）。进程 A 写入时 CPU 把数据存到物理帧，进程 B 读取时 CPU 从同一物理帧取出，没有任何内存复制发生。A 选项的 DMA 是描述 I/O 设备与内存之间的传输，和进程间通信无关。C 选项的 sendfile 是 zero-copy 网络 I/O 技术，减少的是用户空间→内核→用户空间的拷贝，不是共享内存的实现方式。D 选项纯属虚构，内核无法为特定用途「预留」L3 Cache。"
+        },
+        {
+          "id": "os-shared-memory-ipc-1-q2",
+          "question": "在 Linux 上执行 `ls /dev/shm/` 看到了 `video_frames` 这个文件，它的本质是什么？",
+          "choices": [
+            { "id": "A", "text": "这是一个普通文件，内核会把共享内存的内容定期同步到磁盘上" },
+            { "id": "B", "text": "/dev/shm 是 tmpfs 文件系统，该文件就是共享内存对象本身，完全存在于内存中，不会写磁盘" },
+            { "id": "C", "text": "这是一个 Unix Domain Socket 文件，两个进程通过它传输数据" },
+            { "id": "D", "text": "这是内核的 procfs 条目，只读，用于查看共享内存段的元数据" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "/dev/shm 在 Linux 上挂载的是 tmpfs，这是一种纯内存文件系统，文件的内容直接对应物理页帧，进程重启或系统关机后内容消失，永远不会写入磁盘。shm_open 创建的命名共享内存对象就存放在这里，文件大小就是 ftruncate 设置的共享内存大小。你可以直接 `stat /dev/shm/video_frames` 查看大小，或者 `rm /dev/shm/video_frames` 删除它（等价于 shm_unlink）。A 选项错在「同步到磁盘」，tmpfs 不做磁盘持久化。C 和 D 选项与事实不符。"
+        },
+        {
+          "id": "os-shared-memory-ipc-1-q3",
+          "question": "下列哪个 mmap 调用能让两个进程通过共享内存实现数据共享？",
+          "choices": [
+            { "id": "A", "text": "mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE, shm_fd, 0)" },
+            { "id": "B", "text": "mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, shm_fd, 0)" },
+            { "id": "C", "text": "mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_ANONYMOUS, -1, 0)" },
+            { "id": "D", "text": "mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0)" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "MAP_SHARED 标志让写操作直接反映到底层文件/共享内存对象上，其他映射了同一对象的进程立即可见。MAP_PRIVATE（选项 A）会在写操作时触发 Copy-On-Write，修改只在本进程的私有副本上，对其他进程不可见，失去了共享的意义。MAP_ANONYMOUS（选项 C）映射的是匿名内存，没有后端文件，子进程通过 fork 继承这段映射时可以共享（配合 MAP_SHARED），但无法用于不相关的两个进程。MAP_SHARED|MAP_ANONYMOUS 且 fd=-1（选项 D）是父子进程共享内存的方式，不能在两个独立进程间使用。"
+        },
+        {
+          "id": "os-shared-memory-ipc-1-q4",
+          "question": "如果在初始化进程间共享 mutex 时忘记调用 `pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED)`，最可能出现什么现象？",
+          "choices": [
+            { "id": "A", "text": "pthread_mutex_init 会立即返回 EINVAL 错误，程序在初始化时就会崩溃" },
+            { "id": "B", "text": "mutex 能正常初始化，但跨进程 lock/unlock 行为未定义，实测通常表现为互斥完全失效，两个进程同时持有锁" },
+            { "id": "C", "text": "程序编译时会报错，因为 POSIX 标准规定跨进程 mutex 必须用 PTHREAD_PROCESS_SHARED" },
+            { "id": "D", "text": "mutex 会自动降级为基于文件锁（flock）的实现，性能下降但功能正常" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "忘记设置 PTHREAD_PROCESS_SHARED 时，mutex 用默认属性（PTHREAD_PROCESS_PRIVATE）初始化，底层 futex 系统调用使用进程私有的等待队列。当进程 B 尝试 lock 一个被进程 A 持有的 mutex 时，内核无法把进程 B 正确挂到等待队列上，实测行为通常是 lock 立即返回成功（相当于没有互斥），两个进程可以同时修改受保护的数据结构，导致 data race 和随机崩溃。这个 bug 极难复现，因为大多数时候不会有真正的并发冲突，偶发崩溃让人困惑。A 选项错误，init 不会报错。C 和 D 与事实不符。"
+        },
+        {
+          "id": "os-shared-memory-ipc-1-q5",
+          "question": "以下是用 `ipcs -m` 查看 System V 共享内存的输出，关于这个输出的解读哪项正确？\n\n```\n------ Shared Memory Segments --------\nkey        shmid      owner      perms      bytes      nattch     status\n0x00000000 131073     root       600        4096       0\n0xdeadbeef 131074     www-data   666        536870912  3\n```",
+          "choices": [
+            { "id": "A", "text": "第二行的共享内存段大小是 536870912 字节（512MB），有 3 个进程已附加（nattch=3），key=0xdeadbeef 说明是通过 ftok 生成的具名段" },
+            { "id": "B", "text": "nattch=3 表示有 3 个进程正在等待访问这块共享内存，说明存在锁竞争" },
+            { "id": "C", "text": "status 列为空表示这块内存已经被标记为 IPC_RMID，下次所有进程 detach 后会自动释放" },
+            { "id": "D", "text": "perms=666 表示这个共享内存段使用了 666 字节的权限位图来控制访问" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "ipcs -m 输出中，bytes 是共享内存段大小（536870912 = 512 × 1024 × 1024 = 512MB），nattch 是当前调用了 shmat 附加这块内存的进程数量（3 个进程正在使用），key 是创建时指定的标识符（通常通过 ftok 从文件路径派生）。B 选项混淆了 nattch（附加数量）和等待队列。C 选项的判断依据错了，IPC_RMID 标记后 status 列会显示 `dest`，空 status 表示正常在用。D 选项完全错误，perms 是 Unix 权限位（类似文件权限），666 表示 owner/group/other 都有读写权限。"
+        },
+        {
+          "id": "os-shared-memory-ipc-1-q6",
+          "question": "生产者进程在持有 `shm->mutex` 期间因为 SIGSEGV 崩溃，消费者进程随后调用 `pthread_mutex_lock(&shm->mutex)` 会发生什么（假设 mutex 已设置 PTHREAD_MUTEX_ROBUST）？",
+          "choices": [
+            { "id": "A", "text": "lock 调用会永久阻塞，消费者进程卡死" },
+            { "id": "B", "text": "lock 调用返回 EOWNERDEAD，消费者必须调用 pthread_mutex_consistent 然后 unlock 才能恢复 mutex" },
+            { "id": "C", "text": "内核自动检测到 owner 崩溃并释放锁，lock 调用成功返回 0，消费者正常持有锁" },
+            { "id": "D", "text": "lock 调用返回 EDEADLK，表示检测到了死锁" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "PTHREAD_MUTEX_ROBUST 的语义是：如果持有 mutex 的线程/进程终止而没有释放，下一个尝试 lock 的调用者会拿到锁但返回 EOWNERDEAD（而不是 0）。这个返回值是信号，告诉调用者「上一个持有者异常退出了，共享状态可能不一致，你需要修复它」。正确处理流程是：检查 EOWNERDEAD → 修复共享数据结构到一致状态 → 调用 pthread_mutex_consistent 告知内核状态已修复 → 调用 pthread_mutex_unlock 释放锁。如果跳过 consistent 就 unlock，mutex 会进入 ENOTRECOVERABLE 状态，之后所有 lock 调用都会失败。A 描述的是没有 ROBUST 时的行为。C 是错误的，内核不会自动释放并假装一切正常。D 的 EDEADLK 是进程尝试重复锁定自己持有的 mutex 时返回的。"
+        },
+        {
+          "id": "os-shared-memory-ipc-1-q7",
+          "question": "同等数据量下，共享内存吞吐量远高于 Unix Domain Socket 的根本原因是什么？",
+          "choices": [
+            { "id": "A", "text": "共享内存使用的系统调用比 Socket 少，减少了用户态/内核态切换的开销" },
+            { "id": "B", "text": "Socket 传输需要把数据从发送方复制到内核缓冲区再复制到接收方，共享内存通过页表映射让数据只存一份，避免了这两次复制" },
+            { "id": "C", "text": "Socket 受 TCP 拥塞控制算法限制，Unix Domain Socket 虽然没有拥塞控制但仍然有 MTU 限制" },
+            { "id": "D", "text": "共享内存直接使用 CPU 寄存器传递数据，而 Socket 需要经过网络协议栈" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题考的是对「零拷贝」本质的理解。Unix Domain Socket 数据路径是：sender write() → 内核分配 socket buffer → memcpy 数据进 buffer → receiver read() → memcpy 数据出 buffer 到用户空间，共两次 memcpy。对于 12MB 的视频帧，每帧就是 24MB 的无效内存复制，720 帧/秒就是 17.28 GB/s 的纯浪费。共享内存通过页表让双方直接访问同一物理帧，零次复制。A 选项描述的系统调用开销是真实存在的，但对大块数据传输来说是次要因素，memcpy 才是主要瓶颈。C 选项错误，Unix Domain Socket 没有 TCP 拥塞控制，也没有 MTU 限制（那是网络层的概念）。D 选项是错的，CPU 寄存器根本无法跨进程传递数据。"
+        },
+        {
+          "id": "os-shared-memory-ipc-1-q8",
+          "question": "一个高频交易系统使用共享内存在行情网关和策略进程之间传递 tick 数据，延迟要求是 P99 < 1μs。以下哪种同步方案最适合这个场景？",
+          "choices": [
+            { "id": "A", "text": "使用 sem_wait/sem_post 信号量，消费者在 sem_wait 上睡眠等待，有新数据时生产者 sem_post 唤醒" },
+            { "id": "B", "text": "使用 pthread_cond_wait/pthread_cond_signal 条件变量，消费者等待条件变量，生产者写入后 broadcast" },
+            { "id": "C", "text": "使用原子变量（_Atomic uint64_t）作为序列号，消费者用 busy-wait 自旋轮询序列号变化，生产者写入后更新序列号" },
+            { "id": "D", "text": "每次访问共享内存前后都加 flock 文件锁，用内核的文件锁机制保证互斥" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "P99 < 1μs 这个要求意味着任何涉及内核调度的操作都是不可接受的。sem_wait（选项 A）和 pthread_cond_wait（选项 B）在没有数据时都会让线程进入睡眠，等待被 sem_post/cond_signal 唤醒，这个睡眠+唤醒过程涉及两次内核调度，延迟通常在 5-50μs，远超要求。HFT 系统的标准做法是 busy-wait 自旋：消费者线程绑定到一个独占 CPU 核（CPU affinity + isolcpus），不断轮询一个原子序列号；生产者写入完整数据后，用 `atomic_store` 更新序列号。消费者检测到序列号变化后立即读取，全程没有任何内核调用，延迟可控制在 200-500ns。代价是这个 CPU 核的利用率是 100%。flock（选项 D）是文件锁，每次操作都是系统调用，延迟更高，完全不适合低延迟场景。"
+        },
+        {
+          "id": "os-shared-memory-ipc-1-q9",
+          "question": "以下代码创建了一个 POSIX 共享内存并写入数据，进程退出后 `/dev/shm/mydata` 这个文件是否还存在？\n\n```c\nint fd = shm_open(\"/mydata\", O_CREAT|O_RDWR, 0600);\nftruncate(fd, 4096);\nvoid *p = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);\nmemcpy(p, \"hello\", 5);\n// 进程正常退出，没有调用 munmap、close 或 shm_unlink\n```",
+          "choices": [
+            { "id": "A", "text": "进程退出后文件立即消失，因为没有调用 shm_unlink" },
+            { "id": "B", "text": "进程退出后文件仍然存在于 /dev/shm/，内容保留，直到有人调用 shm_unlink 或系统重启" },
+            { "id": "C", "text": "进程退出后文件存在，但内容被清空为零，因为 mmap 映射已解除" },
+            { "id": "D", "text": "进程退出后文件存在，但大小变回 0，因为 ftruncate 的效果只在进程存活时有效" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "POSIX 共享内存的生命周期和文件系统对象类似：shm_open 创建的命名对象会一直存在于 /dev/shm/，直到有进程显式调用 shm_unlink 或系统重启（因为 tmpfs 的内容在重启后消失）。进程退出时，内核会自动关闭 fd（等价于 close）并解除 mmap 映射（等价于 munmap），但不会删除共享内存对象本身——这是 POSIX 的设计意图，因为可能还有其他进程需要用它。这种「进程退出但对象残留」的特性既有好处（另一个进程可以重新 attach），也是常见的资源泄漏源（程序崩溃后忘记 shm_unlink，/dev/shm 随时间积累了大量垃圾对象）。生产代码应该用 atexit 或信号处理器确保 shm_unlink 被调用。"
+        },
+        {
+          "id": "os-shared-memory-ipc-1-q10",
+          "question": "在生产系统中发现某个使用共享内存的消费者进程 CPU 使用率持续 100%，但实际处理的数据量并不大，最可能的原因是什么，如何确认并修复？",
+          "choices": [
+            { "id": "A", "text": "共享内存映射的物理页发生了频繁的 page fault，导致 CPU 大量时间花在页面调入上，需要用 mlock 锁定内存页" },
+            { "id": "B", "text": "消费者使用了 busy-wait 轮询共享内存中的标志位，在没有新数据时仍然不停地空转，CPU 被空转循环耗尽；可以改为 sem_wait 睡眠等待或限制轮询频率" },
+            { "id": "C", "text": "sem_wait 调用出现了优先级反转问题，消费者线程持续尝试加锁但一直失败，进入了 livelock 状态" },
+            { "id": "D", "text": "共享内存的大小超过了系统的 /dev/shm 配额，内核开始频繁 swap，导致 CPU 等待 I/O" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是共享内存系统最经典的性能陷阱。为了追求低延迟，工程师会用 busy-wait（自旋轮询）代替 sem_wait，代码大概是 `while (shm->ready_flag == 0) { /* spin */ }`。在有真实数据需要处理时这很高效；但当数据源的生产速率低于消费者的轮询速率时（例如夜间流量低峰），消费者线程会 100% 占用 CPU 做无意义的轮询。确认方法：`perf top -p <pid>` 观察热点是否在用户态循环上，或 `strace -c -p <pid>` 看系统调用是否极少（纯用户态 spin 没有 syscall）。修复方案有三：一是改用 sem_wait（引入睡眠延迟，适合非极致低延迟场景）；二是加 `nanosleep(1000)` 每轮轮询后睡 1μs，大幅降低空转 CPU 的同时延迟增加有限；三是用 Linux 的 `futex` 搭配自适应等待（先 spin 几百次，若无数据再 futex_wait 睡眠），这是 jemalloc、MySQL InnoDB 等高性能系统采用的方案。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Linux man page: shm_open(3)",
+          "url": "https://man7.org/linux/man-pages/man3/shm_open.3.html"
+        },
+        {
+          "title": "Linux man page: mmap(2)",
+          "url": "https://man7.org/linux/man-pages/man2/mmap.2.html"
+        },
+        {
+          "title": "Linux man page: pthread_mutexattr_setpshared(3)",
+          "url": "https://man7.org/linux/man-pages/man3/pthread_mutexattr_setpshared.3.html"
+        },
+        {
+          "title": "Linux man page: pthread_mutexattr_setrobust(3)",
+          "url": "https://man7.org/linux/man-pages/man3/pthread_mutexattr_setrobust.3.html"
+        },
+        {
+          "title": "POSIX Shared Memory — The Linux Programming Interface (Kerrisk)",
+          "url": "https://man7.org/tlpi/"
+        },
+        {
+          "title": "Shared memory performance benchmarks — LMAX Disruptor design paper",
+          "url": "https://lmax-exchange.github.io/disruptor/disruptor.html"
+        }
+      ]
+    }
+  ]
+}
