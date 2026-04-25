@@ -1,0 +1,159 @@
+{
+  "id": "os-tlb-miss-optimization",
+  "name": "TLB Miss 的性能影响与优化方案",
+  "domain": "operating-system",
+  "description": "TLB 失效代价量化、高频场景识别与大页/内存布局优化实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-tlb-miss-optimization-1",
+      "domain": "operating-system",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": ["TLB", "huge-pages", "performance", "perf", "memory-layout", "NUMA", "virtual-memory", "page-table"],
+      "title": "TLB 失效（TLB Miss）对性能有多大影响，如何优化",
+      "content": "你的团队维护一套内存数据库服务，数据集大小约 10GB，运行在 Linux x86-64 机器上（3GHz CPU，128GB RAM，4 个 NUMA 节点）。近期业务增长后，QPS 从 5 万涨到 8 万，但 CPU 利用率从 30% 飙到 75%，延迟 P99 从 3ms 涨到 18ms，吞吐量没有线性增长。你用 `top` 查看，并没有明显的系统调用瓶颈，也没有 I/O 等待。\n\n同事跑了一条 perf 命令之后，把结果甩给你：\n\n```\n$ perf stat -e dTLB-load-misses,dTLB-store-misses,iTLB-load-misses,\\  \n             cache-misses,cache-references,cycles,instructions \\\n             -p $(pgrep memdb) -- sleep 10\n\n Performance counter stats for process id '18742':\n\n    312,847,291      dTLB-load-misses          #   18.43% of all dTLB cache accesses\n     48,291,033      dTLB-store-misses\n      2,104,889      iTLB-load-misses\n    189,043,221      cache-misses              #   34.21% of all cache refs\n    552,841,031      cache-references\n 28,401,923,044      cycles\n  9,847,203,441      instructions              #    0.35  insn per cycle\n\n      10.003124204 seconds time elapsed\n```\n\ndTLB-load-misses 的比例高达 18.43%，insn per cycle 只有 0.35，正常业务代码在这台机器上应该在 2.0 左右。这个结果意味着什么？TLB Miss 究竟能造成多大的性能损失？如果你来负责这次优化，从哪里入手，能拿到多少收益？",
+      "answer": "## TLB 是什么，为什么它的失效代价如此昂贵\n\n要理解这份 perf 输出有多严重，先要理解 TLB 在现代 CPU 里扮演的角色。现代操作系统使用虚拟内存，每个进程看到的是一段连续的虚拟地址空间，但物理内存是碎片化分配的。每次内存访问，CPU 都必须把虚拟地址翻译成物理地址，这个翻译的依据是页表（page table）——一棵多级树形结构，存在内存里。如果每次访存都去走页表，那内存访问的代价会翻好几倍。TLB（Translation Lookaside Buffer，旁路转换缓冲）就是这个翻译过程的缓存，它把最近用过的虚拟地址到物理地址的映射存在 CPU 芯片上，命中时翻译只需要 1 个时钟周期。\n\n问题在于 TLB 容量极其有限。典型 x86-64 服务器的 L1 dTLB 只有 64 个条目，每个条目覆盖一个 4KB 的页面，所以 L1 dTLB 总共只能覆盖 64 × 4KB = 256KB 的内存范围。L2 TLB 大一些，约 1536 个条目，覆盖约 6MB。对于一个 10GB 的数据集来说，6MB 的覆盖范围意味着随机访问时几乎每次都会 TLB Miss。\n\nTLB Miss 之后发生什么，决定了代价有多高。L1 TLB Miss 时，CPU 先查 L2 TLB，大约 5 个周期。如果 L2 TLB 也 Miss，CPU 的 MMU（内存管理单元）必须做页表遍历（page table walk）：在 x86-64 的四级页表结构（PML4 → PDPT → PD → PT）下，需要 4 次内存读取。如果这 4 级页表页都恰好在 L1/L2 CPU 缓存里，大约需要 100 个周期。但如果页表页本身也不在缓存里，每次读取就要去 DRAM，每次约 100ns，4 次就是 400ns。在 3GHz 的 CPU 上，400ns 等于 1200 个时钟周期。这意味着一次普通的 load 指令，原本只需要 4-5 个周期（L1 缓存命中），因为 TLB Miss 可能膨胀到 1200 个周期，代价放大了 240 倍。\n\n现在回头看那份 perf 数据：18.43% 的 dTLB load miss 率，加上 insn per cycle 只有 0.35（正常应在 2.0 左右），说明 CPU 绝大部分时间都在等待地址翻译，而不是在执行真正的计算指令。这就是为什么 QPS 增长 60% 却把 CPU 打到 75% 的根本原因——每个请求消耗的 CPU 周期数翻了好几倍，都浪费在了 TLB Miss 引发的页表遍历上。\n\n## 量化 TLB Miss 的真实代价\n\n在开始优化之前，先要把代价算清楚。用 perf 可以进一步拿到每次 miss 的平均代价：\n\n```bash\n# 统计 TLB miss 时的平均停顿周期数\n$ perf stat -e dTLB-load-misses,dTLB-load-misses:u,\\  \n             mem_load_retired.l1_miss,\\  \n             mem_load_retired.l2_miss,\\  \n             mem_load_retired.l3_miss \\\n             -p $(pgrep memdb) -- sleep 5\n\n# 用火焰图定位哪些代码路径触发了最多 TLB miss\n$ perf record -e dTLB-load-misses:pp -g -p $(pgrep memdb) -- sleep 30\n$ perf report --stdio | head -50\n```\n\n`dTLB-load-misses:pp` 中的 `:pp` 表示精确采样（precise sampling），可以定位到具体的指令地址，而不是粗粒度的函数。这在找热点数据结构时非常关键——你经常会发现 80% 的 TLB miss 来自某一个核心的哈希表或 B 树遍历。\n\n另一个有用的工具是 `perf mem`，它能告诉你每次内存访问是从哪一层存储层次满足的：\n\n```bash\n$ perf mem record -p $(pgrep memdb) -- sleep 10\n$ perf mem report --stdio\n# 关注 \"TLB\" 这一列，以及 \"L3 Hit\" vs \"DRAM\" 的比例\n```\n\n在这个场景里，合理预期是 TLB miss 正在贡献 20%-40% 的总 CPU 时间，这与 insn per cycle 从 2.0 跌到 0.35 的幅度是吻合的。\n\n## 优化方案一：透明大页（THP）——最小投入最大收益\n\n解决 TLB Miss 最直接的思路是让每个 TLB 条目能覆盖更大的内存范围。x86-64 支持 2MB 的大页（huge page），启用之后 L1 dTLB 的 64 个条目能覆盖 64 × 2MB = 128MB，L2 TLB 的 1536 个条目覆盖约 3GB。对于 10GB 的数据集，虽然还是不够，但 TLB miss 率会从 18% 显著下降。\n\nLinux 提供了透明大页（Transparent Huge Pages，THP）机制，内核会自动把连续的 4KB 页面合并成 2MB 大页，应用程序不需要修改代码：\n\n```bash\n# 查看当前 THP 状态\n$ cat /sys/kernel/mm/transparent_hugepage/enabled\n[always] madvise never\n\n# 如果是 madvise 或 never，改成 always 让内核积极合并\n$ echo always > /sys/kernel/mm/transparent_hugepage/enabled\n\n# 同时启用 khugepaged 后台合并守护进程\n$ echo 1 > /sys/kernel/mm/transparent_hugepage/khugepaged/defrag\n\n# 验证大页使用量\n$ grep -i hugepages /proc/meminfo\nAnonHugePages:   8519680 kB   # 这是 THP 分配量，约 8.1GB，说明大部分数据已用大页\nHugePages_Total:       0\nHugePages_Free:        0\n```\n\n但 THP 有一个隐患：内核在合并或分裂大页时会引入短暂的延迟抖动，这在延迟敏感的场景（比如数据库）里可能造成偶发的 P99 尖刺。Redis 的官方文档就明确建议关闭 THP。更精细的做法是把 THP 改成 `madvise` 模式，然后在应用层对热点数据的内存区域主动调用 `madvise(addr, len, MADV_HUGEPAGE)`：\n\n```c\n// 分配 10GB 数据集内存后，告诉内核这段内存适合用大页\nvoid* data = mmap(NULL, 10UL * 1024 * 1024 * 1024,\n                  PROT_READ | PROT_WRITE,\n                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n// 主动申请内核使用大页（madvise 模式下才需要这一步）\nmadvise(data, 10UL * 1024 * 1024 * 1024, MADV_HUGEPAGE);\n```\n\n## 优化方案二：显式大页（Explicit Huge Pages）——稳定无抖动\n\n比 THP 更可控的方案是在系统启动时预分配固定数量的 2MB 大页，然后用 `mmap` 直接申请：\n\n```bash\n# 预分配 5120 个 2MB 大页 = 10GB\n$ echo 5120 > /proc/sys/vm/nr_hugepages\n\n# 验证预分配成功\n$ grep HugePages /proc/meminfo\nHugePages_Total:    5120\nHugePages_Free:     5120\nHugepagesize:       2048 kB\n```\n\n应用层通过 `MAP_HUGETLB` 标志直接从大页池申请内存：\n\n```c\n#include <sys/mman.h>\n#define HUGE_PAGE_SIZE (2UL * 1024 * 1024)  // 2MB\n\nvoid* alloc_huge(size_t size) {\n    // MAP_HUGETLB 告诉内核从预分配的大页池分配\n    // size 必须是 2MB 的整数倍\n    size_t aligned = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);\n    void* p = mmap(NULL, aligned,\n                   PROT_READ | PROT_WRITE,\n                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,\n                   -1, 0);\n    if (p == MAP_FAILED) {\n        // 回退到普通页面\n        return malloc(size);\n    }\n    return p;\n}\n```\n\n显式大页没有 THP 的合并/分裂抖动，但要求在应用启动之前预留内存，灵活性稍差。PostgreSQL 的 `huge_pages = on` 配置就走的是这条路，官方测试在 `shared_buffers = 32GB` 的场景下查询性能提升 10-20%。\n\n## 优化方案三：内存访问模式优化——有时候比大页还有效\n\n大页能放大每个 TLB 条目的覆盖范围，但如果访问模式本身就是高度随机的（比如跳表、哈希链表），就算用了大页，跨页跳转还是会触发大量 miss。这时候更需要的是改善数据局部性。\n\n「struct of arrays」vs「array of structs」是一个经典的内存布局选择。假设你有一百万条记录，每条记录包含一个 8 字节的 key 和 64 字节的 value：\n\n```c\n// Array of Structs（AoS）：对随机访问 value 友好，但顺序扫描 key 时\n// 每 8 字节 key 之后跟着 64 字节 value，步长大，TLB 压力高\nstruct Record { uint64_t key; char value[64]; };\nRecord records[1000000];  // 总大小 72MB，步长 72 字节\n\n// Struct of Arrays（SoA）：顺序扫描所有 key 只需访问 8MB 连续内存\n// TLB 覆盖范围更小，miss 率更低\nuint64_t keys[1000000];    // 8MB 连续\nchar     values[1000000][64]; // 64MB，按需访问\n```\n\n对于这个内存数据库场景，如果核心操作是「先在 key 空间里做范围查询，再按需取 value」，SoA 布局能显著降低 key 扫描阶段的 TLB 压力，因为所有 key 紧密排列，只需要更少的 TLB 条目就能覆盖整个扫描范围。\n\n## NUMA 的乘数效应\n\n这台机器有 4 个 NUMA 节点，TLB Miss 后的页表遍历如果访问的是远端 NUMA 节点的内存，代价会进一步放大 2-4 倍。用 `numastat` 和 `numactl` 检查：\n\n```bash\n# 查看各 NUMA 节点的内存命中/未命中情况\n$ numastat -p $(pgrep memdb)\n\n# 如果 numa_miss 很高，用 --localalloc 绑定本地分配\n$ numactl --localalloc --cpunodebind=0 ./memdb\n\n# 或者用 --interleave 让数据均匀分布在所有 NUMA 节点上\n$ numactl --interleave=all ./memdb\n```\n\n在 NUMA 架构下，页表本身也有 NUMA 归属问题。内核默认把页表放在发出 `mmap` 调用的那个 CPU 所在的 NUMA 节点上。如果数据访问来自其他 NUMA 节点的 CPU，页表遍历时访问远端节点的页表页，代价会翻倍。`numactl --interleave` 可以分散数据，但无法控制页表的分布，这是目前 Linux 内核的一个已知局限。\n\n## 预期优化效果\n\n针对这个 10GB 内存数据库场景，综合以上优化的实测数据（基于 Redis 及类似系统的生产经验）：启用 THP 或显式大页通常能把 dTLB-load-miss 率从 18% 降到 3-5%，对应 QPS 提升 15-25%，P99 延迟下降 30-50%。结合 NUMA 本地化分配，可以进一步节省 10-15% 的 CPU 开销。数据布局优化（SoA）在大规模范围扫描场景额外带来 10-20% 提升。三者合计，把 insn per cycle 从 0.35 恢复到 1.2-1.5 左右是完全可以预期的。",
+      "keyPoints": [
+        "L1 dTLB 只有 64 个条目，使用 4KB 页时仅覆盖 256KB 内存；10GB 数据集随机访问几乎必然触发 TLB Miss，这是 18.43% miss 率的根本原因",
+        "完整的 TLB Miss 代价链：L1 TLB Miss (~5 cycles) → L2 TLB Miss → 4 级页表遍历 → 若页表页不在 CPU 缓存则 4 次 DRAM 访问 = ~400ns = ~1200 cycles，单次 load 代价放大 240 倍",
+        "insn per cycle 从正常的 2.0 跌到 0.35，说明 CPU 流水线 85% 的时间在等待地址翻译，而不是执行计算指令，这是判断 TLB 瓶颈严重程度的关键指标",
+        "2MB 大页让 L1 dTLB 的 64 个条目覆盖 128MB（是 4KB 页的 512 倍），L2 TLB 覆盖约 3GB，大幅降低相同数据集的 TLB Miss 率",
+        "THP 在 `always` 模式下可能引入大页合并/分裂的延迟抖动，延迟敏感场景应使用 `madvise` 模式配合显式 `madvise(MADV_HUGEPAGE)` 调用，或直接使用 `MAP_HUGETLB` 显式大页",
+        "NUMA 架构下 TLB Miss 触发的页表遍历若跨 NUMA 节点，代价额外放大 2-4 倍；`numactl --localalloc` 是最直接的缓解手段",
+        "数据布局（SoA vs AoS）和访问模式（顺序 vs 随机）影响同等数量内存访问所需的 TLB 条目数；紧密排列热点字段能在不换大页的前提下降低 TLB 压力"
+      ],
+      "quiz": [
+        {
+          "id": "os-tlb-miss-optimization-1-q1",
+          "question": "在 x86-64 架构使用 4KB 页面时，典型的 L1 dTLB（64 个条目）能覆盖多大的内存范围？",
+          "choices": [
+            { "id": "A", "text": "256KB" },
+            { "id": "B", "text": "4MB" },
+            { "id": "C", "text": "64MB" },
+            { "id": "D", "text": "1GB" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "L1 dTLB 有 64 个条目，每个条目映射一个 4KB 的页面，所以总覆盖范围是 64 × 4KB = 256KB。这个数字非常小，对于任何超过数百 KB 的工作集来说，随机访问都几乎必然触发 TLB Miss。B 选项（4MB）是混淆了 64 × 64KB 的计算。C 和 D 选项大幅高估了 L1 TLB 的覆盖能力。理解这个基数很重要——它解释了为什么面对 GB 级别的内存数据集，TLB Miss 会成为严重瓶颈。"
+        },
+        {
+          "id": "os-tlb-miss-optimization-1-q2",
+          "question": "当 L2 TLB Miss 发生且页表页不在 CPU 缓存中时，x86-64 四级页表结构需要几次内存访问才能完成地址翻译？",
+          "choices": [
+            { "id": "A", "text": "1 次（直接查物理页号）" },
+            { "id": "B", "text": "2 次（两级页表）" },
+            { "id": "C", "text": "4 次（PML4 → PDPT → PD → PT）" },
+            { "id": "D", "text": "8 次（需要校验每级的权限位）" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "x86-64 使用四级页表：PML4（Page Map Level 4）→ PDPT（Page Directory Pointer Table）→ PD（Page Directory）→ PT（Page Table），每一级都是一次独立的内存读取。如果这 4 个页表页都不在 CPU 缓存中，就需要 4 次 DRAM 访问，每次约 100ns，合计约 400ns，在 3GHz CPU 上等于约 1200 个时钟周期。A 选项是单级页表的情况（早期 32 位系统）。B 选项是二级页表。D 选项是干扰项，权限位检查是每次访问中的一部分，不会额外产生独立的内存访问。"
+        },
+        {
+          "id": "os-tlb-miss-optimization-1-q3",
+          "question": "perf stat 输出显示 `insn per cycle` 为 0.35，正常业务代码应在 2.0 左右。这个数字说明了什么？",
+          "choices": [
+            { "id": "A", "text": "CPU 分支预测失败率很高，导致流水线频繁冲刷" },
+            { "id": "B", "text": "CPU 大部分时间在等待内存或地址翻译，计算指令无法填满流水线" },
+            { "id": "C", "text": "应用程序是单线程的，没有充分利用多核" },
+            { "id": "D", "text": "CPU 频率受到温度限制被降频到约 17% 的正常水平" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "IPC（instructions per cycle）是 CPU 流水线利用效率的核心指标。正常的 CPU-bound 计算代码 IPC 在 1.5-4.0 之间，越高说明超标量执行越充分。IPC 跌到 0.35 意味着 CPU 每个周期连一条指令都执行不完，几乎所有周期都在等待——最常见的原因是等待内存访问（缓存 miss 或 TLB miss）。A（分支预测）通常会降低 IPC 但不会降得这么极端，且 perf 里 branch-misses 计数器会有明显体现。C（单线程）影响并发度不影响单核 IPC。D 是误解，CPU 降频会减少 Hz 而不是降低 IPC。"
+        },
+        {
+          "id": "os-tlb-miss-optimization-1-q4",
+          "question": "启用 2MB 大页后，L1 dTLB（64 个条目）的内存覆盖范围变为多少？",
+          "choices": [
+            { "id": "A", "text": "512KB（比 4KB 页多一点）" },
+            { "id": "B", "text": "2MB（只有一个大页条目）" },
+            { "id": "C", "text": "128MB" },
+            { "id": "D", "text": "4GB（CPU 自动扩展 TLB 条目数）" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "大页的核心价值在于每个 TLB 条目覆盖更大范围。使用 2MB 大页时，64 个条目 × 2MB/条目 = 128MB，比使用 4KB 页时的 256KB 扩大了整整 512 倍。这解释了大页为什么对 TLB Miss 有如此显著的改善效果——原本 10GB 数据集对 256KB 覆盖范围来说几乎完全 miss，而对 128MB 来说热点数据很可能大部分都在 TLB 里。D 选项是错误的，CPU 的 TLB 条目数是硬件固定的，不会因为使用大页而增加。"
+        },
+        {
+          "id": "os-tlb-miss-optimization-1-q5",
+          "question": "执行 `grep -i hugepages /proc/meminfo` 后看到 `AnonHugePages: 8519680 kB`，这说明什么？",
+          "choices": [
+            { "id": "A", "text": "系统预分配了 8.1GB 的显式大页（HugePages），等待应用使用" },
+            { "id": "B", "text": "THP 已将约 8.1GB 的匿名内存合并为 2MB 大页，应用无感知地获得了大页优化" },
+            { "id": "C", "text": "内核用 8.1GB 内存存储所有进程的页表，说明页表本身占用过大" },
+            { "id": "D", "text": "有 8.1GB 内存标记为 MADV_HUGEPAGE 但尚未真正分配" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "AnonHugePages 是透明大页（THP）的专属计数器，表示内核的 khugepaged 守护进程已经把匿名（anonymous，即非文件映射）的连续 4KB 页面合并成了 2MB 大页，这 8.1GB 都已经在使用大页格式。这是 THP 工作正常的典型表现。A 描述的是 HugePages_Total/HugePages_Free，那是显式大页（通过 nr_hugepages 预分配）的计数。C 是干扰项，页表占用通常在 MB 级别，不会有 GB 量级。D 错误，AnonHugePages 记录的是已实际分配并正在使用的大页，不是待分配的。"
+        },
+        {
+          "id": "os-tlb-miss-optimization-1-q6",
+          "question": "Redis 官方文档建议在生产环境关闭 THP，但本题的调优方案却推荐启用大页。这个矛盾怎么解释？",
+          "choices": [
+            { "id": "A", "text": "Redis 文档已过时，现代 Linux 内核的 THP 实现已没有抖动问题" },
+            { "id": "B", "text": "THP always 模式下内核异步合并/分裂大页会引入延迟抖动；建议用 madvise 模式，由应用主动控制哪些内存区域使用大页" },
+            { "id": "C", "text": "Redis 是单线程的，THP 只对多线程程序有效" },
+            { "id": "D", "text": "大页优化只对读操作有效，Redis 写操作多所以无法受益" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "THP 在 `always` 模式下，khugepaged 守护进程会在后台扫描并合并 4KB 页面，这个合并操作需要暂停相关内存区域的访问，会造成几毫秒量级的随机延迟抖动，对 Redis 这类追求低延迟（<1ms P99）的服务影响很明显。Redis 官方测试发现开启 THP 会导致偶发的高延迟尖刺。正确做法是 THP 改成 `madvise` 模式，然后让应用对确实适合大页的内存区域（比如长期存在的大块哈希表）主动调用 madvise，避免内核随机合并导致的抖动。显式大页（MAP_HUGETLB）完全没有这个问题，因为大页在启动时就预分配好了，运行时不会发生合并操作。"
+        },
+        {
+          "id": "os-tlb-miss-optimization-1-q7",
+          "question": "在同等内存大小下，「Struct of Arrays（SoA）」相比「Array of Structs（AoS）」在顺序扫描 key 字段时，对 TLB 有什么影响？",
+          "choices": [
+            { "id": "A", "text": "SoA 更差，因为 key 和 value 分离，需要两次 TLB 查询" },
+            { "id": "B", "text": "两者一样，TLB 只关心物理页面数量，与数据结构布局无关" },
+            { "id": "C", "text": "SoA 更好，key 数组紧密排列，扫描相同数量的 key 访问更少的页面，需要更少 TLB 条目" },
+            { "id": "D", "text": "AoS 更好，因为连续内存访问触发硬件预取，预取会预热 TLB" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "TLB 压力本质上取决于访问了多少个不同的页面。AoS 中每条记录 (key + value) 是 72 字节，顺序扫描 100 万条 key 需要遍历 72MB 的内存，访问约 18000 个 4KB 页面，远超 TLB 容量。SoA 中 key 数组是 8MB 的紧密排列，扫描同样的 100 万条 key 只访问约 2000 个页面，TLB 需求小得多。A 的逻辑有误，「两次 TLB 查询」不是这里的关键。B 是错误的，TLB 非常关心访问跨越多少不同页面。D 的硬件预取确实存在，但预取的是缓存行（cache line），不能预热 TLB，地址翻译是 CPU 流水线前端的工作，与缓存预取相对独立。"
+        },
+        {
+          "id": "os-tlb-miss-optimization-1-q8",
+          "question": "在 4 个 NUMA 节点的服务器上，TLB Miss 触发的页表遍历为什么可能比单 NUMA 节点更昂贵？",
+          "choices": [
+            { "id": "A", "text": "NUMA 系统的内存总线带宽被分成 4 份，每份带宽只有单节点的 25%" },
+            { "id": "B", "text": "页表遍历需要访问的页表页可能在其他 NUMA 节点的内存上，跨 NUMA 内存访问延迟是本地的 2-4 倍" },
+            { "id": "C", "text": "NUMA 系统必须在所有 4 个节点上同步页表，导致页表遍历需要 4 倍的内存访问次数" },
+            { "id": "D", "text": "NUMA 节点间的 TLB Shootdown 操作在每次页表遍历时都会发生" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "NUMA（Non-Uniform Memory Access）架构的核心特征是访问本地内存（与当前 CPU 在同一节点）延迟低（约 100ns），访问远端节点内存延迟高（约 200-400ns）。当一个进程的页表页被分配在某个 NUMA 节点上，但执行线程跑在另一个节点的 CPU 上时，页表遍历的 4 次内存访问全都变成了远端访问，整体延迟从 400ns 膨胀到 800-1600ns。A 错误，NUMA 分割的是局部性而非总带宽。C 错误，每个进程有自己的页表，不需要跨节点同步（除 TLB Shootdown 外）。D 中的 TLB Shootdown 是修改页表时通知其他 CPU 刷新 TLB 的机制，与页表遍历是不同的操作。"
+        },
+        {
+          "id": "os-tlb-miss-optimization-1-q9",
+          "question": "使用 `MAP_HUGETLB` 分配的显式大页内存，如果 `/proc/sys/vm/nr_hugepages` 中没有足够的预分配大页，会发生什么？",
+          "choices": [
+            { "id": "A", "text": "内核自动从普通页面拼凑出 2MB 连续空间，透明降级" },
+            { "id": "B", "text": "mmap 调用返回 MAP_FAILED（errno = ENOMEM），需要应用程序自行处理回退逻辑" },
+            { "id": "C", "text": "内核触发 OOM killer，杀掉其他进程释放内存" },
+            { "id": "D", "text": "mmap 成功返回，但实际使用时降级为 4KB 页面，应用无感知" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "显式大页（MAP_HUGETLB）的分配来自系统预先保留的大页池，这个池子的大小由 nr_hugepages 决定，运行时不会自动扩展。如果池子里没有足够的大页，mmap 会直接失败并返回 MAP_FAILED，errno 设为 ENOMEM。这就是为什么使用显式大页的代码必须包含回退逻辑（如示例中的 `if (p == MAP_FAILED) return malloc(size)`）。A 描述的是 THP 的行为，不是 MAP_HUGETLB。C（OOM killer）是在整体系统内存不足时才触发，与大页池耗尽是不同的错误条件。D 是 THP 的特性，显式大页没有这种透明降级机制。"
+        },
+        {
+          "id": "os-tlb-miss-optimization-1-q10",
+          "question": "用 `perf stat -e dTLB-load-misses:pp` 中的 `:pp` 修饰符（precise sampling）相比不加修饰符，主要解决了什么问题？",
+          "choices": [
+            { "id": "A", "text": "`:pp` 增加采样频率，每秒采集更多样本，统计数据更准确" },
+            { "id": "B", "text": "`:pp` 启用精确采样，通过 PEBS（Intel）或 IBS（AMD）机制把 miss 定位到触发它的精确指令地址，而不是附近几条指令的某个随机位置" },
+            { "id": "C", "text": "`:pp` 开启 per-process 模式，只采集指定进程而不受系统其他进程干扰" },
+            { "id": "D", "text": "`:pp` 启用并行采样，同时在所有 CPU 核上采集，不遗漏多线程场景" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "PMU（Performance Monitoring Unit）在计数器溢出时产生中断，但中断处理存在延迟，当中断到达时 CPU 已经执行了若干条后续指令，导致记录的 IP（instruction pointer）不是真正触发事件的那条指令，这个偏差叫做「skid」。Intel 的 PEBS（Precise Event Based Sampling）和 AMD 的 IBS（Instruction Based Sampling）机制在硬件层面记录真正触发事件时的精确 IP，消除 skid。`:p` 是低精度精确采样，`:pp` 是高精度精确采样。这在定位热点指令（比如具体是哪个 load 指令触发了 TLB miss）时非常关键——没有精确采样，火焰图上的热点可能指向错误的函数位置。A、C、D 都是对这个修饰符的常见误解。"
+        }
+      ],
+      "references": [
+        "https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html",
+        "https://www.kernel.org/doc/html/latest/admin-guide/mm/transhuge.html",
+        "https://www.brendangregg.com/perf.html",
+        "https://redis.io/docs/management/admin/",
+        "https://www.postgresql.org/docs/current/kernel-resources.html#LINUX-HUGE-PAGES",
+        "https://www.man7.org/linux/man-pages/man2/mmap.2.html",
+        "https://www.man7.org/linux/man-pages/man2/madvise.2.html"
+      ]
+    }
+  ]
+}
