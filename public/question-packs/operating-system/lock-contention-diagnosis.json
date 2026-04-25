@@ -1,0 +1,159 @@
+{
+  "id": "os-lock-contention-diagnosis",
+  "name": "多线程锁竞争问题排查",
+  "domain": "operating-system",
+  "description": "排查多线程程序中锁竞争问题的工具、方法与生产实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-lock-contention-diagnosis-1",
+      "domain": "operating-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["lock-contention", "mutex", "perf", "pprof", "futex", "debugging", "concurrency"],
+      "title": "如何排查多线程程序中的锁竞争问题",
+      "content": "你的服务跑在一台 32 核的物理机上，理论上加满 goroutine 应该能榨干所有核心。然而监控显示，无论把并发度拉多高，QPS 始终卡在 12,000 左右，CPU 使用率停在 60% 就不再上涨了。更让人迷惑的是，P99 延迟高达 180ms，而你用基准测试量过，业务逻辑本身算下来不超过 5ms。\n\n你登到机器上跑了几条命令：\n\n```\n$ top -H -p $(pgrep order-svc)\n  PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND\n12341 www       20   0   8.2g   2.1g   18m S  62.4   3.3  142:18.72 order-svc\n\n$ vmstat 1 3\nprocs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----\n r  b   swpd   free   buff  cache   si   so    bi    bo   in    cs us sy id wa st\n18  0      0 12453m   234m  8912m    0    0     0    12  891 148321  8 54 38  0  0\n18  0      0 12448m   234m  8912m    0    0     0     8  876 152847  9 55 36  0  0\n18  0      0 12440m   234m  8912m    0    0     0     6  901 149233  7 56 37  0  0\n```\n\n注意看 `vmstat` 输出里的两个字段：`cs`（context switches，上下文切换次数）每秒高达 15 万次，`sy`（system time，内核态时间占比）高达 55%。对于纯业务计算型服务来说，`sy` 正常应当不超过 5%，这里却是用户态时间的六倍。CPU 并没有在跑你的代码，而是在内核里反复进行 futex 相关的系统调用——这是锁竞争最典型的外在体征。\n\n这个服务是一个 Go 写的订单处理系统，每次请求进来都会读写一个全局 `sync.Mutex` 保护的 `map[string]int`，用于统计各 SKU 的在途库存计数。临界区只有三行代码，看起来完全没问题。但就是这三行，在 32 核并发下彻底卡死了服务。\n\n**问题是：如果你面对上面这样的监控数据，应该如何一步步确认根因是锁竞争，定位到具体是哪把锁，再制定修复方案？请说明完整的排查工具链和每个工具的判断依据，以及针对本场景你会选择哪种修复策略，为什么。**",
+      "answer": "## 第一步：理解锁竞争的本质，从症状建立直觉\n\n在开始动工具之前，先要理解为什么锁竞争会造成「CPU 加不满但延迟高」这个反直觉的现象。互斥锁的实现核心是 futex（Fast Userspace Mutex，快速用户态互斥量），它的设计哲学是：无竞争时只在用户态做一次 CAS（Compare-And-Swap）原子操作就能拿锁，几乎没有开销；只有当 CAS 失败（锁已被占用）时，才通过 `futex_wait` 这个系统调用把自己挂起，让出 CPU，等持锁方调用 `futex_wake` 来唤醒。\n\n这就引出了锁竞争的代价：每一次「锁被占用 → 睡眠等待 → 被唤醒」的循环，都需要两次内核态切换（`futex_wait` 和 `futex_wake`），每次切换消耗约 1~5 微秒，外加上下文保存/恢复的 CPU 开销。当 32 个 goroutine 同时竞争一把锁，只有一个能拿到，其余 31 个都在睡眠。等它们轮流被唤醒、执行、释放锁，整个临界区的执行变成了串行队列，无论你加多少核心都没用——这就是 Amdahl 定律在锁竞争上的体现：串行部分的比例决定了并行加速比的上限。\n\n所以 `vmstat` 里看到的 `sy` 高、`cs` 高，本质上是大量 goroutine 反复进出内核睡眠的代价，不是真正在做计算。\n\n## 第二步：Linux 层面的工具，逐步缩小范围\n\n### 用 /proc 快速判断「是主动睡眠还是被抢占」\n\n锁竞争导致的上下文切换是「主动切换」——线程自己调用 `futex_wait` 让出 CPU。而 CPU 打满导致的切换是「非自愿切换」——线程被调度器强制换出。`/proc/PID/status` 里精确地记录了这两类切换的次数：\n\n```\n$ cat /proc/$(pgrep order-svc)/status | grep ctxt\nvoluntary_ctxt_switches:    4523891\nnonvoluntary_ctxt_switches:   12847\n```\n\n`voluntary_ctxt_switches`（主动切换）是 `nonvoluntary`（非自愿切换）的 350 倍，直接说明线程是在主动放弃 CPU，而不是因为时间片耗尽被抢占。这个比例在锁竞争严重时会非常悬殊，是最快的一手确认依据。\n\n### 用 strace 量化 futex 开销\n\n确认是主动睡眠之后，下一步是量化 futex 系统调用到底消耗了多少时间：\n\n```\n$ strace -c -e futex -p $(pgrep order-svc) -f -- sleep 5\n% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n100.00    4.821394         181     26632     13287 futex\n------ ----------- ----------- --------- --------- ----------------\n100.00    4.821394                 26632           total\n```\n\n5 秒的采样窗口里，`futex` 累计消耗了 4.8 秒——几乎所有的系统调用时间都花在了互斥等待上。`errors` 字段的 13287 不是真正的错误，而是 `futex_wait` 因为锁已被释放而以 `EAGAIN` 提前返回的次数，属于正常的乐观唤醒机制。看到这个输出，锁竞争的诊断基本坐实。\n\n### 用 perf lock 定位具体是哪把锁\n\n`strace` 告诉你「确实是锁的问题」，但没告诉你是哪把锁。`perf lock` 能做到这一步：\n\n```\n$ perf lock record -p $(pgrep order-svc) -- sleep 10\n[ perf record: Captured and wrote 84.2 MB perf.data ]\n\n$ perf lock report --key=wait_total\n                 Name   acquired  contended  total wait (ns)  max wait (ns)  avg wait (ns)\n---------------------------------------------------------------------------------------------\n    &orderSvc.skuMu      892341     748293      9823456789         234567          13115\n      runtime.mheap         2341        189          892341          45231           4721\n```\n\n第一行的 `&orderSvc.skuMu` 就是根因：被获取了 89 万次，其中 74 万次（84%）发生了竞争，每次平均等待 13 微秒，总计等待了将近 10 秒。`perf lock` 的好处是对语言无感，Go、C++、Java 进程都能用。\n\n## 第三步：Go 专项工具——mutex profile 精准定位代码位置\n\n`perf lock` 给出了锁对象地址，但要找到对应的 Go 代码位置，还需要 pprof 的 mutex profile。Go runtime 默认关闭 mutex 采样，需要在程序入口显式开启：\n\n```go\nimport (\n    \"net/http\"\n    _ \"net/http/pprof\"\n    \"runtime\"\n)\n\nfunc main() {\n    // n=1 表示每次竞争都记录，生产环境建议改为 5~10 降低开销\n    runtime.SetMutexProfileFraction(1)\n    // block profile 记录所有阻塞事件，包括 channel 等待和锁\n    runtime.SetBlockProfileRate(1000) // 每 1000ns 阻塞采样一次\n\n    go func() {\n        http.ListenAndServe(\"localhost:6060\", nil)\n    }()\n    // ... 服务启动逻辑\n}\n```\n\n服务跑起来后，用 pprof 拉取 mutex profile：\n\n```\n$ go tool pprof http://localhost:6060/debug/pprof/mutex\n(pprof) top\nShowing nodes accounting for 748293 samples, 94% of 798204 total\n      flat  flat%   sum%        cum   cum%\n    748293 93.75% 93.75%     748293 93.75%  sync.(*Mutex).Lock\n         0     0% 93.75%     748293 93.75%  main.(*OrderService).recordSKU\n         0     0% 93.75%     748293 93.75%  main.(*OrderService).HandleOrder\n\n(pprof) list recordSKU\nTotal: 748293\nROUTINE ======================== main.(*OrderService).recordSKU\n         0     748293 (flat, cum) 93.75% of Total\n         .          .     42:    func (s *OrderService) recordSKU(sku string, delta int) {\n         .          .     43:        s.skuMu.Lock()\n         .   748293     44:        s.skuMap[sku] += delta   // ← 748293 次竞争都在这里\n         .          .     45:        s.skuMu.Unlock()\n         .          .     46:    }\n```\n\n94% 的锁竞争集中在第 44 行，根因已经精确到代码行级别。如果加上 `-http=:8080` 参数用浏览器打开，还能看到完整的火焰图，竞争调用栈一目了然。\n\n对于 Java 服务，排查思路类似：用 `jstack PID` 查看所有线程状态，处于 `BLOCKED` 状态且等待同一个 `monitor` 的线程群就是锁竞争的现场；VisualVM 的 「Thread Monitor」视图能可视化展示各线程的 BLOCKED/RUNNABLE 比例。C++ 程序则可以用 Valgrind 的 Helgrind 工具检测锁的竞争关系和潜在的锁序问题（死锁风险）。\n\n## 第四步：制定修复方案，按场景选择策略\n\n排查完毕，现在来修。对于这个场景（全局 map + 高并发读写），有三个层次的优化手段，效果依次递增。\n\n**第一层：缩小临界区。** 最常见的低级错误是把 I/O、复杂计算、序列化操作放在锁内。临界区应该只包含真正需要原子性的内存操作。如果 `skuMap` 的写入之前还有一段 validation 逻辑，把它移到锁外面，每次持锁时间从 20μs 降到 2μs，竞争概率立刻降低 10 倍。\n\n**第二层：换用 sync.RWMutex。** 如果读写比高（比如 9:1），读操作可以并发执行，只有写操作需要独占。`sync.RWMutex` 的 `RLock()` 允许多个 goroutine 同时持有读锁，竞争大幅减少。但这里有一个不直觉的坑：当并发读者数量接近或超过 `GOMAXPROCS`（本例是 32）时，`RLock` 内部用来计数读者数量的原子加减操作本身会成为新的热点，导致性能反而不如普通 `Mutex`。如果你线上把 `Mutex` 换成 `RWMutex` 后延迟反而变高，就是踩了这个坑。\n\n**第三层：分片锁（sharding），效果最显著。** 把一把全局锁变成 N 把分桶锁，每个 key 按哈希落到对应的桶，不同桶之间完全不竞争。下面是针对本场景的实现：\n\n```go\nimport (\n    \"hash/fnv\"\n    \"sync\"\n)\n\nconst numShards = 32\n\ntype shard struct {\n    sync.RWMutex\n    data map[string]int\n    // 填充到 64 字节，避免伪共享（false sharing）：\n    // 两个相邻 shard 的 RWMutex 落在同一 CPU 缓存行，\n    // 一个核修改 shard-A 会导致持有 shard-B 的核缓存失效\n    _ [40]byte\n}\n\ntype ShardedSKUMap struct {\n    shards [numShards]shard\n}\n\nfunc NewShardedSKUMap() *ShardedSKUMap {\n    m := &ShardedSKUMap{}\n    for i := range m.shards {\n        m.shards[i].data = make(map[string]int)\n    }\n    return m\n}\n\nfunc (m *ShardedSKUMap) shardIdx(key string) int {\n    h := fnv.New32a()\n    h.Write([]byte(key))\n    return int(h.Sum32()) % numShards\n}\n\nfunc (m *ShardedSKUMap) Add(key string, delta int) {\n    idx := m.shardIdx(key)\n    m.shards[idx].Lock()\n    m.shards[idx].data[key] += delta\n    m.shards[idx].Unlock()\n}\n\nfunc (m *ShardedSKUMap) Get(key string) int {\n    idx := m.shardIdx(key)\n    m.shards[idx].RLock()\n    v := m.shards[idx].data[key]\n    m.shards[idx].RUnlock()\n    return v\n}\n```\n\n优化效果可以用基准测试验证：\n\n```\nBenchmarkGlobalMutex-32       1000000   1823 ns/op\nBenchmarkSyncMap-32           3000000    412 ns/op\nBenchmarkShardedMap32-32     12000000     89 ns/op\n```\n\n分片锁的吞吐量是全局 `Mutex` 的 20 倍，也比 `sync.Map` 快 4 倍多。`sync.Map` 适合「key 集合相对稳定、读远多于写」的场景（比如配置缓存），它的内部实现是 read map + dirty map 的双层结构，写操作有额外的 promote 开销，在写入频繁的场景不如分片锁。\n\n## 生产实践与注意事项\n\n一个容易被忽视的细节是 `SetMutexProfileFraction(1)` 的开销：采样率 1 意味着每次竞争都记录，在高并发下这本身会引入 ~5% 的额外 CPU 开销。生产环境排查时建议用 5~10，日常关闭（设为 0）。排查完成后记得把采样率重置。\n\n另外，false sharing（伪共享）是分片锁实现时最常见的坑：如果 `shard` 结构体没有填充到缓存行大小（x86 通常是 64 字节），相邻两个 shard 的 `RWMutex` 会共享同一条缓存行，一个 CPU 核修改 shard-0 时，持有 shard-1 的核的缓存就会失效，引入额外的 cache coherency 开销，分片的效果大打折扣。上面代码里的 `_ [40]byte` 填充就是为了解决这个问题（`sync.RWMutex` 是 24 字节，加上 40 字节 padding 恰好 64 字节对齐）。",
+      "keyPoints": [
+        "CPU sys% 高、上下文切换（cs）每秒超过十万次是锁竞争的典型外在体征，根因是大量 goroutine 在 futex_wait 系统调用中反复陷入内核睡眠，而非真正执行业务逻辑",
+        "/proc/PID/status 中 voluntary_ctxt_switches 远大于 nonvoluntary_ctxt_switches，说明线程是主动放弃 CPU 等待锁，而非被调度器抢占，是最快的锁竞争一手确认依据",
+        "futex（Fast Userspace Mutex）的设计是无竞争时只做用户态 CAS，有竞争时才通过 futex_wait 陷入内核阻塞，strace -c -e futex 可量化 futex 开销，若占总 syscall 时间 80% 以上基本可断定是锁竞争",
+        "Go 排查锁竞争的精准工具是 mutex profile：在程序入口调用 runtime.SetMutexProfileFraction(n) 开启后，pprof 能展示每个调用栈的竞争次数和累计等待时间，精确定位到代码行",
+        "perf lock record + perf lock report 在 Linux 内核层面统计每把锁的获取次数、竞争次数和总等待时间，对 Go/C++/Java 等所有语言均有效，适合跨语言的通用排查",
+        "sync.RWMutex 在并发读者数量接近 GOMAXPROCS 时，RLock 内部的原子计数操作本身会成为新的竞争瓶颈，可能导致性能反而低于 sync.Mutex，这是高并发场景的反直觉坑点",
+        "将单把全局锁按 key 哈希拆分为 N 个独立分片（sharding）是高并发 map 场景最有效的优化手段，实测吞吐量可达全局 Mutex 的 20 倍，同时需要对 shard 结构体做 64 字节 padding 避免 false sharing",
+        "生产环境使用 mutex profile 时，SetMutexProfileFraction(1) 的全量采样会引入约 5% 的额外 CPU 开销，建议排查时用 5~10，常态关闭（设为 0），排查完及时重置"
+      ],
+      "quiz": [
+        {
+          "id": "os-lock-contention-diagnosis-q1",
+          "question": "下面哪个 vmstat 输出特征最直接地说明服务存在严重的锁竞争，而非 CPU 计算瓶颈？",
+          "choices": [
+            { "id": "A", "text": "us%（用户态时间）持续超过 90%，说明大量 CPU 在跑业务代码" },
+            { "id": "B", "text": "sy%（内核态时间）高达 55% 且 cs（上下文切换）每秒超过 10 万次，而 us% 只有个位数" },
+            { "id": "C", "text": "wa%（I/O 等待）超过 30%，说明磁盘是瓶颈" },
+            { "id": "D", "text": "in（中断次数）每秒超过 5 万次，说明网卡 IRQ 处理不过来" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "锁竞争的核心代价是大量线程反复通过 futex_wait 系统调用陷入内核睡眠，每次陷入都是一次上下文切换，表现为 sy%（内核态时间）异常高、cs（上下文切换次数）极大。而 us% 反而很低，因为线程大部分时间在睡眠等待，不在执行用户态代码。选 A 描述的是 CPU 计算瓶颈（比如算法复杂度高），不是锁竞争。选 C 是 I/O 密集型特征。选 D 是网络高负载特征，和锁没有直接关系。"
+        },
+        {
+          "id": "os-lock-contention-diagnosis-q2",
+          "question": "futex（Fast Userspace Mutex）的设计核心是什么？",
+          "choices": [
+            { "id": "A", "text": "所有锁操作都通过内核系统调用完成，以确保原子性和公平性" },
+            { "id": "B", "text": "锁完全在用户态实现，不依赖内核，因此速度最快但不能跨进程使用" },
+            { "id": "C", "text": "无竞争时只在用户态做 CAS 原子操作，有竞争时才通过 futex_wait 陷入内核睡眠，兼顾无竞争场景的低开销和竞争场景的正确阻塞" },
+            { "id": "D", "text": "始终使用自旋等待（busy waiting）代替睡眠，避免上下文切换开销" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "futex 的名字就是「Fast Userspace Mutex」，设计哲学是把锁状态存在用户态内存里，无竞争时只需一次 CAS 操作（几纳秒），完全不进内核。只有 CAS 失败（说明有竞争）时，才通过 futex_wait 系统调用把自己挂起，等待 futex_wake 唤醒。选 A 描述的是传统内核锁（如 semaphore 系统调用），开销大得多。选 B 错在「完全不依赖内核」，有竞争时必须陷入内核。选 D 描述的是 spinlock（自旋锁），它不睡眠但会浪费 CPU，适合持锁时间极短的场景，不是 futex 的设计。"
+        },
+        {
+          "id": "os-lock-contention-diagnosis-q3",
+          "question": "执行 `cat /proc/PID/status | grep ctxt` 后看到 voluntary_ctxt_switches: 4523891，nonvoluntary_ctxt_switches: 12847。这个比例最能说明什么？",
+          "choices": [
+            { "id": "A", "text": "CPU 核心不够用，线程频繁被调度器强制抢占，需要扩容机器" },
+            { "id": "B", "text": "线程主动放弃 CPU（等待锁或 I/O）的次数远多于被强制切换，是锁竞争或 I/O 阻塞的强烈信号" },
+            { "id": "C", "text": "Go runtime 的 GC STW 频繁触发，导致大量 goroutine 被暂停" },
+            { "id": "D", "text": "进程的线程数过多，超过了操作系统调度器的最优管理范围" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "voluntary_ctxt_switches 代表线程主动调用 sched_yield、futex_wait 或阻塞在 I/O 时发生的上下文切换；nonvoluntary_ctxt_switches 代表线程时间片耗尽被调度器强制切换。前者 350 倍于后者，说明线程几乎都是主动让出 CPU，而不是被抢占，这是等待锁或 I/O 的典型特征。选 A 恰好相反——CPU 不够用的特征是 nonvoluntary 占主导（线程跑满时间片被强制切出）。选 C 是 GC 问题，Go GC 暂停不会体现为大量 voluntary 切换。选 D 是不准确的说法，线程数多少不直接决定切换类型。"
+        },
+        {
+          "id": "os-lock-contention-diagnosis-q4",
+          "question": "在 Go 程序中正确开启 mutex contention profile 的方式是？",
+          "choices": [
+            { "id": "A", "text": "运行 `go test -mutexprofile=mutex.out` 自动开启，无需修改代码" },
+            { "id": "B", "text": "在程序启动时调用 `runtime.SetMutexProfileFraction(n)`，n > 0 时开启采样，n=1 表示每次竞争都记录" },
+            { "id": "C", "text": "mutex profile 默认开启，直接访问 /debug/pprof/mutex 即可拿到数据，无需额外配置" },
+            { "id": "D", "text": "在每个 sync.Mutex.Lock() 调用前手动插入 pprof.StartCPUProfile()，结束后调用 StopCPUProfile()" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "Go runtime 的 mutex profile 默认关闭（fraction=0），必须显式调用 runtime.SetMutexProfileFraction(n) 才能开启。n 是采样间隔：n=1 时每次锁竞争都记录（最精确但开销最大），n=5 时每 5 次竞争采样一次（生产推荐）。选 A 的 -mutexprofile 只在 go test 时有效，运行时服务需要通过代码开启。选 C 是常见误区——/debug/pprof/mutex 端点存在，但如果 fraction=0，返回的 profile 是空的。选 D 完全错误，CPU profile 和 mutex profile 是两个独立的机制，CPU profile 无法追踪锁竞争。"
+        },
+        {
+          "id": "os-lock-contention-diagnosis-q5",
+          "question": "执行 `strace -c -e futex -p PID -- sleep 5` 后看到 errors 字段显示 13287。这代表什么？",
+          "choices": [
+            { "id": "A", "text": "有 13287 次锁获取失败，程序逻辑存在 bug，需要检查并发安全性" },
+            { "id": "B", "text": "futex_wait 系统调用以 EAGAIN 返回的次数，表示在等待期间锁已被释放（乐观唤醒），属于正常的 futex 工作机制" },
+            { "id": "C", "text": "有 13287 次系统调用超时，说明锁持有时间超过了 futex 的默认超时限制" },
+            { "id": "D", "text": "程序在 13287 个 goroutine 中检测到了潜在死锁，但运行时没有触发 panic" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "strace 的 errors 列记录的是系统调用返回非零值（即非 0 的错误码）的次数。对于 futex，EAGAIN 是一种预期的正常返回：futex_wait 的语义是「如果原子值还是我期望的那个值就睡眠」，如果在真正睡眠之前另一个线程已经修改了这个值（锁已释放），futex_wait 会立即以 EAGAIN 返回而不阻塞。这是 futex 的乐观唤醒机制，避免了不必要的睡眠，不代表错误。选 A、C、D 都是对 strace errors 字段的误解，实际上它只是「非零返回码」的计数，不代表「逻辑错误」。"
+        },
+        {
+          "id": "os-lock-contention-diagnosis-q6",
+          "question": "在一个 32 核机器上，一个读写比约为 9:1 的 Go 服务把 sync.Mutex 换成 sync.RWMutex 后，P99 延迟反而从 2ms 涨到了 8ms。最可能的原因是？",
+          "choices": [
+            { "id": "A", "text": "sync.RWMutex 的代码实现比 sync.Mutex 更复杂，每次加解锁的固定开销更大" },
+            { "id": "B", "text": "当并发读者数量接近或超过 GOMAXPROCS（32）时，RLock 内部用于计数读者的原子加减操作本身成为新的竞争热点，缓存行争抢反而更严重" },
+            { "id": "C", "text": "sync.RWMutex 存在写者饥饿问题，大量读请求让写操作长时间无法获取锁，积压导致延迟上升" },
+            { "id": "D", "text": "Go 1.21 对 sync.RWMutex 的实现引入了一个已知 bug，在高并发下会退化为串行执行" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是 sync.RWMutex 最著名的反直觉坑。RLock 的实现需要原子地增加一个 readerCount 计数器，当 32 个 goroutine 同时执行 RLock 时，这 32 次原子加操作本身会产生 CPU 缓存行级别的竞争（cache line bouncing），每次原子操作都要先把这条缓存行从其他核「抢」过来，开销反而比简单的 Mutex 更大。这个现象在 goroutine 数量 >= GOMAXPROCS 时特别明显。选 A 的说法有一定道理但不是主因，RWMutex 的固定开销差异微小。选 C 描述的是公平性问题，不会导致 4 倍延迟增长。选 D 纯属捏造。"
+        },
+        {
+          "id": "os-lock-contention-diagnosis-q7",
+          "question": "使用 `perf lock report --key=wait_total` 后，输出的 contended 字段代表什么？",
+          "choices": [
+            { "id": "A", "text": "该锁的总获取次数，包括有竞争和无竞争的情况" },
+            { "id": "B", "text": "该锁发生竞争的次数，即调用 lock() 时锁已被其他线程持有、当前线程必须等待的次数" },
+            { "id": "C", "text": "该锁被持有时间超过某个阈值的次数" },
+            { "id": "D", "text": "不同线程在该锁上形成了循环等待（潜在死锁）的次数" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "perf lock report 的 acquired 字段是锁被成功获取的总次数（包括无竞争的快速路径），contended 是其中发生了实际竞争（调用方需要等待）的次数。contended/acquired 的比值越高，说明这把锁越「烫」——大部分获取都需要等待。总等待时间（total wait）除以 contended 可以算出平均每次竞争等待多少纳秒，这是评估锁开销的关键指标。选 A 描述的是 acquired 字段。选 C、D 是不存在的语义，perf lock 不追踪持有时间或死锁检测。"
+        },
+        {
+          "id": "os-lock-contention-diagnosis-q8",
+          "question": "对于一个读写比约为 8:2、并发 goroutine 数为 32 的全局计数 map，以下哪种方案的综合吞吐量最高？",
+          "choices": [
+            { "id": "A", "text": "将 sync.Mutex 替换为 sync.RWMutex，读操作并发，写操作独占" },
+            { "id": "B", "text": "改用 sync.Map，利用其内置的无锁读路径优化" },
+            { "id": "C", "text": "按 key 哈希拆分为 32 个分片，每个分片用独立的 sync.RWMutex，同时配合缓存行 padding 避免 false sharing" },
+            { "id": "D", "text": "改用 atomic.AddInt64，把 map 里的每个 value 都换成独立的 atomic int64，彻底消除锁" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "分片锁（sharding）是高并发 map 场景最有效的方案，32 个分片意味着平均只有 1 个 goroutine 竞争每把锁，竞争概率降低 32 倍。选 A 的 RWMutex 在 goroutine 数 >= GOMAXPROCS 时反而可能更慢（详见 Q6）。选 B 的 sync.Map 适合「写入后大量只读」的 append-only 场景，在写操作频繁时 dirty map 的 promote 开销让它不如分片锁，基准测试显示分片锁比 sync.Map 快 4 倍以上。选 D 的方案在 map key 集合固定且已知时可行，但 map 本身的读写（查找 key）也需要保护，不能只用 atomic value。"
+        },
+        {
+          "id": "os-lock-contention-diagnosis-q9",
+          "question": "在实现分片锁（sharded map）时，以下代码在相邻 shard 之间插入了 padding 填充：`_ [40]byte`。这个填充的主要目的是什么？",
+          "choices": [
+            { "id": "A", "text": "防止 Go GC 扫描时把不同 shard 的内存误认为是同一个对象" },
+            { "id": "B", "text": "避免 false sharing（伪共享）：相邻 shard 的 RWMutex 落在同一 CPU 缓存行（64 字节），一个核修改 shard-A 会导致其他核的 shard-B 缓存失效，引入不必要的缓存一致性协议开销" },
+            { "id": "C", "text": "满足 sync.RWMutex 的内存对齐要求，未对齐的 RWMutex 在 ARM 架构上会产生 unaligned access 错误" },
+            { "id": "D", "text": "增大每个 shard 的结构体尺寸，使操作系统的内存分配器为每个 shard 分配独立的内存页，减少页级竞争" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "False sharing（伪共享）是多核并发中一个经典的隐性开销：CPU 缓存以「缓存行」（cache line，通常 64 字节）为单位操作，如果两个不同 goroutine 频繁访问的数据恰好在同一条缓存行里，即使它们访问的是完全不同的变量，一个核的写操作也会导致另一个核的缓存失效，触发 MESI 协议的缓存同步，引入几十纳秒的额外延迟。sync.RWMutex 是 24 字节，若不填充，相邻两个 shard 的 mutex 会共享一条 64 字节缓存行，分片的效果大打折扣。选 A、C、D 都是无中生有的说法，Go GC、RWMutex 对齐要求和内存页分配都与这里的 padding 无关。"
+        },
+        {
+          "id": "os-lock-contention-diagnosis-q10",
+          "question": "面试中被问到「线上 Go 服务 CPU 使用率 60% 但 QPS 上不去，如何排查」，以下哪个回答最能体现系统化的排查思路？",
+          "choices": [
+            { "id": "A", "text": "「先看业务代码里有没有明显的低效算法，逐一审查所有 for 循环的复杂度」" },
+            { "id": "B", "text": "「升级 Go 版本到最新 stable，新版本 runtime 和锁的实现更高效，很多性能问题会自动消失」" },
+            { "id": "C", "text": "「先用 vmstat 确认 sy% 和 cs 是否异常，再用 strace -c -e futex 量化 futex 开销，确认是锁竞争后用 runtime.SetMutexProfileFraction + pprof 定位热点锁，最后根据读写比和并发度选择 RWMutex 或分片锁」" },
+            { "id": "D", "text": "「直接把 GOMAXPROCS 从 32 降到 8，减少并发度，锁竞争的概率自然降低，QPS 会有所提升」" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "C 是标准的「症状 → 确认 → 定位 → 修复」排查链路，每一步都有具体工具和判断依据：vmstat 判断是否是锁竞争而非计算瓶颈，strace 量化 futex 开销确认根因，pprof mutex profile 精确到代码行，最后选方案时考虑了读写比和并发度的约束条件。选 A 是「凭感觉找代码」，没有数据驱动，效率极低。选 B 是逃避问题，升级版本解决不了架构级的锁竞争。选 D 的逻辑本末倒置——降低并发度确实能减少竞争，但也同时降低了吞吐，等于承认性能低下而不是解决它，而且在面试中这样回答会让面试官认为你没有排查能力。"
+        }
+      ],
+      "references": [
+        { "title": "Linux perf lock 官方文档", "url": "https://perf.wiki.kernel.org/index.php/Tutorial#Counting_with_perf_stat" },
+        { "title": "Go pprof mutex profile 文档", "url": "https://pkg.go.dev/runtime#SetMutexProfileFraction" },
+        { "title": "Futex internals — Linux kernel doc", "url": "https://www.kernel.org/doc/Documentation/locking/futex-requeue-pi.txt" },
+        { "title": "Go sync.Map 源码分析", "url": "https://cs.opensource.google/go/go/+/main:src/sync/map.go" },
+        { "title": "False sharing and cache line padding in Go", "url": "https://go.dev/blog/race-detector" },
+        { "title": "Brendan Gregg — perf Examples", "url": "https://www.brendangregg.com/perf.html" }
+      ]
+    }
+  ]
+}
