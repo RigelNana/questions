@@ -1,0 +1,161 @@
+{
+  "id": "os-high-perf-io-framework-design",
+  "name": "高性能网络 I/O 框架设计",
+  "domain": "operating-system",
+  "description": "从零设计高性能网络 I/O 框架的核心决策：事件模型、线程架构与零拷贝优化",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-high-perf-io-framework-design-1",
+      "domain": "operating-system",
+      "type": "open-ended",
+      "difficulty": 4,
+      "tags": ["network-io", "event-loop", "reactor", "thread-model", "zero-copy", "netty", "libuv", "muduo", "io-uring", "backpressure", "buffer-management", "design"],
+      "title": "如何设计一个高性能的网络 I/O 框架",
+      "content": "你所在的基础架构团队决定自研一套高性能网络 I/O 框架，用来替换现有服务中分散使用的各种网络库。这套框架需要支撑公司核心交易链路，目标是在单机上处理 **10 万以上并发连接**、吞吐量达到 **每秒百万级请求**，P99 延迟控制在 **5ms 以内**，同时需要支持 TCP 和 UDP 协议，具备可扩展的协议解析接口，并且能跨 Linux / macOS / Windows 三个平台运行。\n\n你是这个项目的技术负责人，需要在团队内做一次完整的架构设计评审。你会从哪些维度展开设计？核心的技术决策点在哪里？不同方案之间的取舍是什么？如果有人问你「为什么不用现成的 Netty / libuv，非要自研」，你怎么回答？\n\n在回答之前，思考以下几个子问题，这些都是面试官可能继续深追的点：\n\n操作系统在 Linux 上有 `epoll`，在 macOS/BSD 上有 `kqueue`，在 Windows 上有 IOCP，三者的编程模型差异极大——IOCP 是完成端口模型（异步，内核完成后通知），而 epoll/kqueue 是就绪通知模型（同步，内核告诉你「可以读了」，但你自己去读）。你的框架如何在这三者之上建立统一抽象而不损失性能？\n\n10 万并发连接意味着你不可能为每个连接开一个线程（10 万个线程会把系统内存和调度器压垮），所以线程数和连接数必须解耦。你的线程模型是什么？单 Reactor、多 Reactor 还是完全无锁的 work-stealing 模型？每种方案在什么压力下会成为瓶颈？\n\n高频的 `malloc` 和 `free` 会造成严重的内存碎片，而大量小包在用户态和内核态之间反复拷贝会吃掉 CPU。你的 buffer 管理策略是什么？如何结合 `writev`、`sendfile`、甚至 `io_uring` 的 registered buffers 来减少拷贝开销？\n\n当下游消费速度跟不上时，写缓冲区会无限膨胀直到 OOM。你的背压（backpressure）机制是如何设计的？",
+      "answer": "## 为什么要理解 I/O 框架的本质\n\n在真正开始设计之前，我们需要搞清楚一件事：高性能网络框架解决的核心问题不是「怎么收发数据」，而是「如何用尽可能少的线程，管理尽可能多的连接，同时让 CPU 始终在做有用的事」。10 万并发连接如果用一连接一线程的模型，假设每个线程 8MB 栈，光栈内存就需要 800GB，这显然不现实。所以问题的本质是：用事件驱动模型让少数几个线程轮流为大量连接服务，把「等待 I/O」这段无用等待时间彻底消除。\n\n## 第一层：跨平台事件循环抽象\n\n一切的基础是对操作系统 I/O 多路复用机制的抽象。Linux 的 `epoll`、BSD/macOS 的 `kqueue`、Windows 的 IOCP，三者的编程模型存在本质差异，不只是 API 名字不同。`epoll` 和 `kqueue` 是「就绪通知」模型——内核告诉你「某个 fd 现在可读了」，然后你自己调用 `read()` 把数据从内核缓冲区搬到用户空间；而 IOCP 是「完成通知」模型——你先提交一个「异步读」请求，内核把数据搬好之后再通知你「读完了，缓冲区里有数据」。这个差异意味着在 IOCP 上，你的 read 回调触发时数据已经在用户缓冲区里，而在 epoll 上，read 回调触发时你还需要再 `read()` 一次才能拿到数据。\n\nlibuv 做这件事的方式是在每个平台上分别实现 `uv__io_poll()`，然后在上层暴露统一的 `uv_handle_t` 和回调接口，让应用层感知不到平台差异。我们可以学习这个思路：定义一个内部的 `EventPoller` 接口，包含 `add_fd(fd, events, callback)`、`remove_fd(fd)` 和 `poll(timeout_ms)` 三个核心方法，在 Linux 下用 epoll 实现，在 macOS 下用 kqueue 实现，在 Windows 下用 IOCP 实现。每个事件循环实例持有一个 `EventPoller`，单线程地运行 `while(running) { poller.poll(1ms); process_timers(); process_idle(); }`。\n\n这里有一个关键的设计约定，也是所有优秀 I/O 框架都强制执行的规则：**回调里不能阻塞**。你的协议解码器、业务处理逻辑，如果需要做数据库查询或者 CPU 密集计算，必须扔到线程池里，完成后通过线程安全的队列把结果「投递」回事件循环，再触发后续回调。libuv 的 `uv_queue_work` 就是干这件事的——把阻塞任务扔给 libuv 管理的线程池，工作线程完成后把完成回调 post 到主事件循环。一旦在回调里做了任何阻塞操作，那个事件循环管理的所有连接都会卡住，这是最常见的性能陷阱。\n\n## 第二层：线程模型的选择\n\n事件循环确定之后，下一个核心问题是：用几个事件循环，怎么分配连接？\n\n最简单的是单事件循环模型，Redis 6.0 之前就是这么做的：一个主线程跑一个 event loop，所有连接都在这个线程里处理。好处是完全没有竞争，不需要锁，代码极其简单；坏处是无法利用多核，而且一旦有某个回调跑慢了，所有连接都受影响。对于 Redis 这种操作本身极快（纯内存，微秒级）的场景，单线程完全够用。但我们的目标是百万级 req/s，单核根本扛不住。\n\n工业级的方案是多 Reactor 模型，Netty 和 muduo（陈硕写的 C++ 网络库）都是这个架构。具体来说，有一个（或少数几个）boss EventLoop 专门负责 `accept` 新连接，accept 完成后把这个连接「分配」给 worker EventLoop 池中的某一个。每个 worker EventLoop 独立管理自己的连接集合，worker 之间完全不共享状态，热路径上没有任何锁。worker 数量通常设置为 CPU 核数，这样每个 worker 能跑满一个核。\n\n这个模型的 key insight 是：连接分配是一次性的，连接建立后就「绑定」到某个 worker，后续所有的读写都在这个 worker 的线程里串行执行，永远不会有两个线程同时操作同一个连接的状态。这就是为什么 Netty 的 Channel 不需要在读写方法上加锁——Channel 的生命周期里只有一个线程在操作它。如果你需要从外部线程向某个 Channel 写数据，正确做法是把写操作包成一个任务 submit 到那个 Channel 所属的 EventLoop，Netty 的 `channel.writeAndFlush()` 在检测到当前线程不是 EventLoop 线程时，就会自动把写操作放到 EventLoop 的任务队列里延迟执行。\n\n更激进的是 Tokio 用的 work-stealing 调度器：维护多个工作队列，空闲的 worker 线程可以从其他 worker 的队列里「偷」任务来执行。好处是负载均衡更自动，不会出现某个 worker 连接扎堆而另一个 worker 闲置的情况；坏处是偷任务涉及跨线程访问，需要原子操作，实现复杂度高，而且任务可能在不同线程间迁移，增加 cache miss。对于大多数场景，固定绑定的多 Reactor 模型已经够好，work-stealing 只在任务执行时间极不均匀时才有明显收益。\n\n## 第三层：Buffer 管理，热路径上不 malloc\n\n在 10 万连接、百万 req/s 的场景下，如果每次收到数据都 `malloc` 一块缓冲区，GC 或者内存碎片会成为严重瓶颈。Netty 的解决方案是 `PooledByteBufAllocator`：预先向操作系统申请大块内存（一般是 16MB 的 chunk），然后用自己的分配器把这些 chunk 切成不同规格的小块，按连接需要分发，用完归还到池子里。这样热路径上完全避免了系统调用级别的 `malloc`。\n\n更有趣的是 `CompositeByteBuf`：当你需要把 HTTP 响应头和响应体拼在一起发送时，朴素的做法是把两块 buffer 的内容 `memcpy` 到一个新 buffer 里，然后一次 `send()`；而 `CompositeByteBuf` 把两块 buffer 的引用链在一起，不做拷贝，底层用 `writev()` 系统调用（scatter-gather I/O）一次性把多个不连续的内存段发出去。`writev` 接受一个 `iovec` 数组，每个 `iovec` 包含一个 `(base, len)` 对，内核负责把它们串行发送，应用层只需要一次系统调用。这在发送响应头+响应体这类场景下，减少了一次 `memcpy` 和一次 `send` 系统调用，在高 QPS 下效果显著。\n\n每个连接的读缓冲区推荐用环形缓冲区（ring buffer）：固定大小（比如 64KB），读指针和写指针在这块内存上循环推进，不需要频繁重新分配。协议解码器从读指针处消费数据，新数据从网络读入到写指针处，如果写指针追上读指针说明缓冲区满了，需要触发背压。环形缓冲区的好处是内存分配是一次性的，运行期零 malloc，而且内存局部性好，对 CPU cache 友好。\n\n## 第四层：零拷贝优化\n\n「零拷贝」这个词在不同语境下含义不同，我们来细分几种场景。\n\n对于静态文件服务，`sendfile(out_fd, in_fd, offset, count)` 是标准答案。普通 `read` + `write` 的路径是：磁盘 → 内核 page cache → 用户态 buffer → 内核 socket 缓冲区，数据经过两次拷贝。`sendfile` 让内核直接把 page cache 的数据送到 socket 缓冲区，跳过了用户态，拷贝次数减半。Nginx 的静态文件服务就是靠 `sendfile` 实现高吞吐的。\n\n对于代理场景（读入一个连接的数据，写到另一个连接），`splice()` 配合管道可以实现真正的零拷贝：数据在两个 socket 之间通过内核管道传递，全程不进用户态。路径是：socket_in → pipe（内核） → socket_out，数据从未离开内核空间。\n\nLinux 5.1 之后引入的 `io_uring` 把零拷贝推进到了新高度。`io_uring` 的 registered buffers 机制允许你预先把用户态 buffer 「注册」给内核，内核会把这些 buffer 的物理页表锁住（pin），后续的 I/O 操作可以直接使用这些预注册的 buffer，省去了每次 I/O 都要重新映射地址的开销。更重要的是 `io_uring` 的 SQ/CQ 环形队列设计：应用和内核共享一块内存，通过 ring 来提交和收取 I/O 请求，在请求足够密集时甚至可以用 `IORING_SETUP_SQPOLL` 让内核起一个 polling 线程，完全省掉系统调用开销。Tokio 的 `tokio-uring` crate 就是在 io_uring 基础上构建的，在某些 workload 下比 epoll 快 30% 以上。\n\nLinux 4.14+ 还有 `MSG_ZEROCOPY` 这个 `send()` flag，加上这个 flag 后内核会「借用」用户 buffer 来发送，发送完成后通过 socket 的 error queue 通知应用层可以重用这块 buffer 了。注意 `MSG_ZEROCOPY` 有一定使用门槛：需要接收完成通知（额外一次 `recvmsg` 调用），而且只有在发送大块数据（>10KB）时才能弥补通知开销，小包反而会更慢。\n\n## 第五层：背压机制，不让内存撑死\n\n背压是很多初学者设计框架时忽略的部分，但在生产环境中它是稳定性的关键。场景是这样的：客户端发送数据很快，但你的业务处理很慢，或者对端接收很慢（TCP 流量控制把你的发送速率压下来了），导致写缓冲区里堆积的数据越来越多，最终 OOM。\n\nNetty 的做法是给每个 Channel 设置两个水位线（watermark）：高水位（默认 64KB）和低水位（默认 32KB）。写缓冲区超过高水位时，Netty 把 Channel 标记为「不可写」，并触发 `ChannelWritabilityChanged` 事件通知业务层停止产生新数据；写缓冲区排空到低水位以下时，再标记为「可写」并重新触发事件。业务层通过检查 `channel.isWritable()` 来判断是否应该继续生产数据。\n\n更底层的机制是：当写缓冲区过大时，停止注册这个连接上的 `EPOLLIN` 事件（即不再读取这个连接上来的请求），这样客户端的 `send()` 会被 TCP 流量控制自然地阻塞住，形成端到端的背压。这比单纯在应用层堆缓冲区要健康得多，因为压力被传递回了数据来源，整个链路在自然地降速，而不是某个节点在默默堆内存。\n\n## 连接的完整生命周期\n\n把以上所有机制串起来，一个连接的生命周期是这样的：boss EventLoop 通过 `accept()` 拿到新的 fd，通过 round-robin 或者最少连接数算法选一个 worker EventLoop，把 fd 和对应的 `Connection` 对象「转交」给它（通过线程安全的任务队列），worker 注册 `EPOLLIN`。之后数据到来时，worker 调用 `read()` 填满环形缓冲区，协议解码器（必须是状态机，不能阻塞）从中消费字节流，解出完整的消息帧，交给业务 handler 处理。业务 handler 把响应写入输出缓冲区，框架调用 `send()` 尝试立即发送——如果 `send()` 返回 `EAGAIN`（内核发送缓冲区满了），则注册 `EPOLLOUT`，等内核通知「发送缓冲区有空间了」再继续发。同时，每个连接有一个 idle timer，超过一定时间没有活动就关闭连接回收资源。\n\n## 基准测试的正确姿势\n\n最后谈一下怎么验证设计。用 `wrk` 或者 `wrk2` 做 HTTP 压测是入门级手段，但它掩盖了很多问题。真正需要关注的指标是 **P99/P999 延迟**（不是平均延迟，均值会掩盖长尾），以及在压测过程中的 **CPU 热点分析**（用 `perf record -g` + `flamegraph.pl` 生成火焰图，看热点在哪里）。如果火焰图里大量时间花在 `epoll_wait` 上说明连接太少或者请求太稀疏；花在 `malloc/free` 上说明 buffer 池没起作用；花在锁等待上说明多线程竞争是瓶颈。另外，用 `ss -s` 监控连接队列长度，用 `/proc/net/softnet_stat` 监控 RX 队列 drop，这些都是框架外部可观测的健康指标。",
+      "keyPoints": [
+        "epoll/kqueue 是「就绪通知」模型（你去读），IOCP 是「完成通知」模型（内核读完通知你），跨平台框架需要在两种模型上建立统一抽象，libuv 通过 uv__io_poll() 的平台特化实现做到这一点",
+        "多 Reactor 模型中 boss 线程只负责 accept，worker EventLoop 数量等于 CPU 核数，每个连接绑定到单一 worker 后全程不跨线程，热路径完全无锁，这是 Netty 和 muduo 高性能的根本原因",
+        "回调里不能阻塞是事件驱动框架的铁律，任何数据库查询、文件 I/O、CPU 密集操作都必须用 uv_queue_work 之类的机制转到线程池执行，完成后 post 回 event loop",
+        "CompositeByteBuf 通过 writev() scatter-gather 系统调用把多块不连续 buffer 一次发出，避免了拼接时的 memcpy，在 HTTP 响应头+body 这类场景下显著减少 CPU 开销",
+        "sendfile() 让内核直接从 page cache 发到 socket buffer 跳过用户态，splice() 通过管道实现 socket 到 socket 的零拷贝，io_uring registered buffers 通过预 pin 物理页进一步消除每次 I/O 的地址映射开销",
+        "背压的正确实现是：写缓冲区超高水位时停止注册 EPOLLIN（不再读入新请求），让 TCP 流量控制把压力传递回客户端，而不是在应用层无限堆缓冲区直到 OOM",
+        "预分配的 buffer pool 和 per-connection 环形读缓冲区消除了热路径上的 malloc/free，这在百万 QPS 下的收益远比任何算法优化都明显",
+        "P99/P999 延迟 + perf 火焰图 + ss/proc 网络统计才是完整的性能验证手段，平均延迟会掩盖长尾问题，高 QPS 下长尾才是用户真正感受到的"
+      ],
+      "quiz": [
+        {
+          "id": "os-high-perf-io-framework-design-1-q1",
+          "question": "epoll 和 IOCP 在编程模型上最本质的区别是什么？",
+          "choices": [
+            {"id": "A", "text": "epoll 是就绪通知模型（告诉你「可以读了」，你自己调用 read），IOCP 是完成通知模型（内核读完后通知你「数据已在 buffer 里了」）"},
+            {"id": "B", "text": "epoll 支持边缘触发，IOCP 只支持水平触发，所以 IOCP 性能更低"},
+            {"id": "C", "text": "epoll 是同步的，IOCP 是异步的，本质区别只是 API 风格，底层机制相同"},
+            {"id": "D", "text": "IOCP 只能用于文件 I/O，epoll 才是网络 I/O 的标准方案"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是设计跨平台框架时最需要理解的模型差异。epoll/kqueue 是「就绪通知」——内核告诉你某个 fd 现在可读可写，但数据仍在内核缓冲区，你需要自己调用 read()/write() 来搬运数据；IOCP 是「完成通知」——你预先提交一个异步 I/O 请求并提供 buffer，内核在 I/O 完成后（数据已搬入你的 buffer）才通知你。这意味着两者的回调触发时机不同：epoll 回调里第一件事是 read()，IOCP 回调里数据已经可用了。libuv 通过平台特化的 uv__io_poll() 来屏蔽这个差异。B 选项混淆了触发模式（ET/LT）和通知模型这两个不同维度。C 选项的「底层机制相同」是错的，两者的内核实现路径截然不同。D 选项完全错误，IOCP 是 Windows 上网络和文件 I/O 的标准高性能方案。"
+        },
+        {
+          "id": "os-high-perf-io-framework-design-1-q2",
+          "question": "在多 Reactor 模型（如 Netty）中，worker EventLoop 的数量通常设置为多少，原因是什么？",
+          "choices": [
+            {"id": "A", "text": "等于 CPU 核数，让每个 EventLoop 独占一个核，最大化 CPU 利用率并减少上下文切换"},
+            {"id": "B", "text": "等于并发连接数，每个连接分配一个独立的 EventLoop 避免排队"},
+            {"id": "C", "text": "固定为 4 个，这是 Linux 内核 epoll 的并发上限"},
+            {"id": "D", "text": "等于 CPU 核数的 2 倍，留一半给 I/O 等待，另一半处理业务逻辑"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "多 Reactor 中 worker 数量 = CPU 核数是标准配置，背后的逻辑是：每个 EventLoop 是单线程的，它能跑多快取决于它能独占多少 CPU 时间。如果 worker 数 > 核数，线程之间会竞争 CPU，产生无谓的上下文切换；如果 worker 数 < 核数，有核心在空转。Netty 的默认值是 `Runtime.getRuntime().availableProcessors() * 2`，这里的 *2 是考虑到超线程（HT），实际物理核数取决于硬件。B 选项是一连接一线程模型的思路，在 10 万连接下会把调度器压垮。C 选项纯属捏造，epoll 没有并发上限。D 选项的「I/O 等待」说法是错的——EventLoop 是事件驱动的，根本不会在 I/O 上阻塞等待，「等待」这件事由 epoll_wait 来做，不占用额外线程。"
+        },
+        {
+          "id": "os-high-perf-io-framework-design-1-q3",
+          "question": "Netty 的 CompositeByteBuf 和 writev() 系统调用组合使用，主要优化了什么？",
+          "choices": [
+            {"id": "A", "text": "避免了把多块不连续 buffer 合并发送时的 memcpy，用一次 writev 系统调用替代多次 write，同时消除了内存拷贝"},
+            {"id": "B", "text": "通过压缩算法减少了网络传输的数据量，从而提升吞吐量"},
+            {"id": "C", "text": "把多次 send 合并成一次批量发送，主要优化了 TCP 的 Nagle 算法延迟"},
+            {"id": "D", "text": "通过预读机制减少了 epoll 的触发次数，降低事件循环的开销"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "CompositeByteBuf 的核心价值在于「零拷贝拼接」。典型场景：HTTP 响应头在一块 buffer 里，响应体在另一块 buffer 里，如果要一次 send 出去，朴素方案是 memcpy 到一块新 buffer；CompositeByteBuf 把两块 buffer 的引用链在一起不做拷贝，writev() 系统调用接受一个 iovec 数组（每个 iovec 是一段 buffer 的指针+长度），内核负责把多段不连续内存顺序发送。结果是：零次 memcpy + 一次系统调用，而不是一次 memcpy + 一次 write。在百万 QPS 下，这个差异对 CPU 使用率影响显著。B 选项说的是压缩，跟 CompositeByteBuf 没关系。C 选项混淆了 scatter-gather I/O 和 Nagle 算法，Nagle 是 TCP 协议层的小包合并策略，与 writev 不是同一回事。D 选项说的是 epoll 优化，跟 buffer 管理无关。"
+        },
+        {
+          "id": "os-high-perf-io-framework-design-1-q4",
+          "question": "在高性能 I/O 框架中，每个连接使用固定大小的环形缓冲区（ring buffer）作为读缓冲区，相比每次 read 都 malloc 一块新 buffer，主要优势是什么？",
+          "choices": [
+            {"id": "A", "text": "消除了热路径上的动态内存分配，避免了 malloc/free 的系统调用开销和内存碎片，同时固定大小的内存块有更好的 CPU cache 局部性"},
+            {"id": "B", "text": "环形缓冲区支持自动扩容，能在流量激增时不丢包"},
+            {"id": "C", "text": "环形缓冲区可以在多个线程间共享，方便 worker 之间传递数据"},
+            {"id": "D", "text": "固定大小的 buffer 可以让内核直接 DMA 写入，省去用户态和内核态之间的数据复制"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在百万 QPS 的场景下，如果每次读到数据都 malloc 一块 buffer，那么每秒会有百万次内存分配和释放。即使用 jemalloc/tcmalloc 这类优化的分配器，高频 malloc 也会引入不可忽视的 CPU 开销和内存碎片。环形缓冲区的内存在连接建立时一次性分配，read 和 write 指针在这块固定内存上循环推进，热路径上零 malloc。此外，同一块内存被反复使用，操作系统会把它的物理页常驻在 CPU cache 中，访问延迟更低。B 选项错误——环形缓冲区是固定大小的，满了就需要触发背压，不能自动扩容（扩容就等于 malloc 了）。C 选项错误——环形缓冲区是 per-connection 的单线程结构，跨线程共享需要加锁，会破坏无锁设计。D 选项描述的是 io_uring registered buffers 的特性，不是普通环形缓冲区的特性。"
+        },
+        {
+          "id": "os-high-perf-io-framework-design-1-q5",
+          "question": "你在做性能测试时发现 perf 火焰图中有大量时间花在 `__lock_text_start`（即自旋等锁）上，这最可能说明什么问题？",
+          "choices": [
+            {"id": "A", "text": "多个 EventLoop worker 线程在争抢某个共享资源（可能是连接分配队列、buffer pool 锁、或某个全局状态），热路径上存在锁竞争"},
+            {"id": "B", "text": "epoll_wait 的超时设置太短，导致 CPU 自旋等待 I/O 就绪"},
+            {"id": "C", "text": "TCP 协议栈在等待 ACK 确认，属于正常的网络等待，不是 bug"},
+            {"id": "D", "text": "说明压测工具的连接数不够多，worker 线程没有足够的工作可做而进入自旋"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "火焰图里大量时间花在锁等待上，最直接的含义就是多线程竞争。在多 Reactor 框架里，理想状态是 worker 之间完全无共享——每个 worker 只操作自己负责的连接，热路径零锁。如果出现锁竞争，常见原因有：连接分配逻辑用了全局锁（boss 线程 accept 后需要选 worker，如果用共享的 round-robin 计数器加锁会成为瓶颈）、buffer pool 是全局的加了互斥锁（应该改成 per-worker 的 pool）、业务层有全局状态被多个 worker 并发访问。排查方法是在火焰图里找到锁上面的调用栈，看是谁在持有这把锁。B 选项混淆了 epoll_wait 和自旋锁，epoll_wait 超时是内核调度行为，在 perf 里表现为 `sys_epoll_wait` 而不是锁等待。C 选项说的是网络层等待，跟用户态锁无关。D 选项的逻辑完全相反，工作量少的线程会进入 sleep 而不是自旋抢锁。"
+        },
+        {
+          "id": "os-high-perf-io-framework-design-1-q6",
+          "question": "以下代码在 Netty 的 ChannelHandler 里执行，有什么问题？\n\n```java\n@Override\npublic void channelRead(ChannelHandlerContext ctx, Object msg) {\n    String result = database.query(\"SELECT * FROM orders WHERE id=?\", extractId(msg));\n    ctx.writeAndFlush(result);\n}\n```",
+          "choices": [
+            {"id": "A", "text": "database.query() 是阻塞调用，会阻塞 EventLoop 线程，导致这个 EventLoop 管理的所有连接都无法处理新的 I/O 事件"},
+            {"id": "B", "text": "ctx.writeAndFlush() 必须在 synchronized 块里调用，否则多线程并发写会造成数据错乱"},
+            {"id": "C", "text": "channelRead 方法不能直接调用 writeAndFlush，必须先 retain() ByteBuf 防止引用计数归零"},
+            {"id": "D", "text": "SELECT 查询没有使用连接池，每次查询都会建立新连接导致数据库连接数耗尽"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 EventLoop 框架里最经典的错误：在 I/O 回调里做阻塞操作。database.query() 会阻塞当前线程直到数据库返回结果，而这个线程就是 EventLoop 线程。在阻塞的这段时间里，这个 EventLoop 管理的几千个连接全部「冻结」——没有连接能收发数据，没有定时器能触发，整个 EventLoop 停摆了。正确做法是把数据库查询提交到独立的业务线程池（比如用 Netty 的 `DefaultEventExecutorGroup`），查询完成后通过 `ctx.executor().execute()` 把写操作投递回 EventLoop 线程执行。B 选项是错的，Netty 保证同一个 Channel 的写操作都在同一个 EventLoop 线程执行，不需要外部同步。C 选项虽然 ByteBuf 引用计数是真实存在的问题，但不是这段代码的主要问题。D 选项关于连接池的说法可能是真实问题，但不是代码里最严重的架构性错误。"
+        },
+        {
+          "id": "os-high-perf-io-framework-design-1-q7",
+          "question": "sendfile() 和 MSG_ZEROCOPY 都号称「零拷贝」，它们适用的场景有什么不同？应该如何选择？",
+          "choices": [
+            {"id": "A", "text": "sendfile 适合发送磁盘文件（page cache → socket buffer，跳过用户态）；MSG_ZEROCOPY 适合发送用户态 buffer（内核借用 buffer 异步发送，完成后通知）。MSG_ZEROCOPY 有完成通知开销，只在数据块 >10KB 时才有收益"},
+            {"id": "B", "text": "两者功能完全相同，MSG_ZEROCOPY 是 sendfile 的升级版，所有场景都应该用 MSG_ZEROCOPY"},
+            {"id": "C", "text": "sendfile 只能在同一台机器的文件系统和网络之间传输，不能跨 socket；MSG_ZEROCOPY 可以在任意两个 socket 间传输"},
+            {"id": "D", "text": "sendfile 适合小文件，因为大文件会填满 socket 缓冲区；MSG_ZEROCOPY 适合大文件因为它不使用 socket 缓冲区"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这两个零拷贝机制针对的是完全不同的场景。sendfile(out_fd, in_fd, offset, len) 是专门为「把磁盘文件发到网络」设计的：普通路径是磁盘 → page cache → 用户 buffer → socket 缓冲区（两次拷贝），sendfile 让内核直接从 page cache 搬到 socket 缓冲区（零次用户态拷贝），非常适合静态文件服务。MSG_ZEROCOPY 是在 send() 上加的 flag，解决的是「发送用户态 buffer」时的拷贝问题：加上这个 flag 后内核不立即复制 buffer 内容，而是借用物理页直接发送，完成后通过 socket error queue 发通知。问题在于等通知需要额外一次 recvmsg 系统调用，这个开销对小包来说得不偿失，只有数据块超过大约 10KB 才能回本。B 选项「完全相同」是错的，两者解决的场景根本不同。C 选项关于「不能跨 socket」是错误的，sendfile 的 out_fd 就是 socket fd。D 选项关于文件大小的建议完全是捏造的。"
+        },
+        {
+          "id": "os-high-perf-io-framework-design-1-q8",
+          "question": "生产环境中某个服务突然开始 OOM，排查发现是网络框架的写缓冲区无限增长。根本原因最可能是什么，正确的背压设计是什么？",
+          "choices": [
+            {"id": "A", "text": "下游接收速度慢（TCP 流控压低了发送速率）导致写缓冲区积压。正确设计：超高水位时停止注册 EPOLLIN（不再读新请求），让 TCP 流控自然回压到发送端"},
+            {"id": "B", "text": "写缓冲区没有使用 buffer pool，频繁 malloc 导致内存碎片，最终触发 OOM。解决方案是引入 PooledByteBufAllocator"},
+            {"id": "C", "text": "EventLoop 线程数不够，处理不过来的请求排队到了写缓冲区。解决方案是增加 worker 数量"},
+            {"id": "D", "text": "TCP 的 SO_SNDBUF 配置太小，内核发送缓冲区溢出数据被丢弃，应用层重传导致缓冲区堆积"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "写缓冲区无限增长的根本原因是「产生速度 > 消费速度」。具体场景：你的业务生成响应很快，但 TCP 流量控制（对端接收窗口满了）阻止你发送，数据只能堆在应用层的写缓冲区里。如果没有背压机制，缓冲区会一直增长直到 OOM。正确的背压设计分两层：第一层是应用层水位——写缓冲区超过高水位（比如 64KB）时，触发 ChannelWritabilityChanged 事件，通知业务层暂停产生新数据；第二层是 I/O 层——停止在这个连接上注册 EPOLLIN，不再读取对端发来的新请求，让 TCP 接收缓冲区填满，TCP 协议层发 zero window 通告给对端，迫使对端降速发送。这两层形成完整的背压链条，让整个系统在过载时优雅降速。B 选项描述的是内存碎片问题，不是写缓冲区积压的直接原因。C 选项的方向也不对，worker 不够导致的是请求处理延迟增大，不是写缓冲区无限增长。D 选项关于 SO_SNDBUF 的描述不准确，内核缓冲区满时 send() 会返回 EAGAIN，框架应该停止发送注册 EPOLLOUT，不会导致数据堆在应用层写缓冲区。"
+        },
+        {
+          "id": "os-high-perf-io-framework-design-1-q9",
+          "question": "io_uring 相比传统 epoll + read/write 的核心优势是什么？在什么场景下 io_uring 的收益最显著？",
+          "choices": [
+            {"id": "A", "text": "通过共享内存的 SQ/CQ 环形队列减少系统调用次数（SQPOLL 模式可完全零系统调用），registered buffers 消除了每次 I/O 的地址 pin 操作，在 I/O 密集且请求极小的场景收益最大"},
+            {"id": "B", "text": "io_uring 利用了 Linux 的 NUMA 架构，确保网络中断和应用处理在同一个 NUMA 节点，减少跨节点内存访问"},
+            {"id": "C", "text": "io_uring 把 TCP 协议栈移到了用户态，绕过内核网络栈，类似于 DPDK 的原理"},
+            {"id": "D", "text": "io_uring 通过批处理把多个连接的 read 操作合并成一次内核调用，适合大量并发连接的场景"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "io_uring（Linux 5.1+）的核心设计是应用和内核共享一块内存区域，包含提交队列（SQ）和完成队列（CQ）。应用把 I/O 请求写入 SQ（不需要系统调用），内核把完成结果写入 CQ（应用 poll CQ 即可）。在 IORING_SETUP_SQPOLL 模式下，内核起一个 polling 线程不断检查 SQ，应用甚至不需要 syscall 来提交请求，系统调用开销降为零。registered buffers 机制预先 pin 住用户 buffer 的物理页，避免了每次 I/O 都要重新做地址转换和 pin 操作的开销。收益最显著的场景：高频小 I/O（比如 gRPC 的短消息），因为这时系统调用开销占比最高。Tokio-uring 在某些延迟敏感 workload 上比 epoll 快 30%。B 选项说的是 NUMA 亲和性，这是内核调度层面的优化，不是 io_uring 的特性。C 选项描述的是 DPDK/kernel bypass，io_uring 仍然通过内核网络栈，只是减少了系统调用。D 选项的描述不准确，io_uring 是异步 I/O 接口，不是简单的批处理合并。"
+        },
+        {
+          "id": "os-high-perf-io-framework-design-1-q10",
+          "question": "你的网络框架上线后，发现在高峰期 P99 延迟从 2ms 飙升到 50ms，但 P50（中位数）延迟只有 1.5ms，CPU 使用率也不高。最可能的原因是什么，怎么排查？",
+          "choices": [
+            {"id": "A", "text": "存在「毛刺」触发点：可能是 GC STW、定时器回调阻塞、buffer pool 偶发 resize、或者 epoll 惊群。用高精度直方图分析延迟分布，结合 perf 和 GC 日志找到毛刺触发时间点"},
+            {"id": "B", "text": "CPU 使用率不高说明瓶颈在网卡，应该开启多队列网卡（RSS）把中断分散到多个 CPU 核"},
+            {"id": "C", "text": "P99 高而 P50 正常，说明大部分请求都是正常的，P99 的高延迟是由超大请求体（>1MB）引起的，应该限制请求大小"},
+            {"id": "D", "text": "这是 TCP 重传导致的，高峰期网络丢包率升高，重传超时（RTO 默认 200ms）拉高了 P99，应该调低 TCP_RTO_MIN"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "P50 正常、P99 很高这个模式的经典解读是：99% 的请求都很快，但有 1% 的请求会偶发性地卡住很长时间。这种「长尾」现象通常有几类根因。第一类是 Stop-The-World 事件：Java/Go 的 GC STW，或者 EventLoop 里有定时任务偶发执行时间过长（比如连接超时扫描一次性扫了大量连接）。第二类是资源竞争偶发：buffer pool 在某个时刻耗尽需要申请新内存，或者全局锁偶发高竞争。第三类是 epoll 惊群：多个 worker 同时被 EPOLLIN 唤醒但只有一个能处理，其余的再次进入 sleep，唤醒和切换本身有延迟。排查方法：用 HdrHistogram 记录完整延迟分布（而不是只看 P99 平均）找到 spike 的规律；在 spike 时间点对齐 GC 日志；用 `perf trace` 记录系统调用延迟；检查是否有定时任务在整点触发。B 选项关于网卡的建议方向是对的（RSS 是真实优化手段），但 CPU 不高 + P50 正常这个组合不符合带宽瓶颈的特征。C 选项「大请求体」也可能导致 P99 高，但这不是主因，而且 P50 正常排除了这个可能性。D 选项 TCP 重传是可能的，但 RTO 默认值在 Linux 上是 200ms，会把 P99 拉得更高而不是只到 50ms，且这与 CPU 使用率无关。"
+        }
+      ],
+      "references": [
+        {"title": "The C10K Problem — Dan Kegel", "url": "http://www.kegel.com/c10k.html"},
+        {"title": "libuv Design Overview", "url": "https://docs.libuv.org/en/v1.x/design.html"},
+        {"title": "Netty In Action — Norman Maurer", "url": "https://www.manning.com/books/netty-in-action"},
+        {"title": "muduo 网络库源码 — 陈硕", "url": "https://github.com/chenshuo/muduo"},
+        {"title": "Efficient IO with io_uring — Jens Axboe", "url": "https://kernel.dk/io_uring.pdf"},
+        {"title": "Linux man page: sendfile(2)", "url": "https://man7.org/linux/man-pages/man2/sendfile.2.html"},
+        {"title": "Linux man page: splice(2)", "url": "https://man7.org/linux/man-pages/man2/splice.2.html"},
+        {"title": "Tokio: A runtime for writing reliable network applications", "url": "https://tokio.rs/"}
+      ]
+    }
+  ]
+}
