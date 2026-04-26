@@ -1,0 +1,198 @@
+{
+  "id": "os-reduce-mode-switches",
+  "name": "减少用户态内核态切换的性能优化策略",
+  "domain": "operating-system",
+  "description": "通过批量 I/O、vDSO、内核旁路等手段降低模式切换开销的系统级调优实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-reduce-mode-switches-1",
+      "domain": "operating-system",
+      "type": "tuning",
+      "difficulty": 3,
+      "tags": [
+        "mode-switch",
+        "syscall",
+        "optimization",
+        "writev",
+        "io_uring",
+        "DPDK",
+        "vDSO",
+        "mmap",
+        "Linux",
+        "kernel-bypass",
+        "sendmmsg",
+        "TCP_CORK"
+      ],
+      "title": "如何减少用户态和内核态之间的切换次数来优化性能",
+      "content": "## 场景背景\n\n你负责一个日志聚合服务，部署在 8 核的 Linux 6.1 内核机器上。服务接收来自数百个上游节点的日志流，对每条日志做解析后写入本地磁盘并通过 UDP 上报 statsd 指标。高峰期 QPS 约 80 万，但 CPU 使用率只有 40%，P99 写入延迟却高达 12ms，fire-and-forget 的 UDP 指标上报每秒要发出约 10 万个小包。\n\n你的同事跑了一次 `perf stat -p <pid>` 之后给你看了下面这段输出：\n\n```\nPerformance counter stats for process id '12847' (10 seconds):\n\n    82,314,220      syscalls:sys_enter_write\n     9,871,005      syscalls:sys_enter_sendto\n       124,880      syscalls:sys_enter_writev\n\n      10.003124428 seconds time elapsed\n```\n\n也就是说，这 10 秒里服务发起了 **8200 万次 write 系统调用**，平均每秒 820 万次。每次 `write` 写的平均字节数只有约 120 字节。\n\n用户态和内核态切换（也叫「模式切换」，mode switch）是指 CPU 从执行用户程序代码切换到执行内核代码，这个过程需要保存/恢复通用寄存器、切换栈指针、在开启了 PTI（内核页表隔离，一种用来缓解 Meltdown 漏洞的补丁）的机器上还要重载 CR3 寄存器导致 TLB（转换后援缓冲，Translation Lookaside Buffer，CPU 里缓存虚拟地址到物理地址映射的硬件结构）全部失效。在现代 x86-64 上，每次模式切换的实测开销是 **100-350ns**，具体取决于 PTI 是否开启、TLB 大小和 L1i 缓存命中率。看起来几百纳秒微不足道，但 820 万次乘以 200ns = **1.64 秒/每秒的 CPU 时间纯粹消耗在进出内核上**，占 8 核机器单核 100% 的 1.64 倍。\n\n这就是这台服务器 40% CPU 却卡在 12ms P99 的根因：CPU 不是在做业务逻辑，而是在反复进出内核。\n\n**问题**：请结合这个具体场景，系统性地说明有哪些手段可以减少用户态与内核态的切换次数，分别适用于什么场景，以及如何量化优化效果。",
+      "answer": "## 为什么模式切换这么贵\n\n要真正理解优化方向，得先搞清楚一次 `write(fd, buf, 120)` 到底发生了什么。用户程序执行 `syscall` 指令后，CPU 硬件自动把当前特权级从 Ring 3 切到 Ring 0，同时把用户栈指针保存到 TSS（Task State Segment）里，换上内核栈，再跳转到内核的系统调用入口。内核做完工作后，执行 `sysretq` 或 `iretq` 原路返回。\n\n在 2018 年之后打了 PTI 补丁的内核上，问题更严重：进入内核时需要把 CR3 切换到内核页表（一次 CR3 写入会导致整个 TLB 失效），返回用户态时再切回来。TLB miss 意味着之后若干条内存访问都要重新走页表查找，每次 4-5 级页表查找在内存延迟 60-80ns 的机器上会叠加几百纳秒。这就是为什么在打了 PTI 的机器上实测一次系统调用往返是 250-350ns，而没打 PTI 的机器只有 100-150ns。\n\n回到我们的场景：每秒 820 万次 `write`，每次 200ns，就是 1.64 秒的纯切换开销。如果能把 8200 万次 `write` 合并成 82 万次 `writev`，理论上可以省掉 90% 的切换开销。\n\n## 策略一：批量化系统调用\n\n最直接的优化是减少系统调用次数本身，而不是让每次调用更快。`writev(fd, iov, iovcnt)` 是这个方向的经典武器——它允许你把多个内存缓冲区的内容在一次系统调用里写出去。内核实现上，`writev` 会在内核态循环遍历 iovec 数组，把每个缓冲区的数据依次写入，全程不返回用户态。\n\n对我们的日志服务来说，优化思路是这样的：每条解析完的日志不要立刻 `write`，而是追加到一个 `struct iovec[]` 数组里，积累 64 条或者积累 10ms（取先到者）后，一次 `writev` 打出去。实际代码骨架大概是：\n\n```c\n#define BATCH_SIZE 64\nstruct iovec iov[BATCH_SIZE];\nint count = 0;\n\nvoid flush_batch(int fd) {\n    if (count == 0) return;\n    // 一次 writev 替代 count 次 write\n    // 系统调用次数从 count 降为 1\n    writev(fd, iov, count);\n    count = 0;\n}\n\nvoid append_log(int fd, char *buf, size_t len) {\n    iov[count].iov_base = buf;\n    iov[count].iov_len  = len;\n    count++;\n    if (count == BATCH_SIZE) flush_batch(fd);\n}\n```\n\nHTTP 服务器是 `writev` 的另一个经典场景：一个响应由 status line、headers、body 三部分组成，朴素实现是三次 `write`，用 `writev` 可以合成一次。Nginx 内部就是这么做的，它把 response chain 收集完后调一次 `writev` 或 `sendfile`。\n\n对 UDP 指标上报，对应的批量化接口是 `sendmmsg`。它允许一次系统调用发出多个 UDP 数据报，每个包可以有独立的目标地址和数据缓冲区。把 100 条 statsd 指标攒在一起用一次 `sendmmsg` 发出，相比 100 次 `sendto` 可以减少 99% 的切换次数。要注意 statsd 接收端默认的 UDP buffer 大小限制，单次发出的包大小不要超过 8KB，否则会在 IP 层被分片，反而带来新问题。\n\n如果场景更复杂——混合了磁盘读写、网络收发、定时器——那么 `io_uring` 是目前最彻底的批量化方案。`io_uring` 使用两个环形队列（SQ 提交队列、CQ 完成队列），通过 mmap 映射到用户态，应用程序把多个操作描述符写入 SQ 后，只需要一次 `io_uring_enter()` 系统调用就能提交全部操作。更激进的玩法是开启 `IORING_SETUP_SQPOLL`：内核会启动一个 polling 线程持续监视 SQ，用户态写入 SQ 后连 `io_uring_enter()` 都不用调——真正的零系统调用 I/O（代价是那个内核线程会占用一个核的 CPU）。io_uring 在 Linux 5.1 引入，5.6 之后趋于稳定，fio 的 io_uring 引擎实测在 NVMe SSD 上可以比 libaio 快 20-30%，系统调用次数减少超过 95%。\n\n## 策略二：用 vDSO 消除时钟系统调用\n\n`clock_gettime(CLOCK_MONOTONIC)` 和 `gettimeofday()` 是后端代码里调用频率极高的两个接口——日志打时间戳、限流器算时间窗、超时检测。很多人不知道的是，在 Linux 2.6.22 之后，这两个接口已经被实现成了 vDSO（Virtual Dynamic Shared Object，虚拟动态共享对象）——内核把一小段代码和时钟数据映射到每个进程的地址空间，调用 `clock_gettime` 时实际上是在执行用户态代码读取这段映射内存，**完全不进内核**，耗时约 5-15ns（相比走系统调用的 200-350ns 快了一个数量级）。\n\n你可以用 `strace -e trace=clock_gettime` 验证：如果完全没有输出，说明走的是 vDSO 路径，strace 根本拦截不到。Redis 的 `server.unixtime` 和 `server.mstime` 字段每次 event loop 迭代都通过 `gettimeofday()` 刷新，这个操作在高频场景下接近免费，正是因为 vDSO。\n\n坑点是：容器环境下如果 `/proc/sys/kernel/perf_event_paranoid` 设置过于严格，或者 seccomp profile 不当，vDSO 的时钟读取可能回退到真实系统调用。可以用 `perf stat -e syscalls:sys_enter_clock_gettime` 检测是否发生了回退。\n\n## 策略三：用 mmap 让文件读取变成内存访问\n\n`read(fd, buf, len)` 每次都要切换到内核态，内核把页缓存中的数据 memcpy 到用户缓冲区，然后返回。`mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0)` 则把文件直接映射到进程虚拟地址空间，之后读取文件内容就是普通的内存 load 指令——首次访问触发缺页异常（page fault）把页从磁盘读进页缓存，但这个缺页处理不算系统调用，由 CPU 硬件中断驱动，处理完之后重新执行那条 load 指令；后续访问已经在页缓存里的页完全没有内核介入，零系统调用。\n\n数据库系统大量使用这个模式。SQLite 的 WAL 模式下，读者通过 mmap 读共享内存日志；RocksDB 默认对 SST 文件使用 mmap 读取。对我们的场景，如果日志服务需要读取配置文件或规则文件并频繁查询，用 mmap 替代反复 `read` 可以把这部分读取开销降到接近零。\n\n`mmap` 不适合的场景是顺序读取大文件然后丢弃（用 `sendfile` 更合适，它在内核态直接从页缓存发到 socket buffer，零拷贝）；以及文件被频繁截断或被其他进程修改（mmap 的视图可能与磁盘不一致，要额外用 `msync` 处理）。\n\n## 策略四：TCP_CORK 攒包，减少小包 write\n\n在 TCP 场景下，应用层每次 `write` 一小段数据，内核都可能立刻发出一个小 TCP 包（Nagle 算法只能部分缓解这个问题）。设置 `TCP_CORK` 选项相当于在内核层按下「暂停」：后续的 `write` 数据会在内核 TCP 发送缓冲区里积累，直到凑满一个 MSS（最大报文段，通常 1460 字节）或者调用 `setsockopt` 取消 CORK。HTTP 响应用 CORK 模式：先 cork、再 write headers、再 write body、再 uncork，内核只发出 1-2 个满载 TCP 包，而不是每次 write 发一个小包。\n\n值得注意的是，`TCP_NODELAY`（禁用 Nagle 算法）和 `TCP_CORK` 是两个独立维度：`TCP_NODELAY` 关注的是「不等待 ACK 就立刻发」，适合 RPC 类延迟敏感应用（Redis、MySQL 客户端）；`TCP_CORK` 关注的是「等待凑满再发」，适合批量传输（HTTP 文件服务器、大批量日志传输）。同时开启时，`TCP_CORK` 优先。\n\n## 策略五：内核旁路（极致场景）\n\n如果以上手段都用了，业务对延迟的要求还是无法满足，就要考虑完全绕开内核的方案。DPDK（Data Plane Development Kit）把网卡驱动搬到用户态，应用程序直接通过轮询（polling）读写网卡 DMA ring，不经过任何系统调用，也没有中断。网络 I/O 的延迟可以从内核路径的 50-200μs 降到 1-5μs。代价是：占用独立 CPU 核心轮询、需要大页内存（hugepage）支持、驱动和内核网络栈完全脱离（iptables、tc 这些都不起作用）。HFT（高频交易）、电信 5G UPF、大规模 CDN 边缘节点是 DPDK 的典型用户。\n\nRDMA（Remote DMA）走得更远：不只是本机用户态，而是让数据直接从一台机器的内存搬到另一台机器的内存，发送方和接收方的 CPU 与内核全程不参与。Ceph BlueStore、Lustre 文件系统、部分 Kafka 高性能扩展都用了 RDMA。它需要专用 InfiniBand 或 RoCE 网卡，部署成本较高，但在 HPC 场景的网络传输延迟可以达到 1μs 以内。\n\n## 量化优化效果：perf 工具链\n\n优化前后要用数据说话。以下是实际工作中最常用的测量命令组合：\n\n```bash\n# 统计目标进程每秒系统调用次数，每 1000ms 输出一次\nperf stat -e syscalls:sys_enter_total -I 1000 -p <pid>\n\n# 精细分析：哪个系统调用最频繁（运行 10 秒后打印汇总）\nperf trace -p <pid> -s -- sleep 10\n\n# 用 strace 统计模式（注意 strace 本身有 10-30% 开销，只在测试环境用）\nstrace -c -p <pid> &  # attach 采样\nsleep 10\nkill -INT $!          # 打印统计并退出\n\n# 直接计数特定调用\nperf stat -e 'syscalls:sys_enter_write,syscalls:sys_enter_writev,syscalls:sys_enter_sendto,syscalls:sys_enter_sendmmsg' -p <pid> -- sleep 5\n```\n\n对我们开头的日志服务，把 `write` 换成 `writev` 批量写（batch=64）、把 `sendto` 换成 `sendmmsg` 批量上报（batch=100）之后，期望看到的 perf stat 输出变化如下：\n\n```\n优化前（10 秒）:\n  82,314,220  syscalls:sys_enter_write      # 820 万/秒\n   9,871,005  syscalls:sys_enter_sendto     # 98 万/秒\n\n优化后（10 秒）:\n   1,286,160  syscalls:sys_enter_writev     # 降至 12.9 万/秒 (-98.4%)\n      98,710  syscalls:sys_enter_sendmmsg   # 降至 9870/秒 (-99%)\n```\n\n切换开销从约 1.64 秒/秒 降到约 0.026 秒/秒，理论上释放出约 1.6 个 CPU 核心，P99 写入延迟预期从 12ms 降到 1-2ms 范围。\n\n## 调优优先级总结\n\n这几种手段在不同场景下的适用性有明显差异。对大多数后端服务，按照「性价比从高到低」的顺序，建议首先考虑应用层批量化（`writev`/`sendmmsg`/`io_uring`），因为改动成本低且收益确定；其次是检查时钟调用是否走了 vDSO（通常不需要改代码，只需确保容器权限正确）；然后是对大文件访问引入 `mmap`；最后才是 DPDK/RDMA 这类需要专用硬件和大量工程投入的极致方案。没有任何一种手段是万能的，每种优化都有代价，关键是用 `perf trace` 找到系统调用的真实热点，在热点上精准发力。",
+      "keyPoints": [
+        "每次用户态↔内核态切换在开启 PTI 的现代 Linux 内核上耗时 100-350ns（寄存器保存/恢复 + 栈切换 + CR3 重载导致 TLB 失效），高频系统调用会让切换开销占满整个 CPU 核心",
+        "writev 和 sendmmsg 是批量化 I/O 最直接的手段：用 1 次系统调用替代 N 次 write/sendto，系统调用次数可降低 90-99%，适合日志批量写盘和 UDP 指标上报",
+        "io_uring 通过用户态/内核态共享环形队列实现批量提交，开启 SQPOLL 后连 io_uring_enter() 也省掉，适合混合 I/O 高并发场景，Linux 5.6+ 生产可用",
+        "clock_gettime(CLOCK_MONOTONIC) 在 Linux 2.6.22+ 通过 vDSO 机制完全在用户态执行（约 5-15ns），不触发内核切换；容器环境若 seccomp 配置不当会导致 vDSO 回退到真实系统调用，可用 perf stat -e syscalls:sys_enter_clock_gettime 验证",
+        "mmap 把文件映射到进程地址空间后，读取变成内存 load 指令（首次访问为 page fault，后续为零系统调用），适合随机读大文件（数据库 SST 文件、配置文件），不适合顺序大文件传输（用 sendfile）",
+        "TCP_CORK 在内核层积累小写操作直到凑满 MSS 再发，减少网络 I/O 引发的隐式 flush；与 TCP_NODELAY 是独立正交的选项，同时开启时 TCP_CORK 优先",
+        "DPDK 把网卡驱动搬到用户态轮询，彻底消除网络 I/O 系统调用，延迟从 50-200μs 降至 1-5μs，代价是独占 CPU 核心且与内核网络栈完全脱离，适合 HFT/5G UPF/CDN 极致低延迟场景",
+        "用 perf trace -p <pid> -s 和 perf stat -e syscalls:sys_enter_* 量化优化前后系统调用频率，优化的结论必须用数据支撑，而不是凭感觉"
+      ],
+      "quiz": [
+        {
+          "id": "os-reduce-mode-switches-q1",
+          "question": "在开启了 PTI（内核页表隔离）的 Linux 内核上，一次用户态→内核态→用户态的完整往返切换比未开启 PTI 时更慢，主要原因是什么？",
+          "choices": [
+            { "id": "A", "text": "PTI 要求在进出内核时写 CR3 寄存器切换页表，导致 TLB 全部失效，后续内存访问需要重新走页表查找" },
+            { "id": "B", "text": "PTI 在系统调用入口处对每个参数做额外的安全校验，导致参数验证时间增加" },
+            { "id": "C", "text": "PTI 强制使用软件模拟的系统调用路径，不再使用 syscall/sysret 硬件指令" },
+            { "id": "D", "text": "PTI 对内核代码做了地址随机化（KASLR），每次进内核需要重新计算跳转地址" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "PTI（Kernel Page-Table Isolation）是为缓解 Meltdown 漏洞而引入的补丁，核心机制是让用户态和内核态使用两套独立的页表。进入内核时写 CR3 切换到内核页表，返回用户态时再写 CR3 切换回来。写 CR3 寄存器会使整个 TLB 失效（因为 TLB 中缓存的虚拟→物理映射条目属于旧页表），之后若干条访存指令都要重新做 4-5 级页表查找。B 选项混淆了 PTI 与 seccomp 的功能。C 选项错误，syscall/sysret 硬件指令在 PTI 下依然使用。D 选项描述的是 KASLR，与 PTI 无关。PTI 在 Intel 机器上的实测额外开销约 60-200ns/次，这正是「打了 PTI 的机器系统调用更慢」的根本原因。"
+        },
+        {
+          "id": "os-reduce-mode-switches-q2",
+          "question": "以下哪个 Linux 系统调用允许在一次调用中向同一文件描述符写出多个分散缓冲区的内容？",
+          "choices": [
+            { "id": "A", "text": "pwrite64(fd, buf, count, offset)" },
+            { "id": "B", "text": "writev(fd, iov, iovcnt)" },
+            { "id": "C", "text": "write(fd, buf, count)" },
+            { "id": "D", "text": "sendfile(out_fd, in_fd, offset, count)" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "writev（scatter-gather write）接受一个 struct iovec 数组，每个 iovec 描述一段内存缓冲区（base 指针 + len 长度），内核在一次系统调用内依次把所有缓冲区的内容写入 fd，相当于 N 次 write 的效果但只触发 1 次模式切换。pwrite64 虽然可以指定偏移，但每次只写一个缓冲区。sendfile 是内核内零拷贝传输，专用于 file-to-socket 路径，源必须是普通文件。write 只接受单缓冲区。在 HTTP 服务器里，status line + headers + body 三段分散缓冲区用一次 writev 发出，是标准优化手法，Nginx 的 ngx_writev_chain 正是这个原理。"
+        },
+        {
+          "id": "os-reduce-mode-switches-q3",
+          "question": "vDSO（Virtual Dynamic Shared Object）机制让 clock_gettime(CLOCK_MONOTONIC) 不再触发系统调用，其底层原理是什么？",
+          "choices": [
+            { "id": "A", "text": "内核把时钟读取代码和当前时间数据映射到每个进程的用户态地址空间，调用时直接在用户态执行内存读取，无需特权级切换" },
+            { "id": "B", "text": "glibc 在第一次调用 clock_gettime 后把结果缓存在线程局部变量里，后续调用直接返回缓存值" },
+            { "id": "C", "text": "内核为时钟调用创建了专用的快速系统调用通道，绕过 TLB 失效但仍然需要特权级切换" },
+            { "id": "D", "text": "vDSO 只对精度要求低的 CLOCK_REALTIME 有效，CLOCK_MONOTONIC 依然走真实系统调用路径" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "vDSO 的本质是内核在每个进程的地址空间高端映射一小段只读代码页和数据页。这段代码由内核维护并包含读取 HPET/TSC 的逻辑，数据页则存储当前时间基准值和 TSC 频率。用户程序调用 clock_gettime 时，glibc 实际上跳转到这段用户态代码，直接读内存计算时间，从不切换到 Ring 0。B 选项错误，glibc 没有粗粒度缓存，每次调用都会读最新值（精度约 1-10ns）。C 选项描述的「快速通道」不存在。D 选项错误，CLOCK_MONOTONIC 和 CLOCK_REALTIME 都走 vDSO。可以用 `strace -e trace=clock_gettime sleep 1` 验证：完全没有 clock_gettime 的输出，因为 strace 拦截不到 vDSO 代码。"
+        },
+        {
+          "id": "os-reduce-mode-switches-q4",
+          "question": "io_uring 的 SQPOLL 模式（IORING_SETUP_SQPOLL）相比普通 io_uring 模式最核心的区别是什么？",
+          "choices": [
+            { "id": "A", "text": "SQPOLL 模式让 io_uring 支持网络 socket，普通模式只能用于磁盘 I/O" },
+            { "id": "B", "text": "SQPOLL 模式启动一个内核轮询线程持续检查提交队列，用户态写入 SQ 后无需调用 io_uring_enter()，实现真正的零系统调用 I/O" },
+            { "id": "C", "text": "SQPOLL 模式使用中断驱动而非轮询，减少 CPU 占用同时保持零系统调用" },
+            { "id": "D", "text": "SQPOLL 模式允许多个进程共享同一个 io_uring 实例，减少内核资源消耗" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "普通 io_uring 模式下，应用写完提交队列（SQ）后仍需调用 io_uring_enter() 系统调用通知内核去处理——虽然每次 io_uring_enter() 可以批量提交 N 个操作（比 N 次独立 write 好很多），但系统调用本身还在。SQPOLL 模式通过 IORING_SETUP_SQPOLL flag 启动一个内核线程（sq_thread），这个线程持续 spin 检查 SQ 是否有新条目，发现后立刻处理，用户态写入 SQ 无需任何系统调用触发。代价是 sq_thread 会独占一个 CPU 核心做轮询（可以通过 sq_thread_idle 参数设置空闲多少毫秒后线程休眠）。A 选项错误，普通 io_uring 也支持 socket。C 选项描述与实现相反，SQPOLL 恰恰是轮询不是中断。D 选项描述的是另一个特性（IORING_SETUP_ATTACH_WQ）。"
+        },
+        {
+          "id": "os-reduce-mode-switches-q5",
+          "question": "以下是用 perf trace 对某服务采样 5 秒后的部分输出。根据这份数据，最优先应该优化哪个系统调用路径？\n\n```\nsyscall            calls  total       min       avg       max\n-----------  ---------  --------  --------  --------  --------\nwrite          4123847   987.2ms    0.18μs    0.24μs    1.21ms\nclock_gettime  2891034    43.3ms    0.01μs    0.015μs   0.08ms\nfcntl            12450     3.1ms    0.21μs    0.25μs    0.89ms\nfutex              891   128.4ms    0.12μs  144.1μs   12.3ms\n```",
+          "choices": [
+            { "id": "A", "text": "优先优化 clock_gettime，因为调用次数最多（289 万次），总开销 43ms 排第二" },
+            { "id": "B", "text": "优先优化 futex，因为平均延迟最高（144μs），说明存在严重的锁竞争" },
+            { "id": "C", "text": "优先优化 write，因为调用次数 412 万次且总 CPU 开销 987ms 最高，批量化后收益最大" },
+            { "id": "D", "text": "优先优化 fcntl，因为 fcntl 调用通常不应出现在热路径上，说明代码逻辑有问题" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "从这份 perf trace 输出解读：write 调用了 412 万次，5 秒内消耗了 987ms 的 CPU 时间——意味着这个进程每秒有将近 200ms 在纯系统调用切换上，占单核约 20%。这是最值得优化的热点。把批量大小设为 64 的 writev 可以把系统调用次数降低约 98%，理论上释放接近 200ms/秒 的 CPU。clock_gettime 调用次数虽多，但 vDSO 已经把它的总开销压到了 43ms（平均 15ns/次，说明 vDSO 正在工作），没有优化空间。futex 平均延迟高是锁竞争信号，但总开销只有 128ms 且 futex 调用次数极少（891 次），说明竞争偶发，不是系统性瓶颈。fcntl 次数和开销都很小，问题不大。"
+        },
+        {
+          "id": "os-reduce-mode-switches-q6",
+          "question": "在 Docker 容器内运行的 Go 服务中，你发现 clock_gettime 每秒被调用 50 万次，但 perf stat 显示它真实触发了 50 万次系统调用（没有走 vDSO）。最可能的原因是什么？",
+          "choices": [
+            { "id": "A", "text": "Go 运行时不使用 vDSO，所有 clock_gettime 调用都走真实系统调用" },
+            { "id": "B", "text": "容器的 seccomp 配置过滤了 vDSO 内部读取的 clock_gettime 系统调用号，导致 vDSO 代码路径回退到真实系统调用" },
+            { "id": "C", "text": "vDSO 只在物理机上有效，虚拟化和容器环境中都不支持 vDSO" },
+            { "id": "D", "text": "CLOCK_MONOTONIC 在容器内映射到 CLOCK_REALTIME，而 CLOCK_REALTIME 不走 vDSO 路径" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是容器环境中 vDSO 失效的经典场景。vDSO 的时钟代码内部在某些 fallback 路径下会调用 clock_gettime 系统调用（syscall number 228 on x86-64）。如果容器的 seccomp 白名单不包含这个 syscall，内核会返回 EPERM，vDSO 检测到失败后会静默回退到完整的系统调用路径。Docker 默认的 seccomp profile 允许 clock_gettime，但自定义收紧的 seccomp 配置可能漏掉它。A 选项错误，Go 1.9+ 的 runtime 通过汇编直接调用 vDSO 符号（见 src/runtime/sys_linux_amd64.s 的 VDSO_GETCPU 实现）。C 选项错误，KVM 虚拟机和 Linux 容器都支持 vDSO（容器共享宿主机内核）。D 选项错误，两种时钟类型在现代内核上都走 vDSO。排查命令：`strace -e trace=clock_gettime -p <pid>` 若有输出则确认回退。"
+        },
+        {
+          "id": "os-reduce-mode-switches-q7",
+          "question": "mmap 映射文件后读取数据「零系统调用」的说法是否准确？首次访问映射页面时实际发生了什么？",
+          "choices": [
+            { "id": "A", "text": "完全准确。mmap 调用后文件内容就已经全部加载到内存，后续所有读取都是纯内存访问" },
+            { "id": "B", "text": "基本准确但有一处例外：首次访问尚未加载的页面时触发 page fault，内核介入把该页从磁盘读入页缓存，但这不算系统调用，是 CPU 异常处理流程" },
+            { "id": "C", "text": "不准确。每次通过 mmap 读取文件都需要调用 msync() 系统调用来同步页缓存" },
+            { "id": "D", "text": "不准确。mmap 只减少了 read 系统调用，但内核需要通过 madvise 系统调用来管理映射区域的加载" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "mmap 的「零系统调用」说的是稳态读取，即访问已经在页缓存里的页面时完全不进内核。但首次访问一个尚未被读入内存的页面时，CPU 查找页表发现对应的 present bit 为 0，触发缺页异常（page fault），CPU 保存当前状态并跳转到内核的缺页处理程序（do_fault），内核把对应磁盘页读入页缓存，更新页表，然后重新执行触发 fault 的那条 load 指令。这个过程有内核介入，但通过的是硬件异常而非系统调用接口（不同路径，strace 看不到）。A 选项错误，mmap 是懒加载，不会预读全部内容（除非你显式调用 mlock 或 MAP_POPULATE）。C 选项错误，msync 是用来把脏页刷回磁盘的，读取不需要。D 选项错误，madvise 是可选的访问模式提示，不是必须的。"
+        },
+        {
+          "id": "os-reduce-mode-switches-q8",
+          "question": "一个高并发 HTTP 文件服务器（每秒下载请求约 10 万次，文件大小 1-50MB 不等），以下哪种方案最适合把文件内容发到客户端 socket？",
+          "choices": [
+            { "id": "A", "text": "用 mmap 把文件映射到用户态，然后循环 write 到 socket，利用 mmap 的零拷贝优势" },
+            { "id": "B", "text": "用 sendfile(socket_fd, file_fd, NULL, file_size) 在内核态直接从页缓存传输到 socket buffer，不经过用户态拷贝" },
+            { "id": "C", "text": "用 read+write 逐块读取，每块 4096 字节，减少单次系统调用的处理时间" },
+            { "id": "D", "text": "用 io_uring 提交 IORING_OP_READ 把文件读到用户态缓冲区，再提交 IORING_OP_SEND 发送" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "sendfile 是这个场景的最优解。它完全在内核态执行：读 DMA 把磁盘数据写入页缓存（如果还没有），然后通过 scatter-gather DMA 直接从页缓存拷贝到 socket 的发送缓冲区，全程不需要用户态内存缓冲区参与，也不需要在内核态和用户态之间拷贝数据（零拷贝）。相比之下，mmap+write 虽然省了一次 read 的用户态拷贝，但数据还是要从 mmap 页到 socket 缓冲区拷贝一次，而且 write 系统调用不可避免。read+write 是最差的：两次系统调用、两次内存拷贝（磁盘→内核缓冲→用户缓冲→内核 socket 缓冲）。io_uring 方案的数据流动和 read+write 一样，只是系统调用批量化了，对大文件传输没有额外优势。Nginx 的 sendfile 指令正是利用这个接口，把静态文件传输的 CPU 开销降到极低。"
+        },
+        {
+          "id": "os-reduce-mode-switches-q9",
+          "question": "在 DPDK 的用户态网络驱动架构中，收包的过程是通过「轮询」（busy-polling）而非「中断」完成的。这带来的主要代价和优势分别是什么？",
+          "choices": [
+            { "id": "A", "text": "优势：零系统调用，延迟稳定在 1-5μs；代价：专用 CPU 核心持续 100% 占用，哪怕没有包到达也不让核" },
+            { "id": "B", "text": "优势：不占用 CPU，数据包由硬件自动处理；代价：对网卡型号有严格要求，只支持 Intel 网卡" },
+            { "id": "C", "text": "优势：可以与内核网络栈无缝配合，同时享受 iptables 过滤；代价：需要重新编译内核模块" },
+            { "id": "D", "text": "优势：减少了网卡驱动的内存分配；代价：每个数据包仍需一次系统调用通知应用程序" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "DPDK 的核心设计是 run-to-completion 模型：一个（或多个）线程绑定到专用 CPU 核心上，不停地 poll 网卡的接收队列（RX ring），发现新描述符就处理，处理完继续 poll。因为从不阻塞、从不睡眠，线程永远不会被 OS 调度走，网卡来包到被处理的延迟只有 cache 访问那么短（1-5μs）。代价是这个核心 100% 被占，即使流量为零也不会让给其他任务。B 选项错误，DPDK 对 CPU 而非硬件自动化有强依赖，且支持 Intel、Mellanox、Cavium 等多种网卡。C 选项错误，DPDK 和内核网络栈是互斥的：一旦 DPDK 接管网卡，这块网卡的流量就完全绕过了内核，iptables 对 DPDK 流量无效。D 选项错误，DPDK 的核心价值之一就是彻底消除网络相关系统调用。"
+        },
+        {
+          "id": "os-reduce-mode-switches-q10",
+          "question": "你用 sendmmsg 替换 sendto 来批量发 UDP 包，但在压测中发现，当每批次包数量从 50 增加到 200 时，吞吐量没有继续线性提升，反而出现了抖动。以下哪个是最可能的原因？",
+          "choices": [
+            { "id": "A", "text": "sendmmsg 单次调用有硬编码的最大包数量限制（内核源码中 UIO_MAXIOV = 1024），超过 200 包后被截断" },
+            { "id": "B", "text": "批量增大导致每批次积累时间变长，引入了额外的等待延迟；同时单次 sendmmsg 在内核态的执行时间也更长，可能超过调度时间片导致进程被抢占" },
+            { "id": "C", "text": "UDP socket 的发送缓冲区（SO_SNDBUF）默认约 212KB，200 个包（若每包 1KB）超过缓冲区上限会触发丢包和错误重试" },
+            { "id": "D", "text": "sendmmsg 只能在非阻塞 socket 上使用，批次增大后阻塞 socket 频繁返回 EAGAIN" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是批量优化中「批次大小边际收益递减」的经典现象。增大批次有两个副作用：第一，批次越大意味着在凑满一批时等待的时间越长，P99 延迟会因为「等队友」而上升（类似 Nagle 算法的副作用）；第二，sendmmsg 在内核态需要遍历整个 mmsghdr 数组，200 个包的内核处理时间比 50 个包长约 4 倍，如果这段时间超过 Linux 的调度时间片（默认 4ms HZ=250），进程可能被强制抢占，造成延迟毛刺。A 选项中 UIO_MAXIOV=1024 是真实存在的限制，但 200 还远没到上限，不会截断。C 选项：SO_SNDBUF 只影响内核 socket 缓冲区，UDP 发送不会因 SO_SNDBUF 丢包（在本机上），它影响的是网络层的缓冲而不是 sendmmsg 的批次限制。D 选项错误，sendmmsg 阻塞/非阻塞 socket 都能用。实际生产中，UDP 批次大小 64-128 通常是甜点区，需要通过压测找到具体服务的拐点。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Linux man page: writev(2)",
+          "url": "https://man7.org/linux/man-pages/man2/writev.2.html"
+        },
+        {
+          "title": "Linux man page: sendmmsg(2)",
+          "url": "https://man7.org/linux/man-pages/man2/sendmmsg.2.html"
+        },
+        {
+          "title": "io_uring — the Linux AIO replacement (Lord of the io_uring)",
+          "url": "https://unixism.net/loti/"
+        },
+        {
+          "title": "The vDSO(7) — Linux virtual dynamic shared objects",
+          "url": "https://man7.org/linux/man-pages/man7/vdso.7.html"
+        },
+        {
+          "title": "DPDK Getting Started Guide for Linux",
+          "url": "https://doc.dpdk.org/guides/linux_gsg/"
+        },
+        {
+          "title": "Brendan Gregg — Linux Performance: perf Examples",
+          "url": "https://www.brendangregg.com/perf.html"
+        },
+        {
+          "title": "Kernel Page-Table Isolation — LWN.net",
+          "url": "https://lwn.net/Articles/741878/"
+        },
+        {
+          "title": "Linux man page: mmap(2)",
+          "url": "https://man7.org/linux/man-pages/man2/mmap.2.html"
+        }
+      ]
+    }
+  ]
+}
