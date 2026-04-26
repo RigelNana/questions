@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { Header } from './Header';
@@ -11,9 +11,15 @@ export function Layout() {
   const [searchOpen, setSearchOpen] = useState(false);
   const { settings } = useProgressStore();
   const location = useLocation();
+  const mainRef = useRef<HTMLElement>(null);
 
   const openSearch = useCallback(() => setSearchOpen(true), []);
   const closeSearch = useCallback(() => setSearchOpen(false), []);
+
+  // Scroll to top on route change
+  useEffect(() => {
+    mainRef.current?.scrollTo(0, 0);
+  }, [location.pathname]);
 
   // Apply theme
   useEffect(() => {
@@ -44,7 +50,7 @@ export function Layout() {
   }, []);
 
   return (
-    <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden bg-[var(--color-notion-bg)]">
+    <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden bg-[var(--color-notion-bg)] transition-colors duration-300">
       <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
       <div className="flex-1 flex flex-col overflow-hidden">
@@ -53,7 +59,7 @@ export function Layout() {
           onOpenSearch={openSearch}
         />
 
-        <main className="flex-1 overflow-y-auto overflow-x-hidden">
+        <main ref={mainRef} className="flex-1 overflow-y-auto overflow-x-hidden">
           <div className="mobile-nav-offset max-w-7xl mx-auto px-4 py-5 sm:px-8 sm:py-10 lg:pb-12">
             <div key={location.pathname}>
               <Outlet />
@@ -62,7 +68,7 @@ export function Layout() {
         </main>
       </div>
 
-      <BottomNav />
+      <BottomNav hidden={sidebarOpen} />
       <SearchModal isOpen={searchOpen} onClose={closeSearch} />
     </div>
   );

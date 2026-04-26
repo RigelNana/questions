@@ -32,7 +32,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
           lg:translate-x-0 lg:static lg:z-auto
           ${isOpen ? "translate-x-0" : "-translate-x-full"}
         `}
-        style={{ transitionTimingFunction: 'var(--ease-emphasized)' }}
+        style={{ transitionTimingFunction: 'var(--ease-emphasized)', transitionProperty: 'transform, background-color, border-color, color' }}
       >
         {/* Logo */}
         <div className="px-5 py-5 border-b border-[var(--color-notion-border)]">

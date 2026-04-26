@@ -1,7 +1,11 @@
 import { NavLink } from 'react-router-dom';
 import { LayoutDashboard, XCircle, TrendingUp, Settings } from 'lucide-react';
 
-export function BottomNav() {
+interface BottomNavProps {
+  hidden?: boolean;
+}
+
+export function BottomNav({ hidden }: BottomNavProps) {
   const items = [
     { to: '/', icon: LayoutDashboard, label: '总览', end: true },
     { to: '/review', icon: XCircle, label: '错题' },
@@ -10,7 +14,12 @@ export function BottomNav() {
   ];
 
   return (
-    <nav className="bottom-nav lg:hidden fixed inset-x-0 bottom-0 z-40 glass-surface border-t border-[var(--color-notion-border)]">
+    <nav
+      className={`bottom-nav lg:hidden fixed inset-x-0 bottom-0 z-40 glass-surface border-t border-[var(--color-notion-border)] transition-all duration-300 ${
+        hidden ? 'translate-y-full opacity-0 pointer-events-none' : 'translate-y-0 opacity-100'
+      }`}
+      style={{ transitionTimingFunction: 'var(--ease-emphasized)' }}
+    >
       <div className="bottom-nav-grid mx-auto grid max-w-lg grid-cols-4 gap-1 px-2">
         {items.map(({ to, icon: Icon, label, end }) => (
           <NavLink

@@ -1,4 +1,5 @@
-import { Search, Menu, Sun, Moon } from 'lucide-react';
+import { Search, Menu, Sun, Moon, ChevronLeft } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useProgressStore } from '../../stores/progressStore';
 
 interface HeaderProps {
@@ -6,8 +7,12 @@ interface HeaderProps {
   onOpenSearch: () => void;
 }
 
+const TOP_LEVEL_PATHS = ['/', '/review', '/progress', '/settings'];
+
 export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
   const { settings, updateSettings } = useProgressStore();
+  const location = useLocation();
+  const navigate = useNavigate();
 
   const toggleTheme = () => {
     const next = settings.theme === 'dark' ? 'light' : 'dark';
@@ -15,17 +20,28 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
   };
 
   const isDark = settings.theme === 'dark' || (settings.theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  const isSubPage = !TOP_LEVEL_PATHS.includes(location.pathname);
 
   return (
     <header className="h-13 border-b border-[var(--color-notion-border)] flex items-center px-4 sm:px-5 glass-surface sticky top-0 z-30 transition-colors duration-300">
-      {/* Mobile menu button */}
-      <button
-        onClick={onToggleSidebar}
-        className="lg:hidden p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] mr-2 transition-colors"
-        aria-label="Toggle sidebar"
-      >
-        <Menu className="w-[18px] h-[18px]" />
-      </button>
+      {/* Mobile: back button on sub-pages, menu button on top-level */}
+      {isSubPage ? (
+        <button
+          onClick={() => navigate(-1)}
+          className="lg:hidden p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] mr-2 transition-colors active-press"
+          aria-label="Go back"
+        >
+          <ChevronLeft className="w-[18px] h-[18px]" />
+        </button>
+      ) : (
+        <button
+          onClick={onToggleSidebar}
+          className="lg:hidden p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] mr-2 transition-colors"
+          aria-label="Toggle sidebar"
+        >
+          <Menu className="w-[18px] h-[18px]" />
+        </button>
+      )}
 
       {/* Search trigger */}
       <button
