@@ -7,15 +7,19 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
       role="switch"
       aria-checked={checked}
       onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors duration-200 active-press ${
+      className={`relative inline-flex shrink-0 items-center rounded-full transition-colors duration-200 active-press ${
         checked ? 'bg-[var(--color-notion-accent)]' : 'bg-[var(--color-notion-border)]'
       }`}
+      style={{ width: 44, height: 24, minWidth: 44, minHeight: 24 }}
     >
       <span
-        className={`inline-block h-4.5 w-4.5 rounded-full bg-white shadow-sm transition-[translate] duration-200 ${
+        className={`inline-block rounded-full bg-white shadow-sm ${
           checked ? 'translate-x-[22px]' : 'translate-x-[3px]'
         }`}
-        style={{ transitionTimingFunction: 'var(--ease-emphasized)' }}
+        style={{
+          width: 18, height: 18,
+          transition: 'translate 200ms var(--ease-emphasized)',
+        }}
       />
     </button>
   );

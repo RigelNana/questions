@@ -40,7 +40,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
         }}
       >
         {/* Logo + Close */}
-        <div className="px-5 py-5 border-b border-[var(--color-notion-border)] flex items-center justify-between">
+        <div className="px-5 py-5 border-b border-[var(--color-notion-border)] flex items-center justify-between" style={{ paddingTop: 'calc(1.25rem + env(safe-area-inset-top, 0px))' }}>
           <NavLink
             to="/"
             className="flex items-center gap-2.5 no-underline"

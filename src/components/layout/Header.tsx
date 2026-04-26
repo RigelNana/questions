@@ -26,8 +26,12 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
 
   return (
     <header
-      className="h-13 border-b border-[var(--color-notion-border)] flex items-center px-4 sm:px-5 glass-surface sticky top-0 z-30 transition-colors duration-300"
-      style={electron ? { WebkitAppRegion: 'drag' } as React.CSSProperties : undefined}
+      className="border-b border-[var(--color-notion-border)] flex items-center px-4 sm:px-5 glass-surface sticky top-0 z-30"
+      style={{
+        height: 'calc(3.25rem + env(safe-area-inset-top, 0px))',
+        paddingTop: 'env(safe-area-inset-top, 0px)',
+        ...(electron ? { WebkitAppRegion: 'drag' } as React.CSSProperties : {}),
+      }}
     >
       {/* Back button — visible on sub-pages */}
       {isSubPage && (
