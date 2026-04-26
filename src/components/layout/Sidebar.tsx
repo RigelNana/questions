@@ -4,6 +4,7 @@ import {
   Target,
   LayoutDashboard,
   XCircle,
+  X,
   TrendingUp,
   Settings,
 } from "lucide-react";
@@ -16,26 +17,30 @@ interface SidebarProps {
 export function Sidebar({ isOpen, onClose }: SidebarProps) {
   return (
     <>
-      {/* Mobile overlay */}
-      {isOpen && (
-        <div
-          className="fixed inset-0 bg-black/30 backdrop-blur-sm z-40 lg:hidden animate-overlay-in"
-          onClick={onClose}
-        />
-      )}
+      {/* Mobile overlay — always mounted, animated via opacity */}
+      <div
+        className={`fixed inset-0 bg-black/30 backdrop-blur-sm z-40 lg:hidden transition-opacity ${
+          isOpen
+            ? "opacity-100 pointer-events-auto"
+            : "opacity-0 pointer-events-none"
+        }`}
+        style={{ transitionDuration: 'var(--duration-medium-2)', transitionTimingFunction: 'var(--ease-standard)' }}
+        onClick={onClose}
+      />
 
       <aside
         className={`
           fixed top-0 left-0 z-50 h-full w-64 bg-[var(--color-notion-bg-secondary)]
           border-r border-[var(--color-notion-border)] flex flex-col
-          transition-transform duration-[var(--duration-long-1)]
           lg:translate-x-0 lg:static lg:z-auto
           ${isOpen ? "translate-x-0" : "-translate-x-full"}
         `}
-        style={{ transitionTimingFunction: 'var(--ease-emphasized)', transitionProperty: 'transform, background-color, border-color, color' }}
+        style={{
+          transition: 'transform var(--duration-long-1) var(--ease-emphasized), background-color 0.3s ease, border-color 0.3s ease',
+        }}
       >
-        {/* Logo */}
-        <div className="px-5 py-5 border-b border-[var(--color-notion-border)]">
+        {/* Logo + Close */}
+        <div className="px-5 py-5 border-b border-[var(--color-notion-border)] flex items-center justify-between">
           <NavLink
             to="/"
             className="flex items-center gap-2.5 no-underline"
@@ -48,6 +53,13 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
               刷题
             </span>
           </NavLink>
+          <button
+            onClick={onClose}
+            className="lg:hidden p-1.5 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] transition-colors active-press"
+            aria-label="Close sidebar"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
 
         {/* Navigation */}
