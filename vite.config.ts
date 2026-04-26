@@ -2,9 +2,9 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
-const isElectron = process.env.ELECTRON === 'true';
+const isNative = process.env.ELECTRON === 'true' || process.env.CAPACITOR === 'true';
 
 export default defineConfig({
-  base: isElectron ? './' : '/questions/',
+  base: isNative ? './' : '/questions/',
   plugins: [react(), tailwindcss()],
 })
