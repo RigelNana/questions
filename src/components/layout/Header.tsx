@@ -42,10 +42,13 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
       {/* Theme toggle */}
       <button
         onClick={toggleTheme}
-        className="ml-3 p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] transition-all duration-200"
+        className="ml-3 p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] transition-all duration-200 active-press"
         aria-label="Toggle theme"
       >
-        {isDark ? <Sun className="w-[18px] h-[18px]" /> : <Moon className="w-[18px] h-[18px]" />}
+        {isDark
+          ? <Sun key="sun" className="w-[18px] h-[18px] animate-icon-rotate" />
+          : <Moon key="moon" className="w-[18px] h-[18px] animate-icon-rotate" />
+        }
       </button>
     </header>
   );

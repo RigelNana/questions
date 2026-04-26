@@ -15,7 +15,7 @@ export function QuestionCard({ question, isCompleted, isBookmarked }: QuestionCa
   return (
     <Link
       to={`/domains/${question.domain}/${question.id}`}
-      className="block px-4 sm:px-5 py-3.5 border-b border-[var(--color-notion-border)] hover:bg-[var(--color-notion-bg-secondary)] transition-all duration-200 no-underline group"
+      className="block px-4 sm:px-5 py-3.5 border-b border-[var(--color-notion-border)] hover:bg-[var(--color-notion-bg-secondary)] transition-all duration-200 no-underline group active-press"
     >
       <div className="flex items-start gap-3">
         {/* Status indicator */}

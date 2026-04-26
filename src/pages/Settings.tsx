@@ -19,7 +19,7 @@ export function Settings() {
         个性化你的刷题体验
       </p>
 
-      <div className="space-y-4 sm:space-y-6">
+      <div className="space-y-4 sm:space-y-6 animate-stagger">
         {/* Theme settings */}
         <div className="p-4 sm:p-5 rounded-lg border border-[var(--color-notion-border)]">
           <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4">外观</h3>
@@ -28,7 +28,7 @@ export function Settings() {
               <button
                 key={value}
                 onClick={() => updateSettings({ theme: value })}
-                className={`flex-1 flex flex-col items-center gap-2 py-3 px-3 rounded-lg border-2 transition-all ${
+                className={`flex-1 flex flex-col items-center gap-2 py-3 px-3 rounded-lg border-2 transition-all active-press ${
                   settings.theme === value
                     ? 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)]'
                     : 'border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]'

@@ -141,7 +141,7 @@ export function QuizPanel({
               <span
                 className={`block h-2.5 w-2.5 rounded-full transition-transform duration-200 ${dotColor} ${
                   isCurrent ? 'scale-150' : 'group-hover:scale-125'
-                }`}
+                } ${isCurrent && !attempt ? 'animate-dot-breathe' : ''}`}
               />
             </button>
           );
@@ -180,7 +180,11 @@ export function QuizPanel({
                 onClick={() => !isAnswered && setSelectedAnswer(choice.id)}
                 disabled={isAnswered}
                 className={`w-full text-left px-3.5 sm:px-4 py-2.5 sm:py-3 rounded-lg border transition-all duration-200 flex items-start gap-2.5 sm:gap-3 ${choiceStyle} ${
-                  isAnswered ? 'cursor-default' : 'cursor-pointer'
+                  isAnswered ? 'cursor-default' : 'cursor-pointer active-press'
+                } ${
+                  isAnswered && isCorrectChoice ? 'animate-success-pulse' : ''
+                } ${
+                  isAnswered && isSelected && !isCorrectChoice ? 'animate-shake' : ''
                 }`}
               >
                 <span className={`text-sm font-medium flex-shrink-0 mt-0.5 ${isSelected && !isAnswered ? 'text-[var(--color-notion-accent)]' : 'text-[var(--color-notion-text-secondary)]'}`}>
@@ -203,7 +207,7 @@ export function QuizPanel({
             <button
               onClick={handleSubmit}
               disabled={!selectedAnswer}
-              className="w-full rounded-lg bg-[var(--color-notion-accent)] px-5 py-2.5 text-sm font-medium text-white transition-all duration-200 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30 sm:w-auto"
+              className="w-full rounded-lg bg-[var(--color-notion-accent)] px-5 py-2.5 text-sm font-medium text-white transition-all duration-200 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30 sm:w-auto active-press"
             >
               提交答案
             </button>

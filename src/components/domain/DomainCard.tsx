@@ -24,7 +24,7 @@ export function DomainCard({
   return (
     <Link
       to={`/domains/${domain}`}
-      className="block p-5 rounded-xl border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/50 hover:shadow-lg hover:shadow-[var(--color-notion-accent)]/5 transition-all duration-300 no-underline group"
+      className="block p-5 rounded-xl border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/50 hover:shadow-lg hover:shadow-[var(--color-notion-accent)]/5 transition-all duration-300 no-underline group active-press"
     >
       <div className="flex items-start justify-between mb-4">
         <div className="w-11 h-11 rounded-xl bg-[var(--color-notion-accent-light)] flex items-center justify-center group-hover:scale-110 transition-transform duration-300">
@@ -48,7 +48,7 @@ export function DomainCard({
       {/* Progress bar */}
       <div className="w-full h-1.5 bg-[var(--color-notion-bg-hover)] rounded-full overflow-hidden">
         <div
-          className="h-full bg-gradient-to-r from-[var(--color-notion-accent)] to-[var(--color-notion-accent)]/70 rounded-full transition-all duration-500 ease-out"
+          className="h-full bg-gradient-to-r from-[var(--color-notion-accent)] to-[var(--color-notion-accent)]/70 rounded-full animate-progress"
           style={{ width: `${progress}%` }}
         />
       </div>

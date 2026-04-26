@@ -231,13 +231,13 @@ export function QuestionDetail() {
             </button>
             <button
               onClick={() => questionId && toggleBookmark(questionId)}
-              className={`flex w-full items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-all duration-200 sm:w-auto sm:justify-start sm:py-2.5 ${
+              className={`flex w-full items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-all duration-200 active-press sm:w-auto sm:justify-start sm:py-2.5 ${
                 bookmarked
                   ? 'border-[var(--color-notion-warning)] bg-[var(--color-notion-warning-light)] text-[var(--color-notion-warning)]'
                   : 'border-[var(--color-notion-border)] text-[var(--color-notion-text-secondary)] hover:border-[var(--color-notion-warning)] hover:bg-[var(--color-notion-warning-light)]'
               }`}
             >
-              <Star className={`w-4 h-4 ${bookmarked ? 'fill-current' : ''}`} />
+              <Star className={`w-4 h-4 ${bookmarked ? 'fill-current animate-spring-pop' : ''}`} />
               {bookmarked ? '已收藏' : '收藏'}
             </button>
             {hasQuiz && (

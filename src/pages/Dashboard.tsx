@@ -145,7 +145,7 @@ export function Dashboard() {
       </div>
 
       {/* Stats overview */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-10">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-10 animate-stagger">
         {stats.map(({ label, value, icon: Icon, color }) => (
           <div
             key={label}
@@ -168,7 +168,7 @@ export function Dashboard() {
 
       {/* Continue last */}
       {lastVisited && (
-        <div className="mb-8 p-4 rounded-xl border border-[var(--color-notion-accent)]/30 bg-[var(--color-notion-accent-light)] hover:bg-[var(--color-notion-accent)]/10 transition-colors">
+        <div className="mb-8 p-4 rounded-xl border border-[var(--color-notion-accent)]/30 bg-[var(--color-notion-accent-light)] hover:bg-[var(--color-notion-accent)]/10 transition-colors animate-slide-in-right">
           <Link
             to={`/domains/${lastVisited.domain}/${lastVisited.questionId}`}
             className="flex items-center gap-2.5 text-sm text-[var(--color-notion-accent)] font-medium no-underline hover:underline"

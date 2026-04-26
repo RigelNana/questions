@@ -40,7 +40,7 @@ export function Progress() {
         你的学习数据总览
       </p>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4 mb-8">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4 mb-8 animate-stagger">
         <div className="p-4 sm:p-5 rounded-lg border border-[var(--color-notion-border)] text-center">
           <div className="text-2xl sm:text-3xl font-bold text-[var(--color-notion-accent)]">{totalCompleted}</div>
           <div className="text-xs sm:text-sm text-[var(--color-notion-text-secondary)] mt-1">已完成题目</div>
@@ -77,7 +77,7 @@ export function Progress() {
                     </div>
                     <div className="w-full h-1.5 bg-[var(--color-notion-bg-secondary)] rounded-full overflow-hidden">
                       <div
-                        className="h-full bg-[var(--color-notion-accent)] rounded-full transition-all duration-300"
+                        className="h-full bg-[var(--color-notion-accent)] rounded-full animate-progress"
                         style={{ width: `${pct}%` }}
                       />
                     </div>

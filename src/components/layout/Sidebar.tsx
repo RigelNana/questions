@@ -19,7 +19,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
       {/* Mobile overlay */}
       {isOpen && (
         <div
-          className="fixed inset-0 bg-black/30 backdrop-blur-sm z-40 lg:hidden"
+          className="fixed inset-0 bg-black/30 backdrop-blur-sm z-40 lg:hidden animate-overlay-in"
           onClick={onClose}
         />
       )}
@@ -28,10 +28,11 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
         className={`
           fixed top-0 left-0 z-50 h-full w-64 bg-[var(--color-notion-bg-secondary)]
           border-r border-[var(--color-notion-border)] flex flex-col
-          transition-transform duration-250 ease-out
+          transition-transform duration-[var(--duration-long-1)]
           lg:translate-x-0 lg:static lg:z-auto
           ${isOpen ? "translate-x-0" : "-translate-x-full"}
         `}
+        style={{ transitionTimingFunction: 'var(--ease-emphasized)' }}
       >
         {/* Logo */}
         <div className="px-5 py-5 border-b border-[var(--color-notion-border)]">

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Search, ArrowRight, CornerDownLeft } from 'lucide-react';
 import { useQuestionStore } from '../../stores/questionStore';
@@ -12,7 +12,21 @@ interface SearchModalProps {
 export function SearchModal({ isOpen, onClose }: SearchModalProps) {
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [isClosing, setIsClosing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const closingTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  const handleClose = useCallback(() => {
+    setIsClosing(true);
+    closingTimerRef.current = setTimeout(() => {
+      setIsClosing(false);
+      onClose();
+    }, 200);
+  }, [onClose]);
+
+  useEffect(() => {
+    return () => { if (closingTimerRef.current) clearTimeout(closingTimerRef.current); };
+  }, []);
   const navigate = useNavigate();
   const { getAllLoadedQuestions } = useQuestionStore();
 
@@ -45,7 +59,7 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
     const item = results[index];
     if (item) {
       navigate(`/domains/${item.domain}/${item.id}`);
-      onClose();
+      handleClose();
     }
   };
 
@@ -64,7 +78,7 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
         handleSelect(selectedIndex);
         break;
       case 'Escape':
-        onClose();
+        handleClose();
         break;
     }
   };
@@ -74,10 +88,10 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
   return (
     <div className="fixed inset-0 z-[100] flex items-start justify-center pt-[8vh] sm:pt-[15vh]">
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+      <div className={`absolute inset-0 bg-black/50 backdrop-blur-sm ${isClosing ? 'animate-overlay-out' : 'animate-overlay-in'}`} onClick={handleClose} />
 
       {/* Modal */}
-      <div className="relative w-full max-w-lg mx-3 sm:mx-4 bg-[var(--color-notion-bg)] rounded-xl shadow-2xl shadow-black/20 border border-[var(--color-notion-border)] overflow-hidden animate-scale-in">
+      <div className={`relative w-full max-w-lg mx-3 sm:mx-4 bg-[var(--color-notion-bg)] rounded-xl shadow-2xl shadow-black/20 border border-[var(--color-notion-border)] overflow-hidden ${isClosing ? 'animate-scale-out' : 'animate-scale-in'}`}>
         {/* Search input */}
         <div className="flex items-center gap-3 px-4 py-3.5 border-b border-[var(--color-notion-border)]">
           <Search className="w-4 h-4 text-[var(--color-notion-accent)] flex-shrink-0" />
