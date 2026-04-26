@@ -247,7 +247,7 @@ export function QuizPanel({
             disabled={currentIndex === 0}
             className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
           >
-            <ChevronLeft className="w-4 h-4" /> 上一题
+            <ChevronLeft className="w-4 h-4" /> 上一小题
           </button>
           <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono">
             {currentIndex + 1} / {quizzes.length}
@@ -257,7 +257,7 @@ export function QuizPanel({
             disabled={currentIndex === quizzes.length - 1}
             className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
           >
-            下一题 <ChevronRight className="w-4 h-4" />
+            下一小题 <ChevronRight className="w-4 h-4" />
           </button>
         </div>
       </div>

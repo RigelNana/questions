@@ -8,7 +8,7 @@ import { DifficultyBadge } from '../components/filter/DifficultyBadge';
 import { TypeBadge } from '../components/filter/TypeBadge';
 import { QuizPanel } from '../components/question/QuizPanel';
 import { DOMAIN_LABELS, DOMAIN_ICONS, type Domain, type QuizAttempt } from '../types';
-import { Lightbulb, Star, ChevronUp, ChevronLeft, ChevronRight, BookOpen, ClipboardCheck, Highlighter } from 'lucide-react';
+import { Lightbulb, Star, ChevronUp, ArrowLeft, ArrowRight, BookOpen, ClipboardCheck, Highlighter } from 'lucide-react';
 
 type DetailTab = 'content' | 'quiz';
 
@@ -308,14 +308,16 @@ export function QuestionDetail() {
         </div>
       )}
 
-      {/* Navigation — with generous bottom margin */}
+      {/* Question navigation — visually distinct from quiz internal nav */}
       <div className="flex items-center justify-between pt-5 mt-6 mb-8 border-t border-[var(--color-notion-border)]">
         <button
           onClick={() => handleNav(-1)}
           disabled={currentIndex <= 0}
-          className="flex items-center gap-1.5 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] disabled:opacity-30 transition-colors duration-200 active-press"
         >
-          <ChevronLeft className="w-4 h-4" /> 上一题
+          <ArrowLeft className="w-4 h-4" />
+          <span className="hidden sm:inline">上一知识点</span>
+          <span className="sm:hidden">上一个</span>
         </button>
         <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono">
           {currentIndex + 1} / {allQuestions.length}
@@ -323,9 +325,11 @@ export function QuestionDetail() {
         <button
           onClick={() => handleNav(1)}
           disabled={currentIndex >= allQuestions.length - 1}
-          className="flex items-center gap-1.5 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] disabled:opacity-30 transition-colors duration-200 active-press"
         >
-          下一题 <ChevronRight className="w-4 h-4" />
+          <span className="hidden sm:inline">下一知识点</span>
+          <span className="sm:hidden">下一个</span>
+          <ArrowRight className="w-4 h-4" />
         </button>
       </div>
     </div>

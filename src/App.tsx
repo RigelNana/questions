@@ -1,6 +1,13 @@
-import { lazy, Suspense } from 'react';
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { lazy, Suspense, type ReactNode } from 'react';
+import { BrowserRouter, HashRouter, Routes, Route } from 'react-router-dom';
 import { Layout } from './components/layout/Layout';
+
+const isElectron = 'electronAPI' in window;
+
+function Router({ children }: { children: ReactNode }) {
+  if (isElectron) return <HashRouter>{children}</HashRouter>;
+  return <BrowserRouter basename="/questions">{children}</BrowserRouter>;
+}
 
 // Lazy-loaded pages for code splitting
 const Dashboard = lazy(() => import('./pages/Dashboard').then((m) => ({ default: m.Dashboard })));
@@ -26,7 +33,7 @@ function PageLoader() {
 
 export default function App() {
   return (
-    <BrowserRouter basename="/questions">
+    <Router>
       <Routes>
         <Route element={<Layout />}>
           <Route index element={<Suspense fallback={<PageLoader />}><Dashboard /></Suspense>} />
@@ -37,6 +44,6 @@ export default function App() {
           <Route path="settings" element={<Suspense fallback={<PageLoader />}><Settings /></Suspense>} />
         </Route>
       </Routes>
-    </BrowserRouter>
+    </Router>
   );
 }
