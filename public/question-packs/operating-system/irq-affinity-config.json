@@ -1,0 +1,156 @@
+{
+  "id": "os-irq-affinity-config",
+  "name": "IRQ 亲和性配置与网络中断调优",
+  "domain": "operating-system",
+  "description": "中断亲和性的配置方法、RSS 多队列绑定策略与 NUMA 感知的中断分配实践",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-irq-affinity-config-1",
+      "domain": "operating-system",
+      "type": "modification",
+      "difficulty": 3,
+      "tags": ["IRQ-affinity", "smp_affinity", "irqbalance", "RSS", "XPS", "NIC", "NUMA", "ethtool", "Linux"],
+      "title": "中断亲和性（IRQ Affinity）是什么，如何配置",
+      "content": "你在一家视频直播平台担任 SRE，核心直播代理服务器规格是双路 Intel Xeon Gold 6154（每路 18 核，HT 开启，共 72 个逻辑 CPU），双 NUMA 节点架构，Node 0 和 Node 1 各挂载 36 个逻辑核。服务器配备一块 Intel X710 10GbE 网卡，通过 PCIe 连接在 NUMA Node 0 的根联合体上。\n\n系统当前状态：irqbalance 服务正在运行，网卡只启用了 1 个 RX/TX 队列。最近两周直播流量增长明显，你用 `top` 持续观测，发现流量高峰期 CPU0 的 `%si`（软中断占比）稳定在 87%，其余 71 个核基本空闲。带宽监控显示出口流量卡在 3.2 Gbps，但合同带宽是 10 Gbps，理论上这台机器应该能跑到更高。\n\n```\n# 高峰期 /proc/interrupts 片段（节选）\n           CPU0       CPU1       CPU2       CPU3  ...\n120:  94827361          0          0          0  PCI-MSI  eth0-rx-0\n```\n\n你用 `cat /proc/irq/120/smp_affinity` 查看，输出是 `ffffffffffffffff`——说明内核允许所有 CPU 处理这个中断，但 irqbalance 把它全部集中到了 CPU0 上。\n\n你的同事整理了如下改造方案，计划在下周维护窗口执行：\n\n```bash\n# 步骤 1：停止 irqbalance 并禁止开机自启\nsystemctl stop irqbalance\nsystemctl disable irqbalance\n\n# 步骤 2：开启 NIC 8 队列（当前只有 1 个）\nethtool -L eth0 combined 8\n\n# 步骤 3：将各队列 IRQ 绑到 NUMA Node 0 的前 8 个逻辑核（CPU 0-7）\nfor i in 0 1 2 3 4 5 6 7; do\n  IRQ=$(grep \"eth0-rx-$i\" /proc/interrupts | awk -F: '{print $1}' | tr -d ' ')\n  echo $((1 << i)) > /proc/irq/$IRQ/smp_affinity\ndone\n\n# 步骤 4：配置 XPS，将 TX 队列绑到对应的 CPU\nfor i in 0 1 2 3 4 5 6 7; do\n  printf '%x\\n' $((1 << i)) > /sys/class/net/eth0/queues/tx-$i/xps_cpus\ndone\n```\n\n**请分析这个方案，并回答以下问题：**\n\n1. IRQ Affinity（中断亲和性）的核心机制是什么？`/proc/irq/N/smp_affinity` 的十六进制位掩码如何映射到具体 CPU？\n2. 这个方案在 NUMA 感知方面是否正确？为什么不应该把 NIC 中断绑到 NUMA Node 1 的核上？\n3. 停用 irqbalance 后有哪些潜在风险？如何确保配置在重启后仍然有效？\n4. 步骤 3 中 `echo $((1 << i))` 的写法在 `i` 超过某个值后会出什么问题？如何正确处理超过 32 CPU 的系统？\n5. 如果网卡不支持硬件多队列（如 virtio-net），有什么软件层面的替代方案？",
+      "answer": "## 中断、CPU 与「谁来处理」的问题\n\n在谈 IRQ Affinity 之前，先要搞清楚中断这件事本身。当网卡收到一个以太网帧，它不会等程序来主动轮询，而是向 CPU 发一个硬件信号，告诉它「我有数据了，来处理一下」——这就是硬件中断，缩写 IRQ（Interrupt Request）。CPU 收到这个信号后暂停当前任务，跳转到内核的中断处理例程（ISR），处理完毕再恢复原来的工作。你在 `top` 里看到的 `%hi`（硬中断）和 `%si`（软中断）就是这段处理时间占 CPU 的比例。\n\n在多核系统上，内核需要决定让哪个 CPU 响应每一个中断，这就是 IRQ Affinity（中断亲和性）要解决的问题。「亲和性」的意思是：这个中断「偏好」被哪些 CPU 处理。默认情况下，Linux 会启动 irqbalance 守护进程来自动分配中断，每隔几秒采样各 CPU 的中断负载，如果某个 CPU 中断太多就迁移部分到其他核。这个策略对通用服务器够用，但它优化的是负载均衡，而不是延迟或吞吐量。题目里 irqbalance 把所有中断都堆给了 CPU0，完全没利用其余 71 个核，恰恰说明 irqbalance 的默认策略在高负载单队列场景下会退化。\n\n手动 IRQ Affinity 能比 irqbalance 更好，核心理由是**缓存局部性**。当网卡中断打到 CPU0，CPU0 的中断处理例程从网卡 DMA 缓冲区读入数据包，这些数据会进入 CPU0 的 L1/L2 缓存。如果处理这些数据包的应用进程（比如 nginx worker）也运行在 CPU0 上，它就能直接从 L1 缓存读取，延迟只有几纳秒。反之，若中断在 CPU0 处理而 nginx worker 被调度到 CPU20，CPU20 需要从 L3 甚至主存重新加载这些数据，延迟可能增加一个量级。这就是「中断处理 CPU」和「数据消费进程 CPU」要尽量放在一起的原因。\n\n## smp_affinity 位掩码：每一个 bit 都是一个 CPU\n\n`/proc/irq/N/smp_affinity` 是内核暴露给用户空间的控制文件，读写的是一个十六进制位掩码。规则很简单：第 0 位（最低位）代表 CPU0，第 1 位代表 CPU1，第 N 位代表 CPUN，某位为 1 表示允许该 CPU 处理这个中断。\n\n```bash\n# 读当前 IRQ 120 的亲和性\ncat /proc/irq/120/smp_affinity\n# f  →  0b00001111  →  允许 CPU0、CPU1、CPU2、CPU3\n\n# 更直观的 CPU 列表格式\ncat /proc/irq/120/smp_affinity_list\n# 0-3\n\n# 将 IRQ 120 绑到 CPU0（只有 bit 0 = 1）\necho 1 > /proc/irq/120/smp_affinity         # 0x1 = 0b00000001\n\n# 将 IRQ 120 绑到 CPU2 和 CPU3（bit 2 和 bit 3 = 1）\necho c > /proc/irq/120/smp_affinity         # 0xc = 0b00001100\n\n# 用 smp_affinity_list 写，更直观（同等效果）\necho 2-3 > /proc/irq/120/smp_affinity_list\n```\n\n到这里一切正常。但题目里的服务器有 72 个逻辑 CPU，这里有一个很多人踩过的坑：`smp_affinity` 的单个十六进制字段只能表示 32 个 CPU（8 位十六进制 = 32 个 bit）。超过 32 个 CPU 时，内核要求用逗号分隔的多段格式，每段是一个 32 位掩码，从右到左分别对应 CPU0-31、CPU32-63、CPU64-95……\n\n```bash\n# 72 CPU 系统，将中断绑到 CPU0（第一段的 bit 0）\necho 00000000,00000000,00000001 > /proc/irq/120/smp_affinity\n#   [CPU64-71]  [CPU32-63]   [CPU0-31]\n\n# 绑到 CPU35（第二段的 bit 3，因为 35 = 32 + 3，0x8 = 0b00001000）\necho 00000000,00000008,00000000 > /proc/irq/120/smp_affinity\n\n# 绑到 CPU7（第一段的 bit 7，0x80 = 0b10000000）\necho 00000000,00000000,00000080 > /proc/irq/120/smp_affinity\n```\n\n题目方案步骤 3 用 `echo $((1 << i))`，当 `i` 在 0-7 时输出十进制整数（1、2、4、8、16、32、64、128），内核把这个字符串按十六进制解析。这里潜藏一个错误：`echo 128` 被内核读作十六进制 0x128，意味着 bit 8（CPU8）和 bit 5（CPU5）同时置位，而不是预期的 bit 7（CPU7）。更健壮的写法是始终用 `printf '%x'` 输出十六进制格式，这样 `i=7` 时输出 `80`，内核读作 0x80 = bit 7 = CPU7，才是正确的。一旦 `i >= 32`，`$((1 << 32))` 结果超过 32 位边界，直接写入会收到 `write error: Invalid argument`。对于需要绑定 CPU32 以上的场景，必须手动构建多段逗号分隔的掩码字符串。\n\n## RSS 多队列：从根本上突破单队列瓶颈\n\n题目场景里真正的性能瓶颈不只是中断绑核，而是网卡只有 1 个队列。单队列意味着所有数据包——无论来自多少条 TCP 流——都经过同一个接收描述符环（RX ring），触发同一个 IRQ，只有一个 CPU 来处理。这就是 CPU0 `%si` 87% 而其他核空闲的根本原因：物理上只有一条数据进入通道。\n\nRSS（Receive Side Scaling）是现代高性能网卡的标配功能。它在网卡硬件层面对入站数据包做 Toeplitz 哈希（通常取源 IP + 目的 IP + 源端口 + 目的端口四元组），根据哈希结果把包分配到不同的 RX 队列。每个队列有独立的 DMA 描述符环和独立的 MSI-X 中断线，不同队列的中断可以由不同 CPU 完全并行处理。\n\n```bash\n# 查看当前网卡队列配置\nethtool -l eth0\n# Channel parameters for eth0:\n# Pre-set maximums:\n# Combined:    16        ← X710 硬件最大支持 16 个队列\n# Current hardware settings:\n# Combined:     1        ← 当前只开了 1 个（这就是瓶颈所在！）\n\n# 开启 8 个队列（业务低峰期执行，会短暂重置网卡）\nethtool -L eth0 combined 8\n\n# 确认 IRQ 分配情况\ngrep eth0 /proc/interrupts\n# 120:  456789  0  0  0  0  0  0  0  PCI-MSI  eth0-rx-0\n# 121:       0  456789  0  0  0  0  0  0  PCI-MSI  eth0-rx-1\n# 122:       0  0  456789  0  0  0  0  0  PCI-MSI  eth0-rx-2\n# 123:       0  0  0  456789  0  0  0  0  PCI-MSI  eth0-rx-3\n# 124:       0  0  0  0  456789  0  0  0  PCI-MSI  eth0-rx-4\n# 125:       0  0  0  0  0  456789  0  0  PCI-MSI  eth0-rx-5\n# 126:       0  0  0  0  0  0  456789  0  PCI-MSI  eth0-rx-6\n# 127:       0  0  0  0  0  0  0  456789  PCI-MSI  eth0-rx-7\n```\n\n现在把每个队列的 IRQ 绑到对应的 CPU，建立「队列 N → IRQ N → CPU N」的一一对应关系：\n\n```bash\nfor i in 0 1 2 3 4 5 6 7; do\n  IRQ=$(grep \"eth0-rx-$i\" /proc/interrupts | awk -F: '{print $1}' | tr -d ' ')\n  printf '%x\\n' $((1 << i)) > /proc/irq/$IRQ/smp_affinity\ndone\n```\n\n这样 8 条数据通道完全并行，每个 CPU 的 `%si` 从原来的 87%/0%/0%... 均匀分布到约 11% 每核，带宽上限从 3.2 Gbps 扩展到接近 10 Gbps 线速。这个改造在实际生产中的效果非常直观——改造前 CPU0 满负荷其余核空载，改造后监控大屏上能看到 8 个核同时起来工作。\n\n## NUMA 感知：一个经常被忽略的关键细节\n\nNUMA（Non-Uniform Memory Access，非一致内存访问）架构的核心特点是：每个 CPU 插槽有自己本地的内存控制器，访问本地内存的延迟远低于访问另一个插槽的内存。Intel Xeon 双路系统中，两个节点通过 UPI（Ultra Path Interconnect）互联，本地内存访问延迟约 80ns，跨节点访问约 140-160ns，差了近一倍。\n\n网卡通过 PCIe 连接在 NUMA Node 0 的根联合体上，这意味着网卡的 DMA 缓冲区（存放接收数据包的内存页）是在 Node 0 的内存上分配的。如果把 IRQ 绑到 Node 1 的 CPU（CPU18-35 或 CPU54-71），中断处理例程需要跨 UPI 总线访问 Node 0 上的数据包缓冲区，每个包都多了 60-80ns 的延迟。在每秒百万级数据包的场景下，这个开销累积起来非常可观。\n\n```bash\n# 先确认网卡在哪个 NUMA 节点\ncat /sys/class/net/eth0/device/numa_node\n# 0  ← 网卡在 Node 0\n\n# 查看 Node 0 包含哪些逻辑 CPU\nnumactl --hardware\n# node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17\n#              36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53\n# node 1 cpus: 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35\n#              54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71\n```\n\n题目方案把 8 个队列绑到 CPU0-7，这些核全在 Node 0 上，与网卡同节点，方向正确。进一步的优化是把业务进程（nginx worker）也通过 `numactl --cpunodebind=0` 固定在 Node 0 上，让「中断处理」和「数据消费」都在同一 NUMA 节点，最大化 L3 缓存命中率。如果业务进程需要分散到两个节点上，至少应该让 Node 0 上的进程优先处理网络 I/O 密集的工作，Node 1 处理 CPU 密集的计算任务。\n\n## XPS：发送方向的对称优化\n\nRSS 解决入站方向的并行，XPS（Transmit Packet Steering）解决出站方向的问题。XPS 通过 `/sys/class/net/eth0/queues/tx-N/xps_cpus` 告诉内核：当 CPU N 要发送数据包时，选择 TX 队列 N。这样做有两个好处：减少多个 CPU 竞争同一 TX 队列的自旋锁开销；让同一条 TCP 流的收发都在同一个 CPU 上处理，TCP 状态机相关的数据（ACK 序列号、拥塞窗口、发送缓冲区指针等）在 L1/L2 缓存里保持热度。\n\n```bash\n# 将 TX 队列 N 绑到 CPU N（xps_cpus 需要十六进制格式）\nfor i in 0 1 2 3 4 5 6 7; do\n  printf '%x\\n' $((1 << i)) > /sys/class/net/eth0/queues/tx-$i/xps_cpus\ndone\n```\n\n注意 `xps_cpus` 和 `smp_affinity` 一样，期望的是十六进制格式。这里必须用 `printf '%x'` 而不是直接 `echo $((1 << i))` 输出十进制，否则 `i=3` 时 `echo 8` 被读作十六进制 0x8，碰巧等于 CPU3，但 `i=4` 时 `echo 16` 被读作十六进制 0x16 = bit1+bit2+bit4 = CPU1+CPU2+CPU4，完全不是预期的 CPU4 单核。题目方案步骤 4 已经用了 `printf '%x\\n'`，这一点是正确的。\n\n## 停用 irqbalance 的代价与配置持久化\n\n停用 irqbalance 不是免费的午餐。irqbalance 的价值在于动态适应变化的流量模式——如果某个队列的流量突然激增，CPU 出现局部过载时没有自动均衡机制。你需要手动介入，或者用 `ethtool -X eth0 hfunc toeplitz` 调整哈希函数配置和 indirection table 来重新分流。对于流量模式比较均匀稳定的视频直播场景（大量长连接，流量分布均匀），手动绑核比 irqbalance 更合适；对于流量突发性强、连接模式多变的 API 服务，irqbalance 的动态调整可能反而更好。\n\n更重要的是，`/proc/irq/` 下的修改和 `ethtool -L` 的队列设置在重启后全部失效，必须写 systemd 服务持久化：\n\n```bash\n# /usr/local/bin/set-irq-affinity.sh\n#!/bin/bash\nethtool -L eth0 combined 8\nsleep 1  # 等待内核完成 IRQ 重新分配\nfor i in 0 1 2 3 4 5 6 7; do\n  IRQ=$(grep \"eth0-rx-$i\" /proc/interrupts | awk -F: '{print $1}' | tr -d ' ')\n  [ -n \"$IRQ\" ] && printf '%x\\n' $((1 << i)) > /proc/irq/$IRQ/smp_affinity\ndone\nfor i in 0 1 2 3 4 5 6 7; do\n  printf '%x\\n' $((1 << i)) > /sys/class/net/eth0/queues/tx-$i/xps_cpus\ndone\n```\n\n```ini\n# /etc/systemd/system/irq-affinity.service\n[Unit]\nDescription=Set NIC IRQ affinity\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/set-irq-affinity.sh\nRemainAfterExit=yes\n\n[Install]\nWantedBy=multi-user.target\n```\n\n脚本里 IRQ 号必须从 `/proc/interrupts` 动态 grep，绝对不能硬编码。内核升级、驱动更新或 PCIe 设备枚举顺序变化都可能让 IRQ 号改变，硬编码的脚本在系统更新后会默默失效，你可能要等到下次流量高峰时才发现。脚本里的 `[ -n \"$IRQ\" ]` 守卫也很重要——如果 grep 没匹配到（比如队列名格式不同），避免把空字符串写到 smp_affinity 里导致奇怪的错误。\n\n## 软件 RSS：没有硬件多队列时的替代方案\n\n如果网卡不支持 RSS——比如 KVM 虚拟机里的 virtio-net 通常只有单队列，或者一些老旧 NIC——Linux 提供了 RPS（Receive Packet Steering）和 RFS（Receive Flow Steering）在内核软中断层面模拟 RSS 效果。\n\nRPS 在软中断处理阶段对数据包做哈希，把包分发到不同 CPU 的 backlog 队列，从而把收包处理分散到多核。RFS 更进一步，它追踪每条流的应用进程运行在哪个 CPU 上，把属于该流的数据包也发到同一 CPU，实现「数据消费」和「中断处理」真正亲和，效果与硬件 RSS + IRQ Affinity 的组合相似。\n\n```bash\n# 开启 RPS：允许 8 个 CPU（0xff）处理 rx-0 队列的包\necho ff > /sys/class/net/eth0/queues/rx-0/rps_cpus\n\n# 每队列 flow 记录数（建议 4096）\necho 4096 > /sys/class/net/eth0/queues/rx-0/rps_flow_cnt\n\n# 全局 flow 表大小（建议等于 rps_flow_cnt × 队列数，向上取 2 的幂）\necho 32768 > /proc/sys/net/core/rps_sock_flow_entries\n```\n\nRPS/RFS 的开销高于硬件 RSS——哈希计算和 flow table 查找都在 CPU 上完成，每个包都有额外的 softirq 调度开销。对于 10GbE 场景，virtio-net + RPS 通常能把吞吐量从 1-2 Gbps 提升到 4-6 Gbps；真正要跑 10Gbps 线速，还是需要支持 SR-IOV 的虚拟化网卡（比如 Mellanox VF）或者带硬件 RSS 的物理 NIC。",
+      "keyPoints": [
+        "IRQ Affinity 通过将硬件中断固定到特定 CPU 来提升缓存局部性，使中断处理例程与数据消费进程共享同一 CPU 的 L1/L2 缓存，避免跨核缓存失效，是高吞吐网络场景的核心调优手段",
+        "`/proc/irq/N/smp_affinity` 使用十六进制位掩码表示允许处理该中断的 CPU 集合（bit N = CPUN），超过 32 个 CPU 时必须使用逗号分隔的多段 32 位格式，如 `00000000,00000001` 表示 64 核系统中的 CPU0",
+        "RSS（Receive Side Scaling）在网卡硬件层面对入站数据包做 Toeplitz 四元组哈希并分发到多个 RX 队列，每个队列有独立的 MSI-X 中断线，配合 IRQ Affinity 将「队列 N → IRQ N → CPU N」一一对应，可实现真正的多核并行收包",
+        "NUMA 感知是 NIC 中断调优的硬约束：网卡的 DMA 缓冲区在其所在 NUMA 节点的内存上分配，若将 IRQ 绑到远端 NUMA 节点的 CPU，每个数据包都需要跨 UPI 总线访问内存，双路 Intel Xeon 系统上远端访问延迟约为本地访问的 2 倍（160ns vs 80ns）",
+        "XPS（Transmit Packet Steering）是 RSS 的发送方向对称机制，将 TX 队列与特定 CPU 绑定，减少多核争抢 TX 队列自旋锁的开销，并保持同一 TCP 流的收发都在同一 CPU 处理，维持 TCP 状态机数据的 L1/L2 缓存热度",
+        "停用 irqbalance 后必须将配置持久化为 systemd 服务，脚本中 IRQ 号必须动态从 `/proc/interrupts` 查询而非硬编码，内核升级或驱动更新都可能改变 IRQ 分配，硬编码会导致调优配置在系统更新后默默失效",
+        "对不支持硬件多队列的网卡（如 KVM virtio-net），RPS/RFS 在内核软中断层面提供 RSS 的软件模拟，RPS 按哈希分发数据包到多核，RFS 追踪流与进程的亲和关系，适合虚拟化场景，但开销高于硬件 RSS，10GbE 线速仍需硬件支持"
+      ],
+      "quiz": [
+        {
+          "id": "os-irq-affinity-config-q1",
+          "question": "在一台 4 核服务器上，执行 `echo c > /proc/irq/24/smp_affinity` 后，IRQ 24 会由哪些 CPU 处理？",
+          "choices": [
+            {"id": "A", "text": "CPU2 和 CPU3（0xc = 0b1100，bit 2 和 bit 3 分别对应 CPU2 和 CPU3）"},
+            {"id": "B", "text": "CPU0 和 CPU3（把 c 理解成十进制 12 的某种变体，造成错误的位对应）"},
+            {"id": "C", "text": "CPU12（把十六进制 c 直接当成十进制 CPU 编号）"},
+            {"id": "D", "text": "所有 CPU 都不处理（误以为 c 是「clear」的缩写，表示清空亲和性）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "smp_affinity 是一个十六进制位掩码，每一位对应一个 CPU。0xc 的二进制是 0b00001100，bit 2 = 1 表示 CPU2 允许处理，bit 3 = 1 表示 CPU3 允许处理，bit 0 和 bit 1 = 0 表示 CPU0 和 CPU1 不处理。常见的错误是把十六进制 c（12）当成十进制 CPU 编号，或者误以为 c 代表 CPU0 和 CPU3（把最高位和最低位搞混）。记住规则：每一个十六进制位代表 4 个 CPU，c = 0b1100，从低位到高位数，bit 0 = CPU0，bit 1 = CPU1，bit 2 = CPU2（这里为 1），bit 3 = CPU3（这里为 1）。"
+        },
+        {
+          "id": "os-irq-affinity-config-q2",
+          "question": "关于 irqbalance 服务，以下哪个描述最准确？",
+          "choices": [
+            {"id": "A", "text": "irqbalance 动态平衡各 CPU 的中断负载，在延迟敏感或吞吐量优先的场景下停用它，是因为它优化的是负载均衡而非缓存局部性，且会周期性覆盖手动设置的中断亲和性"},
+            {"id": "B", "text": "irqbalance 会随机分配中断到各 CPU，没有任何智能逻辑，生产环境应该始终停用"},
+            {"id": "C", "text": "irqbalance 只在 CPU 核数超过 8 个时才会启动工作，对于 4 核以下服务器没有任何效果"},
+            {"id": "D", "text": "irqbalance 通过调整中断的优先级（nice 值）而非 CPU 亲和性来均衡负载"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "irqbalance 是一个用户态守护进程，定期（默认每 10 秒）采样 /proc/interrupts 里各 CPU 的中断计数，根据负载情况通过修改 /proc/irq/N/smp_affinity 来重新分配中断。它的优化目标是让各 CPU 的中断负载均衡，而不考虑缓存局部性或 NUMA 拓扑。在手动绑核场景下必须先停用 irqbalance，否则它会定期把你手动设置的亲和性覆盖回去，导致调优失效。对于通用服务器，irqbalance 是合理的默认选择；对于网络吞吐量优化或延迟敏感的场景，手动绑核结合停用 irqbalance 效果更好。"
+        },
+        {
+          "id": "os-irq-affinity-config-q3",
+          "question": "RSS（Receive Side Scaling）在默认配置下，使用哪些字段来计算将数据包分发到哪个接收队列的哈希值？",
+          "choices": [
+            {"id": "A", "text": "源 IP + 目的 IP + 源端口 + 目的端口（四元组 Toeplitz 哈希）"},
+            {"id": "B", "text": "仅目的 IP + 目的端口（二元组），因为发送方信息在负载均衡场景下不重要"},
+            {"id": "C", "text": "以太网帧的目的 MAC 地址，因为网卡在 IP 层之前处理"},
+            {"id": "D", "text": "数据包的总长度和 TCP 序列号，以保证顺序传递"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "RSS 使用四元组（源 IP + 目的 IP + 源端口 + 目的端口）做 Toeplitz 哈希，目的是让同一条 TCP 流（相同四元组）始终落到同一个 RX 队列，保证 TCP 数据包的顺序处理和状态机的局部性。如果只用目的 IP + 目的端口（B 选项），来自同一服务器不同客户端的连接可能全部落到同一队列，失去负载均衡的意义。MAC 地址（C 选项）在同一子网内所有数据包的目的 MAC 都是网关 MAC，完全无法区分流。TCP 序列号（D 选项）在 RSS 层面没有意义，且网卡不会解析到这么深的层次。"
+        },
+        {
+          "id": "os-irq-affinity-config-q4",
+          "question": "在双路 NUMA 服务器上，Intel X710 网卡通过 PCIe 连接在 NUMA Node 0 上。如果将该网卡所有 RX 队列的 IRQ 都绑定到 NUMA Node 1 的 CPU 上，最可能导致什么问题？",
+          "choices": [
+            {"id": "A", "text": "网卡 DMA 写入的数据包缓冲区在 Node 0 的内存上，Node 1 的 CPU 处理中断时需要跨 UPI 总线访问，每个数据包额外增加约 60-80ns 的远端内存访问延迟，高包率下显著影响吞吐量"},
+            {"id": "B", "text": "内核会直接报错拒绝跨 NUMA 节点的 IRQ 绑定，因为这违反了 PCIe 拓扑约束"},
+            {"id": "C", "text": "网卡驱动会自动将 DMA 缓冲区迁移到 Node 1 的内存上，不会有性能影响"},
+            {"id": "D", "text": "只有延迟会受影响，吞吐量不会受到 NUMA 跨节点访问的影响"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "NUMA 架构中，每个 CPU 插槽有自己的本地内存控制器，访问本地内存延迟约 80ns，跨节点访问需要通过 UPI（Intel）或 HyperTransport（AMD）互联，延迟约 140-160ns，差了近一倍。网卡的 DMA 缓冲区由驱动在网卡所在 NUMA 节点的内存上分配（numactl --membind），不会自动迁移。Node 1 的 CPU 处理中断时每次都要跨节点读取数据包，在每秒百万包的场景下延迟和内存带宽开销都非常可观。内核不会阻止跨 NUMA 的 IRQ 绑定（B 错），这是合法的配置，只是性能不佳。"
+        },
+        {
+          "id": "os-irq-affinity-config-q5",
+          "question": "执行 `ethtool -L eth0 combined 8` 后，观察 `grep eth0 /proc/interrupts` 的输出，以下哪个描述最符合预期？",
+          "choices": [
+            {"id": "A", "text": "出现 8 行新的 IRQ 记录（如 eth0-rx-0 到 eth0-rx-7），初始计数全为 0，随着流量进入各队列开始累积计数"},
+            {"id": "B", "text": "仍然只有 1 行记录，因为 /proc/interrupts 只显示当前有中断流量的 IRQ，空队列不显示"},
+            {"id": "C", "text": "显示 16 行，因为 combined 8 会分别创建 8 个独立的 RX IRQ 和 8 个独立的 TX IRQ"},
+            {"id": "D", "text": "/proc/interrupts 不会立即更新，需要等待下次系统调度周期（约 250ms）才能看到新 IRQ"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "Intel X710 使用 MSI-X（Message Signaled Interrupts eXtended），每个队列对应一个独立的 MSI-X 向量，即一个独立的 IRQ。执行 ethtool -L 后驱动会重新初始化网卡，分配 8 个 combined 队列，内核会为每个队列注册一个 IRQ，这些 IRQ 立即出现在 /proc/interrupts 里，初始计数为 0。C 选项说 16 行是错的：combined 队列模式下一个队列共用同一个 IRQ 处理收发（或者分别有 rx/tx IRQ，具体看驱动，但不是固定 16 行）。/proc/interrupts 是实时文件，IRQ 注册后立即可见，不需要等待调度周期（D 错）。"
+        },
+        {
+          "id": "os-irq-affinity-config-q6",
+          "question": "工程师执行了完整的 IRQ 绑核脚本，但第二天发现 /proc/interrupts 里中断计数又全部集中到了 CPU0。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "执行绑核脚本前没有停止 irqbalance 服务，irqbalance 每隔 10 秒检测一次中断分布，发现不均衡后将 smp_affinity 恢复到了它认为合适的状态"},
+            {"id": "B", "text": "Linux 内核有一个保护机制，防止单个 IRQ 长时间绑定到同一个 CPU，会自动迁移"},
+            {"id": "C", "text": "Intel X710 网卡固件有 bug，在流量超过 1Gbps 时会重置中断亲和性到默认值"},
+            {"id": "D", "text": "smp_affinity 的修改在下次 CPU 频率调整（cpufreq governor 触发）后会被重置"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是手动 IRQ 绑核最常见的坑：忘记停用 irqbalance。irqbalance 默认每 10 秒运行一次，它会读取 /proc/interrupts 统计各 CPU 的中断负载，如果发现分布不均（手动绑核后所有中断集中在少数 CPU 上，从 irqbalance 的视角看这就是不均衡），它会重新写入 smp_affinity，把中断分配改回它认为更均衡的状态。这通常意味着把高负载 IRQ 迁移到其他核，结果破坏了你精心设计的绑核方案。解决方法很简单：systemctl stop irqbalance && systemctl disable irqbalance，然后再执行绑核脚本。Linux 内核本身不会自动迁移已设置亲和性的 IRQ（B 选项是虚构的）。"
+        },
+        {
+          "id": "os-irq-affinity-config-q7",
+          "question": "RPS（Receive Packet Steering）和 RSS（Receive Side Scaling）的核心区别是什么？",
+          "choices": [
+            {"id": "A", "text": "RSS 是网卡硬件层面的多队列分发，需要网卡支持 MSI-X 和多队列；RPS 是内核软中断层面的软件模拟，对任何网卡都适用，但哈希计算在 CPU 上完成，开销更高"},
+            {"id": "B", "text": "RSS 处理接收方向，RPS 处理发送方向，两者功能互补，应该同时配置"},
+            {"id": "C", "text": "RPS 是 RSS 的升级版本，Linux 5.0 以后 RSS 已被废弃，所有场景都应使用 RPS"},
+            {"id": "D", "text": "RSS 仅支持 TCP 流，RPS 支持 TCP 和 UDP，适用范围更广"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "RSS 在网卡硬件内部实现：网卡有多个 RX 描述符环（队列），硬件对每个数据包做 Toeplitz 哈希，直接把包 DMA 写入对应的队列缓冲区，每个队列触发独立的 MSI-X 中断，由不同 CPU 处理。整个过程对 CPU 透明，开销极低。RPS 工作在内核软中断（NET_RX_SOFTIRQ）层面：数据包先到达单个队列，内核软中断处理时对包做哈希，通过 IPI（处理器间中断）把包分发到其他 CPU 的 backlog 队列。RPS 的哈希计算和 IPI 都消耗 CPU 周期，但对硬件没有要求。B 选项混淆了 RPS 和 XPS 的功能（XPS 才是发送方向的对应机制）。"
+        },
+        {
+          "id": "os-irq-affinity-config-q8",
+          "question": "配置 XPS（Transmit Packet Steering）的主要目的是什么？",
+          "choices": [
+            {"id": "A", "text": "将特定 TX 队列绑定到特定 CPU，减少多核竞争同一 TX 队列自旋锁的开销，同时让同一 TCP 流的收发在同一 CPU 处理，保持 TCP 状态机数据的缓存局部性"},
+            {"id": "B", "text": "XPS 控制数据包的发送优先级和 QoS 标记，与 CPU 亲和性无关"},
+            {"id": "C", "text": "XPS 用于配置网卡发送队列的深度（ring buffer size），防止发包时缓冲区溢出"},
+            {"id": "D", "text": "XPS 是 TCP 拥塞控制算法的一部分，通过预测目的端 CPU 负载来动态调整发送窗口"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "XPS（Transmit Packet Steering）通过 /sys/class/net/<iface>/queues/tx-N/xps_cpus 文件配置，该文件是一个 CPU 位掩码，告诉内核当这个掩码里的某个 CPU 调用 dev_queue_xmit() 发包时，应该选择 TX 队列 N。这带来两个好处：首先，避免多个 CPU 同时选择同一个 TX 队列，减少 TX 队列 spinlock 的竞争；其次，如果 CPU N 同时处理 RX 队列 N 的中断，那么同一条 TCP 流的数据包收发都在 CPU N 进行，相关的内核数据结构（sock 结构、TCP 控制块）在 L1/L2 缓存里是热的，处理更高效。XPS 与 QoS 标记（B 选项）、ring buffer 大小（C 选项）、拥塞控制（D 选项）完全无关。"
+        },
+        {
+          "id": "os-irq-affinity-config-q9",
+          "question": "在一台有 64 个逻辑 CPU 的服务器上，要将某个 IRQ 绑定到 CPU32（第 33 个 CPU），正确的 smp_affinity 写入值是什么？",
+          "choices": [
+            {"id": "A", "text": "`echo 00000001,00000000 > /proc/irq/N/smp_affinity`（CPU32 在第二段的 bit 0，即 0x1）"},
+            {"id": "B", "text": "`echo 100000000 > /proc/irq/N/smp_affinity`（把 CPU32 理解为第 33 位，写一个 9 位十六进制数）"},
+            {"id": "C", "text": "`echo 32 > /proc/irq/N/smp_affinity`（直接写 CPU 编号）"},
+            {"id": "D", "text": "`echo ffffffff,00000000 > /proc/irq/N/smp_affinity`（第二段全 1 表示 CPU32-63 全部允许）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "smp_affinity 超过 32 个 CPU 时，使用逗号分隔的多段 32 位掩码格式，从右到左每段对应 CPU0-31、CPU32-63 等。CPU32 在第二段（CPU32-63 那段）的 bit 0 位置（因为 32 - 32 = 0），所以第二段的值是 0x1。写法是 `echo 00000001,00000000`：左边的段（00000001）对应 CPU32-63，bit 0 = 1 表示 CPU32；右边的段（00000000）对应 CPU0-31，全 0 表示不允许。B 选项写一个超过 8 位的十六进制数是非法的，内核会报 Invalid argument。C 选项直接写十进制 CPU 编号是错的，smp_affinity 只接受十六进制位掩码格式。D 选项会把中断绑到所有 CPU32-63 而不是单独 CPU32。"
+        },
+        {
+          "id": "os-irq-affinity-config-q10",
+          "question": "完成 RSS 多队列配置和 IRQ 绑核后，你发现 `grep eth0 /proc/interrupts` 显示 eth0-rx-3 的中断计数仍然全部集中在 CPU0，而其他队列的中断已经均匀分布在对应 CPU 上。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "绑核脚本中 `grep \"eth0-rx-3\"` 未匹配到正确 IRQ 号（可能因为 /proc/interrupts 里队列名有前导空格或格式差异），导致 $IRQ 为空，smp_affinity 未被修改"},
+            {"id": "B", "text": "Intel X710 网卡的第 4 个队列（索引 3）硬件设计上不支持 MSI-X，只能使用 legacy IRQ，无法配置 smp_affinity"},
+            {"id": "C", "text": "CPU3 此时负载过高，内核自动将 IRQ 从 CPU3 迁移到 CPU0 以保证系统稳定性"},
+            {"id": "D", "text": "RSS 的 Toeplitz 哈希出现了严重碰撞，所有流的哈希值都落到了队列 3，导致该队列负载远超其他队列，中断被迫转移到 CPU0"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这种「部分队列绑核生效，个别队列失效」的现象，最典型的原因是脚本里的 grep 没有匹配到正确的 IRQ 号，导致 $IRQ 变量为空，后续的 smp_affinity 写入要么是 `echo $((1 << 3)) > /proc/irq//smp_affinity`（路径不完整报错），要么被 [ -n \"$IRQ\" ] 守卫跳过了。调试方法是手动运行 `grep \"eth0-rx-3\" /proc/interrupts` 看实际输出，检查队列名是否与脚本里的字符串完全匹配（有时 /proc/interrupts 的格式是 eth0-TxRx-3 而不是 eth0-rx-3，取决于驱动版本）。Intel X710 所有队列都支持 MSI-X（B 错）。内核不会因为 CPU 负载高而自动迁移已设置 smp_affinity 的 IRQ（C 错）——除非 irqbalance 还在跑。严重哈希碰撞会导致某队列流量暴增，但不会改变 smp_affinity 的配置（D 描述的现象不会引起中断自动迁移）。"
+        }
+      ],
+      "references": [
+        {"title": "Linux kernel docs: SMP IRQ affinity", "url": "https://www.kernel.org/doc/html/latest/core-api/irq/irq-affinity.html"},
+        {"title": "Linux kernel docs: Scaling in the Linux Networking Stack (RPS/RSS/XPS/RFS)", "url": "https://www.kernel.org/doc/html/latest/networking/scaling.html"},
+        {"title": "Intel Ethernet Controller X710 Datasheet", "url": "https://www.intel.com/content/www/us/en/products/sku/83967/intel-ethernet-controller-x710-10gbe/specifications.html"},
+        {"title": "Red Hat Performance Tuning Guide: Network IRQ Affinity", "url": "https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/monitoring_and_managing_system_status_and_performance/setting-interrupt-affinity_monitoring-and-managing-system-status-and-performance"}
+      ]
+    }
+  ]
+}
