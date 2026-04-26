@@ -2,10 +2,12 @@ import { lazy, Suspense, type ReactNode } from 'react';
 import { BrowserRouter, HashRouter, Routes, Route } from 'react-router-dom';
 import { Layout } from './components/layout/Layout';
 
-const isElectron = 'electronAPI' in window;
+const isNative = 'electronAPI' in window
+  || 'Capacitor' in window
+  || window.location.hostname === 'localhost' && window.location.protocol === 'https:';
 
 function Router({ children }: { children: ReactNode }) {
-  if (isElectron) return <HashRouter>{children}</HashRouter>;
+  if (isNative) return <HashRouter>{children}</HashRouter>;
   return <BrowserRouter basename="/questions">{children}</BrowserRouter>;
 }
 
