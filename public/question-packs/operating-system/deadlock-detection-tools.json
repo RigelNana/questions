@@ -1,0 +1,156 @@
+{
+  "id": "os-deadlock-detection-tools",
+  "name": "Linux 系统死锁检测工具与方法",
+  "domain": "operating-system",
+  "description": "使用 lockdep、ThreadSanitizer、gdb、jstack 等工具检测和定位 Linux 环境死锁的实战指南",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-deadlock-detection-tools-1",
+      "domain": "operating-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["deadlock", "debugging", "linux", "gdb", "tsan", "jstack", "pprof"],
+      "title": "如何使用工具检测 Linux 系统中的死锁",
+      "content": "## 服务挂起了，从哪里开始排查\n\n你收到告警：线上一个 C++ 服务（使用 pthreads）在凌晨 2 点开始不响应。SSH 上去看，进程还在，没有崩溃，但所有传入连接都 hang 住了。CPU 几乎为 0，内存正常。你运行 `ps aux` 看到进程状态是 `S`（可中断睡眠）。\n\n```\nUSER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nwww-data  1234  0.1  2.3 456789 23456 ?        S    02:15   0:00 /app/order-service\n```\n\n进一步看 `/proc/1234/wchan`，显示的是 `futex_wait_queue_me`——进程正在等待一个 futex（Linux 快速用户态互斥量，是 pthread_mutex 的底层实现）。这几乎可以确认是锁相关问题了。\n\n现在的问题是：有多少个线程在等待，它们在等什么锁，谁持有这些锁？你手头没有源码调试符号（生产二进制通常去掉了 debug info），pprof 接口也没有开放。你会怎么做？",
+      "answer": "## 第一步：确认症状——从 /proc 和系统工具开始\n\n在 attach 调试器之前，先用无侵入性的系统工具确认问题性质。`/proc/<PID>/wchan` 只给出一个等待函数名，`/proc/<PID>/status` 则给出线程数量：\n\n```bash\n# 看进程等在什么内核函数上\ncat /proc/1234/wchan\n# 输出：futex_wait_queue_me\n# futex_wait 说明在等互斥锁或条件变量\n\n# 看总线程数\ncat /proc/1234/status | grep Threads\n# 输出：Threads: 24\n# 正常时应该是 10 个工作线程，现在 24 说明有线程堆积\n\n# 看所有线程的等待状态\nls /proc/1234/task/   # 列出所有线程 ID\nfor tid in $(ls /proc/1234/task/); do\n    echo -n \"Thread $tid: \"\n    cat /proc/1234/task/$tid/wchan\ndone\n# 输出类似：\n# Thread 1234: futex_wait_queue_me\n# Thread 1235: futex_wait_queue_me\n# Thread 1236: ep_poll   <- 这个在等 epoll，是正常的网络线程\n# Thread 1237: futex_wait_queue_me\n```\n\n多个线程都在 `futex_wait_queue_me`，而且它们的等待时间（通过 `cat /proc/<PID>/task/<TID>/schedstat` 查看调度统计）都很长——这是死锁的强烈信号。\n\n## 第二步：GDB attach 获取所有线程堆栈\n\n`gdb -p <PID>` 附加到运行中的进程，然后打印所有线程的调用栈：\n\n```bash\ngdb -p 1234\n# GDB 会暂停进程，进入交互模式\n(gdb) set pagination off         # 关闭分页，避免输出被截断\n(gdb) thread apply all bt        # 打印所有线程的 backtrace\n```\n\n即使没有调试符号，输出也能提供关键信息：\n\n```\nThread 1 (Thread 0x7f8a1c003700 (LWP 1234)):\n#0  0x00007f8a1c1a3456 in futex () from /lib/x86_64-linux-gnu/libpthread.so.0\n#1  0x00007f8a1c198abc in pthread_mutex_lock () from /lib/x86_64-linux-gnu/libpthread.so.0\n#2  0x0000000000401234 in ?? ()   # <- 这是你的代码，地址 0x401234\n#3  0x000000000040abcd in ?? ()\n\nThread 2 (Thread 0x7f8a1c003701 (LWP 1235)):\n#0  0x00007f8a1c1a3456 in futex () from /lib/x86_64-linux-gnu/libpthread.so.0\n#1  0x00007f8a1c198abc in pthread_mutex_lock () from /lib/x86_64-linux-gnu/libpthread.so.0\n#2  0x0000000000401567 in ?? ()   # <- 不同的代码地址\n#3  0x000000000040cdef in ?? ()\n```\n\n两个线程都卡在 `pthread_mutex_lock`，调用它们的代码地址不同（0x401234 和 0x401567）——这就是锁顺序问题的证据。有了这些地址，你可以用 `addr2line` 把地址转成文件名和行号（如果有 DWARF debug info 的话），或者回去翻代码 Review 在这两个地址附近的逻辑。\n\n如果有 debug 符号，输出会更直接：\n\n```\n(gdb) thread apply all bt\nThread 1:\n#2  OrderService::processOrder (this=0x...) at order_service.cpp:145\n  -> 在这里调用了 inventory_mutex_.lock()\n\nThread 2:\n#2  InventoryService::updateStock (this=0x...) at inventory_service.cpp:89\n  -> 在这里调用了 order_mutex_.lock()\n```\n\n对比两个线程，分析各自持有什么锁、在等什么锁，死锁链就清晰了。\n\n## 第三步：ThreadSanitizer——在测试环境提前发现\n\nGDB 是事后诊断，ThreadSanitizer（TSan）是在测试阶段预防。TSan 是 LLVM/GCC 的运行时检测工具，通过编译时插桩（instrumentation）记录所有锁操作的历史顺序，检测潜在的锁顺序反转。\n\n```bash\n# 编译时开启 TSan（GCC 或 Clang 均支持）\ng++ -fsanitize=thread -g -O1 -o order_service main.cpp order_service.cpp\n# 或者\nclang++ -fsanitize=thread -g -O1 -o order_service main.cpp order_service.cpp\n\n# 运行程序（TSan 在运行时检测）\n./order_service\n```\n\n当 TSan 检测到锁顺序反转时，它会输出类似这样的报告：\n\n```\n==================\nWARNING: ThreadSanitizer: lock-order-inversion (potential deadlock)\n  Cycle in lock order graph: M1 (0x7b0400000040) => M2 (0x7b0400000080) => M1\n\n  Mutex M1 acquired here while holding mutex M2 in thread T1:\n    #0 pthread_mutex_lock /usr/src/tsan_interceptors.cpp:782\n    #1 InventoryService::updateStock() order_service.cpp:89\n    #2 WorkerThread::run() worker.cpp:34\n\n  Mutex M2 acquired here while holding mutex M1 in thread T2:\n    #0 pthread_mutex_lock /usr/src/tsan_interceptors.cpp:782\n    #1 OrderService::processOrder() order_service.cpp:145\n    #2 WorkerThread::run() worker.cpp:34\n==================\n```\n\nTSan 精确指出了两个代码路径中锁顺序相反的位置。注意：TSan 即使在这次运行中没有真正发生死锁（可能时序刚好没有碰上），只要它在历史上观察到了锁顺序反转，就会报告——这让它能在单次测试运行中就发现潜在的死锁。TSan 的运行时开销大约是 5-15 倍，适合在持续集成（CI）中的压测或并发测试阶段使用。\n\n## 第四步：Valgrind Helgrind——无需重新编译的替代方案\n\n如果无法重新编译（比如测试第三方库），可以使用 Helgrind，它通过二进制插桩工作：\n\n```bash\nvalgrind --tool=helgrind \\\n         --history-level=full \\\n         --log-file=helgrind_output.txt \\\n         ./order_service\n```\n\nHelgrind 同样检测锁顺序违反，但运行时开销更大（20-50 倍），输出格式与 TSan 类似。一个实际的权衡：开发阶段新增功能时用 TSan（快，集成到 CI）；排查已有二进制中的问题时用 Helgrind（不需要重新编译）。\n\n## 第五步：Java 服务的 jstack 工作流\n\nJava 服务的死锁排查更自动化。`jstack <PID>` 不仅能打印所有线程的堆栈，还会在末尾自动识别死锁并打印摘要：\n\n```bash\njstack 5678 > thread_dump.txt\ngrep -A 20 'Found.*deadlock' thread_dump.txt\n```\n\n输出示例：\n\n```\nFound one Java-level deadlock:\n=============================\n\"order-worker-1\" is waiting to lock monitor 0x00007f8a1c003498\n  (object 0x000000076b8e4f98, a com.example.InventoryService),\n  which is held by \"inventory-worker-1\"\n\"inventory-worker-1\" is waiting to lock monitor 0x00007f8a1c001498\n  (object 0x000000076b8e5008, a com.example.OrderService),\n  which is held by \"order-worker-1\"\n\nJava stack information for the threads listed above:\n===================================================\n\"order-worker-1\":\n\tat com.example.OrderService.processOrder(OrderService.java:145)\n\t- waiting to lock <0x000000076b8e4f98> (a com.example.InventoryService)\n\t- locked <0x000000076b8e5008> (a com.example.OrderService)\n```\n\n锁持有链完整清晰，直接定位到代码行，这是 Java 死锁排查比 C++ 方便得多的地方。对于无法停服的生产 Java 服务，`jstack -l <PID>` 的 `-l` 参数还会额外输出锁信息，不会中断服务（但会暂停 JVM 几毫秒做 safepoint）。\n\n## 第六步：Go 服务的排查工作流\n\nGo 服务的排查方式前面已经详细介绍，这里给出完整的命令序列：\n\n```bash\n# 方式一：通过 pprof HTTP（不中断服务）\ncurl -s http://localhost:6060/debug/pprof/goroutine?debug=2 | \\\n    grep -A 5 'semacquire\\|sync\\.(*Mutex)'\n\n# 方式二：SIGQUIT（会终止进程！生产慎用）\nkill -SIGQUIT $(pgrep go-service) 2>&1 | tee goroutine_dump.txt\n\n# 方式三：查看 mutex 竞争 profile\ncurl -s http://localhost:6060/debug/pprof/mutex?debug=1\n```\n\nGo runtime 对「所有 goroutine 都在等待」这种完全死锁会自动检测并 panic：`fatal error: all goroutines are asleep - deadlock!`。但部分死锁（有其他活跃 goroutine）不会自动检测，需要手动分析。\n\n## 工具选择决策树\n\n面对不同场景，工具选择的逻辑是这样的：生产环境已经挂起的进程，首选 GDB（C/C++）或 jstack（Java）或 pprof goroutine dump（Go）做现场采集；开发/测试阶段，C/C++ 用 TSan（需要重编译，速度快）或 Helgrind（不需要重编译，速度慢）；Linux 内核代码开发用 lockdep；Go 项目 CI 中用 `go test -race` 检测数据竞争（TSan 的 Go 版本集成）。生产环境绝不运行 TSan 或 Helgrind（性能开销太大）。",
+      "keyPoints": [
+        "`/proc/<PID>/wchan` 显示进程当前等待的内核函数，`futex_wait_queue_me` 是 pthread_mutex_lock 的底层，是死锁的强信号",
+        "GDB `thread apply all bt` 打印所有线程的完整调用栈，即使没有调试符号也能通过代码地址定位锁冲突位置，是生产环境死锁的核心诊断工具",
+        "ThreadSanitizer（-fsanitize=thread）在测试阶段通过记录历史锁顺序检测潜在死锁，即使本次运行没有真正死锁也会报告，5-15 倍开销适合 CI 使用",
+        "Helgrind（valgrind --tool=helgrind）不需要重新编译，通过二进制插桩检测锁顺序违反，开销 20-50 倍，适合无法获取源码时使用",
+        "jstack 自动分析 Java 线程 dump 中的死锁并打印摘要，`Found one Java-level deadlock` 段落直接给出完整锁持有链和代码行号",
+        "Go 服务用 pprof goroutine endpoint（`/debug/pprof/goroutine?debug=2`）无侵入地获取 goroutine dump，关注 semacquire 状态且等待时间相近的 goroutine 对",
+        "生产环境排查用 GDB/jstack/pprof，开发测试阶段用 TSan/Helgrind 提前发现，绝对不在生产运行 TSan 或 Helgrind"
+      ],
+      "quiz": [
+        {
+          "id": "os-deadlock-detection-tools-q1",
+          "question": "`cat /proc/1234/wchan` 输出 `futex_wait_queue_me`，这说明什么？",
+          "choices": [
+            {"id": "A", "text": "进程正在等待网络 I/O，可能是 connect 超时"},
+            {"id": "B", "text": "进程正在等待一个 futex（快速用户态互斥量），通常意味着在等 pthread_mutex 或 semaphore"},
+            {"id": "C", "text": "进程正在等待文件读写操作完成"},
+            {"id": "D", "text": "进程正在执行大量计算，futex 是 CPU 运算单元"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "futex（Fast Userspace muTEX）是 Linux 内核提供的底层同步原语，glibc 的 pthread_mutex、Go 的 sync.Mutex 等用户态锁都在竞争时调用 futex 陷入内核等待。`futex_wait_queue_me` 是进程在等待一个 futex 被唤醒时内核函数的名字，出现这个 wchan 说明进程正在等待某个互斥锁。如果多个线程都在 `futex_wait_queue_me` 且等待时间很长，是死锁的强烈信号。等待网络 I/O 的 wchan 通常是 `tcp_recvmsg`、`poll_schedule_timeout` 等，与 futex 完全不同。"
+        },
+        {
+          "id": "os-deadlock-detection-tools-q2",
+          "question": "GDB 命令 `thread apply all bt` 的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "对所有线程设置断点（breakpoint）"},
+            {"id": "B", "text": "对所有线程执行 bt（backtrace）命令，打印所有线程的调用栈"},
+            {"id": "C", "text": "把所有线程的状态回滚（backtrack）到上一个安全点"},
+            {"id": "D", "text": "分析所有线程的内存使用情况（memory usage）"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`thread apply all` 是 GDB 的「对所有线程执行命令」语法，`bt` 是 `backtrace` 的缩写，打印当前线程从最内层到最外层的完整函数调用链。组合起来就是「打印所有线程的调用栈」，是排查多线程死锁、性能问题的首要命令。分析输出时寻找多个线程都卡在 `pthread_mutex_lock` 的情况，再对比各自的上层调用，找出「A 持有锁 1 等锁 2，B 持有锁 2 等锁 1」的模式。`info threads` 可以先列出所有线程及当前停止位置，再用 `thread <N>` 切换到特定线程查看详情。"
+        },
+        {
+          "id": "os-deadlock-detection-tools-q3",
+          "question": "ThreadSanitizer 的一个重要特性是：即使本次程序运行没有真正发生死锁，它也可能报告潜在死锁。这是为什么？",
+          "choices": [
+            {"id": "A", "text": "TSan 使用静态分析，不依赖运行时行为"},
+            {"id": "B", "text": "TSan 记录整个运行过程中所有锁的获取历史顺序，发现「曾先锁 A 后锁 B」且「曾先锁 B 后锁 A」就报告潜在死锁，与是否真正发生无关"},
+            {"id": "C", "text": "TSan 会模拟所有可能的线程调度顺序来验证"},
+            {"id": "D", "text": "TSan 在报告前会人为制造死锁来确认问题存在"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "TSan 维护一个锁依赖有向图，每当它观察到「线程在持有锁 A 的情况下获取了锁 B」，就在图中加入 A→B 的边。如果之后某线程又出现了 B→A 的边（持有 B 时获取 A），图中就存在环，TSan 立刻报告锁顺序反转（lock-order-inversion）——即使这两个事件发生在不同的时间，没有真正产生循环等待。这是一个「保守」检测：它会有假阳性（报告实际上不会死锁的情况），但不会有假阴性。在 CI 中这通常是可接受的——宁可多报，不要漏报。"
+        },
+        {
+          "id": "os-deadlock-detection-tools-q4",
+          "question": "相比 ThreadSanitizer，Helgrind 最主要的优势是什么？",
+          "choices": [
+            {"id": "A", "text": "Helgrind 运行更快，开销更低"},
+            {"id": "B", "text": "Helgrind 不需要重新编译程序，通过 Valgrind 的二进制插桩直接分析已有可执行文件"},
+            {"id": "C", "text": "Helgrind 支持 Go 和 Java，而 TSan 只支持 C/C++"},
+            {"id": "D", "text": "Helgrind 可以在生产环境运行，不影响性能"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Helgrind 作为 Valgrind 工具套件的一部分，通过 Valgrind 的动态二进制插桩（DBI）框架工作，不需要修改源代码或重新编译。只需要 `valgrind --tool=helgrind ./program` 即可对任何 Linux ELF 可执行文件进行检测，包括你没有源码的第三方库。这在调试已有二进制、测试第三方依赖库，或者当构建系统复杂到难以加入编译选项时非常有用。TSan 需要在编译时加 `-fsanitize=thread` 标志，更快（5-15 倍 vs 20-50 倍开销）但必须控制编译过程。两者都不适合生产环境使用。"
+        },
+        {
+          "id": "os-deadlock-detection-tools-q5",
+          "question": "对一个生产 Java 服务执行 `jstack -l <PID>` 时，`-l` 参数有什么作用？有什么潜在影响？",
+          "choices": [
+            {"id": "A", "text": "-l 表示 live，只打印还活跃的线程，忽略已终止的线程"},
+            {"id": "B", "text": "-l 输出额外的锁信息（锁列表），会触发一次 JVM safepoint，导致所有 Java 线程短暂暂停（通常几毫秒）"},
+            {"id": "C", "text": "-l 表示 loop，持续输出 thread dump 直到手动停止"},
+            {"id": "D", "text": "-l 以 JSON 格式输出，便于自动化分析"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "jstack -l 输出每个线程持有的 Java 锁（JUC 锁，不仅仅是 synchronized）的详细信息，包括 java.util.concurrent.locks.ReentrantLock 等。这需要 JVM 进入 safepoint——暂停所有 Java 线程以确保堆状态一致，然后收集信息。safepoint 通常只持续几毫秒，对生产服务影响极小，是可以接受的操作。相比之下，jstack 不加 -l 也需要 safepoint，只是输出的锁信息更少。真正可能影响生产的是操作频率——不要每秒都 jstack，偶尔一次是安全的。"
+        },
+        {
+          "id": "os-deadlock-detection-tools-q6",
+          "question": "Linux 内核的 lockdep 工具（CONFIG_PROVE_LOCKING=y）检测到潜在死锁后会怎么做？",
+          "choices": [
+            {"id": "A", "text": "立刻 panic 内核，因为潜在死锁是严重的内核 bug"},
+            {"id": "B", "text": "在 dmesg 中打印详细的锁依赖链和警告信息，但内核继续运行"},
+            {"id": "C", "text": "自动修复锁的获取顺序，确保不再发生"},
+            {"id": "D", "text": "把相关的内核模块卸载以消除死锁风险"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "lockdep 检测到锁顺序违反（证明存在循环依赖）时，会在 `dmesg` 中打印详细的警告，包括完整的锁依赖链、每个锁被获取时的调用栈，以及锁顺序如何形成环路。内核会继续运行，不会 panic（但有些配置下会打印 WARN 然后触发 oops）。lockdep 本身的设计目标是在内核开发期间帮助开发者发现潜在的死锁问题，而不是在生产内核中运行。开启 lockdep 会带来显著的性能开销（每次锁操作都要更新依赖图），生产内核（如 Ubuntu 的 linux-image 包）编译时不开启 CONFIG_PROVE_LOCKING。"
+        },
+        {
+          "id": "os-deadlock-detection-tools-q7",
+          "question": "Go 的 `go test -race` 标志能检测死锁吗？",
+          "choices": [
+            {"id": "A", "text": "能，它会检测所有类型的并发问题包括死锁"},
+            {"id": "B", "text": "不能，-race 只检测数据竞争（data race），不检测死锁（deadlock）"},
+            {"id": "C", "text": "能，但只检测 channel 相关的死锁"},
+            {"id": "D", "text": "能，通过模拟所有可能的 goroutine 调度顺序来验证"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`go test -race` 启用的是 Go 版本的 ThreadSanitizer（Go race detector），专门检测数据竞争（data race）——即多个 goroutine 同时无保护地访问同一内存且至少一个是写操作。死锁（deadlock）是「循环等待锁」问题，不涉及无保护的内存访问，race detector 无法检测。Go 对完全死锁（所有 goroutine 都在等待）有内置检测并会 panic 报告，但对部分死锁没有自动检测。检测 Go 代码中的死锁应该用 pprof goroutine dump 手动分析，或者用 goleak 检测测试中的 goroutine 泄漏。"
+        },
+        {
+          "id": "os-deadlock-detection-tools-q8",
+          "question": "在没有调试符号的生产二进制中，GDB 打印的调用栈地址如何转换为源代码行号？",
+          "choices": [
+            {"id": "A", "text": "无法转换，没有符号就只能看地址，需要重新部署带符号的版本"},
+            {"id": "B", "text": "使用 addr2line 工具，配合编译时生成的 .debug 符号文件或带符号的二进制副本，将地址映射到源文件和行号"},
+            {"id": "C", "text": "在 GDB 中运行 source-map 命令自动还原"},
+            {"id": "D", "text": "查看 /proc/<PID>/maps 文件即可得到行号信息"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "`addr2line -e <binary> <address>` 可以将代码地址转换为源文件名和行号，但前提是二进制文件中包含 DWARF 调试信息（编译时不加 `-s` 剥离符号）或者有对应的 .debug 符号文件。生产环境的最佳实践是：编译时用 `-g` 生成调试信息，但部署时用 `strip --only-keep-debug` 把调试信息分离到单独的 .debug 文件（存放在调试符号服务器上），部署的二进制去掉调试信息（减小体积），排查时通过符号服务器加载。这样既保证了生产二进制的体积，又保留了排查能力。GDB 支持 `set debug-file-directory` 指向符号文件目录。"
+        },
+        {
+          "id": "os-deadlock-detection-tools-q9",
+          "question": "为什么 ThreadSanitizer 和 Helgrind 不能在生产环境使用？",
+          "choices": [
+            {"id": "A", "text": "它们只能在 root 权限下运行，生产服务器不允许 root 权限"},
+            {"id": "B", "text": "TSan 带来 5-15 倍、Helgrind 带来 20-50 倍的运行时性能开销，会导致生产服务响应时间显著增加，超出 SLA"},
+            {"id": "C", "text": "它们会修改内存布局，可能导致程序行为与正常运行时不同"},
+            {"id": "D", "text": "它们只能在 x86 架构上运行，不支持 ARM 服务器"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "ThreadSanitizer 通过对每次内存访问和锁操作插桩来记录 happens-before 关系，这需要维护大量的影子内存（shadow memory，通常是程序实际内存的 5-10 倍）和执行额外的检查逻辑，导致 CPU 和内存开销显著增加（5-15 倍 CPU，3-5 倍内存）。Helgrind 在此基础上还有 Valgrind 框架本身的解释执行开销（20-50 倍）。一个正常响应时间 10ms 的接口在 TSan 下可能变成 50-150ms，在 Helgrind 下变成 200-500ms，显然超出任何生产 SLA。这些工具是测试和开发阶段的工具，不是生产监控工具。"
+        },
+        {
+          "id": "os-deadlock-detection-tools-q10",
+          "question": "在排查生产死锁时，以下工具使用顺序哪个是正确的？",
+          "choices": [
+            {"id": "A", "text": "先重启服务恢复业务 → 再从日志分析死锁原因 → 代码修复后用 TSan 验证"},
+            {"id": "B", "text": "立刻用 Helgrind 重新运行生产二进制收集信息 → 分析报告 → 修复代码"},
+            {"id": "C", "text": "先不重启，采集现场（GDB thread dump / jstack / pprof goroutine dump） → 分析死锁链 → 修复代码 → 在测试环境用 TSan/Helgrind 验证修复 → 发布"},
+            {"id": "D", "text": "直接 kill -9 所有相关进程 → 分析 core dump → 修复代码"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "正确的死锁排查流程分为「现场保全 → 分析 → 修复验证 → 发布」四个阶段。第一步最关键：在重启之前采集现场证据（goroutine dump、thread dump），因为重启会销毁所有现场信息，导致无法找到根因，问题会反复出现。采集方式因语言而异：C++ 用 GDB，Java 用 jstack，Go 用 pprof goroutine endpoint。有了完整的调用栈，就能分析锁持有链。修复代码后，不要直接上线，应该先在测试环境用 TSan 或 Helgrind 验证修复有效且没有引入新的锁顺序问题。选项 A 的问题是先重启丢失了现场。选项 D 的 kill -9 同样丢失现场（且不会产生 core dump，core dump 需要 SIGABRT 或 SIGSEGV）。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/locking/lockdep-design.html",
+        "https://clang.llvm.org/docs/ThreadSanitizer.html",
+        "https://valgrind.org/docs/manual/hg-manual.html",
+        "https://man7.org/linux/man-pages/man1/gdb.1.html"
+      ]
+    }
+  ]
+}
