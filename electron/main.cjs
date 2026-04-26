@@ -1,10 +1,11 @@
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, shell, ipcMain } = require('electron');
 const path = require('path');
 
 // Keep a global reference to prevent garbage collection
 let mainWindow = null;
 
 const isDev = !app.isPackaged;
+const isMac = process.platform === 'darwin';
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -20,11 +21,24 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
     },
-    // Frameless look on macOS, normal on Windows/Linux
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    frame: isMac,                        // macOS keeps native frame; Windows/Linux frameless
+    titleBarStyle: isMac ? 'hiddenInset' : 'default',
     backgroundColor: '#ECEFF4',
-    show: false, // Show when ready to avoid flash
+    show: false,
   });
+
+  // Window control IPC handlers
+  ipcMain.handle('window:minimize', () => mainWindow?.minimize());
+  ipcMain.handle('window:maximize', () => {
+    if (mainWindow?.isMaximized()) mainWindow.unmaximize();
+    else mainWindow?.maximize();
+  });
+  ipcMain.handle('window:close', () => mainWindow?.close());
+  ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized());
+
+  // Notify renderer when maximize state changes
+  mainWindow.on('maximize', () => mainWindow.webContents.send('window:maximized', true));
+  mainWindow.on('unmaximize', () => mainWindow.webContents.send('window:maximized', false));
 
   if (isDev) {
     // In dev mode, load from Vite dev server

@@ -12,7 +12,7 @@ import {
   type QuestionType,
   type Difficulty,
 } from '../types';
-import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react';
 
 type StatusFilter = 'all' | 'completed' | 'incomplete' | 'bookmarked';
 const PAGE_SIZE = 15;
@@ -216,30 +216,39 @@ export function QuestionList() {
           {totalPages > 1 && (
             <div className="mt-6 mb-8 flex flex-col gap-3 pt-4 sm:flex-row sm:items-center sm:justify-between">
               <span className="text-sm text-[var(--color-notion-text-secondary)]">
-                {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, filteredQuestions.length)} / {filteredQuestions.length}
+                第 {currentPage}/{totalPages} 页，共 {filteredQuestions.length} 题
               </span>
 
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1">
+                {/* First page */}
+                <button
+                  onClick={() => setCurrentPage(1)}
+                  disabled={currentPage === 1}
+                  className="p-1.5 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] disabled:opacity-30 transition-colors active-press"
+                  title="第一页"
+                >
+                  <ChevronsLeft className="w-4 h-4" />
+                </button>
                 <button
                   onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
                   disabled={currentPage === 1}
-                  className="p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] disabled:opacity-30 transition-all"
+                  className="p-1.5 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] disabled:opacity-30 transition-colors active-press"
                 >
                   <ChevronLeft className="w-4 h-4" />
                 </button>
 
                 {Array.from({ length: totalPages }, (_, i) => i + 1)
-                  .filter((p) => p === 1 || p === totalPages || Math.abs(p - currentPage) <= 1)
+                  .filter((p) => p === 1 || p === totalPages || Math.abs(p - currentPage) <= 2)
                   .map((page, i, arr) => {
                     const showEllipsis = i > 0 && page - arr[i - 1] > 1;
                     return (
                       <span key={page} className="flex items-center">
-                        {showEllipsis && <span className="px-1 text-[var(--color-notion-text-secondary)]">…</span>}
+                        {showEllipsis && <span className="px-0.5 text-xs text-[var(--color-notion-text-secondary)] select-none">…</span>}
                         <button
                           onClick={() => setCurrentPage(page)}
-                          className={`w-9 h-9 rounded-lg text-sm font-medium transition-all ${
+                          className={`min-w-[34px] h-[34px] rounded-lg text-sm font-medium transition-colors active-press ${
                             page === currentPage
-                              ? 'bg-[var(--color-notion-accent)] text-white'
+                              ? 'bg-[var(--color-notion-accent)] text-white shadow-sm'
                               : 'hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)]'
                           }`}
                         >
@@ -252,9 +261,18 @@ export function QuestionList() {
                 <button
                   onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
                   disabled={currentPage === totalPages}
-                  className="p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] disabled:opacity-30 transition-all"
+                  className="p-1.5 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] disabled:opacity-30 transition-colors active-press"
                 >
                   <ChevronRight className="w-4 h-4" />
+                </button>
+                {/* Last page */}
+                <button
+                  onClick={() => setCurrentPage(totalPages)}
+                  disabled={currentPage === totalPages}
+                  className="p-1.5 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] disabled:opacity-30 transition-colors active-press"
+                  title="最后一页"
+                >
+                  <ChevronsRight className="w-4 h-4" />
                 </button>
               </div>
             </div>

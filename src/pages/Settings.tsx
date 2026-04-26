@@ -1,6 +1,26 @@
 import { useProgressStore } from '../stores/progressStore';
 import { Settings as SettingsIcon, AlertTriangle, Keyboard, Sun, Moon, Monitor } from 'lucide-react';
 
+function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors duration-200 active-press ${
+        checked ? 'bg-[var(--color-notion-accent)]' : 'bg-[var(--color-notion-border)]'
+      }`}
+    >
+      <span
+        className={`inline-block h-4.5 w-4.5 rounded-full bg-white shadow-sm transition-[translate] duration-200 ${
+          checked ? 'translate-x-[22px]' : 'translate-x-[3px]'
+        }`}
+        style={{ transitionTimingFunction: 'var(--ease-emphasized)' }}
+      />
+    </button>
+  );
+}
+
 export function Settings() {
   const { settings, updateSettings, resetProgress } = useProgressStore();
 
@@ -21,17 +41,17 @@ export function Settings() {
 
       <div className="space-y-4 sm:space-y-6 animate-stagger">
         {/* Theme settings */}
-        <div className="p-4 sm:p-5 rounded-lg border border-[var(--color-notion-border)]">
+        <div className="p-4 sm:p-5 rounded-xl border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/30 transition-colors duration-200">
           <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4">外观</h3>
           <div className="flex gap-3">
             {themeOptions.map(({ value, icon: Icon, label }) => (
               <button
                 key={value}
                 onClick={() => updateSettings({ theme: value })}
-                className={`flex-1 flex flex-col items-center gap-2 py-3 px-3 rounded-lg border-2 transition-all active-press ${
+                className={`flex-1 flex flex-col items-center gap-2.5 py-3.5 px-3 rounded-xl border-2 transition-all duration-200 active-press ${
                   settings.theme === value
-                    ? 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)]'
-                    : 'border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]'
+                    ? 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)] shadow-sm shadow-[var(--color-notion-accent)]/10'
+                    : 'border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/50'
                 }`}
               >
                 <Icon className={`w-5 h-5 ${settings.theme === value ? 'text-[var(--color-notion-accent)]' : 'text-[var(--color-notion-text-secondary)]'}`} />
@@ -44,38 +64,34 @@ export function Settings() {
         </div>
 
         {/* Quiz settings */}
-        <div className="p-4 sm:p-5 rounded-lg border border-[var(--color-notion-border)]">
+        <div className="p-4 sm:p-5 rounded-xl border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/30 transition-colors duration-200">
           <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4">答题设置</h3>
 
-          <label className="flex items-center justify-between py-2 gap-4">
+          <div className="flex items-center justify-between py-2.5 gap-4">
             <div className="min-w-0">
               <div className="text-sm text-[var(--color-notion-text)]">随机打乱选项顺序</div>
-              <div className="text-xs text-[var(--color-notion-text-secondary)]">每次作答时选项顺序不同</div>
+              <div className="text-xs text-[var(--color-notion-text-secondary)] mt-0.5">每次作答时选项顺序不同</div>
             </div>
-            <input
-              type="checkbox"
+            <Toggle
               checked={settings.shuffleChoices}
-              onChange={(e) => updateSettings({ shuffleChoices: e.target.checked })}
-              className="w-4 h-4 accent-[var(--color-notion-accent)]"
+              onChange={(v) => updateSettings({ shuffleChoices: v })}
             />
-          </label>
+          </div>
 
-          <label className="flex items-center justify-between py-2 border-t border-[var(--color-notion-border)] gap-4">
+          <div className="flex items-center justify-between py-2.5 border-t border-[var(--color-notion-border)] gap-4">
             <div className="min-w-0">
               <div className="text-sm text-[var(--color-notion-text)]">自动展开答案</div>
-              <div className="text-xs text-[var(--color-notion-text-secondary)]">进入题目详情时默认展开参考答案</div>
+              <div className="text-xs text-[var(--color-notion-text-secondary)] mt-0.5">进入题目详情时默认展开参考答案</div>
             </div>
-            <input
-              type="checkbox"
+            <Toggle
               checked={settings.autoExpandAnswer}
-              onChange={(e) => updateSettings({ autoExpandAnswer: e.target.checked })}
-              className="w-4 h-4 accent-[var(--color-notion-accent)]"
+              onChange={(v) => updateSettings({ autoExpandAnswer: v })}
             />
-          </label>
+          </div>
         </div>
 
         {/* Danger zone */}
-        <div className="p-4 sm:p-5 rounded-lg border border-[var(--color-notion-error)]">
+        <div className="p-4 sm:p-5 rounded-xl border border-[var(--color-notion-error)]/40 hover:border-[var(--color-notion-error)] transition-colors duration-200">
           <h3 className="text-base font-semibold text-[var(--color-notion-error)] mb-2 flex items-center gap-1.5">
             <AlertTriangle className="w-4 h-4" /> 危险操作
           </h3>
@@ -88,14 +104,14 @@ export function Settings() {
                 resetProgress();
               }
             }}
-            className="px-4 py-2 text-sm font-medium text-white bg-[var(--color-notion-error)] rounded hover:opacity-90 transition-opacity"
+            className="px-4 py-2 text-sm font-medium text-white bg-[var(--color-notion-error)] rounded-lg hover:opacity-90 transition-opacity active-press"
           >
             重置所有进度
           </button>
         </div>
 
         {/* Keyboard shortcuts */}
-        <div className="p-4 sm:p-5 rounded-lg border border-[var(--color-notion-border)]">
+        <div className="p-4 sm:p-5 rounded-xl border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/30 transition-colors duration-200">
           <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4 flex items-center gap-1.5">
             <Keyboard className="w-4 h-4" /> 键盘快捷键
           </h3>
@@ -106,9 +122,9 @@ export function Settings() {
               ['S', '收藏/取消收藏'],
               ['Ctrl+K', '搜索'],
             ].map(([key, desc]) => (
-              <div key={key} className="flex items-center justify-between py-1">
+              <div key={key} className="flex items-center justify-between py-1.5">
                 <span className="text-[var(--color-notion-text-secondary)]">{desc}</span>
-                <kbd className="px-2 py-0.5 text-xs bg-[var(--color-notion-bg-secondary)] border border-[var(--color-notion-border)] rounded text-[var(--color-notion-text)]">
+                <kbd className="px-2.5 py-1 text-xs bg-[var(--color-notion-bg-secondary)] border border-[var(--color-notion-border)] rounded-md text-[var(--color-notion-text)] font-mono shadow-sm">
                   {key}
                 </kbd>
               </div>

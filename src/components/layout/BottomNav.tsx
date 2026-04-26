@@ -15,10 +15,10 @@ export function BottomNav({ hidden }: BottomNavProps) {
 
   return (
     <nav
-      className={`bottom-nav lg:hidden fixed inset-x-0 bottom-0 z-40 glass-surface border-t border-[var(--color-notion-border)] transition-all duration-300 ${
+      className={`bottom-nav lg:hidden fixed inset-x-0 bottom-0 z-40 glass-surface border-t border-[var(--color-notion-border)] ${
         hidden ? 'translate-y-full opacity-0 pointer-events-none' : 'translate-y-0 opacity-100'
       }`}
-      style={{ transitionTimingFunction: 'var(--ease-emphasized)' }}
+      style={{ transition: 'translate 300ms var(--ease-emphasized), opacity 300ms var(--ease-emphasized)' }}
     >
       <div className="bottom-nav-grid mx-auto grid max-w-lg grid-cols-4 gap-1 px-2">
         {items.map(({ to, icon: Icon, label, end }) => (
@@ -27,15 +27,26 @@ export function BottomNav({ hidden }: BottomNavProps) {
             to={to}
             end={end}
             className={({ isActive }) =>
-              `touch-target flex min-w-0 flex-col items-center justify-center gap-0.5 rounded-xl px-2 py-1.5 no-underline transition-all duration-200 ${
+              `touch-target flex min-w-0 flex-col items-center justify-center gap-1.5 px-2 py-1.5 no-underline transition-colors duration-200 ${
                 isActive
-                  ? 'text-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)]'
+                  ? 'text-[var(--color-notion-accent)]'
                   : 'text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
               }`
             }
           >
-            <Icon className="w-[18px] h-[18px]" />
-            <span className="truncate text-[10px] leading-none font-medium">{label}</span>
+            {({ isActive }) => (
+              <>
+                <span className="relative flex items-center justify-center">
+                  <span
+                    className={`absolute inset-y-[-4px] inset-x-[-14px] rounded-full transition-all duration-200 ${
+                      isActive ? 'bg-[var(--color-notion-accent-light)] scale-100' : 'bg-transparent scale-75'
+                    }`}
+                  />
+                  <Icon className="relative w-[18px] h-[18px]" />
+                </span>
+                <span className="truncate text-[10px] leading-none font-medium">{label}</span>
+              </>
+            )}
           </NavLink>
         ))}
       </div>

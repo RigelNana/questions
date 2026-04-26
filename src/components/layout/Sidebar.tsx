@@ -36,7 +36,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
           ${isOpen ? "translate-x-0" : "-translate-x-full"}
         `}
         style={{
-          transition: 'transform var(--duration-long-1) var(--ease-emphasized), background-color 0.3s ease, border-color 0.3s ease',
+          transition: 'translate var(--duration-long-1) var(--ease-emphasized), transform var(--duration-long-1) var(--ease-emphasized), background-color 0.3s ease, border-color 0.3s ease',
         }}
       >
         {/* Logo + Close */}
