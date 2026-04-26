@@ -1,0 +1,157 @@
+{
+  "id": "os-oom-killer-diagnosis",
+  "name": "生产环境 OOM Killer 杀进程的排查流程",
+  "domain": "operating-system",
+  "description": "从 dmesg 日志到内存泄漏定位的完整 OOM 事件排查方法论与预防措施",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-oom-killer-diagnosis-1",
+      "domain": "operating-system",
+      "type": "debugging",
+      "difficulty": 3,
+      "tags": ["oom-killer", "memory", "debugging", "linux", "kubernetes", "valgrind", "pprof"],
+      "title": "生产环境中进程被 OOM Killer 杀死了，你会怎么排查",
+      "content": "凌晨两点，你收到一条 PagerDuty 告警：核心交易服务不可用，监控显示进程已退出。SSH 上机器，发现进程消失了，系统日志里没有明显报错。内存监控图显示过去六小时内存使用从 4GB 稳定地爬升到了 15GB，然后在告警触发前五分钟突然归零。\n\n```\n$ systemctl status trade-service\n● trade-service.service - Core Trading Service\n   Loaded: loaded (/etc/systemd/system/trade-service.service; enabled)\n   Active: activating (auto-restart) (Result: signal) since ...\n  Process: 18934 ExecStart=/opt/trade/bin/trade-service (code=killed, signal=KILL)\n```\n\n`code=killed, signal=KILL` 是一个强烈的提示。这台机器运行 Linux 5.10，没有 cgroup 内存限制，32GB RAM，过去半年这个服务从来没有出过这种问题。\n\n请描述你的完整排查思路：如何确认是 OOM kill、如何读懂 OOM 报告、如何判断是突发还是泄漏、以及对不同语言栈（C/C++、Java、Go）如何定位内存泄漏根因。同时说明如何防止下次再发生。",
+      "answer": "## 第一步：确认 OOM Kill，不要靠猜\n\n`signal=KILL` 意味着进程被 SIGKILL 终止，而不是自行崩溃。触发 SIGKILL 的来源有两个：OOM killer 或者 `kill -9`。先排除人工干预的可能，然后直接去内核日志里找证据。\n\n```bash\n# -T 参数让 dmesg 显示人类可读的时间戳\ndmesg -T | grep -i 'oom\\|killed process\\|out of memory' | tail -50\n```\n\n如果看到类似下面这样的输出，案子就基本定了：\n\n```\n[Thu Nov 14 02:17:43 2024] Out of memory: Kill process 18934 (trade-service) score 847 or sacrifice child\n[Thu Nov 14 02:17:43 2024] Killed process 18934 (trade-service) total-vm:28311552kB, anon-rss:14520320kB, file-rss:65536kB, shmem-rss:0kB\n```\n\n`dmesg` 的内核环形缓冲区在重启后会清空，如果机器重启了，就要去 `/var/log/kern.log`（Debian/Ubuntu）或 `/var/log/messages`（RHEL/CentOS）里找，这些文件是持久化的：\n\n```bash\ngrep -i 'oom\\|killed process' /var/log/kern.log | tail -50\n# 或\ngrep -i 'out of memory' /var/log/syslog\n```\n\n某些发行版上 `journalctl` 会更方便，它聚合了所有来源的日志：\n\n```bash\njournalctl -k --since \"2024-11-14 02:00\" | grep -i oom\n```\n\n## 第二步：读懂 OOM 报告里的信息\n\nOOM killer 触发时，内核会把当时的完整内存快照打印到 dmesg，这份报告信息量极大，但大多数人不知道怎么读。找到那条「Out of memory」之后，往下看几十行：\n\n```\nMem-Info:\nactive_anon:3245678 inactive_anon:124567 isolated_anon:0\nactive_file:23456 inactive_file:45678 isolated_file:0\nunevictable:1234 dirty:567 writeback:0\nslab_reclaimable:89012 slab_unreclaimable:34567\nmapped:12345 shmem:3456 pagetables:7890\nfree:45678 free_pcp:123 free_cma:0\n```\n\n关注几个关键字：`free` 是当前可用的 4KB pages 数量（free × 4 = free KB），`active_anon` 是活跃的匿名内存（堆、栈），`inactive_anon` 是不活跃的匿名内存。如果 `free` 接近 0 而 `active_anon` 极大，说明是真正的内存耗尽，不是 page cache 占满可以回收的情况。\n\n接下来内核会打印每个进程的内存快照和 oom_score：\n\n```\n[ pid ]   uid  tgid total_vm      rss pgtables_bytes swapents oom_score_adj name\n[18934]  1000 18934  7077888  3630080   29786112        0             0 trade-service\n[  987]     0   987    45678     2345     524288        0          -1000 systemd\n[  988]     0   988    34567     1234     524288        0          -1000 sshd\n```\n\n`rss` 的单位是 pages（4KB/page），所以 `trade-service` 实际 RSS = 3630080 × 4KB = 约 13.8GB。`oom_score_adj` 是进程的 OOM 分数调整值，默认 0，越低越不容易被杀（-1000 表示永不被杀）。内核最终的 oom_score 综合了进程 RSS 大小和这个调整值，RSS 最大的进程分数最高，最先被选中。\n\n从这份报告里，我们知道：trade-service 用了 13.8GB RAM，total-vm 约 27GB（虚拟地址空间），系统总物理内存 32GB 基本耗尽。\n\n## 第三步：判断是突发分配还是慢性泄漏\n\n内存监控图已经给出了答案：六小时内从 4GB 线性增长到 15GB，斜率稳定，这是教科书式的内存泄漏特征。突发分配的内存曲线应该是阶跃式的：某个时刻突然跳高，然后保持水平或回落。\n\n如果监控不完善，可以用历史工具追溯。`sar`（来自 sysstat 包）会每隔固定间隔记录系统资源快照：\n\n```bash\n# 查看今天的内存历史，每分钟一条\nsar -r -f /var/log/sa/sa$(date +%d) 1\n\n# 输出示例：\n# 02:00:01    kbmemfree  kbavail kbmemused  %memused\n# 02:10:01      4567890  5123456  27234567    84.9\n# 02:20:01      3456789  4012345  28345678    88.4\n# 02:30:01      2345678  2901234  29456789    91.8\n```\n\n如果 sysstat 没装，也可以通过 Prometheus 或者业务自带的 APM 系统查历史曲线。关键问题是：内存有没有「只增不减」的趋势？如果有，并且重启之后内存从低位重新缓慢爬升，内存泄漏的诊断基本可以确立。\n\n## 第四步：定位泄漏根因——分语言栈\n\n### C/C++ 应用：Valgrind 与 AddressSanitizer\n\nC/C++ 泄漏的根因通常是 `malloc`/`new` 分配了内存但忘记 `free`/`delete`，或者指针断链导致内存块再也找不到。\n\n`valgrind --leak-check=full` 是最直接的工具，它在运行时拦截所有内存分配和释放，程序退出时打印未释放的内存块和分配时的调用栈：\n\n```bash\nvalgrind --leak-check=full --show-leak-kinds=all --track-origins=yes \\\n  --log-file=valgrind.log ./trade-service\n```\n\nValgrind 的缺点是运行时开销极大（通常慢 10-50 倍），生产环境无法直接使用。替代方案是 AddressSanitizer（ASan），编译时加 `-fsanitize=address` 即可，运行时开销约 2 倍，可以在预发/灰度环境开启。\n\n对于已经在跑的进程，`/proc/<PID>/smaps_rollup` 提供了详细的内存分类统计，不需要重新编译：\n\n```bash\ncat /proc/18934/smaps_rollup\n# 输出：\n# Rss:           14234567 kB\n# Pss:           14234567 kB\n# Anonymous:     14123456 kB    ← 堆内存，泄漏通常在这里\n# Shared_Clean:     12345 kB\n# Private_Dirty:  14123456 kB\n```\n\n如果 `Anonymous` 远大于预期，说明堆内存没有被释放。配合 `pmap -x <PID>` 可以看到每个内存映射区域的详情，找到那些极大的匿名映射段。\n\n### Java 应用：堆分析\n\nJava 的堆内存由 JVM 管理，「内存泄漏」在 Java 语境下通常意味着对象被不必要地持有引用导致 GC 无法回收，而不是真正意义上的 C 风格泄漏。\n\n首先，JVM 进程被 OS OOM kill 而不是抛出 `OutOfMemoryError`，通常意味着 JVM 的堆外内存（Direct Memory、Metaspace、JNI 分配、GC 元数据）在泄漏，因为 GC 只管理堆，堆外是不受 JVM 控制的 native 内存。\n\n对于堆内泄漏，最高效的工具组合是 GC 日志 + 堆 dump：\n\n```bash\n# 先看 GC 日志（如果配置了 -Xlog:gc*:file=/var/log/gc.log）\ntail -100 /var/log/gc.log\n# 如果 Full GC 越来越频繁，且每次 GC 后 Old Gen 没有下降，说明堆内泄漏\n\n# 对活着的 JVM 进程做堆快照\njmap -dump:format=b,file=/tmp/heap.hprof <PID>\n\n# 也可以让 JVM OOM 时自动 dump（启动参数中加）\n# -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/var/log/\n```\n\n把 `heap.hprof` 下载到本地，用 Eclipse MAT（Memory Analyzer Tool）打开，它会自动显示「Leak Suspects」报告，指出哪个类的实例占用了最多内存、从哪里被引用。常见场景：`ThreadLocal` 没有 remove 导致的 Map 条目堆积；静态集合类（`static List`、`static Map`）无限增长；数据库连接泄漏导致连接对象堆积。\n\n堆外泄漏的排查：`jcmd <PID> VM.native_memory` 可以打印 JVM native 内存的分类统计（需要启动参数加 `-XX:NativeMemoryTracking=summary`）；Netty 的 Direct Memory 泄漏可以通过 `-Dio.netty.leakDetection.level=paranoid` 开启检测。\n\n### Go 应用：pprof 内存剖析\n\nGo 的 GC 会自动回收不再引用的对象，真正的 Go 内存泄漏通常是 goroutine 泄漏（goroutine 持有引用导致相关数据无法被 GC），或者 CGo 侧的 native 内存没有释放。\n\n```bash\n# Go 服务通常开了 pprof HTTP endpoint（import _ \"net/http/pprof\"）\n# 获取堆内存 profile\ncurl http://localhost:6060/debug/pprof/heap -o heap.pprof\ngo tool pprof heap.pprof\n\n# pprof 交互中：\n(pprof) top10          # 按内存占用排前 10\n(pprof) list FuncName  # 查看某函数的内存分配行\n(pprof) web            # 在浏览器中显示调用图\n\n# 检查 goroutine 泄漏：如果 goroutine 数量随时间单调增长\ncurl http://localhost:6060/debug/pprof/goroutine?debug=1 | head -50\n```\n\n如果 pprof 的 `inuse_space` 并不大，但操作系统看到的 RSS 很高，通常是 Go runtime 把已经 GC 掉的内存归还给 OS 的速度太慢，可以用 `GODEBUG=madvdontneed=1`（Go 1.12+）或者设置 `GOMEMLIMIT`（Go 1.19+）来控制 runtime 的内存上限。\n\n## 第五步：立即缓解与长期预防\n\n短期止血：调整 OOM 优先级，让不重要的进程先被杀：\n\n```bash\n# 把关键服务设为最不容易被 OOM kill（-1000 = 永不被杀）\necho -1000 > /proc/$(pidof trade-service)/oom_score_adj\n\n# 或在 systemd unit 文件中持久化\n# [Service]\n# OOMScoreAdjust=-900\n```\n\n增加 swap 作为应急缓冲（治标但能给争取排查时间）：\n\n```bash\nfallocate -l 8G /swapfile && chmod 600 /swapfile\nmkswap /swapfile && swapon /swapfile\n```\n\n长期预防的核心是「把隐式崩溃变成可观测的事件」。用 cgroup 给每个服务设置内存上限，配合 Prometheus 告警：\n\n```yaml\n# Prometheus alerting rule\n- alert: MemoryUsageHigh\n  expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10\n  for: 5m\n  annotations:\n    summary: \"节点可用内存低于 10%，预计 OOM 即将发生\"\n```\n\n在 Kubernetes 环境里，给每个 Pod 设置合理的 `resources.limits.memory`，这样 OOM 被隔离在 cgroup 范围内，不会触发全局 OOM killer；通过 `kubectl top pod --sort-by=memory` 持续监控内存最高的 Pod；开启 `VerticalPodAutoscaler`（VPA）的推荐模式，让它帮你分析历史内存用量并给出合理的 limits 建议。",
+      "keyPoints": [
+        "OOM kill 的确认依赖 dmesg 日志中「Out of memory: Kill process」行，cgroup 级 OOM 日志含「Memory cgroup out of memory」前缀，两者触发范围不同",
+        "dmesg 的 OOM 报告包含事件发生时每个进程的 RSS 和 oom_score，从中可以判断哪个进程消耗最多内存以及为何被选中",
+        "内存曲线单调递增代表泄漏，阶跃式跳高代表突发分配，两种场景排查方向完全不同，sar -r 可以追溯历史内存使用趋势",
+        "Java 进程被 OS OOM kill（而非抛 OutOfMemoryError）通常意味着 JVM 堆外内存（Direct Memory、Metaspace）在泄漏，需用 VM.native_memory 工具分析，而不是堆 dump",
+        "Go 应用 pprof 的 inuse_space 很小但 OS RSS 很高，通常是 runtime 未及时归还 OS 内存，可通过 GOMEMLIMIT 上限或 MADV_FREE 行为调整解决",
+        "oom_score_adj 设为 -1000 可以让关键服务永不被 OOM kill，应在 systemd unit 的 OOMScoreAdjust 字段持久化，避免重启后失效",
+        "预防 OOM 的最优实践是为每个服务设置 cgroup 内存上限并配置可用内存告警（如 MemAvailable < 10%），把隐式崩溃变成可观测事件"
+      ],
+      "quiz": [
+        {
+          "id": "os-oom-killer-diagnosis-1-q1",
+          "question": "systemd 报告服务退出原因为 `code=killed, signal=KILL`，以下哪条命令最直接地确认是否是 OOM killer 触发的？",
+          "choices": [
+            {"id": "A", "text": "top -b -n 1 | grep trade-service"},
+            {"id": "B", "text": "dmesg -T | grep -i 'out of memory\\|killed process'"},
+            {"id": "C", "text": "cat /proc/meminfo | grep MemFree"},
+            {"id": "D", "text": "journalctl -u trade-service --since '1 hour ago'"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "OOM killer 的所有活动都记录在内核日志中，dmesg 是读取内核环形缓冲区的标准工具，-T 参数添加时间戳。grep 的关键词「out of memory」和「killed process」可以精确定位 OOM 事件行。top 显示的是当前状态，进程已经死了就看不到了。/proc/meminfo 显示当前内存状态，不是历史记录，OOM 发生后内存可能已经释放回正常水位。journalctl -u 只显示该服务自身的 unit 日志，OOM kill 事件在内核日志里，不在服务日志里（除非 systemd 做了转发，但 OOM 报告的完整内容通常只在 dmesg 中）。"
+        },
+        {
+          "id": "os-oom-killer-diagnosis-1-q2",
+          "question": "dmesg OOM 报告中，`oom_score_adj` 为 -1000 的进程代表什么？",
+          "choices": [
+            {"id": "A", "text": "该进程 OOM 分数最高，最先被 OOM killer 选中"},
+            {"id": "B", "text": "该进程被标记为永不被 OOM killer 杀死"},
+            {"id": "C", "text": "该进程已经被 OOM killer 选中，-1000 是其退出码"},
+            {"id": "D", "text": "该进程的内存用量为负，说明统计出错"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "oom_score_adj 的取值范围是 -1000 到 1000，-1000 是特殊值，代表「该进程永远不会被 OOM killer 选中」。内核在计算最终 oom_score 时，如果 adj 为 -1000，会直接跳过该进程。这个值通常给关键系统进程使用，如 systemd、sshd（不能被杀，否则机器就再也连不上了）。dmesg 报告中显示 -1000 说明这些进程被「保护」了，OOM killer 不会动它们，而会去找 adj 最高的、RSS 最大的进程下手。"
+        },
+        {
+          "id": "os-oom-killer-diagnosis-1-q3",
+          "question": "OOM 事件的内存曲线显示：内存使用从 6 小时前开始以稳定速率从 4GB 线性增长到 15GB。以下哪种描述最准确？",
+          "choices": [
+            {"id": "A", "text": "这是正常的 page cache 积累，重启后会自动释放，不需要排查"},
+            {"id": "B", "text": "这是典型的内存泄漏特征，应着重排查对象生命周期管理和未释放的内存分配"},
+            {"id": "C", "text": "这是突发流量导致的正常内存扩张，应优先扩容而非排查代码"},
+            {"id": "D", "text": "这是 JVM 堆预热的正常行为，GC 会在下一次 Full GC 时清理"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "线性、单调递增的内存曲线是内存泄漏的经典特征：新分配的内存从未被释放，速率稳定意味着单位时间内泄漏量恒定（如每处理一个请求泄漏固定量的内存）。突发流量导致的内存扩张应该是阶跃式的，且流量回落后内存应该下降。page cache 确实会积累，但 page cache 增长会让 Buffers/Cached 升高，而 Available 下降的速率会因为内核可以随时回收 page cache 而相对缓慢；此外 page cache 占用不会触发 OOM。JVM 的 Young Gen 内存会波动，但 6 小时线性爬升到 11GB 增量，远超正常 JVM 堆行为。"
+        },
+        {
+          "id": "os-oom-killer-diagnosis-1-q4",
+          "question": "用 jmap 对 Java 进程做了堆 dump 并用 MAT 分析，发现堆内对象总量只有 500MB，但进程的 RSS 高达 6GB。最可能的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "MAT 只分析存活对象，6GB 中有 5.5GB 是等待 GC 的垃圾"},
+            {"id": "B", "text": "JVM 的堆外内存（Direct Memory、Metaspace、JNI 等）在泄漏，jmap 只看堆内存"},
+            {"id": "C", "text": "堆 dump 文件被截断，实际堆比显示的大"},
+            {"id": "D", "text": "RSS 统计包含了共享库，5.5GB 是 JDK 标准库的共享内存"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "jmap 和 MAT 只能分析 JVM 托管堆（-Xmx 控制的那部分），但 JVM 进程的 native 内存远不止托管堆。常见的堆外内存区域包括：Direct ByteBuffer（`ByteBuffer.allocateDirect()`，Netty 大量使用）受 `-XX:MaxDirectMemorySize` 控制；Metaspace（类元数据，动态类加载场景可能无限增长）；JNI 分配的 native heap；线程栈（每个线程默认 512KB-1MB）。这些部分只能通过 `jcmd <PID> VM.native_memory` 或 jemalloc 分析。GC 等待的垃圾通常不超过一两个 GC 周期的累积量，不会有 5.5GB 之多。共享库的共享内存在 RSS 中记录但在 PSS 中按比例分摊，总量通常在几百 MB 量级，不会到 5.5GB。"
+        },
+        {
+          "id": "os-oom-killer-diagnosis-1-q5",
+          "question": "以下 dmesg 输出中，哪个进程最可能被 OOM killer 选中？\n```\n[ pid ] uid  rss  oom_score_adj  name\n[1001]  0    2048  -1000         systemd\n[2034]  500  524288  0           java-app\n[2045]  500  131072  200         batch-job\n[2056]  0    8192    -500        docker\n```",
+          "choices": [
+            {"id": "A", "text": "systemd，因为它是 PID 1，内存最稳定"},
+            {"id": "B", "text": "java-app，RSS 最大（约 2GB）且 oom_score_adj 为 0"},
+            {"id": "C", "text": "batch-job，oom_score_adj 最高（200），最先被选中"},
+            {"id": "D", "text": "docker，adj 为 -500，在四者中分数计算最复杂"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "OOM killer 的选择算法综合了 RSS 大小和 oom_score_adj。最终 oom_score 的计算中，oom_score_adj = 200 会让 batch-job 的基础分数额外加 200 × (RAM/1000)（粗略理解）。但更直接地说：oom_score_adj 越高，越优先被杀；oom_score_adj = -1000 的 systemd 绝对不会被杀。batch-job 的 adj 最高（200），在同等 RSS 条件下最先被杀；即使 java-app 的 RSS 是 batch-job 的 4 倍，adj = 200 的倾斜会让 batch-job 的最终 oom_score 可能超过 java-app。可以用 `cat /proc/<pid>/oom_score` 查看内核计算出的实际分数来精确判断。"
+        },
+        {
+          "id": "os-oom-killer-diagnosis-1-q6",
+          "question": "对一个正在运行的 Go 服务执行 pprof 采样，发现 inuse_space 只有 200MB，但 `top` 显示该进程 RSS 为 1.8GB。以下哪种解释最合理？",
+          "choices": [
+            {"id": "A", "text": "Go 的 GC 已经回收了 1.6GB 对象，但 runtime 还没把这些页面归还给操作系统"},
+            {"id": "B", "text": "pprof 只采样了 1/8 的内存，实际堆大小应乘以 8"},
+            {"id": "C", "text": "1.6GB 是 goroutine 的栈内存，pprof heap profile 不包含栈"},
+            {"id": "D", "text": "Go runtime 的内存统计有 bug，RSS 数据不可信"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "这是 Go 内存管理的经典现象。Go 的 GC 回收对象后，底层内存页并不一定立即归还给操作系统，而是保留在 runtime 的空闲 span 池里等待复用（这有助于避免频繁的 mmap/munmap 系统调用）。操作系统的 RSS 统计只要页面还映射在进程地址空间就计数，不管里面有没有活跃数据。在 Go 1.12 之前，runtime 用 MADV_DONTNEED 释放页，效果好但频繁；1.12+ 改为 MADV_FREE（在支持的内核上），页面被标记为可回收但不立即还给 OS，RSS 会虚高。设置 GODEBUG=madvdontneed=1 可以恢复老行为，或者用 Go 1.19 的 GOMEMLIMIT 让 runtime 更激进地归还内存。"
+        },
+        {
+          "id": "os-oom-killer-diagnosis-1-q7",
+          "question": "你想给 trade-service 设置 oom_score_adj 为 -900，并确保重启后依然有效。以下哪种方式正确？",
+          "choices": [
+            {"id": "A", "text": "在 /etc/rc.local 中加 echo -900 > /proc/$(pidof trade-service)/oom_score_adj"},
+            {"id": "B", "text": "在 systemd unit 文件的 [Service] 段加 OOMScoreAdjust=-900"},
+            {"id": "C", "text": "在应用代码启动时 os.WriteFile(\"/proc/self/oom_score_adj\", []byte(\"-900\"), 0644)"},
+            {"id": "D", "text": "在 /etc/sysctl.conf 中加 vm.oom_score_adj=-900"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "systemd unit 文件的 OOMScoreAdjust 是最规范的持久化方式：服务每次启动时 systemd 自动设置该值，无论 PID 如何变化都有效，且配置与服务声明在同一个文件里，运维清晰可见。rc.local 的写法有竞争条件（服务启动前 PID 不存在），且 rc.local 在现代 systemd 系统上执行时机不确定。应用代码中写 oom_score_adj 需要 root 权限（或 CAP_SYS_RESOURCE），给应用加 root 权限来做运维配置是反模式。sysctl.conf 中不存在 vm.oom_score_adj 这个全局参数，oom_score_adj 是 per-process 的，没有全局默认值配置项。"
+        },
+        {
+          "id": "os-oom-killer-diagnosis-1-q8",
+          "question": "使用 Valgrind 排查 C++ 服务内存泄漏，发现报告中标记为「definitely lost」的内存块。这是什么意思？",
+          "choices": [
+            {"id": "A", "text": "这些内存块在程序退出时被操作系统回收了，不构成真正的泄漏"},
+            {"id": "B", "text": "这些内存块被分配后，所有指向它们的指针都已丢失，无法被代码显式释放，是确定的泄漏"},
+            {"id": "C", "text": "这些内存块还有指针引用，只是在本次运行中没有被访问"},
+            {"id": "D", "text": "这些内存块是 Valgrind 自身的开销，不是应用代码造成的"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Valgrind 把未释放内存分为几类：definitely lost（确定泄漏：分配后指针完全丢失，代码再也无法 free 它）、indirectly lost（间接泄漏：通过泄漏的指针结构间接持有）、possibly lost（可能泄漏：还有指针但指向块内部而非块头部，可能是故意的也可能不是）、still reachable（程序结束时还被引用，如全局静态对象，不一定是 bug）。definitely lost 是最需要优先修复的类别，因为这些内存在程序整个生命周期内都无法被代码主动释放，会随着运行时间积累，正是导致 OOM 的元凶。程序退出时操作系统确实会回收所有内存，但这掩盖了长期运行时的问题。"
+        },
+        {
+          "id": "os-oom-killer-diagnosis-1-q9",
+          "question": "Kubernetes Pod 被 OOM kill，kubectl describe pod 显示某容器的 lastState.exitCode 为 137。以下哪项说法正确？",
+          "choices": [
+            {"id": "A", "text": "137 是应用代码中 os.Exit(137) 的返回值，说明应用主动退出"},
+            {"id": "B", "text": "137 = 128 + 9，代表进程被信号 9（SIGKILL）终止，OOM killer 使用 SIGKILL 强制杀进程"},
+            {"id": "C", "text": "137 是 HTTP 状态码，说明健康检查失败导致容器重启"},
+            {"id": "D", "text": "137 是 Kubernetes 的内部错误码，代表调度失败"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "Unix 的退出码约定：当进程被信号终止时，exit code = 128 + 信号编号。SIGKILL 的编号是 9，所以 128 + 9 = 137。OOM killer 通过发送 SIGKILL 来杀进程（不是 SIGTERM，因为需要确保进程立即终止，不能给它 cleanup 的机会——否则泄漏的服务可能在 cleanup 阶段再分配内存）。在 kubectl describe pod 中看到 exitCode: 137 且 reason: OOMKilled 可以确认是 OOM。如果只看到 exitCode: 137 但 reason 是 Error，则可能是收到外部 SIGKILL，需要结合 dmesg 确认。"
+        },
+        {
+          "id": "os-oom-killer-diagnosis-1-q10",
+          "question": "你为 trade-service 配置了 cgroup memory.max=8GB 来防止它耗尽整机内存，但服务遇到内存泄漏时仍然在 OOM 前无任何告警。如何改进？",
+          "choices": [
+            {"id": "A", "text": "把 memory.max 改为 16GB，给更大缓冲空间，OOM kill 的频率会降低"},
+            {"id": "B", "text": "同时设置 memory.high=6GB，当用量超过 6GB 时触发 Prometheus 告警，在到达 8GB 硬限制前有 2GB 的告警窗口"},
+            {"id": "C", "text": "开启内核的 overcommit_memory=2，禁止内存过度承诺，分配失败时应用提前报错"},
+            {"id": "D", "text": "设置 oom_score_adj=-999，让服务尽量不被杀，等下次手动重启"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "memory.high 是专门为「提前预警」设计的软水位线。当内存用量超过 6GB 时，内核开始节流该 cgroup 并积极回收，这个状态可以被 Prometheus 的 container_memory_working_set_bytes 或 node_exporter 的 cgroup 内存指标检测到，在此时触发 PagerDuty 告警，运维有时间介入（重启服务、分析泄漏），不必等到 OOM kill 才知道出问题了。单纯调大 memory.max 只是推迟 OOM，不解决无告警的问题。overcommit_memory=2 是全局参数，影响整机所有进程，且主要针对虚拟地址分配而非实际物理内存用量，副作用很大。降低 oom_score_adj 只是让别人先死，自己晚死，泄漏问题依然存在。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/admin-guide/mm/concepts.html",
+        "https://www.brendangregg.com/blog/2019-08-20/linux-out-of-memory.html",
+        "https://kubernetes.io/docs/tasks/configure-pod-container/assign-memory-resource/",
+        "https://go.dev/blog/pprof",
+        "https://valgrind.org/docs/manual/mc-manual.html"
+      ]
+    }
+  ]
+}
