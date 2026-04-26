@@ -1,0 +1,172 @@
+{
+  "id": "os-interrupt-top-bottom-half",
+  "name": "中断上半部与下半部机制详解",
+  "domain": "operating-system",
+  "description": "Linux 中断处理两阶段设计：top half 的约束与 softirq/tasklet/workqueue 三种下半部机制对比",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-interrupt-top-bottom-half-1",
+      "domain": "operating-system",
+      "type": "principle",
+      "difficulty": 3,
+      "tags": ["interrupt", "top-half", "bottom-half", "softirq", "tasklet", "workqueue", "ksoftirqd", "NIC", "Linux", "kernel", "NAPI", "IRQ"],
+      "title": "中断处理的上半部和下半部（Top Half / Bottom Half）是什么",
+      "content": "## 背景场景\n\n你在做服务器性能优化，发现一台处理高流量的机器上 `top` 输出里有几个叫 `ksoftirqd/0`、`ksoftirqd/1` 的内核线程在持续消耗 CPU，有时候单核能跑到 30%。同事说「这是中断下半部的问题，调一下 `netdev_budget` 就好了」，但你完全不知道他在说什么。\n\n这道题就从这里开始：Linux 为什么要把中断处理分成「上半部」和「下半部」，这两部分各自做什么，三种下半部机制（softirq、tasklet、workqueue）有什么区别，以及 NIC 收包这条路径是怎么把这些概念串起来的。\n\n## 先问一个根本性的问题\n\n假设你是一块网卡，每秒钟要接收 100 万个数据包。每来一个包，你就拉一下 CPU 的中断线，CPU 暂停当前任务，跳到你的中断处理函数里执行。这个处理函数需要：解析以太网帧头、IP 头、TCP 头，找到对应的 socket，复制数据到 socket 接收缓冲区，唤醒等待读数据的进程……整个过程可能需要几十微秒甚至几毫秒。\n\n问题来了：在 CPU 跳进中断处理函数的这段时间里，当前 CPU 核的中断是**被屏蔽的**。如果 NIC 每秒打来 100 万次中断，每次处理耗时 10 微秒，那 CPU 就 100% 被中断处理占满了，根本无法运行普通进程。更严重的是，如果处理一个中断的时间太长，期间产生的新中断就会积压甚至丢失。\n\n这就是「上半部/下半部」分离设计的根本动机——**必须让中断响应足够快，把耗时的工作推迟到中断退出之后再做**。\n\n## 上半部（Top Half）到底受多大约束\n\n上半部就是硬件中断服务例程（ISR，Interrupt Service Routine）本身。当 NIC 拉低中断线，CPU 响应中断，从中断描述符表（IDT）跳到对应的 ISR，这段代码就是上半部。\n\n上半部的运行环境极其苛刻：本地 CPU 的中断被禁用（`irqsave` 语义），不能调用 `schedule()` 让出 CPU，不能睡眠，不能等待锁（互斥锁会睡眠，所以只能用自旋锁），不能做任何可能阻塞的操作。实践中 ISR 通常要求在 10 微秒以内完成。\n\n它的标准工作是三件事：**确认硬件中断**（写寄存器告诉 NIC「我知道你发包了」，否则 NIC 会一直保持中断线有效）、**把数据从硬件寄存器/DMA 缓冲区读到内核内存**、然后**调度下半部来处理后续工作**。\n\n以 Intel igb 驱动为例，ISR 大致是这样：\n\n```c\n// drivers/net/ethernet/intel/igb/igb_main.c (简化)\nstatic irqreturn_t igb_msix_ring(int irq, void *data)\n{\n    struct igb_q_vector *q_vector = data;\n    /* 屏蔽该队列的中断，防止重复触发 */\n    igb_write_itr(q_vector);\n    /* 调度 NAPI poll，这就是触发下半部的关键调用 */\n    napi_schedule(&q_vector->napi);\n    return IRQ_HANDLED;\n}\n```\n\n`napi_schedule()` 做的事情是：把这个 NAPI 结构体加入当前 CPU 的 softirq 待处理队列，然后调用 `raise_softirq(NET_RX_SOFTIRQ)` 标记「有 softirq 需要处理」。整个 ISR 不到 10 行代码，微秒级完成，然后把剩余工作全部交给下半部。\n\n## 三种下半部机制的全景对比\n\nLinux 提供了三种机制让你把工作推迟到中断退出后执行，它们的设计哲学、能力边界和适用场景差异很大。\n\n**softirq** 是最底层、最高性能的机制。内核预定义了 10 种类型，`NET_RX_SOFTIRQ`（网络接收）、`NET_TX_SOFTIRQ`（网络发送）、`TIMER_SOFTIRQ`（定时器）等，编号固定。softirq 在中断返回时由 `do_softirq()` 触发执行，或者由 `ksoftirqd` 内核线程执行。它运行时中断是**开启的**（可以被打断），但**不能睡眠**。关键特性是 per-CPU 的：每个 CPU 维护自己的 softirq 待处理位图，不同 CPU 间无需加锁。但同一种 softirq 处理函数可以在多个 CPU 上**并发执行**，所以 softirq handler 必须是可重入的，需要自己处理并发安全。\n\n**tasklet** 建立在 softirq 之上，使用 `HI_SOFTIRQ` 和 `TASKLET_SOFTIRQ` 两个 slot。驱动开发者通过 `tasklet_init()` 创建、`tasklet_schedule()` 调度。tasklet 提供了一个重要保证：**同一个 tasklet 绝不会在多个 CPU 上并发执行**，而且总是在调度它的那个 CPU 上运行。这让驱动开发简单很多，不需要考虑 handler 的重入性。但它同样不能睡眠。从 Linux 5.x 开始，tasklet 被标记为 deprecated，官方推荐改用 threaded IRQ（`request_threaded_irq()`），因为 threaded IRQ 可以睡眠，在实时内核（PREEMPT_RT）下行为更可预期。\n\n**workqueue** 是三种机制中能力最强的，也是限制最少的。它运行在进程上下文（`kworker/N:M` 内核线程），因此**可以睡眠、可以持有互斥锁、可以等待 I/O 完成**。驱动调用 `schedule_work()` 把工作项提交给系统默认工作队列 `system_wq`，后台的 kworker 线程会取出执行。代价是有线程调度开销，延迟比 softirq 高一个数量级。需要阻塞操作的场景（比如中断处理完成后需要读一个 I²C 寄存器）只能用 workqueue。\n\n| 机制 | 运行上下文 | 能否睡眠 | 并发性 | 延迟 | 适用场景 |\n|------|-----------|---------|--------|------|----------|\n| softirq | 软中断上下文 | 否 | 多 CPU 并发 | 最低 | 网络、定时器 |\n| tasklet | 软中断上下文 | 否 | 同 tasklet 串行 | 低 | 简单驱动 |\n| workqueue | 进程上下文 | **是** | kworker 线程 | 较高 | 需要阻塞的工作 |\n\n## NIC 收包的完整内核路径\n\n把以上所有概念串起来，看一下一个数据包从网线到达 socket 接收缓冲区的完整路径：\n\n```\n数据包到达网卡\n  → NIC 通过 DMA 把数据写入 ring buffer（驱动预先分配的内存区域）\n  → NIC 触发硬件中断\n  → CPU 跳入 ISR（上半部）\n    → 写寄存器屏蔽该队列后续中断（防止中断风暴）\n    → 调用 napi_schedule()，把 NAPI 结构体加入 poll_list\n    → raise_softirq(NET_RX_SOFTIRQ)\n    → ISR 返回，耗时 < 5μs\n\n  → 中断返回时触发 do_softirq()\n  → net_rx_action()（NET_RX_SOFTIRQ 的 handler）\n    → 遍历 poll_list，调用驱动注册的 poll() 函数\n    → poll() 从 ring buffer 读取数据包，构造 sk_buff\n    → 调用 netif_receive_skb()\n      → 协议栈：ETH → IP（ip_rcv）→ TCP（tcp_v4_rcv）\n      → 找到对应 socket，数据写入 socket 接收缓冲区\n      → 唤醒 epoll/等待中的进程\n    → 如果 ring buffer 清空，重新打开 NIC 中断（napi_complete）\n    → 如果还有数据但已超出 budget（默认 300 个包），退出等待下次调度\n```\n\nNAPI（New API）是这里的关键设计：**不是每个包都触发一次中断，而是第一个包触发中断，然后切换到轮询模式，批量处理直到 ring buffer 空**。这在高包速率下极大降低了中断次数。\n\n## ksoftirqd 与 netdev_budget 调优\n\n当 softirq 的工作量很大时（比如流量突发），`do_softirq()` 在中断返回路径里直接执行可能耗时过长，影响进程调度延迟。Linux 的解决方案是设置一个预算上限：每次 softirq 执行循环有时间和次数的双重限制，超出后把剩余工作「甩给」`ksoftirqd/N` 内核线程（N 是 CPU 编号）来处理。这就是为什么在高流量机器上能看到 ksoftirqd 吃 CPU。\n\n关键内核参数：`net.core.netdev_budget`（默认 300）控制每次 softirq 运行最多处理多少个数据包；`net.core.netdev_budget_usecs`（默认 2000，即 2ms）控制最长耗时。高流量服务器调优时可以适当增大这两个值，但要小心：调得太大会让 softirq 占用 CPU 过久，导致其他进程「饥饿」；调得太小又会导致 ring buffer 溢出丢包。合理的起点是把 `netdev_budget` 调到 600，同时用 `ethtool -S eth0` 监控 `rx_missed_errors` 是否增长。",
+      "answer": "## 中断处理为什么必须分成两半\n\n理解上半部/下半部分离，要从 CPU 响应中断的底层机制说起。当外部设备（比如网卡收到一个包）需要 CPU 处理时，它通过 PIC/APIC 向 CPU 发送一个中断信号。CPU 在完成当前指令后，会检查中断标志位，如果中断未被屏蔽，就保存当前寄存器状态，然后根据中断向量表（IDT，Interrupt Descriptor Table）跳转到对应的中断服务例程（ISR）执行。\n\n这里有一个关键的硬件行为：**CPU 在进入 ISR 时会自动清除 EFLAGS 中的 IF 标志位**，意味着本地 CPU 的中断被屏蔽了。这是有原因的——如果 ISR 执行过程中被更高优先级的中断打断（嵌套中断），会导致内核栈溢出和状态混乱。所以 ISR 在这段时间内是「独占」CPU 的，外界没有办法打断它。\n\n正因如此，ISR 必须极其短暂。如果一块 NIC 每秒接收 100 万个包，每个包都触发一次中断，ISR 耗时哪怕只有 10 微秒，100 万次乘以 10 微秒就是整整 10 秒——这一核的 CPU 完全被中断处理吞噬。更何况 TCP/IP 协议栈处理远不止 10 微秒，要进行校验和验证、路由查找、拥塞控制计算、内存拷贝，轻松达到几十上百微秒。\n\n解决方案是「上半部做最少的事，下半部做真正的事」。上半部（hardirq context）只做三件不可推迟的事：**告诉硬件「中断已收到」**（ACK，否则硬件会一直重试）、**把数据从不稳定的硬件缓冲区转移到稳定的内核内存**、以及**标记一个下半部任务待处理**。整个过程通常在 1-5 微秒内完成。然后 ISR 返回，恢复 IF 标志，中断重新开启，剩余的协议栈处理交给下半部在中断开启的环境中慢慢执行。\n\n## 上半部的约束边界\n\n上半部运行在 hardirq 上下文中，受到一组严格的约束，违反任何一条都会导致内核崩溃或死锁。\n\n**不能睡眠，不能调用 `schedule()`**。调度器的切换需要保存/恢复进程上下文，而 ISR 本身没有「进程」概念——它是借用被中断进程的内核栈运行的，一旦调度切走，这个栈就悬空了。同样，任何可能导致当前「任务」被切换走的操作都不能调用：`wait_event()`、`msleep()`、`kmalloc(GFP_KERNEL)` 都不行（`GFP_KERNEL` 允许在内存不足时睡眠等待回收）。\n\n**只能用自旋锁，不能用互斥锁**。互斥锁在竞争时会让调用者睡眠等待，这在 ISR 里是致命的。自旋锁则是在原地「忙等」，不涉及调度，所以安全。但要注意：如果 ISR 和进程上下文代码共享一把自旋锁，进程上下文代码必须用 `spin_lock_irqsave()` 而不是 `spin_lock()`，因为前者会先禁用本地中断，防止持有锁的情况下被中断打断导致死锁。\n\n**执行时间必须极短**。内核文档建议 ISR 不超过 100 微秒，但现代高性能驱动的实际 ISR 通常只有 1-10 微秒。Linux 提供了 `irqsoff tracer`（`/sys/kernel/debug/tracing/`）可以测量 ISR 执行时间，用于定位慢 ISR 问题。\n\n## softirq：最底层的下半部机制\n\n软中断（softirq）是 Linux 内核中性能最高的下半部机制。内核中静态定义了 10 种 softirq 类型，编号固定，存放在 `softirq_vec[]` 数组中。与硬中断不同，softirq 运行时**本地中断是开启的**，可以被硬件中断打断，因此响应延迟更低，但自身处理不能阻塞。\n\n```c\n// include/linux/interrupt.h\nenum {\n    HI_SOFTIRQ = 0,       // 高优先级 tasklet\n    TIMER_SOFTIRQ,         // 定时器\n    NET_TX_SOFTIRQ,        // 网络发送\n    NET_RX_SOFTIRQ,        // 网络接收  ← NIC 收包路径用这个\n    BLOCK_SOFTIRQ,         // 块设备 I/O 完成\n    IRQ_POLL_SOFTIRQ,\n    TASKLET_SOFTIRQ,       // 普通 tasklet\n    SCHED_SOFTIRQ,         // 调度器负载均衡\n    HRTIMER_SOFTIRQ,       // 高精度定时器\n    RCU_SOFTIRQ,           // RCU 回调\n};\n```\n\n当 ISR 调用 `raise_softirq(NET_RX_SOFTIRQ)` 时，它仅仅是在当前 CPU 的 `__softirq_pending` 位图中设置对应的位。真正的执行时机有两个：一是硬件中断返回时，内核检查 `__softirq_pending`，如果有待处理项则调用 `do_softirq()` 直接执行；二是如果此时 softirq 负载太重（执行时间超过 2ms 或循环次数超过 10 次），把剩余工作移交给 `ksoftirqd` 内核线程异步处理。\n\nsoftirq 的核心设计是 **per-CPU**：每个 CPU 有自己独立的 pending 位图和执行，不同 CPU 之间处理各自的 softirq，零锁竞争。但反过来，**同一种 softirq 可以在多个 CPU 上同时运行**。`NET_RX_SOFTIRQ` 的处理函数 `net_rx_action()` 在 CPU 0 和 CPU 1 上可能同时跑，所以它的实现必须是可重入的，内部对共享数据的访问需要细粒度锁保护。\n\n## tasklet：为驱动开发者简化的下半部\n\ntasklet 建立在 softirq 之上，使用 `HI_SOFTIRQ`（优先级高）和 `TASKLET_SOFTIRQ`（普通优先级）两个 softirq 槽位。驱动中使用起来非常简单：\n\n```c\n// 驱动初始化时\nstruct tasklet_struct my_tasklet;\nvoid my_handler(unsigned long data) {\n    // 真正的中断处理工作，但不能睡眠\n    process_received_data((struct my_device *)data);\n}\ntasklet_init(&my_tasklet, my_handler, (unsigned long)dev);\n\n// 在 ISR 中\nstatic irqreturn_t my_isr(int irq, void *dev_id) {\n    // ... 读取数据到缓冲区 ...\n    tasklet_schedule(&my_tasklet);  // 调度 tasklet\n    return IRQ_HANDLED;\n}\n```\n\ntasklet 的关键保证是：**同一个 tasklet 在任意时刻只会在一个 CPU 上运行**，内核通过 `TASKLET_STATE_RUN` 标志位来保证这一点。这让驱动开发者不需要担心自己的 handler 被并发调用，大幅降低了开发难度。\n\n然而从 Linux 5.10 开始，tasklet 被标记为 deprecated。原因是在实时内核补丁（PREEMPT_RT）中，softirq 上下文被实现为可抢占的内核线程，tasklet 的行为变得微妙且难以预期。官方推荐的替代方案是 **threaded IRQ**：`request_threaded_irq(irq, hard_handler, thread_fn, flags, name, dev)` 其中 `thread_fn` 运行在专用内核线程中，可以睡眠，语义更清晰。\n\n## workqueue：能睡眠的下半部\n\nworkqueue 是三种机制中最灵活也最「昂贵」的。它的下半部代码运行在 `kworker/N:M` 内核线程（进程上下文），拥有完整的进程特权：**可以睡眠、可以持有互斥锁、可以等待文件系统 I/O 完成、可以调用任何「normal」内核 API**。\n\n```c\n// 声明一个 work 结构体\nstatic void my_work_handler(struct work_struct *work)\n{\n    struct my_device *dev = container_of(work, struct my_device, work);\n    // 可以睡眠，可以用 mutex\n    mutex_lock(&dev->lock);\n    i2c_read_register(dev->i2c_client, REG_STATUS, &dev->status); // 可能阻塞\n    mutex_unlock(&dev->lock);\n}\n\n// 在设备结构体里\nstruct my_device {\n    struct work_struct work;\n    // ...\n};\n\n// 初始化\nINIT_WORK(&dev->work, my_work_handler);\n\n// 在 ISR 中调度\nschedule_work(&dev->work);  // 提交到 system_wq\n```\n\n代价是延迟：workqueue 需要唤醒 kworker 线程，经过一次完整的进程调度，延迟通常在几十到几百微秒级别，远高于 softirq 的几微秒。另外 `schedule_work()` 提交到的是共享的 `system_wq`，如果工作项很多，可能排队等待。对延迟敏感但又需要睡眠能力的场景，可以用 `alloc_ordered_workqueue()` 创建专用队列并设置优先级。\n\n## NIC 收包的完整内核路径（NAPI 细节）\n\n现代网卡驱动几乎都使用 NAPI（New API）框架，它是对传统「每包一中断」模式的根本性优化。核心思想是：**第一个包触发中断，然后屏蔽后续中断，改用轮询从 ring buffer 批量读包，直到 ring buffer 空了再重新开启中断**。这样在高包速率时，中断次数从「包数」降低到「burst 次数」，效果极其显著。\n\n完整的 NAPI 收包流程：\n\n```\n① 包到达 → NIC DMA 写入 ring buffer（驱动预分配的内存，通常 256-4096 个描述符）\n② NIC 触发 MSI-X 中断 → CPU 跳入 igb_msix_ring()（上半部）\n   → igb_write_itr() 写寄存器，屏蔽该队列后续中断\n   → napi_schedule(&q_vector->napi)，把 napi 加入 softnet_data.poll_list\n   → 设置 NET_RX_SOFTIRQ pending 位\n   → ISR 返回（< 5μs）\n\n③ 中断返回路径调用 do_softirq() → net_rx_action()\n   → 遍历 poll_list，对每个 napi 调用 napi->poll()（即驱动注册的 igb_poll）\n   → igb_poll() 从 ring buffer 读取 skb，最多读 budget 个（默认 64 per napi）\n   → 每个 skb 调用 netif_receive_skb() 进入协议栈：\n      napi_gro_receive() → GRO 合并 → ip_rcv() → tcp_v4_rcv()\n      → tcp_rcv_established() → 写入 sk->sk_receive_queue\n      → sk->sk_data_ready() → 唤醒 epoll\n   → 如果 ring buffer 空了：napi_complete_done()，重新打开 NIC 中断\n   → 如果还有数据但到达 netdev_budget 上限：napi 留在 poll_list，\n     本次 net_rx_action 退出，等待下次 softirq 触发（或由 ksoftirqd 继续）\n```\n\n这条路径在现代内核（6.x）中还有 XDP（eXpress Data Path）钩子：在 `netif_receive_skb()` 之前，XDP 程序可以直接在驱动层面 DROP 或 REDIRECT 数据包，完全绕过协议栈，实现几十纳秒级别的包处理，这是 DPDK 之外的内核内高性能包处理方案。\n\n## ksoftirqd 的设计与调优实践\n\n`ksoftirqd/N` 是每个 CPU 上的专用 softirq 服务线程，优先级为 SCHED_NORMAL（nice 0）。它的存在解决了一个两难问题：softirq 如果不限制执行时间，可能导致普通进程长时间得不到调度（softirq 在中断返回路径里优先于进程调度）；但如果限制太死，高流量时包处理跟不上速度导致丢包。\n\n解决方案是「尽力而为 + 兜底」：`do_softirq()` 在中断返回路径最多执行 10 次循环或 2ms，超过则唤醒 `ksoftirqd` 来继续处理。`ksoftirqd` 作为普通线程参与 CPU 调度，给其他进程留出运行机会，但调度延迟也随之增加。在 `top` 里看到 ksoftirqd 吃 CPU，通常意味着网络或存储 I/O 负载很高，或者 softirq 处理速度跟不上中断速率。\n\n高流量服务器的调优思路：\n\n```bash\n# 查看当前 budget 值（默认 300）\nsysctl net.core.netdev_budget\n# 每次 softirq 最多处理多少个包，建议高流量服务器调到 600-1200\nsysctl -w net.core.netdev_budget=600\n\n# 每次 softirq 最长运行时间（微秒，默认 2000 即 2ms）\nsysctl -w net.core.netdev_budget_usecs=8000\n\n# 监控 NIC ring buffer 是否溢出（dropped 增长说明来不及处理）\nethtool -S eth0 | grep -E 'miss|drop|error'\n\n# 查看各 CPU 上的 softirq 统计\nwatch -n1 'cat /proc/softirqs | grep NET_RX'\n\n# 如果单核 softirq 是瓶颈，配置 RSS（Receive Side Scaling）把中断分散到多核\nethtool -L eth0 combined 8  # 使用 8 个 RX queue\n```\n\n真正的生产优化往往不止于此。当 `ksoftirqd` 消耗过高时，先用 `perf top -p $(pgrep ksoftirqd/0)` 看热点在哪里，再决定是调 budget、增加 RX queue 数量（RSS），还是开启 GRO（Generic Receive Offload）减少协议栈调用次数。对延迟极度敏感的场景（比如高频交易），会把 ksoftirqd 绑定到专用 CPU 核，用 `isolcpus` 隔离这些核不参与普通进程调度，确保 softirq 处理的延迟一致性。\n\n## 面试中的「加分回答」\n\n如果面试官追问「硬中断和软中断同时发生了怎么办」，可以这样回答：softirq 在执行时，本地中断是开启的，所以可以被硬中断打断。硬中断 ISR 执行完毕返回时，发现软中断 pending，会先执行这个新的软中断，然后才返回到原来被打断的 softirq 处理函数继续。这不会有问题，因为 softirq 的执行状态是 per-CPU 的，每次进入都从 pending 位图里读取待处理项，重入是安全的。\n\n另一个常见追问是「为什么不用 workqueue 处理所有下半部工作，非要搞 softirq 这么复杂的东西」。答案是性能。workqueue 依赖线程调度，即使在无竞争的情况下，从中断返回到 kworker 线程被调度执行，也需要至少一次上下文切换，延迟约 10-50 微秒。而 softirq 在中断返回路径直接执行，总延迟通常 < 5 微秒。对于每秒百万包的网络处理场景，这个差距是决定性的。",
+      "keyPoints": [
+        "上半部（hardirq）运行时本地 CPU 中断被屏蔽，不能睡眠、不能调度、只能用自旋锁，必须在 10 微秒内完成；它的职责是 ACK 硬件、把数据转移到内核内存、然后触发下半部",
+        "softirq 是 per-CPU 的下半部机制，10 种类型静态编译进内核；执行时中断开启但不能睡眠；同一种 softirq 可在多 CPU 并发运行，handler 必须可重入",
+        "tasklet 基于 softirq 实现，保证同一 tasklet 串行执行（不并发），驱动开发更简单；但从 Linux 5.10 起被 deprecated，推荐改用 threaded IRQ",
+        "workqueue 运行在 kworker 进程上下文中，是三种机制中唯一可以睡眠、持有互斥锁、等待 I/O 的机制；代价是比 softirq 高一个数量级的调度延迟",
+        "NIC 收包使用 NAPI 框架：第一个包触发硬中断，ISR 调用 napi_schedule() 并屏蔽后续中断，由 NET_RX_SOFTIRQ 的 net_rx_action() 轮询批量处理，ring buffer 空时重新开启中断",
+        "ksoftirqd/N 是每 CPU 的 softirq 兜底线程：当 do_softirq() 在中断返回路径执行超出时间/次数预算时，剩余工作移交给 ksoftirqd，避免普通进程被长期饿死",
+        "net.core.netdev_budget（默认 300）控制每次 softirq 最多处理的包数，高流量服务器可调大；同时需要用 ethtool -S 监控 rx_missed_errors 防止 ring buffer 溢出丢包"
+      ],
+      "quiz": [
+        {
+          "id": "os-interrupt-top-bottom-half-q1",
+          "question": "Linux 硬件中断服务例程（ISR，即上半部）在执行期间，本地 CPU 的中断状态是？",
+          "choices": [
+            { "id": "A", "text": "中断被屏蔽（禁用），直到 ISR 返回才恢复" },
+            { "id": "B", "text": "中断保持开启，可以被更高优先级的中断打断（嵌套中断）" },
+            { "id": "C", "text": "中断状态取决于驱动是否调用了 local_irq_disable()" },
+            { "id": "D", "text": "硬件中断被屏蔽，但软中断（softirq）仍然可以执行" }
+          ],
+          "correctAnswer": "A",
+          "explanation": "CPU 跳入 ISR 时会自动清除 EFLAGS 的 IF（Interrupt Flag）位，本地 CPU 的所有可屏蔽中断被禁用，这是硬件行为而非软件选择。这正是 ISR 必须快速完成的根本原因——在此期间任何新的硬件中断都无法被响应。B 选项描述的是部分旧架构支持的「嵌套中断」，但现代 Linux x86 默认禁用该模式。C 选项混淆了概念，local_irq_disable() 是在进程上下文中主动禁中断的方式，不是 ISR 的行为。D 选项是错误的，softirq 不会在 hardirq 上下文中自动执行，软中断和硬中断共享同一个「中断开启」标志。"
+        },
+        {
+          "id": "os-interrupt-top-bottom-half-q2",
+          "question": "以下哪个操作在硬件 ISR（上半部）中是被允许的？",
+          "choices": [
+            { "id": "A", "text": "调用 mutex_lock() 获取一个互斥锁" },
+            { "id": "B", "text": "调用 kmalloc(GFP_KERNEL) 分配内存" },
+            { "id": "C", "text": "调用 spin_lock_irqsave() 获取自旋锁" },
+            { "id": "D", "text": "调用 schedule() 主动让出 CPU" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "自旋锁（spinlock）通过原子操作忙等来获取锁，不会导致调用者睡眠或调度切换，因此在 ISR 中是安全的。注意要用 spin_lock_irqsave() 而不是 spin_lock()，因为前者会先禁用本地中断，防止在持有锁时被中断打断导致死锁。A 选项的 mutex_lock() 在竞争时会让调用者进入睡眠等待，在 ISR 中这是致命的，会导致内核 BUG。B 选项的 GFP_KERNEL 标志允许内存分配器在内存不足时睡眠等待页面回收，同样不能在 ISR 中使用（应该用 GFP_ATOMIC，它在内存不足时直接返回 NULL 而不睡眠）。D 选项的 schedule() 在 ISR 中完全不可调用，会导致内核崩溃。"
+        },
+        {
+          "id": "os-interrupt-top-bottom-half-q3",
+          "question": "关于 Linux softirq 的并发特性，以下哪个描述是正确的？",
+          "choices": [
+            { "id": "A", "text": "同一种 softirq（如 NET_RX_SOFTIRQ）在任意时刻只有一个实例在运行，不会并发" },
+            { "id": "B", "text": "同一种 softirq 可以在不同 CPU 上同时运行，handler 必须是可重入的" },
+            { "id": "C", "text": "softirq 通过全局锁保证串行化执行，所以 handler 不需要考虑并发" },
+            { "id": "D", "text": "softirq 只在单个 CPU 上运行，多核机器上同一时刻只有一个 CPU 处理 softirq" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "softirq 是 per-CPU 设计的核心权衡：每个 CPU 独立维护 softirq pending 位图，不同 CPU 之间不需要全局锁，这带来了极高的并发吞吐量。但代价是同一种 softirq 的 handler（比如 net_rx_action）可以在 CPU 0 和 CPU 1 上同时执行，内部对共享状态的访问必须有适当的同步机制。这与 tasklet 形成对比——tasklet 保证同一实例串行，所以 handler 不需要考虑自身的重入问题。A 和 C 选项都错误地假设 softirq 是全局串行的。D 选项描述的更接近单核系统的行为，多核系统上每个 CPU 都可以独立运行 softirq。"
+        },
+        {
+          "id": "os-interrupt-top-bottom-half-q4",
+          "question": "tasklet 和 softirq 的核心区别是什么？",
+          "choices": [
+            { "id": "A", "text": "tasklet 运行在进程上下文，可以睡眠；softirq 运行在中断上下文，不能睡眠" },
+            { "id": "B", "text": "tasklet 保证同一实例不并发执行（串行化）；softirq 可以在多 CPU 并发执行" },
+            { "id": "C", "text": "tasklet 有更高优先级，总是在 softirq 之前执行" },
+            { "id": "D", "text": "tasklet 是 Linux 5.x 新引入的机制，softirq 是旧的已废弃机制" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "tasklet 的核心设计优势就是串行化保证：内核用 TASKLET_STATE_RUN 原子标志位确保同一个 tasklet 实例在任意时刻只有一个 CPU 在执行它，大幅简化了驱动开发者的并发处理负担。而 softirq 没有这个保证，同类 handler 可以在多 CPU 并发跑。A 选项完全相反，tasklet 同样运行在软中断上下文，不能睡眠。C 选项不准确，tasklet 使用的是 HI_SOFTIRQ（高优先级）和 TASKLET_SOFTIRQ，只有 HI_SOFTIRQ 优先级较高，TASKLET_SOFTIRQ 优先级很低。D 选项时间线完全相反，实际上是 tasklet 在 Linux 5.x 中被标记为 deprecated，建议改用 threaded IRQ。"
+        },
+        {
+          "id": "os-interrupt-top-bottom-half-q5",
+          "question": "在一台高流量服务器上执行 `watch -n1 'cat /proc/softirqs'`，发现 NET_RX 行中某个 CPU 的计数每秒增长约 50 万次，同时 `top` 显示 `ksoftirqd/2` 占用 40% CPU。这最可能说明什么？",
+          "choices": [
+            { "id": "A", "text": "网卡驱动有 bug，触发了中断风暴，应该立即重载驱动模块" },
+            { "id": "B", "text": "softirq 处理速度跟不上中断速率，do_softirq() 执行超时，工作溢出到 ksoftirqd；可能需要增加 netdev_budget 或配置 RSS 多队列" },
+            { "id": "C", "text": "内核发生了死锁，ksoftirqd 在等待锁释放，应该检查 /proc/sys/kernel/hung_task_timeout_secs" },
+            { "id": "D", "text": "系统内存不足，内核在用 ksoftirqd 做内存回收，应该增加 swap 分区" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "ksoftirqd/N 的职责是作为 softirq 的「兜底」处理者：当 do_softirq() 在中断返回路径执行超出时间预算（默认 2ms，即 netdev_budget_usecs）或次数预算（10 次循环）时，剩余的 softirq 工作会被移交给 ksoftirqd 内核线程继续处理。ksoftirqd 持续高 CPU 说明网络流量已经超出了默认 budget 配置的处理能力。正确的处理方向是：增大 netdev_budget（每次 softirq 处理更多包），用 ethtool -L 配置多个 RX queue（RSS），把中断分散到多个 CPU 核。A 选项的「中断风暴」是中断计数异常高（每秒百万次硬中断），且通常伴随系统响应变慢；NAPI 机制本身会限制中断速率，不符合症状描述。C 和 D 选项与网络 softirq 场景毫不相关。"
+        },
+        {
+          "id": "os-interrupt-top-bottom-half-q6",
+          "question": "一个驱动开发者想在中断下半部中读取一个 I²C 寄存器（I²C 总线通信可能需要几毫秒并且会睡眠等待总线响应），他应该选择哪种下半部机制？",
+          "choices": [
+            { "id": "A", "text": "softirq，因为它优先级最高，能尽快处理中断" },
+            { "id": "B", "text": "tasklet，因为它保证串行执行，I²C 通信不会有并发问题" },
+            { "id": "C", "text": "workqueue，因为它运行在进程上下文，可以睡眠等待 I²C 总线响应" },
+            { "id": "D", "text": "直接在 ISR（上半部）中读取，因为 I²C 通信非常简单" }
+          ],
+          "correctAnswer": "C",
+          "explanation": "判断该用哪种下半部机制的第一个问题就是：「这段代码需要睡眠吗？」I²C 通信需要等待总线响应，驱动通常通过等待队列或信号量来实现，这意味着会睡眠。只有 workqueue 运行在进程上下文（kworker 线程），支持睡眠操作。softirq 和 tasklet 都运行在软中断上下文，如果在其中调用任何会睡眠的函数，会触发内核的「scheduling while atomic」BUG，导致 BUG_ON 崩溃。A 选项优先级高是真的，但无法睡眠是根本限制。B 选项的串行保证跟能否睡眠是两个独立的问题，tasklet 同样不能睡眠。D 选项在 ISR 里做毫秒级阻塞操作是不可接受的，会导致系统完全无法响应其他中断。"
+        },
+        {
+          "id": "os-interrupt-top-bottom-half-q7",
+          "question": "NAPI（New API）相比传统「每包一中断」模式的核心改进是什么？",
+          "choices": [
+            { "id": "A", "text": "NAPI 使用更快的 DMA 引擎，减少了数据从网卡到内存的复制时间" },
+            { "id": "B", "text": "NAPI 在第一个包触发中断后切换为轮询模式，批量处理 ring buffer 中的包，大幅减少高包速率下的中断次数" },
+            { "id": "C", "text": "NAPI 把协议栈处理从内核移到了用户空间，避免了内核态和用户态的切换开销" },
+            { "id": "D", "text": "NAPI 使用多线程并行处理数据包，每个 CPU 核处理一部分包" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "NAPI 解决的核心问题是「中断风暴」：在每秒百万包的场景下，如果每个包都触发一次硬中断，中断处理本身就会消耗掉全部 CPU 资源。NAPI 的方案是：收到第一个包时触发中断（进入 softirq），然后立即屏蔽该 NIC 队列的后续中断，改用轮询方式（调用驱动的 poll() 函数）批量读取 ring buffer 中积累的所有包，直到 ring buffer 为空才重新开启中断。这样中断次数从「等于包数」降低到「等于 burst 次数」，在高流量下效果显著。A 选项的 DMA 引擎优化是网卡硬件特性，与 NAPI 无关。C 选项描述的是 DPDK 或 io_uring 的思路，不是 NAPI。D 选项描述的是 RSS（Receive Side Scaling）多队列的特性，是 NAPI 的补充而非本质。"
+        },
+        {
+          "id": "os-interrupt-top-bottom-half-q8",
+          "question": "生产环境中一台 8 核服务器的网络吞吐达到上限，`/proc/softirqs` 显示所有 NET_RX 中断都集中在 CPU0 上，其他 7 个 CPU 的 NET_RX 计数为 0。这个问题的根本原因和解决方案是？",
+          "choices": [
+            { "id": "A", "text": "这是正常现象，Linux 默认把所有中断路由到 CPU0，不需要修改" },
+            { "id": "B", "text": "NIC 只有一个 RX 队列，所有中断发往同一个 CPU；解决方案是配置 RSS 多队列（ethtool -L）并调整 /proc/irq/N/smp_affinity 把不同队列绑到不同 CPU" },
+            { "id": "C", "text": "软中断亲和性配置问题，修改 /proc/sys/net/core/rps_cpus 即可" },
+            { "id": "D", "text": "需要增大 net.core.netdev_budget，让 CPU0 每次处理更多的包来提高吞吐" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "NIC 中断都集中在单核是典型的单队列 NIC 性能瓶颈。现代 10GbE/25GbE 网卡支持 RSS（Receive Side Scaling）：网卡硬件根据五元组哈希（srcIP:srcPort:dstIP:dstPort:protocol）把数据包分散到多个 RX 硬件队列，每个队列有独立的中断向量，可以绑定到不同 CPU。配置方式是 `ethtool -L eth0 combined 8` 设置 8 个队列，然后通过 `/proc/irq/N/smp_affinity` 或 `irqbalance` 把各队列中断分配到不同 CPU。A 选项错误，虽然系统启动时 irqbalance 可能把中断都堆到 CPU0，但这不是「正常」状态，是需要优化的。C 选项的 RPS（Receive Packet Steering）是软件层面的解决方案，把收包处理分散到多 CPU，但中断仍然集中，效果不如硬件 RSS。D 选项增大 budget 只能让 CPU0 处理更多包，但单核性能终归有上限，无法真正水平扩展。"
+        },
+        {
+          "id": "os-interrupt-top-bottom-half-q9",
+          "question": "以下关于 `spin_lock()` 和 `spin_lock_irqsave()` 的使用场景，哪个描述是正确的？",
+          "choices": [
+            { "id": "A", "text": "两者完全等价，spin_lock_irqsave 只是 spin_lock 的别名，性能相同" },
+            { "id": "B", "text": "如果一把锁只在进程上下文中使用（不在 ISR 中使用），spin_lock() 就足够；如果 ISR 和进程上下文都会竞争同一把锁，进程上下文必须用 spin_lock_irqsave() 防止死锁" },
+            { "id": "C", "text": "ISR 中必须用 spin_lock_irqsave()，进程上下文中必须用 spin_lock()，两者绑定使用场景不可互换" },
+            { "id": "D", "text": "spin_lock_irqsave() 只在 SMP（多核）系统上有意义，单核系统上退化为 spin_lock()" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "理解这对 API 的关键是死锁场景：假设进程 A 持有 spin_lock()，此时发生中断，ISR 也来抢同一把锁。由于中断屏蔽了进程上下文（ISR 不会让出 CPU），ISR 会无限自旋等待锁，而锁的持有者进程 A 因为被 ISR 抢占而永远无法运行来释放锁——死锁。spin_lock_irqsave() 在获锁时先禁用本地中断，保存中断状态到 flags，这样即使在持锁过程中有中断到来，ISR 也不会执行，等 spin_unlock_irqrestore() 释放锁并恢复中断状态后，ISR 才有机会执行。如果一把锁的所有使用者都在进程上下文（没有 ISR 竞争者），用 spin_lock() 即可，禁用中断是不必要的开销。C 选项的描述过于绝对，ISR 中当然也可以用 spin_lock_irqsave（虽然进入 ISR 时中断已经屏蔽，irqsave 会保存已屏蔽状态）。D 选项混淆了概念，irqsave 的作用是禁用本地 CPU 中断，与 SMP 无关。"
+        },
+        {
+          "id": "os-interrupt-top-bottom-half-q10",
+          "question": "调大 `net.core.netdev_budget` 从 300 到 1200 后，以下哪个副作用是需要重点关注的？",
+          "choices": [
+            { "id": "A", "text": "网卡 ring buffer 会更快被填满，导致丢包率上升" },
+            { "id": "B", "text": "softirq 每次运行时间变长，可能导致普通用户进程调度延迟增大（「饥饿」问题）" },
+            { "id": "C", "text": "ksoftirqd 线程会被完全停止，因为 budget 已经足够大" },
+            { "id": "D", "text": "会导致更多的上下文切换，增加内核的调度开销" }
+          ],
+          "correctAnswer": "B",
+          "explanation": "netdev_budget 控制每次 net_rx_action()（NET_RX_SOFTIRQ handler）处理的最大包数。增大 budget 意味着 softirq 在中断返回路径可以一次性处理更多包，减少了「工作溢出到 ksoftirqd」的频率，有利于降低包处理延迟和提高吞吐。但代价是 softirq 单次占用 CPU 的时间更长，在这段时间内普通进程（SCHED_NORMAL）无法被调度。对于延迟敏感的服务（比如 Redis、低延迟 API），过大的 budget 会导致请求处理延迟 P99/P999 的抖动，因为每次 softirq「长跑」都是一次调度延迟。正确做法是逐步调整并监控：用 `perf stat -e sched:sched_switch` 观察上下文切换频率，用 `tc qdisc show` 和网络延迟测试来平衡吞吐与延迟。A 选项逻辑相反，budget 增大让 ring buffer 被更快清空，反而减少丢包风险。C 选项错误，即使 budget 增大，流量突发时 ksoftirqd 仍会被唤醒。D 选项上下文切换减少而不是增加，因为更少次进入 ksoftirqd 线程。"
+        }
+      ],
+      "references": [
+        {
+          "title": "Linux Kernel Development (3rd Ed.) — Robert Love, Chapter 7: Interrupts and Interrupt Handlers",
+          "url": "https://www.oreilly.com/library/view/linux-kernel-development/9780768696974/"
+        },
+        {
+          "title": "Linux kernel source: kernel/softirq.c",
+          "url": "https://elixir.bootlin.com/linux/latest/source/kernel/softirq.c"
+        },
+        {
+          "title": "Linux kernel source: net/core/dev.c — net_rx_action(), napi_schedule()",
+          "url": "https://elixir.bootlin.com/linux/latest/source/net/core/dev.c"
+        },
+        {
+          "title": "Kernel docs: NAPI — New API for network drivers",
+          "url": "https://docs.kernel.org/networking/napi.html"
+        },
+        {
+          "title": "Brendan Gregg — Linux Performance: Network Stack Internals",
+          "url": "https://www.brendangregg.com/linuxperf.html"
+        }
+      ]
+    }
+  ]
+}
