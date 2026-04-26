@@ -1,0 +1,159 @@
+{
+  "id": "os-mode-switch-overhead",
+  "name": "系统调用模式切换的真实开销测量",
+  "domain": "operating-system",
+  "description": "精确测量 Linux 系统调用开销的方法论、PTI 的额外代价与 AMD/Intel 差异",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-mode-switch-overhead-1",
+      "domain": "operating-system",
+      "type": "real-data",
+      "difficulty": 3,
+      "tags": ["syscall", "mode-switch", "PTI", "overhead", "benchmark", "perf", "getpid", "Intel", "AMD", "Linux"],
+      "title": "一次系统调用导致的模式切换开销有多大",
+      "content": "在优化一个高并发 RPC 服务时，你发现某些看起来「很轻」的操作——比如每次请求都调用一次 `clock_gettime` 获取时间戳——在压测时会造成明显的 CPU 占用上升。同事说「系统调用很便宜，纳秒级别，不用优化」，但另一个同事说「PTI 开启之后开销翻了一倍」。你想搞清楚：一次系统调用到底花多少时间？\n\n为了量化这个问题，你写了一个最小 benchmark，用 `getpid()` 作为基准——它是最简单的系统调用之一，只读取内核 task_struct 中的 `tgid` 字段然后返回，没有 I/O，没有锁，没有复杂逻辑，纯粹体现模式切换本身的开销：\n\n```c\n// benchmark_syscall.c\n#include <sys/types.h>\n#include <unistd.h>\n#include <time.h>\n#include <stdio.h>\n\nint main() {\n    struct timespec start, end;\n    int N = 10000000;  // 一千万次调用，平均值更稳定\n    clock_gettime(CLOCK_MONOTONIC, &start);\n    for (int i = 0; i < N; i++) getpid();\n    clock_gettime(CLOCK_MONOTONIC, &end);\n    long ns = (end.tv_sec - start.tv_sec) * 1000000000LL\n              + (end.tv_nsec - start.tv_nsec);\n    printf(\"%.1f ns/syscall\\n\", (double)ns / N);\n    return 0;\n}\n```\n\n编译运行后，你在一台 Intel Xeon E5-2686 v4（Broadwell）上得到了 **287 ns/syscall**，而在公司另一台 AMD EPYC 7R13 上只有 **96 ns/syscall**。同样是 Linux 5.15，同样是 `getpid()`，差距将近 3 倍。\n\n请根据这组数据分析：模式切换的开销由哪几个部分组成？为什么 Intel 和 AMD 的差距如此显著？PTI（Page Table Isolation）具体带来了多少额外开销？如何用 `perf` 工具进一步量化各个子开销？如果你的服务每秒要发起超过百万次系统调用，应该怎么优化？",
+      "answer": "## 系统调用是什么，它为什么有开销\n\n要回答「系统调用有多贵」，得先搞清楚为什么系统调用在设计上就注定有代价。现代 CPU 运行在两种权限级别下：用户态（ring 3）和内核态（ring 0）。用户程序运行在 ring 3，没有权限直接操作硬件、读写任意物理内存。当程序需要操作系统帮忙——读文件、分配内存、获取时间——就必须通过系统调用「请求」内核代劳。CPU 提供了专门的指令来实现这个切换：x86-64 上是 `syscall` 指令（AMD 引入，后来 Intel 也支持）。这个切换不是免费的，因为它涉及一系列必须完成的「安全交接」动作。\n\n## 模式切换的开销组成\n\n**第一个环节是 `syscall` 指令本身的执行**，大约 20-40 cycles。这条指令会做几件事：把当前的 RIP（程序计数器）、RFLAGS、RSP 保存到 CPU 的 MSR 寄存器（Model-Specific Register），然后跳转到内核预先注册的入口地址，并切换到内核栈。MSR 是 CPU 内部的特殊寄存器，读写它的指令（`rdmsr`/`wrmsr`）本身就有十几个 cycle 的延迟，这是 `syscall` 开销的基础成本。\n\n**第二个环节是寄存器保存**，大约 10-20 cycles。内核入口函数（`entry_SYSCALL_64`）必须把用户态的所有通用寄存器保存到内核栈上的 `pt_regs` 结构体里，以便系统调用返回时完整恢复用户现场。这一步是不可省略的——内核函数可能使用任何寄存器，必须保存用户的上下文。\n\n**第三个环节是 SWAPGS**，它把 `GS` 段寄存器从用户态的值换成内核态的值。这是因为内核需要通过 `GS` 访问 per-CPU 数据结构（比如 `current` 任务指针），而用户态程序可以随意使用 `GS`，所以进入和退出内核都需要执行 `SWAPGS` 交换。这条指令本身很快，但在有 Spectre 漏洞的 CPU 上，周围还会插入 `LFENCE`（内存序屏障）来防止投机执行攻击，额外增加十几个 cycle。\n\n**第四个环节也是差异最大的一环：PTI 引入的 CR3 切换**。这里需要先解释一下什么是 CR3 和 PTI。CR3 是 CPU 的一个控制寄存器，它存放着「当前进程的页表基地址」——也就是告诉 CPU 如何把虚拟地址翻译成物理地址的那张表的位置。TLB（Translation Lookaside Buffer）则是一个硬件缓存，专门缓存最近用过的虚拟地址→物理地址映射，避免每次访存都走页表。\n\n2018 年 Meltdown 漏洞被公开后，Linux 引入了 PTI（Page Table Isolation，页表隔离）来修复漏洞。PTI 的做法是：给每个进程维护两套页表——用户态用的页表里，内核的绝大多数内存都不可见；只有进入内核时，才切换到包含完整内核映射的页表。这个切换通过修改 CR3 寄存器来实现。\n\n`CR3` 的写入会触发 TLB 的部分或全部刷新。TLB 的作用是缓存地址翻译结果，一旦被刷新，后续的内存访问就得重走页表，每次要多花几十到几百个 cycle（取决于 cache 状态和页表深度）。这就是 PTI 昂贵的根本原因：不仅 CR3 写入本身有代价（约 10-30 cycles），TLB 被刷之后的「冷启动」惩罚更大。\n\n**第五个环节是实际的系统调用处理函数**，对于 `getpid()` 来说，这一步极其简单：`return current->tgid`，读一个整数返回。这也是为什么 `getpid()` 能作为「纯模式切换代价」的基准——它的业务逻辑几乎为零。\n\n**第六个环节是返回路径**：`sysret` 指令恢复用户态 MSR，加上再一次 SWAPGS，加上（如果 PTI 开启）再一次 CR3 切换切回用户态页表。来回两次 CR3 切换，TLB 双向受损。\n\n把这些加起来，在没有 PTI 的情况下，一次 `getpid()` 大约花费 80-150 ns（AMD EPYC 在 80-120 ns 范围，Intel Xeon 在 100-150 ns 范围）。开启 PTI 后，Intel 上典型数字跳到 200-350 ns，接近翻倍。\n\n## 为什么 AMD 不受 PTI 影响\n\nAMD 的 CPU 在微架构层面没有 Meltdown 漏洞（AMD 的内存读取不会投机执行跨权限访问），因此 Linux 内核默认对 AMD CPU 不启用 PTI。这意味着 AMD EPYC 的 `getpid()` 就是「裸」模式切换的代价，没有 CR3 切换的额外负担，所以只需 ~96 ns。\n\n验证方式很简单：\n\n```bash\n# 确认 PTI 状态\ndmesg | grep -i pti\n# AMD 机器通常输出：\n# [    0.073987] Kernel/User page tables isolation: disabled on this CPU by hardware default\n# Intel 机器（默认开启）：\n# [    0.073987] Kernel/User page tables isolation: enabled\n```\n\n## PCID 优化：把 PTI 损耗拉回来\n\nLinux 4.15 引入了 PCID（Process-Context Identifiers，进程上下文标识符）优化来缓解 PTI 的 TLB 刷新代价。PCID 是 CPU 的一项特性（Intel Westmere 及以后支持，通过 `grep pcid /proc/cpuinfo` 确认），它允许 TLB 条目带上一个 12-bit 的进程标识符，这样切换页表时不必把所有 TLB 条目全部作废——内核态的 TLB 条目用内核 PCID 打了标签，用户态的用另一个 PCID，两套互不干扰。\n\n有了 PCID 之后，PTI 的 CR3 切换从「必须全量刷 TLB」变成了「TLB 保留，仅改 PCID」，开销大幅下降。这就是为什么现代 Intel 机器（有 PCID 且内核 ≥ 4.15）实测是 150-250 ns，而不是更早期 PTI 实现的 300+ ns。\n\n## 用 perf 深入量化\n\n光有 ns 数字是不够的，`perf stat` 可以给出更细的 CPU 事件计数：\n\n```bash\n# 编译 benchmark\ngcc -O2 -o bench benchmark_syscall.c\n\n# 基础统计：cycles、instructions、cache-misses\nperf stat -e cycles,instructions,cache-misses,\\\ntlb-misses,context-switches ./bench\n\n# 输出示例（Intel Xeon + PTI）：\n#  2,870,000,000  cycles               # 287 cycles × 10M\n#  1,420,000,000  instructions         # IPC ≈ 0.49，执行效率很低\n#     48,000,000  cache-misses         # 平均 4.8 次 cache miss/syscall\n#     32,000,000  tlb-misses           # 平均 3.2 次 TLB miss/syscall\n\n# 专门统计系统调用次数（验证 benchmark 正确性）\nperf stat -e syscalls:sys_enter_getpid ./bench\n# 应该精确输出 10,000,000 次\n\n# 更细粒度：查看 PTI 相关的 CR3 切换事件\nperf stat -e cpu/event=0x08,umask=0x04/  ./bench\n# （具体事件编码因 CPU 型号不同，参考 Intel/AMD 手册）\n```\n\nIPC（Instructions Per Cycle，每周期执行指令数）只有 0.49，说明 CPU 大部分时间在等待——等 TLB miss 填充，等 cache miss 从 L2/L3 取数据。模式切换的代价本质上是「状态冷启动」，而不是指令本身计算量大。\n\n## vDSO：绕过内核的 10 倍加速\n\n有些「系统调用」其实根本不进内核。`gettimeofday()` 和 `clock_gettime()` 在现代 Linux 上通过 vDSO（Virtual Dynamic Shared Object）实现——内核在进程启动时把一小段代码和数据（包含当前时间）映射到用户空间，这段代码直接读内核维护的时间数据，不需要切换到 ring 0。\n\n```bash\n# 验证 vDSO 是否生效：用 strace 看有没有实际的 syscall\nstrace -e trace=clock_gettime ./your_program 2>&1 | head -5\n# 如果 vDSO 工作，strace 根本看不到 clock_gettime 调用\n# （strace 挂在 syscall 入口，vDSO 绕过了入口）\n\n# 同样的 benchmark 改用 clock_gettime：\n# vDSO 路径：约 5-15 ns（直接读内存，一次 rdtsc 指令）\n# 禁用 vDSO 后（boot 参数 vdso=0）：约 80-200 ns（走真正的 syscall）\n```\n\n这就是「系统调用」和「内核服务」的区别——接口相同，路径不同，性能差 10-30 倍。这也是面试官真正想考察的认知：知道 `clock_gettime` 是系统调用接口，但理解它不一定走 syscall 路径。\n\n## 设计意义：什么时候才需要担心\n\n单次 300 ns 看起来很小，但频率高了就不一样。以 Intel + PTI 的 300 ns/syscall 为例：单核理论上每秒最多处理 ~3.3 M 次系统调用（如果每次调用都立刻返回）。对于做实际 I/O 的 `read()`/`write()`，系统调用本身是总耗时的一小部分，不是瓶颈。但在这几类场景里，模式切换代价值得优化：\n\n每次只传一个字节的 `write(1)` 调用，业务逻辑接近于零，syscall 占总耗时超过 90%——解法是用 `stdio` 的缓冲区批量写，或用 `writev()` 合并多次写入一次调用。高频时间戳采样（每条请求记录入口和出口时间戳），如果用的是 `syscall` 路径的 `clock_gettime`，可以换成 vDSO 版本，直接消除 syscall 开销。每次网络收发都是一个 `sendto`/`recvfrom` 的高频小包场景，可以用 `sendmmsg`/`recvmmsg` 批量发送，把 N 次 syscall 合并成 1 次。极端的低延迟场景（HFT 高频交易、DPDK 数据包处理），干脆用内核旁路技术——DPDK 在用户空间直接 poll 网卡队列，RDMA 让网卡直接读写用户内存，彻底消除 syscall 和模式切换。\n\n一个实用的判断标准是：热路径每秒 < 10 万次 syscall，忽略。10 万到 100 万之间，值得测量但可能不是瓶颈。超过 100 万次，考虑批量化（`io_uring`、`sendmmsg` 等）。超过 1000 万次，考虑内核旁路。",
+      "keyPoints": [
+        "一次系统调用的完整开销包括：syscall 指令（20-40 cycles）、SWAPGS（+ Spectre 防护的 LFENCE）、pt_regs 寄存器保存（10-20 cycles）、PTI 引入的 CR3 切换（10-30 cycles + TLB 刷新惩罚），返回路径上述步骤再来一遍。AMD EPYC 无 PTI 约 80-120 ns，Intel 开启 PTI 约 200-350 ns。",
+        "PTI（Page Table Isolation）是 2018 年 Meltdown 漏洞补丁引入的页表隔离机制，用户态和内核态使用两套页表，进出内核必须切换 CR3 寄存器，导致 TLB 被部分或全量刷新，这是 Intel 机器 syscall 开销翻倍的直接原因。AMD CPU 因架构上不受 Meltdown 影响，默认不开启 PTI。",
+        "Linux 4.15 引入的 PCID 优化让 CR3 切换不再强制全量刷 TLB——TLB 条目携带进程 PCID 标签，内核/用户两套页表的 TLB 条目独立共存，PTI 开销因此从 ~300 ns 降至 ~150-250 ns，约节省 50%。检查方式：grep pcid /proc/cpuinfo。",
+        "getpid() 是量化「纯模式切换代价」的最小基准——它的内核路径只有 return current->tgid 一行，没有 I/O 没有锁，任何额外耗时都来自切换本身而非业务逻辑。用 perf stat -e cycles,tlb-misses 可以看到 IPC 约 0.49，说明大量时间在等待 TLB/cache 填充而非执行指令。",
+        "vDSO（Virtual Dynamic Shared Object）让部分「系统调用」根本不进内核，clock_gettime/gettimeofday 在现代 Linux 上通过 vDSO 直接读内核映射到用户空间的时间数据，耗时仅 5-15 ns，比走 syscall 路径快 10-30 倍。用 strace 追踪时完全看不到这些调用，因为 strace 挂在 syscall 入口而 vDSO 绕过了它。",
+        "批量化是降低高频 syscall 总开销的核心思路：writev 合并多次 write，sendmmsg/recvmmsg 批量收发，io_uring 异步批量提交 I/O 请求，都是把 N 次模式切换摊薄到 1 次的方法。实践判断阈值：热路径 <10 万次/核/秒可忽略，>100 万次/核/秒应考虑批量化，>1000 万次/核/秒考虑 DPDK/RDMA 内核旁路彻底消除 syscall。",
+        "用 dmesg | grep -i pti 可以确认当前机器的 PTI 状态；perf stat -e syscalls:sys_enter_getpid 可以精确统计 getpid 调用次数；在测试环境中 boot 参数 nopti 或 mitigations=off 可以禁用 PTI 来量化其单独贡献，但生产环境绝不应关闭安全缓解措施。"
+      ],
+      "quiz": [
+        {
+          "id": "os-mode-switch-overhead-1-q1",
+          "question": "以下哪个选项最准确描述了「系统调用」在 x86-64 Linux 上的权限切换机制？",
+          "choices": [
+            {"id": "A", "text": "通过 int 0x80 软件中断实现，每次中断都保存完整的 CPU 寄存器状态并切换到中断描述符表（IDT）指定的内核入口"},
+            {"id": "B", "text": "通过 syscall 指令实现，CPU 从 MSR 寄存器读取内核入口地址和内核栈指针，同时保存用户 RIP/RFLAGS/RSP，不触发中断控制器"},
+            {"id": "C", "text": "通过 sysenter 指令实现，这是 x86-64 专用指令，比 syscall 快，是 64 位 Linux 的标准路径"},
+            {"id": "D", "text": "通过 CR0 寄存器中的 ring 切换位实现，不需要专门指令，CPU 检测到目标地址属于内核段时自动切换权限级别"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "x86-64 Linux 使用 syscall 指令（由 AMD 引入 AMD64 架构，Intel 随后支持）执行系统调用。syscall 从 STAR/LSTAR/CSTAR 等 MSR 寄存器中读取内核入口地址和 CS/SS 段选择子，把当前 RIP 存入 RCX，RFLAGS 存入 R11，然后跳到内核入口。A 选项的 int 0x80 是 32 位 Linux 的旧接口，在 64 位内核上性能差很多（需要完整走中断处理路径）。C 选项的 sysenter 是 Intel 32 位指令，x86-64 上不用它，64 位标准路径是 syscall。D 选项纯属虚构，没有自动 ring 切换机制。"
+        },
+        {
+          "id": "os-mode-switch-overhead-1-q2",
+          "question": "在 AMD EPYC 机器上运行 getpid() 基准测试得到约 96 ns，在 Intel Xeon（同内核版本）上得到约 287 ns。最主要的原因是什么？",
+          "choices": [
+            {"id": "A", "text": "AMD CPU 的时钟频率更高，相同 cycle 数对应的时间更短"},
+            {"id": "B", "text": "Intel CPU 因 Meltdown 漏洞默认开启了 PTI，每次 syscall 需要两次 CR3 切换导致 TLB 刷新；AMD 架构上无此漏洞，默认不启用 PTI"},
+            {"id": "C", "text": "Intel 的 syscall 指令实现比 AMD 慢，因为 Intel 的 MSR 读写延迟更高"},
+            {"id": "D", "text": "AMD 机器的 getpid() 走了 vDSO 快速路径，Intel 机器走了真正的 syscall 路径"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这道题的核心考点是 PTI 与 CPU 架构的关系。Meltdown 漏洞（CVE-2017-5754）存在于 Intel 的乱序执行实现中，AMD 的微架构设计不受影响（AMD CPU 在推测执行跨权限内存读取时不会把数据填入 cache，故无法被利用）。Linux 内核对 AMD CPU 默认 nopti，对 Intel 默认开启 PTI。PTI 的两次 CR3 切换（进入内核一次、返回用户态一次）会刷新 TLB，后续内存访问 TLB miss 增加，这是主要开销差异来源。A 选项方向反了，EPYC 频率不一定比 Xeon 高。C 选项 MSR 延迟差异存在但不是数倍级别的主要原因。D 选项完全错误，getpid() 没有 vDSO 实现。"
+        },
+        {
+          "id": "os-mode-switch-overhead-1-q3",
+          "question": "PTI（Page Table Isolation）的工作原理是什么，它为什么会增加系统调用的开销？",
+          "choices": [
+            {"id": "A", "text": "PTI 在每次 syscall 时加密内核内存，防止用户态通过侧信道读取内核数据，加解密操作增加了约 100-200 ns"},
+            {"id": "B", "text": "PTI 为每个进程维护两套页表：用户态的页表不包含内核映射，进入内核时必须切换 CR3 到内核页表，返回时再切回来，每次切换可能导致 TLB 条目失效"},
+            {"id": "C", "text": "PTI 通过内存保护键（MPK）标记内核页面，每次访问内核内存都要验证权限位，增加了每次内存访问的延迟"},
+            {"id": "D", "text": "PTI 插入了额外的系统调用审计日志记录，把每次 syscall 的参数写入内核日志，I/O 操作导致开销增加"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PTI 的设计思路很直接：如果用户态看不到内核内存，就算利用 CPU 投机执行漏洞也无法读到内核数据。实现方式是把每个进程的页表一分为二——用户态页表只映射了一小段「蹦床」代码（trampoline，用于安全地切换到内核页表）；内核页表是完整版。切换方式是修改 CR3 寄存器（存放当前页表基地址），CR3 修改会让 CPU 认为地址映射关系变了，导致 TLB 刷新。A 选项的加密说法完全错误，PTI 没有加密操作。C 选项描述的是另一种技术 MPK（Memory Protection Keys），与 PTI 无关。D 选项子虚乌有。"
+        },
+        {
+          "id": "os-mode-switch-overhead-1-q4",
+          "question": "Linux 4.15 引入的 PCID 优化对 PTI 开销有什么影响，原理是什么？",
+          "choices": [
+            {"id": "A", "text": "PCID 缓存了最近 N 次系统调用的参数和返回值，对相同参数的重复调用直接返回缓存结果，不需要进内核"},
+            {"id": "B", "text": "PCID 允许 TLB 条目携带进程上下文标识符，内核和用户的 TLB 条目分别用不同 PCID 打标签，CR3 切换时可以保留各自的 TLB 条目，避免全量刷新"},
+            {"id": "C", "text": "PCID 把用户态和内核态的页表合并到一套里，通过访问控制位区分权限，消除了 CR3 切换，彻底消除了 PTI 的额外开销"},
+            {"id": "D", "text": "PCID 预分配了一批内核内存给用户态直接访问，常用的内核数据结构不再需要系统调用就能读取"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PCID（Process-Context Identifiers）是 Intel Westmere（2010）及以后 CPU 支持的硬件特性，允许 TLB 条目携带 12-bit 标识符（PCID），这样多个进程（或内核/用户两套页表）的 TLB 条目可以共存而不互相污染。PTI + PCID 的工作方式是：用户态页表用 PCID=A，内核页表用 PCID=B；CR3 切换时设置 CR3.NOFLUSH 位，告知 CPU「切换了但不要刷 TLB」，两套 TLB 条目各自保留。这把 PTI 开销从「两次全量 TLB 刷」变成「两次 CR3 写入（各约 10-30 cycles）」，实测把 Intel 的 getpid() 从 ~300 ns 拉回 ~180 ns 范围。A 选项描述的是系统调用缓存，不存在这个机制。C 选项错误，PCID 没有合并页表，PTI 的两套页表依然存在。D 选项完全错误。"
+        },
+        {
+          "id": "os-mode-switch-overhead-1-q5",
+          "question": "运行以下 perf stat 命令后，输出中 IPC（Instructions Per Cycle）只有 0.49，这说明什么？",
+          "choices": [
+            {"id": "A", "text": "benchmark 代码写错了，getpid() 实际上没有被调用，大量 cycle 浪费在循环控制上"},
+            {"id": "B", "text": "CPU 大部分时间在等待 TLB miss 和 cache miss 填充，而不是在执行指令，模式切换的代价主要来自内存层次结构的「冷启动」"},
+            {"id": "C", "text": "系统存在严重的上下文切换，其他进程抢占了 CPU 导致 cycle 计数虚高"},
+            {"id": "D", "text": "IPC 低说明 CPU 流水线被分支预测失败打断，getpid() 的返回值难以预测"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "IPC（Instructions Per Cycle）是衡量 CPU 执行效率的关键指标，现代超标量处理器在理想情况下 IPC 可达 3-5。0.49 的 IPC 意味着每个 cycle 不到半条指令完成——CPU 大量时间在「等待」而非「计算」。系统调用路径上有两类典型等待：TLB miss（地址翻译缓存未命中，需要走多级页表，每次 10-100 cycles）和 instruction/data cache miss（内核代码和数据在用户态执行期间可能从 L1/L2 cache 被驱逐，第一次访问需从 L3 甚至内存加载）。这正是 PTI 开销的深层原因：不只是 CR3 指令本身，而是 TLB 刷新后的连锁 cache 冷效应。A 选项错误，循环控制指令是高 IPC 操作。C 选项的上下文切换影响 perf 的 task-clock 事件，但 cycle 计数不会虚高。D 选项的分支预测失败通常让 IPC 从 4 降到 2 左右，不会降到 0.49。"
+        },
+        {
+          "id": "os-mode-switch-overhead-1-q6",
+          "question": "一个同事说「我们的服务用了 clock_gettime(CLOCK_MONOTONIC) 记录每条请求的时间，这个函数本质上是系统调用，每次调用要 200+ ns，这是性能瓶颈」。这个说法的问题在哪里？",
+          "choices": [
+            {"id": "A", "text": "CLOCK_MONOTONIC 比 CLOCK_REALTIME 快很多，不存在 200 ns 的问题，选对时钟类型就够了"},
+            {"id": "B", "text": "在现代 Linux 上，clock_gettime 通过 vDSO 实现，实际上并不进入内核，耗时约 5-15 ns，不是真正的 syscall，同事的前提假设错误"},
+            {"id": "C", "text": "clock_gettime 确实是 200+ ns，但这是操作系统无法优化的固定成本，同事说法正确"},
+            {"id": "D", "text": "用 __builtin_ia32_rdtsc() 直接读 TSC 寄存器更快，但会绕过内核的时钟校正，返回值可能不准确，所以不能替换 clock_gettime"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "这是一个非常常见的误解，而且很重要：clock_gettime() 和 gettimeofday() 在 Linux 2.6+ 上通过 vDSO（Virtual Dynamic Shared Object）实现。vDSO 是内核在进程启动时映射到用户空间的一段共享内存，包含内核维护的当前时间数据和读取它的代码。调用 vDSO 路径的 clock_gettime 相当于在用户空间读一块内存，不需要 ring 0 切换，耗时 5-15 ns。用 strace 追踪时，vDSO 路径的 clock_gettime 根本不出现在 strace 输出里，因为 strace 挂在 syscall 入口，vDSO 绕过了它。只有传入 boot 参数 vdso=0 禁用 vDSO 后，clock_gettime 才会走真正的 syscall 路径。D 选项的 rdtsc 确实可以用，但现代 Linux 的 vDSO 本身内部就用了 rdtsc，直接用 clock_gettime 是更正确的做法。"
+        },
+        {
+          "id": "os-mode-switch-overhead-1-q7",
+          "question": "对于每次只写 1 字节的高频 write() 调用（如日志库），以下哪种优化最有效？",
+          "choices": [
+            {"id": "A", "text": "把进程 nice 值设低以获得更高 CPU 调度优先级，减少 write() 等待 CPU 的时间"},
+            {"id": "B", "text": "用 writev() 或 stdio 的缓冲区把多个小写合并成一次系统调用，从根本上减少 syscall 次数，把模式切换代价摊薄到更多数据上"},
+            {"id": "C", "text": "使用 O_DIRECT 标志打开文件，跳过 page cache 直接写磁盘，减少内核缓冲区复制"},
+            {"id": "D", "text": "在写操作前调用 posix_fadvise(POSIX_FADV_SEQUENTIAL) 提示内核顺序写，内核会自动合并小写操作"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "每次 write(fd, buf, 1) 的成本分解：1 字节的数据传输代价约 0 ns，但 syscall 本身的模式切换代价约 100-300 ns——也就是说 99% 的时间都花在「申请内核帮我做事」的仪式上，而不是做事本身。解法是批量化：stdio 的 fwrite 维护一个用户态缓冲区（默认 4KB 或 8KB），只有缓冲区满或调用 fflush 时才真正 write，把 4096 次 1 字节 write syscall 合并成 1 次 4096 字节 write syscall，syscall 次数减少 4096 倍。writev 则允许一次 syscall 传多个不连续缓冲区，对日志库很实用。A 选项 nice 值影响调度优先级，不影响单次 syscall 延迟。C 选项 O_DIRECT 跳过 page cache，实际上会增加而非减少 I/O 延迟（page cache 是帮你做批量的）。D 选项 posix_fadvise 是给 readahead 的提示，不合并写操作。"
+        },
+        {
+          "id": "os-mode-switch-overhead-1-q8",
+          "question": "一个 HFT（高频交易）系统要求网络收包延迟低于 5 μs，当前基于 Linux socket 的实现延迟约 50-80 μs，主要瓶颈是内核网络栈和系统调用开销。最适合的优化方向是什么？",
+          "choices": [
+            {"id": "A", "text": "把进程绑定到独立 CPU 核（CPU affinity），禁用 NUMA 远端内存访问，优化 NUMA 拓扑，延迟可以降到 5 μs 以内"},
+            {"id": "B", "text": "用 io_uring 的 SQPOLL 模式，让内核以轮询方式处理 I/O，减少 syscall 次数，可以把延迟从 50 μs 降到 5 μs"},
+            {"id": "C", "text": "使用 DPDK 内核旁路框架，用户空间直接 poll 网卡队列，完全绕过内核网络栈和所有 syscall，配合 CPU 独占可实现 1-3 μs 延迟"},
+            {"id": "D", "text": "使用 SO_BUSY_POLL socket 选项让 recv() 系统调用自旋等待而非阻塞，减少上下文切换，延迟可降到 5 μs 以内"}
+          ],
+          "correctAnswer": "C",
+          "explanation": "50 μs 到 5 μs 的跨越不是「调优」能解决的，需要架构层面的「旁路」。Linux 内核网络栈的固定开销来自多个层面：syscall 模式切换（~300 ns）、socket 缓冲区复制（skb 内存分配和拷贝）、软中断处理、协议栈层层处理。即便每层优化 50%，加起来也很难低于 10 μs。DPDK（Data Plane Development Kit）完全绕过内核——它在用户空间通过 UIO/VFIO 直接操作网卡，用轮询替代中断，数据包直接在用户内存中处理，整个接收路径没有任何 syscall，确定性延迟可达 1-3 μs。A 选项 CPU affinity 和 NUMA 优化很重要但只能减少几微秒的抖动，不能解决根本的内核栈开销。B 选项 io_uring SQPOLL 减少了 syscall 次数但还是走内核网络栈，适合高吞吐场景而非极低延迟场景。D 选项 SO_BUSY_POLL 减少了 recv 的等待延迟，但单次 syscall 处理仍然走内核栈，降幅有限。"
+        },
+        {
+          "id": "os-mode-switch-overhead-1-q9",
+          "question": "在生产环境 Intel 机器上执行 `dmesg | grep -i pti` 看到「Kernel/User page tables isolation: disabled」，可能是什么原因，是否安全？",
+          "choices": [
+            {"id": "A", "text": "这是正常的，Intel 在最新的微码更新后通过硬件修复了 Meltdown，内核检测到后自动禁用软件 PTI，性能更好且依然安全"},
+            {"id": "B", "text": "机器被配置了 nopti 或 mitigations=off boot 参数，或者内核检测到 CPU 微码已包含 Meltdown 硬件修复，需要检查 /proc/cmdline 和 /sys/devices/system/cpu/vulnerabilities/meltdown 来确认是否真的安全"},
+            {"id": "C", "text": "这意味着内核版本太旧，PTI 补丁未被应用，应立即升级内核到 4.15 以上"},
+            {"id": "D", "text": "这是云虚机环境的正常现象，因为 hypervisor 层已经处理了 Meltdown 隔离，宿主机的 PTI 不需要在 guest 内开启"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "PTI 被禁用可能有多种原因，必须仔细区分。最危险的情况是运维人员或某个脚本设置了 nopti 或 mitigations=off boot 参数来「优化性能」，这在未打微码补丁的旧 Intel CPU 上会真正暴露 Meltdown 漏洞。检查方法：cat /proc/cmdline 看 boot 参数；cat /sys/devices/system/cpu/vulnerabilities/meltdown 看内核对该 CPU 的漏洞评估（如果输出 Mitigation: PTI 说明补丁已启用，如果输出 Not affected 说明 CPU 本身不受影响）。A 选项的「微码硬件修复 Meltdown」说法不正确，Meltdown 是微架构设计问题，不能通过微码完全修复，只能通过 PTI 软件隔离。C 选项判断方向有问题，内核 <4.15 根本没有 PTI，会输出另外的信息而非「disabled」。D 选项对于 Xen 等半虚拟化可能部分成立，但不是通用规律，不能以此为由放弃检查。"
+        },
+        {
+          "id": "os-mode-switch-overhead-1-q10",
+          "question": "你的服务在 Intel 机器上每秒发起约 200 万次系统调用（通过 perf stat 确认），P99 延迟高于预期。以下哪种诊断和优化步骤是正确的优先顺序？",
+          "choices": [
+            {"id": "A", "text": "先升级到最新内核版本，再开启 PCID 优化，再考虑 io_uring，最后考虑 DPDK"},
+            {"id": "B", "text": "先用 perf top 找出哪些 syscall 占比最高（不同 syscall 代价不同），再按 syscall 类型选择优化方案：时间获取类换 vDSO、小 I/O 类用批量接口（writev/sendmmsg/io_uring）、网络高频收发考虑批量或 DPDK"},
+            {"id": "C", "text": "直接升级到 AMD EPYC 机器，利用 AMD 无 PTI 的架构优势，syscall 开销自然降低，不需要改代码"},
+            {"id": "D", "text": "在 /proc/sys/kernel/syscall_batch 中设置批量模式，内核会自动把相邻的同类 syscall 合并，不需要修改代码"}
+          ],
+          "correctAnswer": "B",
+          "explanation": "200 万次/秒是需要认真对待的数量，但盲目优化比不优化更危险。正确步骤是先诊断再优化。perf top -e syscalls:sys_enter 可以显示各个 syscall 的调用次数占比，因为不同 syscall 的优化策略完全不同：clock_gettime 已经走 vDSO 根本不是 syscall，那就不是问题；大量 write(1 byte) 说明缺少缓冲，用 stdio 或 writev 解决；大量 sendto/recvfrom 小包说明网络收发过碎，用 sendmmsg/recvmmsg 或 io_uring 批量处理；如果是 epoll_wait 频繁唤醒，说明事件粒度太细。A 选项的步骤没有错但缺少诊断阶段，升级内核可能什么都没改变。C 选项换机器是有效的，AMD 无 PTI 能省 ~150 ns/syscall，但 200 万次/秒 × 150 ns = 0.3 核，只占一部分，且不解决 syscall 次数本身过多的问题。D 选项的 /proc/sys/kernel/syscall_batch 根本不存在，是虚构的。"
+        }
+      ],
+      "references": [
+        "https://www.kernel.org/doc/html/latest/x86/pti.html",
+        "https://meltdownattack.com/meltdown.pdf",
+        "https://lwn.net/Articles/741878/",
+        "https://www.brendangregg.com/perf.html",
+        "https://man7.org/linux/man-pages/man7/vdso.7.html",
+        "https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/cpuid-enumeration-and-architectural-msrs.html",
+        "https://lwn.net/Articles/738975/"
+      ]
+    }
+  ]
+}
