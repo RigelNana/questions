@@ -1,0 +1,157 @@
+{
+  "id": "os-reduce-context-switch-concurrency",
+  "name": "高并发服务中减少不必要上下文切换的实践",
+  "domain": "operating-system",
+  "description": "通过协程、线程池、无锁编程与 IO 多路复用降低高并发服务上下文切换开销的具体方法",
+  "version": "1.0.0",
+  "questions": [
+    {
+      "id": "os-reduce-context-switch-concurrency-1",
+      "domain": "operating-system",
+      "type": "practice",
+      "difficulty": 3,
+      "tags": ["context-switch", "concurrency", "thread-pool", "epoll", "goroutine", "lock-free", "cpu-affinity", "performance"],
+      "title": "在高并发服务中如何减少不必要的上下文切换",
+      "content": "## 问题背景\n\n你的团队刚完成了一个高并发订单处理服务的初版，架构很直观：每来一个请求就从线程池取一个线程处理，查数据库、扣库存、发消息，完成后线程归池。压测时，单机 TPS 跑到 8000 就上不去了，CPU 使用率只有 60%，`vmstat` 显示 `cs` 在 480000/秒上下，`sy`（内核态 CPU）占了总 CPU 的 22%，远超正常的 5-8%。\n\n同事说「加机器吧」，但你直觉上觉得这是软件问题，不是硬件问题。22% 的 sy 和将近 50 万/秒的上下文切换，说明 CPU 大量时间在做调度开销，而不是真正的业务计算。这台服务器的 CPU 并没有「累」，它在「忙着换任务」。\n\n## 你需要回答的问题\n\n请从以下六个维度来描述如何系统性地降低高并发服务中的上下文切换开销：\n\n**维度一：线程池的正确大小。** CPU 密集型和 IO 密集型任务的线程数公式分别是什么？为什么「线程越多，并发能力越强」是一个危险的误解？\n\n**维度二：异步 IO 替代阻塞线程。** epoll 事件循环和「一请求一线程」模型在 1 万并发时的线程数差异是多少？Netty/Go net 等框架是如何做到用少量线程处理大量并发的？\n\n**维度三：协程/goroutine 的优势。** goroutine 切换为什么比 OS 线程切换快 10-50 倍？Go 的 GMP 调度模型具体是什么？\n\n**维度四：减少锁竞争。** 分段锁、无锁数据结构（CAS）、RCU、批量操作这几个方案分别适用于什么场景？\n\n**维度五：CPU 亲和性。** `taskset` 的用法，以及 CPU 亲和性对缓存效率的具体影响。\n\n**维度六：避免忙等待。** `while (!ready) {}` 的危害，以及正确的替代方案是什么？",
+      "answer": "## 背景：为什么高并发会导致高上下文切换\n\n在深入六个维度之前，先建立一个直觉：上下文切换不是「并发本身」带来的，而是「错误的并发方式」带来的。理论上，如果一台 16 核服务器上永远只有 16 个线程在跑，每个线程独占一个核，那上下文切换可以接近于零。问题在于，大多数服务的并发模型不是这样的——它们往往用「一请求一线程」或者「过大的线程池」来处理并发，导致可运行线程数远超 CPU 核心数，调度器不停地在做无效的切换。\n\n理解这个根因，六个优化维度就有了统一的逻辑主线：**减少参与调度的 OS 线程数，同时保持或提升实际并发处理能力**。\n\n## 维度一：给线程池配对合适的大小\n\n「线程越多，并发越强」是高并发开发中最危险的误解之一。在一台 16 核机器上把线程池设为 1000，意味着每次 CPU 上只能有 16 个线程真正在跑，剩下 984 个在 run queue 里排队。调度器每隔 4ms 就要从这 1000 个线程中选出 16 个来跑，然后把另外 16 个换下去，上下文切换的频率和无谓开销随线程数线性增长。\n\n正确的做法是用公式算出合理的线程数。CPU 密集型任务（计算、加密、图像处理），线程数等于 CPU 核心数，多一个就是浪费——多出来的线程必然被抢占，增加非自愿切换，反而让整体吞吐下降。IO 密集型任务（数据库查询、RPC 调用、文件读写），有一个经典公式：\n\n```\n线程数 = nCPU × (1 + IO等待时间 / CPU计算时间)\n```\n\n假设每个请求 80% 时间在等数据库（40ms），20% 时间在 CPU 上处理（10ms），那比值是 4，16 核机器应设 16 × 5 = 80 个线程。这 80 个线程中，任意时刻最多有 16 个在 CPU 上工作，其余 64 个在等 IO，这样既不浪费 CPU，也不引发过多的调度竞争。\n\n注意这是「理论最优」，实际中需要结合压测数据调整。公式的意义在于给你一个出发点，而不是一个答案。\n\n## 维度二：异步 IO——一个事件循环顶一万个线程\n\n线程池的上限是「右-sizing」，治标不治本。更彻底的方案是把阻塞 IO 改成非阻塞的事件驱动模式，从根本上消除「等 IO 时浪费线程」的问题。\n\nepoll 的工作原理是：把所有 socket 的文件描述符注册到 epoll 实例，然后一个线程调用 `epoll_wait` 阻塞，等待任意一个 socket 有数据可读或可写。一旦有事件发生，`epoll_wait` 返回，线程处理这个事件，然后继续等下一个。整个过程用一个或少数几个线程处理所有并发连接：\n\n```\n传统 BIO：10000 并发连接 → 10000 个线程 → 16 核机器每核 625 个线程 → 严重上下文切换\nepoll 模型：10000 并发连接 → 1-32 个线程 → 几乎没有多余的调度切换\n```\n\nNetty（Java）、libuv（Node.js）、Go net 包都是基于这个模型构建的。Netty 用少量 IO 线程（通常 2×nCPU）来管理网络事件，真正的业务逻辑在 worker 线程池里跑。Go net 更进一步，把 epoll 封装在 runtime 内部，goroutine 调用 `net.Read()` 时，如果数据没有就绪，Go runtime 会把这个 goroutine 从 M（OS 线程）上摘下来，等 epoll 通知数据就绪了再把它调度回来——整个过程对 goroutine 透明，看起来像阻塞调用，实际上 M 从没真正阻塞。\n\n## 维度三：goroutine 是怎么做到廉价的\n\nGo 的 goroutine 之所以能「百万并发」，核心在于它是用户空间的协程，由 Go runtime 的 GMP 调度器管理，而不是 OS 调度器。\n\nGMP 模型的三个组件：G（goroutine，用户态协程，初始栈 2KB，可动态扩展）、M（OS thread，真正运行在 CPU 上的线程，数量约等于 nCPU）、P（logical processor，逻辑处理器，持有一个本地 goroutine 队列，数量由 GOMAXPROCS 决定，默认等于 nCPU）。每个 P 每次只能被一个 M 持有，M 从 P 的本地队列里取 G 来执行。\n\ngoroutine 切换发生在用户空间：只需要保存少量的寄存器（Go 的调用约定使得 goroutine 切换只需保存几个 callee-saved 寄存器），不需要切换虚拟地址空间（所有 goroutine 共享同一进程地址空间），不需要进入内核（无系统调用）。这让 goroutine 切换的代价约 100-300 纳秒，而 OS 线程上下文切换是 1-5 微秒，差距约 10-50 倍。\n\n更重要的是，goroutine 切换不触发 TLB 刷新，不导致 CPU 缓存失效——因为地址空间没变，缓存里的数据依然有效。这个隐形收益在实际性能上往往比「切换速度快 10 倍」更显著。\n\n## 维度四：减少锁竞争，减少等锁导致的切换\n\n锁竞争是高 cswch/s（自愿切换）的主要来源。当 100 个线程同时来抢一把锁，99 个线程会阻塞并发生自愿切换，等锁的释放才能被唤醒（再来一次切换）。对于一把热点锁，这可以产生每秒几十万次的自愿切换。\n\n分段锁（sharding）是最简单实用的方案：把一把全局锁替换成 N 把分段锁，每个操作根据 key 哈希到对应的分段。16 把分段锁意味着理论上锁竞争降低到 1/16，线程更少等待，切换也随之减少。Java 的 `ConcurrentHashMap`（Java 8 之前用分段锁，8 之后改用更精细的 CAS）就是这个思路。\n\n无锁数据结构（lock-free）用 CAS（Compare-And-Swap）原子指令实现线程安全，完全不需要锁，也就不存在「等锁→切换→被唤醒→切换」的模式。Go 的 `sync/atomic` 包、Java 的 `AtomicLong`/`AtomicReference` 都提供了 CAS 原语，适合保护简单的计数器、队列头尾指针等结构。\n\n批量操作是一个经常被忽略的优化：不要每个操作都单独获取锁，而是积累一批操作后，一次加锁处理所有操作。从「1000 次加锁，每次更新 1 条记录」改成「1 次加锁，更新 1000 条记录」，加锁次数降低 1000 倍，对应的上下文切换也随之骤降。\n\n## 维度五：CPU 亲和性减少迁移开销\n\ncpu-migration（CPU 迁移）是一种特殊的非自愿切换：进程不只是被换下 CPU，而是被从 CPU0 迁移到 CPU3。迁移代价比普通切换更高——CPU0 上与这个进程相关的 L1/L2 缓存全部失效，进程在 CPU3 上重新运行时必须重建缓存，可能需要几十微秒的 cache miss 密集期。\n\n`taskset -cp 0,1,2,3 PID` 把进程绑定到 CPU 0-3，调度器保证只在这四个核上调度，消除了迁移到其他核的可能。对于延迟敏感的服务（如撮合引擎、实时风控），CPU 亲和性可以让 P99 延迟大幅降低，因为缓存始终是热的。\n\nRedis 在生产环境通常配置 `server_cpulist` 把 Redis 进程绑定到专属 CPU，与其他进程的负载隔离，这是 Redis 能实现微秒级响应时间的工程保障之一。\n\n## 维度六：消灭忙等待\n\n`while (!ready) {}` 这种忙等待（busy-wait）有两个问题：一是持续消耗 CPU，让调度器更频繁地认为「这个线程在占用 CPU 应该换一换」，从而触发非自愿切换；二是浪费 CPU 做无用功，让本来可以跑业务逻辑的 CPU 时间全被这个循环吃掉。\n\n正确的替代方案是基于事件的等待，让线程在「没事做」的时候真正睡下去：condition variable（`pthread_cond_wait` / Go 的 channel 接收）在条件不满足时阻塞，满足时被唤醒；futex（`FUTEX_WAIT` 系统调用）是 Linux 最底层的等待原语，mutex 和 condition variable 最终都由它实现；Go 的 channel 在没有数据时会让 goroutine 挂起（不消耗 M，也不占 CPU），数据到来时精准唤醒。\n\n极少数情况下（如内核自旋锁，等待时间确定极短），自旋等待（spinlock）是合理的——因为很快就能拿到锁，睡下去再唤醒的切换代价反而比自旋更贵。但在用户空间的高并发服务里，等待时间通常不确定，应该始终用基于事件的等待，而不是忙等待。",
+      "keyPoints": [
+        "线程池正确大小公式：CPU 密集型 = nCPU，IO 密集型 = nCPU × (1 + IO等待时间/CPU计算时间)，超出此数只会增加非自愿切换",
+        "epoll 事件驱动让 1-32 个线程处理 10000 并发连接，消除了「一请求一线程」模型中每连接一次切换的开销",
+        "goroutine 切换比 OS 线程切换快 10-50 倍（100-300ns vs 1-5μs），且不触发 TLB 刷新和 CPU 缓存失效",
+        "分段锁（sharding）和无锁 CAS 通过减少锁竞争来降低自愿上下文切换，批量加锁可将加锁次数（和切换次数）降低 100-1000 倍",
+        "CPU 亲和性（taskset）消除 CPU 迁移，保持 L1/L2 缓存热度，对延迟敏感型服务的 P99 有显著改善",
+        "忙等待（while !ready）持续消耗 CPU 并触发频繁非自愿切换，应替换为 condition variable/channel/futex 等事件驱动等待"
+      ],
+      "quiz": [
+        {
+          "id": "os-reduce-context-switch-concurrency-q1",
+          "question": "一台 8 核服务器运行 IO 密集型服务，每个请求平均 CPU 计算时间 10ms，等待数据库时间 30ms，按照公式应配置多少线程？",
+          "choices": [
+            {"id": "A", "text": "8 × (1 + 30/10) = 32 个线程"},
+            {"id": "B", "text": "8 个线程（等于 CPU 核心数）"},
+            {"id": "C", "text": "8 × 2 = 16 个线程（业界通用经验值翻倍）"},
+            {"id": "D", "text": "500 个线程（为了保证在高并发时有足够的线程可用）"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "IO 密集型线程池公式是 nCPU × (1 + 等待时间/计算时间)。这里等待 30ms，计算 10ms，比值 3，所以 8 × (1+3) = 32 个线程。逻辑是：线程 75% 的时间在等 IO 不消耗 CPU，为让 CPU 满载需要 4 倍的线程。8 线程等于核心数适合 CPU 密集型任务，IO 密集型如果只用 8 线程，CPU 大部分时间是空的。500 线程会让 8 个核心服务 500 个可运行线程，非自愿切换激增，sy 暴涨，实际 TPS 反而下降。"
+        },
+        {
+          "id": "os-reduce-context-switch-concurrency-q2",
+          "question": "以下哪个描述最准确地解释了 epoll 如何减少上下文切换？",
+          "choices": [
+            {"id": "A", "text": "一个线程通过 epoll_wait 监听所有 socket，只有有数据时才处理，10000 个连接只需要少量线程，大幅减少了 OS 调度的线程数"},
+            {"id": "B", "text": "epoll 通过内核旁路（kernel bypass）技术让网络 IO 完全绕过 OS，消除了系统调用开销"},
+            {"id": "C", "text": "epoll 给每个 socket 分配一个独立的内核线程处理，避免了用户空间的锁竞争"},
+            {"id": "D", "text": "epoll 使用 SCHED_FIFO 实时调度策略，确保 IO 事件被立即处理"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "epoll 的核心是多路复用（IO multiplexing）：一个调用 epoll_wait 的线程可以同时监听任意数量的 socket，当任何一个 socket 就绪时被唤醒处理，处理完继续 epoll_wait。这意味着 10000 个并发连接不需要 10000 个线程，只需要少数几个线程，OS 调度器管理的活跃线程数骤降，上下文切换也随之骤降。内核旁路（DPDK/RDMA）是完全不同的技术，bypass 的是内核网络栈而非调度器。epoll 不创建内核线程，也不使用实时调度。"
+        },
+        {
+          "id": "os-reduce-context-switch-concurrency-q3",
+          "question": "Go 的 goroutine 切换为什么不会触发 TLB 刷新？",
+          "choices": [
+            {"id": "A", "text": "所有 goroutine 共享同一个进程的虚拟地址空间，切换 goroutine 时不需要切换页表，TLB 中的映射继续有效"},
+            {"id": "B", "text": "Go runtime 使用了硬件 TLB shootdown 抑制机制，专门阻止 TLB 刷新"},
+            {"id": "C", "text": "goroutine 每个都有独立的虚拟地址空间，但 Go 在切换时会提前预热 TLB"},
+            {"id": "D", "text": "Go 1.18 之后引入了 TLB 共享池，多个 goroutine 共用同一组 TLB 条目"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "TLB（Translation Lookaside Buffer）缓存的是「虚拟地址→物理地址」的映射。当切换进程时，因为不同进程的虚拟地址空间不同，相同的虚拟地址在不同进程中对应不同的物理地址，所以必须刷新 TLB。但 goroutine 是线程级别的协程，所有 goroutine 都运行在同一个进程内，共享同一个虚拟地址空间和同一张页表，切换 goroutine 不需要切换页表，TLB 中的映射全部保持有效。这是 goroutine 切换比进程/线程切换代价小得多的关键原因之一。"
+        },
+        {
+          "id": "os-reduce-context-switch-concurrency-q4",
+          "question": "Go 的 GMP 调度模型中，P（逻辑处理器）的数量由什么决定，它的作用是什么？",
+          "choices": [
+            {"id": "A", "text": "P 的数量由 GOMAXPROCS 决定（默认等于 nCPU），P 持有本地 goroutine 队列，M 通过持有 P 来执行 goroutine"},
+            {"id": "B", "text": "P 的数量等于 goroutine 的数量，每个 goroutine 对应一个 P"},
+            {"id": "C", "text": "P 是物理 CPU 核心的抽象，数量固定等于机器的 CPU 核心数，不可修改"},
+            {"id": "D", "text": "P 是内存页面管理器，负责 goroutine 的栈内存分配，数量由可用内存决定"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "在 Go 的 GMP 模型中，P（逻辑处理器）的数量由 GOMAXPROCS 环境变量或 runtime.GOMAXPROCS() 函数决定，默认值是机器的 CPU 核心数。P 的核心作用是持有一个本地的 goroutine 运行队列（local run queue），以及一些执行 goroutine 所需的本地状态（如内存分配缓存）。M（OS 线程）必须先获得一个 P 才能执行 goroutine，没有 P 的 M 就无法运行 G。这种设计让 goroutine 的调度主要在 P 的本地队列中完成，减少了全局锁竞争。"
+        },
+        {
+          "id": "os-reduce-context-switch-concurrency-q5",
+          "question": "把全局锁改为 16 把分段锁（sharding），对上下文切换有什么影响？",
+          "choices": [
+            {"id": "A", "text": "锁竞争概率降低到约 1/16，等锁阻塞的频率下降，自愿上下文切换（cswch/s）也随之降低"},
+            {"id": "B", "text": "分段锁增加了锁的数量，会导致上下文切换增加，因为管理更多锁需要更多系统调用"},
+            {"id": "C", "text": "分段锁主要影响非自愿切换（nvcswch/s），对自愿切换没有影响"},
+            {"id": "D", "text": "分段锁的效果取决于 CPU 型号，Intel CPU 有锁优化指令，AMD CPU 没有"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "分段锁减少上下文切换的原理很直接：16 把锁意味着同时最多 16 个线程可以各自持有不同分段的锁并发执行，而不是只有 1 个线程能持有全局锁。竞争概率降低到约 1/16，意味着线程等锁阻塞的概率也降到约 1/16，自愿上下文切换（等锁→主动让出）随之降低。锁竞争导致的是「主动让出 CPU 等待」，所以影响的是 cswch（自愿切换），而不是 nvcswch（非自愿切换）。分段锁不涉及额外的系统调用，锁本身是用户空间的 futex 操作。CPU 品牌对锁性能有影响，但不是决定因素。"
+        },
+        {
+          "id": "os-reduce-context-switch-concurrency-q6",
+          "question": "以下代码中，`while (!ready.load()) {}` 这种忙等待相比 `cond.wait()` 条件变量等待，对上下文切换有什么影响？",
+          "choices": [
+            {"id": "A", "text": "忙等待持续消耗 CPU，被调度器频繁抢占产生高 nvcswch；条件变量让线程真正睡眠，只在被通知时产生少量 cswch"},
+            {"id": "B", "text": "忙等待更高效，因为它避免了调用 wait() 时的系统调用开销，上下文切换更少"},
+            {"id": "C", "text": "两者的上下文切换次数相同，区别只是忙等待的 CPU 占用更高"},
+            {"id": "D", "text": "忙等待只会产生自愿切换（cswch），因为它在用户空间主动轮询，不触发系统调用"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "忙等待（busy-wait）让 CPU 一直执行 load 指令检查标志，从调度器角度看这个线程在「努力工作」，时间片到了就强制切走（非自愿切换 nvcswch 升高），新时间片开始了又切回来继续忙转，循环往复。条件变量 wait() 调用后线程进入 sleeping 状态，CPU 真正让出去，只有当另一个线程调用 notify()/broadcast() 时才被精准唤醒（一次自愿切换），期间不消耗任何 CPU。在等待时间不确定的场景，条件变量的总切换次数远少于忙等待，且不浪费 CPU。"
+        },
+        {
+          "id": "os-reduce-context-switch-concurrency-q7",
+          "question": "Nginx 「每个 CPU 一个 worker + epoll」的架构，相比「一请求一线程」架构，处理 50000 并发连接时大约节省了多少个 OS 线程？",
+          "choices": [
+            {"id": "A", "text": "在 16 核机器上节省约 50000 - 32 = 49968 个线程，减少了约 99.94% 的线程数"},
+            {"id": "B", "text": "节省约一半，因为 epoll 需要额外的监听线程"},
+            {"id": "C", "text": "节省数量取决于连接的 QPS，低 QPS 时可能反而更多"},
+            {"id": "D", "text": "两种架构的线程数相同，Nginx 的优势在于每个线程的内存占用更小"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "「一请求一线程」模型下，50000 并发连接需要 50000 个线程（每个连接一个线程等待 IO）。Nginx 的 epoll 模型在 16 核机器上只有 16 个 worker 进程（加上少量辅助进程，约 20-32 个进程/线程总数）。差值约 49968，减少了约 99.94% 的线程数。线程数减少意味着 OS 调度器需要管理的可运行任务急剧减少，上下文切换从每秒几十万次降到几千次，这正是 Nginx 能以极低 CPU sy 时间处理海量并发的原因。"
+        },
+        {
+          "id": "os-reduce-context-switch-concurrency-q8",
+          "question": "将线程池从 500 缩小到 64（16 核 IO 密集型服务），预期会看到什么变化？",
+          "choices": [
+            {"id": "A", "text": "nvcswch/s 显著下降，run queue 减少，sy（内核态 CPU）降低，TPS 可能略升或持平"},
+            {"id": "B", "text": "服务吞吐量（TPS）会下降 87%，因为线程数减少了 87%"},
+            {"id": "C", "text": "cswch/s 会显著上升，因为更少的线程要处理同样的工作，每个线程更忙"},
+            {"id": "D", "text": "没有明显变化，OS 调度器会自动优化，线程数多少不影响性能"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "线程池从 500 减到 64，最直接的效果是 run queue 从「500 个线程争 16 个核」变成「64 个线程争 16 个核」，可运行线程大幅减少，调度器做非自愿切换的频率骤降（nvcswch/s 下降），内核态 CPU 时间（sy%）随之降低。对于 IO 密集型服务，线程 80% 时间在等 IO，真正消耗 CPU 的只有 20%，64 个线程足够让 16 个核保持忙碌。TPS 通常不降反升，因为 CPU 时间从「无效切换开销」回流到「真正的业务处理」。cswch/s（自愿切换）取决于 IO 模式，不会因为线程减少而增加。"
+        },
+        {
+          "id": "os-reduce-context-switch-concurrency-q9",
+          "question": "对于一个撮合引擎（每笔交易延迟要求 < 100μs），除了减少线程数，还有哪个优化对降低上下文切换特别有效？",
+          "choices": [
+            {"id": "A", "text": "CPU 亲和性（taskset 绑核），让撮合线程永远在同一个 CPU 核心运行，保持 L1/L2 缓存热度，消除 CPU 迁移"},
+            {"id": "B", "text": "把撮合引擎改成 Go 实现，goroutine 切换更快，延迟自然更低"},
+            {"id": "C", "text": "增加服务器的 CPU 核心数，让每个线程独享一个更快的核心"},
+            {"id": "D", "text": "把数据库查询改为异步，减少等待时间"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "撮合引擎的延迟目标是 100μs，而一次 CPU 迁移（进程从 CPU0 移到 CPU1）导致的 L1/L2 缓存全部失效，重建缓存可能需要 50-200μs（大量 cache miss，每次约 4-100ns，几百次就是几十μs）。CPU 亲和性绑核让撮合线程始终在同一个核心运行，缓存始终是热的，把最坏情况的延迟降低一个数量级。改用 Go 虽然切换快，但 goroutine 的非确定性调度对微秒级延迟可能反而不友好，延迟敏感型系统通常用 C++ + 绑核 + 无锁队列。扩 CPU 核心数对单线程延迟没有帮助。撮合引擎通常是纯内存计算，不查数据库。"
+        },
+        {
+          "id": "os-reduce-context-switch-concurrency-q10",
+          "question": "把「每次操作单独加锁更新一条记录」改为「积累 100 条后一次加锁批量更新」，对上下文切换有什么影响？",
+          "choices": [
+            {"id": "A", "text": "加锁次数降低 100 倍，锁竞争和等锁阻塞随之降低，cswch/s（自愿切换）也降低约 100 倍"},
+            {"id": "B", "text": "批量操作会让锁持有时间延长 100 倍，其他线程等待更久，cswch/s 反而升高"},
+            {"id": "C", "text": "对上下文切换没有影响，只影响数据库的写入性能"},
+            {"id": "D", "text": "批量操作改变的是 nvcswch/s（非自愿切换），因为持锁时间长会被调度器抢占"}
+          ],
+          "correctAnswer": "A",
+          "explanation": "锁竞争导致上下文切换的模式是：线程 A 想加锁 → 发现锁被占用 → 主动阻塞（cswch +1）→ 锁释放后被唤醒（cswch +1）。每次加锁冲突触发两次自愿切换。把 100 次单独加锁改成 1 次批量加锁，加锁次数降低 100 倍，锁冲突概率随之降低约 100 倍，cswch 也随之降低。B 的担忧有一定道理（持锁时间变长，但只有 1 次，而不是 100 次），总体上批量锁的等待总量远小于 100 次细粒度锁。批量操作减少的是等锁引起的主动让出，属于 cswch（自愿），不是 nvcswch（非自愿）。"
+        }
+      ],
+      "references": [
+        "https://www.brendangregg.com/blog/2016-02-08/linux-ebpf-off-cpu-flame-graph.html",
+        "https://go.dev/blog/scheduler",
+        "https://netty.io/wiki/thread-model.html",
+        "https://www.nginx.com/blog/thread-pools-boost-performance-9x/",
+        "https://man7.org/linux/man-pages/man2/epoll_wait.2.html",
+        "https://www.kernel.org/doc/html/latest/scheduler/sched-design-CFS.html"
+      ]
+    }
+  ]
+}
