@@ -1,16 +1,11 @@
-interface ViewTransitionDocument extends Document {
-  startViewTransition?: (update: () => void | Promise<void>) => unknown;
-}
-
 export function runAppearanceTransition(
   update: () => void,
   reduceMotion: boolean,
 ) {
-  const viewTransitionDocument = document as ViewTransitionDocument;
-  if (reduceMotion || !viewTransitionDocument.startViewTransition) {
+  if (reduceMotion || typeof document.startViewTransition !== 'function') {
     update();
     return;
   }
 
-  viewTransitionDocument.startViewTransition(update);
+  document.startViewTransition(update);
 }
