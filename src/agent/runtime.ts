@@ -11,6 +11,7 @@ import {
 } from '@earendil-works/pi-agent-core';
 import {
   createModels,
+  createProvider,
   InMemoryCredentialStore,
   type Api,
   type AssistantMessage,
@@ -86,17 +87,33 @@ function serializeMessages(messages: AgentMessage[]) {
 
 async function registerProvider(
   models: ReturnType<typeof createModels>,
-  provider: AgentSettings['provider'],
+  settings: AgentSettings,
 ) {
-  if (provider === 'anthropic') {
+  if (settings.provider === 'anthropic') {
     const { anthropicProvider } = await import('@earendil-works/pi-ai/providers/anthropic');
     models.setProvider(anthropicProvider());
-  } else if (provider === 'google') {
+  } else if (settings.provider === 'google') {
     const { googleProvider } = await import('@earendil-works/pi-ai/providers/google');
     models.setProvider(googleProvider());
   } else {
     const { openaiProvider } = await import('@earendil-works/pi-ai/providers/openai');
-    models.setProvider(openaiProvider());
+    const { openAIResponsesApi } = await import('@earendil-works/pi-ai/api/openai-responses.lazy');
+    const { openAICompletionsApi } = await import('@earendil-works/pi-ai/api/openai-completions.lazy');
+    const builtIn = openaiProvider();
+    models.setProvider(createProvider<
+      'openai-responses' | 'openai-completions'
+    >({
+      id: builtIn.id,
+      name: builtIn.name,
+      baseUrl: builtIn.baseUrl,
+      headers: builtIn.headers,
+      auth: builtIn.auth,
+      models: builtIn.getModels(),
+      api: {
+        'openai-responses': openAIResponsesApi(),
+        'openai-completions': openAICompletionsApi(),
+      },
+    }));
   }
 }
 
@@ -112,6 +129,11 @@ function chooseModel(
   }
   return {
     ...base,
+    api: settings.provider === 'openai'
+      ? settings.openaiProtocol === 'chat-completions'
+        ? 'openai-completions'
+        : 'openai-responses'
+      : base.api,
     id: settings.modelId.trim() || base.id,
     name: exact?.name ?? (settings.modelId.trim() || base.name),
     baseUrl: settings.baseUrl.trim() || base.baseUrl,
@@ -206,7 +228,7 @@ export async function createQuestionAgentRuntime(
       fileExists: async () => false,
     },
   });
-  await registerProvider(models, settings.provider);
+  await registerProvider(models, settings);
 
   const model = chooseModel(models, settings);
   const skills = getEnabledSkills(

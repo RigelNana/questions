@@ -29,6 +29,7 @@ import {
   type AgentToolName,
 } from '../agent/types';
 import { validateAgentConfiguration } from '../agent/runtime';
+import { Toggle } from '../components/ui/Toggle';
 
 const INPUT_CLASS = 'w-full rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-3 py-2 text-sm text-[var(--color-notion-text)] outline-none transition-colors focus:border-[var(--color-notion-accent)]';
 
@@ -37,30 +38,6 @@ const MODEL_SUGGESTIONS: Record<AgentProvider, string[]> = {
   anthropic: ['claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-7'],
   google: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3-flash-preview'],
 };
-
-function Toggle({
-  checked,
-  onChange,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      onClick={() => onChange(!checked)}
-      className={`relative h-6 w-11 flex-shrink-0 rounded-full transition-colors ${
-        checked ? 'bg-[var(--color-notion-accent)]' : 'bg-[var(--color-notion-border)]'
-      }`}
-    >
-      <span className={`absolute left-0 top-[3px] h-[18px] w-[18px] rounded-full bg-white shadow transition-transform ${
-        checked ? 'translate-x-[22px]' : 'translate-x-[3px]'
-      }`} />
-    </button>
-  );
-}
 
 function SettingRow({
   title,
@@ -246,7 +223,7 @@ export function AgentSettings() {
             ))}
           </div>
 
-          {settings.connectionMode === 'proxy' ? (
+          {settings.connectionMode === 'proxy' && (
             <>
               <SettingRow title="Proxy URL" description="Pi streamProxy 会请求 {proxyUrl}/api/stream。">
                 <input
@@ -260,25 +237,36 @@ export function AgentSettings() {
                 <input
                   type="password"
                   value={proxyToken}
-                  onChange={(event) => setProxyToken(event.target.value)}
+                  onChange={(event) => {
+                    setProxyToken(event.target.value);
+                    agentSecrets.setProxyToken(event.target.value);
+                  }}
                   placeholder="Proxy bearer token"
                   autoComplete="off"
                   className={INPUT_CLASS}
                 />
               </SettingRow>
             </>
-          ) : (
-            <SettingRow title="Provider API Key" description="浏览器脚本可访问该值；只应使用个人、限额密钥。">
-              <input
-                type="password"
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder="仅当前标签页"
-                autoComplete="off"
-                className={INPUT_CLASS}
-              />
-            </SettingRow>
           )}
+
+          <SettingRow
+            title="Provider API Key"
+            description={settings.connectionMode === 'direct'
+              ? '浏览器直连必填；仅保存在当前标签页 sessionStorage。'
+              : 'Proxy 模式不会把此 Key 发送到代理；保留它便于切换到直连模式。'}
+          >
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(event) => {
+                setApiKey(event.target.value);
+                agentSecrets.setApiKey(event.target.value);
+              }}
+              placeholder={settings.provider === 'openai' ? 'sk-…' : '仅当前标签页'}
+              autoComplete="off"
+              className={INPUT_CLASS}
+            />
+          </SettingRow>
 
           <div className="border-t border-[var(--color-notion-border)] pt-4">
             <button
@@ -325,11 +313,45 @@ export function AgentSettings() {
               </datalist>
             </label>
           </div>
-          <SettingRow title="自定义 Base URL" description="留空使用 Pi provider 默认地址；可用于兼容端点。">
+
+          {settings.provider === 'openai' && (
+            <div className="mt-4 border-t border-[var(--color-notion-border)] pt-4">
+              <div className="mb-2 text-sm font-medium text-[var(--color-notion-text)]">OpenAI API 协议</div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {([
+                  ['responses', 'Responses API', '/v1/responses；支持 reasoning 与新式工具调用'],
+                  ['chat-completions', 'OpenAI Compatible', '/v1/chat/completions；适配兼容服务和本地网关'],
+                ] as const).map(([value, label, description]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => updateSettings({ openaiProtocol: value })}
+                    className={`rounded-xl border p-3 text-left transition-colors ${
+                      settings.openaiProtocol === value
+                        ? 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)]'
+                        : 'border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/60'
+                    }`}
+                  >
+                    <span className="block text-sm font-medium text-[var(--color-notion-text)]">{label}</span>
+                    <span className="mt-1 block text-xs text-[var(--color-notion-text-secondary)]">{description}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <SettingRow
+            title={settings.provider === 'openai' ? 'OpenAI Base URL' : '自定义 Base URL'}
+            description={settings.provider === 'openai' && settings.openaiProtocol === 'chat-completions'
+              ? '填写兼容服务的 API 根地址，例如 https://host.example/v1。'
+              : '留空使用 Pi provider 默认地址。'}
+          >
             <input
               value={settings.baseUrl}
               onChange={(event) => updateSettings({ baseUrl: event.target.value })}
-              placeholder="留空使用默认"
+              placeholder={settings.provider === 'openai' && settings.openaiProtocol === 'chat-completions'
+                ? 'https://api.openai.com/v1'
+                : '留空使用默认'}
               className={INPUT_CLASS}
             />
           </SettingRow>
