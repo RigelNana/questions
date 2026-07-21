@@ -48,7 +48,6 @@ export function Layout() {
   const resolvedTheme = useResolvedTheme();
   const location = useLocation();
   const mainRef = useRef<HTMLElement>(null);
-  const appearanceReady = useRef(false);
 
   const openSearch = useCallback(() => setSearchOpen(true), []);
   const closeSearch = useCallback(() => setSearchOpen(false), []);
@@ -61,12 +60,6 @@ export function Layout() {
   // Apply all appearance settings in one render pass so theme changes stay in sync.
   useLayoutEffect(() => {
     const root = document.documentElement;
-    if (appearanceReady.current && !settings.reduceMotion) {
-      root.classList.add('theme-transition');
-    } else {
-      appearanceReady.current = true;
-    }
-
     root.setAttribute('data-theme', resolvedTheme);
     root.setAttribute('data-font-size', settings.fontSize);
     root.setAttribute('data-reduce-motion', String(settings.reduceMotion));
@@ -125,14 +118,6 @@ export function Layout() {
       root.style.removeProperty('--color-notion-on-accent');
       THEME_SURFACE_PROPERTIES.forEach((property) => root.style.removeProperty(property));
     }
-
-    const transitionTimer = window.setTimeout(() => {
-      root.classList.remove('theme-transition');
-    }, 350);
-    return () => {
-      window.clearTimeout(transitionTimer);
-      root.classList.remove('theme-transition');
-    };
   }, [resolvedTheme, settings.accentColor, settings.fontSize, settings.reduceMotion]);
 
   // Global Ctrl+K shortcut

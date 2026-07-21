@@ -1,4 +1,5 @@
 import { useProgressStore } from '../stores/progressStore';
+import { runAppearanceTransition } from '../utils/appearanceTransition';
 import {
   Settings as SettingsIcon,
   AlertTriangle,
@@ -52,6 +53,12 @@ export function Settings() {
     { value: 'dark', icon: Moon, label: '深色' },
     { value: 'system', icon: Monitor, label: '跟随系统' },
   ];
+  const updateAppearance = (next: Parameters<typeof updateSettings>[0]) => {
+    runAppearanceTransition(
+      () => updateSettings(next),
+      settings.reduceMotion,
+    );
+  };
 
   return (
     <div className="animate-fade-in">
@@ -70,7 +77,7 @@ export function Settings() {
             {themeOptions.map(({ value, icon: Icon, label }) => (
               <button
                 key={value}
-                onClick={() => updateSettings({ theme: value })}
+                onClick={() => updateAppearance({ theme: value })}
                 className={`flex-1 flex flex-col items-center gap-2.5 py-3.5 px-3 rounded-xl border-2 transition-all duration-200 active-press ${
                   settings.theme === value
                     ? 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)] shadow-sm shadow-[var(--color-notion-accent)]/10'
@@ -96,7 +103,7 @@ export function Settings() {
               {ACCENT_OPTIONS.map((option) => (
                 <button
                   key={option.value}
-                  onClick={() => updateSettings({ accentColor: option.value })}
+                  onClick={() => updateAppearance({ accentColor: option.value })}
                   className={`group flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs transition-colors ${
                     settings.accentColor === option.value
                       ? 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)] text-[var(--color-notion-text)]'
@@ -115,7 +122,7 @@ export function Settings() {
                 <input
                   type="color"
                   value={settings.accentColor === 'default' ? '#5E81AC' : settings.accentColor}
-                  onChange={(event) => updateSettings({ accentColor: event.target.value.toUpperCase() })}
+                  onChange={(event) => updateAppearance({ accentColor: event.target.value.toUpperCase() })}
                   className="compact-control h-4 w-4 cursor-pointer border-0 bg-transparent p-0"
                   aria-label="自定义主题色"
                 />
@@ -136,7 +143,7 @@ export function Settings() {
               ] as const).map(([value, label]) => (
                 <button
                   key={value}
-                  onClick={() => updateSettings({ fontSize: value })}
+                  onClick={() => updateAppearance({ fontSize: value })}
                   className={`rounded-lg px-3 py-2 text-sm transition-colors ${
                     settings.fontSize === value
                       ? 'bg-[var(--color-notion-bg)] font-medium text-[var(--color-notion-accent)] shadow-sm'

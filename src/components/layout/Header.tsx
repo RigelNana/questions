@@ -4,6 +4,7 @@ import { useProgressStore } from '../../stores/progressStore';
 import { WindowControls } from './WindowControls';
 import { useResolvedTheme } from '../../hooks/useResolvedTheme';
 import { isElectronEnv } from '../../utils/platform';
+import { runAppearanceTransition } from '../../utils/appearanceTransition';
 
 interface HeaderProps {
   onToggleSidebar: () => void;
@@ -21,7 +22,10 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
 
   const toggleTheme = () => {
     const next = resolvedTheme === 'dark' ? 'light' : 'dark';
-    updateSettings({ theme: next });
+    runAppearanceTransition(
+      () => updateSettings({ theme: next }),
+      settings.reduceMotion,
+    );
   };
 
   const isDark = resolvedTheme === 'dark';
