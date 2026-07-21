@@ -51,6 +51,7 @@ function mergeSettings(saved?: Partial<AgentSettings>): AgentSettings {
     ...saved,
     enabledTools: saved?.enabledTools ?? DEFAULT_AGENT_SETTINGS.enabledTools,
     enabledSkills: saved?.enabledSkills ?? DEFAULT_AGENT_SETTINGS.enabledSkills,
+    customSkills: saved?.customSkills ?? DEFAULT_AGENT_SETTINGS.customSkills,
     permissions: {
       ...DEFAULT_AGENT_SETTINGS.permissions,
       ...saved?.permissions,

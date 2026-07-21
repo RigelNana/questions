@@ -209,7 +209,10 @@ export async function createQuestionAgentRuntime(
   await registerProvider(models, settings.provider);
 
   const model = chooseModel(models, settings);
-  const skills = getEnabledSkills(settings.enabledSkills);
+  const skills = getEnabledSkills(
+    settings.enabledSkills,
+    settings.customSkills,
+  );
   const allTools = createQuestionAgentTools(context, settings, skills);
   const enabledTools = new Set(settings.enabledTools);
   const tools = allTools.filter((tool) => enabledTools.has(tool.name as AgentToolName));

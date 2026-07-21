@@ -1,4 +1,5 @@
 import type { Skill } from '@earendil-works/pi-agent-core';
+import type { AgentCustomSkill } from './types';
 
 export const AGENT_SKILLS: Skill[] = [
   {
@@ -55,7 +56,23 @@ export const AGENT_SKILLS: Skill[] = [
   },
 ];
 
-export function getEnabledSkills(enabledNames: string[]) {
+export function getAvailableSkills(customSkills: AgentCustomSkill[] = []) {
+  const custom = customSkills.map((skill) => ({
+    ...skill,
+    filePath: `/custom-skills/${skill.name}/SKILL.md`,
+  }));
+  const customNames = new Set(custom.map((skill) => skill.name));
+  return [
+    ...AGENT_SKILLS.filter((skill) => !customNames.has(skill.name)),
+    ...custom,
+  ];
+}
+
+export function getEnabledSkills(
+  enabledNames: string[],
+  customSkills: AgentCustomSkill[] = [],
+) {
   const enabled = new Set(enabledNames);
-  return AGENT_SKILLS.filter((skill) => enabled.has(skill.name));
+  return getAvailableSkills(customSkills)
+    .filter((skill) => enabled.has(skill.name));
 }

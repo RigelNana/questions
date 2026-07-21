@@ -8,6 +8,7 @@ import {
   KeyRound,
   ListRestart,
   Network,
+  Plus,
   RotateCcw,
   Save,
   ShieldCheck,
@@ -19,7 +20,7 @@ import {
   useAgentStore,
 } from '../agent/agentStore';
 import { agentSecrets } from '../agent/secrets';
-import { AGENT_SKILLS } from '../agent/skills';
+import { getAvailableSkills } from '../agent/skills';
 import {
   AGENT_TOOL_LABELS,
   DEFAULT_AGENT_SETTINGS,
@@ -116,7 +117,13 @@ export function AgentSettings() {
   const [apiKey, setApiKey] = useState(agentSecrets.getApiKey);
   const [proxyToken, setProxyToken] = useState(agentSecrets.getProxyToken);
   const [secretSaved, setSecretSaved] = useState(false);
+  const [customSkillDraft, setCustomSkillDraft] = useState({
+    name: '',
+    description: '',
+    content: '',
+  });
   const validationError = validateAgentConfiguration(settings);
+  const availableSkills = getAvailableSkills(settings.customSkills);
 
   const saveSecrets = () => {
     agentSecrets.setApiKey(apiKey);
@@ -153,6 +160,30 @@ export function AgentSettings() {
         [toolName]: permission,
       },
     });
+  };
+
+  const addCustomSkill = () => {
+    const name = customSkillDraft.name.trim();
+    if (!/^[a-z0-9][a-z0-9-]{1,63}$/.test(name)) {
+      window.alert('Skill 名称需为 2-64 位小写字母、数字或连字符。');
+      return;
+    }
+    if (!customSkillDraft.description.trim() || !customSkillDraft.content.trim()) {
+      window.alert('请填写 Skill 描述和完整 Markdown 指令。');
+      return;
+    }
+    updateSettings({
+      customSkills: [
+        ...settings.customSkills.filter((skill) => skill.name !== name),
+        {
+          name,
+          description: customSkillDraft.description.trim(),
+          content: customSkillDraft.content.trim(),
+        },
+      ],
+      enabledSkills: Array.from(new Set([...settings.enabledSkills, name])),
+    });
+    setCustomSkillDraft({ name: '', description: '', content: '' });
   };
 
   return (
@@ -598,10 +629,10 @@ export function AgentSettings() {
 
         <Section icon={Sparkles} title="Skills" description="Skills 遵循渐进披露：系统提示只列出元数据，需要时通过 load_skill 读取完整流程。">
           <div className="grid gap-3 sm:grid-cols-2">
-            {AGENT_SKILLS.map((skill) => (
-              <label
+            {availableSkills.map((skill) => (
+              <div
                 key={skill.name}
-                className={`flex cursor-pointer items-start gap-3 rounded-xl border p-3 ${
+                className={`flex items-start gap-3 rounded-xl border p-3 ${
                   settings.enabledSkills.includes(skill.name)
                     ? 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)]'
                     : 'border-[var(--color-notion-border)]'
@@ -616,10 +647,70 @@ export function AgentSettings() {
                 <span>
                   <span className="block text-sm font-medium text-[var(--color-notion-text)]">{skill.name}</span>
                   <span className="mt-1 block text-xs text-[var(--color-notion-text-secondary)]">{skill.description}</span>
+                  {settings.customSkills.some((item) => item.name === skill.name) && (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        updateSettings({
+                          customSkills: settings.customSkills.filter((item) => item.name !== skill.name),
+                          enabledSkills: settings.enabledSkills.filter((name) => name !== skill.name),
+                        });
+                      }}
+                      className="mt-2 text-xs text-[var(--color-notion-error)] hover:underline"
+                    >
+                      删除自定义 Skill
+                    </button>
+                  )}
                 </span>
-              </label>
+              </div>
             ))}
           </div>
+          <details className="mt-4 rounded-xl border border-[var(--color-notion-border)] p-4">
+            <summary className="cursor-pointer text-sm font-medium text-[var(--color-notion-text)]">
+              导入自定义 Skill Markdown
+            </summary>
+            <p className="mt-2 text-xs text-[var(--color-notion-text-secondary)]">
+              浏览器版使用虚拟 SKILL.md；只加载指令文本，不执行 Skill 中的脚本。
+            </p>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <input
+                value={customSkillDraft.name}
+                onChange={(event) => setCustomSkillDraft((current) => ({
+                  ...current,
+                  name: event.target.value,
+                }))}
+                placeholder="skill-name"
+                className={INPUT_CLASS}
+              />
+              <input
+                value={customSkillDraft.description}
+                onChange={(event) => setCustomSkillDraft((current) => ({
+                  ...current,
+                  description: event.target.value,
+                }))}
+                placeholder="何时使用这个 Skill"
+                className={INPUT_CLASS}
+              />
+            </div>
+            <textarea
+              rows={8}
+              value={customSkillDraft.content}
+              onChange={(event) => setCustomSkillDraft((current) => ({
+                ...current,
+                content: event.target.value,
+              }))}
+              placeholder="# Skill instructions..."
+              className={`${INPUT_CLASS} mt-3 resize-y font-mono text-xs`}
+            />
+            <button
+              type="button"
+              onClick={addCustomSkill}
+              className="mt-3 inline-flex items-center gap-2 rounded-lg bg-[var(--color-notion-accent)] px-3 py-2 text-sm font-medium text-[var(--color-notion-on-accent)]"
+            >
+              <Plus className="h-4 w-4" /> 添加并启用
+            </button>
+          </details>
         </Section>
 
         <Section icon={ShieldCheck} title="系统提示与安全" description="参考题目会放入 <reference> 区块并明确按不可信数据处理。">

@@ -30,7 +30,7 @@ import {
   validateAgentConfiguration,
   type QuestionAgentRuntime,
 } from './runtime';
-import { AGENT_SKILLS } from './skills';
+import { getAvailableSkills } from './skills';
 import {
   AGENT_TOOL_LABELS,
   type AgentRuntimeStatus,
@@ -157,6 +157,7 @@ export function AgentPanel({
       thinking: '',
     };
   const configError = validateAgentConfiguration(settings);
+  const availableSkills = getAvailableSkills(settings.customSkills);
 
   useEffect(() => {
     if (open && !session) ensureSession(contextRef.current);
@@ -464,7 +465,7 @@ export function AgentPanel({
               className="min-w-0 flex-1 rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] px-2.5 py-1.5 text-xs text-[var(--color-notion-text)]"
             >
               <option value="">自动选择 Skill</option>
-              {AGENT_SKILLS
+              {availableSkills
                 .filter((skill) => settings.enabledSkills.includes(skill.name))
                 .map((skill) => (
                   <option key={skill.name} value={skill.name}>{skill.name}</option>

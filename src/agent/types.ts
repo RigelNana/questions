@@ -20,6 +20,12 @@ export type AgentToolName =
   | 'get_learning_progress'
   | 'load_skill';
 
+export interface AgentCustomSkill {
+  name: string;
+  description: string;
+  content: string;
+}
+
 export interface AgentSettings {
   enabled: boolean;
   connectionMode: AgentConnectionMode;
@@ -53,6 +59,7 @@ export interface AgentSettings {
   maxContextChars: number;
   enabledTools: AgentToolName[];
   enabledSkills: string[];
+  customSkills: AgentCustomSkill[];
   permissions: Record<AgentToolName, AgentPermission>;
   defaultPermission: AgentPermission;
   autoCompaction: boolean;
@@ -167,6 +174,7 @@ export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
     'answer-critic',
     'mock-interviewer',
   ],
+  customSkills: [],
   permissions: {
     get_question_context: 'allow',
     search_current_material: 'allow',
