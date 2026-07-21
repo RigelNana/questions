@@ -1,4 +1,11 @@
-import { useEffect, useState } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useState,
+  type FormEvent,
+} from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuestionStore } from '../stores/questionStore';
 import { useProgressStore } from '../stores/progressStore';
@@ -7,10 +14,14 @@ import { HighlightableMarkdown } from '../components/question/HighlightableMarkd
 import { DifficultyBadge } from '../components/filter/DifficultyBadge';
 import { TypeBadge } from '../components/filter/TypeBadge';
 import { QuizPanel } from '../components/question/QuizPanel';
+import { useAgentStore } from '../agent/agentStore';
 import { DOMAIN_LABELS, DOMAIN_ICONS, type Domain, type QuizAttempt } from '../types';
-import { Lightbulb, Star, ChevronUp, ArrowLeft, ArrowRight, BookOpen, ClipboardCheck, Highlighter } from 'lucide-react';
+import { Lightbulb, Star, ArrowLeft, ArrowRight, BookOpen, ClipboardCheck, Highlighter, Sparkles } from 'lucide-react';
 
-type DetailTab = 'content' | 'quiz';
+type DetailTab = 'content' | 'answer' | 'quiz';
+const AgentPanel = lazy(() => import('../agent/AgentPanel').then((module) => ({
+  default: module.AgentPanel,
+})));
 
 export function QuestionDetail() {
   const { domain, questionId } = useParams<{ domain: string; questionId: string }>();
@@ -29,6 +40,7 @@ export function QuestionDetail() {
     isBookmarked,
     getQuestionProgress,
     setLastVisited,
+    settings,
   } = useProgressStore();
   // 必须返回稳定的原始值（number），否则每次 render 都会产生新数组引用，
   // 触发 useSyncExternalStore 的 Object.is 判定为"变化"，造成无限循环 (React #185)。
@@ -42,9 +54,25 @@ export function QuestionDetail() {
     return total;
   });
   const clearForQuestion = useHighlightStore((s) => s.clearForQuestion);
+  const agentEnabled = useAgentStore((state) => state.settings.enabled);
+  const agentOpen = useAgentStore((state) => state.panelOpen);
+  const setAgentOpen = useAgentStore((state) => state.setPanelOpen);
 
-  const [showAnswer, setShowAnswer] = useState(false);
-  const [activeTab, setActiveTab] = useState<DetailTab>('content');
+  const [tabState, setTabState] = useState<{
+    questionId: string;
+    tab: DetailTab;
+  }>({
+    questionId: '',
+    tab: 'content',
+  });
+  const [questionJumpState, setQuestionJumpState] = useState({
+    questionId: '',
+    value: '1',
+  });
+  const [agentPromptRequest, setAgentPromptRequest] = useState({
+    id: 0,
+    text: '',
+  });
 
   useEffect(() => {
     fetchRegistry();
@@ -68,13 +96,43 @@ export function QuestionDetail() {
   const currentIndex = allQuestions.findIndex((q) => q.id === questionId);
   const progress = questionId ? getQuestionProgress(questionId) : undefined;
   const bookmarked = questionId ? isBookmarked(questionId) : false;
+  const questionHighlights = questionId
+    ? useHighlightStore.getState().getHighlightsByQuestion(questionId)
+    : [];
+  const activeTab = tabState.questionId === questionId
+    ? tabState.tab
+    : settings.autoExpandAnswer ? 'answer' : 'content';
+  const questionJump = questionJumpState.questionId === questionId
+    ? questionJumpState.value
+    : String(Math.max(1, currentIndex + 1));
 
-  const handleToggleAnswer = () => {
-    if (!showAnswer && questionId) {
+  useEffect(() => {
+    if (settings.autoExpandAnswer && questionId) {
       markAnswerViewed(questionId);
     }
-    setShowAnswer((s) => !s);
-  };
+  }, [questionId, settings.autoExpandAnswer, markAnswerViewed]);
+
+  const handleSelectTab = useCallback((tab: DetailTab) => {
+    if (tab === 'answer' && questionId) {
+      markAnswerViewed(questionId);
+    }
+    setTabState({
+      questionId: questionId ?? '',
+      tab,
+    });
+  }, [markAnswerViewed, questionId]);
+
+  const handleToggleAnswer = useCallback(() => {
+    handleSelectTab(activeTab === 'answer' ? 'content' : 'answer');
+  }, [activeTab, handleSelectTab]);
+
+  const handleOpenAgent = useCallback((text = '') => {
+    setAgentPromptRequest((current) => ({
+      id: current.id + 1,
+      text,
+    }));
+    setAgentOpen(true);
+  }, [setAgentOpen]);
 
   const handleQuizAttempt = (attempt: QuizAttempt) => {
     if (questionId) {
@@ -82,27 +140,55 @@ export function QuestionDetail() {
     }
   };
 
-  const handleNav = (direction: -1 | 1) => {
+  const handleNav = useCallback((direction: -1 | 1) => {
     const newIndex = currentIndex + direction;
     if (newIndex >= 0 && newIndex < allQuestions.length) {
       navigate(`/domains/${domain}/${allQuestions[newIndex].id}`);
     }
+  }, [allQuestions, currentIndex, domain, navigate]);
+
+  const handleQuestionJump = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const requested = Number.parseInt(questionJump, 10);
+    if (Number.isNaN(requested)) {
+      setQuestionJumpState({
+        questionId: questionId ?? '',
+        value: String(currentIndex + 1),
+      });
+      return;
+    }
+    const targetIndex = Math.min(allQuestions.length, Math.max(1, requested)) - 1;
+    const target = allQuestions[targetIndex];
+    if (target) navigate(`/domains/${domain}/${target.id}`);
   };
 
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (agentOpen) return;
+      if (
+        e.target instanceof HTMLInputElement
+        || e.target instanceof HTMLTextAreaElement
+        || e.target instanceof HTMLSelectElement
+      ) return;
       switch (e.key) {
         case 'ArrowLeft':
-          handleNav(-1);
+          if (activeTab !== 'quiz') {
+            e.preventDefault();
+            handleNav(-1);
+          }
           break;
         case 'ArrowRight':
-          handleNav(1);
+          if (activeTab !== 'quiz') {
+            e.preventDefault();
+            handleNav(1);
+          }
           break;
         case ' ':
-          e.preventDefault();
-          handleToggleAnswer();
+          if (activeTab !== 'quiz') {
+            e.preventDefault();
+            handleToggleAnswer();
+          }
           break;
         case 's':
         case 'S':
@@ -112,7 +198,7 @@ export function QuestionDetail() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  });
+  }, [activeTab, agentOpen, handleNav, handleToggleAnswer, questionId, toggleBookmark]);
 
   if (!question) {
     return (
@@ -156,26 +242,46 @@ export function QuestionDetail() {
       </div>
 
       {/* Title */}
-      <h1 className="text-xl font-bold text-[var(--color-notion-text)] mb-6 leading-tight tracking-tight">
-        {question.title}
-      </h1>
+      <div className="mb-6 flex items-start justify-between gap-3">
+        <h1 className="min-w-0 text-xl font-bold leading-tight tracking-tight text-[var(--color-notion-text)]">
+          {question.title}
+        </h1>
+        {agentEnabled && (
+          <button
+            onClick={() => handleOpenAgent()}
+            className="flex flex-shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-notion-accent)] px-3 py-2 text-sm font-medium text-[var(--color-notion-on-accent)] shadow-sm transition-opacity hover:opacity-90 active-press"
+          >
+            <Sparkles className="h-4 w-4" /> <span className="hidden sm:inline">问 AI</span>
+          </button>
+        )}
+      </div>
 
       {/* Tab bar */}
-      {hasQuiz && (
-        <div className="mb-6 flex min-w-0 items-stretch gap-1 border-b border-[var(--color-notion-border)]">
+      <div className="mb-6 flex min-w-0 items-stretch gap-1 border-b border-[var(--color-notion-border)]">
+        <button
+          onClick={() => handleSelectTab('content')}
+          className={`-mb-px flex min-w-0 flex-1 items-center justify-center gap-1.5 border-b-2 px-2 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 sm:flex-none sm:px-4 ${
+            activeTab === 'content'
+              ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
+              : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
+          }`}
+        >
+          <BookOpen className="w-4 h-4" /> 题目内容
+        </button>
+        <button
+          onClick={() => handleSelectTab('answer')}
+          className={`-mb-px flex min-w-0 flex-1 items-center justify-center gap-1.5 border-b-2 px-2 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 sm:flex-none sm:px-4 ${
+            activeTab === 'answer'
+              ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
+              : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
+          }`}
+        >
+          <Lightbulb className="w-4 h-4" /> 参考答案
+        </button>
+        {hasQuiz && (
           <button
-            onClick={() => setActiveTab('content')}
-            className={`-mb-px flex min-w-0 flex-1 items-center justify-center gap-1.5 border-b-2 px-3 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 sm:flex-none sm:px-4 ${
-              activeTab === 'content'
-                ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
-                : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
-            }`}
-          >
-            <BookOpen className="w-4 h-4" /> 题目内容
-          </button>
-          <button
-            onClick={() => setActiveTab('quiz')}
-            className={`-mb-px flex min-w-0 flex-1 items-center justify-center gap-1.5 border-b-2 px-3 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 sm:flex-none sm:px-4 ${
+            onClick={() => handleSelectTab('quiz')}
+            className={`-mb-px flex min-w-0 flex-1 items-center justify-center gap-1.5 border-b-2 px-2 py-2.5 text-sm font-medium whitespace-nowrap transition-all duration-200 sm:flex-none sm:px-4 ${
               activeTab === 'quiz'
                 ? 'border-[var(--color-notion-accent)] text-[var(--color-notion-accent)]'
                 : 'border-transparent text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
@@ -183,52 +289,62 @@ export function QuestionDetail() {
           >
             <ClipboardCheck className="w-4 h-4" /> 选择题 ({question.quiz.length})
           </button>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* Tab: Content */}
       {activeTab === 'content' && (
         <div className="animate-fade-in">
-          {/* Content (可划线批注) */}
-          <div className="p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] mb-3">
-            <HighlightableMarkdown
-              content={question.content}
-              questionId={question.id}
-              section="content"
-            />
-          </div>
-
-          {/* Highlight hint / summary */}
-          <div className="mb-5 flex items-center justify-between gap-2 text-xs text-[var(--color-notion-text-secondary)]">
-            <span className="inline-flex items-center gap-1.5">
-              <Highlighter className="w-3.5 h-3.5 text-[var(--color-notion-accent)]" />
-              {questionHighlightCount > 0 ? (
-                <>已有 <span className="font-semibold text-[var(--color-notion-text)]">{questionHighlightCount}</span> 条划线批注 · 选中文字可继续划线</>
-              ) : (
-                <>选中文字即可划线批注 · 点击划线可编辑</>
+          <section className="min-w-0 overflow-hidden rounded-xl border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)]">
+            <div className="flex items-center gap-2 border-b border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] px-4 py-3 text-sm font-semibold text-[var(--color-notion-text)]">
+              <BookOpen className="h-4 w-4 text-[var(--color-notion-accent)]" /> 问题
+            </div>
+            <div className="p-4 sm:p-6">
+              <HighlightableMarkdown
+                content={question.content}
+                questionId={question.id}
+                section="content"
+              />
+            </div>
+            <div className="flex items-center justify-between gap-2 border-t border-[var(--color-notion-border)] px-4 py-3 text-xs text-[var(--color-notion-text-secondary)]">
+              <span className="inline-flex items-center gap-1.5">
+                <Highlighter className="h-3.5 w-3.5 text-[var(--color-notion-accent)]" />
+                {questionHighlightCount > 0 ? (
+                  <>已有 <span className="font-semibold text-[var(--color-notion-text)]">{questionHighlightCount}</span> 条批注</>
+                ) : (
+                  <>选中文字即可划线批注</>
+                )}
+              </span>
+              {questionHighlightCount > 0 && (
+                <button
+                  onClick={() => {
+                    if (!questionId) return;
+                    if (window.confirm('确认清除本题全部划线批注？')) clearForQuestion(questionId);
+                  }}
+                  className="flex-shrink-0 text-[var(--color-notion-text-secondary)] transition-colors hover:text-[var(--color-notion-error)]"
+                >
+                  清除全部
+                </button>
               )}
-            </span>
-            {questionHighlightCount > 0 && (
-              <button
-                onClick={() => {
-                  if (!questionId) return;
-                  if (window.confirm('确认清除本题全部划线批注？')) clearForQuestion(questionId);
-                }}
-                className="text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-error)] transition-colors"
-              >
-                清除全部
-              </button>
-            )}
-          </div>
+            </div>
+          </section>
 
           {/* Action buttons */}
-          <div className="mb-5 flex flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center">
+          <div className="mb-5 mt-4 flex flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center">
             <button
-              onClick={handleToggleAnswer}
+              onClick={() => handleSelectTab('answer')}
               className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-4 py-2 text-sm font-medium text-[var(--color-notion-text)] transition-all duration-200 hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:justify-start sm:py-2.5"
             >
-              {showAnswer ? <><ChevronUp className="w-4 h-4" /> 收起答案</> : <><Lightbulb className="w-4 h-4 text-[var(--color-notion-warning)]" /> 显示答案</>}
+              <Lightbulb className="w-4 h-4 text-[var(--color-notion-warning)]" /> 查看答案
             </button>
+            {agentEnabled && (
+              <button
+                onClick={() => handleOpenAgent('请解释这道题考察的核心问题，并给出思考路径。')}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-accent)] px-4 py-2 text-sm font-medium text-[var(--color-notion-accent)] transition-colors hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:py-2.5"
+              >
+                <Sparkles className="h-4 w-4" /> 向 AI 追问题目
+              </button>
+            )}
             <button
               onClick={() => questionId && toggleBookmark(questionId)}
               className={`flex w-full items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-all duration-200 active-press sm:w-auto sm:justify-start sm:py-2.5 ${
@@ -242,59 +358,69 @@ export function QuestionDetail() {
             </button>
             {hasQuiz && (
               <button
-                onClick={() => setActiveTab('quiz')}
+                onClick={() => handleSelectTab('quiz')}
                 className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-4 py-2 text-sm font-medium text-[var(--color-notion-text)] transition-all duration-200 hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:justify-start sm:py-2.5"
               >
                 <ClipboardCheck className="w-4 h-4" /> 开始做题
               </button>
             )}
           </div>
-
-          {/* Answer */}
-          {showAnswer && (
-            <div className="mb-5 p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] animate-slide-up">
-              <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4">
-                参考答案
-              </h3>
-
-              {/* Key points */}
-              {question.keyPoints.length > 0 && (
-                <div className="mb-5 p-4 bg-[var(--color-notion-bg)] rounded-lg border border-[var(--color-notion-border)]">
-                  <h4 className="text-sm font-medium text-[var(--color-notion-text)] mb-2.5">核心要点</h4>
-                  <ul className="text-sm text-[var(--color-notion-text-secondary)] space-y-1.5 pl-4 list-disc">
-                    {question.keyPoints.map((point, i) => (
-                      <li key={i}>{point}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              <HighlightableMarkdown
-                content={question.answer}
-                questionId={question.id}
-                section="answer"
-              />
-
-              {/* References */}
-              {question.references && question.references.length > 0 && (
-                <div className="mt-5 pt-4 border-t border-[var(--color-notion-border)]">
-                  <h4 className="text-xs font-medium text-[var(--color-notion-text-secondary)] mb-2">参考资料</h4>
-                  <ul className="text-xs text-[var(--color-notion-accent)] space-y-1">
-                    {question.references.map((ref, i) => {
-                      const url = typeof ref === 'string' ? ref : ref.url;
-                      const label = typeof ref === 'string' ? ref : ref.title;
-                      return (
-                        <li key={i}>
-                          <a href={url} target="_blank" rel="noopener noreferrer" className="hover:underline">{label}</a>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </div>
-              )}
-            </div>
-          )}
         </div>
+      )}
+
+      {/* Tab: Answer */}
+      {activeTab === 'answer' && (
+        <section className="min-w-0 overflow-hidden rounded-xl border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] animate-fade-in">
+          <div className="flex items-center gap-2 border-b border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] px-4 py-3 text-sm font-semibold text-[var(--color-notion-text)]">
+            <Lightbulb className="h-4 w-4 text-[var(--color-notion-warning)]" /> 参考答案
+          </div>
+          <div className="p-4 sm:p-6">
+            {question.keyPoints.length > 0 && (
+              <div className="mb-5 rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] p-4">
+                <h4 className="mb-2.5 text-sm font-medium text-[var(--color-notion-text)]">核心要点</h4>
+                <ul className="list-disc space-y-1.5 pl-4 text-sm text-[var(--color-notion-text-secondary)]">
+                  {question.keyPoints.map((point, index) => (
+                    <li key={index}>{point}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <HighlightableMarkdown
+              content={question.answer}
+              questionId={question.id}
+              section="answer"
+            />
+
+            {question.references && question.references.length > 0 && (
+              <div className="mt-5 border-t border-[var(--color-notion-border)] pt-4">
+                <h4 className="mb-2 text-xs font-medium text-[var(--color-notion-text-secondary)]">参考资料</h4>
+                <ul className="space-y-1 text-xs text-[var(--color-notion-accent)]">
+                  {question.references.map((reference, index) => {
+                    const url = typeof reference === 'string' ? reference : reference.url;
+                    const label = typeof reference === 'string' ? reference : reference.title;
+                    return (
+                      <li key={index}>
+                        <a href={url} target="_blank" rel="noopener noreferrer" className="hover:underline">{label}</a>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
+
+            {agentEnabled && (
+              <div className="mt-6 border-t border-[var(--color-notion-border)] pt-4">
+                <button
+                  onClick={() => handleOpenAgent('请审查这份参考答案：指出正确之处、遗漏、边界条件，并给出更好的面试表达。')}
+                  className="inline-flex items-center gap-2 rounded-lg border border-[var(--color-notion-accent)] px-4 py-2 text-sm font-medium text-[var(--color-notion-accent)] transition-colors hover:bg-[var(--color-notion-accent-light)]"
+                >
+                  <Sparkles className="h-4 w-4" /> 向 AI 追问答案
+                </button>
+              </div>
+            )}
+          </div>
+        </section>
       )}
 
       {/* Tab: Quiz */}
@@ -304,6 +430,9 @@ export function QuestionDetail() {
             quizzes={question.quiz}
             existingAttempts={progress?.quizAttempts ?? []}
             onAttempt={handleQuizAttempt}
+            onBoundaryNavigate={handleNav}
+            hasPreviousQuestion={currentIndex > 0}
+            hasNextQuestion={currentIndex < allQuestions.length - 1}
           />
         </div>
       )}
@@ -319,9 +448,41 @@ export function QuestionDetail() {
           <span className="hidden sm:inline">上一知识点</span>
           <span className="sm:hidden">上一个</span>
         </button>
-        <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono">
-          {currentIndex + 1} / {allQuestions.length}
-        </span>
+        <form onSubmit={handleQuestionJump} className="flex items-center gap-1.5">
+          <label htmlFor="question-jump" className="hidden text-xs text-[var(--color-notion-text-secondary)] sm:inline">
+            知识点
+          </label>
+          <input
+            id="question-jump"
+            type="number"
+            min={1}
+            max={allQuestions.length}
+            value={questionJump}
+            onChange={(event) => setQuestionJumpState({
+              questionId: questionId ?? '',
+              value: event.target.value,
+            })}
+            onBlur={() => {
+              if (!questionJump) {
+                setQuestionJumpState({
+                  questionId: questionId ?? '',
+                  value: String(currentIndex + 1),
+                });
+              }
+            }}
+            className="search-control compact-control h-8 w-14 rounded-md border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-2 text-center text-xs text-[var(--color-notion-text)]"
+            aria-label={`跳转知识点，范围 1 到 ${allQuestions.length}`}
+          />
+          <span className="text-xs font-mono text-[var(--color-notion-text-secondary)]">
+            / {allQuestions.length}
+          </span>
+          <button
+            type="submit"
+            className="compact-control inline-flex h-8 items-center rounded-md border border-[var(--color-notion-border)] px-2 text-xs text-[var(--color-notion-text-secondary)] hover:border-[var(--color-notion-accent)] hover:text-[var(--color-notion-accent)]"
+          >
+            跳转
+          </button>
+        </form>
         <button
           onClick={() => handleNav(1)}
           disabled={currentIndex >= allQuestions.length - 1}
@@ -332,6 +493,22 @@ export function QuestionDetail() {
           <ArrowRight className="w-4 h-4" />
         </button>
       </div>
+
+      {agentEnabled && agentOpen && (
+        <Suspense fallback={null}>
+          <AgentPanel
+            open
+            context={{
+              question,
+              activeSection: activeTab,
+              highlights: questionHighlights,
+              progress,
+            }}
+            promptRequest={agentPromptRequest}
+            onClose={() => setAgentOpen(false)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

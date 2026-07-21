@@ -60,7 +60,3 @@ export function WindowControls() {
     </div>
   );
 }
-
-export function isElectronEnv(): boolean {
-  return 'electronAPI' in window;
-}

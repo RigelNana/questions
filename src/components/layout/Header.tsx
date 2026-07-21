@@ -1,27 +1,34 @@
 import { Search, Menu, Sun, Moon, ChevronLeft } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useProgressStore } from '../../stores/progressStore';
-import { WindowControls, isElectronEnv } from './WindowControls';
+import { WindowControls } from './WindowControls';
+import { useResolvedTheme } from '../../hooks/useResolvedTheme';
+import { isElectronEnv } from '../../utils/platform';
+import { runAppearanceTransition } from '../../utils/appearanceTransition';
 
 interface HeaderProps {
   onToggleSidebar: () => void;
   onOpenSearch: () => void;
 }
 
-const TOP_LEVEL_PATHS = ['/', '/review', '/progress', '/settings'];
+const TOP_LEVEL_PATHS = ['/', '/bookmarks', '/review', '/progress', '/settings'];
 const electron = isElectronEnv();
 
 export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
   const { settings, updateSettings } = useProgressStore();
+  const resolvedTheme = useResolvedTheme();
   const location = useLocation();
   const navigate = useNavigate();
 
   const toggleTheme = () => {
-    const next = settings.theme === 'dark' ? 'light' : 'dark';
-    updateSettings({ theme: next });
+    const next = resolvedTheme === 'dark' ? 'light' : 'dark';
+    runAppearanceTransition(
+      () => updateSettings({ theme: next }),
+      settings.reduceMotion,
+    );
   };
 
-  const isDark = settings.theme === 'dark' || (settings.theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  const isDark = resolvedTheme === 'dark';
   const isSubPage = !TOP_LEVEL_PATHS.includes(location.pathname);
 
   return (
@@ -56,7 +63,8 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
       {/* Search trigger */}
       <button
         onClick={onOpenSearch}
-        className="flex-1 max-w-md flex items-center gap-2.5 px-3.5 py-2 rounded-lg bg-[var(--color-notion-bg-secondary)] text-[var(--color-notion-text-secondary)] text-sm cursor-pointer hover:bg-[var(--color-notion-bg-hover)] transition-all duration-200 border border-transparent hover:border-[var(--color-notion-border)] [-webkit-app-region:no-drag]"
+        className="search-control box-border flex flex-1 max-w-md items-center gap-2.5 rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] px-4 py-2 text-sm text-[var(--color-notion-text-secondary)] transition-colors duration-200 hover:bg-[var(--color-notion-bg-hover)] [-webkit-app-region:no-drag]"
+        aria-label="搜索题目"
       >
         <Search className="w-3.5 h-3.5 flex-shrink-0 opacity-60" />
         <span className="truncate">搜索题目...</span>
@@ -69,7 +77,8 @@ export function Header({ onToggleSidebar, onOpenSearch }: HeaderProps) {
       <button
         onClick={toggleTheme}
         className="ml-3 p-2 rounded-lg hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)] transition-all duration-200 active-press [-webkit-app-region:no-drag]"
-        aria-label="Toggle theme"
+        aria-label={isDark ? '切换到浅色模式' : '切换到深色模式'}
+        title={settings.theme === 'system' ? '当前跟随系统，点击切换为手动模式' : undefined}
       >
         {isDark
           ? <Sun key="sun" className="w-[18px] h-[18px] animate-icon-rotate" />

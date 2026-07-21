@@ -19,6 +19,8 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
   const handleClose = useCallback(() => {
     setIsClosing(true);
     closingTimerRef.current = setTimeout(() => {
+      setQuery('');
+      setSelectedIndex(0);
       setIsClosing(false);
       onClose();
     }, 200);
@@ -45,15 +47,10 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
 
   useEffect(() => {
     if (isOpen) {
-      setQuery('');
-      setSelectedIndex(0);
-      setTimeout(() => inputRef.current?.focus(), 50);
+      const focusTimer = setTimeout(() => inputRef.current?.focus(), 50);
+      return () => clearTimeout(focusTimer);
     }
   }, [isOpen]);
-
-  useEffect(() => {
-    setSelectedIndex(0);
-  }, [query]);
 
   const handleSelect = (index: number) => {
     const item = results[index];
@@ -99,7 +96,10 @@ export function SearchModal({ isOpen, onClose }: SearchModalProps) {
             ref={inputRef}
             type="text"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setSelectedIndex(0);
+            }}
             onKeyDown={handleKeyDown}
             placeholder="搜索题目、标签、知识点..."
             className="flex-1 text-sm bg-transparent text-[var(--color-notion-text)] placeholder:text-[var(--color-notion-text-secondary)]/60 focus:outline-none"

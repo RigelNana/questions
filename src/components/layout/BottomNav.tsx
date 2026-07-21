@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, XCircle, TrendingUp, Settings } from 'lucide-react';
+import { LayoutDashboard, Star, XCircle, TrendingUp, Settings } from 'lucide-react';
 
 interface BottomNavProps {
   hidden?: boolean;
@@ -8,6 +8,7 @@ interface BottomNavProps {
 export function BottomNav({ hidden }: BottomNavProps) {
   const items = [
     { to: '/', icon: LayoutDashboard, label: '总览', end: true },
+    { to: '/bookmarks', icon: Star, label: '收藏' },
     { to: '/review', icon: XCircle, label: '错题' },
     { to: '/progress', icon: TrendingUp, label: '进度' },
     { to: '/settings', icon: Settings, label: '设置' },
@@ -20,7 +21,7 @@ export function BottomNav({ hidden }: BottomNavProps) {
       }`}
       style={{ transition: 'translate 300ms var(--ease-emphasized), opacity 300ms var(--ease-emphasized)' }}
     >
-      <div className="bottom-nav-grid mx-auto grid max-w-lg grid-cols-4 gap-1 px-2">
+      <div className="bottom-nav-grid mx-auto grid max-w-lg grid-cols-5 gap-1 px-2">
         {items.map(({ to, icon: Icon, label, end }) => (
           <NavLink
             key={to}

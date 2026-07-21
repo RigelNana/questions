@@ -1,19 +1,49 @@
-import { useState, useMemo, useEffect, useCallback } from 'react';
+import { useState, useMemo, useEffect, useCallback, type FormEvent } from 'react';
 import type { QuizQuestion as QuizQuestionType, QuizAttempt } from '../../types';
 import { MarkdownRenderer } from '../ui/MarkdownRenderer';
 import { CheckCircle, XCircle, ChevronLeft, ChevronRight } from 'lucide-react';
+import { useProgressStore } from '../../stores/progressStore';
+
+const EMPTY_CHOICES: QuizQuestionType['choices'] = [];
+
+function hashString(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function shuffledChoices(quiz: QuizQuestionType) {
+  const choices = [...quiz.choices];
+  let seed = hashString(quiz.id);
+  for (let index = choices.length - 1; index > 0; index -= 1) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    const swapIndex = seed % (index + 1);
+    [choices[index], choices[swapIndex]] = [choices[swapIndex], choices[index]];
+  }
+  return choices;
+}
 
 interface QuizPanelProps {
   quizzes: QuizQuestionType[];
   existingAttempts: QuizAttempt[];
   onAttempt: (attempt: QuizAttempt) => void;
+  onBoundaryNavigate?: (direction: -1 | 1) => void;
+  hasPreviousQuestion?: boolean;
+  hasNextQuestion?: boolean;
 }
 
 export function QuizPanel({
   quizzes,
   existingAttempts,
   onAttempt,
+  onBoundaryNavigate,
+  hasPreviousQuestion = false,
+  hasNextQuestion = false,
 }: QuizPanelProps) {
+  const shuffleChoices = useProgressStore((state) => state.settings.shuffleChoices);
   // Start from first unanswered question
   const firstUnanswered = useMemo(() => {
     const answeredIds = new Set(existingAttempts.map((a) => a.quizId));
@@ -24,8 +54,15 @@ export function QuizPanel({
   const [currentIndex, setCurrentIndex] = useState(firstUnanswered);
   const [selectedAnswer, setSelectedAnswer] = useState<string | null>(null);
   const [showExplanation, setShowExplanation] = useState(false);
+  const [jumpInput, setJumpInput] = useState(String(firstUnanswered + 1));
+
+  const orderedChoices = useMemo(() => quizzes.map((quiz) => {
+    if (!shuffleChoices) return quiz.choices;
+    return shuffledChoices(quiz);
+  }), [quizzes, shuffleChoices]);
 
   const currentQuiz = quizzes[currentIndex];
+  const currentChoices = orderedChoices[currentIndex] ?? EMPTY_CHOICES;
   const existingAttempt = currentQuiz
     ? existingAttempts.find((a) => a.quizId === currentQuiz.id)
     : undefined;
@@ -52,51 +89,86 @@ export function QuizPanel({
       setCurrentIndex((i) => i + 1);
       setSelectedAnswer(null);
       setShowExplanation(false);
+    } else {
+      onBoundaryNavigate?.(1);
     }
-  }, [currentIndex, quizzes.length]);
+  }, [currentIndex, quizzes.length, onBoundaryNavigate]);
 
   const handlePrev = useCallback(() => {
     if (currentIndex > 0) {
       setCurrentIndex((i) => i - 1);
       setSelectedAnswer(null);
       setShowExplanation(false);
+    } else {
+      onBoundaryNavigate?.(-1);
     }
-  }, [currentIndex]);
+  }, [currentIndex, onBoundaryNavigate]);
 
-  const jumpTo = (index: number) => {
+  const jumpTo = useCallback((index: number) => {
     setCurrentIndex(index);
     setSelectedAnswer(null);
     setShowExplanation(false);
+  }, []);
+
+  useEffect(() => {
+    setJumpInput(String(currentIndex + 1));
+  }, [currentIndex]);
+
+  const handleJump = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const requested = Number.parseInt(jumpInput, 10);
+    if (Number.isNaN(requested)) {
+      setJumpInput(String(currentIndex + 1));
+      return;
+    }
+    jumpTo(Math.min(quizzes.length, Math.max(1, requested)) - 1);
   };
 
-  // Keyboard shortcuts: 1-4 or A-D to select, Enter to submit
+  // Arrow keys move through quizzes and continue to adjacent knowledge points at boundaries.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (isAnswered) {
-        if (e.key === 'Enter' || e.key === 'ArrowRight') {
-          e.preventDefault();
-          handleNext();
-        }
+      if (
+        e.target instanceof HTMLInputElement
+        || e.target instanceof HTMLTextAreaElement
+        || e.target instanceof HTMLSelectElement
+      ) return;
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (e.key === 'ArrowLeft') handlePrev();
+        else handleNext();
         return;
       }
-      const choiceMap: Record<string, string> = { '1': 'A', '2': 'B', '3': 'C', '4': 'D', 'a': 'A', 'b': 'B', 'c': 'C', 'd': 'D' };
-      if (choiceMap[e.key]) {
+
+      if (isAnswered && e.key === 'Enter') {
         e.preventDefault();
-        setSelectedAnswer(choiceMap[e.key]);
-      } else if (e.key === 'Enter' && selectedAnswer) {
+        handleNext();
+        return;
+      }
+
+      const numericIndex = /^[1-9]$/.test(e.key) ? Number(e.key) - 1 : -1;
+      const letterIndex = /^[a-i]$/i.test(e.key) ? e.key.toUpperCase().charCodeAt(0) - 65 : -1;
+      const choiceIndex = numericIndex >= 0 ? numericIndex : letterIndex;
+      if (!isAnswered && currentChoices[choiceIndex]) {
+        e.preventDefault();
+        setSelectedAnswer(currentChoices[choiceIndex].id);
+      } else if (!isAnswered && e.key === 'Enter' && selectedAnswer) {
         e.preventDefault();
         handleSubmit();
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [isAnswered, selectedAnswer, handleSubmit, handleNext]);
+  }, [isAnswered, selectedAnswer, currentChoices, handleSubmit, handleNext, handlePrev]);
 
   const displayAnswer = existingAttempt?.selectedAnswer ?? selectedAnswer;
   const isCorrect = currentQuiz
     ? existingAttempt?.isCorrect ?? (showExplanation ? displayAnswer === currentQuiz.correctAnswer : undefined)
     : undefined;
+  const correctChoiceIndex = currentChoices.findIndex((choice) => choice.id === currentQuiz?.correctAnswer);
+  const correctChoiceLabel = correctChoiceIndex >= 0
+    ? String.fromCharCode(65 + correctChoiceIndex)
+    : currentQuiz?.correctAnswer;
 
   if (!currentQuiz) return null;
 
@@ -114,38 +186,61 @@ export function QuizPanel({
       </div>
 
       {/* Dot navigation */}
-      <div className="px-4 py-2.5 bg-[var(--color-notion-bg-secondary)] border-b border-[var(--color-notion-border)] flex items-center gap-1.5 flex-wrap">
-        {quizzes.map((q, i) => {
-          const attempt = existingAttempts.find((a) => a.quizId === q.id);
-          const isCurrent = i === currentIndex;
-          let dotColor = 'bg-[var(--color-notion-border)]';
-          if (attempt) {
-            dotColor = attempt.isCorrect
-              ? 'bg-[var(--color-notion-correct)]'
-              : 'bg-[var(--color-notion-error)]';
-          } else if (isCurrent) {
-            dotColor = 'bg-[var(--color-notion-accent)]';
-          }
-          return (
-            <button
-              key={q.id}
-              onClick={() => jumpTo(i)}
-              className={`compact-control group flex h-7 w-7 items-center justify-center rounded-full transition-all duration-200 ${
-                isCurrent
-                  ? 'bg-[var(--color-notion-accent-light)]'
-                  : 'hover:bg-[var(--color-notion-bg-hover)]'
-              }`}
-              title={`Q${i + 1}`}
-              aria-label={`跳转到第 ${i + 1} 题`}
-            >
-              <span
-                className={`block h-2.5 w-2.5 rounded-full transition-transform duration-200 ${dotColor} ${
-                  isCurrent ? 'scale-150' : 'group-hover:scale-125'
-                } ${isCurrent && !attempt ? 'animate-dot-breathe' : ''}`}
-              />
-            </button>
-          );
-        })}
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] px-4 py-2.5">
+        <div className="flex flex-1 flex-wrap items-center gap-1.5">
+          {quizzes.map((q, i) => {
+            const attempt = existingAttempts.find((a) => a.quizId === q.id);
+            const isCurrent = i === currentIndex;
+            let dotColor = 'bg-[var(--color-notion-border)]';
+            if (attempt) {
+              dotColor = attempt.isCorrect
+                ? 'bg-[var(--color-notion-correct)]'
+                : 'bg-[var(--color-notion-error)]';
+            } else if (isCurrent) {
+              dotColor = 'bg-[var(--color-notion-accent)]';
+            }
+            return (
+              <button
+                key={q.id}
+                onClick={() => jumpTo(i)}
+                className={`compact-control group flex h-7 w-7 items-center justify-center rounded-full transition-all duration-200 ${
+                  isCurrent
+                    ? 'bg-[var(--color-notion-accent-light)]'
+                    : 'hover:bg-[var(--color-notion-bg-hover)]'
+                }`}
+                title={`Q${i + 1}`}
+                aria-label={`跳转到第 ${i + 1} 题`}
+              >
+                <span
+                  className={`block h-2.5 w-2.5 rounded-full transition-transform duration-200 ${dotColor} ${
+                    isCurrent ? 'scale-150' : 'group-hover:scale-125'
+                  } ${isCurrent && !attempt ? 'animate-dot-breathe' : ''}`}
+                />
+              </button>
+            );
+          })}
+        </div>
+        <form onSubmit={handleJump} className="ml-auto flex items-center gap-1.5">
+          <span className="text-xs text-[var(--color-notion-text-secondary)]">跳至</span>
+          <input
+            type="number"
+            min={1}
+            max={quizzes.length}
+            value={jumpInput}
+            onChange={(event) => setJumpInput(event.target.value)}
+            onBlur={() => {
+              if (!jumpInput) setJumpInput(String(currentIndex + 1));
+            }}
+            className="search-control compact-control h-7 w-12 rounded-md border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-1 text-center text-xs text-[var(--color-notion-text)]"
+            aria-label={`跳转选择题，范围 1 到 ${quizzes.length}`}
+          />
+          <button
+            type="submit"
+            className="compact-control h-7 rounded-md border border-[var(--color-notion-border)] px-2 text-xs text-[var(--color-notion-text-secondary)] hover:border-[var(--color-notion-accent)] hover:text-[var(--color-notion-accent)]"
+          >
+            前往
+          </button>
+        </form>
       </div>
 
       {/* Question */}
@@ -157,9 +252,10 @@ export function QuizPanel({
 
         {/* Choices */}
         <div className="space-y-2">
-          {currentQuiz.choices.map((choice, choiceIdx) => {
+          {currentChoices.map((choice, choiceIdx) => {
             const isSelected = displayAnswer === choice.id;
             const isCorrectChoice = choice.id === currentQuiz.correctAnswer;
+            const displayLabel = String.fromCharCode(65 + choiceIdx);
 
             let choiceStyle = 'border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/60 hover:bg-[var(--color-notion-bg-secondary)]';
             if (isAnswered) {
@@ -188,7 +284,7 @@ export function QuizPanel({
                 }`}
               >
                 <span className={`text-sm font-medium flex-shrink-0 mt-0.5 ${isSelected && !isAnswered ? 'text-[var(--color-notion-accent)]' : 'text-[var(--color-notion-text-secondary)]'}`}>
-                  {choice.id}.
+                  {displayLabel}.
                 </span>
                 <MarkdownRenderer content={choice.text} className="text-sm flex-1" />
                 {!isAnswered && (
@@ -207,7 +303,7 @@ export function QuizPanel({
             <button
               onClick={handleSubmit}
               disabled={!selectedAnswer}
-              className="w-full rounded-lg bg-[var(--color-notion-accent)] px-5 py-2.5 text-sm font-medium text-white transition-all duration-200 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30 sm:w-auto active-press"
+              className="w-full rounded-lg bg-[var(--color-notion-accent)] px-5 py-2.5 text-sm font-medium text-[var(--color-notion-on-accent)] transition-all duration-200 hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30 sm:w-auto active-press"
             >
               提交答案
             </button>
@@ -234,7 +330,7 @@ export function QuizPanel({
             <MarkdownRenderer content={currentQuiz.explanation} className="text-sm" />
             {!isCorrect && (
               <div className="mt-2.5 pt-2 border-t border-[var(--color-notion-border)] text-xs text-[var(--color-notion-text-secondary)]">
-                正确答案: <span className="font-semibold text-[var(--color-notion-correct)]">{currentQuiz.correctAnswer}</span>
+                正确答案: <span className="font-semibold text-[var(--color-notion-correct)]">{correctChoiceLabel}</span>
               </div>
             )}
           </div>
@@ -244,20 +340,20 @@ export function QuizPanel({
         <div className="flex items-center justify-between mt-5 pt-4 border-t border-[var(--color-notion-border)]">
           <button
             onClick={handlePrev}
-            disabled={currentIndex === 0}
+            disabled={currentIndex === 0 && !hasPreviousQuestion}
             className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
           >
-            <ChevronLeft className="w-4 h-4" /> 上一小题
+            <ChevronLeft className="w-4 h-4" /> {currentIndex === 0 ? '上一知识点' : '上一小题'}
           </button>
           <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono">
             {currentIndex + 1} / {quizzes.length}
           </span>
           <button
             onClick={handleNext}
-            disabled={currentIndex === quizzes.length - 1}
+            disabled={currentIndex === quizzes.length - 1 && !hasNextQuestion}
             className="flex items-center gap-1 text-sm text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-accent)] disabled:opacity-30 transition-all duration-200"
           >
-            下一小题 <ChevronRight className="w-4 h-4" />
+            {currentIndex === quizzes.length - 1 ? '下一知识点' : '下一小题'} <ChevronRight className="w-4 h-4" />
           </button>
         </div>
       </div>

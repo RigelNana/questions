@@ -18,7 +18,17 @@ interface ProgressState extends UserProgress {
 }
 
 export const useProgressStore = create<ProgressState>((set, get) => {
-  const saved = loadProgress<UserProgress>(DEFAULT_PROGRESS);
+  const loaded = loadProgress<Partial<UserProgress>>(DEFAULT_PROGRESS);
+  const saved: UserProgress = {
+    ...DEFAULT_PROGRESS,
+    ...loaded,
+    questions: loaded.questions ?? {},
+    bookmarks: loaded.bookmarks ?? [],
+    settings: {
+      ...DEFAULT_PROGRESS.settings,
+      ...loaded.settings,
+    },
+  };
 
   const persist = () => {
     const { questions, bookmarks, settings, lastVisited } = get();
@@ -110,7 +120,12 @@ export const useProgressStore = create<ProgressState>((set, get) => {
     },
 
     resetProgress: () => {
-      set(DEFAULT_PROGRESS);
+      set({
+        ...DEFAULT_PROGRESS,
+        questions: {},
+        bookmarks: [],
+        settings: { ...DEFAULT_PROGRESS.settings },
+      });
       persist();
     },
 

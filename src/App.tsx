@@ -5,10 +5,11 @@ import { Layout } from './components/layout/Layout';
 const isNative = 'electronAPI' in window
   || 'Capacitor' in window
   || window.location.hostname === 'localhost' && window.location.protocol === 'https:';
+const webBaseName = import.meta.env.BASE_URL.replace(/\/$/, '') || '/';
 
 function Router({ children }: { children: ReactNode }) {
   if (isNative) return <HashRouter>{children}</HashRouter>;
-  return <BrowserRouter basename="/questions">{children}</BrowserRouter>;
+  return <BrowserRouter basename={webBaseName}>{children}</BrowserRouter>;
 }
 
 // Lazy-loaded pages for code splitting
@@ -18,6 +19,8 @@ const QuestionDetail = lazy(() => import('./pages/QuestionDetail').then((m) => (
 const Review = lazy(() => import('./pages/Review').then((m) => ({ default: m.Review })));
 const Progress = lazy(() => import('./pages/Progress').then((m) => ({ default: m.Progress })));
 const Settings = lazy(() => import('./pages/Settings').then((m) => ({ default: m.Settings })));
+const Bookmarks = lazy(() => import('./pages/Bookmarks').then((m) => ({ default: m.Bookmarks })));
+const AgentSettings = lazy(() => import('./pages/AgentSettings').then((m) => ({ default: m.AgentSettings })));
 
 function PageLoader() {
   return (
@@ -43,7 +46,9 @@ export default function App() {
           <Route path="domains/:domain/:questionId" element={<Suspense fallback={<PageLoader />}><QuestionDetail /></Suspense>} />
           <Route path="review" element={<Suspense fallback={<PageLoader />}><Review /></Suspense>} />
           <Route path="progress" element={<Suspense fallback={<PageLoader />}><Progress /></Suspense>} />
+          <Route path="bookmarks" element={<Suspense fallback={<PageLoader />}><Bookmarks /></Suspense>} />
           <Route path="settings" element={<Suspense fallback={<PageLoader />}><Settings /></Suspense>} />
+          <Route path="settings/agent" element={<Suspense fallback={<PageLoader />}><AgentSettings /></Suspense>} />
         </Route>
       </Routes>
     </Router>

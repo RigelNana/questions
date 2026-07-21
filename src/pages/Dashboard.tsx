@@ -133,7 +133,7 @@ export function Dashboard() {
       <div className="mb-10">
         <div className="flex items-center gap-3 mb-2">
           <div className="w-9 h-9 rounded-xl bg-[var(--color-notion-accent)] flex items-center justify-center">
-            <Target className="w-5 h-5 text-white" />
+            <Target className="w-5 h-5 text-[var(--color-notion-on-accent)]" />
           </div>
           <h1 className="text-2xl font-bold text-[var(--color-notion-text)] tracking-tight">
             刷题工具
@@ -182,10 +182,14 @@ export function Dashboard() {
 
       {/* Bookmarks quick access */}
       {bookmarkCount > 0 && (
-        <div className="mb-6 flex items-center gap-2 text-sm text-[var(--color-notion-text-secondary)]">
+        <Link
+          to="/bookmarks"
+          className="mb-6 flex items-center gap-2 rounded-lg border border-transparent px-3 py-2 text-sm text-[var(--color-notion-text-secondary)] no-underline transition-colors hover:border-[var(--color-notion-border)] hover:bg-[var(--color-notion-bg-secondary)] hover:text-[var(--color-notion-accent)]"
+        >
           <Star className="w-4 h-4 text-[var(--color-notion-warning)]" />
           已收藏 {bookmarkCount} 道题目
-        </div>
+          <span className="ml-auto text-xs">查看全部 →</span>
+        </Link>
       )}
 
       {/* Domain grid */}
