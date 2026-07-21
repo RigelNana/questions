@@ -4,6 +4,28 @@ import { MarkdownRenderer } from '../ui/MarkdownRenderer';
 import { CheckCircle, XCircle, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useProgressStore } from '../../stores/progressStore';
 
+const EMPTY_CHOICES: QuizQuestionType['choices'] = [];
+
+function hashString(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function shuffledChoices(quiz: QuizQuestionType) {
+  const choices = [...quiz.choices];
+  let seed = hashString(quiz.id);
+  for (let index = choices.length - 1; index > 0; index -= 1) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    const swapIndex = seed % (index + 1);
+    [choices[index], choices[swapIndex]] = [choices[swapIndex], choices[index]];
+  }
+  return choices;
+}
+
 interface QuizPanelProps {
   quizzes: QuizQuestionType[];
   existingAttempts: QuizAttempt[];
@@ -36,16 +58,11 @@ export function QuizPanel({
 
   const orderedChoices = useMemo(() => quizzes.map((quiz) => {
     if (!shuffleChoices) return quiz.choices;
-    const choices = [...quiz.choices];
-    for (let index = choices.length - 1; index > 0; index -= 1) {
-      const swapIndex = Math.floor(Math.random() * (index + 1));
-      [choices[index], choices[swapIndex]] = [choices[swapIndex], choices[index]];
-    }
-    return choices;
+    return shuffledChoices(quiz);
   }), [quizzes, shuffleChoices]);
 
   const currentQuiz = quizzes[currentIndex];
-  const currentChoices = orderedChoices[currentIndex] ?? [];
+  const currentChoices = orderedChoices[currentIndex] ?? EMPTY_CHOICES;
   const existingAttempt = currentQuiz
     ? existingAttempts.find((a) => a.quizId === currentQuiz.id)
     : undefined;

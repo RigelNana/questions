@@ -5,8 +5,13 @@ import { DifficultyBadge } from '../filter/DifficultyBadge';
 import { TypeBadge } from '../filter/TypeBadge';
 import { Check, Circle, Star } from 'lucide-react';
 
+type QuestionCardData = Pick<
+  QuestionEntry,
+  'id' | 'domain' | 'title' | 'type' | 'difficulty' | 'tags'
+>;
+
 interface QuestionCardProps {
-  question: QuestionEntry;
+  question: QuestionCardData;
   isCompleted?: boolean;
   isBookmarked?: boolean;
   onToggleBookmark?: () => void;

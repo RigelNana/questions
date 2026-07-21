@@ -114,7 +114,7 @@ export function Settings() {
                   type="color"
                   value={settings.accentColor === 'default' ? '#5E81AC' : settings.accentColor}
                   onChange={(event) => updateSettings({ accentColor: event.target.value.toUpperCase() })}
-                  className="h-4 w-4 cursor-pointer border-0 bg-transparent p-0"
+                  className="compact-control h-4 w-4 cursor-pointer border-0 bg-transparent p-0"
                   aria-label="自定义主题色"
                 />
                 自定义
@@ -168,7 +168,7 @@ export function Settings() {
           <div className="flex items-center justify-between py-2.5 gap-4">
             <div className="min-w-0">
               <div className="text-sm text-[var(--color-notion-text)]">随机打乱选项顺序</div>
-              <div className="text-xs text-[var(--color-notion-text-secondary)] mt-0.5">每次作答时选项顺序不同</div>
+              <div className="text-xs text-[var(--color-notion-text-secondary)] mt-0.5">避免正确选项总在固定位置</div>
             </div>
             <Toggle
               checked={settings.shuffleChoices}

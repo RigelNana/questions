@@ -3,42 +3,39 @@ import { Link } from 'react-router-dom';
 import { Star, Search } from 'lucide-react';
 import { QuestionCard } from '../components/question/QuestionCard';
 import { useProgressStore } from '../stores/progressStore';
-import { useQuestionStore } from '../stores/questionStore';
 import { ALL_DOMAINS } from '../types';
+import {
+  loadQuestionIndex,
+  type QuestionIndexEntry,
+} from '../utils/questionLoader';
 
 export function Bookmarks() {
   const { bookmarks, questions: progress, toggleBookmark } = useProgressStore();
-  const {
-    registry,
-    fetchRegistry,
-    fetchPacksForDomain,
-    getAllLoadedQuestions,
-  } = useQuestionStore();
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
+  const [questionIndex, setQuestionIndex] = useState<QuestionIndexEntry[]>([]);
 
   useEffect(() => {
-    fetchRegistry();
-  }, [fetchRegistry]);
-
-  useEffect(() => {
-    if (!registry) return;
     let active = true;
-    setIsLoading(true);
-    Promise.all(ALL_DOMAINS.map((domain) => fetchPacksForDomain(domain)))
+    Promise.all(ALL_DOMAINS.map(loadQuestionIndex))
+      .then((indexes) => {
+        if (active) setQuestionIndex(indexes.flat());
+      })
+      .catch(() => {
+        if (active) setQuestionIndex([]);
+      })
       .finally(() => {
         if (active) setIsLoading(false);
       });
     return () => {
       active = false;
     };
-  }, [registry, fetchPacksForDomain]);
+  }, []);
 
-  const allQuestions = getAllLoadedQuestions();
   const bookmarkedQuestions = useMemo(() => {
     const bookmarkOrder = new Map(bookmarks.map((id, index) => [id, index]));
     const query = searchQuery.trim().toLowerCase();
-    return allQuestions
+    return questionIndex
       .filter((question) => bookmarkOrder.has(question.id))
       .filter((question) => (
         !query
@@ -46,7 +43,7 @@ export function Bookmarks() {
         || question.tags.some((tag) => tag.toLowerCase().includes(query))
       ))
       .sort((a, b) => (bookmarkOrder.get(b.id) ?? 0) - (bookmarkOrder.get(a.id) ?? 0));
-  }, [allQuestions, bookmarks, searchQuery]);
+  }, [questionIndex, bookmarks, searchQuery]);
 
   return (
     <div className="animate-fade-in">

@@ -132,12 +132,6 @@ export function HighlightableMarkdown({
     [],
   );
 
-  // highlights 变化时，若悬停目标已被删除/失效，主动清理。
-  useEffect(() => {
-    if (!hoveredMark) return;
-    if (!highlights.some((h) => h.id === hoveredMark.id)) setHoveredMark(null);
-  }, [highlights, hoveredMark]);
-
   // 点击已有 <mark> 打开编辑态
   const handleContainerClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {

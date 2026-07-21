@@ -1,7 +1,28 @@
-import type { PackRegistry, QuestionPack, QuestionEntry, QuizQuestion } from '../types';
+import type {
+  PackRegistry,
+  QuestionPack,
+  QuestionEntry,
+  QuizQuestion,
+  Domain,
+  QuestionType,
+  Difficulty,
+} from '../types';
 
 const BASE = import.meta.env.BASE_URL;
 const packCache = new Map<string, QuestionPack>();
+const indexCache = new Map<Domain, QuestionIndexEntry[]>();
+
+export interface QuestionIndexEntry {
+  id: string;
+  domain: Domain;
+  type: QuestionType;
+  difficulty: Difficulty;
+  tags: string[];
+  title: string;
+  keyPoints: string[];
+  packId: string;
+  packFile: string;
+}
 
 export async function loadRegistry(): Promise<PackRegistry> {
   const res = await fetch(`${BASE}question-packs/registry.json`);
@@ -44,6 +65,19 @@ export async function loadQuestionPack(filePath: string): Promise<QuestionPack> 
   return pack;
 }
 
+export async function loadQuestionIndex(domain: Domain): Promise<QuestionIndexEntry[]> {
+  const cached = indexCache.get(domain);
+  if (cached) return cached;
+
+  const res = await fetch(`${BASE}question-index/${domain}.json`);
+  if (!res.ok) throw new Error(`Failed to load question index: ${domain} (${res.status})`);
+  const data = await res.json() as { questions?: QuestionIndexEntry[] };
+  const questions = data.questions ?? [];
+  indexCache.set(domain, questions);
+  return questions;
+}
+
 export function clearPackCache(): void {
   packCache.clear();
+  indexCache.clear();
 }

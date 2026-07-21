@@ -1,8 +1,9 @@
 import { Search, Menu, Sun, Moon, ChevronLeft } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useProgressStore } from '../../stores/progressStore';
-import { WindowControls, isElectronEnv } from './WindowControls';
+import { WindowControls } from './WindowControls';
 import { useResolvedTheme } from '../../hooks/useResolvedTheme';
+import { isElectronEnv } from '../../utils/platform';
 
 interface HeaderProps {
   onToggleSidebar: () => void;

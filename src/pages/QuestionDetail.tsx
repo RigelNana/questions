@@ -44,9 +44,15 @@ export function QuestionDetail() {
   });
   const clearForQuestion = useHighlightStore((s) => s.clearForQuestion);
 
-  const [showAnswer, setShowAnswer] = useState(false);
   const [activeTab, setActiveTab] = useState<DetailTab>('content');
-  const [questionJump, setQuestionJump] = useState('1');
+  const [answerVisibility, setAnswerVisibility] = useState({
+    key: '',
+    visible: false,
+  });
+  const [questionJumpState, setQuestionJumpState] = useState({
+    questionId: '',
+    value: '1',
+  });
 
   useEffect(() => {
     fetchRegistry();
@@ -70,24 +76,29 @@ export function QuestionDetail() {
   const currentIndex = allQuestions.findIndex((q) => q.id === questionId);
   const progress = questionId ? getQuestionProgress(questionId) : undefined;
   const bookmarked = questionId ? isBookmarked(questionId) : false;
+  const answerStateKey = `${questionId ?? ''}:${settings.autoExpandAnswer}`;
+  const showAnswer = answerVisibility.key === answerStateKey
+    ? answerVisibility.visible
+    : settings.autoExpandAnswer;
+  const questionJump = questionJumpState.questionId === questionId
+    ? questionJumpState.value
+    : String(Math.max(1, currentIndex + 1));
 
   useEffect(() => {
-    setShowAnswer(settings.autoExpandAnswer);
     if (settings.autoExpandAnswer && questionId) {
       markAnswerViewed(questionId);
     }
   }, [questionId, settings.autoExpandAnswer, markAnswerViewed]);
 
-  useEffect(() => {
-    if (currentIndex >= 0) setQuestionJump(String(currentIndex + 1));
-  }, [currentIndex]);
-
   const handleToggleAnswer = useCallback(() => {
     if (!showAnswer && questionId) {
       markAnswerViewed(questionId);
     }
-    setShowAnswer((s) => !s);
-  }, [markAnswerViewed, questionId, showAnswer]);
+    setAnswerVisibility({
+      key: answerStateKey,
+      visible: !showAnswer,
+    });
+  }, [answerStateKey, markAnswerViewed, questionId, showAnswer]);
 
   const handleQuizAttempt = (attempt: QuizAttempt) => {
     if (questionId) {
@@ -106,7 +117,10 @@ export function QuestionDetail() {
     event.preventDefault();
     const requested = Number.parseInt(questionJump, 10);
     if (Number.isNaN(requested)) {
-      setQuestionJump(String(currentIndex + 1));
+      setQuestionJumpState({
+        questionId: questionId ?? '',
+        value: String(currentIndex + 1),
+      });
       return;
     }
     const targetIndex = Math.min(allQuestions.length, Math.max(1, requested)) - 1;
@@ -400,9 +414,17 @@ export function QuestionDetail() {
             min={1}
             max={allQuestions.length}
             value={questionJump}
-            onChange={(event) => setQuestionJump(event.target.value)}
+            onChange={(event) => setQuestionJumpState({
+              questionId: questionId ?? '',
+              value: event.target.value,
+            })}
             onBlur={() => {
-              if (!questionJump) setQuestionJump(String(currentIndex + 1));
+              if (!questionJump) {
+                setQuestionJumpState({
+                  questionId: questionId ?? '',
+                  value: String(currentIndex + 1),
+                });
+              }
             }}
             className="search-control compact-control h-8 w-14 rounded-md border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-2 text-center text-xs text-[var(--color-notion-text)]"
             aria-label={`跳转知识点，范围 1 到 ${allQuestions.length}`}
@@ -412,7 +434,7 @@ export function QuestionDetail() {
           </span>
           <button
             type="submit"
-            className="compact-control hidden h-8 rounded-md border border-[var(--color-notion-border)] px-2 text-xs text-[var(--color-notion-text-secondary)] hover:border-[var(--color-notion-accent)] hover:text-[var(--color-notion-accent)] sm:inline-flex sm:items-center"
+            className="compact-control inline-flex h-8 items-center rounded-md border border-[var(--color-notion-border)] px-2 text-xs text-[var(--color-notion-text-secondary)] hover:border-[var(--color-notion-accent)] hover:text-[var(--color-notion-accent)]"
           >
             跳转
           </button>
