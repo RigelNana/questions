@@ -10,8 +10,8 @@ import {
   Bot,
   Brain,
   CircleStop,
-  Compress,
   LoaderCircle,
+  Minimize2,
   Plus,
   Send,
   Settings,
@@ -115,6 +115,8 @@ export function AgentPanel({
   const runtimeRef = useRef<QuestionAgentRuntime | null>(null);
   const contextRef = useRef(context);
   contextRef.current = context;
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [runtimeView, setRuntimeView] = useState<RuntimeView>({
     key: '',
@@ -155,14 +157,15 @@ export function AgentPanel({
   }, [open, session, context.question.id, ensureSession]);
 
   useEffect(() => {
-    if (!open || !session || configError) return;
+    const initialSession = sessionRef.current;
+    if (!open || !initialSession || configError) return;
     let cancelled = false;
     let runtime: QuestionAgentRuntime | null = null;
 
     createQuestionAgentRuntime({
       context: contextRef.current,
       settings,
-      session,
+      session: initialSession,
       onEvent: (event) => {
         if (cancelled) return;
         if (event.type === 'status') {
@@ -180,12 +183,12 @@ export function AgentPanel({
             thinking: event.thinking,
           }));
         } else if (event.type === 'messages') {
-          setSessionMessages(session.id, event.messages);
+          setSessionMessages(initialSession.id, event.messages);
         } else if (event.type === 'tool') {
-          upsertToolRun(session.id, event.run);
+          upsertToolRun(initialSession.id, event.run);
         } else if (event.type === 'compacted') {
-          const latest = useAgentStore.getState().sessions[session.id];
-          updateSession(session.id, {
+          const latest = useAgentStore.getState().sessions[initialSession.id];
+          updateSession(initialSession.id, {
             messages: event.messages,
             compactedSummary: event.summary,
             compactionCount: (latest?.compactionCount ?? 0) + 1,
@@ -317,7 +320,7 @@ export function AgentPanel({
             className="compact-control rounded-lg p-2 text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] disabled:opacity-30"
             title="手动压缩上下文"
           >
-            <Compress className="h-4 w-4" />
+            <Minimize2 className="h-4 w-4" />
           </button>
           <Link
             to="/settings/agent"

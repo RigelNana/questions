@@ -63,10 +63,13 @@ function messageText(message: Message | AgentMessage) {
       .map((item) => item.text)
       .join('\n');
   }
-  return message.content
-    .filter((item) => item.type === 'text')
-    .map((item) => item.text)
-    .join('\n');
+  if (message.role === 'toolResult') {
+    return message.content
+      .filter((item) => item.type === 'text')
+      .map((item) => item.text)
+      .join('\n');
+  }
+  return '';
 }
 
 function serializeMessages(messages: AgentMessage[]) {
@@ -74,7 +77,10 @@ function serializeMessages(messages: AgentMessage[]) {
     if (message.role === 'toolResult') {
       return `[工具 ${message.toolName}${message.isError ? '（失败）' : ''}]\n${messageText(message)}`;
     }
-    return `[${message.role === 'user' ? '用户' : '助手'}]\n${messageText(message)}`;
+    if (message.role === 'user' || message.role === 'assistant') {
+      return `[${message.role === 'user' ? '用户' : '助手'}]\n${messageText(message)}`;
+    }
+    return '';
   }).join('\n\n');
 }
 

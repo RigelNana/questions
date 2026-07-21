@@ -20,7 +20,6 @@ function capText(value: string, maxChars: number) {
 function buildQuestionSection(
   context: QuestionAgentContext,
   section: string,
-  settings: AgentSettings,
 ) {
   const { question } = context;
   switch (section) {
@@ -52,25 +51,45 @@ export function createQuestionAgentTools(
   settings: AgentSettings,
   skills: Skill[],
 ): AgentTool[] {
-  const getQuestionContext: AgentTool = {
+  const questionContextParameters = Type.Object({
+    section: Type.Union([
+      Type.Literal('question'),
+      Type.Literal('answer'),
+      Type.Literal('key-points'),
+      Type.Literal('quiz'),
+      Type.Literal('all'),
+    ], { description: '需要读取的题目区块' }),
+  });
+  const searchParameters = Type.Object({
+    query: Type.String({
+      minLength: 1,
+      maxLength: 200,
+      description: '一个或多个搜索关键词',
+    }),
+    limit: Type.Optional(Type.Integer({
+      minimum: 1,
+      maximum: 12,
+      description: '最多返回的片段数',
+    })),
+  });
+  const progressParameters = Type.Object({});
+  const skillParameters = Type.Object({
+    name: Type.String({
+      minLength: 1,
+      description: '系统提示中列出的 Skill 名称',
+    }),
+  });
+
+  const getQuestionContext: AgentTool<typeof questionContextParameters> = {
     name: 'get_question_context',
     label: '读取当前题目',
     description: '读取当前题目的题干、参考答案、核心要点或配套选择题。需要准确引用原文时使用。',
-    parameters: Type.Object({
-      section: Type.Union([
-        Type.Literal('question'),
-        Type.Literal('answer'),
-        Type.Literal('key-points'),
-        Type.Literal('quiz'),
-        Type.Literal('all'),
-      ], { description: '需要读取的题目区块' }),
-    }),
+    parameters: questionContextParameters,
     async execute(_toolCallId, params, signal) {
       signal?.throwIfAborted();
       const content = buildQuestionSection(
         context,
         String(params.section),
-        settings,
       );
       return textResult(capText(content, settings.maxContextChars), {
         section: params.section,
@@ -79,22 +98,11 @@ export function createQuestionAgentTools(
     },
   };
 
-  const searchCurrentMaterial: AgentTool = {
+  const searchCurrentMaterial: AgentTool<typeof searchParameters> = {
     name: 'search_current_material',
     label: '搜索题目与答案',
     description: '按关键词搜索当前题目、答案和核心要点，返回最相关的原文片段。',
-    parameters: Type.Object({
-      query: Type.String({
-        minLength: 1,
-        maxLength: 200,
-        description: '一个或多个搜索关键词',
-      }),
-      limit: Type.Optional(Type.Integer({
-        minimum: 1,
-        maximum: 12,
-        description: '最多返回的片段数',
-      })),
-    }),
+    parameters: searchParameters,
     async execute(_toolCallId, params, signal) {
       signal?.throwIfAborted();
       const terms = String(params.query)
@@ -130,11 +138,11 @@ export function createQuestionAgentTools(
     },
   };
 
-  const getLearningProgress: AgentTool = {
+  const getLearningProgress: AgentTool<typeof progressParameters> = {
     name: 'get_learning_progress',
     label: '读取学习进度',
     description: '读取当前题目的查看状态、选择题作答结果和用户划线批注。',
-    parameters: Type.Object({}),
+    parameters: progressParameters,
     async execute(_toolCallId, _params, signal) {
       signal?.throwIfAborted();
       const attempts = context.progress?.quizAttempts ?? [];
@@ -160,16 +168,11 @@ export function createQuestionAgentTools(
     },
   };
 
-  const loadSkill: AgentTool = {
+  const loadSkill: AgentTool<typeof skillParameters> = {
     name: 'load_skill',
     label: '加载 Skill',
     description: '按名称加载一个已启用 Skill 的完整工作流程说明。',
-    parameters: Type.Object({
-      name: Type.String({
-        minLength: 1,
-        description: '系统提示中列出的 Skill 名称',
-      }),
-    }),
+    parameters: skillParameters,
     async execute(_toolCallId, params, signal) {
       signal?.throwIfAborted();
       const skill = skills.find((item) => item.name === params.name);
