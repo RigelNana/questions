@@ -1,17 +1,30 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { Header } from './Header';
 import { BottomNav } from './BottomNav';
 import { SearchModal } from '../ui/SearchModal';
 import { useProgressStore } from '../../stores/progressStore';
+import { useResolvedTheme } from '../../hooks/useResolvedTheme';
+
+function parseHexColor(color: string) {
+  const normalized = color.trim().replace(/^#/, '');
+  if (!/^[\da-f]{6}$/i.test(normalized)) return null;
+  return {
+    r: Number.parseInt(normalized.slice(0, 2), 16),
+    g: Number.parseInt(normalized.slice(2, 4), 16),
+    b: Number.parseInt(normalized.slice(4, 6), 16),
+  };
+}
 
 export function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const { settings } = useProgressStore();
+  const resolvedTheme = useResolvedTheme();
   const location = useLocation();
   const mainRef = useRef<HTMLElement>(null);
+  const appearanceReady = useRef(false);
 
   const openSearch = useCallback(() => setSearchOpen(true), []);
   const closeSearch = useCallback(() => setSearchOpen(false), []);
@@ -21,21 +34,42 @@ export function Layout() {
     mainRef.current?.scrollTo(0, 0);
   }, [location.pathname]);
 
-  // Apply theme
-  useEffect(() => {
-    const apply = (theme: 'light' | 'dark') => {
-      document.documentElement.setAttribute('data-theme', theme);
-    };
-    if (settings.theme === 'system') {
-      const mq = window.matchMedia('(prefers-color-scheme: dark)');
-      apply(mq.matches ? 'dark' : 'light');
-      const handler = (e: MediaQueryListEvent) => apply(e.matches ? 'dark' : 'light');
-      mq.addEventListener('change', handler);
-      return () => mq.removeEventListener('change', handler);
+  // Apply all appearance settings in one render pass so theme changes stay in sync.
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    if (appearanceReady.current && !settings.reduceMotion) {
+      root.classList.add('theme-transition');
     } else {
-      apply(settings.theme);
+      appearanceReady.current = true;
     }
-  }, [settings.theme]);
+
+    root.setAttribute('data-theme', resolvedTheme);
+    root.setAttribute('data-font-size', settings.fontSize);
+    root.setAttribute('data-reduce-motion', String(settings.reduceMotion));
+
+    const accent = settings.accentColor === 'default'
+      ? null
+      : parseHexColor(settings.accentColor);
+    if (accent) {
+      const { r, g, b } = accent;
+      const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+      root.style.setProperty('--color-notion-accent', `rgb(${r} ${g} ${b})`);
+      root.style.setProperty('--color-notion-accent-light', `rgb(${r} ${g} ${b} / ${resolvedTheme === 'dark' ? 0.2 : 0.13})`);
+      root.style.setProperty('--color-notion-on-accent', luminance > 0.62 ? '#2E3440' : '#FFFFFF');
+    } else {
+      root.style.removeProperty('--color-notion-accent');
+      root.style.removeProperty('--color-notion-accent-light');
+      root.style.removeProperty('--color-notion-on-accent');
+    }
+
+    const transitionTimer = window.setTimeout(() => {
+      root.classList.remove('theme-transition');
+    }, 350);
+    return () => {
+      window.clearTimeout(transitionTimer);
+      root.classList.remove('theme-transition');
+    };
+  }, [resolvedTheme, settings.accentColor, settings.fontSize, settings.reduceMotion]);
 
   // Global Ctrl+K shortcut
   useEffect(() => {

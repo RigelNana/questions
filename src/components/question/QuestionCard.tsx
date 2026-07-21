@@ -9,15 +9,21 @@ interface QuestionCardProps {
   question: QuestionEntry;
   isCompleted?: boolean;
   isBookmarked?: boolean;
+  onToggleBookmark?: () => void;
 }
 
-export function QuestionCard({ question, isCompleted, isBookmarked }: QuestionCardProps) {
+export function QuestionCard({
+  question,
+  isCompleted,
+  isBookmarked,
+  onToggleBookmark,
+}: QuestionCardProps) {
   return (
-    <Link
-      to={`/domains/${question.domain}/${question.id}`}
-      className="block px-4 sm:px-5 py-3.5 border-b border-[var(--color-notion-border)] hover:bg-[var(--color-notion-bg-secondary)] transition-all duration-200 no-underline group active-press"
-    >
-      <div className="flex items-start gap-3">
+    <div className="group flex items-stretch border-b border-[var(--color-notion-border)] transition-colors duration-200 hover:bg-[var(--color-notion-bg-secondary)]">
+      <Link
+        to={`/domains/${question.domain}/${question.id}`}
+        className="flex min-w-0 flex-1 items-start gap-3 px-4 py-3.5 no-underline active-press sm:px-5"
+      >
         {/* Status indicator */}
         <div className="mt-0.5 flex-shrink-0">
           {isCompleted ? (
@@ -33,7 +39,7 @@ export function QuestionCard({ question, isCompleted, isBookmarked }: QuestionCa
             <h4 className="text-sm font-medium text-[var(--color-notion-text)] truncate group-hover:text-[var(--color-notion-accent)] transition-colors">
               {question.title}
             </h4>
-            {isBookmarked && <Star className="w-3 h-3 text-[var(--color-notion-warning)] fill-current flex-shrink-0" />}
+            {isBookmarked && !onToggleBookmark && <Star className="w-3 h-3 text-[var(--color-notion-warning)] fill-current flex-shrink-0" />}
           </div>
 
           {/* Tags */}
@@ -55,7 +61,23 @@ export function QuestionCard({ question, isCompleted, isBookmarked }: QuestionCa
         <span className="text-xs text-[var(--color-notion-text-secondary)] flex-shrink-0 hidden sm:block opacity-60">
           {DOMAIN_LABELS[question.domain]}
         </span>
-      </div>
-    </Link>
+      </Link>
+      {onToggleBookmark && (
+        <button
+          type="button"
+          onClick={onToggleBookmark}
+          className={`compact-control my-auto mr-3 flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg transition-colors sm:mr-4 ${
+            isBookmarked
+              ? 'bg-[var(--color-notion-warning-light)] text-[var(--color-notion-warning)]'
+              : 'text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-warning-light)] hover:text-[var(--color-notion-warning)]'
+          }`}
+          aria-label={isBookmarked ? `取消收藏：${question.title}` : `收藏：${question.title}`}
+          aria-pressed={isBookmarked}
+          title={isBookmarked ? '取消收藏' : '收藏'}
+        >
+          <Star className={`h-4 w-4 ${isBookmarked ? 'fill-current animate-spring-pop' : ''}`} />
+        </button>
+      )}
+    </div>
   );
 }

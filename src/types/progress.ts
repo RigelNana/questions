@@ -20,6 +20,10 @@ export interface UserSettings {
   autoExpandAnswer: boolean;
   enabledPacks: string[];
   theme: 'light' | 'dark' | 'system';
+  accentColor: string;
+  fontSize: 'small' | 'medium' | 'large';
+  questionLayout: 'split' | 'stacked';
+  reduceMotion: boolean;
 }
 
 /** 用户总进度 */
@@ -39,6 +43,10 @@ export const DEFAULT_SETTINGS: UserSettings = {
   autoExpandAnswer: false,
   enabledPacks: [],
   theme: 'light',
+  accentColor: 'default',
+  fontSize: 'medium',
+  questionLayout: 'split',
+  reduceMotion: false,
 };
 
 export const DEFAULT_PROGRESS: UserProgress = {

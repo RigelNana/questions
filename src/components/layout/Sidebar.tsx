@@ -7,6 +7,7 @@ import {
   X,
   TrendingUp,
   Settings,
+  Star,
 } from "lucide-react";
 
 interface SidebarProps {
@@ -47,7 +48,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
             onClick={onClose}
           >
             <div className="w-7 h-7 rounded-lg bg-[var(--color-notion-accent)] flex items-center justify-center">
-              <Target className="w-4 h-4 text-white" />
+              <Target className="w-4 h-4 text-[var(--color-notion-on-accent)]" />
             </div>
             <span className="font-semibold text-[var(--color-notion-text)] text-[15px] tracking-tight">
               刷题
@@ -119,6 +120,20 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
           </div>
 
           <div className="space-y-0.5 px-3">
+            <NavLink
+              to="/bookmarks"
+              onClick={onClose}
+              className={({ isActive }) =>
+                `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm no-underline transition-all duration-200 ${
+                  isActive
+                    ? "bg-[var(--color-notion-accent-light)] text-[var(--color-notion-accent)] font-medium"
+                    : "text-[var(--color-notion-text-secondary)] hover:bg-[var(--color-notion-bg-hover)] hover:text-[var(--color-notion-text)]"
+                }`
+              }
+            >
+              <Star className="w-4 h-4" />
+              我的收藏
+            </NavLink>
             <NavLink
               to="/review"
               onClick={onClose}

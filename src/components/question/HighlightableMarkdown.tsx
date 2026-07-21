@@ -402,7 +402,7 @@ function HighlightToolbar({
             </button>
             <button
               onClick={onSaveNote}
-              className="inline-flex items-center gap-1 rounded-md bg-[var(--color-notion-accent)] px-2.5 py-1 text-xs font-medium text-white hover:opacity-90"
+              className="inline-flex items-center gap-1 rounded-md bg-[var(--color-notion-accent)] px-2.5 py-1 text-xs font-medium text-[var(--color-notion-on-accent)] hover:opacity-90"
             >
               <Check className="w-3.5 h-3.5" /> 保存
             </button>

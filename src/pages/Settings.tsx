@@ -1,5 +1,25 @@
 import { useProgressStore } from '../stores/progressStore';
-import { Settings as SettingsIcon, AlertTriangle, Keyboard, Sun, Moon, Monitor } from 'lucide-react';
+import {
+  Settings as SettingsIcon,
+  AlertTriangle,
+  Keyboard,
+  Sun,
+  Moon,
+  Monitor,
+  Palette,
+  Type,
+  Columns2,
+  Accessibility,
+} from 'lucide-react';
+
+const ACCENT_OPTIONS = [
+  { value: 'default', label: 'Nord', color: '#5E81AC' },
+  { value: '#486FA8', label: '海蓝', color: '#486FA8' },
+  { value: '#7C5CBF', label: '鸢紫', color: '#7C5CBF' },
+  { value: '#16827B', label: '松绿', color: '#16827B' },
+  { value: '#B64F70', label: '莓红', color: '#B64F70' },
+  { value: '#B56B27', label: '暖橙', color: '#B56B27' },
+] as const;
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -47,7 +67,7 @@ export function Settings() {
         {/* Theme settings */}
         <div className="p-4 sm:p-5 rounded-xl border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/30 transition-colors duration-200">
           <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4">外观</h3>
-          <div className="flex gap-3">
+          <div className="grid grid-cols-3 gap-2 sm:gap-3">
             {themeOptions.map(({ value, icon: Icon, label }) => (
               <button
                 key={value}
@@ -64,6 +84,80 @@ export function Settings() {
                 </span>
               </button>
             ))}
+          </div>
+
+          <div className="mt-5 border-t border-[var(--color-notion-border)] pt-5">
+            <div className="mb-3 flex items-center gap-2 text-sm font-medium text-[var(--color-notion-text)]">
+              <Palette className="h-4 w-4" /> 主题色
+            </div>
+            <div className="flex flex-wrap items-center gap-2.5">
+              {ACCENT_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  onClick={() => updateSettings({ accentColor: option.value })}
+                  className={`group flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs transition-colors ${
+                    settings.accentColor === option.value
+                      ? 'border-[var(--color-notion-accent)] bg-[var(--color-notion-accent-light)] text-[var(--color-notion-text)]'
+                      : 'border-[var(--color-notion-border)] text-[var(--color-notion-text-secondary)] hover:border-[var(--color-notion-accent)]'
+                  }`}
+                  aria-pressed={settings.accentColor === option.value}
+                >
+                  <span
+                    className="h-4 w-4 rounded-full border border-black/10 shadow-sm"
+                    style={{ backgroundColor: option.color }}
+                  />
+                  {option.label}
+                </button>
+              ))}
+              <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-2.5 py-2 text-xs text-[var(--color-notion-text-secondary)] transition-colors hover:border-[var(--color-notion-accent)]">
+                <input
+                  type="color"
+                  value={settings.accentColor === 'default' ? '#5E81AC' : settings.accentColor}
+                  onChange={(event) => updateSettings({ accentColor: event.target.value.toUpperCase() })}
+                  className="h-4 w-4 cursor-pointer border-0 bg-transparent p-0"
+                  aria-label="自定义主题色"
+                />
+                自定义
+              </label>
+            </div>
+          </div>
+
+          <div className="mt-5 border-t border-[var(--color-notion-border)] pt-5">
+            <div className="mb-3 flex items-center gap-2 text-sm font-medium text-[var(--color-notion-text)]">
+              <Type className="h-4 w-4" /> 阅读字号
+            </div>
+            <div className="grid grid-cols-3 gap-2 rounded-xl bg-[var(--color-notion-bg-secondary)] p-1">
+              {([
+                ['small', '小'],
+                ['medium', '标准'],
+                ['large', '大'],
+              ] as const).map(([value, label]) => (
+                <button
+                  key={value}
+                  onClick={() => updateSettings({ fontSize: value })}
+                  className={`rounded-lg px-3 py-2 text-sm transition-colors ${
+                    settings.fontSize === value
+                      ? 'bg-[var(--color-notion-bg)] font-medium text-[var(--color-notion-accent)] shadow-sm'
+                      : 'text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-text)]'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-5 flex items-center justify-between gap-4 border-t border-[var(--color-notion-border)] pt-5">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-sm text-[var(--color-notion-text)]">
+                <Accessibility className="h-4 w-4" /> 减少界面动效
+              </div>
+              <div className="mt-0.5 text-xs text-[var(--color-notion-text-secondary)]">关闭页面入场、弹跳和主题过渡动画</div>
+            </div>
+            <Toggle
+              checked={settings.reduceMotion}
+              onChange={(value) => updateSettings({ reduceMotion: value })}
+            />
           </div>
         </div>
 
@@ -90,6 +184,19 @@ export function Settings() {
             <Toggle
               checked={settings.autoExpandAnswer}
               onChange={(v) => updateSettings({ autoExpandAnswer: v })}
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4 border-t border-[var(--color-notion-border)] py-2.5">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-sm text-[var(--color-notion-text)]">
+                <Columns2 className="h-4 w-4" /> 问题与答案双栏显示
+              </div>
+              <div className="mt-0.5 text-xs text-[var(--color-notion-text-secondary)]">宽屏时并排阅读，窄屏自动切换为上下布局</div>
+            </div>
+            <Toggle
+              checked={settings.questionLayout === 'split'}
+              onChange={(value) => updateSettings({ questionLayout: value ? 'split' : 'stacked' })}
             />
           </div>
         </div>
@@ -121,7 +228,8 @@ export function Settings() {
           </h3>
           <div className="space-y-2 text-sm">
             {[
-              ['←/→', '上一题 / 下一题'],
+              ['←/→', '选择题内切题，到边界后切换知识点'],
+              ['1-9 / A-I', '选择当前选项'],
               ['Space', '展开/收起答案'],
               ['S', '收藏/取消收藏'],
               ['Ctrl+K', '搜索'],

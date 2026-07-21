@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuestionStore } from '../stores/questionStore';
 import { useProgressStore } from '../stores/progressStore';
@@ -29,6 +29,7 @@ export function QuestionDetail() {
     isBookmarked,
     getQuestionProgress,
     setLastVisited,
+    settings,
   } = useProgressStore();
   // 必须返回稳定的原始值（number），否则每次 render 都会产生新数组引用，
   // 触发 useSyncExternalStore 的 Object.is 判定为"变化"，造成无限循环 (React #185)。
@@ -45,6 +46,7 @@ export function QuestionDetail() {
 
   const [showAnswer, setShowAnswer] = useState(false);
   const [activeTab, setActiveTab] = useState<DetailTab>('content');
+  const [questionJump, setQuestionJump] = useState('1');
 
   useEffect(() => {
     fetchRegistry();
@@ -69,12 +71,23 @@ export function QuestionDetail() {
   const progress = questionId ? getQuestionProgress(questionId) : undefined;
   const bookmarked = questionId ? isBookmarked(questionId) : false;
 
-  const handleToggleAnswer = () => {
+  useEffect(() => {
+    setShowAnswer(settings.autoExpandAnswer);
+    if (settings.autoExpandAnswer && questionId) {
+      markAnswerViewed(questionId);
+    }
+  }, [questionId, settings.autoExpandAnswer, markAnswerViewed]);
+
+  useEffect(() => {
+    if (currentIndex >= 0) setQuestionJump(String(currentIndex + 1));
+  }, [currentIndex]);
+
+  const handleToggleAnswer = useCallback(() => {
     if (!showAnswer && questionId) {
       markAnswerViewed(questionId);
     }
     setShowAnswer((s) => !s);
-  };
+  }, [markAnswerViewed, questionId, showAnswer]);
 
   const handleQuizAttempt = (attempt: QuizAttempt) => {
     if (questionId) {
@@ -82,27 +95,51 @@ export function QuestionDetail() {
     }
   };
 
-  const handleNav = (direction: -1 | 1) => {
+  const handleNav = useCallback((direction: -1 | 1) => {
     const newIndex = currentIndex + direction;
     if (newIndex >= 0 && newIndex < allQuestions.length) {
       navigate(`/domains/${domain}/${allQuestions[newIndex].id}`);
     }
+  }, [allQuestions, currentIndex, domain, navigate]);
+
+  const handleQuestionJump = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const requested = Number.parseInt(questionJump, 10);
+    if (Number.isNaN(requested)) {
+      setQuestionJump(String(currentIndex + 1));
+      return;
+    }
+    const targetIndex = Math.min(allQuestions.length, Math.max(1, requested)) - 1;
+    const target = allQuestions[targetIndex];
+    if (target) navigate(`/domains/${domain}/${target.id}`);
   };
 
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (
+        e.target instanceof HTMLInputElement
+        || e.target instanceof HTMLTextAreaElement
+        || e.target instanceof HTMLSelectElement
+      ) return;
       switch (e.key) {
         case 'ArrowLeft':
-          handleNav(-1);
+          if (activeTab === 'content') {
+            e.preventDefault();
+            handleNav(-1);
+          }
           break;
         case 'ArrowRight':
-          handleNav(1);
+          if (activeTab === 'content') {
+            e.preventDefault();
+            handleNav(1);
+          }
           break;
         case ' ':
-          e.preventDefault();
-          handleToggleAnswer();
+          if (activeTab === 'content') {
+            e.preventDefault();
+            handleToggleAnswer();
+          }
           break;
         case 's':
         case 'S':
@@ -112,7 +149,7 @@ export function QuestionDetail() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  });
+  }, [activeTab, handleNav, handleToggleAnswer, questionId, toggleBookmark]);
 
   if (!question) {
     return (
@@ -189,40 +226,116 @@ export function QuestionDetail() {
       {/* Tab: Content */}
       {activeTab === 'content' && (
         <div className="animate-fade-in">
-          {/* Content (可划线批注) */}
-          <div className="p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] mb-3">
-            <HighlightableMarkdown
-              content={question.content}
-              questionId={question.id}
-              section="content"
-            />
-          </div>
+          <div className={`grid items-start gap-4 ${
+            settings.questionLayout === 'split' ? 'lg:grid-cols-2' : 'grid-cols-1'
+          }`}>
+            {/* Question (可划线批注) */}
+            <section className="min-w-0 overflow-hidden rounded-xl border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)]">
+              <div className="flex items-center gap-2 border-b border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] px-4 py-3 text-sm font-semibold text-[var(--color-notion-text)]">
+                <BookOpen className="h-4 w-4 text-[var(--color-notion-accent)]" /> 问题
+              </div>
+              <div className="p-4 sm:p-6">
+                <HighlightableMarkdown
+                  content={question.content}
+                  questionId={question.id}
+                  section="content"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-2 border-t border-[var(--color-notion-border)] px-4 py-3 text-xs text-[var(--color-notion-text-secondary)]">
+                <span className="inline-flex items-center gap-1.5">
+                  <Highlighter className="h-3.5 w-3.5 text-[var(--color-notion-accent)]" />
+                  {questionHighlightCount > 0 ? (
+                    <>已有 <span className="font-semibold text-[var(--color-notion-text)]">{questionHighlightCount}</span> 条批注</>
+                  ) : (
+                    <>选中文字即可划线批注</>
+                  )}
+                </span>
+                {questionHighlightCount > 0 && (
+                  <button
+                    onClick={() => {
+                      if (!questionId) return;
+                      if (window.confirm('确认清除本题全部划线批注？')) clearForQuestion(questionId);
+                    }}
+                    className="flex-shrink-0 text-[var(--color-notion-text-secondary)] transition-colors hover:text-[var(--color-notion-error)]"
+                  >
+                    清除全部
+                  </button>
+                )}
+              </div>
+            </section>
 
-          {/* Highlight hint / summary */}
-          <div className="mb-5 flex items-center justify-between gap-2 text-xs text-[var(--color-notion-text-secondary)]">
-            <span className="inline-flex items-center gap-1.5">
-              <Highlighter className="w-3.5 h-3.5 text-[var(--color-notion-accent)]" />
-              {questionHighlightCount > 0 ? (
-                <>已有 <span className="font-semibold text-[var(--color-notion-text)]">{questionHighlightCount}</span> 条划线批注 · 选中文字可继续划线</>
+            {/* Answer */}
+            <section className="min-w-0 overflow-hidden rounded-xl border border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)]">
+              <div className="flex items-center justify-between gap-3 border-b border-[var(--color-notion-border)] px-4 py-3">
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-[var(--color-notion-text)]">
+                  <Lightbulb className="h-4 w-4 text-[var(--color-notion-warning)]" /> 参考答案
+                </h3>
+                <button
+                  onClick={handleToggleAnswer}
+                  className="compact-control text-xs text-[var(--color-notion-accent)] transition-opacity hover:opacity-70"
+                >
+                  {showAnswer ? '收起' : '展开'}
+                </button>
+              </div>
+
+              {showAnswer ? (
+                <div className="p-4 animate-slide-up sm:p-6">
+                  {question.keyPoints.length > 0 && (
+                    <div className="mb-5 rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] p-4">
+                      <h4 className="mb-2.5 text-sm font-medium text-[var(--color-notion-text)]">核心要点</h4>
+                      <ul className="list-disc space-y-1.5 pl-4 text-sm text-[var(--color-notion-text-secondary)]">
+                        {question.keyPoints.map((point, index) => (
+                          <li key={index}>{point}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  <HighlightableMarkdown
+                    content={question.answer}
+                    questionId={question.id}
+                    section="answer"
+                  />
+
+                  {question.references && question.references.length > 0 && (
+                    <div className="mt-5 border-t border-[var(--color-notion-border)] pt-4">
+                      <h4 className="mb-2 text-xs font-medium text-[var(--color-notion-text-secondary)]">参考资料</h4>
+                      <ul className="space-y-1 text-xs text-[var(--color-notion-accent)]">
+                        {question.references.map((reference, index) => {
+                          const url = typeof reference === 'string' ? reference : reference.url;
+                          const label = typeof reference === 'string' ? reference : reference.title;
+                          return (
+                            <li key={index}>
+                              <a href={url} target="_blank" rel="noopener noreferrer" className="hover:underline">{label}</a>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  )}
+                </div>
               ) : (
-                <>选中文字即可划线批注 · 点击划线可编辑</>
+                <div className="flex min-h-44 flex-col items-center justify-center gap-3 p-6 text-center">
+                  <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[var(--color-notion-warning-light)]">
+                    <Lightbulb className="h-5 w-5 text-[var(--color-notion-warning)]" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium text-[var(--color-notion-text)]">先独立思考，再查看答案</p>
+                    <p className="mt-1 text-xs text-[var(--color-notion-text-secondary)]">也可以按空格键快速展开</p>
+                  </div>
+                  <button
+                    onClick={handleToggleAnswer}
+                    className="rounded-lg bg-[var(--color-notion-accent)] px-4 py-2 text-sm font-medium text-[var(--color-notion-on-accent)] transition-opacity hover:opacity-90 active-press"
+                  >
+                    显示答案
+                  </button>
+                </div>
               )}
-            </span>
-            {questionHighlightCount > 0 && (
-              <button
-                onClick={() => {
-                  if (!questionId) return;
-                  if (window.confirm('确认清除本题全部划线批注？')) clearForQuestion(questionId);
-                }}
-                className="text-[var(--color-notion-text-secondary)] hover:text-[var(--color-notion-error)] transition-colors"
-              >
-                清除全部
-              </button>
-            )}
+            </section>
           </div>
 
           {/* Action buttons */}
-          <div className="mb-5 flex flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center">
+          <div className="mb-5 mt-4 flex flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center">
             <button
               onClick={handleToggleAnswer}
               className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-border)] px-4 py-2 text-sm font-medium text-[var(--color-notion-text)] transition-all duration-200 hover:border-[var(--color-notion-accent)] hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:justify-start sm:py-2.5"
@@ -249,51 +362,6 @@ export function QuestionDetail() {
               </button>
             )}
           </div>
-
-          {/* Answer */}
-          {showAnswer && (
-            <div className="mb-5 p-4 sm:p-6 rounded-xl border border-[var(--color-notion-border)] bg-[var(--color-notion-bg-secondary)] animate-slide-up">
-              <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4">
-                参考答案
-              </h3>
-
-              {/* Key points */}
-              {question.keyPoints.length > 0 && (
-                <div className="mb-5 p-4 bg-[var(--color-notion-bg)] rounded-lg border border-[var(--color-notion-border)]">
-                  <h4 className="text-sm font-medium text-[var(--color-notion-text)] mb-2.5">核心要点</h4>
-                  <ul className="text-sm text-[var(--color-notion-text-secondary)] space-y-1.5 pl-4 list-disc">
-                    {question.keyPoints.map((point, i) => (
-                      <li key={i}>{point}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              <HighlightableMarkdown
-                content={question.answer}
-                questionId={question.id}
-                section="answer"
-              />
-
-              {/* References */}
-              {question.references && question.references.length > 0 && (
-                <div className="mt-5 pt-4 border-t border-[var(--color-notion-border)]">
-                  <h4 className="text-xs font-medium text-[var(--color-notion-text-secondary)] mb-2">参考资料</h4>
-                  <ul className="text-xs text-[var(--color-notion-accent)] space-y-1">
-                    {question.references.map((ref, i) => {
-                      const url = typeof ref === 'string' ? ref : ref.url;
-                      const label = typeof ref === 'string' ? ref : ref.title;
-                      return (
-                        <li key={i}>
-                          <a href={url} target="_blank" rel="noopener noreferrer" className="hover:underline">{label}</a>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </div>
-              )}
-            </div>
-          )}
         </div>
       )}
 
@@ -304,6 +372,9 @@ export function QuestionDetail() {
             quizzes={question.quiz}
             existingAttempts={progress?.quizAttempts ?? []}
             onAttempt={handleQuizAttempt}
+            onBoundaryNavigate={handleNav}
+            hasPreviousQuestion={currentIndex > 0}
+            hasNextQuestion={currentIndex < allQuestions.length - 1}
           />
         </div>
       )}
@@ -319,9 +390,33 @@ export function QuestionDetail() {
           <span className="hidden sm:inline">上一知识点</span>
           <span className="sm:hidden">上一个</span>
         </button>
-        <span className="text-xs text-[var(--color-notion-text-secondary)] font-mono">
-          {currentIndex + 1} / {allQuestions.length}
-        </span>
+        <form onSubmit={handleQuestionJump} className="flex items-center gap-1.5">
+          <label htmlFor="question-jump" className="hidden text-xs text-[var(--color-notion-text-secondary)] sm:inline">
+            知识点
+          </label>
+          <input
+            id="question-jump"
+            type="number"
+            min={1}
+            max={allQuestions.length}
+            value={questionJump}
+            onChange={(event) => setQuestionJump(event.target.value)}
+            onBlur={() => {
+              if (!questionJump) setQuestionJump(String(currentIndex + 1));
+            }}
+            className="search-control compact-control h-8 w-14 rounded-md border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-2 text-center text-xs text-[var(--color-notion-text)]"
+            aria-label={`跳转知识点，范围 1 到 ${allQuestions.length}`}
+          />
+          <span className="text-xs font-mono text-[var(--color-notion-text-secondary)]">
+            / {allQuestions.length}
+          </span>
+          <button
+            type="submit"
+            className="compact-control hidden h-8 rounded-md border border-[var(--color-notion-border)] px-2 text-xs text-[var(--color-notion-text-secondary)] hover:border-[var(--color-notion-accent)] hover:text-[var(--color-notion-accent)] sm:inline-flex sm:items-center"
+          >
+            跳转
+          </button>
+        </form>
         <button
           onClick={() => handleNav(1)}
           disabled={currentIndex >= allQuestions.length - 1}

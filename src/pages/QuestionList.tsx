@@ -1,5 +1,5 @@
-import { useEffect, useState, useMemo } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useEffect, useState, useMemo, type FormEvent } from 'react';
+import { useParams, Link, useSearchParams } from 'react-router-dom';
 import { useQuestionStore } from '../stores/questionStore';
 import { useProgressStore } from '../stores/progressStore';
 import { QuestionCard } from '../components/question/QuestionCard';
@@ -19,19 +19,26 @@ const PAGE_SIZE = 15;
 
 export function QuestionList() {
   const { domain } = useParams<{ domain: string }>();
+  const [searchParams, setSearchParams] = useSearchParams();
   const {
     registry,
     fetchRegistry,
     fetchPacksForDomain,
     getQuestionsForDomain,
   } = useQuestionStore();
-  const { questions: progress, bookmarks } = useProgressStore();
+  const { questions: progress, bookmarks, toggleBookmark } = useProgressStore();
 
   const [typeFilter, setTypeFilter] = useState<QuestionType | 'all'>('all');
   const [difficultyFilter, setDifficultyFilter] = useState<Difficulty | 0>(0);
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const initialStatus = searchParams.get('status');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(
+    initialStatus === 'completed' || initialStatus === 'incomplete' || initialStatus === 'bookmarked'
+      ? initialStatus
+      : 'all',
+  );
   const [searchQuery, setSearchQuery] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
+  const [pageInput, setPageInput] = useState('1');
 
   const handleTypeFilterChange = (value: QuestionType | 'all') => {
     setTypeFilter(value);
@@ -46,6 +53,7 @@ export function QuestionList() {
   const handleStatusFilterChange = (value: StatusFilter) => {
     setStatusFilter(value);
     setCurrentPage(1);
+    setSearchParams(value === 'all' ? {} : { status: value }, { replace: true });
   };
 
   const handleSearchQueryChange = (value: string) => {
@@ -101,6 +109,24 @@ export function QuestionList() {
     currentPage * PAGE_SIZE,
   );
 
+  useEffect(() => {
+    setCurrentPage((page) => Math.min(page, totalPages));
+  }, [totalPages]);
+
+  useEffect(() => {
+    setPageInput(String(currentPage));
+  }, [currentPage]);
+
+  const handlePageJump = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const requestedPage = Number.parseInt(pageInput, 10);
+    if (Number.isNaN(requestedPage)) {
+      setPageInput(String(currentPage));
+      return;
+    }
+    setCurrentPage(Math.min(totalPages, Math.max(1, requestedPage)));
+  };
+
   if (!domain) return null;
   const domainKey = domain as Domain;
   const DomainIcon = DOMAIN_ICONS[domainKey];
@@ -142,7 +168,7 @@ export function QuestionList() {
           placeholder="搜索题目..."
           value={searchQuery}
           onChange={(e) => handleSearchQueryChange(e.target.value)}
-          className="w-full sm:flex-1 sm:min-w-[200px] px-3.5 py-2.5 text-sm rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] text-[var(--color-notion-text)] focus:outline-none focus:border-[var(--color-notion-accent)] focus:ring-2 focus:ring-[var(--color-notion-accent)]/10 transition-all"
+          className="search-control box-border w-full rounded-lg border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-4 py-2.5 text-sm text-[var(--color-notion-text)] transition-colors placeholder:text-[var(--color-notion-text-secondary)] sm:min-w-[200px] sm:flex-1"
         />
 
         <div className="grid grid-cols-1 gap-2 min-[560px]:grid-cols-3 sm:flex sm:gap-3">
@@ -208,6 +234,7 @@ export function QuestionList() {
                 question={q}
                 isCompleted={!!progress[q.id]?.completedAt}
                 isBookmarked={bookmarks.includes(q.id)}
+                onToggleBookmark={() => toggleBookmark(q.id)}
               />
             ))}
           </div>
@@ -219,7 +246,7 @@ export function QuestionList() {
                 第 {currentPage}/{totalPages} 页，共 {filteredQuestions.length} 题
               </span>
 
-              <div className="flex items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1">
                 {/* First page */}
                 <button
                   onClick={() => setCurrentPage(1)}
@@ -248,7 +275,7 @@ export function QuestionList() {
                           onClick={() => setCurrentPage(page)}
                           className={`min-w-[34px] h-[34px] rounded-lg text-sm font-medium transition-colors active-press ${
                             page === currentPage
-                              ? 'bg-[var(--color-notion-accent)] text-white shadow-sm'
+                              ? 'bg-[var(--color-notion-accent)] text-[var(--color-notion-on-accent)] shadow-sm'
                               : 'hover:bg-[var(--color-notion-bg-hover)] text-[var(--color-notion-text-secondary)]'
                           }`}
                         >
@@ -274,6 +301,30 @@ export function QuestionList() {
                 >
                   <ChevronsRight className="w-4 h-4" />
                 </button>
+                <form onSubmit={handlePageJump} className="ml-2 flex items-center gap-1.5">
+                  <label htmlFor="page-jump" className="text-xs text-[var(--color-notion-text-secondary)]">
+                    跳至
+                  </label>
+                  <input
+                    id="page-jump"
+                    type="number"
+                    min={1}
+                    max={totalPages}
+                    value={pageInput}
+                    onChange={(event) => setPageInput(event.target.value)}
+                    onBlur={() => {
+                      if (!pageInput) setPageInput(String(currentPage));
+                    }}
+                    className="search-control compact-control h-8 w-14 rounded-md border border-[var(--color-notion-border)] bg-[var(--color-notion-bg)] px-2 text-center text-sm text-[var(--color-notion-text)]"
+                    aria-label={`跳转页码，范围 1 到 ${totalPages}`}
+                  />
+                  <button
+                    type="submit"
+                    className="compact-control h-8 rounded-md border border-[var(--color-notion-border)] px-2.5 text-xs text-[var(--color-notion-text-secondary)] transition-colors hover:border-[var(--color-notion-accent)] hover:text-[var(--color-notion-accent)]"
+                  >
+                    前往
+                  </button>
+                </form>
               </div>
             </div>
           )}
