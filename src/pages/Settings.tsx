@@ -8,7 +8,6 @@ import {
   Monitor,
   Palette,
   Type,
-  Columns2,
   Accessibility,
 } from 'lucide-react';
 
@@ -88,8 +87,11 @@ export function Settings() {
 
           <div className="mt-5 border-t border-[var(--color-notion-border)] pt-5">
             <div className="mb-3 flex items-center gap-2 text-sm font-medium text-[var(--color-notion-text)]">
-              <Palette className="h-4 w-4" /> 主题色
+              <Palette className="h-4 w-4" /> 页面主题色
             </div>
+            <p className="mb-3 text-xs text-[var(--color-notion-text-secondary)]">
+              同步调整强调色、页面背景、卡片和边框色调
+            </p>
             <div className="flex flex-wrap items-center gap-2.5">
               {ACCENT_OPTIONS.map((option) => (
                 <button
@@ -178,8 +180,8 @@ export function Settings() {
 
           <div className="flex items-center justify-between py-2.5 border-t border-[var(--color-notion-border)] gap-4">
             <div className="min-w-0">
-              <div className="text-sm text-[var(--color-notion-text)]">自动展开答案</div>
-              <div className="text-xs text-[var(--color-notion-text-secondary)] mt-0.5">进入题目详情时默认展开参考答案</div>
+              <div className="text-sm text-[var(--color-notion-text)]">默认打开答案</div>
+              <div className="text-xs text-[var(--color-notion-text-secondary)] mt-0.5">进入题目详情时默认显示参考答案标签</div>
             </div>
             <Toggle
               checked={settings.autoExpandAnswer}
@@ -187,18 +189,6 @@ export function Settings() {
             />
           </div>
 
-          <div className="flex items-center justify-between gap-4 border-t border-[var(--color-notion-border)] py-2.5">
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 text-sm text-[var(--color-notion-text)]">
-                <Columns2 className="h-4 w-4" /> 问题与答案双栏显示
-              </div>
-              <div className="mt-0.5 text-xs text-[var(--color-notion-text-secondary)]">宽屏时并排阅读，窄屏自动切换为上下布局</div>
-            </div>
-            <Toggle
-              checked={settings.questionLayout === 'split'}
-              onChange={(value) => updateSettings({ questionLayout: value ? 'split' : 'stacked' })}
-            />
-          </div>
         </div>
 
         {/* Danger zone */}
@@ -230,7 +220,7 @@ export function Settings() {
             {[
               ['←/→', '选择题内切题，到边界后切换知识点'],
               ['1-9 / A-I', '选择当前选项'],
-              ['Space', '展开/收起答案'],
+              ['Space', '切换题目 / 答案标签'],
               ['S', '收藏/取消收藏'],
               ['Ctrl+K', '搜索'],
             ].map(([key, desc]) => (

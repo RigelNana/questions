@@ -22,7 +22,6 @@ export interface UserSettings {
   theme: 'light' | 'dark' | 'system';
   accentColor: string;
   fontSize: 'small' | 'medium' | 'large';
-  questionLayout: 'split' | 'stacked';
   reduceMotion: boolean;
 }
 
@@ -45,7 +44,6 @@ export const DEFAULT_SETTINGS: UserSettings = {
   theme: 'light',
   accentColor: 'default',
   fontSize: 'medium',
-  questionLayout: 'split',
   reduceMotion: false,
 };
 
