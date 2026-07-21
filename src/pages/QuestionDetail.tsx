@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useState,
+  type FormEvent,
+} from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { useQuestionStore } from '../stores/questionStore';
 import { useProgressStore } from '../stores/progressStore';
@@ -7,10 +14,14 @@ import { HighlightableMarkdown } from '../components/question/HighlightableMarkd
 import { DifficultyBadge } from '../components/filter/DifficultyBadge';
 import { TypeBadge } from '../components/filter/TypeBadge';
 import { QuizPanel } from '../components/question/QuizPanel';
+import { useAgentStore } from '../agent/agentStore';
 import { DOMAIN_LABELS, DOMAIN_ICONS, type Domain, type QuizAttempt } from '../types';
-import { Lightbulb, Star, ArrowLeft, ArrowRight, BookOpen, ClipboardCheck, Highlighter } from 'lucide-react';
+import { Lightbulb, Star, ArrowLeft, ArrowRight, BookOpen, ClipboardCheck, Highlighter, Sparkles } from 'lucide-react';
 
 type DetailTab = 'content' | 'answer' | 'quiz';
+const AgentPanel = lazy(() => import('../agent/AgentPanel').then((module) => ({
+  default: module.AgentPanel,
+})));
 
 export function QuestionDetail() {
   const { domain, questionId } = useParams<{ domain: string; questionId: string }>();
@@ -43,6 +54,9 @@ export function QuestionDetail() {
     return total;
   });
   const clearForQuestion = useHighlightStore((s) => s.clearForQuestion);
+  const agentEnabled = useAgentStore((state) => state.settings.enabled);
+  const agentOpen = useAgentStore((state) => state.panelOpen);
+  const setAgentOpen = useAgentStore((state) => state.setPanelOpen);
 
   const [tabState, setTabState] = useState<{
     questionId: string;
@@ -54,6 +68,10 @@ export function QuestionDetail() {
   const [questionJumpState, setQuestionJumpState] = useState({
     questionId: '',
     value: '1',
+  });
+  const [agentPromptRequest, setAgentPromptRequest] = useState({
+    id: 0,
+    text: '',
   });
 
   useEffect(() => {
@@ -78,6 +96,9 @@ export function QuestionDetail() {
   const currentIndex = allQuestions.findIndex((q) => q.id === questionId);
   const progress = questionId ? getQuestionProgress(questionId) : undefined;
   const bookmarked = questionId ? isBookmarked(questionId) : false;
+  const questionHighlights = questionId
+    ? useHighlightStore.getState().getHighlightsByQuestion(questionId)
+    : [];
   const activeTab = tabState.questionId === questionId
     ? tabState.tab
     : settings.autoExpandAnswer ? 'answer' : 'content';
@@ -104,6 +125,14 @@ export function QuestionDetail() {
   const handleToggleAnswer = useCallback(() => {
     handleSelectTab(activeTab === 'answer' ? 'content' : 'answer');
   }, [activeTab, handleSelectTab]);
+
+  const handleOpenAgent = useCallback((text = '') => {
+    setAgentPromptRequest((current) => ({
+      id: current.id + 1,
+      text,
+    }));
+    setAgentOpen(true);
+  }, [setAgentOpen]);
 
   const handleQuizAttempt = (attempt: QuizAttempt) => {
     if (questionId) {
@@ -136,6 +165,7 @@ export function QuestionDetail() {
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (agentOpen) return;
       if (
         e.target instanceof HTMLInputElement
         || e.target instanceof HTMLTextAreaElement
@@ -168,7 +198,7 @@ export function QuestionDetail() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [activeTab, handleNav, handleToggleAnswer, questionId, toggleBookmark]);
+  }, [activeTab, agentOpen, handleNav, handleToggleAnswer, questionId, toggleBookmark]);
 
   if (!question) {
     return (
@@ -212,9 +242,19 @@ export function QuestionDetail() {
       </div>
 
       {/* Title */}
-      <h1 className="text-xl font-bold text-[var(--color-notion-text)] mb-6 leading-tight tracking-tight">
-        {question.title}
-      </h1>
+      <div className="mb-6 flex items-start justify-between gap-3">
+        <h1 className="min-w-0 text-xl font-bold leading-tight tracking-tight text-[var(--color-notion-text)]">
+          {question.title}
+        </h1>
+        {agentEnabled && (
+          <button
+            onClick={() => handleOpenAgent()}
+            className="flex flex-shrink-0 items-center gap-1.5 rounded-lg bg-[var(--color-notion-accent)] px-3 py-2 text-sm font-medium text-[var(--color-notion-on-accent)] shadow-sm transition-opacity hover:opacity-90 active-press"
+          >
+            <Sparkles className="h-4 w-4" /> <span className="hidden sm:inline">问 AI</span>
+          </button>
+        )}
+      </div>
 
       {/* Tab bar */}
       <div className="mb-6 flex min-w-0 items-stretch gap-1 border-b border-[var(--color-notion-border)]">
@@ -297,6 +337,14 @@ export function QuestionDetail() {
             >
               <Lightbulb className="w-4 h-4 text-[var(--color-notion-warning)]" /> 查看答案
             </button>
+            {agentEnabled && (
+              <button
+                onClick={() => handleOpenAgent('请解释这道题考察的核心问题，并给出思考路径。')}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-notion-accent)] px-4 py-2 text-sm font-medium text-[var(--color-notion-accent)] transition-colors hover:bg-[var(--color-notion-accent-light)] sm:w-auto sm:py-2.5"
+              >
+                <Sparkles className="h-4 w-4" /> 向 AI 追问题目
+              </button>
+            )}
             <button
               onClick={() => questionId && toggleBookmark(questionId)}
               className={`flex w-full items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-all duration-200 active-press sm:w-auto sm:justify-start sm:py-2.5 ${
@@ -358,6 +406,17 @@ export function QuestionDetail() {
                     );
                   })}
                 </ul>
+              </div>
+            )}
+
+            {agentEnabled && (
+              <div className="mt-6 border-t border-[var(--color-notion-border)] pt-4">
+                <button
+                  onClick={() => handleOpenAgent('请审查这份参考答案：指出正确之处、遗漏、边界条件，并给出更好的面试表达。')}
+                  className="inline-flex items-center gap-2 rounded-lg border border-[var(--color-notion-accent)] px-4 py-2 text-sm font-medium text-[var(--color-notion-accent)] transition-colors hover:bg-[var(--color-notion-accent-light)]"
+                >
+                  <Sparkles className="h-4 w-4" /> 向 AI 追问答案
+                </button>
               </div>
             )}
           </div>
@@ -434,6 +493,22 @@ export function QuestionDetail() {
           <ArrowRight className="w-4 h-4" />
         </button>
       </div>
+
+      {agentEnabled && agentOpen && (
+        <Suspense fallback={null}>
+          <AgentPanel
+            open
+            context={{
+              question,
+              activeSection: activeTab,
+              highlights: questionHighlights,
+              progress,
+            }}
+            promptRequest={agentPromptRequest}
+            onClose={() => setAgentOpen(false)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

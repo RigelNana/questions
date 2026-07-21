@@ -20,6 +20,7 @@ const Review = lazy(() => import('./pages/Review').then((m) => ({ default: m.Rev
 const Progress = lazy(() => import('./pages/Progress').then((m) => ({ default: m.Progress })));
 const Settings = lazy(() => import('./pages/Settings').then((m) => ({ default: m.Settings })));
 const Bookmarks = lazy(() => import('./pages/Bookmarks').then((m) => ({ default: m.Bookmarks })));
+const AgentSettings = lazy(() => import('./pages/AgentSettings').then((m) => ({ default: m.AgentSettings })));
 
 function PageLoader() {
   return (
@@ -47,6 +48,7 @@ export default function App() {
           <Route path="progress" element={<Suspense fallback={<PageLoader />}><Progress /></Suspense>} />
           <Route path="bookmarks" element={<Suspense fallback={<PageLoader />}><Bookmarks /></Suspense>} />
           <Route path="settings" element={<Suspense fallback={<PageLoader />}><Settings /></Suspense>} />
+          <Route path="settings/agent" element={<Suspense fallback={<PageLoader />}><AgentSettings /></Suspense>} />
         </Route>
       </Routes>
     </Router>

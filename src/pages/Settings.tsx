@@ -1,5 +1,6 @@
 import { useProgressStore } from '../stores/progressStore';
 import { runAppearanceTransition } from '../utils/appearanceTransition';
+import { Link } from 'react-router-dom';
 import {
   Settings as SettingsIcon,
   AlertTriangle,
@@ -10,6 +11,8 @@ import {
   Palette,
   Type,
   Accessibility,
+  Bot,
+  ChevronRight,
 } from 'lucide-react';
 
 const ACCENT_OPTIONS = [
@@ -70,6 +73,22 @@ export function Settings() {
       </p>
 
       <div className="space-y-4 sm:space-y-6 animate-stagger">
+        <Link
+          to="/settings/agent"
+          className="group flex items-center gap-4 rounded-xl border border-[var(--color-notion-accent)]/40 bg-[var(--color-notion-accent-light)] p-4 text-left no-underline transition-colors hover:border-[var(--color-notion-accent)] sm:p-5"
+        >
+          <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl bg-[var(--color-notion-accent)] text-[var(--color-notion-on-accent)]">
+            <Bot className="h-5 w-5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h3 className="text-base font-semibold text-[var(--color-notion-text)]">Pi AI Agent</h3>
+            <p className="mt-0.5 text-xs text-[var(--color-notion-text-secondary)]">
+              Provider、模型、Skills、工具、Loop、上下文压缩与权限策略
+            </p>
+          </div>
+          <ChevronRight className="h-5 w-5 text-[var(--color-notion-text-secondary)] transition-transform group-hover:translate-x-1" />
+        </Link>
+
         {/* Theme settings */}
         <div className="p-4 sm:p-5 rounded-xl border border-[var(--color-notion-border)] hover:border-[var(--color-notion-accent)]/30 transition-colors duration-200">
           <h3 className="text-base font-semibold text-[var(--color-notion-text)] mb-4">外观</h3>
