@@ -117,6 +117,8 @@ export function AgentPanel({
   contextRef.current = context;
   const sessionRef = useRef(session);
   sessionRef.current = session;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [runtimeView, setRuntimeView] = useState<RuntimeView>({
     key: '',
@@ -139,8 +141,12 @@ export function AgentPanel({
     context.highlights.map((highlight) => highlight.updatedAt).join(','),
     context.progress?.quizAttempts.length ?? 0,
   ].join(':');
+  const runtimeSettingsKey = JSON.stringify({
+    ...settings,
+    permissions: undefined,
+  });
   const runtimeKey = session
-    ? `${session.id}:${contextVersion}:${JSON.stringify(settings)}`
+    ? `${session.id}:${contextVersion}:${runtimeSettingsKey}`
     : '';
   const view = runtimeView.key === runtimeKey
     ? runtimeView
@@ -159,12 +165,13 @@ export function AgentPanel({
   useEffect(() => {
     const initialSession = sessionRef.current;
     if (!open || !initialSession || configError) return;
+    const initialSettings = settingsRef.current;
     let cancelled = false;
     let runtime: QuestionAgentRuntime | null = null;
 
     createQuestionAgentRuntime({
       context: contextRef.current,
-      settings,
+      settings: initialSettings,
       session: initialSession,
       onEvent: (event) => {
         if (cancelled) return;
@@ -223,7 +230,7 @@ export function AgentPanel({
     runtimeKey,
     configError,
     contextVersion,
-    settings,
+    runtimeSettingsKey,
     setSessionMessages,
     upsertToolRun,
     updateSession,
@@ -542,7 +549,7 @@ export function AgentPanel({
                   onClick={() => resolveApproval('allow-once')}
                   className="flex-1 rounded-lg border border-[var(--color-notion-accent)] px-3 py-2 text-sm text-[var(--color-notion-accent)]"
                 >
-                  本次允许
+                  本会话允许
                 </button>
                 <button
                   onClick={() => resolveApproval('allow-always')}

@@ -54,7 +54,7 @@ function Toggle({
         checked ? 'bg-[var(--color-notion-accent)]' : 'bg-[var(--color-notion-border)]'
       }`}
     >
-      <span className={`absolute top-[3px] h-[18px] w-[18px] rounded-full bg-white shadow transition-transform ${
+      <span className={`absolute left-0 top-[3px] h-[18px] w-[18px] rounded-full bg-white shadow transition-transform ${
         checked ? 'translate-x-[22px]' : 'translate-x-[3px]'
       }`} />
     </button>
